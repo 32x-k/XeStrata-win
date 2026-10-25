@@ -114,6 +114,12 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
             <input class="st-input" id="img-cfg" type="number" min="0" max="30" step="0.5"></label>
           <label class="st-field">Seed
             <input class="st-input" id="img-seed" type="number" min="0" placeholder="random"></label>
+          <label class="st-field">Images
+            <select class="st-input" id="img-n"><option>1</option><option>2</option><option>3</option><option>4</option></select></label>
+          <label class="st-field">Format
+            <select class="st-input" id="img-fmt"><option value="png">PNG</option><option value="jpeg">JPEG</option><option value="webp">WebP</option></select></label>
+          <label class="st-field" id="img-q-f" hidden>Quality
+            <input class="st-input" id="img-q" type="number" min="0" max="100" step="1" value="90" aria-label="Quality, 0 to 100"></label>
           <label class="st-field img-check" id="img-bg-f" hidden>
             <input type="checkbox" id="img-bg"> Transparent background</label>
           <button type="submit" class="st-btn st-btn--primary" id="img-go">Generate</button>
@@ -281,6 +287,10 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
     <div class="st-field">
       <label class="st-label" for="s-topk">Top-k <output id="o-topk"></output></label>
       <input class="st-slider" type="range" id="s-topk" min="1" max="64" step="1">
+    </div>
+    <div class="st-field">
+      <label class="st-label" for="s-minp">Min-p <output>empty = the server's default</output></label>
+      <input class="st-input" id="s-minp" type="number" min="0" max="1" step="0.01" placeholder="Server's default">
     </div>
     <div class="st-field">
       <label class="st-label" for="s-max">Max tokens <output>empty = until done</output></label>

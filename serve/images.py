@@ -166,6 +166,7 @@ def model_defaults(cfg: dict) -> dict:
         steps, least, fixed = TURBO_STEPS, TURBO_STEPS, True
     edit = int(cfg.get("edit_steps") or steps) if cfg.get("edit_model") else steps
     return {"steps": steps, "edit_steps": edit, "steps_min": least, "steps_max": MAX_STEPS, "steps_fixed": fixed,
+            "max_n": int(cfg.get("max_n") or 4),
             "guidance": float(cfg.get("cfg_scale") or 1.0) if mage else 1.0,
             "negative_prompt": MF_NEG if mage else None, "transparency": cfg.get("transparency") is not False,
             "mask": cfg.get("mask") is not False}

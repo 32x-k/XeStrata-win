@@ -738,7 +738,8 @@ function markdown(text) {
 // fields: the server picks the card's set for the request's thinking state (thinking 1.0 / 0.95 / 20, not thinking
 // 0.7 / 0.8 / 20 with a presence penalty). Before 0.1.45 the page sent 0.6 itself; a stored 0.6 with the other two
 // values untouched counts as "not set" too.
-const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true};
+const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, min_p: "", max: "", seed: "", show: true, esp: true,
+                  mcp: true};
 const OLD_DEFAULT_TEMPERATURE = 0.6;
 function samplingUntouched(s) {
   const t = +s.temperature;
@@ -982,6 +983,7 @@ async function send() {
   } else if (!samplingUntouched(settings)) {
     Object.assign(body, {temperature: +settings.temperature, top_p: +settings.top_p, top_k: +settings.top_k});
   }
+  if (settings.temperature > 0 && settings.min_p !== "" && settings.min_p != null) body.min_p = +settings.min_p;
   if (settings.seed) body.seed = +settings.seed;
   if (settings.max) body.max_tokens = +settings.max;
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
@@ -1183,7 +1185,7 @@ function openDrawer(open) {
 function loadDrawer(s = settings) {
   for (const b of $("s-thinking").children) b.setAttribute("aria-checked", String(b.dataset.v === s.thinking));
   $("s-temp").value = s.temperature; $("s-topp").value = s.top_p; $("s-topk").value = s.top_k;
-  $("s-max").value = s.max; $("s-seed").value = s.seed;
+  $("s-max").value = s.max; $("s-seed").value = s.seed; $("s-minp").value = s.min_p ?? "";
   $("s-show").setAttribute("aria-checked", String(!!s.show));
   $("s-esp").setAttribute("aria-checked", String(s.esp !== false));
   $("esp-row").hidden = !projectionLoaded();
@@ -1204,6 +1206,7 @@ function sharedDefaults(s) {
   const d = {reasoning_effort: s.thinking};
   if (!(+s.temperature > 0)) d.temperature = 0;
   else if (!samplingUntouched(s)) Object.assign(d, {temperature: +s.temperature, top_p: +s.top_p, top_k: +s.top_k});
+  if (+s.temperature > 0 && s.min_p !== "" && s.min_p != null) d.min_p = +s.min_p;
   if (s.seed) d.seed = +s.seed;
   if (s.max) d.max_tokens = +s.max;
   if (projectionLoaded()) d.experimental_speed_projection = s.esp !== false;
@@ -1231,7 +1234,7 @@ function outputs() {
   $("o-topk").textContent = $("s-topk").value;
   const sel = [...$("s-thinking").children].find((b) => b.getAttribute("aria-checked") === "true");
   $("o-thinking").textContent = sel ? {none: "answers right away", low: "short", medium: "medium", high: "thorough (default)"}[sel.dataset.v] : "";
-  for (const id of ["s-topp", "s-topk"]) $(id).disabled = t === 0;
+  for (const id of ["s-topp", "s-topk", "s-minp"]) $(id).disabled = t === 0;
 }
 for (const b of $("s-thinking").children) b.onclick = () => { for (const x of $("s-thinking").children) x.setAttribute("aria-checked", String(x === b)); outputs(); };
 for (const id of ["s-temp", "s-topp", "s-topk"]) $(id).oninput = outputs;
@@ -1243,7 +1246,8 @@ $("s-reset").onclick = () => loadDrawer(DEFAULTS);
 $("s-apply").onclick = async () => {
   const sel = [...$("s-thinking").children].find((b) => b.getAttribute("aria-checked") === "true");
   settings = {thinking: sel ? sel.dataset.v : "high", temperature: +$("s-temp").value, top_p: +$("s-topp").value,
-              top_k: +$("s-topk").value, max: $("s-max").value.trim(), seed: $("s-seed").value.trim(),
+              top_k: +$("s-topk").value, min_p: $("s-minp").value.trim(), max: $("s-max").value.trim(),
+              seed: $("s-seed").value.trim(),
               show: $("s-show").getAttribute("aria-checked") === "true",
               esp: $("s-esp").getAttribute("aria-checked") === "true",
               mcp: $("s-mcp").getAttribute("aria-checked") === "true"};
@@ -1329,6 +1333,10 @@ function imgDefaults() {
   $("img-steps").placeholder = String((refs ? d.edit_steps : d.steps) || "");
   $("img-cfg").placeholder = d.guidance > 1 ? String(d.guidance) : "off";
   $("img-bg-f").hidden = !d.transparency;
+  const maxN = d.max_n || 4, n = $("img-n"), was = +n.value || 1;
+  n.replaceChildren(...Array.from({length: maxN}, (_, i) => new Option(String(i + 1))));
+  n.value = String(Math.min(was, maxN));
+  imgFormat();
   imgNegHint();
 }
 // whether the negative prompt is used: only with guidance above 1, and some models guide only with one
@@ -1397,6 +1405,15 @@ function imgMask() {
   g.drawImage(c, 0, 0);
   return m.toDataURL("image/png");
 }
+// the format: JPEG and WebP take a quality; a transparent background has no JPEG (no alpha channel)
+function imgFormat() {
+  const f = $("img-fmt"), bg = $("img-bg").checked && !$("img-bg-f").hidden;
+  f.options[1].disabled = bg;
+  if (bg && f.value === "jpeg") f.value = "png";
+  $("img-q-f").hidden = f.value === "png";
+}
+$("img-fmt").onchange = imgFormat;
+$("img-bg").onchange = imgFormat;
 $("img-neg").oninput = imgNegHint;
 $("img-cfg").oninput = imgNegHint;
 $("img-ref").onchange = () => { imgDefaults(); imgMaskSetup(); };
@@ -1414,6 +1431,9 @@ $("img-form").onsubmit = async (ev) => {
   if ($("img-steps").value !== "" && !$("img-steps-f").hidden) body.steps = Number($("img-steps").value);
   if ($("img-cfg").value !== "") body.true_cfg_scale = Number($("img-cfg").value);
   if ($("img-bg").checked && !$("img-bg-f").hidden) body.background = "transparent";
+  if (+$("img-n").value > 1) body.n = +$("img-n").value;
+  body.output_format = $("img-fmt").value;
+  if (body.output_format !== "png") body.output_compression = Math.max(0, Math.min(100, +$("img-q").value || 0));
   $("img-go").disabled = true;
   const t0 = performance.now();
   $("img-hint").textContent = "Generating\u2026 (a minute or more on a small GPU)";
@@ -1430,7 +1450,7 @@ $("img-form").onsubmit = async (ev) => {
     for (const d of j.data) {
       const fig = document.createElement("figure");
       const img = document.createElement("img");
-      img.src = "data:image/png;base64," + d.b64_json;
+      img.src = `data:image/${j.output_format || "png"};base64,` + d.b64_json;
       img.alt = prompt;
       const cap = document.createElement("figcaption");
       const made = j.strata && j.strata.made_size ? ` (made at ${j.strata.made_size}, middle cut out)` : "";
