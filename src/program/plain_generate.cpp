@@ -874,6 +874,9 @@ int plain_main(int argc, char** argv) {
     std::fprintf(stderr, "strata (%s): below the VRAM tier: %lld routed entries read over PCIe; experts taken from "
                          "RAM %lld, from the files %lld (%.1f MB)\n", arch.c_str(), (long long) model.offloaded(),
                  (long long) model.ram_reads(), (long long) model.file_reads(), (double) model.file_read_bytes() / 1e6);
+    if (model.ram_adapts() > 0)
+        std::fprintf(stderr, "strata (%s): %lld experts moved into the RAM copy in the places of unused ones "
+                             "(STRATA_RAM_ADAPT)\n", arch.c_str(), (long long) model.ram_adapts());
     if (model.spec_windows() > 0)
         std::fprintf(stderr, "strata (%s): %lld windows checked %lld drafts, accepted %lld (%.1f%%), %.2f tokens a window; "
                              "a window %.2f ms, its drafts %.2f ms\n",

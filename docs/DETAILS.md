@@ -373,6 +373,7 @@ Not yet: images, and the options made for Qwen3.8-Flash-Next such as the KV cach
 When RAM is short of all the experts, the engine keeps the ones VRAM does not hold in RAM as far as it has room and
 reads the rest from the model file through the OS file cache (slower; setup warns of it when the RAM and the VRAM
 together are short).
+`STRATA_RAM_ADAPT=<n>` (above) makes the RAM copy follow the conversation then, on one GPU.
 
 The engine's options (added to the settings' `args`):
 

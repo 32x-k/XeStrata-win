@@ -190,6 +190,8 @@ public:
     int64_t ram_reads() const;
     int64_t file_reads() const;
     uint64_t file_read_bytes() const;
+    /// STRATA_RAM_ADAPT's moves into the RAM copy so far
+    int64_t ram_adapts() const { return complement_ != nullptr ? complement_->ram_adapts() : 0; }
     /// The layer split's first blocks after GPU 0's (empty: one GPU).
     std::vector<int64_t> split_points() const;
     /// Writes what this run learned as a profile (rank_learned_profile: the experts in VRAM now, then by the routing
@@ -298,6 +300,9 @@ private:
     /// The adaptive tier's copies in flight: their experts become resident once the copies are done (`wait`: wait
     /// for them; else only if they are).
     bool settle_swaps(bool wait, std::string& err);
+    /// STRATA_RAM_ADAPT=<n> (opt-in, one GPU, the experts outside the VRAM tier in RAM): after a window, up to n
+    /// experts the conversation keeps routing to take the RAM places of unused ones (generate.cpp's rule).
+    void ram_adapt();
     bool fill_slot(int64_t layer, int32_t expert, std::string& err);
     /// The prompt path's buffers for chunks of `T` tokens, carved by prompt_carve: the pinned host block allocated at
     /// load for the longest chunk, the device block borrowed from the tier for each prompt (plain_prompt.cpp uses them).

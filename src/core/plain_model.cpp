@@ -1797,7 +1797,41 @@ bool PlainModel::stage_forward(const int32_t* tokens, int T, int64_t pos, const 
     tokens_since_adapt_ += T;
     // a layer split's stages take their rounds in turn (adapt_phase_), so that one's copies land before the next's
     if (!disp_.usage.empty() && (windows_ + adapt_phase_) % opt_.adapt_every == 0 && !adapt(err)) return false;
+    ram_adapt();
     return true;
+}
+
+// STRATA_RAM_ADAPT, as generate.cpp: the RAM copy is chosen once, at load, so an expert it does not hold is read from
+// the file every time the conversation routes to it.  With this, between windows and while no adaptive round's copies
+// are in flight (they read the RAM copy), up to n experts the windows keep routing to (decayed count 2 or more) take
+// the places of experts of their layer that are not routed to (below 0.5), one pair per layer, the largest difference
+// first; one blob read each, on this thread.  One GPU only: a layer split's stages share the copy.
+void PlainModel::ram_adapt() {
+    static const int n = [] {
+        const char* e = std::getenv("STRATA_RAM_ADAPT");
+        return e != nullptr ? std::max(0, (int) std::strtol(e, nullptr, 10)) : 0;
+    }();
+    if (n <= 0 || complement_ == nullptr || !complement_->complement_ready() || disp_.usage.empty() ||
+        !next_.empty() || root_ != this || !pending_.empty() || windows_ < 2)
+        return;
+    constexpr float kRouted = 2.0f, kUnused = 0.5f;
+    struct RamSwap { float gain; int32_t layer, in, out; };
+    std::vector<RamSwap> swaps;
+    const int64_t E = spec_.n_expert;
+    for (int64_t l = 0; l < n_moe_; ++l) {
+        const float* u = disp_.usage.data() + l * E;
+        const int32_t* r = res_.data() + l * E;
+        int32_t in = -1, out = -1;
+        for (int32_t e = 0; e < (int32_t) E; ++e) {
+            if (r[e] >= 0) continue;   // in VRAM: the RAM copy does not hold it
+            if (complement_->has_resident(l, e)) { if (out < 0 || u[e] < u[out]) out = e; }
+            else if (u[e] >= kRouted && (in < 0 || u[e] > u[in])) in = e;
+        }
+        if (in >= 0 && out >= 0 && u[out] < kUnused) swaps.push_back({u[in] - u[out], (int32_t) l, in, out});
+    }
+    std::sort(swaps.begin(), swaps.end(), [](const RamSwap& a, const RamSwap& b) { return a.gain > b.gain; });
+    if ((int) swaps.size() > n) swaps.resize((size_t) n);
+    for (const RamSwap& x : swaps) complement_->replace_resident(x.layer, x.in, x.out);
 }
 
 // The decode's PCIe share, measured: whether the GPU reading a share of the missed experts over PCIe beats the CPU
