@@ -1,0 +1,29 @@
+SPDX-FileCopyrightText: The oneMath contributors
+SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+SPDX-License-Identifier: Apache-2.0
+
+windows-native-rocblas: oneMath (XeStrata's fork, tag xestrata-10) builds its rocBLAS backend on Windows in a cross
+build from Linux only; this builds it in a build on Windows itself as well, where the backend finds HIP and rocBLAS
+through their CMake packages (the ROCm SDK of AMD's Python packages). Applied by CMakeLists.txt in such a build only,
+until the fork carries it. Nothing changes elsewhere.
+---
+diff --git a/src/blas/backends/CMakeLists.txt b/src/blas/backends/CMakeLists.txt
+--- a/src/blas/backends/CMakeLists.txt
++++ b/src/blas/backends/CMakeLists.txt
+@@ -1,6 +1,7 @@
+ #===============================================================================
+ # Copyright 2020-2021 Intel Corporation
+ # Modified 2026 by MistVVK and the XeStrata contributors: the cuBLAS and rocBLAS backends in a cross build for Windows.
++# Modified 2026 by MistVVK and the XeStrata contributors: the rocBLAS backend in a build on Windows itself.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+@@ -47,7 +48,7 @@ if(ENABLE_CUBLAS_BACKEND AND (UNIX OR CMAKE_CROSSCOMPILING))
+   add_subdirectory(cublas)
+ endif()
+ 
+-if(ENABLE_ROCBLAS_BACKEND AND (UNIX OR CMAKE_CROSSCOMPILING))
++if(ENABLE_ROCBLAS_BACKEND AND (UNIX OR CMAKE_CROSSCOMPILING OR WIN32))
+   add_subdirectory(rocblas)
+ endif()
+ 
