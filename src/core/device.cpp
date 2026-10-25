@@ -667,11 +667,14 @@ uint64_t max_alloc_limit_bytes() {
 
 // Whether the GPU is the processor's own graphics (its memory is the system RAM), as the SYCL runtime reports it.
 // Not asked of Level Zero directly: the engine links no maker's driver library, so a contrib build starts on a PC
-// with only Intel's or only NVIDIA's (the runtime opens each backend's library when it is there).  The HIP runtime
-// does not answer the integrated-GPU aspect; it says the same as unified host memory (hipDeviceAttributeIntegrated).
+// with only Intel's or only NVIDIA's (the runtime opens each backend's library when it is there).  Only Level Zero
+// answers the integrated-GPU aspect: the CUDA and HIP adapters print an error each time it is asked ("<CUDA>[ERROR]:
+// Unsupported ParamName", UR_DEVICE_INFO_IS_INTEGRATED_GPU) and report it absent.  The HIP runtime says the same as
+// unified host memory (hipDeviceAttributeIntegrated), which is asked in its place.
 bool integrated_gpu(const sycl::device& d) {
-    if (d.has(sycl::aspect::ext_oneapi_is_integrated_gpu)) return true;
-    if (d.get_backend() != sycl::backend::ext_oneapi_hip) return false;
+    const sycl::backend b = d.get_backend();
+    if (b == sycl::backend::ext_oneapi_level_zero) return d.has(sycl::aspect::ext_oneapi_is_integrated_gpu);
+    if (b != sycl::backend::ext_oneapi_hip) return false;
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     return d.get_info<sycl::info::device::host_unified_memory>();
