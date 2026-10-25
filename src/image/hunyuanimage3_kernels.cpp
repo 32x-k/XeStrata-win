@@ -202,8 +202,10 @@ void hunyuanimage3_rope_angles(const int32_t* pos_y, const int32_t* pos_x, int64
     const int64_t half = head_dim / 2;
     const auto e = queue_for(stream).parallel_for(sycl::range<2>((size_t) T, (size_t) half), [=](sycl::id<2> i) {
         const int64_t t = (int64_t) i[0], j = (int64_t) i[1];
-        const double pos = (j % 2) ? (double) pos_x[t] : (double) pos_y[t];
-        ang[t * half + j] = (float) (pos * sycl::pow((double) theta, -2.0 * (double) j / (double) head_dim));
+        // FP32 as the reference's `1.0 / (base ** (arange(0, n, 2).float() / n))` (and no FP64, which not every
+        // GPU has)
+        const float pos = (float) ((j % 2) ? pos_x[t] : pos_y[t]);
+        ang[t * half + j] = pos * (1.0f / sycl::pow(theta, (float) (2 * j) / (float) head_dim));
     });
     finish(stream, e, "hunyuanimage3_rope_angles");
 }
