@@ -55,16 +55,27 @@ bool hunyuanimage3_layer_host(const HunyuanImage3File& f, int64_t layer, const f
 
 /// The model's own special token ids (its config's `im_start_id`/`im_end_id`/`image_token_id` and its tokenizer's
 /// `added_tokens` for the rest): the markers a sequence is built with, and the three whose rows a step replaces.
-/// `<img_size_256>` and `<img_ratio_0>` are the first of their runs (the sizes 128034 .. 128043, the 37 ratio
-/// buckets from 128044): which ones a prompt carries is the caller's choice, not the engine's.
+/// `<img_size_256>` and `<img_ratio_0>` are the first of their runs (the sizes 128034 .. 128043, the ratio buckets
+/// 0 .. 32 from 128044 and 33 .. 36 - the four sizes the image processor adds - from 130103, added to the vocabulary
+/// later): which ones a prompt carries is the caller's choice, not the engine's.
 constexpr int32_t kHunyuanImage3Boi = 128000, kHunyuanImage3Eoi = 128001, kHunyuanImage3Image = 128006;
 constexpr int32_t kHunyuanImage3Timestep = 128017, kHunyuanImage3Guidance = 130082;
 constexpr int32_t kHunyuanImage3TimestepR = 130107;
-constexpr int32_t kHunyuanImage3ImgSize256 = 128034, kHunyuanImage3ImgRatio0 = 128044;
+constexpr int32_t kHunyuanImage3ImgSize256 = 128034, kHunyuanImage3ImgRatio0 = 128044, kHunyuanImage3ImgRatio33 = 130103;
+constexpr int32_t kHunyuanImage3RatioBuckets = 37;
 constexpr int32_t kHunyuanImage3JointImgSep = 128077;   // `<joint_img_sep>`: between a reference's VAE and ViT tokens
 /// `<img_size_N>`: the run's ids are 128034 .. 128043 for N = 256, 512, 768, 1024, ... (the model's sizes grow by
-/// 256); `<img_ratio_i>` is kHunyuanImage3ImgRatio0 + i.
+/// 256).
 constexpr int64_t hunyuanimage3_img_size_of(int32_t id) { return 256 * (int64_t) (id - kHunyuanImage3ImgSize256 + 1); }
+/// i of `<img_ratio_i>` (-1 for an id that is none), and the id of bucket i: the two runs above.
+constexpr int32_t hunyuanimage3_ratio_of(int32_t id) {
+    return id >= kHunyuanImage3ImgRatio0 && id < kHunyuanImage3ImgRatio0 + 33 ? id - kHunyuanImage3ImgRatio0
+         : id >= kHunyuanImage3ImgRatio33 && id < kHunyuanImage3ImgRatio33 + 4 ? 33 + id - kHunyuanImage3ImgRatio33
+         : -1;
+}
+constexpr int32_t hunyuanimage3_ratio_id(int32_t i) {
+    return i < 33 ? kHunyuanImage3ImgRatio0 + i : kHunyuanImage3ImgRatio33 + i - 33;
+}
 
 /// One image block of a sequence as its markers lay it out.  A reference image (an edit's) is `<boi> <img_size_N>
 /// <img_ratio_i> <timestep> <img> * vae_n <joint_img_sep> <img> * vit_n <eoi>`: its VAE latent's tokens, then its

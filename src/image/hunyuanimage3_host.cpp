@@ -429,7 +429,6 @@ int64_t hunyuanimage3_trim(const int32_t* ids, int64_t t, std::string& err) {
 bool hunyuanimage3_blocks(const int32_t* ids, int64_t t, std::vector<HunyuanImage3Block>& blocks, std::string& err) {
     blocks.clear();
     auto is_size = [](int32_t id) { return id >= kHunyuanImage3ImgSize256 && id < kHunyuanImage3ImgRatio0; };
-    auto is_ratio = [](int32_t id) { return id >= kHunyuanImage3ImgRatio0 && id < kHunyuanImage3ImgRatio0 + 64; };
     auto run = [&](int64_t from) {   // the `<img>` run from `from`
         int64_t n = 0;
         while (from + n < t && ids[from + n] == kHunyuanImage3Image) ++n;
@@ -446,9 +445,9 @@ bool hunyuanimage3_blocks(const int32_t* ids, int64_t t, std::vector<HunyuanImag
         HunyuanImage3Block b;
         b.boi = i;
         int64_t k = i + 1;
-        if (k + 1 < t && is_size(ids[k]) && is_ratio(ids[k + 1])) {
+        if (k + 1 < t && is_size(ids[k]) && hunyuanimage3_ratio_of(ids[k + 1]) >= 0) {
             b.base_size = hunyuanimage3_img_size_of(ids[k]);
-            b.ratio_index = ids[k + 1] - kHunyuanImage3ImgRatio0;
+            b.ratio_index = hunyuanimage3_ratio_of(ids[k + 1]);
             k += 2;
         } else {
             err = "hunyuanimage3_blocks: the block at " + std::to_string(i) + " has no <img_size_N> <img_ratio_i>";
