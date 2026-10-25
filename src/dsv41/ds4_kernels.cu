@@ -6,6 +6,7 @@
 #include "ds4_numerics.cuh"
 #include "ds4_q6k.cuh"
 #include "ds4_attn_split.cuh"
+#include "ds4_wmma.cuh"
 
 #include <cuda_fp16.h>
 
@@ -1128,6 +1129,152 @@ __global__ void __launch_bounds__(kThreads) sparse_attn_packed_kernel(const floa
     }
 }
 
+// DS4_FAST_ATTN=1: the chunked prompt's packed-KV attention on the matrix cores (gfx11/gfx12 WMMA; the R9700's gfx12).
+// The matrix's rows are 16 heads of ONE query, so a block stages a 16-key tile once for all of them: Q (16 heads x 512
+// dims) is the A operand of the scores' product, the key tile is B, and the same tile is B of the values' product (the
+// heads' softmaxes and their 512-dim outputs are its rows).  The QK and PV sums are the matrix cores' order, not
+// sparse_attn_packed_kernel's scalar lanes' - hence opt-in (DS4_FAST_ATTN).
+constexpr int kFaHeads = 16;   // heads a tile (the matrix's rows)
+constexpr int kFaKeys = 16;    // keys a tile
+constexpr int kFaD = 512;      // the head dim
+constexpr int kFaLd = 520;     // halves a tile row (512 + 8: the pad keeps the 16 rows off one bank)
+__global__ void __launch_bounds__(kThreads) sparse_attn_wmma_kernel(const float* __restrict__ q,
+                                                                    const uint16_t* __restrict__ win,
+                                                                    const uint8_t* __restrict__ ckv,
+                                                                    const int* __restrict__ sel, int sel_stride,
+                                                                    AttnRows ar, const float* __restrict__ sink,
+                                                                    int heads, float scale, float* __restrict__ out) {
+    __shared__ __align__(16) uint16_t qs[kFaHeads * kFaLd];
+    __shared__ __align__(16) uint16_t ks[kFaKeys * kFaLd];
+    __shared__ float sc[kFaHeads][kFaKeys];
+    __shared__ float part[8][kFaHeads][kFaKeys];   // (the 8 warps' 64-dim slices of the scores)
+    __shared__ uint16_t ps[kFaHeads][kFaKeys];
+    __shared__ const uint8_t* rows[kFaKeys];
+    __shared__ float m_run[kFaHeads], den[kFaHeads], ts[kFaHeads];
+    const int tid = (int) threadIdx.x, wp = tid >> 5, lane = tid & 31, l16 = lane & 15, hi = lane >> 4;
+    const int t = blockIdx.y, hb = blockIdx.x * kFaHeads;
+    int n_win, n_sel, w0;
+    if (ar.gen) {
+        const long long ta = ar.t0 + t, pa = ar.p0 + ta;
+        const long long first = max((long long) ar.win - ar.p0, ta + 1);
+        w0 = (int) first;
+        n_win = (int) (ar.win + ta - first + 1);
+        n_sel = ar.R > 0 ? (int) min((long long) ar.kcap, (pa + 1) / ar.R) : 0;
+    } else {
+        n_win = ar.nwin[t], n_sel = ar.nsel[t], w0 = ar.win0[t];
+    }
+    const uint16_t* wbase = win + (size_t) w0 * kFaD;
+    const int* sl = sel + (size_t) t * sel_stride;
+    const size_t crow = kv_row_bytes(kKvFp4, kFaD);
+    // the block's 16 heads' queries as FP16 (the matrix's A operand), and their running softmax state
+    for (int i = tid; i < kFaHeads * kFaD; i += kThreads) {
+        const int h = i / kFaD, c = i % kFaD;
+        qs[h * kFaLd + c] = __builtin_bit_cast(uint16_t, (_Float16) q[((size_t) t * heads + hb + h) * kFaD + c]);
+    }
+    if (tid < kFaHeads) {
+        m_run[tid] = -1e30f;
+        den[tid] = 0.0f;
+    }
+    f8v o[4];
+#pragma unroll
+    for (int f = 0; f < 4; ++f)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) o[f][i] = 0.0f;
+    __syncthreads();
+    auto stage = [&](int t0, int n) {   // the tile's n rows into ks (BF16 rows -> FP16)
+        const int sr = tid >> 4, part = tid & 15;
+        if (sr >= n) return;
+        const uint8_t* row = rows[sr];
+        uint16_t tmp[32];
+        if (t0 + sr < n_win) {
+            const uint4* src = (const uint4*) (row + part * 64);
+            const uint4 a = src[0], b = src[1], c = src[2], d = src[3];
+            ((uint4*) tmp)[0] = a;
+            ((uint4*) tmp)[1] = b;
+            ((uint4*) tmp)[2] = c;
+            ((uint4*) tmp)[3] = d;
+        } else {
+            unpack32(row, part, (uint4*) tmp);
+        }
+        uint16_t* dst = ks + sr * kFaLd + part * 32;
+#pragma unroll
+        for (int i = 0; i < 32; ++i) dst[i] = __builtin_bit_cast(uint16_t, (_Float16) bf16f(tmp[i]));
+    };
+    const int total = n_win + n_sel;
+    for (int t0 = 0; t0 < total; t0 += kFaKeys) {
+        const int nt = min(kFaKeys, total - t0);
+        if (tid < nt) {
+            const int j = t0 + tid;
+            rows[tid] = j < n_win ? (const uint8_t*) (wbase + (size_t) j * kFaD) : ckv + (size_t) sl[j - n_win] * crow;
+        }
+        __syncthreads();
+        stage(t0, nt);
+        __syncthreads();
+        {   // the scores in 8 slices of 64 dims, a warp a slice, summed in shared
+            f8v acc = {0, 0, 0, 0, 0, 0, 0, 0};
+            const int k0 = wp * 64;
+            for (int kk = k0; kk < k0 + 64; kk += 16) {
+                h16v a, b;
+#pragma unroll
+                for (int i = 0; i < 16; ++i) {
+                    a[i] = __builtin_bit_cast(_Float16, qs[l16 * kFaLd + kk + i]);
+                    b[i] = __builtin_bit_cast(_Float16, ks[l16 * kFaLd + kk + i]);
+                }
+                acc = set_wmma(a, b, acc);
+            }
+#pragma unroll
+            for (int i = 0; i < 8; ++i) part[wp][set_wmma_row(i, hi)][l16] = acc[i];
+            __syncthreads();
+            const int h = tid >> 4, k = tid & 15;
+            float a = 0.0f;
+#pragma unroll
+            for (int w = 0; w < 8; ++w) a += part[w][h][k];
+            sc[h][k] = t0 + k < total ? a * scale : -INFINITY;
+        }
+        __syncthreads();
+        if (tid < kFaHeads) {   // the online softmax, a head a thread
+            float m = -INFINITY;
+            for (int j = 0; j < nt; ++j) m = fmaxf(m, sc[tid][j]);
+            const float mo = m_run[tid], mn = fmaxf(mo, m);
+            float s = 0.0f;
+            for (int j = 0; j < nt; ++j) {
+                const float p = expf(sc[tid][j] - mn);
+                ps[tid][j] = __builtin_bit_cast(uint16_t, (_Float16) p);
+                s += p;
+            }
+            for (int j = nt; j < kFaKeys; ++j) ps[tid][j] = 0;   // (the stale rows: the values' product reads them)
+            ts[tid] = expf(mo - mn);
+            den[tid] = den[tid] * ts[tid] + s;
+            m_run[tid] = mn;
+        }
+        __syncthreads();
+        const int dim0 = wp * 64;
+#pragma unroll
+        for (int f = 0; f < 4; ++f)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) o[f][i] *= ts[set_wmma_row(i, hi)];
+#pragma unroll
+        for (int f = 0; f < 4; ++f) {   // the values: P (16 heads x 16 keys) x V (16 keys x 64 dims this warp)
+            h16v a, b;
+#pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                a[i] = __builtin_bit_cast(_Float16, ps[l16][i]);
+                b[i] = __builtin_bit_cast(_Float16, ks[i * kFaLd + dim0 + f * 16 + l16]);
+            }
+            o[f] = set_wmma(a, b, o[f]);
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int f = 0; f < 4; ++f)
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int h = set_wmma_row(i, hi), dm = wp * 64 + f * 16 + l16;
+            const float dv = den[h] + expf(sink[hb + h] - m_run[h]);
+            out[((size_t) t * heads + hb + h) * kFaD + dm] = o[f][i] / dv;
+        }
+}
+
 // the ring's rows are kKvFp8: E4M3 codes, a UE8M0 scale per 32 (decoded: exactly the BF16 values they were made from)
 __global__ void ring_to_ext_kernel(const uint8_t* __restrict__ ring, uint16_t* __restrict__ ext, long long p0, int n,
                                    int d) {
@@ -1839,6 +1986,16 @@ bool split_enabled() {
     }();
     return on;
 }
+// DS4_FAST_ATTN=1: the chunked prompt's packed-KV attention on the matrix cores (sparse_attn_wmma_kernel).  Opt-in: the
+// QK/PV sums are the matrix cores' order, so the outputs differ from the scalar kernel's in the last places (the owner
+// approved the trade for the prefill; the decode path stays on the scalar kernels).
+bool fast_attn_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("DS4_FAST_ATTN");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    return on;
+}
 attnsplit::AttnSplitScratch split_scratch(cudaStream_t s, int heads) {
     static std::mutex mu;
     static std::map<std::pair<int, cudaStream_t>, attnsplit::AttnSplitScratch> m;
@@ -2094,9 +2251,15 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
                                                                              heads, d, scale, out);
         return;
     }
+    // DS4_FAST_ATTN=1: the chunked prompt's matrix-core path (16 heads a block, a 16-key tile).  The decode and the
+    // verify windows keep the scalar kernels: one query's heads are not the matrix's rows there.
+    if (fast_attn_enabled() && a.gen != 0 && T >= kFaKeys && heads % kFaHeads == 0) {
+        sparse_attn_wmma_kernel<<<dim3(heads / kFaHeads, T), kThreads, 0, s>>>(q, win, (const uint8_t*) ckv, sel, sel_stride,
+                                                                              a, sink, heads, scale, out);
+        return;
+    }
     // packed rows: as many heads a block as still leaves two blocks a multiprocessor (a decoded row serves them all)
-    int G = heads_per_block;
-    if (G != 1 && G != 2 && G != 4 && G != 8) {
+    int G = heads_per_block;    if (G != 1 && G != 2 && G != 4 && G != 8) {
         G = 8;
         while (G > 1 && (heads % G != 0 || (heads / G) * T < 2 * sm_count())) G /= 2;
     }
