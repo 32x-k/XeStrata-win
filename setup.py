@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Strata one-click setup and start (Windows and Linux, NVIDIA or AMD GPUs).
 
     START-HERE.bat  (Windows)   /   ./setup.sh  (Linux)      - they install Python if needed and run this file
@@ -8036,6 +8036,21 @@ def dsv41_prefill_chunk_args(cards, ram_gb) -> list:
     return ["--prefill-chunk", "8192"]
 
 
+def dsv41_config_env(cards) -> dict:
+    """Engine env settings for the DeepSeek engine on a unified-memory APU (Ryzen AI Max, gfx1151).
+
+    DS4_ASYNC_T=4: the engine's windowed decode uses the mailbox ("async") path for windows up to this size, 8 by default.  On the
+    128 GB Strix Halo the async path is slower than the synchronous one for the 6-row verify window: measured 2026-10-25 (2.00
+    bpw, engine 0.1.51, 256-token code set, greedy): 15.87-16.33 tok/s with the default against 20.14-21.28 with 4 (+31%); the
+    agent set with the same accepted tokens a round: 15.93 against 18.48 (+16%).  The same bits come out - only the scheduling
+    changes - and the drafter's own single-token windows (T=1) stay on the async path.  A discrete card keeps the engine's
+    default; STRATA_DSV41_ASYNC_T=n overrides the value, STRATA_DSV41_ASYNC_T=8 restores the default."""
+    if not cards or not any(c.get("uma") for c in cards):
+        return {}
+    value = os.environ.get("STRATA_DSV41_ASYNC_T") or "4"
+    return {} if value == "8" else {"DS4_ASYNC_T": value}
+
+
 def dsv41_engine_env(lib_dirs) -> dict:
     env = dict(os.environ)
     dirs = [str(d) for d in lib_dirs or [] if d]
@@ -8267,9 +8282,11 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
     args = ["--pack", str(pack), "--max-context", str(ctx), "--eos", "1", "--dspark", "auto",
             *(["--dspark-conf", "0.65"] if md.get("recipe") == "ista" else []), *dsv41_prefill_chunk_args(cards, ram),
             *plan["args"]]
+    env = dsv41_config_env(cards)
     cfg = {"exe": str(exe), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": fam["name"], "arch": fam["arch"], "log": str(home() / f"strata-{tag.lower()}.log"),
-           "lib_dirs": lib_dirs, "port": port, "engine_ready_s": 3600}      # 300+ GB read from the files: a slow disk needs its time
+           "lib_dirs": lib_dirs, "port": port, "engine_ready_s": 3600,      # 300+ GB read from the files: a slow disk needs its time
+           **({"env": env} if env else {})}
     if cuda_tk == 12:
         cfg["cuda"] = 12
     if hip:

@@ -42,10 +42,12 @@ perplexity +7.3% (code +3.2%, agent work +2.2%). IQ1_M: perplexity +21% (KL 0.21
 **On a Ryzen AI Max "Strix Halo" (Windows)** the graphics chip and the CPU share one pool of memory, so the engine counts it once: the
 128 GB box (a 64 GB BIOS carve-out plus the 64 GB Windows sees) keeps about 109 GB of the 2.00 set's experts in that pool (the dense
 weights and 12 GB for Windows and the desktop aside) and reads the other 23 GB from the SSD. Measured there (2.00 bpw, default Faster
-mode, DSpark auto): answers 15-17 tokens/s on code and 10-11 on chat; a 4,000-token prompt 87 tokens/s, 8,000 tokens 125, 32,000
-tokens 177 (setup writes `--prefill-chunk 8192` on this PC: 11-15% faster than the engine's 1,024-token default, decode unchanged).
-The tested driver is AMD Adrenalin 26.10.1 (driver 32.0.32015.7029); the 2025-03 driver failed at 32K context, so 26.10.1 is the
-minimum to use. The 32K and 64K contexts work on it; an 8-hour 32K soak passed on this box.
+mode, DSpark auto): answers 19-21 tokens/s on code (about 18 on agent) and 11 on chat; a 4,000-token prompt 87 tokens/s, 8,000
+tokens 125, 32,000 tokens 177 (setup writes `--prefill-chunk 8192` on this PC: 11-15% faster than the engine's 1,024-token default,
+decode unchanged). The verify window runs synchronously here (setup writes `DS4_ASYNC_T=4` in the config's env; the engine's
+mailbox path is sized for cards that hold most of the experts and costs this box 31% on code - `STRATA_DSV41_ASYNC_T=8` restores
+the default). The tested driver is AMD Adrenalin 26.10.1 (driver 32.0.32015.7029); the 2025-03 driver failed at 32K context, so
+26.10.1 is the minimum to use. The 32K and 64K contexts work on it; an 8-hour 32K soak passed on this box.
 
 121 + 111 + 8 = 239 GB for 1.75; 138 + 111 + 8 = 257 GB for 2.00; 155 + 111 + 8 = 274 GB for 2.25.
 

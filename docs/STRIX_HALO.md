@@ -49,12 +49,20 @@ Measured on the maintainers' box (Ryzen AI Max+ 395, 128 GB unified, Windows 11,
 
 | Workload | Result |
 | --- | --- |
-| Code answer | 15-17 tokens/s |
-| Chat answer | 10-11 tokens/s |
+| Code answer | 19-21 tokens/s |
+| Agent answer | about 18 tokens/s |
+| Chat answer | 11 tokens/s |
 | 4K prompt | about 87 tokens/s |
 | 8K prompt | about 125 tokens/s |
 | 32K prompt | about 177 tokens/s |
 | Stability | 100-request, 1-hour (243 requests) and 8-hour 32K (646 requests) soaks passed on the engine line this package is built from |
+
+The verify window runs synchronously on this PC: setup writes `DS4_ASYNC_T=4` in the config's env (`STRATA_DSV41_ASYNC_T=8`
+restores the engine's default, any other value overrides). The engine's mailbox ("async") path is sized for cards that hold most
+of the experts and is slower here: measured 2026-10-25 (2.00 bpw, greedy, 256 tokens): code 15.87-16.33 → 20.14-21.28 tok/s
+(+31%), agent with the same accepted tokens a round 15.93 → 18.48 (+16%), chat 10.33 → 11.30 (+9%). The same bits come out; only
+the scheduling changes, and the drafter's own single-token windows stay async. The 2.25 set runs without the drafter on this box
+(its experts leave no room for it) and does not change.
 
 Prompts are read in 8,192-token chunks: setup writes `--prefill-chunk 8192` on this PC (STRATA_DSV41_NO_BIG_CHUNK=1 leaves the
 engine's 1,024-token default). Measured 2026-10-25: 4K 78.7 → 87.2, 8K 108.9 → 125.1, 32K 155.2 → 176.9 tok/s; decode unchanged
