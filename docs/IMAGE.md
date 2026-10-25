@@ -114,6 +114,7 @@ The config file's (`xestrata-<model>.json`) `"images"` also has entries to set b
 
 - With several models installed, the model can be chosen; the fields' defaults and which fields there are (steps, transparent background, edits, mask) follow it.
 - Choose the prompt, the size (1024x1024, 1536x1024, 1024x1536, 768x768, 512x512, 1920x1080, 1080x1920, auto, or any size with sides of 256 to 2048) and the seed, and press Generate.
+- The number of images (from 1 up to the config's limit) and the format (PNG, JPEG or WebP; JPEG and WebP with a quality) can be chosen; a transparent background takes no JPEG.
 - A negative prompt (what the image should not have), the steps and the CFG strength can be given too. Left empty, they are the model's defaults (the API's), which the fields show greyed out.
   The steps are not shown for Turbo (fixed at 8). The negative prompt takes effect only with CFG above 1, and a line under it says so when it does not.
 - With Qwen-Image-2.1, a transparent background can be chosen as well.
