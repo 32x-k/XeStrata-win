@@ -383,7 +383,7 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
    - Inco AI と Splash の貢献者による [Splash](https://github.com/incoai/splash)。
    - Neroued による [ninfer](https://github.com/Neroued/ninfer)。
    - syv.ai と HyperQwen の貢献者による [HyperQwen](https://github.com/syv-ai/HyperQwen)。
-   - mw00 と Project Maya の貢献者による [Project Maya](https://github.com/mw00/project-maya)（VRAM にないエキスパートを CPU と PCIe に分ける数の決め方）。
+   - mw00 と Project Maya の貢献者による [Project Maya](https://github.com/mw00/project-maya)（VRAM にないエキスパートを CPU と PCIe に分ける数の決め方、SSD から読むエキスパートを順位で飛ばすやり方）。
    - maxfridbe による [nextsycl](https://github.com/maxfridbe/nextsycl)（Qwen3.5 系のモデルの decode でカーネルをまとめるやり方）。
 - 部品の一覧は [third_party/main/README.md](third_party/main/README.md)、詳しくは [docs/DETAILS.ja.md](docs/DETAILS.ja.md#クレジットとライセンス) にあります。
 

@@ -403,7 +403,8 @@ permission under GPL section 7, what goes in, and how to report).
    - [ninfer](https://github.com/Neroued/ninfer), by Neroued;
    - [HyperQwen](https://github.com/syv-ai/HyperQwen), by syv.ai and the HyperQwen contributors;
    - [Project Maya](https://github.com/mw00/project-maya), by mw00 and the Project Maya contributors (how many of the
-     experts missing from VRAM the CPU computes and how many are read over PCIe);
+     experts missing from VRAM the CPU computes and how many are read over PCIe; skipping the experts read from the
+     SSD by their rank);
    - [nextsycl](https://github.com/maxfridbe/nextsycl), by maxfridbe (which kernels the decode of the Qwen3.5 family's
      models merges).
 - The parts are listed in [third_party/main/README.md](third_party/main/README.md); more in [docs/DETAILS.md](docs/DETAILS.md#credits-and-licenses).
