@@ -151,9 +151,9 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 | `quality` | `auto` | Qwen-Image-2.1 の元のモデルのステップ数: `low` 20、`medium`（`standard`）30、`high`・`hd`・`auto` は既定の 40（`steps` を付けたときはそちら） |
 | `negative_prompt` | なし（Mage-Flow は空白 1 文字） | CFG のネガティブのプロンプト |
 | `true_cfg_scale`、`guidance_scale` | Mage-Flow は設定の値 | CFG の強さ（0〜30、1 なら CFG なし）。Qwen-Image-2.1 は `true_cfg_scale` が 1 より大きく `negative_prompt` があるときだけ掛け（`guidance_scale` は使いません）、Mage-Flow は `true_cfg_scale`、なければ `guidance_scale` |
-| `background` | `auto` | `transparent` で透明な背景（Qwen の推奨する形でプロンプトを包みます。png か webp だけ）、`opaque` でアルファを白の上に重ねて消す。Mage-Flow は `transparent` を断ります |
-| `output_format` | `png` | `png`、`jpeg`、`webp` |
-| `output_compression` | 100 | 0〜100。jpeg と webp の画質 |
+| `background` | `auto` | `transparent` で透明な背景（Qwen の推奨する形でプロンプトを包みます。png、webp、jxl だけ）、`opaque` でアルファを白の上に重ねて消す。Mage-Flow は `transparent` を断ります |
+| `output_format` | `png` | `png`、`jpeg`、`webp`、`jxl`（JPEG XL。libjxl の cjxl があるときだけ） |
+| `output_compression` | 100 | 0〜100。jpeg、webp、jxl の画質（jxl の 100 は可逆） |
 | `response_format` | `b64_json` | `url` なら `/v1/images/files/<名前>` のリンクを返します（新しい 64 枚まで残します） |
 
 Qwen-Image-2.1 の CFG は、diffusers の Qwen-Image-2.1 と同じ式です。条件ありとネガティブの 2 つ分を計算するので、時間は 1024x1024 で約 2 倍、512x512 では約 1.5 倍です。

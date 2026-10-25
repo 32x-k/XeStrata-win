@@ -19,6 +19,9 @@ archs="sm_60;sm_61;sm_70;sm_75;sm_80;sm_86;sm_89;sm_90"
 hip_archs="gfx1030;gfx1031;gfx1035;gfx1036;gfx1100;gfx1101;gfx1102;gfx1103;gfx1150;gfx1151;gfx1200;gfx1201"
 xwin_ver=0.10.0
 python_ver=3.14.8
+# libjxl's Windows tools (the release's static build), for cjxl.exe: the images' JPEG XL
+jxl_ver=v0.12.0
+jxl_sha256=3025d7e308390796d20492322e606bc92decaee7b6bc99d3f7547870ae5db7de
 # oneMKL's Windows headers, import libraries and CMake package (Intel's PyPI wheels; not free software: linked against,
 # never in the 7z), of the version whose DLLs the engine then loads (mkl_sycl_blas.6.dll): setup.py's ONEMKL_SERIES
 mkl_ver=$(sed -n 's/^ONEMKL_SERIES = "\(.*\)"$/\1/p' "$src/setup.py").0
@@ -152,11 +155,16 @@ pyver=$(echo "$python_ver" | cut -d. -f1-2)
 python3 -m pip download -q --only-binary=:all: --platform win_amd64 --python-version "$pyver" --implementation cp \
   -r /build/requirements.txt -d /build/wheels
 
+curl -fsSL -o /build/jxl.zip \
+  "https://github.com/libjxl/libjxl/releases/download/$jxl_ver/jxl-x64-windows-static.zip"
+echo "$jxl_sha256  /build/jxl.zip" | sha256sum -c -
+unzip -q /build/jxl.zip -d "/build/jxl-$jxl_ver"
+
 version=$(sed -n 's/^set(STRATA_UPSTREAM_VERSION "\(.*\)")$/\1/p' "$src/CMakeLists.txt")-$(sed -n \
   's/^set(XESTRATA_REVISION \([0-9]*\))$/\1/p' "$src/CMakeLists.txt")
 python3 "$src/tools/package/windows_bundle.py" --src "$src" --engine /build/engine --sycl "$sycl" \
   --launcher /build/launcher --nuget /cache/nuget --python-zip "/build/python-$python_ver-embed-amd64.zip" \
-  --wheels /build/wheels --llama "$llama" --rocm /build/rocmwin --version "$version" --cuda-archs "$archs" \
+  --wheels /build/wheels --llama "$llama" --jxl "/build/jxl-$jxl_ver/x64-windows-static" --rocm /build/rocmwin --version "$version" --cuda-archs "$archs" \
   --hip-archs "$hip_archs" --mkl-version "$mkl_ver" --out /build/out
 cp /build/out/*.7z /out/
 
@@ -168,6 +176,7 @@ cp /build/out/*.7z /out/
   echo "xwin: $xwin_ver"
   echo "oneMKL (linked against, not carried): $mkl_ver"
   echo "python: $python_ver"
+  echo "libjxl: $jxl_ver"
   echo "dotnet: $(dotnet --version)"
   echo "llama.cpp: $commit"
   echo "jobs: ${XESTRATA_JOBS:-default}"

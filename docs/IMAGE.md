@@ -151,9 +151,9 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 | `quality` | `auto` | The steps of Qwen-Image-2.1's base model: `low` 20, `medium` (`standard`) 30, `high`, `hd` and `auto` the default 40 (`steps`, when given, wins) |
 | `negative_prompt` | none (one space for Mage-Flow) | CFG's negative prompt |
 | `true_cfg_scale`, `guidance_scale` | the config's for Mage-Flow | CFG's strength (0 to 30; 1 is no CFG). Qwen-Image-2.1 applies it only when `true_cfg_scale` is above 1 and there is a `negative_prompt` (it does not use `guidance_scale`); Mage-Flow takes `true_cfg_scale`, else `guidance_scale` |
-| `background` | `auto` | `transparent` makes a transparent background (the prompt wrapped as Qwen recommends; png or webp only); `opaque` flattens the alpha onto white. Mage-Flow refuses `transparent` |
-| `output_format` | `png` | `png`, `jpeg`, `webp` |
-| `output_compression` | 100 | 0 to 100: jpeg's and webp's quality |
+| `background` | `auto` | `transparent` makes a transparent background (the prompt wrapped as Qwen recommends; png, webp or jxl only); `opaque` flattens the alpha onto white. Mage-Flow refuses `transparent` |
+| `output_format` | `png` | `png`, `jpeg`, `webp`, `jxl` (JPEG XL; only with libjxl's cjxl) |
+| `output_compression` | 100 | 0 to 100: jpeg's, webp's and jxl's quality (jxl's 100 is lossless) |
 | `response_format` | `b64_json` | `url` returns a `/v1/images/files/<name>` link (the newest 64 are kept) |
 
 Qwen-Image-2.1's CFG is diffusers' Qwen-Image-2.1 formula. It computes the prompt and the negative prompt both, so an image takes about twice as long at 1024x1024, about 1.5 times at 512x512.

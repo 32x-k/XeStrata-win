@@ -67,6 +67,7 @@ import queue
 import random
 import re
 import secrets
+import shutil
 import struct
 import subprocess
 import sys
@@ -83,9 +84,10 @@ MODEL_NAME = "qwen-image-2.1-turbo"
 POLICIES = ("auto", "keep", "shrink", "unload")
 SIZE_STEP = 16                     # the VAE's 8x and the DiT's 2x2 patches: sides made at a multiple of 16, then cut
 MIN_SIDE = 256
-FILE_NAME = re.compile(r"^[0-9a-f]{32}\.(png|jpeg|webp)$")
-# OpenAI's output_format -> the file's MIME type (Pillow writes jpeg and webp; PNG is png_rgba's)
-FORMATS = {"png": "image/png", "jpeg": "image/jpeg", "webp": "image/webp"}
+FILE_NAME = re.compile(r"^[0-9a-f]{32}\.(png|jpeg|webp|jxl)$")
+# OpenAI's output_format, and JPEG XL beside them -> the file's MIME type (Pillow writes jpeg and webp, libjxl's cjxl
+# jxl; PNG is png_rgba's)
+FORMATS = {"png": "image/png", "jpeg": "image/jpeg", "webp": "image/webp", "jxl": "image/jxl"}
 # Qwen's recommended prompt for a transparent image (its README's "Transparent Image Generation (RGBA)")
 TRANSPARENT_PROMPT = ("This is an RGBA image with transparency. {prompt}. The image has alpha channel and the "
                       "background is transparent.")
@@ -166,15 +168,33 @@ def model_defaults(cfg: dict) -> dict:
         steps, least, fixed = TURBO_STEPS, TURBO_STEPS, True
     edit = int(cfg.get("edit_steps") or steps) if cfg.get("edit_model") else steps
     return {"steps": steps, "edit_steps": edit, "steps_min": least, "steps_max": MAX_STEPS, "steps_fixed": fixed,
-            "max_n": int(cfg.get("max_n") or 4),
+            "max_n": int(cfg.get("max_n") or 4), "formats": output_formats(),
             "guidance": float(cfg.get("cfg_scale") or 1.0) if mage else 1.0,
             "negative_prompt": MF_NEG if mage else None, "transparency": cfg.get("transparency") is not False,
             "mask": cfg.get("mask") is not False}
 
 
+_CJXL: list[str | None] = []
+
+
+def cjxl() -> str | None:
+    """libjxl's encoder, cjxl: the system's (the distributions' libjxl-tools / libjxl-utils), else the one the Windows
+    7z carries beside the engine; None: no JPEG XL."""
+    if not _CJXL:
+        beside = Path(__file__).resolve().parents[1] / "engine" / ("cjxl.exe" if sys.platform == "win32" else "cjxl")
+        _CJXL.append(shutil.which("cjxl") or (str(beside) if beside.is_file() else None))
+    return _CJXL[0]
+
+
+def output_formats() -> list[str]:
+    """The output_formats this server writes: png, jpeg and webp, and jxl where there is a cjxl."""
+    return ["png", "jpeg", "webp"] + (["jxl"] if cjxl() else [])
+
+
 def parse_request(req: dict, cfg: dict) -> dict:
-    """The fields of one /v1/images/generations request, checked.  output_format png, jpeg or webp
-    (output_compression 0-100, the quality jpeg and webp are written at); quality low, medium or high (the base model's
+    """The fields of one /v1/images/generations request, checked.  output_format png, jpeg, webp or jxl (where
+    output_formats has it; output_compression 0-100, the quality jpeg, webp and jxl are written at, jxl's 100
+    lossless); quality low, medium or high (the base model's
     steps, QUALITY_STEPS; an explicit steps wins); background transparent (the prompt in Qwen's form for it, an image
     with alpha; not with jpeg), opaque (alpha flattened on white) or auto.  vLLM-Omni's fields too: num_inference_steps
     (steps by its name), negative_prompt, guidance_scale and true_cfg_scale (CFG_FIELDS).  Unknown fields (style,
@@ -190,8 +210,8 @@ def parse_request(req: dict, cfg: dict) -> dict:
     if fmt not in ("b64_json", "url"):
         raise ImageRequestError("response_format: b64_json or url")
     out_fmt = req.get("output_format") or "png"
-    if out_fmt not in FORMATS:
-        raise ImageRequestError("output_format: png, jpeg or webp")
+    if out_fmt not in output_formats():
+        raise ImageRequestError("output_format: " + ", ".join(output_formats()))
     compression = _int_field(req, "output_compression", 0, 100, 100)
     quality = req.get("quality")
     if quality is not None and quality not in QUALITY_STEPS:
@@ -200,7 +220,7 @@ def parse_request(req: dict, cfg: dict) -> dict:
     if background not in ("auto", "opaque", "transparent"):
         raise ImageRequestError("background: auto, opaque or transparent")
     if background == "transparent" and out_fmt == "jpeg":
-        raise ImageRequestError("background transparent: png or webp (jpeg has no alpha channel)")
+        raise ImageRequestError("background transparent: png, webp or jxl (jpeg has no alpha channel)")
     if background == "transparent" and cfg.get("transparency") is False:
         raise ImageRequestError("background transparent: this image model does not make transparent images")
     w, h = parse_size(req.get("size"), int(cfg.get("max_side") or 2048))
@@ -266,9 +286,12 @@ def model_prompt(job: dict) -> str:
 
 def encode_image(png: bytes, fmt: str, compression: int, opaque: bool = False) -> bytes:
     """A made image (png_rgba's PNG) in OpenAI's output_format: PNG as it is, jpeg (no alpha: on white) and webp at
-    `compression` as their quality (Pillow); `opaque` (background opaque): its alpha flattened on white."""
+    `compression` as their quality (Pillow), jxl at it as its quality, 100 lossless (cjxl); `opaque` (background
+    opaque): its alpha flattened on white."""
     if fmt == "png" and not opaque:
         return png
+    if fmt == "jxl" and not opaque:
+        return encode_jxl(png, compression)
     import io
     from PIL import Image
     im = Image.open(io.BytesIO(png))
@@ -277,8 +300,25 @@ def encode_image(png: bytes, fmt: str, compression: int, opaque: bool = False) -
         bg.paste(im, mask=im.split()[-1])
         im = bg
     out = io.BytesIO()
+    if fmt == "jxl":
+        im.save(out, format="PNG")
+        return encode_jxl(out.getvalue(), compression)
     im.save(out, format=fmt.upper(), **({} if fmt == "png" else {"quality": compression}))
     return out.getvalue()
+
+
+def encode_jxl(png: bytes, quality: int) -> bytes:
+    """A PNG as JPEG XL at `quality` (100: lossless, its alpha kept) by cjxl.  Lossless at effort 3: on an i7-14700 a
+    1024x1024 image in 0.04 s and 5% larger than at cjxl's default 7, which takes 0.87 s; the others at 7 (0.12 s)."""
+    exe = cjxl()
+    if exe is None:
+        raise ImageJobFailed("output_format jxl: this computer has no cjxl (libjxl's tools)")
+    no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0) if sys.platform == "win32" else 0
+    r = subprocess.run([exe, "-", "-", "-q", str(quality), "-e", "3" if quality == 100 else "7", "--quiet"],
+                       input=png, capture_output=True, timeout=300, creationflags=no_window)
+    if r.returncode != 0 or not r.stdout:
+        raise ImageJobFailed(f"cjxl failed: {r.stderr.decode(errors='replace').strip()[-300:]}")
+    return r.stdout
 
 
 def base_sigmas(steps: int, width: int, height: int) -> list[float]:
@@ -1183,7 +1223,7 @@ class ImageModels:
 
 # ------------------------------------------------------------------------------------------- chat's image tools
 OPTION_KEYS = ("size", "quality", "output_format", "output_compression", "background")
-FILE_REF = re.compile(r"/v1/images/files/([0-9a-f]{32}\.(?:png|jpeg|webp))")
+FILE_REF = re.compile(r"/v1/images/files/([0-9a-f]{32}\.(?:png|jpeg|webp|jxl))")
 TOOLS: list[dict[str, Any]] = [
     {"name": "generate_image",
      "description": "Make an image from a description with the image model on this computer. "
@@ -1270,7 +1310,7 @@ class ImageTools:
 
     def _image(self, which: str) -> bytes | None:
         """The image an edit takes: a /v1/images/files/ link (or its file name), else the conversation's last."""
-        m = FILE_REF.search(which or "") or re.fullmatch(r"([0-9a-f]{32}\.(?:png|jpeg|webp))", which or "")
+        m = FILE_REF.search(which or "") or re.fullmatch(r"([0-9a-f]{32}\.(?:png|jpeg|webp|jxl))", which or "")
         if m:
             return self._file(m.group(1))
         if self.made:
