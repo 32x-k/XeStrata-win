@@ -11,6 +11,7 @@
 // floats a row.  The report goes to stderr.
 #include "strata/program/plain_generate.hpp"
 #include "strata/program/option_scope.hpp"
+#include "strata/program/shared_options.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/conversation_memory.hpp"
@@ -637,12 +638,49 @@ int plain_main(int argc, char** argv) {
     std::vector<int32_t> follow;   // --spec-follow: the continuation emitted instead of the picks (benchmarks)
     ConversationCache cache;       // --serve: --conversation-cache-mib and its slots
     double save_min = 10.0;   // --expert-profile-save-every (serve)
+    // the options Qwen3.8-Flash-Next's engine takes with the same meaning, parsed by the same code
+    const std::string who = "strata (" + arch + ")";
+    strata::program::SharedOptionFields shared;
+    shared.who = who.c_str();
+    shared.adapt_every = &opt.adapt_every;
+    shared.adapt_swaps = &opt.adapt_swaps;
+    shared.adapt_min_gain = &opt.adapt_min_gain;
+    shared.adapt_decay = &opt.adapt_decay;
+    shared.expert_profile = &opt.profile;
+    shared.expert_profile_save = &profile_save;
+    shared.expert_profile_save_min = &save_min;
+    shared.max_context = &opt.max_cells;
+    shared.max_new = &n_new;
+    shared.temperature = &sp.temperature;
+    shared.top_k = &sp.top_k;
+    shared.top_p = &sp.top_p;
+    shared.seed = &sp.seed;
+    shared.greedy = &sp.greedy;
+    shared.spec = &opt.spec;
+    shared.spec_window = &opt.spec_window;
+    shared.spec_window_all = true;
+    shared.spec_min_p = &opt.spec_min_p;
+    shared.mmap_experts = &opt.mmap_experts;
+    shared.vram_free_mib = &opt.vram_free_mib;
+    shared.vram_elastic = &opt.vram_elastic;
+    shared.vram_segment_mib = &opt.vram_segment_mib;
+    shared.pool_workers = &opt.pool_workers;
+    shared.prefill_cpu_share = true;
+    shared.rope_scaling = &opt.rope_scaling;
+    shared.rope_scale = &opt.rope_scale;
+    shared.rope_freq_base = &opt.rope_freq_base;
+    shared.rope_freq_scale = &opt.rope_freq_scale;
+    shared.yarn_orig_ctx = &opt.yarn_orig_ctx;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
             if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", what); std::exit(2); }
             return argv[++i];
         };
+        if (const int r = strata::program::parse_shared_option(a, next, shared); r != 0) {
+            if (r < 0) return 2;
+            continue;
+        }
         if (a == "--native") (void) next("--native");
         else if (a == "--tokens") {
             if (!parse_ids(next("--tokens"), prompt)) { std::fprintf(stderr, "--tokens: a list of token ids\n"); return 2; }
@@ -653,30 +691,14 @@ int plain_main(int argc, char** argv) {
             if (!parse_ids(text, prompt)) { std::fprintf(stderr, "--tokens-file: a list of token ids\n"); return 2; }
         }
         else if (a == "--help" || a == "-h") { plain_usage(arch); return 0; }
-        else if (a == "--max-new") n_new = std::strtoll(next("--max-new"), nullptr, 10);
         else if (a == "--serve") serve = true;
         else if (a == "--greedy") sp.greedy = true;
-        else if (a == "--seed") { sp.seed = std::strtoull(next("--seed"), nullptr, 10); sp.greedy = false; }
-        else if (a == "--top-k") sp.top_k = (int) std::strtol(next("--top-k"), nullptr, 10);
-        else if (a == "--top-p") sp.top_p = std::strtof(next("--top-p"), nullptr);
-        else if (a == "--temperature") sp.temperature = std::strtof(next("--temperature"), nullptr);
         else if (a == "--stop-eos") stop_eos = true;
         else if (a == "--eos-ids") {
             if (!parse_ids(next("--eos-ids"), eos)) { std::fprintf(stderr, "--eos-ids: a list of token ids\n"); return 2; }
             stop_eos = true;
         }
-        else if (a == "--max-context") opt.max_cells = std::strtoll(next("--max-context"), nullptr, 10);
         else if (a == "--max-t") opt.max_t = (int) std::strtol(next("--max-t"), nullptr, 10);
-        else if (a == "--spec") opt.spec = (int) std::strtol(next("--spec"), nullptr, 10);
-        else if (a == "--spec-window") {
-            opt.spec_window = next("--spec-window");
-            if (opt.spec_window != "auto" && opt.spec_window != "all" && opt.spec_window != "min-p") {
-                std::fprintf(stderr, "strata (%s): --spec-window takes auto, all or min-p\n", arch.c_str());
-                return 2;
-            }
-        }
-        else if (a == "--spec-min-p") opt.spec_min_p = std::clamp(std::strtod(next("--spec-min-p"), nullptr), 0.0, 1.0);
-        else if (a == "--pool-workers") opt.pool_workers = (int) std::strtol(next("--pool-workers"), nullptr, 10);
         else if (a == "--dump-logits") dump_path = next("--dump-logits");
         else if (a == "--dump-routing") opt.dump_routing = next("--dump-routing");
         else if (a == "--conversation-cache-mib")
@@ -691,19 +713,12 @@ int plain_main(int argc, char** argv) {
             const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
             if (!parse_ids(text, follow)) { std::fprintf(stderr, "--spec-follow: a list of token ids\n"); return 2; }
         }
-        else if (a == "--adapt-every") opt.adapt_every = (int) std::strtol(next("--adapt-every"), nullptr, 10);
-        else if (a == "--adapt-swaps") opt.adapt_swaps = (int) std::strtol(next("--adapt-swaps"), nullptr, 10);
         else if (a == "--adapt-mib-per-token")
             opt.adapt_mib_per_token = (int) std::strtol(next("--adapt-mib-per-token"), nullptr, 10);
         else if (a == "--gpu") (void) next("--gpu");
-        else if (a == "--mmap-experts") opt.mmap_experts = true;
         else if (a == "--no-pcie-split") opt.pcie_split = false;
-        else if (a == "--expert-profile") opt.profile = next("--expert-profile");
         else if (a == "--draft-vocab") opt.draft_vocab = next("--draft-vocab");
         else if (a == "--prompt-chunk") opt.prompt_chunk = std::strtoll(next("--prompt-chunk"), nullptr, 10);
-        else if (a == "--rope-scaling") opt.rope_scaling = next("--rope-scaling");
-        else if (a == "--rope-scale") opt.rope_scale = std::strtod(next("--rope-scale"), nullptr);
-        else if (a == "--yarn-orig-ctx") opt.yarn_orig_ctx = std::strtod(next("--yarn-orig-ctx"), nullptr);
         else if (a == "--layer-split") {
             const std::string v = next("--layer-split");
             opt.split_auto = v == "auto";
@@ -748,13 +763,10 @@ int plain_main(int argc, char** argv) {
         else if (a == "--split-order") (void) next("--split-order");   // the stages take the GPUs as given
         else if (a == "--vram-reserve-mib")
             opt.reserve_mib = std::max<int64_t>(0, std::strtoll(next("--vram-reserve-mib"), nullptr, 10));
-        else if (a == "--vram-free-mib")
-            opt.vram_free_mib = std::max<int64_t>(0, std::strtoll(next("--vram-free-mib"), nullptr, 10));
         else if (a == "--expert-cache") {
             const std::string v = next("--expert-cache");
             opt.expert_slots = v == "auto" ? -1 : std::max<int64_t>(0, std::strtoll(v.c_str(), nullptr, 10));
         }
-        else if (a == "--adapt-decay") opt.adapt_decay = std::strtof(next("--adapt-decay"), nullptr);
         else if (a == "--kv-ram") {
             const std::string v = next("--kv-ram");
             if (v != "on" && v != "off") {
@@ -772,18 +784,6 @@ int plain_main(int argc, char** argv) {
             }
             opt.kv_int8 = v == "int8";
         }
-        else if (a == "--prefill-cpu-share") {
-            const std::string v = next("--prefill-cpu-share");
-            strata::prefill::set_cpu_share(v == "auto" ? -1.0 : std::max(0.0, std::strtod(v.c_str(), nullptr)));
-        }
-        else if (a == "--vram-elastic") opt.vram_elastic = true;
-        else if (a == "--vram-segment-mib")
-            opt.vram_segment_mib = std::strtoll(next("--vram-segment-mib"), nullptr, 10);
-        else if (a == "--adapt-min-gain") opt.adapt_min_gain = std::strtof(next("--adapt-min-gain"), nullptr);
-        else if (a == "--rope-freq-base") opt.rope_freq_base = std::strtod(next("--rope-freq-base"), nullptr);
-        else if (a == "--rope-freq-scale") opt.rope_freq_scale = std::strtod(next("--rope-freq-scale"), nullptr);
-        else if (a == "--expert-profile-save") profile_save = next("--expert-profile-save");
-        else if (a == "--expert-profile-save-every") save_min = std::strtod(next("--expert-profile-save-every"), nullptr);
         else {
             switch (option_scope(a)) {
                 case OptionScope::qwen38_only:

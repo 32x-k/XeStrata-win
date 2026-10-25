@@ -21,6 +21,7 @@
 #include "strata/core/device.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_tier.hpp"
+#include "strata/program/shared_options.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_disk.hpp"
 #include "strata/core/conversation_file.hpp"
@@ -2376,12 +2377,49 @@ int main(int argc, char** argv) {
     Options o;
     bool have_tokens = false;
     bool have_logits_stride = false;
+    // the options the other models' engine (plain_generate.cpp) takes with the same meaning, parsed by the same code
+    strata::program::SharedOptionFields shared;
+    shared.who = "strata generate";
+    shared.adapt_every = &o.adapt_every;
+    shared.adapt_every_given = &o.adapt_every_given;
+    shared.adapt_swaps = &o.adapt_swaps;
+    shared.adapt_min_gain = &o.adapt_min_gain;
+    shared.adapt_decay = &o.adapt_decay;
+    shared.expert_profile = &o.expert_profile;
+    shared.expert_profile_save = &o.expert_profile_save;
+    shared.expert_profile_save_min = &o.expert_profile_save_min;
+    shared.max_context = &o.max_context;
+    shared.max_new = &o.max_new;
+    shared.temperature = &o.temperature;
+    shared.top_k = &o.top_k;
+    shared.top_p = &o.top_p;
+    shared.seed = &o.seed;
+    shared.greedy = &o.greedy;
+    shared.spec = &o.spec;
+    shared.spec_window = &o.spec_window;
+    shared.spec_window_given = &o.spec_window_given;
+    shared.spec_min_p = &o.spec_min_p;
+    shared.mmap_experts = &o.mmap_experts;
+    shared.vram_free_mib = &o.vram_free_mib;
+    shared.vram_elastic = &o.vram_elastic;
+    shared.vram_segment_mib = &o.vram_segment_mib;
+    shared.pool_workers = &o.pool_workers;
+    shared.prefill_cpu_share = true;
+    shared.rope_scaling = &o.rope_scaling;
+    shared.rope_scale = &o.rope_scale;
+    shared.rope_freq_base = &o.rope_freq_base;
+    shared.rope_freq_scale = &o.rope_freq_scale;
+    shared.yarn_orig_ctx = &o.yarn_orig_ctx;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
             if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", what); std::exit(2); }
             return argv[++i];
         };
+        if (const int r = strata::program::parse_shared_option(a, next, shared); r != 0) {
+            if (r < 0) return 2;
+            continue;
+        }
         if (a == "--help" || a == "-h") { usage(); return 0; }
         else if (a == "--pack") o.pack = next("--pack");
         else if (a == "--tokens") {
@@ -2402,22 +2440,11 @@ int main(int argc, char** argv) {
             }
             have_tokens = true;
         }
-        else if (a == "--max-new") o.max_new = std::strtoll(next("--max-new"), nullptr, 10);
-        else if (a == "--max-context") o.max_context = std::strtoll(next("--max-context"), nullptr, 10);
-        else if (a == "--rope-scaling") o.rope_scaling = next("--rope-scaling");
-        else if (a == "--rope-scale") o.rope_scale = std::strtod(next("--rope-scale"), nullptr);
-        else if (a == "--rope-freq-base") o.rope_freq_base = std::strtod(next("--rope-freq-base"), nullptr);
-        else if (a == "--rope-freq-scale") o.rope_freq_scale = std::strtod(next("--rope-freq-scale"), nullptr);
-        else if (a == "--yarn-orig-ctx") o.yarn_orig_ctx = std::strtod(next("--yarn-orig-ctx"), nullptr);
         else if (a == "--yarn-ext-factor") o.yarn_ext_factor = std::strtod(next("--yarn-ext-factor"), nullptr);
         else if (a == "--yarn-attn-factor") o.yarn_attn_factor = std::strtod(next("--yarn-attn-factor"), nullptr);
         else if (a == "--yarn-beta-fast") o.yarn_beta_fast = std::strtod(next("--yarn-beta-fast"), nullptr);
         else if (a == "--yarn-beta-slow") o.yarn_beta_slow = std::strtod(next("--yarn-beta-slow"), nullptr);
         else if (a == "--greedy") o.greedy = true;
-        else if (a == "--seed") { o.seed = (uint64_t) std::strtoll(next("--seed"), nullptr, 10); o.greedy = false; }
-        else if (a == "--top-k") o.top_k = (int) std::strtol(next("--top-k"), nullptr, 10);
-        else if (a == "--top-p") o.top_p = (float) std::strtod(next("--top-p"), nullptr);
-        else if (a == "--temperature") o.temperature = (float) std::strtod(next("--temperature"), nullptr);
         else if (a == "--dump-logits") o.dump_logits = next("--dump-logits");
         else if (a == "--logits-stride") {
             if (have_logits_stride) { std::fprintf(stderr, "--logits-stride must be supplied only once\n"); return 2; }
@@ -2468,7 +2495,6 @@ int main(int argc, char** argv) {
         else if (a == "--stage-timing") o.stage_timing = true;
         else if (a == "--graph-only") o.graph_only = true;
         else if (a == "--gpu-only-full") o.gpu_only_full = true;
-        else if (a == "--pool-workers") o.pool_workers = (int) std::strtol(next("--pool-workers"), nullptr, 10);
         else if (a == "--pool-cores") o.pool_cores = next("--pool-cores");
         else if (a == "--aux-cpus") {
             o.aux_cpus = next("--aux-cpus");
@@ -2499,9 +2525,6 @@ int main(int argc, char** argv) {
         else if (a == "--expert-cache-device3") o.expert_cache_remote[2] = (int) std::strtol(next("--expert-cache-device3"), nullptr, 10);
         else if (a == "--expert-cache-remote-placement")
             o.expert_cache_remote_placement = next("--expert-cache-remote-placement");
-        else if (a == "--vram-elastic") o.vram_elastic = true;
-        else if (a == "--vram-segment-mib") o.vram_segment_mib = std::strtoll(next("--vram-segment-mib"), nullptr, 10);
-        else if (a == "--vram-free-mib") o.vram_free_mib = std::max<int64_t>(0, std::strtoll(next("--vram-free-mib"), nullptr, 10));
         else if (a == "--vram-reserve-mib") {
             o.vram_reserve_mib = (int) std::strtol(next("--vram-reserve-mib"), nullptr, 10);
             o.vram_reserve_given = true;
@@ -2517,12 +2540,7 @@ int main(int argc, char** argv) {
         else if (a == "--no-prefill-borrow") o.no_prefill_borrow = true;
         else if (a == "--prefill-until") o.prefill_until = std::strtoll(next("--prefill-until"), nullptr, 10);
         else if (a == "--prefill-experts") o.prefill_experts = (int) std::strtol(next("--prefill-experts"), nullptr, 10);
-        else if (a == "--prefill-cpu-share") {
-            const std::string v = next("--prefill-cpu-share");
-            strata::prefill::set_cpu_share(v == "auto" ? -1.0 : std::max(0.0, std::strtod(v.c_str(), nullptr)));
-        }
         else if (a == "--dump-final-r") o.dump_final_r = next("--dump-final-r");
-        else if (a == "--spec") o.spec = (int) std::strtol(next("--spec"), nullptr, 10);
         else if (a == "--batch" || a == "--slots") o.batch = (int) std::strtol(next(a.c_str()), nullptr, 10);
         else if (a == "--batch-groups") {
             const char* bgv = next(a.c_str());
@@ -2549,22 +2567,7 @@ int main(int argc, char** argv) {
         else if (a == "--mtp") o.mtp = next("--mtp");
         else if (a == "--mtp-window") o.mtp_window = std::strtoll(next("--mtp-window"), nullptr, 10);
         else if (a == "--pcie-frac") o.pcie_frac = std::strtod(next("--pcie-frac"), nullptr);
-        else if (a == "--adapt-every") {
-            o.adapt_every = (int) std::strtol(next("--adapt-every"), nullptr, 10);
-            o.adapt_every_given = true;
-        }
-        else if (a == "--adapt-decay") o.adapt_decay = std::strtof(next("--adapt-decay"), nullptr);
-        else if (a == "--adapt-min-gain") o.adapt_min_gain = std::strtof(next("--adapt-min-gain"), nullptr);
         else if (a == "--adapt-async") o.adapt_async = std::strtol(next("--adapt-async"), nullptr, 10) != 0 ? 1 : 0;
-        else if (a == "--spec-min-p") o.spec_min_p = std::strtod(next("--spec-min-p"), nullptr);
-        else if (a == "--spec-window") {
-            o.spec_window = next("--spec-window");
-            o.spec_window_given = true;
-            if (o.spec_window != "auto" && o.spec_window != "min-p") {
-                std::fprintf(stderr, "strata generate: --spec-window takes auto or min-p, not %s\n", o.spec_window.c_str());
-                return 2;
-            }
-        }
         else if (a == "--stop-eos") o.stop_eos = true;
         else if (a == "--spec-split") o.spec_split = true;
         else if (a == "--layer-split") o.layer_split = next("--layer-split");
@@ -2667,20 +2670,14 @@ int main(int argc, char** argv) {
             if (!parse_i64_list(next("--eos-ids"), o.eos_ids, e)) { std::fprintf(stderr, "--eos-ids: %s\n", e.c_str()); return 2; }
             o.stop_eos = true;
         }
-        else if (a == "--adapt-swaps") o.adapt_swaps = (int) std::strtol(next("--adapt-swaps"), nullptr, 10);
         else if (a == "--expert-cache-cpu-order") o.expert_cache_cpu_order = true;
         else if (a == "--expert-cache-per-layer") o.expert_cache_per_layer = true;
         else if (a == "--no-hit-poke") o.no_hit_poke = true;
-        else if (a == "--expert-profile") o.expert_profile = next("--expert-profile");
-        else if (a == "--expert-profile-save") o.expert_profile_save = next("--expert-profile-save");
-        else if (a == "--expert-profile-save-every")
-            o.expert_profile_save_min = std::strtod(next("--expert-profile-save-every"), nullptr);
         else if (a == "--gpu-stages") o.gpu_stages = true;
         else if (a == "--coupled-draft") o.coupled_draft = true;
         else if (a == "--no-coupled-draft") o.coupled_draft = false;
         else if (a == "--shared-expert-arena") o.shared_expert_arena = next("--shared-expert-arena");
         else if (a == "--resident-cpu-experts") { o.mmap_experts = o.resident_cpu_experts = true; o.resident_gib = -1; }
-        else if (a == "--mmap-experts") o.mmap_experts = true;
         else if (a == "--resident-experts") { o.mmap_experts = o.resident_pin = true; o.resident_gib = -1; }
         else if (a == "--resident-budget-gib") {
             o.mmap_experts = o.resident_pin = true;
