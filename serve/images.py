@@ -35,8 +35,11 @@ size is the bucket's, and "strata" names the size asked for (requested_size) whe
 token, not two passes: guidance_scale (true_cfg_scale as its other name), default the config's "guidance" 2.5, and a
 negative prompt has nothing to steer (model_defaults says so with guidance_token, so the web page and the estimate
 treat a guided step as one).  Its steps are the config's (the Distil model's 8) on the model's own schedule - the
-engine builds the sigmas (shift 3.0) from the count, so none are sent.  Its edits are not built yet (the VAE's
-encoder), and masks and transparent images it has none of.  Its weights are under the Tencent Hunyuan Community
+engine builds the sigmas (shift 3.0) from the count, so none are sent.  Its edits take up to the config's
+"max_refs" (3) reference images, each a block of its own in the sequence before the prompt (hunyuanimage3_ids: the
+image's VAE latent at the bucket nearest its shape and its 1024 SigLIP2 slots, which the engine fills), and need the
+model's vision file ("vision": the bf16 shard with vision_model.*, which setup downloads); masks and transparent
+images it has none of.  Its weights are under the Tencent Hunyuan Community
 License Agreement, which does not apply in the European Union, the United Kingdom or South Korea:
 https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE
 
@@ -66,9 +69,10 @@ The config's "images" section (written by setup --images, tools/image/qimage.py)
                      "ram_left_gb": 14.0}}
 HunyuanImage 3.0's instead: {"model_name": "hunyuan-image-3-distil", "family": "hunyuan-image-3", "exe",
 "quant": "w4a8"|"int8", "diffusion_model", "vae", "tokenizer": ".../tokenizer.json" (the model's own, read as a
-byte-level BPE: tools/strata_tokenizer.py's Tokenizer.from_hf), "system_prompt": ".../en_unified.txt", "steps": 8,
-"guidance": 2.5, "schedule": "hunyuanimage3", "resolutions": {"base_size": 1024, "step": 64, "align": 16,
-"extra_resolutions": [...]}, "mask": false, "transparency": false} - no "llm" (no text encoder), no "vision".
+byte-level BPE: tools/strata_tokenizer.py's Tokenizer.from_hf), "system_prompt": ".../en_unified.txt",
+"vision": ".../model-0032-of-0032.safetensors" (SigLIP2, for the edits), "max_refs": 3, "steps": 8, "guidance": 2.5,
+"schedule": "hunyuanimage3", "resolutions": {"base_size": 1024, "step": 64, "align": 16, "extra_resolutions":
+[...]}, "mask": false, "transparency": false} - no "llm" (no text encoder).
   max_n: the most images one request makes; budget_s: the longest one request's images may take, by the speed this
   server measured (ImageGen.estimate_s; until it has made an image, at most UNMEASURED_N); schedule: Turbo's own
   sigmas or the base model's (base_sigmas; no "schedule" is Turbo), Mage-Flow's static shift (mage_sigmas),
@@ -144,6 +148,9 @@ MF_SHIFT = 6.0                     # Mage-Flow's static time shift
 MF_NEG = " "                       # its pipeline's negative prompt when none is given
 HUNYUANIMAGE3_STEPS = 8            # HunyuanImage 3.0 Instruct-Distil's own (its generation_config's diff_infer_steps)
 HUNYUANIMAGE3_GUIDANCE = 2.5       # its guidance token's default (diff_guidance_scale)
+HUNYUANIMAGE3_MAX_REFS = 3         # its edits' reference images at most (each about 5,000 tokens at 1024x1024)
+HUNYUANIMAGE3_VIT_PATCH = 16       # SigLIP2's patch, and the slots a reference's features take (its processor's)
+HUNYUANIMAGE3_VIT_SLOTS = 1024
 # an edit's reference image in the prompt: one pad, which the engine widens to the image's tokens
 REF_PROMPT = "{sep}<image{i}><|vision_start|><|image_pad|><|vision_end|>"
 REF_MAX_BYTES = 32 << 20
@@ -456,15 +463,14 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
     changes, the rest kept as it is (the engine's inpainting), as job["mask"]; refused by a model whose config says
     "mask": false."""
     mage = cfg.get("family") == "mage-flow"
-    if cfg.get("family") == "hunyuan-image-3":
-        raise ImageRequestError("edits: HunyuanImage 3.0 makes an image from a prompt (its VAE's encoder is not built "
-                                "yet)")
+    hunyuan = cfg.get("family") == "hunyuan-image-3"
     if not cfg.get("vision") or (mage and not cfg.get("edit_model")):
-        raise ImageRequestError("edits need the vision encoder" + (" and the edit model" if mage else "") +
+        raise ImageRequestError("edits need the vision " + ("model's file" if hunyuan else "encoder") +
+                                (" and the edit model" if mage else "") +
                                 f": run setup with --images {setup_choice(cfg)} again")
     if not images:
         raise ImageRequestError("image: one reference image or more")
-    max_refs = int(cfg.get("max_refs") or (MF_MAX_REFS if mage else MAX_REFS))
+    max_refs = int(cfg.get("max_refs") or (MF_MAX_REFS if mage else HUNYUANIMAGE3_MAX_REFS if hunyuan else MAX_REFS))
     if len(images) > max_refs:
         raise ImageRequestError(f"image: at most {max_refs} reference images")
     dims = []
@@ -527,14 +533,17 @@ def ref_size(ref_w: int, ref_h: int) -> tuple[int, int]:
 def usage(job: dict) -> dict:
     """OpenAI's usage of an image job, in the image engine's tokens: the prompt's ids (the model's chat form) and the
     reference images' DiT tokens in, the made images' DiT tokens out (a token a 16 x 16 pixel square).  HunyuanImage
-    3.0's ids carry the image block itself, so its share is taken out of the text."""
+    3.0's ids carry the image block and the reference images' blocks themselves, so their shares are taken out of the
+    text (a reference's: its VAE grid and its 1024 SigLIP2 slots)."""
     mw, mh = made_size(job)
     text = len(job.get("ids") or ())
-    sizes = (ref_size(*image_dims(r)) for r in job.get("refs") or ())
-    refs = sum((w // SIZE_STEP) * (h // SIZE_STEP) for w, h in sizes)
     block = (mw // SIZE_STEP) * (mh // SIZE_STEP)
     if job.get("bucket") is not None:
-        text -= block
+        refs = sum(b["tokens_h"] * b["tokens_w"] + HUNYUANIMAGE3_VIT_SLOTS for b in job.get("ref_buckets") or ())
+        text -= block + refs
+    else:
+        sizes = (ref_size(*image_dims(r)) for r in job.get("refs") or ())
+        refs = sum((w // SIZE_STEP) * (h // SIZE_STEP) for w, h in sizes)
     out = job["n"] * block
     return {"input_tokens": text + refs, "output_tokens": out, "total_tokens": text + refs + out,
             "input_tokens_details": {"text_tokens": text, "image_tokens": refs}}
@@ -591,15 +600,19 @@ def hunyuanimage3_bucket(cfg: dict, width: int, height: int) -> dict:
     return min(hunyuanimage3_buckets(cfg), key=lambda b: abs(b["ratio"] - height / width))
 
 
-def hunyuanimage3_ids(tok, prompt: str, bucket: dict, base_size: int = 1024, system: str | None = None) -> list[int]:
+def hunyuanimage3_ids(tok, prompt: str, bucket: dict, base_size: int = 1024, system: str | None = None,
+                      refs: list[dict] | None = None) -> list[int]:
     """HunyuanImage 3.0's sequence for an image of `bucket` (hunyuanimage3_bucket), as its tokenizer's "instruct"
     template writes it: <|startoftext|>, the system prompt (`system`, the model's en_unified text) and a blank line,
-    "User: " and the prompt, a blank line, "Assistant: ", <answer>, <boi>, <img_size_base_size>,
-    <img_ratio_ratio_index>, the three a step writes over (<timestep>, <guidance>, <timestep_r>), the block's <img>
-    tokens, <eoi>, </answer> and a blank line (which the engine's hunyuanimage3_trim drops with the rest after <eoi>).
-    `system` None leaves the system turn out, as the CPU golden's batch_system_prompt=[None] did.  Every section is
-    encoded on its own - as one string the pieces merge across the boundaries, and the reference encodes each section
-    too - and the prompt plain, so a special token spelled in it stays text."""
+    "User: ", an edit's reference images (`refs`: each one's bucket, hunyuanimage3_bucket of its shape - its block
+    <boi>, <img_size_base_size>, <img_ratio_i>, <timestep>, its VAE grid's <img> tokens, <joint_img_sep>, its 1024
+    SigLIP2 slots' <img> tokens, <eoi>; the reference's `cond_joint_image` before the prompt), the prompt, a blank
+    line, "Assistant: ", <answer>, <boi>, <img_size_base_size>, <img_ratio_ratio_index>, the three a step writes over
+    (<timestep>, <guidance>, <timestep_r>), the block's <img> tokens, <eoi>, </answer> and a blank line (which the
+    engine's hunyuanimage3_trim drops with the rest after <eoi>).  `system` None leaves the system turn out, as the
+    CPU golden's batch_system_prompt=[None] did.  Every section is encoded on its own - as one string the pieces
+    merge across the boundaries, and the reference encodes each section too - and the prompt plain, so a special
+    token spelled in it stays text."""
     def marker(name: str) -> int:
         i = tok.special_ids.get(name)
         if i is None:
@@ -609,7 +622,13 @@ def hunyuanimage3_ids(tok, prompt: str, bucket: dict, base_size: int = 1024, sys
     ids = [marker("<|startoftext|>")]
     if system is not None:
         ids += tok.encode(system, parse_special=False) + tok.encode("\n\n", parse_special=False)
-    for text in ("User: ", prompt, "\n\n", "Assistant: "):
+    ids += tok.encode("User: ", parse_special=False)
+    for b in refs or ():
+        ids += [marker("<boi>"), marker(f"<img_size_{int(base_size)}>"), marker(f"<img_ratio_{int(b['ratio_index'])}>"),
+                marker("<timestep>")]
+        ids += [marker("<img>")] * (int(b["tokens_h"]) * int(b["tokens_w"]))
+        ids += [marker("<joint_img_sep>")] + [marker("<img>")] * HUNYUANIMAGE3_VIT_SLOTS + [marker("<eoi>")]
+    for text in (prompt, "\n\n", "Assistant: "):
         ids += tok.encode(text, parse_special=False)
     ids += [marker("<answer>"), marker("<boi>"), marker(f"<img_size_{int(base_size)}>"),
             marker(f"<img_ratio_{int(bucket['ratio_index'])}>"), marker("<timestep>"), marker("<guidance>"),
@@ -643,9 +662,8 @@ def load_tokenizer(path: str, family: str = "qwen-image"):
 
 def can_edit(cfg: dict) -> bool:
     """Whether the image model of the config section `cfg` edits (takes reference images): Qwen-Image-2.1's and
-    Mage-Flow's with their vision encoder (and Mage-Flow's edit model); MageTrail and HunyuanImage 3.0 do not."""
-    if cfg.get("family") == "hunyuan-image-3":
-        return False
+    Mage-Flow's with their vision encoder (and Mage-Flow's edit model), HunyuanImage 3.0's with its vision model's
+    file; MageTrail does not."""
     return bool(cfg.get("vision")) and not (cfg.get("family") == "mage-flow" and not cfg.get("edit_model"))
 
 
@@ -1077,7 +1095,8 @@ class ImageGen:
         """The config keys that name this model's files: HunyuanImage 3.0's tokenizer and system prompt stand where the
         others' text encoder does."""
         if self.family == "hunyuan-image-3":
-            return ("exe", "diffusion_model", "vae", "tokenizer", "system_prompt")
+            return ("exe", "diffusion_model", "vae", "tokenizer", "system_prompt") + \
+                (("vision",) if self.cfg.get("vision") else ())
         return ("exe", "diffusion_model", "vae", "llm") + (("vision",) if self.cfg.get("vision") else ())
 
     def missing(self) -> list[str]:
@@ -1132,10 +1151,12 @@ class ImageGen:
         if self.tok is None:
             self.tok = load_tokenizer(self._tokenizer_path(), self.family)
         if "ids" not in job:
-            if self.family == "hunyuan-image-3":   # the DiT reads the whole sequence, the image block in it
+            if self.family == "hunyuan-image-3":   # the DiT reads the whole sequence, the image blocks in it
                 bucket = job.get("bucket") or hunyuanimage3_bucket(self.cfg, job["width"], job["height"])
+                # a reference image's block names the bucket nearest its shape: the engine reads it at that size
+                job["ref_buckets"] = [hunyuanimage3_bucket(self.cfg, *image_dims(r)) for r in job.get("refs") or ()]
                 job["ids"] = hunyuanimage3_ids(self.tok, model_prompt(job), bucket, self._base_size(),
-                                               self.system_text())
+                                               self.system_text(), job["ref_buckets"])
             else:
                 job["ids"] = prompt_ids(self.tok, model_prompt(job), len(job.get("refs") or ()), self.family)
                 if job.get("cfg"):   # guidance's negative prompt, in the same form (its pads as the prompt's)

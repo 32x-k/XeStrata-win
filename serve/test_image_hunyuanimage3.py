@@ -28,7 +28,8 @@ def cfg(**kw) -> dict:
     """A run config's "images" section as setup --images writes HunyuanImage 3.0's (tools/image/qimage.py)."""
     out = {"model_name": "hunyuan-image-3-distil", "family": "hunyuan-image-3", "exe": "strata-image",
            "quant": "w4a8", "diffusion_model": "dit.safetensors", "vae": "vae.safetensors",
-           "tokenizer": "tokenizer.json", "system_prompt": "en_unified.txt", "steps": 8, "guidance": 2.5,
+           "tokenizer": "tokenizer.json", "system_prompt": "en_unified.txt", "vision": "shard.safetensors",
+           "max_refs": 3, "steps": 8, "guidance": 2.5,
            "schedule": "hunyuanimage3", "mask": False, "transparency": False, "resolutions": RESOLUTIONS,
            "gpu_policy": "auto", "uma": False, "ssd_offload": False}
     out.update(kw)
@@ -40,7 +41,8 @@ class FakeTokenizer:
     encoded on its own (recorded, so the test can say which sections it asked for), one id a character."""
 
     NAMES = ("<|startoftext|>", "<answer>", "<boi>", "<img_size_1024>", "<img_size_256>", "<img_ratio_16>",
-             "<timestep>", "<guidance>", "<timestep_r>", "<img>", "<eoi>", "</answer>")
+             "<img_ratio_36>", "<timestep>", "<guidance>", "<timestep_r>", "<img>", "<eoi>", "</answer>",
+             "<joint_img_sep>")
 
     def __init__(self):
         self.special_ids = {name: 900 + i for i, name in enumerate(self.NAMES)}
@@ -126,11 +128,17 @@ class Requests(unittest.TestCase):
         self.assertEqual(usage["output_tokens"], 80 * 45)
         self.assertEqual(usage["input_tokens"], 10, "the block is the output's, not the prompt's")
 
-    def test_a_transparent_image_and_an_edit_are_refused(self):
+    def test_a_transparent_image_is_refused_and_an_edit_takes_the_vision_file(self):
         with self.assertRaises(images.ImageRequestError):
             images.parse_request({"prompt": "a cube", "background": "transparent"}, cfg())
+        png = b"\x89PNG\r\n\x1a\n" + bytes(8) + (1920).to_bytes(4, "big") + (1080).to_bytes(4, "big") + bytes(40)
         with self.assertRaises(images.ImageRequestError):
-            images.parse_edit_request({"prompt": "a cube"}, [b"\x89PNG\r\n\x1a\n" + bytes(64)], cfg())
+            images.parse_edit_request({"prompt": "a cube"}, [png], cfg(vision=None))
+        job = images.parse_edit_request({"prompt": "a cube"}, [png], cfg())
+        self.assertEqual((job["width"], job["height"]), (1280, 720),
+                         "size auto: the first reference's shape, at its bucket")
+        with self.assertRaises(images.ImageRequestError):
+            images.parse_edit_request({"prompt": "a cube"}, [png] * 4, cfg())
 
     def test_the_other_two_models_are_as_they_were(self):
         qwen = {"exe": "strata-image", "diffusion_model": "dit.gguf", "vae": "vae.safetensors", "llm": "text.gguf",
@@ -172,6 +180,22 @@ class Sequence(unittest.TestCase):
         self.assertIn(tok.special_ids["<img_size_1024>"], ids)
         self.assertNotIn(tok.special_ids["<img_size_256>"], ids)
 
+    def test_a_reference_image_stands_before_the_prompt(self):
+        """An edit's reference: its block after "User: " and before the prompt, its VAE grid then 1024 slots."""
+        tok = FakeTokenizer()
+        ref = {"ratio_index": 36, "height": 720, "width": 1280, "tokens_h": 45, "tokens_w": 80, "ratio": 720 / 1280}
+        ids = images.hunyuanimage3_ids(tok, "ab", self.BUCKET, 1024, None, [ref])
+        s = tok.special_ids
+        self.assertEqual(ids[:2], [s["<|startoftext|>"], 6])
+        self.assertEqual(ids[2:6], [s["<boi>"], s["<img_size_1024>"], s["<img_ratio_36>"], s["<timestep>"]])
+        self.assertEqual(ids[6:6 + 45 * 80], [s["<img>"]] * (45 * 80))
+        at = 6 + 45 * 80
+        self.assertEqual(ids[at], s["<joint_img_sep>"])
+        self.assertEqual(ids[at + 1:at + 1 + 1024], [s["<img>"]] * 1024)
+        self.assertEqual(ids[at + 1025], s["<eoi>"])
+        self.assertEqual(ids[at + 1026:at + 1029], [2, 2, 11], "the prompt, the blank line, \"Assistant: \"")
+        self.assertEqual(ids.count(s["<boi>"]), 2)
+
     def test_the_engine_keeps_through_eoi(self):
         """hunyuanimage3_trim keeps the last <img> and the <eoi> after it: what follows it is dropped."""
         ids = images.hunyuanimage3_ids(FakeTokenizer(), "ab", self.BUCKET, 256, None)
@@ -195,11 +219,12 @@ class Job(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.d = Path(self.tmp.name)
-        for name in ("strata-image", "dit.safetensors", "vae.safetensors", "tokenizer.json", "en_unified.txt"):
+        for name in ("strata-image", "dit.safetensors", "vae.safetensors", "tokenizer.json", "en_unified.txt",
+                     "shard.safetensors"):
             (self.d / name).write_text("x", encoding="utf-8")
         self.cfg = cfg(exe=str(self.d / "strata-image"), diffusion_model=str(self.d / "dit.safetensors"),
                        vae=str(self.d / "vae.safetensors"), tokenizer=str(self.d / "tokenizer.json"),
-                       system_prompt=str(self.d / "en_unified.txt"))
+                       system_prompt=str(self.d / "en_unified.txt"), vision=str(self.d / "shard.safetensors"))
         self.gen = images.ImageGen(self.cfg)
 
     def tearDown(self):

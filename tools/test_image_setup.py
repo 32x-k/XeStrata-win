@@ -53,7 +53,7 @@ class Tables(unittest.TestCase):
         self.assertEqual(QI.dit_quants("hunyuanimage3"), QI.HUNYUANIMAGE3_QUANTS)
         self.assertEqual(QI.file_names("w4a8", "", "", "hunyuanimage3"),
                          ("hunyuanimage3-w4a8", "hunyuanimage3-vae", "hunyuanimage3-tokenizer",
-                          "hunyuanimage3-system-prompt"))
+                          "hunyuanimage3-system-prompt", "hunyuanimage3-vision"))
         for entry in QI.file_names("int8", "", "", "hunyuanimage3"):
             # one folder for the model's four files, named after the model (not after the first file's DiT)
             self.assertEqual(QI.local_path("/models", entry).parent.name, "hunyuan-image-3", entry)
@@ -77,7 +77,7 @@ class RamFit(unittest.TestCase):
         self.assertEqual(QI.fit_ram(12.0), ("Q4_K_M", "Q4_K", False))
 
     def test_hunyuanimage3_lowers_its_own_size(self):
-        # 49.4 GB (DiT 46.9 + VAE 2.5) and 84.3 GB, plus the engine's own 2 GB
+        # 49.4 GB (DiT 46.9 + VAE 2.5) and 84.3 GB, plus the vision model's 0.9 and the engine's own 2 GB
         self.assertEqual(QI.fit_ram(60.0, "", "w4a8", "", "hunyuanimage3"), ("w4a8", "", True))
         self.assertEqual(QI.fit_ram(90.0, "", "int8", "", "hunyuanimage3"), ("int8", "", True))
         self.assertEqual(QI.fit_ram(45.0, "", "int8", "", "hunyuanimage3"), ("w4a8", "", False))
@@ -172,10 +172,12 @@ class Config(unittest.TestCase):
         self.assertEqual(self.cfg["vae"], "/models/hunyuan-image-3/hunyuan_image_3_vae_fp16.safetensors")
         self.assertEqual(self.cfg["tokenizer"], "/models/hunyuan-image-3/tokenizer.json")
         self.assertEqual(self.cfg["system_prompt"], "/models/hunyuan-image-3/en_unified.txt")
+        self.assertEqual(self.cfg["vision"], "/models/hunyuan-image-3/model-0032-of-0032.safetensors")
+        self.assertEqual(self.cfg["max_refs"], 3)
         self.assertEqual(self.cfg["resolutions"], QI.hunyuanimage3_resolutions())
 
     def test_no_text_encoder_of_its_own(self):
-        for key in ("llm", "vision", "text_encoder", "text_quant", "edit_model", "max_refs"):
+        for key in ("llm", "text_encoder", "text_quant", "edit_model"):
             self.assertNotIn(key, self.cfg, key)
         self.assertFalse(self.cfg["mask"])
         self.assertFalse(self.cfg["transparency"])

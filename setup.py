@@ -5878,7 +5878,7 @@ def describe() -> dict:
         images.append({"id": choice, "title": QI.DITS[dit][0], "about": QI.ABOUT.get(choice, ""),
                        "download_gb": round(sum(QI.FILES[n][2] for n in names) / 1e9, 1),
                        "ram_gb": round(QI.ram_need_gb(QI.default_quant(dit), enc, QI.DEFAULT_TEXT_QUANT, dit), 1),
-                       "edits": dit in QI.MF_EDIT or not (QI.is_mage(dit) or QI.is_hunyuanimage3(dit)),
+                       "edits": dit in QI.MF_EDIT or not QI.is_mage(dit),
                        "license": QI.license_note(dit),
                        "uncensored": choice + "-uncensored" in QI.IMAGE_MODELS,
                        # the sizes one can ask for after its name (--images qwen-image-turbo:Q6_K, magetrail:int8,

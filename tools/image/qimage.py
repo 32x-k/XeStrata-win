@@ -34,8 +34,10 @@ model.
 
 HunyuanImage 3.0 (Tencent, the Tencent Hunyuan Community License; hunyuan-image-3-distil): the model reads its own
 prompt - there is no text encoder - so its files are the denoiser (Tencent's own quantization, w4a8 43.7 GiB or
-int8_convrot 76.2 GiB, closer to the bf16 weights and about twice as slow), the VAE (fp16), and the model's own
-`tokenizer.json`.  Its system prompt, the 5,674 characters the ids start with, is read out of the same repository's
+int8_convrot 76.2 GiB, closer to the bf16 weights and about twice as slow), the VAE (fp16), the model's own
+`tokenizer.json`, and for its edits the last of the model's bf16 shards, which holds its SigLIP2 (`vision_model.*`,
+0.9 GB of the shard's 3.3; the engine reads those tensors alone).  Its system prompt, the 5,674 characters the ids
+start with, is read out of the same repository's
 `system_prompt.py` as the model is installed (never run), and its 37 resolution buckets, which a requested size snaps
 to, are computed from the model's base size and the four sizes its image processor adds (hunyuanimage3_buckets).
 Tencent publishes the model in bf16 only; the two quantized files and the VAE are pinned where they are published as
@@ -164,6 +166,9 @@ FILES = {
                                 "c2439418b9be76a54d8b5ff1ed89b37e36ec1735730f7da99b5aabb83a73db64"),
     "hunyuanimage3-system-prompt": (_HY, "system_prompt.py", 16_113,
                                     "280f145b0b9ac3c1370b2a51a12ab066c190fc9d65dd3d27aeb9b7859d5a29d8"),
+    # the model's last bf16 shard: its SigLIP2 (vision_model.*), which an edit's reference images go through
+    "hunyuanimage3-vision": (_HY, "model-0032-of-0032.safetensors", 3_316_299_512,
+                             "65b72ec507661c7a146b3174fd0baaa2689a5c7e85a8736aa9778b1d146a4ec6"),
 }
 QUANTS = ("Q4_K_M", "Q6_K", "Q8_0")
 TEXT_QUANTS = ("Q4_K", "Q5_K", "Q6_K", "Q8_0")      # the text encoder's, smallest first like QUANTS
@@ -173,6 +178,8 @@ HUNYUANIMAGE3_QUANTS = ("w4a8", "int8")
 HUNYUANIMAGE3_DEFAULT_QUANT = "w4a8"
 HUNYUANIMAGE3_DIR = "hunyuan-image-3"
 HUNYUANIMAGE3_GUIDANCE = 2.5                       # the distilled model's guidance token (its generation_config)
+HUNYUANIMAGE3_MAX_REFS = 3                         # its edits' reference images at most (serve/images.py)
+HUNYUANIMAGE3_VISION_GB = 0.9                      # what the engine reads of the vision shard (vision_model.*)
 HUNYUANIMAGE3_BASE_SIZE = 1024                     # its resolution buckets: base x base, a token 16 x 16 pixels
 HUNYUANIMAGE3_ALIGN = 16
 # the four aspect ratios its image processor adds to the computed ones (its `image_processor.py`), (height, width)
@@ -205,7 +212,7 @@ ABOUT = {"qwen-image-turbo": "Everyday images and edits (recommended), 8 steps",
          "mage-flow-base": "Mage-Flow's base model, 30 steps with guidance",
          "magetrail": "Mage-Flow tuned on Danbooru and e621 images, for illustrations from booru tags; no edits",
          "hunyuan-image-3-distil": "Tencent's large MoE model (80B), the most detailed and the slowest; reads its own "
-                                   "prompt, needs about 50 GB of RAM; no edits"}
+                                   "prompt, needs about 50 GB of RAM; edits with up to 3 reference images"}
 # the DiT -> its name, its steps (Turbo's are its own 8 sigmas; the base model's, the default of its pipeline,
 # diffusers' QwenImage21Pipeline, sampled without guidance as Qwen meant it), its Hugging Face model
 DITS = {"turbo": ("Qwen-Image-2.1-Turbo", 8, "Qwen/Qwen-Image-2.1-Turbo"),
@@ -319,7 +326,7 @@ def file_names(quant: str, text_encoder: str = DEFAULT_TEXT_ENCODER, text_quant:
     and the model's tokenizer and system prompt instead)."""
     if is_hunyuanimage3(dit):
         return (f"hunyuanimage3-{quant}", "hunyuanimage3-vae", "hunyuanimage3-tokenizer",
-                "hunyuanimage3-system-prompt")
+                "hunyuanimage3-system-prompt", "hunyuanimage3-vision")
     if is_mage(dit):
         vae, text = MF_VAE.get(dit, "mf-vae"), text_file(text_encoder, text_quant)
         if dit not in MF_EDIT:
@@ -336,8 +343,9 @@ def ram_need_gb(quant: str, text_encoder: str = DEFAULT_TEXT_ENCODER, text_quant
     too with `keep` (else one DiT at a time)."""
     share = 1.0 if q8 is False else MF_Q8_SHARE
     names = file_names(quant, text_encoder, text_quant, dit)
-    if is_hunyuanimage3(dit):                 # no text encoder: the files and the engine's own
-        return sum(FILES[k][2] for k in names) / 1e9 + HOST_GB
+    if is_hunyuanimage3(dit):   # no text encoder: the files (of the vision shard, the read part) and the engine's own
+        return sum(FILES[k][2] for k in names if k != "hunyuanimage3-vision") / 1e9 + HUNYUANIMAGE3_VISION_GB \
+            + HOST_GB
     if is_mage(dit) and not keep and dit in MF_EDIT:
         names = tuple(k for k in names if k != f"{MF_EDIT[dit][0]}-bf16")
     return sum(FILES[k][2] * (share if k.endswith("-bf16") and is_mage(dit) else 1) for k in names) / 1e9 \
@@ -454,6 +462,7 @@ def image_config(quant: str, exe: Path, models_dir: Path, *, model: str = DEFAUL
                 "vae": str(local_path(models_dir, "hunyuanimage3-vae")),
                 "tokenizer": str(local_path(models_dir, "hunyuanimage3-tokenizer")),
                 "system_prompt": str(system_prompt_path(models_dir)), "steps": DITS[dit][1],
+                "vision": str(local_path(models_dir, "hunyuanimage3-vision")), "max_refs": HUNYUANIMAGE3_MAX_REFS,
                 "guidance": HUNYUANIMAGE3_GUIDANCE, "schedule": "hunyuanimage3", "mask": False,
                 "transparency": False, "resolutions": hunyuanimage3_resolutions(),
                 "gpu_policy": policy, "uma": bool(uma), "ssd_offload": bool(ssd_offload)}
