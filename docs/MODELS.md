@@ -70,9 +70,13 @@ you have the disk. Perplexity is measured on a fixed set of 4,995 test texts; lo
 | --- | --- |
 | NVIDIA RTX 30, 40 and 50 series, 12 GB or more | Windows, Linux |
 | AMD Radeon AI PRO R9700 | Linux |
+| AMD Ryzen AI Max (Strix Halo, gfx1151, 64 GB or more shared) | Windows |
 
-Tested on an RTX 3060 (Linux), an RTX 5070 (Windows) and four R9700 cards (Linux). The RTX 30 kernels were also checked
-on an RTX A4000. Windows on RTX 30 and the RX 9070 are built but were not run. Mac and Strix Halo do not run it yet.
+Tested on an RTX 3060 (Linux), an RTX 5070 (Windows), four R9700 cards (Linux) and a Ryzen AI Max+ 395 with 64 GB (Windows:
+14 to 16 tokens a second on code with the default Faster mode, 10 to 11 on chat, 78 tokens a second on a 4K prompt and 109 on
+8K). The RTX 30 kernels were also checked on an RTX A4000. Windows on RTX 30 and the RX 9070 are built but were not run. Mac
+and Strix Halo on Linux do not run it yet; on Strix Halo Windows the graphics memory is the RAM, so most of the experts are
+read from the SSD and an NVMe drive matters.
 
 **What you need:** a graphics card with 12 GB or more, 46 GB of RAM at least (64 GB is the tested comfortable size),
 an NVMe SSD, and the disk space above. Setup warns when disk or RAM is short and does not stop you.
