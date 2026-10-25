@@ -10,6 +10,8 @@
 //   STRATA_GR_DOWN_TG=1  the hyper-connection down projection with one token a block row (T times the blocks); =2 (token
 //                        pairs) on a 12.0 card with fewer than 80 SMs
 //   STRATA_GU_SWIGLU=1   gate/up, SwiGLU and the q8_1 blocks of the routed experts in one launch
+//   STRATA_GR_UP_WIDE=1  the hyper-connection up projection with one warp a row (1,280 blocks instead of 160; +1.9%
+//                        story / +0.7% code decode on the RTX PRO 5000, 5 pairs, token ids identical; bitwise)
 // and one that rounds differently (KL-checked, the AMD gfx12 rule): STRATA_PF_FUSED (the native packs' prompt experts on the
 // fused int8 kernels, IQ2_S / IQ3_XXS / IQ3_S / IQ4_XS gate/up only, 12.0 cards with 80+ SMs only; =0 keeps MMQ, =1 takes every
 // covered format on any card).

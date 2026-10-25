@@ -439,13 +439,27 @@ __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
 constexpr int UPW_COLS = 2;
 constexpr int UPW_BLOCKS = N / UPW_COLS;
 
-/// STRATA_GR_UP_WIDE=1: the wide up read; default off (each card's own A/B decides).
+/// STRATA_GR_UP_WIDE: the wide up read.  ON BY DEFAULT on a 12.0 card (sm120_series.hpp; STRATA_SM120_PERF=0 or
+/// STRATA_GR_UP_WIDE=0 turns it off, =1 forces it on any card).  Measured on the RTX PRO 5000 (IQ3_S, all experts
+/// resident, 5 interleaved pairs of fresh engines): story 197.6 -> 201.3 tok/s (+1.9%), code 243.5 -> 245.1 (+0.7%),
+/// the produced token ids identical in 6/6 runs; the isolated read (fused_gr_bench) is bitwise the old kernel's.
 bool gr_up_wide_on() {
-    static const bool on = [] {
+    static const int env = [] {
         const char* v = std::getenv("STRATA_GR_UP_WIDE");
-        return v != nullptr && std::atoi(v) != 0;
+        return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1;
     }();
-    return on;
+    if (env >= 0) return env != 0;
+    static int per_dev[64];   // 0 unknown, 1 no, 2 yes
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    if (!per_dev[dev]) {
+        int major = 0, minor = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        per_dev[dev] = strata::sm120_default(major, minor) ? 2 : 1;
+        cudaGetLastError();   // drop what an attribute query on a CPU-only box leaves behind
+    }
+    return per_dev[dev] == 2;
 }
 
 template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false>
