@@ -1776,6 +1776,131 @@ DS4_SPARSE_PACKED_SIG(ds4_sparse_attn_g1) DS4_SPARSE_PACKED_BODY(1)
 #undef DS4_SPARSE_PACKED_SIG
 #undef DS4_SPARSE_PACKED_BODY
 
+// ---------------------------------------------------------------- sparse attention on the matrix units (G = 8 heads a threadgroup)
+//
+// The same attention as ds4_sparse_attn_g8 (a token, eight heads, the window rows plus the selected compressed rows, softmax with the head's
+// sink) but the dots and the weighted sum run on simdgroup 8x8 matrices: eight rows a pass are staged once as BF16 (exact), q and the
+// softmax weights are split into a BF16 high and low part (so the products keep about 16 bits), accumulation is fp32, and the softmax is the
+// online one (the running maximum rescales the accumulators through a diagonal matrix).
+kernel void ds4_sparse_attn_mx(device const float* q [[buffer(0)]], device const ushort* win [[buffer(1)]],
+                               device const uchar* ckv [[buffer(2)]], device const int* sel [[buffer(3)]],
+                               constant uint& sel_stride [[buffer(4)]], constant Ds4AttnRows& ar [[buffer(5)]],
+                               device const float* sink [[buffer(6)]], constant uint& heads [[buffer(7)]],
+                               constant float& scale [[buffer(8)]], device float* out [[buffer(9)]],
+                               uint2 tgp [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                               ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint4 tile4[8u * 64u];
+    threadgroup float qbuf[4096];            // q hi / lo as BF16 (8 KB each), later the output rows as float
+    threadgroup float part[8u * 64u];
+    threadgroup float ssm[64];
+    threadgroup bfloat phi[64], plo[64];
+    threadgroup float dg[64];
+    threadgroup float m_s[8], den_s[8], sc_s[8];
+    threadgroup bfloat* qhi = (threadgroup bfloat*) qbuf;
+    threadgroup bfloat* qlo = qhi + 4096;
+    threadgroup const bfloat* kt = (threadgroup const bfloat*) tile4;
+
+    const int hb = int(tgp.x) * 8, t = int(tgp.y);
+    int n_win, n_sel, w0;
+    ds4_attn_counts(ar, t, n_win, n_sel, w0);
+    const device ushort* wbase = win + (size_t) w0 * 512u;
+    const device int* sl = sel + (size_t) t * (size_t) sel_stride;
+    for (uint x = 0; x < 16u; ++x) {
+        const uint idx = tid * 16u + x, h = idx >> 9, d = idx & 511u;
+        const float v = q[((size_t) t * heads + uint(hb) + h) * 512u + d];
+        const bfloat hi = bfloat(v);
+        qhi[idx] = hi;
+        qlo[idx] = bfloat(v - float(hi));
+    }
+    if (tid < 8u) {
+        m_s[tid] = -1e30f;
+        den_s[tid] = 0.0f;
+    }
+    simdgroup_float8x8 O[8];
+    for (int c = 0; c < 8; ++c) O[c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    const int sr = int(tid) >> 4, pt = int(tid) & 15;
+    const int total = n_win + n_sel;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int t0 = 0; t0 < total; t0 += 8) {
+        const int n = min(8, total - t0);
+        if (sr < 8) {
+            if (sr < n) {
+                ds4_attn_stage(wbase, ckv, sl, n_win, t0, 0, n, sr, pt, tile4);
+            } else {
+                threadgroup uint4* dst = tile4 + (size_t) sr * 64u + (size_t) pt * 4u;
+                dst[0] = uint4(0); dst[1] = uint4(0); dst[2] = uint4(0); dst[3] = uint4(0);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {   // S = q . K^T over this simdgroup's eighth of the 512 values
+            simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            for (int kb = int(sg) * 8; kb < int(sg) * 8 + 8; ++kb) {
+                simdgroup_bfloat8x8 a_hi, a_lo, b;
+                simdgroup_load(b, kt, 512, ulong2(ulong(kb) * 8ul, 0ul), true);
+                simdgroup_load(a_hi, qhi, 512, ulong2(ulong(kb) * 8ul, 0ul));
+                simdgroup_load(a_lo, qlo, 512, ulong2(ulong(kb) * 8ul, 0ul));
+                simdgroup_multiply_accumulate(acc, a_hi, b, acc);
+                simdgroup_multiply_accumulate(acc, a_lo, b, acc);
+            }
+            simdgroup_store(acc, part + uint(sg) * 64u, 8);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < 64u) {
+            float s = 0.0f;
+            for (uint g = 0; g < 8u; ++g) s += part[g * 64u + tid];
+            ssm[tid] = s * scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {   // head sg's online softmax over the pass's rows
+            const bool valid = int(lane) < n;
+            const float s = valid ? ssm[uint(sg) * 8u + uint(lane)] : -INFINITY;
+            const float m = ds4_attn_warp_max(s);
+            const float m_old = m_s[sg];
+            const float m_new = fmax(m_old, m);
+            const float p = valid ? exp(s - m_new) : 0.0f;
+            const float ps = ds4_warp_sum(p);
+            if (lane < 8u) {
+                const bfloat hi = bfloat(p);
+                phi[uint(sg) * 8u + uint(lane)] = hi;
+                plo[uint(sg) * 8u + uint(lane)] = bfloat(p - float(hi));
+            }
+            if (lane == 0u) {
+                const float cs = exp(m_old - m_new);
+                sc_s[sg] = cs;
+                den_s[sg] = den_s[sg] * cs + ps;
+                m_s[sg] = m_new;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < 64u) dg[tid] = (tid >> 3) == (tid & 7u) ? sc_s[tid >> 3] : 0.0f;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {   // O = diag(rescale) O + P V on this simdgroup's 64 columns
+            simdgroup_float8x8 D;
+            simdgroup_bfloat8x8 ph, pl;
+            simdgroup_load(D, dg, 8);
+            simdgroup_load(ph, phi, 8);
+            simdgroup_load(pl, plo, 8);
+            for (int c = 0; c < 8; ++c) {
+                simdgroup_float8x8 tmp;
+                simdgroup_multiply(tmp, D, O[c]);
+                simdgroup_bfloat8x8 v;
+                simdgroup_load(v, kt, 512, ulong2(ulong(sg) * 64ul + ulong(c) * 8ul, 0ul));
+                simdgroup_multiply_accumulate(tmp, ph, v, tmp);
+                simdgroup_multiply_accumulate(tmp, pl, v, tmp);
+                O[c] = tmp;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (int c = 0; c < 8; ++c) simdgroup_store(O[c], qbuf, 512, ulong2(ulong(sg) * 64ul + ulong(c) * 8ul, 0ul));
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint x = 0; x < 16u; ++x) {
+        const uint idx = tid * 16u + x, h = idx >> 9, d = idx & 511u;
+        const float den = den_s[h] + exp(sink[uint(hb) + h] - m_s[h]);
+        out[((size_t) t * heads + uint(hb) + h) * 512u + d] = qbuf[idx] / den;
+    }
+}
+
 // kContig == false (the row set is BF16 already): one head and query a threadgroup, a warp a row's dot and warp 0 the
 // softmax, every thread two output values.
 static inline void ds4_sparse_bf16_run(device const float* q, device const ushort* win, device const ushort* ckv,

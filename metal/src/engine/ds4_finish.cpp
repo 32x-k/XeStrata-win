@@ -1151,7 +1151,9 @@ bool sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
     if (heads % 8 != 0) G = heads % 4 == 0 ? 4 : (heads % 2 == 0 ? 2 : 1);
     while (G > 1 && (heads / G) * T < 64) G /= 2;   // keep enough threadgroups on the GPU (CUDA's 2 * SMs, in effect)
 
-    const char* fn = ckv_fmt == 2 ? (G == 8 ? "ds4_sparse_attn_g8" : G == 4 ? "ds4_sparse_attn_g4"
+    static const int attn_mode = std::getenv("DS4_ATTN_MX") ? std::atoi(std::getenv("DS4_ATTN_MX")) : 0;   // 1: matrix-unit kernel; 2: both, compare
+    const bool use_mx = ckv_fmt == 2 && G == 8 && attn_mode != 0;
+    const char* fn = use_mx ? "ds4_sparse_attn_mx" : ckv_fmt == 2 ? (G == 8 ? "ds4_sparse_attn_g8" : G == 4 ? "ds4_sparse_attn_g4"
                                             : G == 2 ? "ds4_sparse_attn_g2" : "ds4_sparse_attn_g1")
                                   : "ds4_sparse_attn_bf16";
     mtl::Pipeline pl;
@@ -1175,6 +1177,31 @@ bool sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
     dsp.tg[0] = 256;
     dsp.tg[1] = dsp.tg[2] = 1;
     g_cx->run({dsp});
+    if (use_mx && attn_mode == 2) {   // debugging: the scalar kernel on the same inputs, then the difference
+        mtl::Pipeline ps;
+        try { ps = g_cx->pipeline(g_lib, "ds4_sparse_attn_g8"); } catch (...) { return true; }
+        mtl::Buffer bo2 = g_cx->alloc(obytes);
+        mtl::Dispatch d2 = dsp;
+        d2.p = &ps;
+        d2.args.back() = mtl::Arg::B(bo2, 0);
+        g_cx->run({d2});
+        g_cx->flush_runs();
+        const float* a = (const float*) ho;
+        const float* c = (const float*) bo2.ptr;
+        double mx_abs = 0, mx_ref = 0, sum_sq = 0, sum_ref = 0;
+        for (size_t i = 0; i < obytes / 4; ++i) {
+            const double df = std::fabs((double) a[i] - (double) c[i]);
+            mx_abs = std::max(mx_abs, df);
+            mx_ref = std::max(mx_ref, (double) std::fabs(c[i]));
+            sum_sq += df * df;
+            sum_ref += (double) c[i] * (double) c[i];
+        }
+        static double worst_rel = 0; static long calls = 0;
+        const double rel = std::sqrt(sum_sq / (sum_ref + 1e-30));
+        worst_rel = std::max(worst_rel, rel);
+        if (++calls % 50 == 1) std::fprintf(stderr, "attn mx vs scalar: call %ld T %d max abs %.3g (max |ref| %.3g) rms rel %.3g worst rms rel %.3g\n", calls, T, mx_abs, mx_ref, rel, worst_rel);
+        g_cx->free(bo2);
+    }
     return true;
 }
 
