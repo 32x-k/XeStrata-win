@@ -8842,6 +8842,11 @@ def main() -> int:
                                                                    else "the amdgpu driver's KFD topology is empty)."))
         for g in amd:
             say(f"    GPU {g['index']}: {g['name']}, {amd_mem_text(g)} - " + (amd_problem(g) or "can be used"))
+        if not WIN:                                    # WSL: the Linux HIP engines hang there; a warning, the run goes on
+            from strata_control.engine_component import wsl_amd_note
+            wsl_note = wsl_amd_note("hip", wsl=is_wsl())
+            if wsl_note:
+                warn(wsl_note)
         usable = [g for g in amd if amd_problem(g) is None]
         if not WIN and (amd or amd_pci_devices()):     # a warning only: recommend, never force
             acc = amd_device_access_problem()
