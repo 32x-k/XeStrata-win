@@ -170,8 +170,8 @@ void tl_report(id<MTLDevice> dev) {
     struct Acc { double busy = 0, gap = 0, gap_big = 0; size_t n = 0, n_big = 0; };
     std::map<std::string, Acc> acc;
     double t_first = 0, t_last = 0, total_busy = 0, total_gap = 0, total_big = 0;
-    double prev_end = -1;
-    size_t used = 0;
+    double prev_end = -1, ovl_us = 0;
+    size_t used = 0, n_ovl = 0;
     for (size_t k = from; k < n; ++k) {
         if (g_tl.names[k].empty()) continue;
         const double st = (double) ts[2 * k].timestamp * ns_per_gpu * 1e-3, en = (double) ts[2 * k + 1].timestamp * ns_per_gpu * 1e-3;   // us
@@ -181,6 +181,7 @@ void tl_report(id<MTLDevice> dev) {
         a.busy += en - st;
         ++a.n;
         total_busy += en - st;
+        if (prev_end >= 0 && st < prev_end) { ++n_ovl; ovl_us += prev_end - st; }
         if (prev_end >= 0 && st >= prev_end) {
             const double gp = st - prev_end;
             a.gap += gp;
@@ -196,6 +197,7 @@ void tl_report(id<MTLDevice> dev) {
     std::sort(v.begin(), v.end(), [](auto& x, auto& y) { return x.first > y.first; });
     std::fprintf(stderr, "timeline: %zu dispatches, wall %.1f ms, GPU busy %.1f ms, idle gaps %.1f ms (of it > 300 us: %.1f ms)\n", used,
                  (t_last - t_first) / 1000.0, total_busy / 1000.0, total_gap / 1000.0, total_big / 1000.0);
+    std::fprintf(stderr, "timeline: %zu dispatches started before the previous one ended (%.1f ms overlapped)\n", n_ovl, ovl_us / 1000.0);
     std::fprintf(stderr, "timeline: kernel                          n   busy ms  us/disp   gap ms  gap/disp  big-gap ms (n)\n");
     for (size_t i = 0; i < v.size() && i < 40; ++i) {
         const Acc& a = acc[v[i].second];
@@ -774,6 +776,8 @@ double Context::run(const std::vector<Dispatch>& ds, int reps, bool concurrent, 
     std::lock_guard<std::recursive_mutex> lk_(impl_->mu);
     @autoreleasepool {
         if (ds.size() == 1 && reps == 1 && !barrier_between) {
+            { static const std::string skipk = std::getenv("DS4_SKIP_K") ? std::string(",") + std::getenv("DS4_SKIP_K") + "," : std::string();   // debugging: drop these kernels (timing only)
+              if (!skipk.empty() && skipk.find("," + ds[0].p->name + ",") != std::string::npos) return 0.0; }
             if (impl_->cb_def == nil || impl_->def_n >= 2000000) {
                 if (impl_->cb_def != nil) split_runs();   // (a buffer committed earlier may still be running: the queue keeps the order)
                 if (std::getenv("DS4_ERRINFO")) {

@@ -2164,10 +2164,13 @@ kernel void ds4_dq_q5k(device const uchar* W [[buffer(0)]], constant ulong& ld [
     const device uchar* qh = p + 16;
     const device uchar* qs = p + 48 + 32u * (ib >> 1);
     const uint sh = 4u * (ib & 1u);
-    device half* o = out + (ulong) row * k + (ulong) blk * 256ul + ib * 32u;
-    for (uint l = 0; l < 32u; ++l) {
-        const uint q = ((uint(qs[l]) >> sh) & 15u) | (((uint(qh[l]) >> ib) & 1u) << 4);
-        o[l] = half(d * float(sc) * float(q) - dmin * float(mm));
+    device packed_half4* o = (device packed_half4*) (out + (ulong) row * k + (ulong) blk * 256ul + ib * 32u);
+    const float ds = d * float(sc), dm = dmin * float(mm);
+    for (uint l = 0; l < 32u; l += 4u) {   // four values a step: 4-byte loads, 8-byte stores (the same arithmetic a value)
+        const uint4 a = uint4(*(const device packed_uchar4*) (qs + l));
+        const uint4 b = uint4(*(const device packed_uchar4*) (qh + l));
+        const uint4 q = ((a >> sh) & 15u) | (((b >> ib) & 1u) << 4);
+        o[l >> 2] = packed_half4(half4(float4(ds) * float4(q) - float4(dm)));
     }
 }
 
