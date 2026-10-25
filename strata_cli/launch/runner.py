@@ -425,9 +425,8 @@ def engine_takes_experts(exe) -> bool:
     return dsv41_engine_version(exe) >= EXPERTS_MIN_ENGINE
 
 
-def used_vram_gb(computer, s: "S.LaunchSettings") -> float:
-    """Graphics memory (GiB) of the cards this launch uses, summed as the engine sums it: the cards named (--gpu, the Cards step; a role other than
-    off), else every card that can be used."""
+def used_cards(computer, s: "S.LaunchSettings") -> list:
+    """The cards this launch uses: the ones named (--gpu, the Cards step; a role other than off), else every card that can be used."""
     cards = list(computer.usable_gpus)
     chosen = None
     if s.gpu_roles:
@@ -436,7 +435,28 @@ def used_vram_gb(computer, s: "S.LaunchSettings") -> float:
         chosen = {int(g) for g in s.gpus}
     if chosen is not None:
         cards = [c for c in cards if int(c.get("index", 0)) in chosen]
-    return sum(float(c.get("vram_gb") or 0) for c in cards)
+    return cards
+
+
+def used_vram_gb(computer, s: "S.LaunchSettings") -> float:
+    """Graphics memory (GiB) of the cards this launch uses, summed as the engine sums it."""
+    return sum(float(c.get("vram_gb") or 0) for c in used_cards(computer, s))
+
+
+def uses_integrated_gpu(computer, s: "S.LaunchSettings") -> bool:
+    """Does the launch run on an integrated / unified-memory GPU (Strix Halo, gfx1151, Radeon 8060S: the hardware probe marks it uma, integrated or
+    unified_memory)? A Mac is left out: DeepSeek is not on the Mac."""
+    for c in used_cards(computer, s):
+        if str(c.get("vendor")) == "apple" or c.get("unified_gb"):
+            continue
+        if c.get("integrated") or c.get("uma") or c.get("unified_memory"):
+            return True
+    return False
+
+
+def faster_by_default(computer, s: "S.LaunchSettings") -> bool:
+    """The engine's `--experts auto` rule: Faster (5 experts) on an integrated GPU, or when the cards used total 16 GiB or less."""
+    return uses_integrated_gpu(computer, s) or S.faster_default(used_vram_gb(computer, s))
 
 
 EXPERTS_LINE = re.compile(r"experts per word: (\d+)")
@@ -1980,7 +2000,7 @@ class Runner:
         if not self.multi_file() or not self.speed_engine_ok():
             return None
         try:
-            default = S.faster_default(used_vram_gb(self.catalog.computer(), self.s))
+            default = faster_by_default(self.catalog.computer(), self.s)
         except Exception:                                    # noqa: BLE001 - when the cards cannot be read, the engine's own default stands
             default = False
         if self.s.speed in S.SPEED_MODES:
