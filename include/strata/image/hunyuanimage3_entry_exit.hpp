@@ -7,7 +7,8 @@
 // (GroupNorm(32) + swish + 3x3 convolution, the timestep's embedding as a per-channel scale and shift, a 1x1 skip)
 // from 1024 to 4096, and at the exit the same block back to 1024, a GroupNorm, a swish and a 3x3 convolution to the
 // 32 channels of the velocity.  The products are `prefill::Gemm`'s FP16 ones over an unfolded 3x3 neighbourhood
-// (the bands the VAE's convolutions unfold), the norms and the residual stream FP32.  `probe around` holds them to
+// (the bands the VAE's convolutions unfold), each operand as two FP16 halves (the value and the rounding it left),
+// the norms and the residual stream FP32.  `probe around` holds them to
 // the host FP32 reference, and the shipped path to the golden's picture (`probe pipeline`).
 //
 // What is NOT here is what costs a step little: `wte` gathers a few hundred rows out of a BF16 table (the
@@ -136,7 +137,7 @@ private:
     uint16_t *x16_ = nullptr, *a16s_ = nullptr, *a16c_ = nullptr, *skip16_ = nullptr, *rows16_ = nullptr,
              *col16_ = nullptr, *emb16_ = nullptr;
     float *f32s_[3] = {nullptr, nullptr, nullptr}, *f32c_[3] = {nullptr, nullptr, nullptr};
-    float *lat32_ = nullptr, *vel32_ = nullptr, *es32_ = nullptr, *gn_ws_ = nullptr;
+    float *lat32_ = nullptr, *vel32_ = nullptr, *es32_ = nullptr, *gn_ws_ = nullptr, *lo32_ = nullptr;
     std::vector<void*> weights_;
     std::vector<void*> grid_;
 };

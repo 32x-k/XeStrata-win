@@ -16,6 +16,13 @@
 // The numbers a step takes are the convolutions': at a 1024 x 1024 image (64 x 64 tokens) the entry and the exit
 // are about a thousand GFLOP together, which the host FP32 version ran at 30 s a step.  Nothing here is tiled past
 // the unfold's row chunks; tile and local-memory forms come if a measurement asks for them.
+//
+// Every product's operand is two FP16 buffers, the value and what its rounding to FP16 left ([2][P][C], the
+// second half at + P * C), multiplied by the same weight and summed: the operand to about 22 bits.  With one FP16
+// operand the paths stood at the FP16 floor (rel 2e-4 against the host FP32), which the 32 layers and the 8 steps
+// grew into 5.7 dB of the picture's PSNR against the golden (B70: 30.07 dB with the floor, 35.78 with the host's
+// FP32, the acceptance 30): records/2026-10-23-hunyuanimage3-plan, entry-leg6.  The weights are the file's BF16,
+// which FP16 holds exactly but for the few under its normal range.
 #include "strata/image/hunyuanimage3_entry_exit.hpp"
 
 #include "strata/core/gpu.hpp"
@@ -65,17 +72,19 @@ uint64_t HunyuanImage3EntryExit::scratch_bytes(int64_t th, int64_t tw) const {
     // exit's first convolution, hidden channels)
     const uint64_t col = std::min<uint64_t>((uint64_t) n * 9 * (uint64_t) hidden_ * 2, (uint64_t) kColBytes);
     uint64_t b = 0;
-    b += (uint64_t) n * (uint64_t) latent_ * 2;       // x16: the latent's FP16 [n][32]
-    b += (uint64_t) n * (uint64_t) hidden_ * 2;       // a16s: a swish'd norm at the hidden width
-    b += (uint64_t) n * 1024 * 2;                     // a16c: one at the block's inner width
-    b += (uint64_t) n * 1024 * 2;                     // skip16: the entry's skip input
-    b += (uint64_t) n * (uint64_t) hidden_ * 2;       // rows16: the exit's skip input
+    // the FP16 operands, each with the rounding it left (two halves)
+    b += 2 * (uint64_t) n * (uint64_t) latent_ * 2;   // x16: the latent's FP16 [n][32]
+    b += 2 * (uint64_t) n * (uint64_t) hidden_ * 2;   // a16s: a swish'd norm at the hidden width
+    b += 2 * (uint64_t) n * 1024 * 2;                 // a16c: one at the block's inner width
+    b += 2 * (uint64_t) n * 1024 * 2;                 // skip16: the entry's skip input
+    b += 2 * (uint64_t) n * (uint64_t) hidden_ * 2;   // rows16: the exit's skip input
     b += col;                                         // col16
+    b += (uint64_t) std::max<int64_t>(n, 2) * (uint64_t) hidden_ * 4;   // lo32: a product of the second halves
     b += 3 * (uint64_t) n * (uint64_t) hidden_ * 4;   // f32s: the entry's three hidden-wide products
     b += 3 * (uint64_t) n * 1024 * 4;                 // f32c: the exit's three
     b += (uint64_t) n * (uint64_t) latent_ * 4;       // lat32
     b += (uint64_t) n * (uint64_t) latent_ * 4;       // vel32
-    b += (uint64_t) hidden_ * 2;                      // emb16
+    b += 2 * (uint64_t) hidden_ * 2;                  // emb16
     b += 2 * (uint64_t) hidden_ * 4;                  // es32: the widest embedding projection (2 * 4096)
     b += (uint64_t) hunyuanimage3_group_ws_floats(n) * 4;
     return b;
@@ -92,7 +101,7 @@ void HunyuanImage3EntryExit::release_grid() {
     x16_ = a16s_ = a16c_ = skip16_ = rows16_ = col16_ = emb16_ = nullptr;
     for (float*& p : f32s_) p = nullptr;
     for (float*& p : f32c_) p = nullptr;
-    lat32_ = vel32_ = es32_ = gn_ws_ = nullptr;
+    lat32_ = vel32_ = es32_ = gn_ws_ = lo32_ = nullptr;
 }
 
 void HunyuanImage3EntryExit::drop_grid() { release_grid(); }
@@ -118,17 +127,18 @@ bool HunyuanImage3EntryExit::set_grid(int64_t th, int64_t tw, std::string& err) 
     try {
         const uint64_t col = std::min<uint64_t>((uint64_t) n * 9 * (uint64_t) hidden_ * 2, (uint64_t) kColBytes);
         col_elems_ = (int64_t) (col / 2);
-        x16_ = static_cast<uint16_t*>(dev(n * latent_ * 2, "the latent's FP16"));
-        a16s_ = static_cast<uint16_t*>(dev(n * hidden_ * 2, "a hidden-wide FP16 operand"));
-        a16c_ = static_cast<uint16_t*>(dev(n * 1024 * 2, "an inner-wide FP16 operand"));
-        skip16_ = static_cast<uint16_t*>(dev(n * 1024 * 2, "the entry's skip input"));
-        rows16_ = static_cast<uint16_t*>(dev(n * hidden_ * 2, "the exit's skip input"));
+        x16_ = static_cast<uint16_t*>(dev(2 * n * latent_ * 2, "the latent's FP16"));
+        a16s_ = static_cast<uint16_t*>(dev(2 * n * hidden_ * 2, "a hidden-wide FP16 operand"));
+        a16c_ = static_cast<uint16_t*>(dev(2 * n * 1024 * 2, "an inner-wide FP16 operand"));
+        skip16_ = static_cast<uint16_t*>(dev(2 * n * 1024 * 2, "the entry's skip input"));
+        rows16_ = static_cast<uint16_t*>(dev(2 * n * hidden_ * 2, "the exit's skip input"));
         col16_ = static_cast<uint16_t*>(dev(col_elems_ * 2, "the unfold's bands"));
+        lo32_ = static_cast<float*>(dev(std::max<int64_t>(n, 2) * hidden_ * 4, "a product of the second halves"));
         for (float*& p : f32s_) p = static_cast<float*>(dev(n * hidden_ * 4, "a hidden-wide product"));
         for (float*& p : f32c_) p = static_cast<float*>(dev(n * 1024 * 4, "an inner-wide product"));
         lat32_ = static_cast<float*>(dev(n * latent_ * 4, "the latent"));
         vel32_ = static_cast<float*>(dev(n * latent_ * 4, "the velocity"));
-        emb16_ = static_cast<uint16_t*>(dev(hidden_ * 2, "the timestep embedding"));
+        emb16_ = static_cast<uint16_t*>(dev(2 * hidden_ * 2, "the timestep embedding"));
         es32_ = static_cast<float*>(dev(2 * hidden_ * 4, "the embedding projection"));
         gn_ws_ = static_cast<float*>(dev(hunyuanimage3_group_ws_floats(n) * 4, "the norms' statistics"));
     } catch (const std::exception& e) {
@@ -376,16 +386,22 @@ bool HunyuanImage3EntryExit::open(const std::string& path, void* stream, std::st
 void HunyuanImage3EntryExit::conv3x3(const Conv& c, const uint16_t* in16, int64_t th, int64_t tw, float* out,
                                      const float* bias) {
     const int64_t P = th * tw, K = 9 * c.in, rows = std::max<int64_t>(1, col_elems_ / K);
+    const uint16_t* lo16 = in16 + P * c.in;
     for (int64_t p0 = 0; p0 < P; p0 += rows) {
         const int64_t r = std::min(rows, P - p0);
         hunyuanimage3_im2col16(in16, th, tw, c.in, p0, r, col16_, s_);
         gemm_.f16(col16_, c.w, out + p0 * c.out, r, c.out, K);
+        hunyuanimage3_im2col16(lo16, th, tw, c.in, p0, r, col16_, s_);
+        gemm_.f16(col16_, c.w, lo32_ + p0 * c.out, r, c.out, K);
     }
+    hunyuanimage3_add(out, lo32_, P * c.out, s_);
     if (bias != nullptr) hunyuanimage3_bias_add32(out, bias, P, c.out, s_);
 }
 
 void HunyuanImage3EntryExit::conv1x1(const Conv& c, const uint16_t* in16, int64_t P, float* out, const float* bias) {
     gemm_.f16(in16, c.w, out, P, c.out, c.in);
+    gemm_.f16(in16 + P * c.in, c.w, lo32_, P, c.out, c.in);
+    hunyuanimage3_add(out, lo32_, P * c.out, s_);
     if (bias != nullptr) hunyuanimage3_bias_add32(out, bias, P, c.out, s_);
 }
 
@@ -400,7 +416,7 @@ void HunyuanImage3EntryExit::norm(const float* x, const Gn& g, const float* scal
     hunyuanimage3_group_stats(part, B, P, g.c / 32, kGnEps, true, inv, mid, s_);
     dump(stage_ + "_" + tag + "_mean", mean, 32);
     dump(stage_ + "_" + tag + "_inv", inv, 32);
-    hunyuanimage3_group_apply16(x, mean, inv, g.w, g.b, scale, shift, P, g.c, true, y16, s_);
+    hunyuanimage3_group_apply16(x, mean, inv, g.w, g.b, scale, shift, P, g.c, true, y16, s_, y16 + P * g.c);
     dump16(stage_ + "_" + tag + "_y16", y16, P * g.c);
 }
 
@@ -409,6 +425,8 @@ void HunyuanImage3EntryExit::res_block(const Res& r, const float* x, const uint1
                                        float* out, float* skip32) {
     // the embedding's projection: hidden -> 2 out, its scale (the first half of `es32_`) and shift (the second)
     gemm_.f16(emb16_, r.emb, es32_, 1, r.emb_n, r.emb_k);
+    gemm_.f16(emb16_ + r.emb_k, r.emb, lo32_, 1, r.emb_n, r.emb_k);
+    hunyuanimage3_add(es32_, lo32_, r.emb_n, s_);
     hunyuanimage3_bias_add32(es32_, r.emb_b, 1, r.emb_n, s_);
     const float* scale = es32_;
     const float* shift = es32_ + r.emb_n / 2;
@@ -429,12 +447,14 @@ void HunyuanImage3EntryExit::embed16(const std::string& which, float t, std::str
     // the embedding the projection takes is the swish'd one (the host reference's `eb = emb; silu_all(eb)`)
     std::vector<float> h((size_t) hidden_);
     if (!hunyuanimage3_time_host(f_, which, t, h.data(), err)) return;
-    std::vector<uint16_t> bits((size_t) hidden_);
+    std::vector<uint16_t> bits((size_t) (2 * hidden_));   // the value, then the rounding it left
     for (int64_t i = 0; i < hidden_; ++i) {
-        const float v = h[(size_t) i];
-        bits[(size_t) i] = strata::kernels::f16_from_f32(v / (1.0f + std::exp(-v)));
+        const float v = h[(size_t) i], e = v / (1.0f + std::exp(-v));
+        bits[(size_t) i] = strata::kernels::f16_from_f32(e);
+        bits[(size_t) (hidden_ + i)] =
+            strata::kernels::f16_from_f32(e - strata::kernels::f32_from_f16(bits[(size_t) i]));
     }
-    if (!gpu::copy(emb16_, bits.data(), (size_t) hidden_ * 2)) err = oom("the timestep embedding");
+    if (!gpu::copy(emb16_, bits.data(), bits.size() * 2)) err = oom("the timestep embedding");
 }
 
 bool HunyuanImage3EntryExit::patch_embed(const float* latent, int64_t th, int64_t tw, float t, float* rows,
@@ -449,10 +469,10 @@ bool HunyuanImage3EntryExit::patch_embed(const float* latent, int64_t th, int64_
         if (!gpu::copy(lat32_, latent, (size_t) (latent_ * P * 4))) throw std::runtime_error(oom("the latent"));
         embed16("time_embed", t, err);
         if (!err.empty()) return false;
-        hunyuanimage3_grid_in16(lat32_, latent_, P, x16_, s_);
+        hunyuanimage3_grid_in16(lat32_, latent_, P, x16_, s_, x16_ + P * latent_);
         conv3x3(patch_in_, x16_, th, tw, f32c_[0], patch_in_.b);
         dump("e_c1", f32c_[0], P * 1024);
-        hunyuanimage3_to16(f32c_[0], P * 1024, skip16_, s_);
+        hunyuanimage3_to16(f32c_[0], P * 1024, skip16_, s_, skip16_ + P * 1024);
         res_block(patch_res_, f32c_[0], skip16_, a16c_, a16s_, P, th, tw, f32s_[0], f32s_[1], f32s_[2]);
         // the block's rows out, as the host reference hands them to the walk
         if (!gpu::stream_sync(s_)) throw std::runtime_error(oom("the entry's drain"));
@@ -476,7 +496,7 @@ bool HunyuanImage3EntryExit::final_layer(const float* rows, int64_t th, int64_t 
         if (!gpu::copy(f32s_[0], rows, (size_t) (P * hidden_ * 4))) throw std::runtime_error(oom("the rows"));
         embed16("time_embed_2", t, err);
         if (!err.empty()) return false;
-        hunyuanimage3_to16(f32s_[0], P * hidden_, rows16_, s_);   // the skip's operand
+        hunyuanimage3_to16(f32s_[0], P * hidden_, rows16_, s_, rows16_ + P * hidden_);   // the skip's operand
         res_block(final_res_, f32s_[0], rows16_, a16s_, a16c_, P, th, tw, f32c_[0], f32c_[1], f32c_[2]);
         norm(f32c_[1], final_gn_, nullptr, nullptr, P, a16c_, "gn_");
         conv3x3(final_out_, a16c_, th, tw, vel32_, final_out_.b);

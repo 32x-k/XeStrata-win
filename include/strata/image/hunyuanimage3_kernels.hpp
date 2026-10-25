@@ -81,10 +81,13 @@ void hunyuanimage3_add(float* x, const float* v, int64_t n, void* stream);
 
 /// y16[p][c] = FP16(x[c][p]): the FP32 [C][P] a host piece writes (the latent, a convolution in channels-first)
 /// as the FP16 [P][C] every product here takes.  P a multiple of 1 and C of 8 (the vec8 inner).
-void hunyuanimage3_grid_in16(const float* x, int64_t C, int64_t P, uint16_t* out16, void* stream);
+/// `lo16` (here and in to16 and group_apply16), when given: FP16(v - y16), the rounding FP16 left, so that a
+/// product of y16 plus one of lo16 has the operand to about 22 bits.
+void hunyuanimage3_grid_in16(const float* x, int64_t C, int64_t P, uint16_t* out16, void* stream,
+                             uint16_t* lo16 = nullptr);
 
 /// y16[i] = FP16(x[i]), n values: an FP32 tensor as the next product's row.
-void hunyuanimage3_to16(const float* x, int64_t n, uint16_t* y16, void* stream);
+void hunyuanimage3_to16(const float* x, int64_t n, uint16_t* y16, void* stream, uint16_t* lo16 = nullptr);
 
 /// col16[r][tap * C + c] = in16[(y + dy, x + dx)][c] (0 outside the grid), output pixel p0 + r with
 /// p = y * W + x, taps in (dy, dx) order matching the convolution weights' packing: the unfold of a 3x3
@@ -115,7 +118,7 @@ void hunyuanimage3_group_stats(const float* part, int64_t B, int64_t P, int64_t 
 /// applies), then v = v * (1 + scale[c]) + shift[c] when `scale` is given (a ResBlock's embedding), then silu.
 void hunyuanimage3_group_apply16(const float* x, const float* mean, const float* inv, const float* w,
                                  const float* b, const float* scale, const float* shift, int64_t P, int64_t C,
-                                 bool silu, uint16_t* y16, void* stream);
+                                 bool silu, uint16_t* y16, void* stream, uint16_t* lo16 = nullptr);
 
 /// out16[t][:] = FP16(table[ids[t]][:]) of a BF16 embedding table [vocab][C]: the sequence's text rows.
 void hunyuanimage3_embed_bf16_16(const uint16_t* table_bf16, const int32_t* ids, int64_t rows, int64_t C, uint16_t* out16,

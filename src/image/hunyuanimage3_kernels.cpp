@@ -347,20 +347,24 @@ void hunyuanimage3_router_logits(const float* x32, const float* w, int64_t T, in
     finish(stream, e, "hunyuanimage3_router_logits");
 }
 
-void hunyuanimage3_grid_in16(const float* x, int64_t C, int64_t P, uint16_t* out16, void* stream) {
+void hunyuanimage3_grid_in16(const float* x, int64_t C, int64_t P, uint16_t* out16, void* stream, uint16_t* lo16) {
     if (C <= 0 || P <= 0) return;
     const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (P * C)), [=](sycl::id<1> id) {
         const auto i = static_cast<int64_t>(id[0]);
         const int64_t p = i / C, c = i - p * C;
-        out16[i] = f16_from_f32(x[c * P + p]);
+        const float v = x[c * P + p];
+        out16[i] = f16_from_f32(v);
+        if (lo16 != nullptr) lo16[i] = f16_from_f32(v - f32_from_f16(out16[i]));
     });
     finish(stream, e, "hunyuanimage3_grid_in16");
 }
 
-void hunyuanimage3_to16(const float* x, int64_t n, uint16_t* y16, void* stream) {
+void hunyuanimage3_to16(const float* x, int64_t n, uint16_t* y16, void* stream, uint16_t* lo16) {
     if (n <= 0) return;
     const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
-        y16[id[0]] = f16_from_f32(x[id[0]]);
+        const float v = x[id[0]];
+        y16[id[0]] = f16_from_f32(v);
+        if (lo16 != nullptr) lo16[id[0]] = f16_from_f32(v - f32_from_f16(y16[id[0]]));
     });
     finish(stream, e, "hunyuanimage3_to16");
 }
@@ -468,7 +472,7 @@ void hunyuanimage3_group_stats(const float* part, int64_t B, int64_t P, int64_t 
 
 void hunyuanimage3_group_apply16(const float* x, const float* mean, const float* inv, const float* w,
                                  const float* b, const float* scale, const float* shift, int64_t P, int64_t C,
-                                 bool silu, uint16_t* y16, void* stream) {
+                                 bool silu, uint16_t* y16, void* stream, uint16_t* lo16) {
     if (P <= 0) return;
     const int64_t cg = C / kGnGroups;
     const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (P * C)), [=](sycl::id<1> id) {
@@ -478,6 +482,7 @@ void hunyuanimage3_group_apply16(const float* x, const float* mean, const float*
         if (scale != nullptr) v = v * (1.f + scale[c]) + shift[c];
         if (silu) v = v / (1.f + sycl::exp(-v));
         y16[i] = f16_from_f32(v);
+        if (lo16 != nullptr) lo16[i] = f16_from_f32(v - f32_from_f16(y16[i]));
     });
     finish(stream, e, "hunyuanimage3_group_apply16");
 }
