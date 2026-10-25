@@ -1266,7 +1266,10 @@ struct Model::Impl {
         for (std::thread& t : cache_ths)
             if (t.joinable()) t.join();
         if (ram_th.joinable()) ram_th.join();
-        for (size_t i = 0; i < ram_chunks.size(); ++i) os::anon_free(ram_chunks[i], ram_chunk_bytes[i]);
+        for (size_t i = 0; i < ram_chunks.size(); ++i) {
+            if (ram_pinned) (void) cudaHostUnregister(ram_chunks[i]);
+            os::anon_free(ram_chunks[i], ram_chunk_bytes[i]);
+        }
         for (Dev& d : devs) {
             cudaSetDevice(d.id);
             for (void* p : d.allocs) cudaFree(p);
@@ -3282,8 +3285,10 @@ struct Model::Impl {
             }
         }
         if (in_ram && ram_pinned && store_blob == nullptr) {   // (DMA'd from where it lies)
-            const uint8_t* p = ram_slots[(size_t) l.ram[(size_t) e]];
-            for (int r = 0; r < 3; ++r) it.src[r] = p + l.lay.trellis[r] + mx_read_off(l, mi, r);
+            const uint8_t* p = copy_mode ? ram_part[(size_t) l.ram[(size_t) e]][0]
+                                         : ram_slots[(size_t) l.ram[(size_t) e]];
+            for (int r = 0; r < 3; ++r)
+                it.src[r] = p + (copy_mode ? cp_lay[(size_t) l.il][(size_t) r] : l.lay.trellis[r]) + mx_read_off(l, mi, r);
             ++c.it_ram;
             return;
         }
@@ -4401,6 +4406,26 @@ struct Model::Impl {
         std::fprintf(stderr, "ds4: %zu of the CPU lane's %zu experts copied into RAM (%.1f GB, %d NUMA part%s) in %.1f s%s\n",
                      jobs.size(), hot.size(), cb / 1e9, NH, NH > 1 ? "s" : "", (now_ms() - t0) / 1000.0,
                      jobs.size() < hot.size() ? "; the others read in place" : "");
+        // DS4_COPY_PIN=1: pin the copies, so the prompt path DMAs each expert from where it lies instead of copying it
+        // to the pinned staging first (measured on the R9700 box: the 8K pass streams 122 GB at 6.8 GB/s through the
+        // staging, where the RAM-to-staging and DMA probes are 24 and 28 GB/s).  The CPU lane reads the same memory, and
+        // pinned 4 KB pages can cost its TLB (an earlier registration measured -15% decode), so this stays opt-in.
+        // DS4_COPY_PIN_RO=1: cudaHostRegisterReadOnly (the GPU only reads it).
+        if (const char* cp = std::getenv("DS4_COPY_PIN"); cp != nullptr && std::atoi(cp) != 0) {
+            const bool ro = std::getenv("DS4_COPY_PIN_RO") != nullptr && std::atoi(std::getenv("DS4_COPY_PIN_RO")) != 0;
+            const double tr = now_ms();
+            bool ok = true;
+            for (size_t i = 0; i < ram_chunks.size() && ok; ++i)
+                ok = cudaHostRegister(ram_chunks[i], ram_chunk_bytes[i],
+                                      ro ? cudaHostRegisterReadOnly : cudaHostRegisterPortable) == cudaSuccess;
+            if (ok) {
+                ram_pinned = true;
+                std::fprintf(stderr, "ds4: the copied experts pinned in %.1f s (%s): the prompt path DMAs them in place\n",
+                             (now_ms() - tr) / 1000.0, ro ? "read-only" : "read-write");
+            } else {
+                std::fprintf(stderr, "ds4: pinning the copied experts failed: the prompt path stages them\n");
+            }
+        }
         return true;
     }
 
