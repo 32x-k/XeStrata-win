@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 
 static int fails = 0;
@@ -176,6 +177,16 @@ int main() {
     const char* five[] = {"STRATA_HIP_WMMA", "STRATA_PF_GEMM", "STRATA_PA_FAST", "STRATA_SELECT_WMMA", "STRATA_HC_UPMIX"};
     for (const char* k : five) unset(k);
     CHECK(apply_arch_defaults("gfx1100", false).empty());
+    // gfx12: a discrete RDNA4 card gets its own nine switches (five prompt, four decode); a second call has nothing to do
+    const char* g12[] = {"STRATA_GDN_HEAD", "STRATA_GDN_PP",  "STRATA_GDN_CONVL2",    "STRATA_GDN_NOY", "STRATA_CVEC_FUSE",
+                         "STRATA_ATTN_LANECELL", "STRATA_ATTN_MERGE_V2", "STRATA_TSUM", "STRATA_EXPDEC"};
+    for (const char* k : g12) unset(k);
+    const auto g12set = apply_arch_defaults("gfx1201", false);
+    CHECK(g12set.size() == 9);
+    for (const char* k : g12) {
+        CHECK(std::getenv(k) != nullptr);
+        CHECK(std::string(std::getenv(k)) == (std::strcmp(k, "STRATA_GDN_PP") == 0 ? "2" : "1"));
+    }
     CHECK(apply_arch_defaults("gfx1201", false).empty());
     CHECK(apply_arch_defaults("gfx1103", false).empty());   // integrated == false: a mixed box (iGPU + dGPU) keeps the old defaults
     for (const char* k : five) CHECK(std::getenv(k) == nullptr);
