@@ -4283,7 +4283,11 @@ struct Model::Impl {
         }
         const uint64_t avail = ram_avail();
         // (Windows: the copies are committed memory, within what its commit still has beside the other programs' margin)
-        const double can = std::min(avail == ~uint64_t{0} ? 1e300 : std::max(0.0, (double) avail - (double) kRamMargin),
+        // DS4_COPY_HUGETLB: the arena comes from the kernel's huge-page pool, which MemAvailable does not count: add
+        // its free bytes so the full copy is taken when the pool holds it.
+        static const bool huge_arena = std::getenv("DS4_COPY_HUGETLB") != nullptr && std::atoi(std::getenv("DS4_COPY_HUGETLB")) != 0;
+        const double pool = huge_arena ? (double) os::huge_free_bytes() : 0.0;
+        const double can = std::min(avail == ~uint64_t{0} ? 1e300 : std::max(0.0, (double) avail - (double) kRamMargin) + pool,
                                     commit_room());
         // (auto: none - copies that all fit were measured no faster than the page cache: the CPU lane's rows are
         // compute-bound, ~46 GB/s from either on 2 Xeon sockets, NUMA parts included; a part copied cost decode speed
@@ -4342,13 +4346,18 @@ struct Model::Impl {
             if (ns == 0) continue;
             const size_t part = cp_lay[(size_t) l.il][3], bytes = (size_t) ns * part;
             std::array<uint8_t*, 2> base = {nullptr, nullptr};
+            // DS4_COPY_HUGETLB=1: the arena on explicit 2 MB pages (the pool must be reserved), so a pin of it keeps
+            // 2 MB pages and the prompt's DMA reads stay stable (a THP arena pinned by cudaHostRegister runs in 4 KB
+            // pages: measured 11.9 s one prompt, 30.4 s the next for the same 140 GB)
+            static const bool huge = std::getenv("DS4_COPY_HUGETLB") != nullptr && std::atoi(std::getenv("DS4_COPY_HUGETLB")) != 0;
             bool ok = true;
             for (int X = 0; X < NH && ok; ++X) {
-                base[(size_t) X] = (uint8_t*) node_map(bytes, X, NH);
+                size_t got = bytes;
+                base[(size_t) X] = (uint8_t*) (huge ? os::huge_alloc(bytes, &got) : node_map(bytes, X, NH));
                 ok = base[(size_t) X] != nullptr;
                 if (ok) {
                     ram_chunks.push_back(base[(size_t) X]);
-                    ram_chunk_bytes.push_back(bytes);
+                    ram_chunk_bytes.push_back(got);
                 }
             }
             if (!ok) {
