@@ -430,6 +430,76 @@ __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
     if (m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0);   // S26 STRATA_QFUSE
 }
 
+// 149-cuda: the same up projection with one warp per row instead of eight rows per warp.  A block still covers
+// all HC streams x a few columns, so the cross-stream sum stays in shared memory, and every row's dot, xor tree
+// and epilogue are gr_up_multi_kernel's - bitwise the same outputs.  8 warps cover 2 columns x 4 streams (8
+// rows), so the grid grows from UPM_BLOCKS (160) to N/2 (1280): the card's SMs get ~8x the warps, which is what
+// this read is short of on a 12.0 card (160 blocks do not fill 192 SMs; measured 2.6 ms per round for 1.26 GB,
+// about 0.5 TB/s).  Not used when the S26 q8_1 tail is on (its counter assumes UPM_COLS columns a block).
+constexpr int UPW_COLS = 2;
+constexpr int UPW_BLOCKS = N / UPW_COLS;
+
+/// STRATA_GR_UP_WIDE=1: the wide up read; default off (each card's own A/B decides).
+bool gr_up_wide_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_GR_UP_WIDE");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
+
+template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false>
+__global__ void __launch_bounds__(THREADS) gr_up_wide_kernel(GrMulti m) {
+    __shared__ __align__(16) float lo[MAX_T][LR];
+    __shared__ float g[MAX_T][HC][UPW_COLS];
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int T = EXACT_T ? MAX_T : m.T;
+    const int d0 = blockIdx.x * UPW_COLS;
+    for (int i = t; i < T * LR; i += THREADS) lo[i / LR][i % LR] = m.a[i / LR].lo[i % LR];
+    __syncthreads();
+    if (warp < HC * UPW_COLS) {
+        const int c = warp / UPW_COLS, dd = warp - c * UPW_COLS, i = c * N + d0 + dd;
+        const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) i * LR);
+        const Bf16x8 wa = unpack8(__ldg(w4 + lane));
+        const Bf16x8 wb = unpack8(lane < LR / 8 - 32 ? __ldg(w4 + 32 + lane) : make_uint4(0, 0, 0, 0));
+        float rv = 0.0f, wn = 0.0f, rsc = 0.0f, bo = 0.0f, ip = 0.0f;
+        bool apply = false;
+        if (lane < T) {
+            const FusedGrArgs& a = m.a[lane];
+            rv = a.R[i];
+            wn = a.w_norm[i];
+            rsc = a.rs[c];
+            apply = a.apply;
+            if (apply) { bo = a.bo_prev[d0 + dd]; ip = a.inj_prev[c]; }
+        }
+        float mine = 0.0f;
+#pragma unroll
+        for (int k = 0; k < MAX_T; ++k) {
+            if (!EXACT_T && k >= T) break;
+            float acc = dot8u_ptr(wa, lo[k] + lane * 8);
+            if (lane < LR / 8 - 32) acc += dot8u_ptr(wb, lo[k] + (32 + lane) * 8);
+            acc = warp_sum(acc);
+            if (lane == k) mine = acc;
+        }
+        if (lane < T) {
+            if (apply) {
+                rv = fmaf(bo, 2.0f * sigmoidf_(ip / (float) HC), rv);
+                m.a[lane].R_out[i] = rv;
+            }
+            const float x = rv * wn * rsc;
+            g[lane][c][dd] = x * sigmoidf_(mine);
+        }
+    }
+    __syncthreads();
+    for (int i = t; i < T * UPW_COLS; i += THREADS) {
+        const int k = i / UPW_COLS, col = i - k * UPW_COLS;
+        float s = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) s += g[k][c][col];
+        m.a[k].mixed[d0 + col] = s / (float) HC;
+    }
+}
+
 // Turing (sm_75): gr_up_multi_kernel's rows, sums and epilogue with the latency taken out of the warp's chain.  A warp's
 // 8 rows of w_up are all loaded before any dot (was: one row's load after the previous row's epilogue: ~9k of the
 // warp's ~22k cycles were waits on memory, ncu on an RTX 2080 Ti); a token's 8 activations per lane are read from
@@ -1317,6 +1387,19 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
         }
     }
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
+    // 149-cuda: the wide up read (test arm; STRATA_GR_UP_WIDE=1).  The q8_1 tail of S26 needs the 16-column
+    // blocks, so the wide kernel is only used when no q8_1 image is written.
+    if (!q8w && m.a[0].q8_mixed == nullptr && gr_up_wide_on()) {
+        switch (no_multi_gr ? kFusedGrMaxT : n_tok) {
+            case 1: gr_up_wide_kernel<1, true><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
+            case 2: gr_up_wide_kernel<2, true><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
+            case 3: gr_up_wide_kernel<3, true><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
+            case 4: gr_up_wide_kernel<4, true><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
+            case 5: gr_up_wide_kernel<5, true><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
+            case 6: gr_up_wide_kernel<6, true><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
+            default: gr_up_wide_kernel<kFusedGrMaxT, false><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
+        }
+    } else
 #if STRATA_GR_FAST_BUILD
     if (fast && !q8w) gr_up_fast_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
     else
