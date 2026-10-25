@@ -20,7 +20,7 @@ const char* const kQwen38Only[] = {
     "--gr-fp32-activations", "--gr-native-mmvf", "--no-fused-gr", "--no-fused-gdn", "--no-fast-attn",
     "--no-fast-select", "--mtp-hnorm", "--vision", "--shared-late", "--shared-expert-arena", "--keep-canonical",
     "--cpu-oracle-q8-0", "--dump-final-r", "--dump-halves", "--dump-mixed", "--dump-residual", "--dump-layers",
-    "--prefill", "--prefill-experts", "--prefill-cpu-share", "--prefill-until", "--no-prefill-borrow",
+    "--prefill", "--prefill-experts", "--prefill-until", "--no-prefill-borrow",
     "--resident-experts", "--resident-cpu-experts", "--resident-budget-gib", "--expert-cache-per-layer",
     "--expert-cache-cpu-order",
 };

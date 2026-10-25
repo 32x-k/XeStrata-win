@@ -21,6 +21,7 @@
 #include "strata/platform/memory.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/prefill.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -571,6 +572,8 @@ static void plain_usage(const std::string& arch) {
                  "  --vram-reserve-mib N leave N MiB of VRAM free beside the tier (default a 32nd of the memory)\n"
                  "  --mmap-experts       read the experts from the GGUF through mmap instead of pinned RAM\n"
                  "  --no-pcie-split      the CPU computes every expert the VRAM tier misses\n"
+                 "  --prefill-cpu-share S  the CPU pool's share of the prompt's experts the VRAM tier misses (0-1;\n"
+                 "                       auto = from the times measured at load, the default; 0: all on the GPU)\n"
                  "  --prompt-chunk N     the prompt's most tokens a chunk through the batched products (default\n"
                  "                       4096; 0: the prompt in windows)\n"
                  "  --max-t N            the decode window's most tokens (default 8)\n"
@@ -722,6 +725,10 @@ int plain_main(int argc, char** argv) {
             opt.expert_slots = v == "auto" ? -1 : std::max<int64_t>(0, std::strtoll(v.c_str(), nullptr, 10));
         }
         else if (a == "--adapt-decay") opt.adapt_decay = std::strtof(next("--adapt-decay"), nullptr);
+        else if (a == "--prefill-cpu-share") {
+            const std::string v = next("--prefill-cpu-share");
+            strata::prefill::set_cpu_share(v == "auto" ? -1.0 : std::max(0.0, std::strtod(v.c_str(), nullptr)));
+        }
         else if (a == "--adapt-min-gain") opt.adapt_min_gain = std::strtof(next("--adapt-min-gain"), nullptr);
         else if (a == "--rope-freq-base") opt.rope_freq_base = std::strtod(next("--rope-freq-base"), nullptr);
         else if (a == "--rope-freq-scale") opt.rope_freq_scale = std::strtod(next("--rope-freq-scale"), nullptr);

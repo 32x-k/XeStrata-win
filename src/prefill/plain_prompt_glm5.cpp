@@ -26,6 +26,7 @@
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/kernels.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/prefill.hpp"
 #include "plain_prompt.hpp"
 
 #include <algorithm>
@@ -98,7 +99,8 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
         const char* v = std::getenv("STRATA_PLAIN_CPU_SHARE");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
-    const bool cpu_share = cpu_env && split_.c > 0.0 && split_.p > 0.0 && P.cpu_cap > 0;
+    const bool cpu_share = cpu_env && strata::prefill::cpu_share_setting() != 0.0 && split_.c > 0.0 && split_.p > 0.0 &&
+                           P.cpu_cap > 0;
     static const bool profile = std::getenv("STRATA_PROMPT_PROFILE") != nullptr;
     // 0 KDA (its parts 5 projections, 6 convolutions and gates, 7 recurrence, 8 output), 1 DSA, 2 the grouping, 3 the
     // experts, 4 the shared expert, mHC and dense FFN

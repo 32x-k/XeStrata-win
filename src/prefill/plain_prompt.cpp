@@ -36,6 +36,7 @@
 #include "strata/kernels/xmx_gemm.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/prefill.hpp"
 #include "strata/prefill/kernels.hpp"
 #include "plain_prompt.hpp"
 
@@ -317,7 +318,10 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
                 if (res_[(size_t) (ml * E + e)] >= 0) ++hits;
                 else missed.emplace_back(count[(size_t) e], (int32_t) e);
             }
-        int want = (int) missed.size() - pcie_split_m(split_, true, (int) missed.size(), hits);
+        // a fixed share (--prefill-cpu-share S) gives the CPU S of the missed experts, else the times decide
+        const double fixed = strata::prefill::cpu_share_setting();
+        int want = fixed > 0.0 ? (int) std::lround(fixed * (double) missed.size())
+                               : (int) missed.size() - pcie_split_m(split_, true, (int) missed.size(), hits);
         std::sort(missed.begin(), missed.end());
         int64_t rows = 0;
         for (const auto& [c, e] : missed) {
@@ -701,12 +705,14 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
     // else dequantized to FP16
     const bool use_mmq = P.int8;
     // the CPU's share of the missed experts needs the split's times (measured at load from pinned RAM, on the decode
-    // window's kernels: the int8 and the FP16 path take them alike); STRATA_PLAIN_CPU_SHARE=0: every expert on the GPU
+    // window's kernels: the int8 and the FP16 path take them alike); STRATA_PLAIN_CPU_SHARE=0, or
+    // --prefill-cpu-share 0 (STRATA_PREFILL_CPU_SHARE, as Qwen3.8-Flash-Next's): every expert on the GPU
     static const bool cpu_env = [] {
         const char* v = std::getenv("STRATA_PLAIN_CPU_SHARE");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
-    const bool cpu_share = cpu_env && split_.c > 0.0 && split_.p > 0.0 && P.cpu_cap > 0;
+    const bool cpu_share = cpu_env && strata::prefill::cpu_share_setting() != 0.0 && split_.c > 0.0 && split_.p > 0.0 &&
+                           P.cpu_cap > 0;
     static const bool prompt_attn_on = [] {   // STRATA_PLAIN_PROMPT_ATTN=0: the decode's attention kernel
         const char* v = std::getenv("STRATA_PLAIN_PROMPT_ATTN");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
