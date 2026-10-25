@@ -2930,6 +2930,14 @@ struct Model::Impl {
             const size_t C = (size_t) chunk;
             c.C = chunk;
             c.A = std::max(64, (int) (((size_t) 8 << 20) / (size_t) HQ) / 64 * 64);
+            // DS4_ATTN_SLAB=N: the attention slab's rows.  The dense projections (q_b, wo_a/b) are dequantized and GEMM'd
+            // once a slab, so a slab of 256 rows dequantizes the same weights 32 times for an 8K prompt (measured: the
+            // dense dequant 916 ms of the 8K prompt, rocBLAS 867 ms); a larger slab costs VRAM for c.q/c.o and the oa
+            // buffers (A * HQ x 4 bytes each).
+            if (const char* v = std::getenv("DS4_ATTN_SLAB")) {
+                const int a = std::atoi(v);
+                if (a > 0) c.A = std::max(64, std::min(chunk, a) / 64 * 64);
+            }
             // (the indexer's slab: its scores rows are the context wide - about 64 MB of them)
             c.AI = std::max(32, std::min(128, (int) (((size_t) 64 << 20) / (((size_t) o.max_context + 64) * 4)) / 32 * 32));
             c.w16_elems = (size_t) 8 << 20;
