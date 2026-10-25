@@ -138,8 +138,8 @@ Each model's own license applies to its files.
 
 ### Image generation (optional)
 
-`xestrata --setup --images qwen-image-turbo` installs a model that makes images (Qwen-Image-2.1, Mage-Flow or MageTrail) besides the text model.
-The image model needs 16-20 GB of RAM besides the text model's.
+`xestrata --setup --images qwen-image-turbo` installs a model that makes images (Qwen-Image-2.1, Mage-Flow, MageTrail or Tencent's HunyuanImage 3.0) besides the text model.
+The image model needs 16-20 GB of RAM besides the text model's (HunyuanImage 3.0 about 50 GB).
 Choosing one, using it and the API: [docs/IMAGE.md](docs/IMAGE.md).
 
 ## Install
@@ -379,7 +379,7 @@ permission under GPL section 7, what goes in, and how to report).
    - the [abliterated versions](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF), by huihui-ai;
    - [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) by Ornith AI (the GSQ-RCO ones by pfeifferj), [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf) by LLM-jp,
      [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) by Qwen and [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) by Z.ai (both GGUFs by Unsloth);
-   - image generation: Qwen's Qwen-Image-2.1, Microsoft's Mage-Flow, RicemanT's MageTrail with Black Forest Labs' Flux2 VAE, and Qwen3-VL as the text encoder ([IMAGE](docs/IMAGE.md#licenses)).
+   - image generation: Qwen's Qwen-Image-2.1, Microsoft's Mage-Flow, RicemanT's MageTrail with Black Forest Labs' Flux2 VAE, Tencent's HunyuanImage 3.0, and Qwen3-VL as the text encoder ([IMAGE](docs/IMAGE.md#licenses)).
 
   Each model's own license applies to its files.
 - **Parts it uses:**

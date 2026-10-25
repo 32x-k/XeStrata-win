@@ -24,19 +24,24 @@ Qwen3.8-Flash-Next のどの版とも組み合わせられ（BETA のモデル�
 | `mage-flow` | [Mage-Flow](https://huggingface.co/Comfy-Org/Mage-Flow) | 20（CFG） | 強化学習で、指示への従い方と文字の描き方を調整した版 |
 | `mage-flow-base` | [Mage-Flow-Base](https://huggingface.co/Comfy-Org/Mage-Flow) | 30（CFG） | 調整の前の元のモデル |
 | `magetrail` | [MageTrail](https://huggingface.co/RicemanT/MageTrail) | 30（CFG） | Mage-Flow を Danbooru と e621 の画像で微調整した版。booru のタグで描くイラスト向け。編集はできない |
+| `hunyuan-image-3-distil` | [HunyuanImage 3.0 Instruct-Distil](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil) | 8 | Tencent の大きな MoE のモデル（80B）。いちばん細かく描け、いちばん遅い。プロンプトを自分で読むので文の読み手が要らず、ディスクと RAM をいちばん多く使う（約 50 GB）。編集はできない |
 
 この文書で「Qwen-Image-2.1」は Turbo と元のモデルの両方を指し、片方だけのことは「Turbo」「元のモデル」と書きます。
 
 - **文の読み手**: プロンプトを読むモデルです。Qwen-Image-2.1 は Qwen3-VL-8B、Mage-Flow と MageTrail は Qwen3-VL-4B を使います。
+  HunyuanImage 3.0 は文の読み手が無く、画像のモデルがプロンプトを自分で読みます。XeStrata はその単語の列（ids）を、モデル自身の `tokenizer.json` と、モデルが既定で使うシステム文（setup が `system_prompt.py` から書き出した `en_unified.txt`、5,674 文字）から組みます。
 - **`-uncensored`**: 名前の後ろに付けると（`qwen-image-turbo-uncensored`、`mage-flow-turbo-uncensored` など）、文の読み手を拒否の方向を取り除いたものに替えます。
   Qwen-Image-2.1 は AtomicChat の Qwen3-VL-8B、Mage-Flow と MageTrail は huihui-ai の Qwen3-VL-4B（noctrex の GGUF）です。画像のモデルと VAE はそのままです。
 - **CFG**: `mage-flow`、`mage-flow-base`、`magetrail` は、既定で強さ 5 の CFG（ネガティブのプロンプトとの差でプロンプトに寄せる方法）を掛けるので、1 ステップに 2 回分の計算をします。
+- **ガイダンス**: HunyuanImage 3.0 のガイダンス（既定 2.5）は、CFG のような 2 回目の計算ではなく、数値をモデルに渡す 1 個のトークンです。ネガティブのプロンプトはありません。
 - **Qwen-Image-2.1 と Mage-Flow の違い**: Qwen-Image-2.1 は編集の参照画像を 10 枚まで受け、マスクと透明な背景も使えます。
   Mage-Flow は参照画像が 3 枚まで（編集のモデルの学習と同じ）で、マスクと透明な背景はありません。
   Mage-Flow は生成用と編集用で画像のモデルが別で、setup は両方を入れ、編集のときだけエンジンが差し替えます。
 - **MageTrail**: Mage-Flow の画像のモデルを作り替えて微調整したもので、生成のモデルだけがあり、編集はできません。
   プロンプトは booru のタグ（`1girl, solo, silver hair, ...`）と文のどちらでも書け、`masterpiece, best quality, very aesthetic, aesthetic` を足すと画質が上がり、`Drawn by <画家名>` を先頭に置くとその画風になります（画家は MageTrail の作者が公開している一覧の 100 人）。
   VAE は作者が使っている Flux2 VAE（Black Forest Labs が FLUX.2-klein-4B で公開しているもの）です。
+- **HunyuanImage 3.0**: 画像を作るだけで、編集（参照画像・マスク・透明な背景）はありません。大きさは、モデルの決めた 37 の大きさ（バケット）のうち、頼んだ大きさに縦横比がいちばん近いもので作ります（512x512 は 1024x1024 になります）。
+  重みは Tencent の量子化した 2 つ（w4a8 と int8）から選びます。Tencent の既定の動かし方（描く前にモデルが推論とプロンプトの書き直しをする）ではなく、プロンプトからすぐ描きます。
 
 ## 入れ方
 
@@ -46,6 +51,9 @@ xestrata --setup --images qwen-image-turbo     # ソースから入れたとき�
 
 - setup は、画像のモデル、VAE、文の読み手、編集のための画像の読み手（Qwen3-VL の mmproj）をダウンロードして、設定に `"images"` を足します。
   どのファイルもリビジョンを固定し、SHA-256 で確かめます。
+- HunyuanImage 3.0 が落とすのは、画像のモデル（Tencent の量子化）、VAE、モデル自身の `tokenizer.json`、システム文の入った `system_prompt.py` の 4 つです。
+  setup は `system_prompt.py` からシステム文を読んで `en_unified.txt` として同じフォルダーに書きます（ファイルは実行しません）。文の読み手と、編集のための画像の読み手はありません。
+  重みを Tencent が配るのは bf16 だけなので、XeStrata は Tencent の量子化したファイル（ComfyUI 向けの単一ファイル）を、それが公開されている場所から固定して落とします。
 - setup を対話で動かすと、画像を作るモデルも聞きます（番号をカンマで区切って選び、2 つ以上なら既定のモデル、非検閲の文の読み手を使うかを続けて聞きます）。そのモデルの setup をやり直すときは、今の設定が既定の答えです。
 - `--images` を付けたときと `--yes` のときは聞きません。`--yes` で付けずに setup をやり直しても、前の画像の設定はそのまま残ります。
 - Windows のランチャー（`xestrata.exe`）では、モデルを入れる画面で画像のモデル（大きさが選べるものは大きさも）を選べ、入っているモデルの「Images ...」から画像のモデルだけを選び直せます（なしにすると外します）。
@@ -53,6 +61,7 @@ xestrata --setup --images qwen-image-turbo     # ソースから入れたとき�
 - カンマで区切ると、いくつものモデルを入れられます（`--images qwen-image-turbo,magetrail`）。先頭が既定のモデルで、ほかは API の `model` か Web のページのモデルの選択で使います。
   モデルの名前の後ろに `:大きさ` を付けると、そのモデルだけの大きさを選べます（`--images qwen-image-turbo:Q8_0,qwen-image-base:Q4_K_M`）。付けないモデルは `--image-quant` か、RAM に合わせた自動です。
   Mage-Flow と MageTrail はファイルが bf16 の 1 つだけなので、`:int8`（エンジンが読み込むときに必ず 8 ビットにする）か `:bf16`（必ず 16 ビットのまま。RAM は多めに要ります）です。付けなければ `--image-dit-q8` か、VRAM に合わせた自動です。
+  HunyuanImage 3.0 は `:w4a8` か `:int8` です。
   一度に GPU で動くのは 1 つで、違うモデルの要求が来ると、前のモデルのエンジンを止めてから起動し直します（数秒〜十数秒かかります）。RAM の目安は、いちばん大きいモデルの分です。
 - 同じ GPU で XeStrata のサーバーをいくつか動かしているときも、画像の仕事は GPU ごとに 1 つずつ順番に動きます。別のサーバーの仕事が動いている間は待ち（Monitor に出ます）、順番が来ると、ほかのモデルのエンジンを止めてから動きます。同じモデルのサーバーどうしは、同じエンジンを使います。
 - 入っている設定にあとから足すときは `tools/image/install.py --config <設定のファイル>` も使えます（`--model`、`--quant` などは setup のオプションと同じ意味です）。
@@ -71,10 +80,20 @@ Mage-Flow は大きさが 1 つ（bf16）で、ダウンロードは 21.9 GB、R
 MageTrail も大きさが 1 つで、ダウンロードは 10.4 GB、RAM の目安は 10 GB です。
 Flux2 VAE は 1024×1024 で約 4.3 GB の VRAM を使い、入らないときは画像をタイルに分けて読みます（遅くなり、色味がわずかに変わることがあります）。
 
-- **ダウンロード**: 画像のモデル（Mage-Flow は生成用と編集用の 2 つ）、VAE、文の読み手（Q8_0）、編集のための画像の読み手（MageTrail にはありません）の合計です。
+HunyuanImage 3.0 は Tencent の 2 つの量子化から選べます（`--image-quant`、既定は w4a8）。
+
+| 大きさ | ダウンロード | RAM の目安 | VRAM |
+| --- | ---: | ---: | ---: |
+| w4a8（既定） | 49.5 GB | 51 GB | 10 GB から |
+| int8 | 84.4 GB | 86 GB | 12 GB から |
+
+w4a8 は 4 ビットの重みと 8 ビットの活性（Tencent が ComfyUI 向けに配った量子化）で、1 ステップが int8 の約 2.5 分の 1 の時間です。int8（convrot の int8）のほうが bf16 の重みに近い画像になります。
+常に VRAM に置く重み（約 6.7 GB）と、流し込むエキスパートの入れ物 2 つ（w4a8 で 2.7 GB、int8 で 4.8 GB）が入らない GPU では動きません。VRAM が多いほどエキスパートを常駐させられ、速くなります。VAE は 1024x1024 で約 7.5 GB の作業領域を使い、タイルには分けないので、入らない大きさは断ります。
+
+- **ダウンロード**: 画像のモデル（Mage-Flow は生成用と編集用の 2 つ）、VAE、文の読み手（Q8_0）、編集のための画像の読み手（MageTrail にはありません）の合計です（HunyuanImage 3.0 は文の読み手の代わりに tokenizer とシステム文）。
 - **RAM の目安**: 文章のモデルとは別に要る量です。ファイルの大きさに、エンジン自身の約 2 GB を足したものです。
 - **足りないとき**: setup は、文章のモデルの残す RAM に入るまで、まず文の読み手を Q6_K、Q5_K、Q4_K の順に下げ、それでも入らなければ画像のモデルを Q6_K、Q4_K_M に下げます（画像のモデルを下げたときは、文の読み手をその横に入る中で最も大きいものにします）。
-  Mage-Flow では文の読み手だけを下げます。
+  Mage-Flow では文の読み手だけを、HunyuanImage 3.0 では画像のモデル（int8 を w4a8 へ）だけを下げます。
   下げたときは、setup の画面、サーバーの起動時の表示、Web のページがそのことを知らせます。
   `--image-ssd-offload on` なら下げずに選んだ大きさのまま入れ、RAM に入らない分は SSD から読みます（遅くなります）。
 - **VRAM**: VRAM に入らない層は、エンジンが RAM から流し込みます。そのため GPU のメモリでは大きさを選ばず、VRAM が大きいほど速くなります。
@@ -86,7 +105,7 @@ setup のオプションです（`xestrata --setup` に付けます）。
 | オプション | 既定 | 意味 |
 | --- | --- | --- |
 | `--images <モデル>`、`no` | — | 画像のモデルを入れる。`no` で画像の設定を消す |
-| `--image-quant Q8_0\|Q6_K\|Q4_K_M` | `Q8_0` | Qwen-Image-2.1 の画像のモデルの大きさ（Mage-Flow には効きません） |
+| `--image-quant Q8_0\|Q6_K\|Q4_K_M`、`w4a8\|int8` | `Q8_0`（HunyuanImage 3.0 は `w4a8`） | 画像のモデルの大きさ（Qwen-Image-2.1 は 3 つ、HunyuanImage 3.0 は Tencent の量子化 2 つ。Mage-Flow には効きません） |
 | `--image-ssd-offload on\|off` | `off` | `on` で、RAM が足りなくても大きさを下げない |
 | `--image-dit-q8 auto\|on\|off` | `auto` | Mage-Flow の画像のモデルを 8 ビットにするか。`auto` は、文の読み手と一緒に VRAM に全部入るときは 16 ビットのまま、入らないときは 8 ビット |
 | `--image-dit-keep on\|off` | `on` | Mage-Flow の使っていない方（生成用か編集用）の画像のモデルを 8 ビットで RAM に残す。`off` で RAM が約 4.4 GB 減り、差し替えのたびにファイルから読み直す |
@@ -109,20 +128,24 @@ Qwen-Image-2.1 の画像のモデルも、int8 の積がある GPU では同じ�
 | `keep_files` | 64 | `response_format: "url"` の画像を残す数 |
 | `out_dir` | 一時フォルダー | 画像とエンジンのログ（`strata-image.log`）を置くフォルダー |
 
+HunyuanImage 3.0 の `"images"` には、このほかに `steps`（8）・`guidance`（2.5）・`resolutions`（大きさのバケットのパラメータ）が入ります。編集が無いので `max_refs` は使いません。
+
 ## Web のページとチャット
 
 **Images のタブ**: 画像を設定すると、Web のページ（`http://127.0.0.1:8095`）に Images のタブが出ます。
 
 - いくつものモデルを入れたときは、モデルを選べます。欄の既定値や、使える欄（ステップ数、透明な背景、編集、マスク）は、選んだモデルに合わせて変わります。
 - プロンプト、大きさ（1024x1024、1536x1024、1024x1536、768x768、512x512、1920x1080、1080x1920、auto、一辺 256〜2048 の自由な大きさ）、種を選んで Generate を押します。
+  HunyuanImage 3.0 では、頼んだ大きさに縦横比がいちばん近い、モデルの決めた 37 の大きさ（バケット）で作り、違う大きさになったときはそう知らせます。
 - 枚数と出力の形式（PNG・JPEG・WebP・JPEG XL。PNG 以外は画質も）を選べます。透明な背景には JPEG は使えません。
   枚数は、選んだ大きさとステップ数で `budget_s` の時間に収まる数まで（`max_n` が上限）で、横に見積もりの時間が出ます。
   形式の既定は、ブラウザーが JPEG XL を表示でき、サーバーが書けるときは JPEG XL（画質 100、可逆）、そうでなければ PNG です。選んだ形式と画質はブラウザーに残ります。
 - ネガティブのプロンプト（画像に入れたくないもの）、ステップ数、CFG の強さも指定できます。空欄ならモデルの既定（API と同じ）で、欄にその値が薄く出ます。
   ステップ数は Turbo（8 で固定）では出ません。ネガティブのプロンプトは CFG を 1 より大きくしたときだけ効き、効かないときは欄の下にそのことが出ます。
+  HunyuanImage 3.0 では、ガイダンスは 1 個のトークンなので、欄は Guidance になり、ネガティブのプロンプトの欄は出ません。
 - Qwen-Image-2.1 では、透明な背景も選べます。
 - Qwen-Image-2.1 で参照画像を添付すると、1 枚目の画像の上で描き直す部分を塗れます（ブラシの大きさ、消しゴム、全部消す）。塗った部分だけを描き直し、残りは元の画素のまま残します（API の `mask`）。塗らなければ、画像全体の編集です。
-- 参照画像を添付すると編集になります（PNG、JPEG、GIF、BMP、WebP）。
+- 参照画像を添付すると編集になります（PNG、JPEG、GIF、BMP、WebP）。MageTrail と HunyuanImage 3.0 は参照画像を受けません。
 - 画像は 1 枚ずつ作ります。何枚も作る途中でチャットの要求が来ると、いまの 1 枚の後にそちらを先に動かし、終わってから残りを作ります（文章のモデルを外す `unload` のときは、外したまま最後まで作ります）。
 - **Monitor** のタブに、いまの段階、ステップの進み具合と 1 ステップの秒数が出ます。
 
@@ -147,14 +170,14 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 | --- | --- | --- |
 | `prompt` | — | 必須。16,000 文字まで |
 | `model` | 既定のモデル | 画像のモデルの名前（`/v1/models` にあるもの）。いくつものモデルを入れたときに選びます。知らない名前（OpenAI の `gpt-image-1` など）は既定のモデルです |
-| `size` | `auto`（1024x1024） | `幅x高さ`。一辺 256〜2048。16 の倍数でない大きさ（1920x1080 など）は、16 の倍数に切り上げて作り、真ん中を切り出します |
+| `size` | `auto`（1024x1024） | `幅x高さ`。一辺 256〜2048。16 の倍数でない大きさ（1920x1080 など）は、16 の倍数に切り上げて作り、真ん中を切り出します。HunyuanImage 3.0 は、縦横比がいちばん近いバケット（37 の大きさ）で作り、応答の `size` はその大きさです |
 | `n` | 1 | 1〜`max_n`（16）。`budget_s` に収まらない数は、見積もりの時間を添えて断ります。i 枚目は種 `seed + i` で作ります |
 | `seed` | ランダム | 0〜2^62 |
-| `steps`（`num_inference_steps`） | モデルのステップ数 | Qwen-Image-2.1 の元のモデルは 2〜100、Mage-Flow は 1〜100。Turbo は 8 のままです |
-| `quality` | `auto` | Qwen-Image-2.1 の元のモデルのステップ数: `low` 20、`medium`（`standard`）30、`high`・`hd`・`auto` は既定の 40（`steps` を付けたときはそちら） |
-| `negative_prompt` | なし（Mage-Flow は空白 1 文字） | CFG のネガティブのプロンプト |
-| `true_cfg_scale`、`guidance_scale` | Mage-Flow は設定の値 | CFG の強さ（0〜30、1 なら CFG なし）。Qwen-Image-2.1 は `true_cfg_scale` が 1 より大きく `negative_prompt` があるときだけ掛け（`guidance_scale` は使いません）、Mage-Flow は `true_cfg_scale`、なければ `guidance_scale` |
-| `background` | `auto` | `transparent` で透明な背景（Qwen の推奨する形でプロンプトを包みます。png、webp、jxl だけ）、`opaque` でアルファを白の上に重ねて消す。Mage-Flow は `transparent` を断ります |
+| `steps`（`num_inference_steps`） | モデルのステップ数 | Qwen-Image-2.1 の元のモデルは 2〜100、Mage-Flow と HunyuanImage 3.0 は 1〜100（HunyuanImage 3.0 の既定は 8）。Turbo は 8 のままです |
+| `quality` | `auto` | Qwen-Image-2.1 の元のモデルのステップ数: `low` 20、`medium`（`standard`）30、`high`・`hd`・`auto` は既定の 40（`steps` を付けたときはそちら）。Mage-Flow と HunyuanImage 3.0 では使いません |
+| `negative_prompt` | なし（Mage-Flow は空白 1 文字） | CFG のネガティブのプロンプト。HunyuanImage 3.0 では使いません（ガイダンスはトークン 1 個で、掛けるものがありません） |
+| `true_cfg_scale`、`guidance_scale` | Mage-Flow と HunyuanImage 3.0 は設定の値 | CFG の強さ（0〜30、1 なら CFG なし）。Qwen-Image-2.1 は `true_cfg_scale` が 1 より大きく `negative_prompt` があるときだけ掛け（`guidance_scale` は使いません）、Mage-Flow は `true_cfg_scale`、なければ `guidance_scale`。HunyuanImage 3.0 はガイダンスの強さとして `guidance_scale`（なければ `true_cfg_scale`、どちらも無ければ設定の 2.5）を使い、CFG は掛けません |
+| `background` | `auto` | `transparent` で透明な背景（Qwen の推奨する形でプロンプトを包みます。png、webp、jxl だけ）、`opaque` でアルファを白の上に重ねて消す。Mage-Flow と HunyuanImage 3.0 は `transparent` を断ります |
 | `output_format` | `png` | `png`、`jpeg`、`webp`、`jxl`（JPEG XL。libjxl の cjxl があるときだけ） |
 | `output_compression` | 100 | 0〜100。jpeg、webp、jxl の画質（jxl の 100 は可逆） |
 | `response_format` | `b64_json` | `url` なら `/v1/images/files/<名前>` のリンクを返します（新しい 64 枚まで残します） |
@@ -168,6 +191,8 @@ Qwen-Image-2.1 の CFG は、diffusers の Qwen-Image-2.1 と同じ式です。�
 
 - **参照画像**: OpenAI の形の multipart の `image` か `image[]`、または JSON の `"images": [{"image_url": ...}]`（data: の URL、http(s) の URL）。
   Qwen-Image-2.1 は 10 枚まで、Mage-Flow は 3 枚までです。1 枚 32 MiB まで、16x16 ピクセル以上です。
+- **モデル**: `model` で選びます。付けないときは既定のモデルで、既定のモデルが編集できないとき（MageTrail、HunyuanImage 3.0）は編集できる最初のモデルで作り、応答の `model` がそれを示します。
+  MageTrail と HunyuanImage 3.0 を指名した編集は断ります（HunyuanImage 3.0 は VAE のエンコーダがまだ無いためです）。
   PNG、JPEG、GIF、BMP はそのまま、ほかの形式（WebP など）は PNG に変えて読みます。
 - **大きさ**: `size` を `auto` にするか付けないと、1 枚目の参照画像の縦横比で約 1024x1024 ピクセルにします。
 - **参照画像の読み方**: Qwen-Image-2.1 は、出力の大きさにかかわらず 1 枚ずつ縦横比を保った約 1024x1024 ピクセルで読みます。参照画像が多いほど時間とメモリがかかります。
@@ -179,8 +204,8 @@ Qwen-Image-2.1 の CFG は、diffusers の Qwen-Image-2.1 と同じ式です。�
 ### 応答
 
 - `data[]`: 画像（`b64_json` か `url`）と、`revised_prompt`、`seed`。
-- `usage`: 画像のエンジンのトークンで数えます（プロンプトのトークンと、参照画像と作った画像の 16x16 ピクセルで 1 つのトークン）。
-- `strata`: かかった秒数、ステップ数、CFG の強さ、文の読み手・サンプリング・VAE のそれぞれの時間、文章のモデルの扱い（`gpu_policy`）。
+- `usage`: 画像のエンジンのトークンで数えます（プロンプトのトークンと、参照画像と作った画像の 16x16 ピクセルで 1 つのトークン）。HunyuanImage 3.0 では、プロンプトの ids と、作った画像の 16x16 画素ごとの 1 個です。
+- `strata`: かかった秒数、ステップ数、CFG の強さ、文の読み手・サンプリング・VAE のそれぞれの時間、文章のモデルの扱い（`gpu_policy`）。HunyuanImage 3.0 では、ガイダンスの強さ（`guidance`）、バケットの番号（`ratio`）、頼んだ大きさが別のときはそれ（`requested_size`）も。
 - 画像のモデルは `/v1/models` にも出ます。
 
 ### チャットから
@@ -223,6 +248,17 @@ Turbo（`qwen-image-turbo`）で 1024x1024、8 ステップの画像 1 枚（エ
 - Qwen-Image-2.1 の編集は、B70 の 1024x1024 で参照画像 3 枚が約 46 秒、10 枚が約 4 分です。
 - 自分の PC での速さは `xestrata --bench` が最後に測ります（[BENCH](BENCH.ja.md)）。
 
+HunyuanImage 3.0（`hunyuan-image-3-distil`、B70 の w4a8、8 ステップ、エンジンの起動を含む）:
+
+| 大きさ | XeStrata |
+| --- | ---: |
+| 1024x1024（64x64 トークン） | 78 秒 |
+| 1280x720（45x80 トークン） | 70 秒 |
+
+- 1024x1024 の 78 秒のうち、エンジンの起動が 18 秒、プロンプトの読み込み（5,370 ids）が 7 秒、サンプリングが 50 秒（6.1 秒/ステップ）、VAE の復号が 3 秒です。
+- int8 は 1 ステップに w4a8 の約 2.5 倍の時間がかかります。
+- 1 ステップの大半は、VRAM に入らないエキスパート（w4a8 で 32 層 43.6 GB）を RAM から流し込む時間と、流し込んだものを 16 ビットに戻す時間です。VRAM が多いほど速くなります。
+
 ## 困ったとき
 
 | 表示 | 原因と対処 |
@@ -232,6 +268,8 @@ Turbo（`qwen-image-turbo`）で 1024x1024、8 ステップの画像 1 枚（エ
 | `this image needs at least X GiB of VRAM ...`（400） | この画像に要る VRAM が足りません。参照画像を減らすか小さくするか、画像を小さくします |
 | `this image keeps X GiB of its prompt's cache in RAM ...`（400） | 参照画像のキャッシュに RAM が足りません。同じく参照画像を減らすか小さくします |
 | `edits need the vision encoder ...`（400） | 編集のためのファイルがありません。setup を `--images` を付けてもう一度実行します |
+| `edits: HunyuanImage 3.0 makes an image from a prompt ...`（400） | HunyuanImage 3.0 は参照画像を受けません（編集はまだありません）。編集は `model` で別のモデルを選びます |
+| `the VRAM budget ... is below the weights that always stay`（400） | HunyuanImage 3.0 の常に置く重みと入れ物（約 10 GB）が VRAM に入りません。この GPU では動きません |
 | `the image engine did not start ...`、`the image engine ended` | 画像のエンジンが起動しないか、止まりました。表示にあるログ（`strata-image.log`）を見てください |
 | `Image generation runs the image model at Q6_K instead of Q8_0 ...` | RAM が足りないので、setup が大きさを下げました（[大きさとメモリ](#大きさとメモリ)） |
 | `faster with NVIDIA's ... cuDNN for the image engine's attention`（setup） | cuDNN がないので、NVIDIA の GPU の注意を XeStrata のカーネルで計算します。示されたコマンドで入れると速くなります |
@@ -243,4 +281,7 @@ Turbo（`qwen-image-turbo`）で 1024x1024、8 ステップの画像 1 枚（エ
   XeStrata は Mage-Flow の内容のフィルターも透かしも入れていません。
 - MageTrail の重みは MIT です。MageTrail は Danbooru と e621 の画像で学習されていて、XeStrata はその内容のフィルターも入れていません。
   VAE は Black Forest Labs が FLUX.2-klein-4B で公開している Flux2 VAE で、Apache 2.0 です（MageTrail のリポジトリにある同じ VAE は FLUX.2-dev の非商用のライセンスなので、setup はそちらを使いません）。
+- HunyuanImage 3.0 の重みは Tencent Hunyuan Community License Agreement で、欧州連合・英国・韓国には適用されません。
+  使い方の許諾の範囲（Acceptable Use Policy）も含めて、使う前に [Tencent のライセンス](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE) を読んでください。
+  量子化したファイルは PedroMarinhoDev が ComfyUI 向けに公開しているものです。
 - 文の読み手（Qwen3-VL、AtomicChat と huihui-ai の版）には、それぞれのライセンスが適用されます。
