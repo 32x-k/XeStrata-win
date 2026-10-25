@@ -1318,6 +1318,25 @@ int64_t PlainModel::swaps() const {
     return n;
 }
 
+int64_t PlainModel::offloaded() const {
+    int64_t n = disp_.offload_entries;
+    for (const auto& st : next_) n += st->offloaded();
+    return n;
+}
+
+// the arena holds every expert in RAM; read in place, the RAM copy and the files count apart (FileExpertSource)
+int64_t PlainModel::ram_reads() const {
+    return in_ram_ ? src_->reads() : static_cast<const FileExpertSource*>(src_)->ram_reads();
+}
+
+int64_t PlainModel::file_reads() const {
+    return in_ram_ ? 0 : static_cast<const FileExpertSource*>(src_)->file_reads();
+}
+
+uint64_t PlainModel::file_read_bytes() const {
+    return in_ram_ ? 0 : static_cast<const FileExpertSource*>(src_)->file_read_bytes();
+}
+
 std::vector<int64_t> PlainModel::split_points() const {
     std::vector<int64_t> at(next_.size());
     for (size_t i = 0; i < next_.size(); ++i) at[i] = next_[i]->lb_;

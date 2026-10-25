@@ -137,7 +137,7 @@ void linkless_gpu_adapter() {
 
 // `--serve` for these models: generate.cpp's --serve protocol (server.py's StrataEngine) for text requests.  READY
 // <context> stop; then `GEN <max_new> [temperature=F top_p=F top_k=N min_p=F seed=N] <ids>` -> RESUME <reused>,
-// one `T <id>` a token, DONE (generate.cpp's fields; the RAM, file and offload ones zero); STOP ends a request,
+// one `T <id>` a token, DONE (generate.cpp's fields); STOP ends a request,
 // QUIT the engine; SAVE / RESTORE <path> a session file.  The commands of Qwen3.8-Flash-Next's engine this one has no
 // part for (VRAM, GENI, BGEN) answer ERR.  The conversation's tokens stay read between requests: a request that starts
 // with them reads only what follows (a model with a recurrent state only when it extends them all; else it starts
@@ -454,6 +454,8 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         const Clock::time_point t0 = Clock::now();
         const int64_t hits0 = model.hits(), look0 = model.hits() + model.misses();
         const int64_t acc0 = model.spec_accepted(), off0 = model.spec_drafted();
+        const int64_t ram0 = model.ram_reads(), files0 = model.file_reads(), offload0 = model.offloaded();
+        const uint64_t file_bytes0 = model.file_read_bytes();
         bool ok = true;
         int32_t next = -1;
         bool windows = opt.prompt_chunk <= 0;
@@ -520,10 +522,12 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         const Clock::time_point t2 = Clock::now();
         const double prompt_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         const double decode_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
-        std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld 0 0 0.0 %lld 0\n", produced, (long long) n,
-                    prompt_ms, decode_ms, finish, (long long) (model.spec_accepted() - acc0),
+        std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld\n", produced,
+                    (long long) n, prompt_ms, decode_ms, finish, (long long) (model.spec_accepted() - acc0),
                     (long long) (model.spec_drafted() - off0), (long long) resume, (long long) (model.hits() - hits0),
-                    (long long) (model.hits() + model.misses() - look0), (long long) (n - resume));
+                    (long long) (model.hits() + model.misses() - look0), (long long) (model.ram_reads() - ram0),
+                    (long long) (model.file_reads() - files0), (double) (model.file_read_bytes() - file_bytes0) / 1e6,
+                    (long long) (n - resume), (long long) (model.offloaded() - offload0));
         std::fflush(stdout);
     }
     if (!profile_save.empty() && !model.save_profile(profile_save, err)) {
@@ -867,6 +871,9 @@ int plain_main(int argc, char** argv) {
                  (double) (produced.size() - 1) / (tg > 0 ? tg : 1), (long long) model.resident(),
                  (long long) model.slots(), routed > 0 ? 100.0 * (double) model.hits() / (double) routed : 0.0,
                  (long long) model.swaps());
+    std::fprintf(stderr, "strata (%s): below the VRAM tier: %lld routed entries read over PCIe; experts taken from "
+                         "RAM %lld, from the files %lld (%.1f MB)\n", arch.c_str(), (long long) model.offloaded(),
+                 (long long) model.ram_reads(), (long long) model.file_reads(), (double) model.file_read_bytes() / 1e6);
     if (model.spec_windows() > 0)
         std::fprintf(stderr, "strata (%s): %lld windows checked %lld drafts, accepted %lld (%.1f%%), %.2f tokens a window; "
                              "a window %.2f ms, its drafts %.2f ms\n",

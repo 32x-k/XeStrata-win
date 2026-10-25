@@ -184,6 +184,12 @@ public:
     int64_t hits() const;
     int64_t misses() const;
     int64_t swaps() const;
+    /// The tiers below VRAM, for the report: the routed entries the GPUs read over PCIe (not in hits or misses), the
+    /// experts taken from the RAM copy and from the model's files, and the bytes read from the files.
+    int64_t offloaded() const;
+    int64_t ram_reads() const;
+    int64_t file_reads() const;
+    uint64_t file_read_bytes() const;
     /// The layer split's first blocks after GPU 0's (empty: one GPU).
     std::vector<int64_t> split_points() const;
     /// Writes what this run learned as a profile (rank_learned_profile: the experts in VRAM now, then by the routing
