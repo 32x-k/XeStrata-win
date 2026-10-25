@@ -382,16 +382,20 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
     // read ahead on the source's threads (prefetch, its page faults side by side), the next group's while this one is
     // copied and multiplied.  Group gi of the loop below takes the gi-th kGroup of the missed experts in order.
     // (GLM-5.3-Flash UD-IQ3_XXS on the B70, a 1K-token prompt: its 11,735 missed experts took 22 s read one by one.)
+    // (each expert asked: with a RAM copy of part of the layer the first expert says nothing of the others - the
+    // layer's file reads went one by one whenever its lowest routed expert was in RAM)
     std::vector<std::vector<int64_t>> ahead;
-    if (use_mmq && transient)
+    if (use_mmq) {
+        int64_t missed = 0;   // the loop's groups count every missed expert: a group's read-ahead takes its file ones
         for (int32_t e : experts)
             if (res_[(size_t) (ml * E + e)] < 0) {
-                if (ahead.empty() || (int) ahead.back().size() == PromptBufs::kGroup) ahead.emplace_back();
-                ahead.back().push_back(e);
+                if (missed++ % PromptBufs::kGroup == 0) ahead.emplace_back();
+                if (src_->transient(ml, e)) ahead.back().push_back(e);
             }
+    }
     std::future<void> fetch;
     auto fetch_group = [&](size_t i) {
-        if (i < ahead.size())
+        if (i < ahead.size() && !ahead[i].empty())
             fetch = std::async(std::launch::async, [this, ml, &ahead, i] {
                 src_->prefetch(ml, ahead[i].data(), (int64_t) ahead[i].size());
             });
