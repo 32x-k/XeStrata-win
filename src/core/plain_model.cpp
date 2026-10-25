@@ -37,6 +37,7 @@
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_select.hpp"
+#include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/rope_scaling.hpp"
 #include "strata/kernels/router_top10.hpp"
@@ -663,22 +664,32 @@ bool PlainModel::load_qwen(std::string& err) {
     n_pages_ = (opt_.max_cells + qs.page_size - 1) / qs.page_size;
     opt_.max_cells = n_pages_ * qs.page_size;
     {
-        const size_t pool = (size_t) (n_pages_ * qs.n_head_kv * qs.page_size * qs.head_dim) * 2;
+        const size_t cells = (size_t) (n_pages_ * qs.n_head_kv * qs.page_size);
         k_pool_.assign((size_t) n_attn, nullptr);
         v_pool_.assign((size_t) n_attn, nullptr);
+        k_q_.assign((size_t) n_attn, nullptr);
+        v_q_.assign((size_t) n_attn, nullptr);
+        k_scale_.assign((size_t) n_attn, nullptr);
+        v_scale_.assign((size_t) n_attn, nullptr);
+        auto take = [&](auto*& p, size_t bytes) {
+            if (!strata::gpu::alloc_device(&p, bytes)) return false;
+            allocs_.push_back(p);
+            return true;
+        };
         for (int64_t i = 0; i < n_attn; ++i) {   // this stage's attention blocks, the MTP layer on the last
             bool mine = has_mtp_ && i == mtp_.attn;
             for (int64_t l = lb_; l < le_ && !mine; ++l) mine = blocks_[(size_t) l].attn == i;
             if (!mine) continue;
-            uint16_t *kp = nullptr, *vp = nullptr;
-            if (!strata::gpu::alloc_device(&kp, pool) || !strata::gpu::alloc_device(&vp, pool)) {
+            const size_t a = (size_t) i;
+            const bool ok = opt_.kv_int8
+                                ? take(k_q_[a], cells * qs.head_dim) && take(v_q_[a], cells * qs.head_dim) &&
+                                      take(k_scale_[a], cells * (qs.head_dim / k::KV_Q8_GROUP) * 2) &&
+                                      take(v_scale_[a], cells * (qs.head_dim / k::KV_Q8_GROUP) * 2)
+                                : take(k_pool_[a], cells * qs.head_dim * 2) && take(v_pool_[a], cells * qs.head_dim * 2);
+            if (!ok) {
                 err = "plain model: no VRAM for the K/V cache (" + std::to_string(opt_.max_cells) + " cells)";
                 return false;
             }
-            allocs_.push_back(kp);
-            allocs_.push_back(vp);
-            k_pool_[(size_t) i] = kp;
-            v_pool_[(size_t) i] = vp;
         }
         std::vector<int32_t> table((size_t) n_pages_);
         for (int64_t i = 0; i < n_pages_; ++i) table[(size_t) i] = (int32_t) i;
@@ -1318,6 +1329,18 @@ int64_t PlainModel::swaps() const {
     return n;
 }
 
+k::QsaAttnPools PlainModel::kv_pools(size_t a) const {
+    k::QsaAttnPools pools;
+    pools.k_pool = k_pool_[a];
+    pools.v_pool = v_pool_[a];
+    pools.k_q = k_q_[a];
+    pools.v_q = v_q_[a];
+    pools.k_scale = k_scale_[a];
+    pools.v_scale = v_scale_[a];
+    pools.page_table = page_table_;
+    return pools;
+}
+
 int64_t PlainModel::offloaded() const {
     int64_t n = disp_.offload_entries;
     for (const auto& st : next_) n += st->offloaded();
@@ -1383,11 +1406,17 @@ std::vector<PlainModel::StatePart> PlainModel::state_parts(int64_t tokens) const
     // table is the identity)
     const k::QsaShapes qs = attn_shapes(s, nkv_);
     const int64_t pages = std::min<int64_t>(n_pages_, (tokens + qs.page_size - 1) / qs.page_size);
-    const size_t page = (size_t) (qs.n_head_kv * qs.page_size * qs.head_dim) * 2;
+    const size_t cells = (size_t) (pages * qs.n_head_kv * qs.page_size);
     for (size_t a = 0; a < k_pool_.size(); ++a) {
-        if (k_pool_[a] == nullptr) continue;
-        parts.push_back({k_pool_[a], (size_t) pages * page});
-        parts.push_back({v_pool_[a], (size_t) pages * page});
+        if (k_pool_[a] != nullptr) {
+            parts.push_back({k_pool_[a], cells * qs.head_dim * 2});
+            parts.push_back({v_pool_[a], cells * qs.head_dim * 2});
+        } else if (k_q_[a] != nullptr) {
+            parts.push_back({k_q_[a], cells * qs.head_dim});
+            parts.push_back({v_q_[a], cells * qs.head_dim});
+            parts.push_back({k_scale_[a], cells * (qs.head_dim / k::KV_Q8_GROUP) * 2});
+            parts.push_back({v_scale_[a], cells * (qs.head_dim / k::KV_Q8_GROUP) * 2});
+        }
     }
     return parts;
 }
@@ -1467,10 +1496,16 @@ bool PlainModel::reset(std::string& err) {
     for (float* p : gdn_state_) ok = ok && (p == nullptr || strata::gpu::memset(p, 0, state_bytes_));
     for (float* p : gdn_conv_) ok = ok && (p == nullptr || strata::gpu::memset(p, 0, conv_bytes_));
     const k::QsaShapes qs = attn_shapes(s, nkv_);
-    const size_t pool = (size_t) (n_pages_ * qs.n_head_kv * qs.page_size * qs.head_dim) * 2;
-    for (size_t i = 0; i < k_pool_.size(); ++i)
+    const size_t cells = (size_t) (n_pages_ * qs.n_head_kv * qs.page_size);
+    const size_t pool = cells * qs.head_dim * 2, codes = cells * qs.head_dim,
+                 scales = cells * (qs.head_dim / k::KV_Q8_GROUP) * 2;
+    for (size_t i = 0; i < k_pool_.size(); ++i) {
         ok = ok && (k_pool_[i] == nullptr ||
                     (strata::gpu::memset(k_pool_[i], 0, pool) && strata::gpu::memset(v_pool_[i], 0, pool)));
+        ok = ok && (k_q_[i] == nullptr ||
+                    (strata::gpu::memset(k_q_[i], 0, codes) && strata::gpu::memset(v_q_[i], 0, codes) &&
+                     strata::gpu::memset(k_scale_[i], 0, scales) && strata::gpu::memset(v_scale_[i], 0, scales)));
+    }
     cur_ = -1;
     drafts_.clear();
     if (!ok) err = "plain model: resetting the state failed";
@@ -1559,15 +1594,16 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
                                     (int) s.rope_dims, eps, rs, pos_q, cs);
         k::native_qsa_rms_norm_rope(kraw_, (int) HD, b.k_norm, kcur_, (int) (T * NKV), (int) HD,
                                     (int) s.rope_dims, eps, rs, pos_k, cs);
-        for (int t = 0; t < T; ++t)
-            k::kv_append_step(k_pool_[(size_t) a], v_pool_[(size_t) a], page_table_,
-                              step_ + (size_t) t * k::kStepCount, kcur_ + (size_t) t * NKV * HD,
-                              vcur_ + (size_t) t * NKV * HD, qs, cs);
-        k::QsaAttnPools pools;
-        pools.k_pool = k_pool_[(size_t) a];
-        pools.v_pool = v_pool_[(size_t) a];
-        pools.page_table = page_table_;
-        k::qsa_dense_attn_batch(qcur_, pools, step_, opt_.max_cells, qs, attn_scratch_, attn_, T, cs);
+        for (int t = 0; t < T; ++t) {
+            const int32_t* st = step_ + (size_t) t * k::kStepCount;
+            const float *kc = kcur_ + (size_t) t * NKV * HD, *vc = vcur_ + (size_t) t * NKV * HD;
+            if (opt_.kv_int8)
+                k::kv_append_q8_step(k_q_[(size_t) a], v_q_[(size_t) a], k_scale_[(size_t) a], v_scale_[(size_t) a],
+                                     page_table_, st, kc, vc, qs, cs);
+            else
+                k::kv_append_step(k_pool_[(size_t) a], v_pool_[(size_t) a], page_table_, st, kc, vc, qs, cs);
+        }
+        k::qsa_dense_attn_batch(qcur_, kv_pools((size_t) a), step_, opt_.max_cells, qs, attn_scratch_, attn_, T, cs);
         if (has_gate_) {
             k::native_qsa_gate_apply(attn_, qfull_, attn32_, (int) (T * NH), (int) HD, cs);
             proj(b.o, attn32_, mix_, T, true);

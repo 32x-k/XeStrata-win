@@ -369,7 +369,7 @@ Ornith's official versions (Q4_K_M to BF16), Qwen3.6 and GLM-5.3-Flash draft up 
 With two or more GPUs chosen by `setup --gpus`, the layers are split across them (the first GPU runs the first layers,
 the next the later ones, the head and the MTP layer; the points follow each GPU's share of the free memory), and the
 experts in VRAM are all the GPUs' together.
-Not yet: images, and the options made for Qwen3.8-Flash-Next such as the KV cache's precision and the low-RAM modes.
+Not yet: images, and the options made for Qwen3.8-Flash-Next such as the low-RAM modes (of the KV cache's precisions only `--kv int8`, and not for GLM-5.3-Flash yet).
 When RAM is short of all the experts, the engine keeps the ones VRAM does not hold in RAM as far as it has room and
 reads the rest from the model file through the OS file cache (slower; setup warns of it when the RAM and the VRAM
 together are short).
@@ -380,6 +380,7 @@ The engine's options (added to the settings' `args`):
 | Option | Meaning |
 | --- | --- |
 | `--max-context N` | the KV cache's tokens (setup picks it from the GPU's VRAM) |
+| `--kv fp16\|int8` | the attention layers' KV cache in FP16 (the default) or as int8 codes with an FP16 scale per 64 values: half the VRAM, the answers differ slightly (not for GLM-5.3-Flash) |
 | `--expert-profile PATH` | fill the experts in VRAM in this profile's order at start |
 | `--expert-profile-save PATH` | write what this run learned as a profile |
 | `--adapt-every N` | how often the experts in VRAM are swapped: at every 4N-th token of a request; where a layer rounds differently on the CPU and the GPU the windows are cut there, so the text does not depend on the drafting. Qwen3.8's four files decode to the same bits on the CPU and the GPU and are not cut, but serve's prompts from the second turn on round with the swaps' timing, so the text can differ from run to run (`STRATA_ADAPT_CUT=1` cuts them) (the batch slots, `--pipeline-windows` and `--adapt-async`: every N windows) (default 4; 0: no swaps). Without it, when the CPU pool took 30% or more of the checks' time at the 32nd output token, the swaps come every 4 tokens; not when the experts the GPU does not hold are read from the files (`--mmap-experts`) |

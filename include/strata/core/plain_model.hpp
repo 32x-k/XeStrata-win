@@ -34,6 +34,7 @@
 #include "strata/core/gpu.hpp"
 #include "strata/core/moe_window.hpp"
 #include "strata/kernels/cpu/pool.hpp"
+#include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/sampler.hpp"
 
 #include <cstdint>
@@ -52,6 +53,9 @@ namespace strata::core {
 struct PlainOptions {
     std::string gguf;               ///< any shard of the model
     int64_t max_cells = 4096;       ///< the context the K/V cache holds
+    /// --kv int8: the attention layers' K and V as int8 codes with an FP16 scale per 64 values (kv_q8.hpp), half the
+    /// FP16 cache's bytes; the answers differ slightly.  Not GLM-5.3-Flash's DSA caches.
+    bool kv_int8 = false;
     int max_t = 8;                  ///< the largest window
     int pool_workers = 0;           ///< CPU pool workers (0: every physical core but the first)
     int64_t reserve_mib = -1;       ///< VRAM left free after the expert slots (-1: from the device's memory)
@@ -542,7 +546,11 @@ private:
     int last_T_ = 0;           ///< the last forward window's size
     int64_t spec_windows_ = 0, spec_drafted_ = 0, spec_accepted_ = 0;
     double spec_ms_check_ = 0, spec_ms_draft_ = 0;
-    std::vector<uint16_t*> k_pool_, v_pool_;      ///< per attention block
+    std::vector<uint16_t*> k_pool_, v_pool_;      ///< per attention block (FP16; null with kv_int8)
+    std::vector<int8_t*> k_q_, v_q_;              ///< ...kv_int8's codes
+    std::vector<uint16_t*> k_scale_, v_scale_;    ///< ...and their scales
+    /// The attention block a's pools, for the kernels
+    strata::kernels::QsaAttnPools kv_pools(size_t a) const;
     int32_t* page_table_ = nullptr;
     int64_t n_pages_ = 0;
 

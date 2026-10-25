@@ -28,6 +28,7 @@
 #include "strata/kernels/prompt_attn.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/qsa.hpp"
+#include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/rope_scaling.hpp"
 #include "strata/kernels/router_top10.hpp"
@@ -881,19 +882,21 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     };
                     norm_rope(P.qfull, qw / NH, b.q_norm, P.qcur, NH, P.pos_q);
                     norm_rope(P.kraw, HD, b.k_norm, P.kcur, NKV, P.pos_k);
-                    k::kv_append_steps(k_pool_[(size_t) a], v_pool_[(size_t) a], page_table_, P.steps, k::kStepCount,
-                                       P.kcur, P.vcur, (int) (NKV * HD), (int) T, qs, cs);
-                    k::QsaAttnPools pools;
-                    pools.k_pool = k_pool_[(size_t) a];
-                    pools.v_pool = v_pool_[(size_t) a];
-                    pools.page_table = page_table_;
+                    if (opt_.kv_int8)
+                        k::kv_append_q8_steps(k_q_[(size_t) a], v_q_[(size_t) a], k_scale_[(size_t) a],
+                                              v_scale_[(size_t) a], page_table_, P.steps, k::kStepCount, P.kcur, P.vcur,
+                                              (int) (NKV * HD), (int) T, qs, cs);
+                    else
+                        k::kv_append_steps(k_pool_[(size_t) a], v_pool_[(size_t) a], page_table_, P.steps,
+                                           k::kStepCount, P.kcur, P.vcur, (int) (NKV * HD), (int) T, qs, cs);
+                    const k::QsaAttnPools pools = kv_pools((size_t) a);
                     // the prompt attention (prompt_attn: K and V read once a block of queries), else the decode's
                     // kernel: every query reads the cells up to its own; the grid as wide as the chunk's last context (not
                     // the cache's capacity: no graph holds it), as many queries a launch as the scratch takes
                     const int64_t cap = std::min<int64_t>(opt_.max_cells, pa + T);
                     const int64_t per_q = (int64_t) k::qsa_decode_attn_scratch_floats(cap, qs);
                     const int64_t nq_max = std::max<int64_t>(1, std::min<int64_t>((int64_t) opt_.max_t * attn_scratch_floats_ / per_q, 4096));
-                    const bool batched = prompt_attn_on &&
+                    const bool batched = prompt_attn_on && !opt_.kv_int8 &&   // prompt_attn reads FP16 pools
                                          k::prompt_attn(P.qcur, k_pool_[(size_t) a], v_pool_[(size_t) a], page_table_, pa,
                                                         T, qs, P.attn, cs);
                     for (int64_t t = 0; !batched && t < T; t += nq_max) {
