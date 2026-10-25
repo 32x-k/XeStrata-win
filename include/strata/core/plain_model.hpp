@@ -36,6 +36,7 @@
 #include "strata/kernels/cpu/pool.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/spec/draft_policy.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -104,6 +105,15 @@ struct PlainOptions {
     /// drafts were the fastest of one to three on the RX 9060 XT (16 and 8 GB), the B70 and the RTX 4070 (Ornith Q6_K
     /// and Q4_K_M, 2026-10-12).
     int spec = 3;
+    /// --spec-window: how many of the drafts a window checks.  "all": every draft made (the fixed window of spec
+    /// tokens); "auto": the drafts kept while the tokens each is expected to add, at its calibrated acceptance, raise
+    /// the window's expected tokens per ms at the measured window costs (strata::spec::DraftPolicy, as Qwen3.8-Flash-
+    /// Next's engine); "min-p": the drafts while each is at least spec_min_p likely under the MTP layer.  "all" by
+    /// default: auto decoded as fast at spec 3, no faster (Ornith-1.5 Q6_K, 256 tokens: B70 95.5 / 97.7 against 96.5 /
+    /// 95.8 tok/s, RTX 4070 80.0 / 84.2 against 79.4 / 84.7; GLM-5.3-Flash at 56 GB of RAM on the B70 4.17 against
+    /// 4.13, 2026-10-26).
+    std::string spec_window = "all";
+    double spec_min_p = 0.0;
     /// A layer split across the engine's GPUs (--layer-split): GPU 0 runs the blocks before split_at[0], GPU 1 those
     /// from there to split_at[1], and so on, the last GPU the rest, the head and the MTP layer; `split_auto`: the points
     /// chosen at load from each GPU's free memory.  Empty and false: one GPU, the current one.
@@ -546,6 +556,10 @@ private:
     int32_t cur_ = -1;
     int64_t cur_pos_ = 0;
     std::vector<int32_t> drafts_;
+    std::vector<float> dprob_;   ///< drafts_[j]'s probability under the MTP layer, for the window rule
+    strata::spec::DraftPolicy policy_{strata::spec::DraftPolicy::kMaxT};
+    /// Whether the window rule keeps another draft after the n drafts made (opt_.spec_window).
+    bool draft_more(int n) const;
     float* mtp_h_ = nullptr;
     // the drafts' head over opt_.draft_vocab's subset (null: the whole head); a draft's pick is its index there
     void* dhead_ = nullptr;
@@ -579,6 +593,7 @@ private:
     int32_t *h_step_ = nullptr, *m_step_ = nullptr;              ///< mapped: T x kStepCount
     int32_t *h_pos_ = nullptr, *m_pos_ = nullptr;                ///< mapped: T x n_head, then T x n_head_kv
     int32_t *h_out_ = nullptr, *m_out_ = nullptr;                ///< mapped: T picked tokens
+    float *h_prob_ = nullptr, *m_prob_ = nullptr;                ///< mapped: the last draft's probability
     strata::kernels::SamplerParams sampler_ = [] {
         strata::kernels::SamplerParams p;
         p.greedy = true;

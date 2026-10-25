@@ -375,6 +375,7 @@ RAM がエキスパートの全体に足りないとき、エンジンは VRAM �
 | `--prompt-chunk N` | prefill で一度にまとめて計算する最大のトークン数（既定 4096、0 でまとめない） |
 | `--max-t N` | decode の窓の最大のトークン数（既定 8） |
 | `--spec N` | MTP の層の推測デコードの窓の最大のトークン数（既定 3: 下書き 2 個。0 で使わない） |
+| `--spec-window all\|auto\|min-p` | 窓で確かめる下書きの数の決め方。`all`（既定）は作った下書きをすべて、`auto` は Qwen3.8-Flash-Next と同じく、下書きの確率と測った窓の時間から 1 ms あたりの出力が増える間だけ、`min-p` は下書きの確率が `--spec-min-p P` 以上の間だけ |
 | `--draft-vocab PATH` | MTP の層の下書きを、このトークンの部分集合（`data/draft_vocab*.bin`）の中だけで作る。ヘッドを読む量が減ります（setup が Qwen3.6 の設定に、`--draft-vocab` の選択に従って書きます） |
 | `--layer-split K[,K2..]` / `auto` | 層を GPU に分ける。最初の GPU が層 K の前まで、次の GPU が K から、…（`auto`: 各 GPU の空いたメモリの割合で。setup の `--gpus` で書かれます） |
 | `--split-device D[,D2..]` | 2 枚目以降の GPU（エンジンの番号か PCI アドレス。既定はほかの単体の GPU） |

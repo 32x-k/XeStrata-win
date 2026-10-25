@@ -323,7 +323,7 @@ bool PlainModel::load_glm5(std::string& err) {
     if (!mapped(T * N * 4, (void**) &h_emb_, (void**) &m_emb_) ||
         !mapped(T * k::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) ||
         !mapped(T * (NH + 1) * 4, (void**) &h_pos_, (void**) &m_pos_) ||
-        !mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_) ||
+        !mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_) || !mapped(16, (void**) &h_prob_, (void**) &m_prob_) ||
         (!first() && !mapped(T * kHC * N * 4, (void**) &h_in_, (void**) &m_in_)) ||
         (!last() && !mapped(T * kHC * N * 4, (void**) &h_hand_, (void**) &m_hand_))) {
         err = "plain model: mapped staging allocation failed";

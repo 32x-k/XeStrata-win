@@ -396,6 +396,7 @@ The engine's options (added to the settings' `args`):
 | `--prompt-chunk N` | the most tokens prefill computes at once (default 4096; 0: none at once) |
 | `--max-t N` | the decode window's most tokens (default 8) |
 | `--spec N` | the most tokens of a window checking the MTP layer's drafts (default 3: two drafts; 0: off) |
+| `--spec-window all\|auto\|min-p` | how many of the drafts a window checks: `all` (the default) every draft made; `auto`, as Qwen3.8-Flash-Next does, while the drafts' probabilities and the measured window times say a draft raises the tokens per ms; `min-p` while a draft is at least `--spec-min-p P` likely |
 | `--draft-vocab PATH` | the MTP layer drafts only tokens of this subset (`data/draft_vocab*.bin`), reading less of the head (setup writes it into Qwen3.6's settings, after its `--draft-vocab` choice) |
 | `--layer-split K[,K2..]` / `auto` | split the layers across the GPUs: the first runs the layers before K, the next those from K on, ... (`auto`: by each GPU's share of the free memory; setup's `--gpus` writes it) |
 | `--split-device D[,D2..]` | the later GPUs (engine numbers or PCI addresses; by default the other discrete GPUs) |

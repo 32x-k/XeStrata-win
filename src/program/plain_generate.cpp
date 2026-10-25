@@ -597,6 +597,9 @@ static void plain_usage(const std::string& arch) {
                  "  --max-t N            the decode window's most tokens (default 8)\n"
                  "  --spec N             speculative decoding with the model's MTP layer: windows of up to N tokens,\n"
                  "                       the last one and N - 1 drafts (default 3; 0: off; greedy only)\n"
+                 "  --spec-window all|auto|min-p  how many drafts a window checks: all (default); auto while each is\n"
+                 "                       expected to raise the tokens per ms at the measured window costs; or while\n"
+                 "                       each is at least --spec-min-p P likely under the MTP layer\n"
                  "  --draft-vocab PATH   the drafts over this token subset (int32 ids, data/draft_vocab*.bin)\n"
                  "  --rope-scaling none|linear|yarn, --rope-scale F, --yarn-orig-ctx N   context extension\n"
                  "  --rope-freq-base F, --rope-freq-scale F   the rotation's base and frequency scale\n"
@@ -664,6 +667,14 @@ int plain_main(int argc, char** argv) {
         else if (a == "--max-context") opt.max_cells = std::strtoll(next("--max-context"), nullptr, 10);
         else if (a == "--max-t") opt.max_t = (int) std::strtol(next("--max-t"), nullptr, 10);
         else if (a == "--spec") opt.spec = (int) std::strtol(next("--spec"), nullptr, 10);
+        else if (a == "--spec-window") {
+            opt.spec_window = next("--spec-window");
+            if (opt.spec_window != "auto" && opt.spec_window != "all" && opt.spec_window != "min-p") {
+                std::fprintf(stderr, "strata (%s): --spec-window takes auto, all or min-p\n", arch.c_str());
+                return 2;
+            }
+        }
+        else if (a == "--spec-min-p") opt.spec_min_p = std::clamp(std::strtod(next("--spec-min-p"), nullptr), 0.0, 1.0);
         else if (a == "--pool-workers") opt.pool_workers = (int) std::strtol(next("--pool-workers"), nullptr, 10);
         else if (a == "--dump-logits") dump_path = next("--dump-logits");
         else if (a == "--dump-routing") opt.dump_routing = next("--dump-routing");

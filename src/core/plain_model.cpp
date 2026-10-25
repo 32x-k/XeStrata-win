@@ -102,7 +102,8 @@ PlainModel::~PlainModel() {
     for (auto& v : msegs_)
         for (auto* g : v) strata::gpu::graph_destroy(g);
     for (void* p : allocs_) strata::gpu::free(p);
-    for (void* p : {(void*) h_emb_, (void*) h_step_, (void*) h_pos_, (void*) h_out_, (void*) fill_tmp_, (void*) hand_host_})
+    for (void* p : {(void*) h_emb_, (void*) h_step_, (void*) h_pos_, (void*) h_out_, (void*) h_prob_, (void*) fill_tmp_,
+                    (void*) hand_host_})
         strata::gpu::free(p);
     if (swap_ev_ != nullptr) strata::gpu::event_destroy(swap_ev_);
     if (swap_cs_ != nullptr) strata::gpu::stream_destroy(swap_cs_);
@@ -710,7 +711,7 @@ bool PlainModel::load_qwen(std::string& err) {
     if (!mapped(T * N * 4, (void**) &h_emb_, (void**) &m_emb_) ||
         !mapped(T * k::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) ||
         !mapped(T * (NH + NKV) * 4, (void**) &h_pos_, (void**) &m_pos_) ||
-        !mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_) ||
+        !mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_) || !mapped(16, (void**) &h_prob_, (void**) &m_prob_) ||
         (!first() && !mapped(T * N * 4, (void**) &h_in_, (void**) &m_in_)) ||
         (!last() && !mapped(T * N * 4, (void**) &h_hand_, (void**) &m_hand_))) {
         err = "plain model: mapped staging allocation failed";
@@ -1991,7 +1992,9 @@ bool PlainModel::mtp_run(int T, const int32_t* tokens, int64_t pos, int32_t* dra
     k::SamplerParams sp;   // the drafts are greedy
     sp.greedy = true;
     sp.temperature = 0.0f;
-    k::sample_tokens(logits_, 1, (int) (dhead_ != nullptr ? n_dvocab_ : n_vocab_), nullptr, 0, sp, m_out_, cs_);
+    const int nv = (int) (dhead_ != nullptr ? n_dvocab_ : n_vocab_);
+    k::sample_tokens(logits_, 1, nv, nullptr, 0, sp, m_out_, cs_);
+    if (opt_.spec_window != "all") k::row_top_prob(logits_, 1, nv, m_out_, m_prob_, cs_);   // for the window rule
     if (!strata::gpu::stream_sync(cs_)) {
         err = std::string("plain model: the MTP layer: ") + strata::gpu::last_error();
         return false;
@@ -2002,12 +2005,20 @@ bool PlainModel::mtp_run(int T, const int32_t* tokens, int64_t pos, int32_t* dra
     }
     *draft = ((volatile int32_t*) h_out_)[0];
     if (dhead_ != nullptr) *draft = *draft >= 0 && *draft < n_dvocab_ ? dvocab_[(size_t) *draft] : -1;
+    if (h_prob_ != nullptr) dprob_.push_back(opt_.spec_window != "all" ? ((volatile float*) h_prob_)[0] : 1.0f);
+    return true;
+}
+
+bool PlainModel::draft_more(int n) const {
+    if (n < 1 || n > (int) dprob_.size()) return true;
+    if (opt_.spec_window == "auto") return policy_.mtp_extend(dprob_.data(), n, n_snap_ + 1);
+    if (opt_.spec_window == "min-p") return dprob_[(size_t) n - 1] >= (float) opt_.spec_min_p;
     return true;
 }
 
 bool PlainModel::mtp_chain(int want, int64_t pos, std::string& err) {
     // each step reads the draft before it at the next position, and the previous step's normed row (mtp_h_)
-    while ((int) drafts_.size() < want) {
+    while ((int) drafts_.size() < want && draft_more((int) drafts_.size())) {
         int32_t d = -1;
         const int64_t p = pos + (int64_t) drafts_.size() - 1;
         if (p >= opt_.max_cells) return true;
@@ -2023,6 +2034,7 @@ bool PlainModel::spec_start(int32_t first, int64_t pos, std::string& err) {
         return tail().spec_start(first, pos, err);
     }
     drafts_.clear();
+    dprob_.clear();
     cur_ = first;
     cur_pos_ = pos;
     if (!has_mtp_ || n_snap_ < 1) return true;
@@ -2050,6 +2062,15 @@ bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int3
     // the window: the pending token and the drafts that fit the context and the limit
     int nd = (int) std::min<int64_t>({(int64_t) drafts_.size(), limit - 1, opt_.max_cells - cur_pos_ - 1});
     nd = std::max(nd, 0);
+    // the window rule (--spec-window) over the drafts' probabilities
+    float probs[strata::spec::DraftPolicy::kMaxT + 1] = {};
+    for (int j = 0; j < nd && j < (int) dprob_.size() && j < strata::spec::DraftPolicy::kMaxT; ++j) probs[j] = dprob_[(size_t) j];
+    if (opt_.spec_window == "auto") nd = std::min(nd, policy_.mtp_window(probs, n_snap_ + 1) - 1);
+    else if (opt_.spec_window == "min-p") {
+        int keep = 0;
+        while (keep < nd && probs[keep] >= (float) opt_.spec_min_p) ++keep;
+        nd = keep;
+    }
     int32_t win[k::cpu::MAXT];
     int32_t out[k::cpu::MAXT];
     win[0] = cur_;
@@ -2069,6 +2090,7 @@ bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int3
     ++spec_windows_;
     spec_drafted_ += nd;
     spec_accepted_ += n;
+    if (opt_.spec_window == "auto") policy_.observe_mtp_drafts(probs, T, n);
     for (int j = 0; j <= n; ++j) emitted[j] = out[j];
     n_emit = n + 1;
     // the recurrent states back to the last accepted row's (the attention's later cells are rewritten in turn)
@@ -2079,7 +2101,13 @@ bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int3
     cur_ = out[n];
     cur_pos_ = pos + n + 1;
     drafts_.clear();
-    if (cur_pos_ >= opt_.max_cells) return true;
+    dprob_.clear();
+    // the round's time (the window, the rollback, the drafts) for the window rule's costs, once the drafts are made
+    auto observe = [&] {
+        if (opt_.spec_window == "auto")
+            policy_.observe(false, T, n, 0, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    };
+    if (cur_pos_ >= opt_.max_cells) { observe(); return true; }
     if (!strata::gpu::copy_async(mtp_h_, hn_, (size_t) (n + 1) * (size_t) spec_.n_embd * 4, cs_)) {
         err = std::string("plain model: the MTP layer's input: ") + strata::gpu::last_error();
         return false;
@@ -2089,6 +2117,7 @@ bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int3
     drafts_.push_back(d);
     const bool ok = mtp_chain(n_snap_, cur_pos_ + 1, err);
     spec_ms_draft_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+    observe();
     return ok;
 }
 
