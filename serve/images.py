@@ -250,7 +250,9 @@ def parse_request(req: dict, cfg: dict) -> dict:
     (steps by its name), negative_prompt, guidance_scale and true_cfg_scale (cfg_request).  Unknown fields (style,
     user, moderation) are accepted and ignored.  HunyuanImage 3.0's size snaps to the model's resolution bucket nearest
     the shape asked for (the job's "width"/"height" are that bucket's, "bucket" its row of the table, and
-    "requested_size" the size asked for when it is another)."""
+    "requested_size" the size asked for when it is another); its size "auto" (or none) is the model's own choice where
+    its config has the ratio head (job["choose_size"]: ImageGen.run asks the engine first, the 1024 x 1024 bucket
+    standing for it until then - no bucket has more tokens)."""
     prompt = req.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise ImageRequestError("prompt: a non-empty string")
@@ -276,10 +278,13 @@ def parse_request(req: dict, cfg: dict) -> dict:
     if background == "transparent" and cfg.get("transparency") is False:
         raise ImageRequestError("background transparent: this image model does not make transparent images")
     w, h = parse_size(req.get("size"), int(cfg.get("max_side") or 2048))
-    bucket, requested = None, {}
+    bucket = None
+    requested: dict = {}
     if cfg.get("family") == "hunyuan-image-3":    # its own table: the bucket nearest the shape asked for
         bucket = hunyuanimage3_bucket(cfg, w, h)
-        if (w, h) != (int(bucket["width"]), int(bucket["height"])):
+        if req.get("size") in (None, "auto") and cfg.get("ratio_head"):
+            requested = {"choose_size": True}
+        elif (w, h) != (int(bucket["width"]), int(bucket["height"])):
             requested = {"requested_size": f"{w}x{h}"}
         w, h = int(bucket["width"]), int(bucket["height"])
     n = _int_field(req, "n", 1, int(cfg.get("max_n") or MAX_N), 1)
@@ -483,7 +488,7 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
         dims.append((w, h))
     if mask is not None:
         mask = check_mask(mask, dims[0], cfg)
-    if req.get("size") in (None, "auto"):
+    if req.get("size") in (None, "auto") and not (hunyuan and cfg.get("ratio_head")):   # else the model chooses
         w0, h0 = dims[0]
         side = int(cfg.get("max_side") or 2048)
         tw = (1024 * 1024 * w0 / h0) ** 0.5
@@ -600,6 +605,34 @@ def hunyuanimage3_bucket(cfg: dict, width: int, height: int) -> dict:
     return min(hunyuanimage3_buckets(cfg), key=lambda b: abs(b["ratio"] - height / width))
 
 
+def _hunyuanimage3_marker(tok, name: str) -> int:
+    i = tok.special_ids.get(name)
+    if i is None:
+        raise ValueError(f"the tokenizer has no {name}: not HunyuanImage 3.0's tokenizer.json")
+    return i
+
+
+def hunyuanimage3_prefix_ids(tok, prompt: str, base_size: int = 1024, system: str | None = None,
+                             refs: list[dict] | None = None) -> list[int]:
+    """hunyuanimage3_ids up to the generated block's <img_size_base_size>: the sequence the engine's RATIO reads the
+    model's own size choice from (the reference's img_ratio task)."""
+    def marker(name: str) -> int:
+        return _hunyuanimage3_marker(tok, name)
+
+    ids = [marker("<|startoftext|>")]
+    if system is not None:
+        ids += tok.encode(system, parse_special=False) + tok.encode("\n\n", parse_special=False)
+    ids += tok.encode("User: ", parse_special=False)
+    for b in refs or ():
+        ids += [marker("<boi>"), marker(f"<img_size_{int(base_size)}>"), marker(f"<img_ratio_{int(b['ratio_index'])}>"),
+                marker("<timestep>")]
+        ids += [marker("<img>")] * (int(b["tokens_h"]) * int(b["tokens_w"]))
+        ids += [marker("<joint_img_sep>")] + [marker("<img>")] * HUNYUANIMAGE3_VIT_SLOTS + [marker("<eoi>")]
+    for text in (prompt, "\n\n", "Assistant: "):
+        ids += tok.encode(text, parse_special=False)
+    return ids + [marker("<answer>"), marker("<boi>"), marker(f"<img_size_{int(base_size)}>")]
+
+
 def hunyuanimage3_ids(tok, prompt: str, bucket: dict, base_size: int = 1024, system: str | None = None,
                       refs: list[dict] | None = None) -> list[int]:
     """HunyuanImage 3.0's sequence for an image of `bucket` (hunyuanimage3_bucket), as its tokenizer's "instruct"
@@ -614,24 +647,10 @@ def hunyuanimage3_ids(tok, prompt: str, bucket: dict, base_size: int = 1024, sys
     merge across the boundaries, and the reference encodes each section too - and the prompt plain, so a special
     token spelled in it stays text."""
     def marker(name: str) -> int:
-        i = tok.special_ids.get(name)
-        if i is None:
-            raise ValueError(f"the tokenizer has no {name}: not HunyuanImage 3.0's tokenizer.json")
-        return i
+        return _hunyuanimage3_marker(tok, name)
 
-    ids = [marker("<|startoftext|>")]
-    if system is not None:
-        ids += tok.encode(system, parse_special=False) + tok.encode("\n\n", parse_special=False)
-    ids += tok.encode("User: ", parse_special=False)
-    for b in refs or ():
-        ids += [marker("<boi>"), marker(f"<img_size_{int(base_size)}>"), marker(f"<img_ratio_{int(b['ratio_index'])}>"),
-                marker("<timestep>")]
-        ids += [marker("<img>")] * (int(b["tokens_h"]) * int(b["tokens_w"]))
-        ids += [marker("<joint_img_sep>")] + [marker("<img>")] * HUNYUANIMAGE3_VIT_SLOTS + [marker("<eoi>")]
-    for text in (prompt, "\n\n", "Assistant: "):
-        ids += tok.encode(text, parse_special=False)
-    ids += [marker("<answer>"), marker("<boi>"), marker(f"<img_size_{int(base_size)}>"),
-            marker(f"<img_ratio_{int(bucket['ratio_index'])}>"), marker("<timestep>"), marker("<guidance>"),
+    ids = hunyuanimage3_prefix_ids(tok, prompt, base_size, system, refs)
+    ids += [marker(f"<img_ratio_{int(bucket['ratio_index'])}>"), marker("<timestep>"), marker("<guidance>"),
             marker("<timestep_r>")]
     ids += [marker("<img>")] * (int(bucket["tokens_h"]) * int(bucket["tokens_w"]))
     ids += [marker("<eoi>"), marker("</answer>")]
@@ -806,6 +825,8 @@ class ImageEngine:
             cmd += ["--text", str(self.cfg["llm"])]
         if self.cfg.get("vision"):
             cmd += ["--vision", str(self.cfg["vision"])]
+        if self.cfg.get("ratio_head"):   # HunyuanImage 3.0's own size choice
+            cmd += ["--ratio-head", str(self.cfg["ratio_head"])]
         if self.cfg.get("dit_q8") is not None:   # Mage-Flow's DiT: 8 bits or FP16 as the config says, else by the VRAM
             cmd += ["--dit-q8", "1" if self.cfg["dit_q8"] else "0"]
         if self.cfg.get("edit_model"):
@@ -1164,6 +1185,29 @@ class ImageGen:
                                                 self.family)
         return job["ids"]
 
+    def _choose_size(self, job: dict, timeout: float, cancel: threading.Event | None) -> None:
+        """HunyuanImage 3.0's size "auto": the bucket the model writes after the prompt (the engine's RATIO, the
+        reference's img_ratio task, greedy), once a job; the job's bucket, size and ids follow it.  The engine keeps
+        the sequence's rows for the images that follow."""
+        if self.tok is None:
+            self.tok = load_tokenizer(self._tokenizer_path(), self.family)
+        job["ref_buckets"] = [hunyuanimage3_bucket(self.cfg, *image_dims(r)) for r in job.get("refs") or ()]
+        prefix = hunyuanimage3_prefix_ids(self.tok, model_prompt(job), self._base_size(), self.system_text(),
+                                          job["ref_buckets"])
+        self._live(stage="size")
+        r = self.engine.ask(f"RATIO 0 {','.join(str(i) for i in prefix)}{self._refs_words(job)}", "RATIO", timeout,
+                            cancel)
+        index = int(r["index"])
+        bucket = next((b for b in hunyuanimage3_buckets(self.cfg) if b["ratio_index"] == index), None)
+        if bucket is None:
+            raise ImageJobFailed(f"the image engine chose ratio {index}, which this model's table has not")
+        job.update(bucket=bucket, width=int(bucket["width"]), height=int(bucket["height"]), choose_size=False,
+                   ratio_s=float(r.get("ratio_s", 0)))
+        job.pop("ids", None)
+        self._live(size=f"{job['width']}x{job['height']}")
+        self._say(f"image size: the model chose {job['width']}x{job['height']} (ratio {index}, "
+                  f"{job['ratio_s']:.1f} s)")
+
     def drop_of(self, job: dict) -> int:
         """The system turn's ids the DiT does not take: Mage-Flow's edit form has its own."""
         return MF_EDIT_DROP if self.family == "mage-flow" and job.get("refs") else self.drop
@@ -1249,7 +1293,6 @@ class ImageGen:
         The caller holds the GPU turn; `pause()` true after an image ends the call there (make_images gives the turn
         to the requests waiting for it).  ImageJobFailed when the engine fails, times out or the job is cancelled."""
         timeout = float(self.cfg.get("timeout_s") or 3600)
-        mw, mh = made_size(job)
         t0 = time.monotonic()
         images, parts = [], []
         work = Path(tempfile.mkdtemp(prefix="job-", dir=self.dir))
@@ -1257,6 +1300,9 @@ class ImageGen:
             with self.lock:
                 self._ready()
                 self.stage(job)
+                if job.get("choose_size"):
+                    self._choose_size(job, timeout, cancel)
+                mw, mh = made_size(job)
                 ids = ",".join(str(i) for i in self.ids(job))
                 sched = self.cfg.get("schedule")
                 sig = (base_sigmas(job["steps"], mw, mh) if sched == "base" else
@@ -1308,6 +1354,7 @@ class ImageGen:
                    "size": f"{job['width']}x{job['height']}", "seed": job["seed"], "engine": "strata-image",
                    "quant": self.cfg.get("quant"),
                    "text_encode_ms": round(sum(r.get("text_s", 0) for r in parts) * 1000, 1),
+                   **({"size_choice_s": job["ratio_s"]} if "ratio_s" in job else {}),
                    "sampling_s": round(sum(r.get("sampling_s", 0) for r in parts), 2),
                    "vae_decode_s": round(sum(r.get("decode_s", 0) for r in parts), 2),
                    "plan": {k: v for k, v in parts[-1].items() if k not in ("text_s", "sampling_s", "decode_s")},
@@ -1348,7 +1395,8 @@ class ImageGen:
                 "quality": job.get("quality") or "auto", "usage": usage(job), "strata": figures}
 
     # ---- the progress the Monitor shows (/metrics' live.image) and the jobs that ended (its Requests table)
-    STAGE_LABELS = {"waiting": "Making room on the GPU", "refs": "Reading the reference images",
+    STAGE_LABELS = {"waiting": "Making room on the GPU", "size": "Choosing the image's size",
+                    "refs": "Reading the reference images",
                     "text": "Reading the prompt", "sampling": "Sampling", "decode": "Decoding the image (VAE)"}
 
     def begin(self, job: dict) -> None:
@@ -1375,7 +1423,7 @@ class ImageGen:
         now = time.monotonic()
         stage, done, steps = j["stage"], j["step"], max(1, j["steps"])
         step_s = round((now - j["sampling_at"]) / done, 2) if j["sampling_at"] is not None and done > 0 else None
-        within = {"waiting": 0.0, "refs": 0.02, "text": 0.05, "sampling": 0.1 + 0.8 * done / steps,
+        within = {"waiting": 0.0, "size": 0.01, "refs": 0.02, "text": 0.05, "sampling": 0.1 + 0.8 * done / steps,
                   "decode": 0.9}.get(stage, 0.0)
         frac = (j["image"] - 1 + within) / max(1, j["images"])
         return {"stage": stage, "label": self.STAGE_LABELS.get(stage, stage), "step": done, "steps": j["steps"],

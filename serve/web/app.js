@@ -1488,7 +1488,8 @@ $("img-form").onsubmit = async (ev) => {
   if (!prompt) return;
   const size = $("img-size").value === "custom" ? `${$("img-w").value}x${$("img-h").value}` : $("img-size").value;
   const refs = Array.from($("img-ref").files || []);
-  const body = {prompt, size: size === "auto" && !refs.length ? "1024x1024" : size, response_format: "b64_json"};
+  // "auto" goes as it is: the server makes it 1024 x 1024, a reference's shape, or the model's own choice
+  const body = {prompt, size, response_format: "b64_json"};
   if (!$("img-model-f").hidden) body.model = $("img-model").value;
   if ($("img-seed").value !== "") body.seed = Number($("img-seed").value);
   const neg = $("img-neg").value.trim();
