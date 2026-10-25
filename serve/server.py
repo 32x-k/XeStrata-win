@@ -6103,17 +6103,18 @@ def make_handler(svc: Service):
             print(f"[strata] image: {job['width']}x{job['height']}, n={job['n']}, {job['steps']} steps, "
                   f"seed {job['seed']}" + (f", {len(job['refs'])} reference image(s)" if job.get("refs") else ""),
                   flush=True)
+            host = self.headers.get("Host") or f"{self.server.server_address[0]}:{self.server.server_address[1]}"
+            scheme = "https" if (self.headers.get("X-Forwarded-Proto") or "").lower() == "https" else "http"
             try:
                 images, figures, policy = images_api.make_images(svc, gen, job, cancel)
+                figures["gpu_policy"] = policy
+                print(f"[strata] image done in {figures['seconds']:.1f} s ({policy})", flush=True)
+                body = gen.response(images, job, figures, f"{scheme}://{host}")   # cjxl may fail (jxl)
             except images_api.ImageJobFailed as e:
                 self._json(500, {"error": {"type": "server_error", "code": "image_generation_failed",
                                            "message": str(e)}})
                 return
-            figures["gpu_policy"] = policy
-            print(f"[strata] image done in {figures['seconds']:.1f} s ({policy})", flush=True)
-            host = self.headers.get("Host") or f"{self.server.server_address[0]}:{self.server.server_address[1]}"
-            scheme = "https" if (self.headers.get("X-Forwarded-Proto") or "").lower() == "https" else "http"
-            self._json(200, gen.response(images, job, figures, f"{scheme}://{host}"))
+            self._json(200, body)
 
         def _props(self):
             model = parse_qs(urlsplit(self.path).query).get("model", [svc.model])[0]
