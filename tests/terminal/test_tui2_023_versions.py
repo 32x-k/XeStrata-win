@@ -21,11 +21,11 @@ def first(path, pattern):
 
 class VersionBump(unittest.TestCase):
     def test_the_terminal_is_0_2_4_2_and_control_is_0_1_49_2_while_the_app_stays_0_2_3(self):
-        # 0.2.6: Terminal, app and release are 0.2.6; engine and Control are 0.1.51 for every Qwen and DeepSeek package (metal included)
+        # 0.2.6: Terminal and app are 0.2.6; Control and the DeepSeek engine are 0.1.51 (the CMake project version); the Qwen engine packages and Metal stay 0.1.50 (no C++ change since 0.2.5)
         self.assertEqual(strata_cli.PRODUCT_VERSION, "0.2.6")
         self.assertEqual(strata_cli.version(), "0.1.51")                # the CMake project version: Control
         self.assertEqual(first("CMakeLists.txt", r"^project\(strata VERSION ([0-9.]+) "), "0.1.51")
-        self.assertIn('STRATA_VERSION="0.1.51-metal"', (ROOT / "metal" / "CMakeLists.txt").read_text(encoding="utf-8"))
+        self.assertIn('STRATA_VERSION="0.1.50-metal"', (ROOT / "metal" / "CMakeLists.txt").read_text(encoding="utf-8"))
 
     def test_every_place_the_app_version_lives_says_0_2_3(self):
         self.assertEqual(first("apps/desktop/src-tauri/Cargo.toml", r'^version = "([^"]+)"'), "0.2.6")
