@@ -4767,8 +4767,28 @@ struct Model::Impl {
         std::vector<std::pair<int, int>> list;
         list.reserve(cand.size());
         for (const auto& c : cand) list.push_back(c.second);
+        // The slots the CPU lane's experts leave over: the experts the VRAM cache holds that the profile counts least (the cache gives
+        // up its coldest to the CPU lane, and a store without them reads each from the SSD while the CPU lane waits - 1.8 misses a
+        // token on the 251 GB R9700 box, 2.9 ms of a 49 ms token), then the lane's experts the profile never saw.  Last in the list: they
+        // take only the slots the likely ones left.  DS4_STORE_SPARE=0: off.
+        if (!(std::getenv("DS4_STORE_SPARE") && std::atoi(std::getenv("DS4_STORE_SPARE")) == 0)) {
+            std::vector<std::pair<double, std::pair<int, int>>> vr, zero;
+            for (const Layer& l : L) {
+                if (l.il >= g.nl) continue;
+                const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
+                for (int e = 0; e < l.n_exp; ++e) {
+                    if (l.slot[(size_t) e] >= 0) vr.push_back({(double) p[e] / (double) l.blob, {l.il, e}});
+                    else if (p[e] == 0) zero.push_back({0.0, {l.il, e}});
+                }
+            }
+            std::stable_sort(vr.begin(), vr.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+            for (const auto& c : vr) list.push_back(c.second);
+            for (const auto& c : zero) list.push_back(c.second);
+        }
         const double t0 = now_ms();
-        const size_t leave = (size_t) (std::getenv("DS4_STORE_RESERVE") ? std::atoi(std::getenv("DS4_STORE_RESERVE")) : 192) + 64;
+        // (with the spare experts in the list the reserve is theirs: last in the list, so the oldest ticks, so the first a demand read replaces)
+        const bool spare_on = !(std::getenv("DS4_STORE_SPARE") && std::atoi(std::getenv("DS4_STORE_SPARE")) == 0);
+        const size_t leave = spare_on ? 0 : (size_t) (std::getenv("DS4_STORE_RESERVE") ? std::atoi(std::getenv("DS4_STORE_RESERVE")) : 192) + 64;
         // The first 48 GB (what a store held before it could take every expert) are read before the first token; the rest of the
         // hottest-first list is read after it, in pieces of 128 experts on a thread of its own, behind the model's own reads (a
         // guess's priority) - the same bytes.  Opt-in (DS4_STORE_BG=1): "ready" comes 9 s sooner on the 251 GB R9700 box (24 s against 34), but a prompt sent at
@@ -6155,6 +6175,19 @@ struct Model::Impl {
             }
             if (got) blob_to_ram(l, sw_b, sw.ram);
             else sw.ram = -1;   // (back to the file's pages then)
+        } else if (ok && store && l.nm == 1 && l.lay.fmt == gg::kFmtMXFP4 && !(std::getenv("DS4_STORE_PUT") && std::atoi(std::getenv("DS4_STORE_PUT")) == 0)) {
+            // `out` goes back to the CPU lane: its blob is in VRAM, so it is copied into a store slot now - the lane would otherwise read it from
+            // the SSD and wait for it (1-2 misses a token on the 251 GB R9700 box).  DS4_STORE_PUT=0: off.
+            uint8_t* dst = store->put_begin(l.il, sw.out);
+            if (dst != nullptr) {
+                const Layer& x = member(l, 0);
+                cudaSetDevice(devs[(size_t) x.dev].id);
+                cudaStream_t cs = copy_st[(size_t) x.dev];
+                const bool got = cudaMemcpyAsync(dst, x.vram_base + (size_t) l.slot[(size_t) sw.out] * unit(l), l.blob, cudaMemcpyDeviceToHost, cs) ==
+                                     cudaSuccess &&
+                                 cudaStreamSynchronize(cs) == cudaSuccess;
+                store->put_done(l.il, sw.out, got);
+            }
         }
         if (check_swaps) {   // DS4_CHECK_SWAPS: the slot (and `out`'s RAM copy) against the model file, byte for byte
             std::vector<uint8_t> dev(l.blob), h(unit(l)), file(l.blob);
