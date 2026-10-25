@@ -718,6 +718,18 @@ SectionEnd
 !macroend
 ; STRATA-STOP-END
 
+; STRATA-CLEAN-BEGIN
+; The app writes into its own folders while it runs (Python bytecode caches under control\, for one), and the file-by-file delete below does not know them,
+; so those folders stayed behind with a few dozen files. These four folders hold only what the installer put there and what the app made there;
+; user data is never in them (it lives in the data folder), and the install folder itself is still removed with a plain RMDir.
+!macro StrataRemoveAppFolders INSTALLDIR
+  RMDir /r "${INSTALLDIR}\control"
+  RMDir /r "${INSTALLDIR}\host"
+  RMDir /r "${INSTALLDIR}\node"
+  RMDir /r "${INSTALLDIR}\harness"
+!macroend
+; STRATA-CLEAN-END
+
 Section Install
   SetOutPath $INSTDIR
 
@@ -896,6 +908,8 @@ Section Uninstall
     ${EndIf}
   {{/each}}
 
+
+  !insertmacro StrataRemoveAppFolders "$INSTDIR"
 
   ; Delete uninstaller
   Delete "$INSTDIR\uninstall.exe"

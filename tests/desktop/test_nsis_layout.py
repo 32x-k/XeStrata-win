@@ -56,7 +56,7 @@ class TemplateTests(unittest.TestCase):
 class MigrationTests(unittest.TestCase):
     def run_nsis(self, body: str, work: Path):
         template = TEMPLATE.read_text(encoding="utf-8")
-        block = chr(10).join(re.search(rf"; STRATA-{name}-BEGIN.*?; STRATA-{name}-END", template, re.S).group(0) for name in ("MIGRATE", "STOP"))
+        block = chr(10).join(re.search(rf"; STRATA-{name}-BEGIN.*?; STRATA-{name}-END", template, re.S).group(0) for name in ("MIGRATE", "STOP", "CLEAN"))
         script = work / "t.nsi"
         script.write_text('Unicode true\nOutFile "t.exe"\nRequestExecutionLevel user\nSilentInstall silent\n' + block + "\nSection\n" + body + "\nSectionEnd\n", encoding="utf-8")
         done = subprocess.run([str(MAKENSIS), "/V1", str(script)], cwd=work, capture_output=True, text=True)
@@ -134,6 +134,28 @@ class MigrationTests(unittest.TestCase):
                     if proc.poll() is None:
                         proc.kill()
                     proc.wait()
+
+
+    def test_files_the_app_made_in_its_own_folders_are_removed_and_the_data_beside_them_is_not(self):
+        """Strix, standard user: after the app had run, Python bytecode caches under control\\ kept the program folder alive."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            inst = base / "Programs" / "Strata"
+            touch(inst, ["strata-desktop.exe", "control/python/python.exe", "control/python/Lib/__pycache__/argparse.cpython-312.pyc",
+                         "control/serve/__pycache__/server.cpython-312.pyc", "host/server/index.mjs", "host/logs/made-at-run.txt", "node/node.exe",
+                         "harness/BUNDLE.json", "components/engine/keep.txt", "runtime/keep.json"])
+            self.run_nsis(f'!insertmacro StrataRemoveAppFolders "{inst}"', base)
+            for folder in ("control", "host", "node", "harness"):
+                self.assertFalse((inst / folder).exists(), folder)
+            for name in ("components/engine/keep.txt", "runtime/keep.json", "strata-desktop.exe"):
+                self.assertTrue((inst / name).is_file(), f"kept: {name}")
+
+    def test_the_uninstaller_clears_those_folders_before_the_last_rmdir(self):
+        text = TEMPLATE.read_text(encoding="utf-8")
+        uninstall = text[text.index("Section Uninstall"):]
+        self.assertIn('!insertmacro StrataRemoveAppFolders "$INSTDIR"', uninstall)
+        self.assertLess(uninstall.index("StrataRemoveAppFolders"), uninstall.index('RMDir "$INSTDIR"'))
+        self.assertNotRegex(uninstall, r'RMDir /r "\$INSTDIR"')
 
 
 class StopOrderTests(unittest.TestCase):
