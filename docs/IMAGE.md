@@ -24,7 +24,7 @@ It goes with any version of Qwen3.8-Flash-Next (not yet with the BETA models), a
 | `mage-flow` | [Mage-Flow](https://huggingface.co/Comfy-Org/Mage-Flow) | 20 (CFG) | Tuned by reinforcement learning to follow instructions and draw text better |
 | `mage-flow-base` | [Mage-Flow-Base](https://huggingface.co/Comfy-Org/Mage-Flow) | 30 (CFG) | The base model, before that tuning |
 | `magetrail` | [MageTrail](https://huggingface.co/RicemanT/MageTrail) | 30 (CFG) | Mage-Flow tuned on Danbooru and e621 images. For illustrations drawn from booru tags. No edits |
-| `hunyuan-image-3-distil` | [HunyuanImage 3.0 Instruct-Distil](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil) | 8 | Tencent's large MoE model (80B): the most detailed and the slowest. It reads its own prompt, so it needs no text encoder, and it uses the most disk and RAM (about 50 GB). No edits |
+| `hunyuan-image-3-distil` | [HunyuanImage 3.0 Instruct-Distil](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil) | 8 | Tencent's large MoE model (80B): the most detailed and the slowest. It reads its own prompt, so it needs no text encoder, and it uses the most disk and RAM (about 52 GB). Edits with up to 3 reference images (no masks or transparent backgrounds) |
 
 In this document "Qwen-Image-2.1" means both Turbo and the base model; what holds for one of them only says "Turbo" or "the base model".
 
@@ -40,7 +40,7 @@ In this document "Qwen-Image-2.1" means both Turbo and the base model; what hold
 - **MageTrail** is Mage-Flow's image model reshaped and tuned; it has a generation model only, and makes no edits.
   Its prompts can be booru tags (`1girl, solo, silver hair, ...`) or sentences; `masterpiece, best quality, very aesthetic, aesthetic` raises the quality, and `Drawn by <artist>` at the start takes that artist's style (the 100 artists of the list MageTrail's author publishes).
   Its VAE is the Flux2 VAE its author uses (as Black Forest Labs publishes it with FLUX.2-klein-4B).
-- **HunyuanImage 3.0** only makes images: no edits (reference images, masks, transparent backgrounds). The size is made at the one of the model's own 37 sizes (buckets) whose shape is nearest the one asked for (512x512 becomes 1024x1024).
+- **HunyuanImage 3.0** edits with up to 3 reference images (the model's own way: a reference goes in as its VAE latent and as SigLIP2's features, before the prompt); it has no masks or transparent backgrounds. The size is made at the one of the model's own 37 sizes (buckets) whose shape is nearest the one asked for (512x512 becomes 1024x1024).
   The weights are Tencent's two quantizations (w4a8 and int8). It draws from the prompt at once, not the way Tencent runs it by default (the model reasoning and rewriting the prompt before it draws).
 
 ## Installing
@@ -51,8 +51,8 @@ xestrata --setup --images qwen-image-turbo     # installed from the source: ./se
 
 - Setup downloads the image model, the VAE, the text encoder and the picture reader for edits (Qwen3-VL's mmproj), and adds `"images"` to the config.
   Every file is pinned to a revision and checked by its SHA-256.
-- HunyuanImage 3.0 downloads four files: its image model (Tencent's quantization), the VAE, the model's own `tokenizer.json` and the `system_prompt.py` that holds its system prompt.
-  Setup reads the system prompt out of `system_prompt.py` into `en_unified.txt` beside them (it never runs the file). It has no text encoder and no picture reader for edits.
+- HunyuanImage 3.0 downloads five files: its image model (Tencent's quantization), the VAE, the model's own `tokenizer.json`, the `system_prompt.py` that holds its system prompt, and the last of the model's bf16 shards, which holds the SigLIP2 that reads an edit's reference images (3.3 GB, of which the engine reads 0.9 GB).
+  Setup reads the system prompt out of `system_prompt.py` into `en_unified.txt` beside them (it never runs the file). It has no text encoder.
   Tencent publishes the weights in bf16 only, so XeStrata takes Tencent's quantized files (single checkpoints made for ComfyUI) pinned where they are published.
 - Setup run interactively asks for the image models too (numbers, comma-separated; with two or more, which is the default, and whether to take the text encoder with the refusal direction removed). Run again for a model, it offers that model's present ones as the default answer.
 - It does not ask with `--images` or `--yes`. Run again with `--yes` and without `--images`, setup keeps the earlier image settings as they are.
@@ -84,13 +84,13 @@ HunyuanImage 3.0 comes in Tencent's two quantizations (`--image-quant`; w4a8 by 
 
 | Size | Download | RAM, about | VRAM |
 | --- | ---: | ---: | ---: |
-| w4a8 (default) | 49.5 GB | 51 GB | 10 GB and up |
-| int8 | 84.4 GB | 86 GB | 12 GB and up |
+| w4a8 (default) | 52.8 GB | 52 GB | 10 GB and up (edits about 14 GB and up) |
+| int8 | 87.7 GB | 87 GB | 12 GB and up (edits about 16 GB and up) |
 
 w4a8 is 4-bit weights with 8-bit activations (Tencent's quantization for ComfyUI), a step about 2.5 times as fast as int8's; int8 (convrot's int8) comes nearer the bf16 weights' images.
-A GPU that does not hold the weights that always stay in VRAM (about 6.7 GB) and two slots for the streamed experts (2.7 GB for w4a8, 4.8 GB for int8) cannot run it. More VRAM keeps more experts resident and is faster. The VAE takes about 7.5 GB of working memory at 1024x1024 and is not tiled, so a size whose decode does not fit is refused.
+A GPU that does not hold the weights that always stay in VRAM (about 6.7 GB; with edits, SigLIP2's and the VAE encoder's 1.3 GB too) and two slots for the streamed experts (2.7 GB for w4a8, 4.8 GB for int8) cannot run it. While an edit's reference images are read, the VAE encoder works in buffers of its own (about 6 GB for a 1024x1024 reference, given back once they are read). More VRAM keeps more experts resident and is faster. The VAE takes about 7.5 GB of working memory at 1024x1024 and is not tiled, so a size whose decode does not fit is refused.
 
-- **The download** is the image model (for Mage-Flow, the generation and edit models), the VAE, the text encoder (Q8_0) and the picture reader for edits (none for MageTrail) together (for HunyuanImage 3.0, its tokenizer and system prompt instead of a text encoder).
+- **The download** is the image model (for Mage-Flow, the generation and edit models), the VAE, the text encoder (Q8_0) and the picture reader for edits (none for MageTrail) together (for HunyuanImage 3.0, its tokenizer and system prompt instead of a text encoder, and the SigLIP2 shard for its edits).
 - **The RAM** is needed besides the text model's: the files' sizes plus about 2 GB for the engine itself.
 - **When it does not fit,** setup lowers the text encoder first, to Q6_K, Q5_K and Q4_K, until it fits the RAM the text model leaves, and then the image model, to Q6_K and Q4_K_M (with the image model lowered, the text encoder is the largest that fits beside it).
   Mage-Flow lowers only its text encoder, HunyuanImage 3.0 only its image model (int8 to w4a8).
@@ -128,7 +128,7 @@ The config file's (`xestrata-<model>.json`) `"images"` also has entries to set b
 | `keep_files` | 64 | How many `response_format: "url"` images are kept |
 | `out_dir` | a temporary folder | The folder for the images and the engine's log (`strata-image.log`) |
 
-HunyuanImage 3.0's `"images"` also has `steps` (8), `guidance` (2.5) and `resolutions` (the resolution buckets' parameters); with no edits, `max_refs` is not used.
+HunyuanImage 3.0's `"images"` also has `steps` (8), `guidance` (2.5), `resolutions` (the resolution buckets' parameters) and `vision` (the shard with SigLIP2); its `max_refs` defaults to 3.
 
 ## The web page and the chat
 
@@ -145,7 +145,7 @@ HunyuanImage 3.0's `"images"` also has `steps` (8), `guidance` (2.5) and `resolu
   With HunyuanImage 3.0 the guidance is one token, so the field is Guidance and there is no negative prompt field.
 - With Qwen-Image-2.1, a transparent background can be chosen as well.
 - With Qwen-Image-2.1 and a reference image attached, the part of the first image to draw again can be painted on it (brush size, eraser, clear). Only the painted part is drawn again, and the rest keeps the image's pixels (the API's `mask`). Unpainted, the edit takes the whole image.
-- Attaching reference images makes it an edit (PNG, JPEG, GIF, BMP, WebP). MageTrail and HunyuanImage 3.0 take no reference images.
+- Attaching reference images makes it an edit (PNG, JPEG, GIF, BMP, WebP). MageTrail takes no reference images; HunyuanImage 3.0 takes up to 3, with no mask.
 - Images are made one at a time. A chat request that comes while several are made runs after the image being made, and the rest follow it (under `unload`, which takes the text model off, the images are all made first).
 - The **Monitor** tab shows the stage, the step and the seconds a step takes.
 
@@ -190,21 +190,22 @@ Other fields (`style`, `user`, `moderation` and the like) are accepted and not u
 Makes an image from reference images: rewriting a reference image, or making a person or a thing in one the subject.
 
 - **The reference images:** OpenAI's multipart form with `image` or `image[]`, or JSON with `"images": [{"image_url": ...}]` (a data: URL or an http(s) URL).
-  Up to 10 for Qwen-Image-2.1, 3 for Mage-Flow; each up to 32 MiB and at least 16x16 pixels.
+  Up to 10 for Qwen-Image-2.1, 3 for Mage-Flow and HunyuanImage 3.0; each up to 32 MiB and at least 16x16 pixels.
   PNG, JPEG, GIF and BMP are read as they are, other formats (WebP and others) are turned into PNG first.
-- **The model:** `model` chooses it. Without one the default model edits, or, where the default makes images only (MageTrail, HunyuanImage 3.0), the first model that edits, and the answer's `model` says which.
-  An edit that names MageTrail or HunyuanImage 3.0 is refused (HunyuanImage 3.0's VAE encoder is not built yet).
+- **The model:** `model` chooses it. Without one the default model edits, or, where the default makes images only (MageTrail), the first model that edits, and the answer's `model` says which.
+  An edit that names MageTrail is refused.
 - **The size:** `size` `auto`, or none, gives the first reference image's aspect ratio at about 1024x1024 pixels.
 - **How the references are read:** Qwen-Image-2.1 reads each at about 1024x1024 pixels with its aspect ratio kept, whatever the output's size; more references take more time and memory.
   Mage-Flow's picture reader reads them with the long side at 384 pixels or less, and its VAE at the output's size.
+  HunyuanImage 3.0 cuts a reference to the bucket whose shape is nearest and reads it with its VAE (4,096 tokens at 1024x1024) and with SigLIP2 (at most 1,024 patches): about 5,000 tokens a reference, which lengthen each step.
 - **A mask** (Qwen-Image-2.1 only): `mask`, a PNG with an alpha channel the size of the first image, redraws only its transparent part and keeps the rest as the first image's pixels.
-- **The steps:** for Qwen-Image-2.1 the same as for generating; for Mage-Flow 4 for Turbo, 30 for the other two.
+- **The steps:** for Qwen-Image-2.1 and HunyuanImage 3.0 the same as for generating; for Mage-Flow 4 for Turbo, 30 for the other two.
 - A reference image's alpha goes to the image model as it is. The other fields are those of generating.
 
 ### The answer
 
 - `data[]`: the images (`b64_json` or `url`), with `revised_prompt` and `seed`.
-- `usage`: counted in the image engine's tokens (the prompt's tokens, and one token for each 16x16 pixels of the reference images and the image made). For HunyuanImage 3.0: the prompt's ids, and one for each 16x16 pixels of the image made.
+- `usage`: counted in the image engine's tokens (the prompt's tokens, and one token for each 16x16 pixels of the reference images and the image made). For HunyuanImage 3.0: the prompt's ids, one for each 16x16 pixels of the image made, and a reference image's VAE tokens and 1,024 SigLIP2 slots.
 - `strata`: the seconds taken, the steps, CFG's strength, the text encoder's, the sampling's and the VAE's times, and what happened to the text model (`gpu_policy`). For HunyuanImage 3.0 it also has the guidance's strength (`guidance`), the bucket's number (`ratio`) and, when the size asked for was another, that size (`requested_size`).
 - The image model is listed in `/v1/models` too.
 
@@ -268,7 +269,7 @@ HunyuanImage 3.0 (`hunyuan-image-3-distil`, w4a8 on the B70, 8 steps, the engine
 | `this image needs at least X GiB of VRAM ...` (400) | Not enough VRAM for this image. Use fewer or smaller reference images, or a smaller image |
 | `this image keeps X GiB of its prompt's cache in RAM ...` (400) | Not enough RAM for the reference images' cache. Likewise use fewer or smaller reference images |
 | `edits need the vision encoder ...` (400) | The files for edits are missing. Run setup with `--images` again |
-| `edits: HunyuanImage 3.0 makes an image from a prompt ...` (400) | HunyuanImage 3.0 takes no reference images (it has no edits yet). Choose another model for the edit with `model` |
+| `edits need the vision model's file ...` (400) | HunyuanImage 3.0's edits lack the SigLIP2 file. Run setup with `--images` again |
 | `the VRAM budget ... is below the weights that always stay` (400) | HunyuanImage 3.0's weights that always stay and its slots (about 10 GB) do not fit the VRAM. It does not run on this GPU |
 | `the image engine did not start ...`, `the image engine ended` | The image engine did not start, or stopped. See the log the message names (`strata-image.log`) |
 | `Image generation runs the image model at Q6_K instead of Q8_0 ...` | The RAM is short, so setup lowered the size ([Sizes and memory](#sizes-and-memory)) |
