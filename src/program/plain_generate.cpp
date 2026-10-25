@@ -11,6 +11,7 @@
 // floats a row.  The report goes to stderr.
 #include "strata/program/plain_generate.hpp"
 #include "strata/program/option_scope.hpp"
+#include "strata/program/done_line.hpp"
 #include "strata/program/shared_options.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
@@ -538,12 +539,13 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         const Clock::time_point t2 = Clock::now();
         const double prompt_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         const double decode_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
-        std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld\n", produced,
-                    (long long) n, prompt_ms, decode_ms, finish, (long long) (model.spec_accepted() - acc0),
-                    (long long) (model.spec_drafted() - off0), (long long) resume, (long long) (model.hits() - hits0),
-                    (long long) (model.hits() + model.misses() - look0), (long long) (model.ram_reads() - ram0),
-                    (long long) (model.file_reads() - files0), (double) (model.file_read_bytes() - file_bytes0) / 1e6,
-                    (long long) (n - resume), (long long) (model.offloaded() - offload0));
+        strata::program::print_done({(int64_t) produced, (int64_t) n, prompt_ms, decode_ms, finish,
+                                     (int64_t) (model.spec_accepted() - acc0), (int64_t) (model.spec_drafted() - off0),
+                                     (int64_t) resume, (int64_t) (model.hits() - hits0),
+                                     (int64_t) (model.hits() + model.misses() - look0),
+                                     (int64_t) (model.ram_reads() - ram0), (int64_t) (model.file_reads() - files0),
+                                     (double) (model.file_read_bytes() - file_bytes0) / 1e6, (int64_t) (n - resume),
+                                     (int64_t) (model.offloaded() - offload0), ""});
         std::fflush(stdout);
     }
     if (!profile_save.empty() && !model.save_profile(profile_save, err)) {

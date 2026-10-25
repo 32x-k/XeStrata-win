@@ -21,6 +21,7 @@
 #include "strata/core/device.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_tier.hpp"
+#include "strata/program/done_line.hpp"
 #include "strata/program/shared_options.hpp"
 #include "strata/core/conversation_snapshot.hpp"
 #include "strata/core/conversation_disk.hpp"
@@ -11983,25 +11984,17 @@ int main(int argc, char** argv) {
             // cancel stopped it part-way (a cancelled request used to be logged and counted as having read them all)
             const int64_t fresh = n - resume;
             const int64_t read_n = cancelled ? std::clamp<int64_t>(pp_reached - resume, 0, fresh) : fresh;
-            // DONE <generated> <prompt> <prompt ms> <decode ms> <finish> <drafts accepted> <drafts offered> <reused> [hits] [lookups]
-            //      [RAM blobs] [file blobs] [file MB]   (CS-T tiers; appended, so an older server reads the rest)
-            //      [prompt tokens read]   (#471: fewer than <prompt> - <reused> when a cancel stopped the read)
-            //      [offloaded]   (#588: the decode's routed experts the GPU read over PCIe or another GPU computed;
-            //                    not in [lookups])
-            //      [lookup-chain accepted] [lookup-chain offered] [suffix accepted] [suffix offered] [windows]
-            //      (only with --lookup-chain)
+            // the DONE line (program/done_line.hpp, the fields there)
             char chain_txt[128] = "";
             if (o.lookup_chain > 0)
                 std::snprintf(chain_txt, sizeof(chain_txt), " %lld %lld %lld %lld %lld", (long long) chain_ok,
                               (long long) chain_drafts, (long long) sfx_ok, (long long) sfx_drafts, (long long) dec_windows);
             if (yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
-            std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld%s\n",
-                        (long long) produced_n,
-                        (long long) n, prompt_ms, decode_ms, finish, (long long) draft_accepted, (long long) draft_offered,
-                        (long long) resume, (long long) req_hits, (long long) req_look,
-                        (long long) (src.ram_reads() - ram0), (long long) (src.file_reads() - files0),
-                        (double) (src.file_read_bytes() - file_bytes0) / 1e6, (long long) read_n,
-                        (long long) req_offload, chain_txt);
+            strata::program::print_done({produced_n, n, prompt_ms, decode_ms, finish, draft_accepted, draft_offered,
+                                         resume, req_hits, req_look, (int64_t) (src.ram_reads() - ram0),
+                                         (int64_t) (src.file_reads() - files0),
+                                         (double) (src.file_read_bytes() - file_bytes0) / 1e6, read_n, req_offload,
+                                         chain_txt});
             std::fflush(stdout);
             if (!finish_staged()) {
                 std::printf("ERR saving a conversation checkpoint failed\n");
