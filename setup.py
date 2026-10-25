@@ -3938,6 +3938,37 @@ def ask_images(cfg_path: Path) -> str | None:
     return ",".join(picks)
 
 
+def write_ratio_head(QI, models_dir: Path) -> None:
+    """HunyuanImage 3.0's ratio head (its own size choice: the final norm and the 37 ratio tokens' output rows) out of
+    the bf16 shards by range requests, 300 KB, checked against its pinned SHA-256."""
+    import hashlib
+    dst = QI.ratio_head_path(models_dir)
+    if dst.exists() and hashlib.sha256(dst.read_bytes()).hexdigest() == QI.HUNYUANIMAGE3_RATIO_HEAD_SHA:
+        ok(f"{dst.name} already there")
+        return
+
+    def read(url: str, start: int, end: int) -> bytes:
+        for attempt in range(5):
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "strata-setup",
+                                                           "Range": f"bytes={start}-{end}"})
+                data = urllib.request.urlopen(req, timeout=120).read()
+                if len(data) == end - start + 1:
+                    return data
+            except (urllib.error.URLError, OSError):
+                pass
+            time.sleep(2 ** attempt)
+        fail(f"cannot read {url} (bytes {start}-{end})", "check the connection to Hugging Face and run setup again")
+
+    data = QI.ratio_head_bytes(read, hf_endpoint())
+    if hashlib.sha256(data).hexdigest() != QI.HUNYUANIMAGE3_RATIO_HEAD_SHA:
+        fail(f"{dst.name}: not the bytes XeStrata pins", "the model's files on Hugging Face changed; update XeStrata")
+    part = dst.with_name(dst.name + ".part")
+    part.write_bytes(data)
+    os.replace(part, dst)
+    ok(f"{dst.name}: the model's size choice ({len(data) >> 10} KiB out of the bf16 shards)")
+
+
 def setup_images(a, gpu: dict, models_dir: Path, eng: Path,
                  text_gb: float | None = None) -> tuple[dict, list[dict]] | None:
     """--images (one choice of qimage.IMAGE_MODELS, or several, comma-separated): their files for the image engine in
@@ -3969,6 +4000,7 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path,
         prompt = QI.write_system_prompt(models_dir)
         ok(f"system prompt: {prompt.name} ({len(prompt.read_text(encoding='utf-8'))} characters) out of "
            f"{QI.local_path(models_dir, 'hunyuanimage3-system-prompt').name}")
+        write_ratio_head(QI, models_dir)
     cfgs = []
     for p in plans:
         cfg = QI.image_config(p["quant"], exe, models_dir, model=p["choice"],

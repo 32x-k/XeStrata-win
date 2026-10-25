@@ -187,6 +187,17 @@ HUNYUANIMAGE3_EXTRA_RESOLUTIONS = ((1024, 768), (1280, 720), (768, 1024), (720, 
 # its system prompt, read out of `system_prompt.py` (the string that file gives it as) into the models folder
 SYSTEM_PROMPT_NAME = "unified_system_prompt_en"
 SYSTEM_PROMPT_FILE = "en_unified.txt"
+# what it chooses its own size with (a size "auto"): the final norm and the output projection's rows of the 37
+# `<img_ratio_i>` tokens, which only the bf16 shards hold (1 and 31, 5.3 GB each): taken by range requests into a file
+# of their own (300 KB), whose SHA-256 is the pin.  The ratio tokens' ids are two runs: 0 - 32, then 33 - 36 (the four
+# sizes the image processor adds), which the vocabulary got later.
+HUNYUANIMAGE3_RATIO_HEAD = "ratio_head.safetensors"
+HUNYUANIMAGE3_RATIO_IDS = tuple(range(128044, 128077)) + tuple(range(130103, 130107))
+HUNYUANIMAGE3_RATIO_SOURCES = (   # (the shard, its tensor, the name in the head file, the rows taken: None for all)
+    ("model-0031-of-0032.safetensors", "model.ln_f.weight", "model.ln_f.weight", None),
+    ("model-0001-of-0032.safetensors", "lm_head.weight", "lm_head.img_ratio.weight", HUNYUANIMAGE3_RATIO_IDS),
+)
+HUNYUANIMAGE3_RATIO_HEAD_SHA = "40dde81664c2408ba52ca17f0aa5f6f741ee38ca33f58d81dce9405aef6c6fa6"
 DEFAULT_TEXT_ENCODER = "stock"
 # setup's --images choices -> (the run config's model_name, the DiT, the text encoder)
 IMAGE_MODELS = {"qwen-image-turbo": ("qwen-image-2.1-turbo", "turbo", "stock"),
@@ -393,6 +404,47 @@ def system_prompt_path(models_dir: Path) -> Path:
     return local_path(models_dir, "hunyuanimage3-system-prompt").with_name(SYSTEM_PROMPT_FILE)
 
 
+def ratio_head_path(models_dir: Path) -> Path:
+    return Path(models_dir) / HUNYUANIMAGE3_DIR / HUNYUANIMAGE3_RATIO_HEAD
+
+
+def ratio_head_bytes(read, endpoint: str = "https://huggingface.co") -> bytes:
+    """HunyuanImage 3.0's ratio head (HUNYUANIMAGE3_RATIO_SOURCES) as a safetensors file's bytes: each shard's header,
+    then its tensor's rows, by `read(url, start, end)` (the bytes start .. end inclusive, a range request).  The
+    tensors are the shards' BF16 as they lie; the header is written the same way each time, so the bytes are the
+    pin's."""
+    import json
+    import struct
+    out, data = {}, bytearray()
+    for shard, tensor, name, rows in HUNYUANIMAGE3_RATIO_SOURCES:
+        url = f"{endpoint.rstrip('/')}/{_HY}/resolve/{REVISIONS[_HY]}/{shard}"
+        n = struct.unpack("<Q", read(url, 0, 7))[0]
+        head = json.loads(read(url, 8, 8 + n - 1))
+        t = head.get(tensor)
+        if t is None or t.get("dtype") != "BF16":
+            raise ValueError(f"{shard}: no BF16 {tensor}")
+        begin = 8 + n + int(t["data_offsets"][0])
+        shape = [int(d) for d in t["shape"]]
+        row = 2 * (shape[1] if len(shape) == 2 else shape[0])
+        if rows is None:
+            got = read(url, begin, begin + row * (shape[0] if len(shape) == 2 else 1) - 1)
+            out_shape = shape
+        else:
+            got, i = b"", 0
+            while i < len(rows):   # the rows' runs, a range each
+                j = i
+                while j + 1 < len(rows) and rows[j + 1] == rows[j] + 1:
+                    j += 1
+                got += read(url, begin + rows[i] * row, begin + (rows[j] + 1) * row - 1)
+                i = j + 1
+            out_shape = [len(rows), row // 2]
+        out[name] = {"dtype": "BF16", "shape": out_shape, "data_offsets": [len(data), len(data) + len(got)]}
+        data += got
+    header = json.dumps(out, sort_keys=True, separators=(",", ":")).encode()
+    header += b" " * (-len(header) % 8)
+    return struct.pack("<Q", len(header)) + header + bytes(data)
+
+
 def write_system_prompt(models_dir: Path) -> Path:
     """HunyuanImage 3.0's system prompt (the ids start with it) written beside the `system_prompt.py` the model ships
     it in, as `en_unified.txt`: the file is parsed for its `unified_system_prompt_en` string and never run (importing
@@ -463,6 +515,7 @@ def image_config(quant: str, exe: Path, models_dir: Path, *, model: str = DEFAUL
                 "tokenizer": str(local_path(models_dir, "hunyuanimage3-tokenizer")),
                 "system_prompt": str(system_prompt_path(models_dir)), "steps": DITS[dit][1],
                 "vision": str(local_path(models_dir, "hunyuanimage3-vision")), "max_refs": HUNYUANIMAGE3_MAX_REFS,
+                "ratio_head": str(ratio_head_path(models_dir)),
                 "guidance": HUNYUANIMAGE3_GUIDANCE, "schedule": "hunyuanimage3", "mask": False,
                 "transparency": False, "resolutions": hunyuanimage3_resolutions(),
                 "gpu_policy": policy, "uma": bool(uma), "ssd_offload": bool(ssd_offload)}
