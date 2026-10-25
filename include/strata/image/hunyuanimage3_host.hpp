@@ -61,6 +61,42 @@ constexpr int32_t kHunyuanImage3Boi = 128000, kHunyuanImage3Eoi = 128001, kHunyu
 constexpr int32_t kHunyuanImage3Timestep = 128017, kHunyuanImage3Guidance = 130082;
 constexpr int32_t kHunyuanImage3TimestepR = 130107;
 constexpr int32_t kHunyuanImage3ImgSize256 = 128034, kHunyuanImage3ImgRatio0 = 128044;
+constexpr int32_t kHunyuanImage3JointImgSep = 128077;   // `<joint_img_sep>`: between a reference's VAE and ViT tokens
+/// `<img_size_N>`: the run's ids are 128034 .. 128043 for N = 256, 512, 768, 1024, ... (the model's sizes grow by
+/// 256); `<img_ratio_i>` is kHunyuanImage3ImgRatio0 + i.
+constexpr int64_t hunyuanimage3_img_size_of(int32_t id) { return 256 * (int64_t) (id - kHunyuanImage3ImgSize256 + 1); }
+
+/// One image block of a sequence as its markers lay it out.  A reference image (an edit's) is `<boi> <img_size_N>
+/// <img_ratio_i> <timestep> <img> * vae_n <joint_img_sep> <img> * vit_n <eoi>`: its VAE latent's tokens, then its
+/// SigLIP2 features' (the processor's fixed 1024 slots, the real patches first); the generated image's block is
+/// `<boi> <img_size_N> <img_ratio_i> <timestep> <guidance> <timestep_r> <img> * n` and ends the sequence.  The
+/// grids are not in the ids: the VAE grid comes from the bucket (N, i) and the ViT grid from the image's naflex
+/// size, which the caller sets (hunyuanimage3_positions_of takes them).
+struct HunyuanImage3Block {
+    bool reference = false;     // a reference image's block (else the generated image's)
+    int64_t boi = 0;            // the `<boi>`
+    int64_t timestep = -1;      // the `<timestep>` (a reference's row is timestep_emb(0))
+    int64_t base_size = 0;      // N of `<img_size_N>`
+    int32_t ratio_index = 0;    // i of `<img_ratio_i>`
+    int64_t vae_start = 0, vae_n = 0;   // the VAE tokens (the generated image's block: its tokens)
+    int64_t vit_start = 0, vit_n = 0;   // a reference's ViT tokens (0 for the generated image)
+    int64_t end = 0;            // one past the block's last token (`<eoi>` included for a reference)
+    int64_t vae_h = 0, vae_w = 0, vit_h = 0, vit_w = 0;   // the grids, filled by the caller
+};
+
+/// The image blocks of `ids` ([t], already trimmed at the last `<img>`): the references in order, then the
+/// generated image's.  False with `err` on a layout that is not one of the two above.
+bool hunyuanimage3_blocks(const int32_t* ids, int64_t t, std::vector<HunyuanImage3Block>& blocks, std::string& err);
+
+/// The 2D rope positions and the attention's key limits of a sequence with `blocks` (their grids filled): text
+/// keeps y = x = its index; every image grid (a reference's VAE and ViT grids, the generated block's) gets the
+/// reference's `build_2d_rope` positions from its start L - beta_y = L + (w h - h)/2, beta_x = L + (w h - w)/2,
+/// (r, c) at (beta_y + r, beta_x + c) truncated - and a ViT slot past its real patches keeps its index.  `key_lim`
+/// ([t]) is the first key a row does not see: a row inside a reference's joint span (its VAE tokens, the separator
+/// and its ViT tokens) sees up to the span's end, every other row before the generated block its own prefix (the
+/// generated block's rows see everything: qi_attention's n_text is its start).
+bool hunyuanimage3_positions_of(int64_t t, const std::vector<HunyuanImage3Block>& blocks, std::vector<int32_t>& y,
+                                std::vector<int32_t>& x, std::vector<int32_t>& key_lim, std::string& err);
 
 /// The engine's sequence: `ids` cut at the last `<img>` token.  The reference's own sequence ends with `<eoi>`
 /// and `</answer>` after the block; none of that can reach the image (its rows are causal and come after the

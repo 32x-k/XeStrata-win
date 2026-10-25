@@ -33,7 +33,10 @@
 #include "strata/image/hunyuanimage3_file.hpp"
 #include "strata/image/hunyuanimage3_host.hpp"
 #include "strata/image/hunyuanimage3_pipeline.hpp"
+#include "strata/image/hunyuanimage3_entry_exit.hpp"
+#include "strata/image/hunyuanimage3_refs.hpp"
 #include "strata/image/hunyuanimage3_vae.hpp"
+#include "strata/image/hunyuanimage3_vision.hpp"
 #include "strata/image/pipeline.hpp"
 #include "strata/image/qi_image_io.hpp"
 
@@ -1433,7 +1436,8 @@ int vae_cmd(const std::string& vae_file, const std::string& lat_file, const std:
 // golden's, and `GOLDEN_IMAGE` is not compared).  `LAYERS` under the file's is a truncated model: plumbing only.
 int pipeline_cmd(const std::string& dit_file, const std::string& vae_file, const std::string& idfile,
                  const std::string& init_file, const std::string& gold_image, const std::string& dst,
-                 int64_t steps, int64_t want_layers, int64_t budget_mib, const std::string& sigma_list) {
+                 int64_t steps, int64_t want_layers, int64_t budget_mib, const std::string& sigma_list,
+                 const std::string& refs_list = std::string(), const std::string& vision_file = std::string()) {
     std::vector<int32_t> ids;
     int64_t h = 0, w = 0;
     if (!read_ids(idfile, ids, h, w)) {
@@ -1472,7 +1476,7 @@ int pipeline_cmd(const std::string& dit_file, const std::string& vae_file, const
 
     si::HunyuanImage3Pipeline pipe;
     const auto t_open = std::chrono::steady_clock::now();
-    if (!pipe.open(dit_file, vae_file, err, want_layers)) {
+    if (!pipe.open(dit_file, vae_file, err, want_layers, vision_file)) {
         std::fprintf(stderr, "strata-image-hunyuanimage3-probe: open: %s\n", err.c_str());
         return 1;
     }
@@ -1485,6 +1489,20 @@ int pipeline_cmd(const std::string& dit_file, const std::string& vae_file, const
     r.drop = 0;
     r.width = 16 * w;
     r.height = 16 * h;
+    {   // an edit's reference images (the sequence's blocks name their buckets)
+        std::stringstream ss(refs_list);
+        for (std::string tok; std::getline(ss, tok, ',');) {
+            if (tok.empty() || tok == "-") continue;
+            si::QiRef f;
+            f.rgba = si::load_rgba8(tok, f.width, f.height, err);
+            if (f.rgba.empty()) {
+                std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s: %s\n", tok.c_str(), err.c_str());
+                return 1;
+            }
+            r.refs.push_back(std::move(f));
+        }
+        if (!r.refs.empty()) std::printf("  %zu reference image(s)\n", r.refs.size());
+    }
     r.seed = 20261024;
     r.steps = steps > 0 ? steps : 8;   // the golden's 8 at its shift 3; a plumbing run cuts them
     r.guidance = 2.5f;                 // the golden's guidance_scale (its model number 2500)
@@ -1596,6 +1614,153 @@ int pipeline_cmd(const std::string& dit_file, const std::string& vae_file, const
     if (gpx.empty()) std::printf("  uint8 equal %.2f%%", 100.0 * (double) same8 / (double) (3 * HW));
     std::printf("\n");
     std::printf("  acceptance (decisions.md): PSNR >= 30 dB, mean <= 6/255, cos >= 0.999\n");
+    return 0;
+}
+
+// An edit's reference image, the engine's pieces against the edit golden's (hy3_cpu_golden_edit.py's dumps in
+// GOLDEN_DIR): the VAE encoder on the golden's own VAE copy (cond_vae_image.npy -> cond_latent.npy), SigLIP2 and
+// the aligner on its own patches (cond_vit_pixels.npy, cond_vit_shape.npy -> cond_vit_hidden.npy, cond_vit_rows.npy),
+// patch_embed at t = 0 on the golden's latent (-> cond_vae_rows.npy) and timestep_emb(0) (-> cond_timestep_row.npy);
+// and, with IMAGE, the engine's own copies of the picture against the golden's two (the reference's PIL resizes).
+//   refs DITFILE VAEFILE VISIONFILE GOLDEN_DIR [IMAGE]
+int refs_cmd(const std::string& dit_file, const std::string& vae_file, const std::string& vision_file,
+             const std::string& golden, const std::string& image) {
+    auto npy = [&](const char* name, Npy& out) {
+        if (!read_npy(golden + "/" + name, out) || out.is_int) {
+            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: cannot read %s/%s\n", golden.c_str(), name);
+            return false;
+        }
+        return true;
+    };
+    auto report = [](const char* what, const std::vector<float>& mine, const std::vector<float>& gold) {
+        if (mine.size() != gold.size()) {
+            std::printf("  %-18s sizes differ: %zu vs %zu\n", what, mine.size(), gold.size());
+            return;
+        }
+        const Diff2 d = compare2(mine.data(), gold.data(), (int64_t) mine.size());
+        double scale = 0;
+        for (float v : gold) scale = std::max(scale, (double) std::fabs(v));
+        std::printf("  %-18s rel %.3e  cos %.8f  max|d| %.3e (of %.3f)  nonfinite %zu\n", what, d.d.rel, d.d.cos,
+                    d.max_abs, scale, d.nonfinite);
+    };
+    Npy img, lat, pix, shape, hid, rows, vrows, trow;
+    if (!npy("cond_vae_image.npy", img) || !npy("cond_latent.npy", lat) || !npy("cond_vit_pixels.npy", pix) ||
+        !npy("cond_vit_shape.npy", shape) || !npy("cond_vit_hidden.npy", hid) || !npy("cond_vit_rows.npy", rows) ||
+        !npy("cond_vae_rows.npy", vrows) || !npy("cond_timestep_row.npy", trow))
+        return 1;
+    if (img.shape.size() != 3 || img.shape[0] != 3 || lat.shape.size() != 3 || lat.shape[0] != 32) {
+        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: the golden's VAE copy is not [3][H][W] / [32][h][w]\n");
+        return 1;
+    }
+    const int64_t H = img.shape[1], W = img.shape[2], h = lat.shape[1], w = lat.shape[2];
+    const int64_t ph = (int64_t) shape.f32[0], pw = (int64_t) shape.f32[1];
+    std::printf("refs: the golden's VAE copy %lld x %lld -> latent %lld x %lld; SigLIP2 %lld x %lld patches of %lld\n",
+                (long long) W, (long long) H, (long long) w, (long long) h, (long long) pw, (long long) ph,
+                (long long) pix.shape[0]);
+    std::string err;
+    void* stream = strata::core::Runtime::get().create_stream();
+
+    // --- the VAE encoder on the golden's copy
+    si::HunyuanImage3Vae vae;
+    if (!vae.open(vae_file, stream, err, false, true)) {
+        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: VAE: %s\n", err.c_str());
+        return 1;
+    }
+    float *d_img = nullptr, *d_z = nullptr;
+    if (!strata::gpu::alloc_device(&d_img, (size_t) img.f32.size() * 4) || !strata::gpu::alloc_device(&d_z, (size_t) lat.f32.size() * 4)) {
+        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: GPU memory\n");
+        return 1;
+    }
+    strata::gpu::copy(d_img, img.f32.data(), img.f32.size() * 4);
+    auto t0 = std::chrono::steady_clock::now();
+    vae.encode(d_img, H, W, d_z);
+    std::vector<float> z(lat.f32.size());
+    strata::gpu::copy(z.data(), d_z, z.size() * 4);
+    std::printf("  VAE encode %.2f s (weights %.2f GB, scratch %.2f GB)\n",
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+                (double) vae.weight_bytes() / 1e9, (double) vae.scratch_held() / 1e9);
+    report("cond_latent", z, lat.f32);
+    vae.drop_scratch();
+
+    // --- patch_embed(latent, t = 0) and timestep_emb(0): the rows the cond block carries
+    {
+        si::HunyuanImage3EntryExit around;
+        if (!around.open(dit_file, stream, err) || !around.set_grid(h, w, err)) {
+            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: entry: %s\n", err.c_str());
+            return 1;
+        }
+        std::vector<float> r((size_t) (h * w * around.hidden()));
+        if (!around.patch_embed(lat.f32.data(), h, w, 0.0f, r.data(), err)) {
+            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: patch_embed: %s\n", err.c_str());
+            return 1;
+        }
+        report("cond_vae_rows", r, vrows.f32);
+        std::vector<float> rg((size_t) (h * w * around.hidden()));
+        if (!around.patch_embed(z.data(), h, w, 0.0f, rg.data(), err)) return 1;
+        report("cond_vae_rows(own z)", rg, vrows.f32);
+        si::HunyuanImage3File f;
+        if (!f.open(dit_file, err)) {
+            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+            return 1;
+        }
+        std::vector<float> tr((size_t) around.hidden());
+        if (!si::hunyuanimage3_time_host(f, "timestep_emb", 0.0f, tr.data(), err)) return 1;
+        report("cond_timestep_row", tr, trow.f32);
+    }
+
+    // --- SigLIP2 and the aligner on the golden's patches
+    si::HunyuanImage3Vision vision;
+    if (!vision.open(vision_file, dit_file, stream, err)) {
+        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: SigLIP2: %s\n", err.c_str());
+        return 1;
+    }
+    std::vector<float> out((size_t) (vision.max_patches() * vision.out_width()));
+    t0 = std::chrono::steady_clock::now();
+    if (!vision.rows(pix.f32.data(), ph, pw, out.data(), err)) {
+        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: SigLIP2: %s\n", err.c_str());
+        return 1;
+    }
+    std::printf("  SigLIP2 + aligner %.2f s (weights %.2f GB, scratch %.2f GB)\n",
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
+                (double) vision.weight_bytes() / 1e9, (double) vision.scratch_bytes() / 1e9);
+    report("cond_vit_hidden", vision.last_hidden(), hid.f32);
+    report("cond_vit_rows", out, rows.f32);
+    {
+        const int64_t n = ph * pw, C = vision.out_width();
+        if (n < vision.max_patches()) {
+            std::vector<float> a(out.begin(), out.begin() + n * C), b(rows.f32.begin(), rows.f32.begin() + n * C);
+            report("  real rows", a, b);
+            std::vector<float> a2(out.begin() + n * C, out.end()), b2(rows.f32.begin() + n * C, rows.f32.end());
+            report("  padded rows", a2, b2);
+        }
+    }
+
+    // --- the engine's own copies of the picture against the golden's (the reference's PIL resize and crop)
+    if (!image.empty()) {
+        si::QiRef f;
+        f.rgba = si::load_rgba8(image, f.width, f.height, err);
+        if (f.rgba.empty()) {
+            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s: %s\n", image.c_str(), err.c_str());
+            return 1;
+        }
+        const std::vector<float> mine = si::hunyuanimage3_vae_copy(f, W, H);
+        report("vae copy (image)", mine, img.f32);
+        int64_t mph = 0, mpw = 0;
+        const std::vector<float> patches = si::hunyuanimage3_vit_patches(f, vision.patch(), vision.max_patches(), mph, mpw);
+        std::printf("  vit copy grid %lld x %lld (the golden's %lld x %lld)\n", (long long) mpw, (long long) mph,
+                    (long long) pw, (long long) ph);
+        report("vit patches (image)", patches, pix.f32);
+        // the whole chain from the picture, against the golden's rows
+        std::vector<float> out2((size_t) (vision.max_patches() * vision.out_width()));
+        if (vision.rows(patches.data(), mph, mpw, out2.data(), err)) report("vit rows (image)", out2, rows.f32);
+        strata::gpu::copy(d_img, mine.data(), mine.size() * 4);
+        vae.encode(d_img, H, W, d_z);
+        std::vector<float> z2(lat.f32.size());
+        strata::gpu::copy(z2.data(), d_z, z2.size() * 4);
+        report("latent (image)", z2, lat.f32);
+    }
+    strata::gpu::free(d_img);
+    strata::gpu::free(d_z);
     return 0;
 }
 
@@ -2195,7 +2360,10 @@ int main(int argc, char** argv) {
             return pipeline_cmd(argv[2], argv[3], argv[4], argc > 5 ? argv[5] : std::string("-"),
                                 argc > 6 ? argv[6] : std::string(), argc > 7 ? argv[7] : std::string(),
                                 argc > 8 ? number(argv[8]) : 8, argc > 9 ? number(argv[9]) : 0,
-                                argc > 10 ? number(argv[10]) : 0, argc > 11 ? argv[11] : std::string());
+                                argc > 10 ? number(argv[10]) : 0, argc > 11 ? argv[11] : std::string(),
+                                argc > 12 ? argv[12] : std::string(), argc > 13 ? argv[13] : std::string());
+        if (argc >= 6 && std::strcmp(argv[1], "refs") == 0)
+            return refs_cmd(argv[2], argv[3], argv[4], argv[5], argc > 6 ? argv[6] : std::string());
         if (argc >= 3 && std::strcmp(argv[1], "vae") == 0)
             return vae_cmd(argv[2], argv[3], argc > 4 ? argv[4] : std::string(),
                            argc > 5 ? argv[5] : std::string(), argc > 6 ? number(argv[6]) : 0,
@@ -2228,10 +2396,12 @@ int main(int argc, char** argv) {
                  "       %s walk QFILE GOLDEN_DIR IDFILE [LAYERS] [BANK_MIB] [OUT.bin]  (the decoder vs the golden)\n"
                  "       %s sample QFILE GOLDEN_DIR IDFILE [STEPS] [LAYERS] [BANK_MIB] [FINAL.bin]"
                  "  (the whole sampler vs the golden)\n"
+                 "       %s refs DITFILE VAEFILE VISIONFILE GOLDEN_DIR [IMAGE]  (an edit's reference image's pieces "
+                 "vs the edit golden)\n"
                  "       %s vae VAEFILE LATENT[.npy|.bin] [GOLDEN.npy [OUT.bin [PRESCALED [GOLDEN_RAW]]]]"
                  "  (the engine's VAE decode vs the golden)\n"
                  "       %s pipeline DITFILE VAEFILE IDFILE [INIT|-[.npy|.bin]] [GOLDEN.png|.npy] [OUT.rgba] "
-                 "[OUT.rgba] [STEPS] [LAYERS] [BANK_MIB] [SIGMAS]"
+                 "[OUT.rgba] [STEPS] [LAYERS] [BANK_MIB] [SIGMAS] [REF.png,...] [VISIONFILE]"
                  "  (the shipped pipeline vs the golden picture)\n"
                  "       %s stages QFILE GOLDEN_DIR IDFILE [LAYER] [BANK_MIB]  (one layer, stage by stage)\n"
                  "       %s gemm [T] [K] [N]              (the FP16 products, against the host's)\n"
@@ -2243,7 +2413,7 @@ int main(int argc, char** argv) {
                  "       %s mem                         (the GPU's free and total VRAM, and the cap below it)\n"
                  "       %s sigmas [STEPS] [SHIFT]\n",
                      argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0],
-                     argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
+                     argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 2;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", e.what());

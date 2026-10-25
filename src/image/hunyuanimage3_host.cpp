@@ -419,15 +419,127 @@ int64_t hunyuanimage3_trim(const int32_t* ids, int64_t t, std::string& err) {
         err = "hunyuanimage3_trim: the image block has no <boi> before it";
         return -1;
     }
-    if (boi > 1) {
-        err = std::to_string(boi) + " <boi> in the sequence: the engine takes one image (edits are not built yet)";
-        return -1;
-    }
     if (last + 1 < t && ids[last + 1] != kHunyuanImage3Eoi) {
         err = "hunyuanimage3_trim: id " + std::to_string(ids[last + 1]) + " follows the block, not <eoi>";
         return -1;
     }
     return last + 1;
+}
+
+bool hunyuanimage3_blocks(const int32_t* ids, int64_t t, std::vector<HunyuanImage3Block>& blocks, std::string& err) {
+    blocks.clear();
+    auto is_size = [](int32_t id) { return id >= kHunyuanImage3ImgSize256 && id < kHunyuanImage3ImgRatio0; };
+    auto is_ratio = [](int32_t id) { return id >= kHunyuanImage3ImgRatio0 && id < kHunyuanImage3ImgRatio0 + 64; };
+    auto run = [&](int64_t from) {   // the `<img>` run from `from`
+        int64_t n = 0;
+        while (from + n < t && ids[from + n] == kHunyuanImage3Image) ++n;
+        return n;
+    };
+    for (int64_t i = 0; i < t; ++i) {
+        if (ids[i] != kHunyuanImage3Boi) {
+            if (ids[i] == kHunyuanImage3Image) {
+                err = "hunyuanimage3_blocks: an <img> token at " + std::to_string(i) + " outside a block";
+                return false;
+            }
+            continue;
+        }
+        HunyuanImage3Block b;
+        b.boi = i;
+        int64_t k = i + 1;
+        if (k + 1 < t && is_size(ids[k]) && is_ratio(ids[k + 1])) {
+            b.base_size = hunyuanimage3_img_size_of(ids[k]);
+            b.ratio_index = ids[k + 1] - kHunyuanImage3ImgRatio0;
+            k += 2;
+        } else {
+            err = "hunyuanimage3_blocks: the block at " + std::to_string(i) + " has no <img_size_N> <img_ratio_i>";
+            return false;
+        }
+        if (k < t && ids[k] == kHunyuanImage3Timestep) b.timestep = k++;
+        else {
+            err = "hunyuanimage3_blocks: the block at " + std::to_string(i) + " has no <timestep>";
+            return false;
+        }
+        if (k + 1 < t && ids[k] == kHunyuanImage3Guidance && ids[k + 1] == kHunyuanImage3TimestepR) {
+            // the generated image's block: its tokens end the sequence
+            k += 2;
+            b.vae_start = k;
+            b.vae_n = run(k);
+            if (b.vae_n == 0 || b.vae_start + b.vae_n != t) {
+                err = "hunyuanimage3_blocks: the generated image's block at " + std::to_string(i) +
+                      " does not end the sequence";
+                return false;
+            }
+            b.end = t;
+            blocks.push_back(b);
+            return true;
+        }
+        b.reference = true;
+        b.vae_start = k;
+        b.vae_n = run(k);
+        k += b.vae_n;
+        if (b.vae_n == 0 || k >= t || ids[k] != kHunyuanImage3JointImgSep) {
+            err = "hunyuanimage3_blocks: the reference at " + std::to_string(i) +
+                  " has no <img> run followed by <joint_img_sep>";
+            return false;
+        }
+        ++k;
+        b.vit_start = k;
+        b.vit_n = run(k);
+        k += b.vit_n;
+        if (b.vit_n == 0 || k >= t || ids[k] != kHunyuanImage3Eoi) {
+            err = "hunyuanimage3_blocks: the reference at " + std::to_string(i) + " has no <eoi> after its ViT tokens";
+            return false;
+        }
+        b.end = k + 1;
+        blocks.push_back(b);
+        i = k;
+    }
+    err = "hunyuanimage3_blocks: no generated image's block at the end of the sequence";
+    return false;
+}
+
+bool hunyuanimage3_positions_of(int64_t t, const std::vector<HunyuanImage3Block>& blocks, std::vector<int32_t>& y,
+                                std::vector<int32_t>& x, std::vector<int32_t>& key_lim, std::string& err) {
+    y.assign((size_t) t, 0);
+    x.assign((size_t) t, 0);
+    key_lim.assign((size_t) t, 0);
+    for (int64_t i = 0; i < t; ++i) {
+        y[(size_t) i] = x[(size_t) i] = (int32_t) i;
+        key_lim[(size_t) i] = (int32_t) (i + 1);
+    }
+    // the grids, in sequence order: (start, h, w, slots) - a grid's rows past h * w (a ViT block's padding) keep
+    // their index, as build_2d_rope's "previous text" range covers them
+    struct Grid { int64_t L, h, w, slots; };
+    std::vector<Grid> grids;
+    for (const HunyuanImage3Block& b : blocks) {
+        if (b.vae_h * b.vae_w != b.vae_n) {
+            err = "hunyuanimage3_positions_of: a block's " + std::to_string(b.vae_n) + " VAE tokens are not its " +
+                  std::to_string(b.vae_h) + " x " + std::to_string(b.vae_w) + " grid";
+            return false;
+        }
+        grids.push_back({b.vae_start, b.vae_h, b.vae_w, b.vae_n});
+        if (b.reference) {
+            if (b.vit_h * b.vit_w > b.vit_n || b.vit_h <= 0 || b.vit_w <= 0) {
+                err = "hunyuanimage3_positions_of: a reference's " + std::to_string(b.vit_h) + " x " +
+                      std::to_string(b.vit_w) + " ViT grid does not fit its " + std::to_string(b.vit_n) + " slots";
+                return false;
+            }
+            grids.push_back({b.vit_start, b.vit_h, b.vit_w, b.vit_n});
+            for (int64_t i = b.vae_start; i < b.vit_start + b.vit_n; ++i)
+                key_lim[(size_t) i] = (int32_t) (b.vit_start + b.vit_n);   // the joint span sees all of itself
+        }
+    }
+    for (const Grid& g : grids) {
+        const double beta_y = (double) g.L + ((double) (g.w * g.h) - (double) g.h) / 2.0;
+        const double beta_x = (double) g.L + ((double) (g.w * g.h) - (double) g.w) / 2.0;
+        for (int64_t r = 0; r < g.h; ++r)
+            for (int64_t c = 0; c < g.w; ++c) {
+                const int64_t i = g.L + r * g.w + c;
+                y[(size_t) i] = (int32_t) std::floor(beta_y + (double) r);
+                x[(size_t) i] = (int32_t) std::floor(beta_x + (double) c);
+            }
+    }
+    return true;
 }
 
 // The sequence's 2D rope positions: text keeps y = x = its index; the image block at L, h x w tokens, gets

@@ -18,6 +18,7 @@
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/image/hunyuanimage3_host.hpp"
+#include "strata/image/hunyuanimage3_refs.hpp"
 #include "strata/image/qi_dit.hpp"
 
 #include <algorithm>
@@ -43,22 +44,38 @@ constexpr int64_t kLatentChannels = 32, kDownsample = 16;
 
 uint64_t clampu(uint64_t v, uint64_t lo, uint64_t hi) { return std::max(lo, std::min(v, hi)); }
 
+// the reference images as a key for the cached rows: their sizes and a hash of their pixels
+std::string refs_key(const std::vector<QiRef>& refs) {
+    std::string key;
+    for (const QiRef& f : refs) {
+        uint64_t h = 1469598103934665603ull;
+        for (uint8_t b : f.rgba) h = (h ^ b) * 1099511628211ull;
+        key += std::to_string(f.width) + "x" + std::to_string(f.height) + ":" + std::to_string(h) + ";";
+    }
+    return key;
+}
+
 }  // namespace
 
 bool HunyuanImage3Pipeline::open(const std::string& dit, const std::string& vae, std::string& err,
-                                 int64_t max_layers) {
+                                 int64_t max_layers, const std::string& vision) {
     s_ = core::Runtime::get().create_stream();
     dit_path_ = dit;
     vae_path_ = vae;
+    vision_path_ = vision;
     max_layers_ = max_layers;
     size_t free = 0, total = 0;
     gpu::mem_info(&free, &total);
     dit_size_ = std::make_unique<HunyuanImage3Dit>();
     vae_size_ = std::make_unique<HunyuanImage3Vae>();
     around_size_ = std::make_unique<HunyuanImage3EntryExit>();
-    if (!(dit_size_->open(dit, s_, err, max_layers, true) && vae_size_->open(vae, s_, err, true) &&
+    if (!(dit_size_->open(dit, s_, err, max_layers, true) && vae_size_->open(vae, s_, err, true, edits()) &&
           around_size_->open(dit, s_, err, true)))
         return false;
+    if (edits()) {
+        vision_size_ = std::make_unique<HunyuanImage3Vision>();
+        if (!vision_size_->open(vision, dit, s_, err, true)) return false;
+    }
     auto_budget_ = vram_cap(free);
     return true;
 }
@@ -75,7 +92,7 @@ void HunyuanImage3Pipeline::ensure_open() {
         around_.reset();
         throw std::runtime_error(err);
     }
-    if (!vae_->open(vae_path_, s_, err)) {
+    if (!vae_->open(vae_path_, s_, err, false, edits())) {
         dit_.reset();
         vae_.reset();
         around_.reset();
@@ -111,14 +128,17 @@ void HunyuanImage3Pipeline::release(bool all) {
         dit_.reset();
         vae_.reset();
         around_.reset();
+        vision_.reset();
         banks_set_ = 0;
         text_ids_.clear();
+        refs_key_.clear();
         text_rows_.clear();
         return;
     }
     dit_->drop_sequence();
     vae_->drop_scratch();
     if (around_) around_->drop_grid();
+    if (vision_) vision_->drop_scratch();
     dit_->set_bank_budget(dit_->bank_min());   // the streamed regions stay, the resident prefix gives its VRAM back
     banks_set_ = dit_->bank_min();
 }
@@ -132,7 +152,71 @@ void HunyuanImage3Pipeline::fit(uint64_t reserve) {
 
 uint64_t HunyuanImage3Pipeline::held() const {
     if (dit_ == nullptr || vae_ == nullptr) return 0;
-    return dit_->held() + vae_->weight_bytes() + vae_->scratch_held() + (around_ ? around_->held() : 0);
+    return dit_->held() + vae_->weight_bytes() + vae_->scratch_held() + (around_ ? around_->held() : 0) +
+           (vision_ ? vision_->held() : 0);
+}
+
+void HunyuanImage3Pipeline::ensure_vision() {
+    if (vision_) return;
+    if (!edits()) throw std::invalid_argument("image engine: HunyuanImage 3.0's edits need the vision model's file "
+                                              "(--vision): run setup with --images again");
+    std::string err;
+    auto v = std::make_unique<HunyuanImage3Vision>();
+    if (!v->open(vision_path_, dit_path_, s_, err)) throw std::runtime_error("image engine: " + err);
+    vision_ = std::move(v);
+}
+
+// The reference images' rows, in the sequence's constant part: for each reference block, the image's VAE copy
+// (the bucket the block names) through the encoder and `patch_embed` at timestep 0 into its VAE tokens, its
+// `<timestep>` row as timestep_emb(0), and its ViT copy through SigLIP2 and the aligner into its 1024 slots - the
+// reference's `instantiate_vae_image_tokens` and `instantiate_vit_image_tokens`.  The encoders' buffers are given
+// back here: the walk's banks and the VAE's decode take the card after.
+void HunyuanImage3Pipeline::reference_rows(const QiRequest& r, const std::vector<HunyuanImage3Block>& blocks,
+                                           int64_t hidden, float* hid) {
+    ensure_vision();
+    std::string err;
+    for (size_t k = 0; k + 1 < blocks.size(); ++k) {
+        const HunyuanImage3Block& b = blocks[k];
+        const QiRef& f = r.refs[k];
+        const int64_t H = b.vae_h * kDownsample, W = b.vae_w * kDownsample;
+        const std::vector<float> img = hunyuanimage3_vae_copy(f, W, H);
+        float *d_img = nullptr, *d_z = nullptr;
+        if (!gpu::alloc_device(&d_img, img.size() * sizeof(float)) ||
+            !gpu::alloc_device(&d_z, (size_t) (kLatentChannels * b.vae_n) * sizeof(float))) {
+            if (d_img != nullptr) gpu::free(d_img);
+            if (d_z != nullptr) gpu::free(d_z);
+            throw std::runtime_error(std::string("image engine: GPU memory for a reference image: ") +
+                                     gpu::last_error());
+        }
+        std::vector<float> z((size_t) (kLatentChannels * b.vae_n));
+        try {
+            gpu::copy(d_img, img.data(), img.size() * sizeof(float));
+            vae_->encode(d_img, H, W, d_z);
+            gpu::copy(z.data(), d_z, z.size() * sizeof(float));
+        } catch (...) {
+            gpu::free(d_img);
+            gpu::free(d_z);
+            vae_->drop_scratch();
+            throw;
+        }
+        gpu::free(d_img);
+        gpu::free(d_z);
+        vae_->drop_scratch();
+        if (!around_->set_grid(b.vae_h, b.vae_w, err) ||
+            !around_->patch_embed(z.data(), b.vae_h, b.vae_w, 0.0f, hid + b.vae_start * hidden, err))
+            throw std::runtime_error("image engine: a reference image's entry: " + err);
+        around_->drop_grid();
+        if (!hunyuanimage3_time_host(*dit_->file(), "timestep_emb", 0.0f, hid + b.timestep * hidden, err))
+            throw std::runtime_error("image engine: " + err);
+        int64_t ph = 0, pw = 0;
+        const std::vector<float> patches =
+            hunyuanimage3_vit_patches(f, vision_->patch(), vision_->max_patches(), ph, pw);
+        if (ph != b.vit_h || pw != b.vit_w || b.vit_n != vision_->max_patches())
+            throw std::logic_error("image engine: a reference image's ViT grid is not the sequence's");
+        if (!vision_->rows(patches.data(), ph, pw, hid + b.vit_start * hidden, err))
+            throw std::runtime_error("image engine: " + err);
+    }
+    vision_->drop_scratch();
 }
 
 bool HunyuanImage3Pipeline::warm_up_request(QiRequest& r) const {
@@ -155,7 +239,9 @@ bool HunyuanImage3Pipeline::warm_up_request(QiRequest& r) const {
 }
 
 bool HunyuanImage3Pipeline::read_sequence(const QiRequest& r, std::vector<int32_t>& ids, int64_t& T, int64_t& start,
-                                          std::vector<int32_t>& y, std::vector<int32_t>& x, std::string& err) const {
+                                          std::vector<int32_t>& y, std::vector<int32_t>& x,
+                                          std::vector<int32_t>& key_lim, std::vector<HunyuanImage3Block>& blocks,
+                                          std::string& err) const {
     if (r.width % kDownsample != 0 || r.height % kDownsample != 0 || r.width <= 0 || r.height <= 0) {
         err = "image engine: the size must be a positive multiple of 16";
         return false;
@@ -169,13 +255,60 @@ bool HunyuanImage3Pipeline::read_sequence(const QiRequest& r, std::vector<int32_
     if (keep < 0) return false;
     ids.resize((size_t) keep);
     T = (int64_t) ids.size();
-    const int64_t th = r.height / kDownsample, tw = r.width / kDownsample;
-    if (!hunyuanimage3_positions(ids.data(), T, th, tw, y, x, start, err)) {
-        err = err + ": the prompt's image block is not the " + std::to_string(th * tw) + " tokens of a " +
-              std::to_string(r.width) + " x " + std::to_string(r.height) + " image";
+    if (!hunyuanimage3_blocks(ids.data(), T, blocks, err)) return false;
+    const size_t n_ref = blocks.size() - 1;
+    if (n_ref != r.refs.size()) {
+        err = "image engine: the ids hold " + std::to_string(n_ref) + " reference image block(s) and the request " +
+              std::to_string(r.refs.size()) + " reference image(s)";
         return false;
     }
-    if (T <= start) {
+    if (n_ref > 0 && !edits()) {
+        err = "image engine: HunyuanImage 3.0's edits need the vision model's file (--vision): run setup with "
+              "--images again";
+        return false;
+    }
+    HunyuanImage3Block& g = blocks.back();
+    g.vae_h = r.height / kDownsample;
+    g.vae_w = r.width / kDownsample;
+    if (g.vae_n != g.vae_h * g.vae_w) {
+        err = "image engine: the prompt's image block is not the " + std::to_string(g.vae_h * g.vae_w) +
+              " tokens of a " + std::to_string(r.width) + " x " + std::to_string(r.height) + " image";
+        return false;
+    }
+    for (size_t k = 0; k < n_ref; ++k) {
+        HunyuanImage3Block& b = blocks[k];
+        const QiRef& f = r.refs[k];
+        if (f.width <= 0 || f.height <= 0 || f.rgba.size() != (size_t) (f.width * f.height * 4)) {
+            err = "image engine: reference image " + std::to_string(k + 1) + " is empty";
+            return false;
+        }
+        const std::vector<HunyuanImage3Bucket> table = hunyuanimage3_buckets(b.base_size);
+        if (b.ratio_index < 0 || (size_t) b.ratio_index >= table.size()) {
+            err = "image engine: reference image " + std::to_string(k + 1) + "'s block names ratio " +
+                  std::to_string(b.ratio_index) + ", which the " + std::to_string(b.base_size) + " base has not";
+            return false;
+        }
+        b.vae_h = table[(size_t) b.ratio_index].height / kDownsample;
+        b.vae_w = table[(size_t) b.ratio_index].width / kDownsample;
+        if (b.vae_n != b.vae_h * b.vae_w) {
+            err = "image engine: reference image " + std::to_string(k + 1) + "'s block has " +
+                  std::to_string(b.vae_n) + " VAE tokens, not the bucket's " + std::to_string(b.vae_h * b.vae_w);
+            return false;
+        }
+        const int64_t patch = vision_size_->patch(), slots = vision_size_->max_patches();
+        int64_t rw = 0, rh = 0;
+        hunyuanimage3_naflex_size(f.width, f.height, patch, slots, rw, rh);
+        b.vit_h = rh / patch;
+        b.vit_w = rw / patch;
+        if (b.vit_n != slots) {
+            err = "image engine: reference image " + std::to_string(k + 1) + "'s block has " +
+                  std::to_string(b.vit_n) + " ViT tokens, not the model's " + std::to_string(slots);
+            return false;
+        }
+    }
+    start = g.vae_start;
+    if (!hunyuanimage3_positions_of(T, blocks, y, x, key_lim, err)) return false;
+    if (start <= 0) {
         err = "image engine: the sequence holds no text before the image block";
         return false;
     }
@@ -183,14 +316,28 @@ bool HunyuanImage3Pipeline::read_sequence(const QiRequest& r, std::vector<int32_
 }
 
 QiNeed HunyuanImage3Pipeline::need(int64_t n_text, int64_t width, int64_t height,
-                                   const std::vector<std::pair<int64_t, int64_t>>&, bool, int64_t) {
+                                   const std::vector<std::pair<int64_t, int64_t>>& refs, bool, int64_t) {
     const int64_t th = height / kDownsample, tw = width / kDownsample;
     if (th <= 0 || tw <= 0 || n_text < th * tw + 1) {
         throw std::invalid_argument("image engine: the ids do not hold the image block and some text");
     }
-    const uint64_t fixed = dit_size_->dense_bytes() + vae_size_->weight_bytes() + around_size_->weight_bytes();
+    uint64_t fixed = dit_size_->dense_bytes() + vae_size_->weight_bytes() + around_size_->weight_bytes();
     const uint64_t act = dit_size_->activation_bytes(n_text) + around_size_->scratch_bytes(th, tw);
-    const uint64_t vae = vae_size_->scratch_bytes(th, tw);
+    uint64_t vae = vae_size_->scratch_bytes(th, tw);
+    if (!refs.empty() && vision_size_) {
+        // an edit: the vision model stays with the weights; each reference's encoding (the VAE encoder's buffers
+        // at the bucket nearest its shape, SigLIP2's) comes and goes before the walk, so it counts as the decode
+        // does - the larger of the two workers
+        fixed += vision_size_->weight_bytes();
+        const std::vector<HunyuanImage3Bucket> table = hunyuanimage3_buckets(1024);
+        for (const auto& wh : refs) {
+            const HunyuanImage3Bucket& b = hunyuanimage3_nearest_bucket(table, std::max<int64_t>(wh.first, 1),
+                                                                        std::max<int64_t>(wh.second, 1));
+            vae = std::max(vae, vae_size_->encode_scratch_bytes(b.height, b.width) +
+                                    around_size_->scratch_bytes(b.height / kDownsample, b.width / kDownsample) +
+                                    vision_size_->scratch_bytes());
+        }
+    }
     QiNeed n;
     // least: every bank streamed (two slots of the largest), the DiT's sequence buffers and the VAE's taken in
     // turn - the decode runs after the walk gives them back.  full: every bank resident as well, both buffers kept.
@@ -209,7 +356,8 @@ QiNeed HunyuanImage3Pipeline::need(int64_t n_text, int64_t width, int64_t height
 QiPlan HunyuanImage3Pipeline::plan(int64_t T, int64_t th, int64_t tw) {
     QiPlan p;
     p.budget = budget_ > 0 ? budget_ : auto_budget_;
-    p.fixed = dit_->dense_bytes() + vae_->weight_bytes() + around_->weight_bytes();
+    p.fixed = dit_->dense_bytes() + vae_->weight_bytes() + around_->weight_bytes() +
+              (vision_ ? vision_->weight_bytes() : 0);
     if (p.budget <= p.fixed)
         throw std::runtime_error("image engine: the VRAM budget (" + std::to_string(p.budget >> 20) +
                                  " MiB) is below the weights that always stay (" +
@@ -244,8 +392,8 @@ std::vector<uint8_t> HunyuanImage3Pipeline::generate(const QiRequest& r, QiTimes
                                                      const std::function<bool(int, int)>& step,
                                                      const std::function<void(const char*)>& stage) {
     using clock = std::chrono::steady_clock;
-    if (!r.refs.empty() || !r.mask.rgba.empty())
-        throw std::invalid_argument("image engine: HunyuanImage 3.0 does not take reference images yet");
+    if (!r.mask.rgba.empty())
+        throw std::invalid_argument("image engine: HunyuanImage 3.0's edits take no mask");
     if (!r.neg_ids.empty() || r.cfg > 1.0f)
         throw std::invalid_argument("image engine: HunyuanImage 3.0 samples once: no negative prompt, no cfg");
     if (r.drop != 0)
@@ -254,28 +402,36 @@ std::vector<uint8_t> HunyuanImage3Pipeline::generate(const QiRequest& r, QiTimes
     std::string err;
     std::vector<int32_t> ids;
     int64_t T = 0, start = 0;
-    std::vector<int32_t> y, x;
-    if (!read_sequence(r, ids, T, start, y, x, err)) throw std::invalid_argument(err);
+    std::vector<int32_t> y, x, key_lim;
+    std::vector<HunyuanImage3Block> blocks;
+    if (!read_sequence(r, ids, T, start, y, x, key_lim, blocks, err)) throw std::invalid_argument(err);
     ensure_open();
     const int64_t hidden = dit_->dims().hidden;
-    QiPlan p = plan(T, r.height / kDownsample, r.width / kDownsample);
-    if (!dit_->set_sequence(T, (T - start), y.data(), x.data(), err))
-        throw std::runtime_error("image engine: " + err);
+    const HunyuanImage3Block& gen = blocks.back();
 
     // ---- the text rows: `wte` over the ids before the block, gathered once for the sequence and kept for the same
-    // ids coming again.  The walk rewrites every row of the sequence, text included, so the cached rows go back into
-    // the buffer at each step - the host reference re-gathers them per step (`hidden_in_host`), which is why the two
-    // paths agree at one step and only there when this copy is missed.
-    if (stage) stage("text");
+    // ids (and the same reference images) coming again, the reference images' rows with them.  The walk rewrites
+    // every row of the sequence, text included, so the cached rows go back into the buffer at each step - the host
+    // reference re-gathers them per step (`hidden_in_host`), which is why the two paths agree at one step and only
+    // there when this copy is missed.  The references are encoded before the plan takes the card for the banks.
+    if (stage) stage(r.refs.empty() ? "text" : "refs");
     std::vector<float> hid((size_t) (T * hidden));
-    if (ids == text_ids_) {
-        p.text_cached = true;
+    const std::string key = refs_key(r.refs);
+    bool cached = false;
+    if (ids == text_ids_ && key == refs_key_) {
+        cached = true;
     } else {
         if (!hunyuanimage3_wte_host(*dit_->file(), ids.data(), start, hid.data(), err))
             throw std::runtime_error("image engine: " + err);
+        if (!r.refs.empty()) reference_rows(r, blocks, hidden, hid.data());
         text_ids_ = ids;
+        refs_key_ = key;
         text_rows_.assign(hid.begin(), hid.begin() + start * hidden);
     }
+    QiPlan p = plan(T, r.height / kDownsample, r.width / kDownsample);
+    p.text_cached = cached;
+    if (!dit_->set_sequence(T, (T - start), y.data(), x.data(), err, blocks.size() > 1 ? key_lim.data() : nullptr))
+        throw std::runtime_error("image engine: " + err);
     auto restore_text_rows = [&] {
         std::copy(text_rows_.begin(), text_rows_.end(), hid.begin());
     };
@@ -323,7 +479,10 @@ std::vector<uint8_t> HunyuanImage3Pipeline::generate(const QiRequest& r, QiTimes
             }();
             const bool host_patch = kHostEnds == "patch" || kHostEnds == "both";
             const bool host_final = kHostEnds == "final" || kHostEnds == "both";
-            if (!hunyuanimage3_meta_rows_host(*dit_->file(), ids.data(), start, t, t_r, guidance, hid.data(), err) ||
+            // the generated block's three meta rows (a reference block's `<timestep>` keeps timestep_emb(0),
+            // which the cached rows carry), then its patch_embed
+            if (!hunyuanimage3_meta_rows_host(*dit_->file(), ids.data() + gen.boi, start - gen.boi, t, t_r,
+                                              guidance, hid.data() + gen.boi * hidden, err) ||
                 (host_patch ? !hunyuanimage3_patch_embed_host(*dit_->file(), lat.data(), th, tw, t, img, err)
                             : !around_->patch_embed(lat.data(), th, tw, t, img, err)))
                 throw std::runtime_error("image engine: " + err);

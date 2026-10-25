@@ -24,11 +24,24 @@
 // for a check: on the B70 with the golden's latent start and 8 steps the picture held PSNR 30.07 dB (both on the
 // card) against 35.78 (both on the host), 34.25 (the exit on the card) and 37.14 (the entry on the card) - the
 // card's FP16 activations are ~2.1e-4 of the entry's rows, which the decoder amplifies.
+//
+// An edit (reference images) is the model's own: each reference stands in the sequence before the prompt as the
+// reference's `cond_joint_image` - `<boi> <img_size_N> <img_ratio_i> <timestep> <img> * (its VAE grid)
+// <joint_img_sep> <img> * 1024 <eoi>` - whose rows are its VAE latent through `patch_embed` at timestep 0 (the
+// VAE's encoder, hunyuanimage3_vae), `timestep_emb(0)`, and SigLIP2's 1024 features through the aligner
+// (hunyuanimage3_vision).  The reference is read as the model's processor reads it (hunyuanimage3_refs: the VAE
+// copy resized and center-cropped to the bucket the ids name, the ViT copy at its naflex size), its span attends
+// to all of itself (hunyuanimage3_positions_of's key limits) and each of its two grids has 2D rope positions of its
+// own.  Those rows are the sequence's constant part, computed once a request with the text rows.  The vision
+// model's file (`--vision`, the model's bf16 shard with `vision_model.*`) opens the edits; without it a request
+// with reference images is refused by name.
 #pragma once
 
 #include "strata/image/hunyuanimage3_dit.hpp"
 #include "strata/image/hunyuanimage3_entry_exit.hpp"
+#include "strata/image/hunyuanimage3_host.hpp"
 #include "strata/image/hunyuanimage3_vae.hpp"
+#include "strata/image/hunyuanimage3_vision.hpp"
 #include "strata/image/pipeline.hpp"
 
 #include <cstdint>
@@ -45,9 +58,13 @@ class HunyuanImage3Pipeline : public ImagePipeline {
 public:
     /// Reads the two files for their sizes; the parts go on the GPU with the first request.  `max_layers`: fewer
     /// than the file holds - a smaller run for a check on a small card, and not a comparison against the golden.
-    /// False with `err` on a file that is not a quantized HunyuanImage 3.0 save, or whose shapes are not this
-    /// walk's.
-    bool open(const std::string& dit, const std::string& vae, std::string& err, int64_t max_layers = 0);
+    /// `vision`: the file with the model's `vision_model.*` tensors (SigLIP2), which opens the edits - with it the
+    /// VAE's encoder is read too; empty, reference images are refused.  False with `err` on a file that is not a
+    /// quantized HunyuanImage 3.0 save, or whose shapes are not this walk's.
+    bool open(const std::string& dit, const std::string& vae, std::string& err, int64_t max_layers = 0,
+              const std::string& vision = std::string());
+    /// Whether the pipeline takes reference images (a vision file was given).
+    bool edits() const { return !vision_path_.empty(); }
 
     void set_budget(uint64_t bytes) override;
     /// The budget in force: the one set, else the free VRAM's at open.
@@ -63,11 +80,12 @@ public:
     /// generic token ramp has no image block, so nothing of this model's graph would run.
     bool warm_up_request(QiRequest& r) const override;
 
-    /// What an image needs, from the two files' sizes with nothing on the GPU.  `n_text` is the request's ids
-    /// after the system turn *including* the image block, which this model's sequence carries as `<img>` tokens:
-    /// the walk's sequence is exactly `n_text` tokens, so unlike the other pipelines nothing is added to it.  The
-    /// image is (width x height)/16 on a side in tokens.  `refs`, `mask` and `n_neg`: an edit's and guidance's,
-    /// which this model does not take - they are ignored.
+    /// What an image needs, from the files' sizes with nothing on the GPU.  `n_text` is the request's ids after
+    /// the system turn *including* the image block (and an edit's reference blocks), which this model's sequence
+    /// carries as `<img>` tokens: the walk's sequence is exactly `n_text` tokens, so unlike the other pipelines
+    /// nothing is added to it.  The image is (width x height)/16 on a side in tokens.  `refs` (their sizes): an
+    /// edit's reference images, whose encoding before the walk takes the VAE encoder's and SigLIP2's buffers;
+    /// `mask` and `n_neg`: what this model does not take - ignored.
     QiNeed need(int64_t n_text, int64_t width, int64_t height,
                 const std::vector<std::pair<int64_t, int64_t>>& refs = {}, bool mask = false,
                 int64_t n_neg = 0) override;
@@ -90,12 +108,22 @@ private:
     /// How the budget is split for a `T`-token sequence at a `th` x `tw` latent grid.
     QiPlan plan(int64_t T, int64_t th, int64_t tw);
     void ensure_open();
-    /// The request's sequence: trimmed, positioned, and checked against the size's token grid.  False with `err`.
+    /// The request's sequence: trimmed, its image blocks read (the reference images' grids from the buckets the ids
+    /// name and the images' naflex sizes, the generated block's from the size), positioned, with the attention's
+    /// key limits.  False with `err`.
     bool read_sequence(const QiRequest& r, std::vector<int32_t>& ids, int64_t& T, int64_t& start,
-                       std::vector<int32_t>& y, std::vector<int32_t>& x, std::string& err) const;
+                       std::vector<int32_t>& y, std::vector<int32_t>& x, std::vector<int32_t>& key_lim,
+                       std::vector<HunyuanImage3Block>& blocks, std::string& err) const;
+    /// The reference images' rows into `hid` ([T][hidden], host): each block's VAE latent through patch_embed at
+    /// timestep 0, its `<timestep>` row and its SigLIP2 rows.  Opens the vision part on first use; the encoders'
+    /// buffers are given back before the walk.
+    void reference_rows(const QiRequest& r, const std::vector<HunyuanImage3Block>& blocks, int64_t hidden,
+                        float* hid);
+    void ensure_vision();
 
     void* s_ = nullptr;
-    std::string dit_path_, vae_path_;
+    std::string dit_path_, vae_path_, vision_path_;
+    std::unique_ptr<HunyuanImage3Vision> vision_, vision_size_;
     int64_t max_layers_ = 0;
     std::unique_ptr<HunyuanImage3Dit> dit_;
     std::unique_ptr<HunyuanImage3Vae> vae_;
@@ -108,6 +136,7 @@ private:
     // the text rows of the last request's sequence: `wte` does not change between a request's steps, so they are
     // gathered once and copied back in, and the same ids coming again do not pay for it twice
     std::vector<int32_t> text_ids_;
+    std::string refs_key_;   // the reference images the cached rows were made with (their sizes and bytes)
     std::vector<float> text_rows_;
     std::vector<float> init_latent_;
 };

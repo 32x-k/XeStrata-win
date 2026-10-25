@@ -139,7 +139,7 @@ void hunyuanimage3_scratch_free(HunyuanImage3Scratch& sc) {
 
 bool hunyuanimage3_layer_run(const HunyuanImage3LayerWeights& w, HunyuanImage3Experts& experts, HunyuanImage3Scratch& sc, const float* x, float* out,
                    int64_t T, const int32_t* pos_y, const int32_t* pos_x, int64_t n_img, const HunyuanImage3Dims& d,
-                   prefill::Gemm& gemm, void* stream, std::string& err) {
+                   prefill::Gemm& gemm, void* stream, std::string& err, const int32_t* key_lim) {
     if (T <= 0) {
         err = "hunyuanimage3_layer_run: no tokens";
         return false;
@@ -173,7 +173,8 @@ bool hunyuanimage3_layer_run(const HunyuanImage3LayerWeights& w, HunyuanImage3Ex
                            sc.v16, stream);
         // the rows T .. qi_attn_rows(T) of q, k and v are the attention's padding: hunyuanimage3_scratch_alloc zeroed them,
         // and a sequence changes T only by going through a new scratch
-        qi_attention(sc.q16, sc.k16, sc.v16, T, d.heads, d.head_dim, T - n_img, sc.a16, sc.attn_scratch, stream);
+        qi_attention(sc.q16, sc.k16, sc.v16, T, d.heads, d.head_dim, T - n_img, sc.a16, sc.attn_scratch, stream,
+                     key_lim);
         hunyuanimage3_rotate16(sc.a16, T, d.hidden, d.rotate, sc.ar16, stream);
         gemm.f16(sc.ar16, w.o, sc.o32, T, w.o_n, w.o_k);
         if (out != x) up(out, x, (size_t) T * d.hidden * sizeof(float));
@@ -322,7 +323,8 @@ void HunyuanImage3Dit::drop_sequence() {
         if (p != nullptr) gpu::free(p);
     seq_owned_.clear();
     h_ = h2_ = nullptr;
-    d_pos_y_ = d_pos_x_ = nullptr;
+    d_pos_y_ = d_pos_x_ = d_key_lim_ = nullptr;
+    has_key_lim_ = false;
     T_ = n_img_ = 0;
 }
 
@@ -578,7 +580,7 @@ bool HunyuanImage3Dit::dense_shapes(int64_t l, Dense& d, std::string& err) {
 }
 
 bool HunyuanImage3Dit::set_sequence(int64_t T, int64_t n_img, const int32_t* pos_y, const int32_t* pos_x,
-                                    std::string& err) {
+                                    std::string& err, const int32_t* key_lim) {
     if (dry_) {
         err = "HunyuanImage 3.0 (GPU DiT): a dry part cannot run";
         return false;
@@ -595,6 +597,7 @@ bool HunyuanImage3Dit::set_sequence(int64_t T, int64_t n_img, const int32_t* pos
             h2_ = take_as<float>(seq_owned_, T * dims_.hidden, "hidden 2");
             d_pos_y_ = take_as<int32_t>(seq_owned_, T, "positions y");
             d_pos_x_ = take_as<int32_t>(seq_owned_, T, "positions x");
+            d_key_lim_ = take_as<int32_t>(seq_owned_, T, "key limits");
         } catch (const std::exception& e) {
             err = e.what();
             drop_sequence();
@@ -605,10 +608,12 @@ bool HunyuanImage3Dit::set_sequence(int64_t T, int64_t n_img, const int32_t* pos
     try {
         up(d_pos_y_, pos_y, (size_t) T * sizeof(int32_t));
         up(d_pos_x_, pos_x, (size_t) T * sizeof(int32_t));
+        if (key_lim != nullptr) up(d_key_lim_, key_lim, (size_t) T * sizeof(int32_t));
     } catch (const std::exception& e) {
         err = e.what();
         return false;
     }
+    has_key_lim_ = key_lim != nullptr;
     n_img_ = n_img;
     return true;
 }
@@ -692,7 +697,8 @@ bool HunyuanImage3Dit::run_layer(int64_t l, const float* a, float* b, std::strin
     lw.sgu_n = d.sgu_n, lw.sgu_k = d.sgu_k, lw.sdn_n = d.sdn_n, lw.sdn_k = d.sdn_k;
     const Bank& bk = bank_refs_[(size_t) l];
     lw.egu_n = bk.egu.n, lw.egu_k = bk.egu.k, lw.edn_n = bk.edn.n, lw.edn_k = bk.edn.k;
-    const bool ok = hunyuanimage3_layer_run(lw, ex, sc_, a, b, T_, d_pos_y_, d_pos_x_, n_img_, dims_, gemm_, s_, err);
+    const bool ok = hunyuanimage3_layer_run(lw, ex, sc_, a, b, T_, d_pos_y_, d_pos_x_, n_img_, dims_, gemm_, s_, err,
+                                            has_key_lim_ ? d_key_lim_ : nullptr);
     banks_.end((int) l);   // the slot is free again once the compute stream is past this layer
     return ok;
 }

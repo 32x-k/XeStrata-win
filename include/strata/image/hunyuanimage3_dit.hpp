@@ -79,13 +79,15 @@ void hunyuanimage3_scratch_free(HunyuanImage3Scratch& sc);
 uint64_t hunyuanimage3_scratch_bytes(int64_t T, const HunyuanImage3Dims& d);
 
 /// One decoder layer on the device: FP32 `x` ([T][hidden]) to FP32 `out` (the same shape; `out` may alias `x`).
-/// The sequence's last `n_img` tokens are the image block - a block row sees all T tokens, a text row its prefix -
-/// and `pos_y`, `pos_x` are its device 2D rope positions ([T], or null for y = x = the index).  The products are
+/// The sequence's last `n_img` tokens are the image block - a block row sees all T tokens, a text row its prefix,
+/// or with `key_lim` (device [T]) the first key_lim[t] keys: an edit's reference image spans see all of themselves
+/// (hunyuanimage3_positions_of builds it) - and `pos_y`, `pos_x` are its device 2D rope positions ([T], or null
+/// for y = x = the index).  The products are
 /// prefill::Gemm's FP16 ones, the attention `qi_attention`'s, and the router's logits come back to the host for
 /// the softmax and the top-k, which the reference runs there too.  False with `err`.
 bool hunyuanimage3_layer_run(const HunyuanImage3LayerWeights& w, HunyuanImage3Experts& experts, HunyuanImage3Scratch& sc, const float* x, float* out,
                    int64_t T, const int32_t* pos_y, const int32_t* pos_x, int64_t n_img, const HunyuanImage3Dims& d,
-                   prefill::Gemm& gemm, void* stream, std::string& err);
+                   prefill::Gemm& gemm, void* stream, std::string& err, const int32_t* key_lim = nullptr);
 
 /// HunyuanImage 3.0's decoder layers on the GPU, read straight from a quantized file (no GGUF, no conversion).
 class HunyuanImage3Dit {
@@ -127,8 +129,10 @@ public:
     uint64_t bank_bytes(int64_t l) const { return banks_.bytes((int) l); }
 
     /// The sequence the walk runs on: `T` tokens, the last `n_img` of them the image block, whose 2D rope positions
-    /// are the host arrays `pos_y` and `pos_x` ([T]).  Grows the scratch and the hidden rows for `T`.
-    bool set_sequence(int64_t T, int64_t n_img, const int32_t* pos_y, const int32_t* pos_x, std::string& err);
+    /// are the host arrays `pos_y` and `pos_x` ([T]); `key_lim` (host [T], or null): the rows' key limits before the
+    /// block (an edit's reference spans).  Grows the scratch and the hidden rows for `T`.
+    bool set_sequence(int64_t T, int64_t n_img, const int32_t* pos_y, const int32_t* pos_x, std::string& err,
+                      const int32_t* key_lim = nullptr);
     int64_t tokens() const { return T_; }
 
     /// Layers [0, n) over that sequence: the device FP32 [T][hidden] `x` in, the last layer's output in the device
@@ -204,7 +208,8 @@ private:
     // the sequence
     int64_t T_ = 0, n_img_ = 0;
     HunyuanImage3Scratch sc_;
-    int32_t *d_pos_y_ = nullptr, *d_pos_x_ = nullptr;
+    int32_t *d_pos_y_ = nullptr, *d_pos_x_ = nullptr, *d_key_lim_ = nullptr;
+    bool has_key_lim_ = false;
     float *h_ = nullptr, *h2_ = nullptr;
     std::vector<void*> owned_;       // the dense weights, freed with the part
     std::vector<void*> seq_owned_;   // the sequence's buffers, freed by drop_sequence()

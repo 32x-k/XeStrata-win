@@ -14,9 +14,12 @@
 // FP16).  A safetensors file whose header is a HunyuanImage 3.0 save - its `format`, or the `comfy_quant` beside
 // its matrices, or the model's own `model.wte.weight` beside `patch_embed` - is HunyuanImage 3.0's, and takes no
 // --text: its DiT reads the ids itself (`wte`, with three rows its embedders write over), so its entry is
-//   strata-image --dit QUANTIZED.safetensors --vae VAE.safetensors (--ids ... | --serve) [--out F] [--width W]
-//                [--height H] [--seed S] [--steps N] [--sigmas 1,...,0] [--guidance G] [--budget-mib M]
-// and its guidance is a token's value (`--guidance`, the model's own 2.5 unset) rather than a second pass.  Mage-Flow's edits take
+//   strata-image --dit QUANTIZED.safetensors --vae VAE.safetensors [--vision VISION.safetensors] (--ids ... |
+//                --serve) [--out F] [--width W] [--height H] [--seed S] [--steps N] [--sigmas 1,...,0]
+//                [--guidance G] [--ref IMAGE]... [--budget-mib M]
+// and its guidance is a token's value (`--guidance`, the model's own 2.5 unset) rather than a second pass.  Its
+// edits (--ref, REF:) need --vision, the model's bf16 shard with its `vision_model.*` tensors (SigLIP2): the ids
+// then carry each reference's block before the prompt (hunyuanimage3_pipeline.hpp).  Mage-Flow's edits take
 // its edit DiT (--edit-dit) and Qwen3-VL-4B's mmproj (--vision), up to three --ref; --dit-keep 1, the default, keeps the
 // DiT not in use in RAM between a generation and an edit (0: read from its file again).
 //
@@ -371,7 +374,8 @@ int main(int argc, char** argv) {
                          "[--dit-keep 0|1]\n",
                          argv[0]);
             std::fprintf(stderr, "       %s: HunyuanImage 3.0 (a quantized .safetensors --dit) takes no --text "
-                         "(its DiT reads the ids itself); [--steps N] [--guidance G] stand for [--sigmas] [--cfg]\n",
+                         "(its DiT reads the ids itself); [--steps N] [--guidance G] stand for [--sigmas] [--cfg]; "
+                         "its edits (--ref) take --vision, the model's shard with vision_model.*\n",
                          argv[0]);
             return 2;
         }
@@ -379,7 +383,7 @@ int main(int argc, char** argv) {
         std::string err;
         if (hunyuanimage3) {
             auto h = std::make_unique<si::HunyuanImage3Pipeline>();
-            if (!h->open(dit, vae, err)) throw std::runtime_error(err);
+            if (!h->open(dit, vae, err, 0, vision)) throw std::runtime_error(err);
             pipe = std::move(h);
         } else if (mage) {
             auto m = std::make_unique<si::MfPipeline>();
