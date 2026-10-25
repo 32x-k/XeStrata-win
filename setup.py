@@ -7847,6 +7847,18 @@ def dsv41_engine_dir(eng: Path) -> Path:
     return (home() if CONTROL else Path(eng).parent) / DSV41_ENGINE_DIR
 
 
+def local_feed(feed: str | None = None) -> bool:
+    """Is the update feed this run reads a local one (a folder, a file or a loopback address, as a test or an offline copy uses)?  Then
+    nothing is downloaded from GitHub and its being slow or down must not stop the run.  `feed` is --feed, else STRATA_UPDATE_FEED."""
+    src = (feed or os.environ.get("STRATA_UPDATE_FEED") or "").strip()
+    if not src:
+        return False
+    if not re.match(r"^[a-z][a-z0-9+.-]*://", src, re.I) or src.lower().startswith("file://"):
+        return True                                     # a path (a Windows C:\... one too)
+    host = (urllib.parse.urlparse(src).hostname or "").lower()
+    return host in ("localhost", "127.0.0.1", "::1") or host.startswith("127.")
+
+
 def github_reachable(timeout: float = 10.0) -> bool:
     """Does GitHub answer within `timeout` seconds (any HTTP answer counts; no answer, a refused or timed-out connection does not)?  One quick check
     instead of minutes of retries when the connection is down (a SYN that is never answered)."""
@@ -8143,7 +8155,8 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
     step(4, "the DeepSeek engine")
     eng, meta, lib_dirs = ROOT / "engine", {"version": None}, []
     exe = dsv41_exe(eng)
-    if exe is None and not getattr(a, "dsv41_package", None) and not dsv41_engine_pending(eng) and not github_reachable():
+    if (exe is None and not getattr(a, "dsv41_package", None) and not dsv41_engine_pending(eng) and not local_feed(getattr(a, "feed", None))
+        and not github_reachable()):
         fail("Strata can't reach GitHub to download the DeepSeek engine.",
              "Check the internet connection and run the same command again. " + dsv41_manual_steps(eng))
     if exe is None and not getattr(a, "build", False):
