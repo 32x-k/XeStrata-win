@@ -1333,12 +1333,46 @@ function imgDefaults() {
   $("img-steps").placeholder = String((refs ? d.edit_steps : d.steps) || "");
   $("img-cfg").placeholder = d.guidance > 1 ? String(d.guidance) : "off";
   $("img-bg-f").hidden = !d.transparency;
-  const maxN = d.max_n || 4, n = $("img-n"), was = +n.value || 1;
-  n.replaceChildren(...Array.from({length: maxN}, (_, i) => new Option(String(i + 1))));
-  n.value = String(Math.min(was, maxN));
+  imgCount();
   imgFormat();
   imgNegHint();
 }
+// the count: up to max_n, and as many as take budget_s at the speed the server measured (its rates; before it has
+// made an image, 4), with the time the images chosen take (the server refuses more, ImageGen.check_n)
+function imgEstimate(n) {
+  const d = imgModel().defaults || {}, rates = d.rates || {};
+  const refs = ($("img-ref").files || []).length > 0;
+  const pts = rates[refs ? "edit" : "generate"] || rates.generate || rates.edit;
+  if (!pts || !pts.length) return null;
+  let [w, h] = $("img-size").value === "custom" ? [+$("img-w").value, +$("img-h").value]
+    : ($("img-size").value === "auto" ? "1024x1024" : $("img-size").value).split("x").map(Number);
+  w = Math.ceil((w || 1024) / 16) * 16;
+  h = Math.ceil((h || 1024) / 16) * 16;
+  let steps = d.steps_fixed ? d.steps : (+$("img-steps").value || (refs ? d.edit_steps : d.steps) || 1);
+  const g = $("img-cfg").value !== "" ? Number($("img-cfg").value) : (d.guidance || 1);
+  if (g > 1 && (d.negative_prompt != null || $("img-neg").value.trim())) steps *= 2;
+  // as the server's ImageGen.estimate_s: the size measured nearest, a step's time scaled (size_exp above it)
+  const mp = w * h / 1e6;
+  const [near, stepS, restS] = pts.reduce((a, p) => Math.abs(Math.log(mp / p[0])) < Math.abs(Math.log(mp / a[0])) ? p : a);
+  const scale = mp / near;
+  return n * (steps * stepS * scale ** (scale > 1 ? (d.size_exp || 1.5) : 1) + restS * scale);
+}
+function imgCount() {
+  const d = imgModel().defaults || {}, n = $("img-n"), was = +n.value || 1;
+  const maxN = d.max_n || 16, budget = d.budget_s || 600, one = imgEstimate(1);
+  const most = one == null ? Math.min(maxN, 4) : Math.max(1, Math.min(maxN, Math.floor(budget / one)));
+  if (n.options.length !== most)
+    n.replaceChildren(...Array.from({length: most}, (_, i) => new Option(String(i + 1))));
+  n.value = String(Math.min(was, most));
+  const est = imgEstimate(+n.value);
+  $("img-n-est").textContent = est == null ? "" : est < 90 ? `about ${Math.max(1, Math.round(est))} s`
+    : `about ${(est / 60).toFixed(est < 600 ? 1 : 0)} min`;
+  $("img-n-f").title = one == null ? "Up to 4 until the server has made an image and measured its speed"
+    : `Up to ${most}: the images one request makes in ${Math.round(budget / 60)} min at most (budget_s)`;
+}
+for (const id of ["img-size", "img-w", "img-h", "img-steps", "img-cfg", "img-n"])
+  $(id).addEventListener("input", imgCount);
+$("img-size").addEventListener("change", imgCount);
 // whether the negative prompt is used: only with guidance above 1, and some models guide only with one
 function imgNegHint() {
   const d = imgModel().defaults || {};
@@ -1435,8 +1469,8 @@ function imgFormat() {
 $("img-fmt").onchange = () => { store.set("img_fmt", $("img-fmt").value); imgFormat(); };
 $("img-q").onchange = () => store.set("img_q_" + $("img-fmt").value, +$("img-q").value);
 $("img-bg").onchange = imgFormat;
-$("img-neg").oninput = imgNegHint;
-$("img-cfg").oninput = imgNegHint;
+$("img-neg").oninput = () => { imgNegHint(); imgCount(); };
+$("img-cfg").addEventListener("input", imgNegHint);
 $("img-ref").onchange = () => { imgDefaults(); imgMaskSetup(); };
 $("img-form").onsubmit = async (ev) => {
   ev.preventDefault();
@@ -1489,7 +1523,7 @@ $("img-form").onsubmit = async (ev) => {
   } finally {
     $("img-go").disabled = false;
     $("img-ref").value = "";   // the reference images go with this job only: the next Generate is a new image
-    imgDefaults();
+    await loadHealth();        // the speed the job measured (the count's limit and estimate)
     imgMaskSetup();
   }
 };

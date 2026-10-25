@@ -42,15 +42,17 @@ otherwise it lets go of everything but its process (about 200 MiB).  The daemon 
 The config's "images" section (written by setup --images, tools/image/qimage.py):
   {"exe": "engine/strata-image", "diffusion_model": "...Q8_0.gguf", "schedule": "turbo"|"base", "steps": 8|40,
    "vae": "...", "llm": "...Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf", "quant": "Q8_0", "gpu_policy": "auto",
-   "reload": "lazy"|"eager", "max_n": 4, "max_side": 2048, "timeout_s": 3600, "uma": false, "out_dir": null,
-   "keep_files": 64,
+   "reload": "lazy"|"eager", "max_n": 16, "budget_s": 600, "max_side": 2048, "timeout_s": 3600, "uma": false,
+   "out_dir": null, "keep_files": 64,
    "vision": "...mmproj-F16.gguf", "max_refs": 10, "reserve_mib": 512, "spare_mib": 1024, "ssd_offload": false,
    "text_encoder": "stock", "text_quant": "Q4_K",
    "quant_lowered": {"from": "Q8_0", "to": "Q6_K", "text_from": "Q8_0", "text_to": "Q4_K", "need_gb": 20.2,
                      "ram_left_gb": 14.0}}
-  schedule: Turbo's own sigmas or the base model's (base_sigmas; no "schedule" is Turbo); steps: the base model's
-  default (a request's "steps", 2 to MAX_STEPS, overrides it); vision: Qwen3-VL's vision encoder (mmproj), for the
-  edits (without it they are refused); max_refs: the reference images an edit takes at most; reserve_mib: VRAM the
+  max_n: the most images one request makes; budget_s: the longest one request's images may take, by the speed this
+  server measured (ImageGen.estimate_s; until it has made an image, at most UNMEASURED_N); schedule: Turbo's own
+  sigmas or the base model's (base_sigmas; no "schedule" is Turbo); steps: the base model's default (a request's
+  "steps", 2 to MAX_STEPS, overrides it); vision: Qwen3-VL's vision encoder (mmproj), for the edits (without it they
+  are refused); max_refs: the reference images an edit takes at most; reserve_mib: VRAM the
   image engine leaves free when it sizes itself; spare_mib: the free VRAM that must remain after a job under keep for
   the engine to keep its layers; quant_lowered (only when setup lowered them): the sizes setup took instead of the ones
   asked for, because the RAM the text model leaves was short (note(): the server's log and the web page say so).
@@ -84,6 +86,12 @@ MODEL_NAME = "qwen-image-2.1-turbo"
 POLICIES = ("auto", "keep", "shrink", "unload")
 SIZE_STEP = 16                     # the VAE's 8x and the DiT's 2x2 patches: sides made at a multiple of 16, then cut
 MIN_SIDE = 256
+MAX_N = 16                         # "max_n": the most images one request makes
+BUDGET_S = 600                     # "budget_s": the longest one request's images may take (ImageGen.check_n)
+UNMEASURED_N = 4                   # the most images a request makes before the server has measured its speed
+# a step's time against the image's pixels, above the largest size measured (estimate_s): the attention's share grows
+# with them (the B70, Qwen-Image Turbo: 6.5 times the time at 4 times the pixels, 1.35); taken higher, to err long
+SIZE_EXP = 1.5
 FILE_NAME = re.compile(r"^[0-9a-f]{32}\.(png|jpeg|webp|jxl)$")
 # OpenAI's output_format, and JPEG XL beside them -> the file's MIME type (Pillow writes jpeg and webp, libjxl's cjxl
 # jxl; PNG is png_rgba's)
@@ -168,7 +176,8 @@ def model_defaults(cfg: dict) -> dict:
         steps, least, fixed = TURBO_STEPS, TURBO_STEPS, True
     edit = int(cfg.get("edit_steps") or steps) if cfg.get("edit_model") else steps
     return {"steps": steps, "edit_steps": edit, "steps_min": least, "steps_max": MAX_STEPS, "steps_fixed": fixed,
-            "max_n": int(cfg.get("max_n") or 4), "formats": output_formats(),
+            "max_n": int(cfg.get("max_n") or MAX_N), "budget_s": float(cfg.get("budget_s") or BUDGET_S),
+            "formats": output_formats(),
             "guidance": float(cfg.get("cfg_scale") or 1.0) if mage else 1.0,
             "negative_prompt": MF_NEG if mage else None, "transparency": cfg.get("transparency") is not False,
             "mask": cfg.get("mask") is not False}
@@ -224,7 +233,7 @@ def parse_request(req: dict, cfg: dict) -> dict:
     if background == "transparent" and cfg.get("transparency") is False:
         raise ImageRequestError("background transparent: this image model does not make transparent images")
     w, h = parse_size(req.get("size"), int(cfg.get("max_side") or 2048))
-    n = _int_field(req, "n", 1, int(cfg.get("max_n") or 4), 1)
+    n = _int_field(req, "n", 1, int(cfg.get("max_n") or MAX_N), 1)
     if "num_inference_steps" in req:            # vLLM-Omni's name for steps
         if req.get("steps") not in (None, req["num_inference_steps"]):
             raise ImageRequestError("steps and num_inference_steps: give one, or the same number")
@@ -865,6 +874,9 @@ class ImageGen:
         self.tok = None
         self.totals = {"images": 0, "jobs": 0, "seconds": 0.0, "failed": 0}
         self.last: dict | None = None              # the last job's figures (/v1/status)
+        # the measured speed, an edit's apart (its reference images): for each size made (in megapixels), one step's
+        # seconds (a guided step two) and the rest's an image (estimate_s)
+        self.rates: dict[str, dict[float, list[float]]] = {}
         self.progress: tuple | None = None         # (step, steps) of the running job
         # the job in the GPU's turn as the Monitor shows it (live()), and the jobs that ended, newest last (recent()):
         # the one record of an image job's progress, which /metrics reads
@@ -890,8 +902,55 @@ class ImageGen:
                 "(what does not fit is read from the SSD, slower).")
 
     def defaults(self) -> dict:
-        """What a request leaves out gets from this image model (model_defaults)."""
-        return model_defaults(self.cfg)
+        """What a request leaves out gets from this image model (model_defaults), and the speed it was measured at
+        (rates: [megapixels, a step's seconds, the rest's] of each size, for the web page's estimate, estimate_s)."""
+        return {**model_defaults(self.cfg), "size_exp": SIZE_EXP,
+                "rates": {k: [[mp, *v] for mp, v in sorted(pts.items())] for k, pts in self.rates.items()}}
+
+    @staticmethod
+    def _work(job: dict) -> tuple[float, float]:
+        """One image's (steps, megapixels): a guided step two, the size the engine makes."""
+        mw, mh = made_size(job)
+        return job["steps"] * (2 if job.get("cfg") else 1), round(mw * mh / 1e6, 3)
+
+    def _measured(self, job: dict, r: dict) -> None:
+        """One image's engine figures (its IMAGE line) into the rates of its size, a running mean that follows the
+        latest; the eight sizes made last are kept."""
+        steps, mp = self._work(job)
+        rate = [r.get("sampling_s", 0) / steps, r.get("text_s", 0) + r.get("decode_s", 0)]
+        pts = self.rates.setdefault("edit" if job.get("refs") else "generate", {})
+        was = pts.pop(mp, None)
+        pts[mp] = rate if was is None else [round((a + b) / 2, 4) for a, b in zip(was, rate)]
+        while len(pts) > 8:
+            del pts[next(iter(pts))]
+
+    def estimate_s(self, job: dict) -> float | None:
+        """The seconds `job`'s images take at the speed measured (an edit's, else a generation's; None: none yet): the
+        size measured nearest, a step's time scaled to the pixels (to the SIZE_EXP power above it), the rest's by
+        them."""
+        pts = self.rates.get("edit" if job.get("refs") else "generate") or next(iter(self.rates.values()), None)
+        if not pts:
+            return None
+        steps, mp = self._work(job)
+        near = min(pts, key=lambda p: abs(math.log(mp / p)))
+        step_s, rest_s = pts[near]
+        scale = mp / near
+        return job["n"] * (steps * step_s * scale ** (SIZE_EXP if scale > 1 else 1) + rest_s * scale)
+
+    def check_n(self, job: dict) -> None:
+        """Refuse more images than budget_s allows at the speed measured (before it is measured, UNMEASURED_N)."""
+        n, budget = job["n"], float(self.cfg.get("budget_s") or BUDGET_S)
+        est = self.estimate_s(job)
+        if n == 1:
+            return
+        if est is None:
+            if n > UNMEASURED_N:
+                raise ImageRequestError(f"n: at most {UNMEASURED_N} until this server has made an image (its speed "
+                                        "is not measured yet)")
+        elif est > budget:
+            most = max(1, int(budget // (est / n)))
+            raise ImageRequestError(f"n: {n} images of this size and steps take about {est / 60:.1f} min here, over "
+                                    f"the {budget / 60:.0f} min limit (budget_s); at most {most}")
 
     def missing(self) -> list[str]:
         keys = ("exe", "diffusion_model", "vae", "llm") + (("vision",) if self.cfg.get("vision") else ())
@@ -1062,6 +1121,7 @@ class ImageGen:
                         raise ImageJobFailed(why) from e
                     images.append(png_rgba(out.read_bytes(), job["width"], job["height"], mw, mh))
                     parts.append(r)
+                    self._measured(job, r)
         finally:
             self.progress = None
             self.unstage(job)
@@ -1441,7 +1501,9 @@ def make_images(svc, gen: ImageGen, job: dict,
                 cancel: threading.Event | None = None) -> tuple[list[bytes], dict, str]:
     """`job`'s images in the GPU's turn (gpu_turn) -> (the PNG files' bytes, figures, the policy used).  When a request
     waits for the turn after an image, the turn is given to it and taken again for the rest, so a chat is not held up
-    by a batch; not under unload (giving it would load the text model and unload it again for each image)."""
+    by a batch; not under unload (giving it would load the text model and unload it again for each image).  Too many
+    images for budget_s are refused first (ImageGen.check_n)."""
+    gen.check_n(job)
     images: list[bytes] = []
     parts: list[dict] = []
     used = "keep"

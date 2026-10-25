@@ -99,7 +99,8 @@ The config file's (`xestrata-<model>.json`) `"images"` also has entries to set b
 
 | Entry | Default | Meaning |
 | --- | --- | --- |
-| `max_n` | 4 | The most images one request makes |
+| `max_n` | 16 | The most images one request makes |
+| `budget_s` | 600 | The most seconds one request's images may take, estimated from the speed the server measured (for each size); more images are refused. Before the server has made an image, 4 at most |
 | `max_side` | 2048 | The largest side of an image, in pixels |
 | `max_refs` | 10 for Qwen-Image-2.1, 3 for Mage-Flow | The most reference images an edit takes |
 | `timeout_s` | 3600 | The most seconds a job is waited for |
@@ -114,7 +115,8 @@ The config file's (`xestrata-<model>.json`) `"images"` also has entries to set b
 
 - With several models installed, the model can be chosen; the fields' defaults and which fields there are (steps, transparent background, edits, mask) follow it.
 - Choose the prompt, the size (1024x1024, 1536x1024, 1024x1536, 768x768, 512x512, 1920x1080, 1080x1920, auto, or any size with sides of 256 to 2048) and the seed, and press Generate.
-- The number of images (from 1 up to the config's limit) and the format (PNG, JPEG, WebP or JPEG XL; all but PNG with a quality) can be chosen; a transparent background takes no JPEG.
+- The number of images and the format (PNG, JPEG, WebP or JPEG XL; all but PNG with a quality) can be chosen; a transparent background takes no JPEG.
+  The number goes up to what fits in `budget_s` at the size and steps chosen (`max_n` at most), with the estimated time beside it.
   The format is JPEG XL by default (quality 100, lossless) when the browser shows it and the server writes it, PNG otherwise. The format and quality chosen are kept in the browser.
 - A negative prompt (what the image should not have), the steps and the CFG strength can be given too. Left empty, they are the model's defaults (the API's), which the fields show greyed out.
   The steps are not shown for Turbo (fixed at 8). The negative prompt takes effect only with CFG above 1, and a line under it says so when it does not.
@@ -146,7 +148,7 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 | `prompt` | — | Required; up to 16,000 characters |
 | `model` | the default model | The image model's name (as `/v1/models` lists it), to choose one where several are installed. An unknown name (OpenAI's `gpt-image-1`, for example) is the default model |
 | `size` | `auto` (1024x1024) | `WIDTHxHEIGHT`, sides of 256 to 2048. A size whose sides are not multiples of 16 (1920x1080 and the like) is made at the multiples of 16 above it and its middle cut out |
-| `n` | 1 | 1 to 4; image i uses the seed `seed + i` |
+| `n` | 1 | 1 to `max_n` (16); a number that does not fit in `budget_s` is refused with the estimated time. Image i uses the seed `seed + i` |
 | `seed` | random | 0 to 2^62 |
 | `steps` (`num_inference_steps`) | the model's steps | 2 to 100 for Qwen-Image-2.1's base model, 1 to 100 for Mage-Flow; Turbo stays at 8 |
 | `quality` | `auto` | The steps of Qwen-Image-2.1's base model: `low` 20, `medium` (`standard`) 30, `high`, `hd` and `auto` the default 40 (`steps`, when given, wins) |
