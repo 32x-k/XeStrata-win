@@ -560,6 +560,8 @@ static void plain_usage(const std::string& arch) {
                  "  --adapt-mib-per-token N   and at most N MiB of them for each token read since the last round\n"
                  "                       (default 48; 0: no such bound)\n"
                  "  --adapt-decay F      the routing counts are multiplied by F after each round (default 0.7)\n"
+                 "  --adapt-min-gain F   an expert moves in only when its decayed count is F over the one it\n"
+                 "                       evicts (default 1.5)\n"
                  "  --expert-cache N|auto   the VRAM tier's most expert slots, over all the layers (default auto)\n"
                  "  --vram-free-mib N    size the VRAM tier from at most N MiB free\n"
                  "  --vram-reserve-mib N leave N MiB of VRAM free beside the tier (default a 32nd of the memory)\n"
@@ -716,6 +718,7 @@ int plain_main(int argc, char** argv) {
             opt.expert_slots = v == "auto" ? -1 : std::max<int64_t>(0, std::strtoll(v.c_str(), nullptr, 10));
         }
         else if (a == "--adapt-decay") opt.adapt_decay = std::strtof(next("--adapt-decay"), nullptr);
+        else if (a == "--adapt-min-gain") opt.adapt_min_gain = std::strtof(next("--adapt-min-gain"), nullptr);
         else if (a == "--rope-freq-base") opt.rope_freq_base = std::strtod(next("--rope-freq-base"), nullptr);
         else if (a == "--rope-freq-scale") opt.rope_freq_scale = std::strtod(next("--rope-freq-scale"), nullptr);
         else if (a == "--expert-profile-save") profile_save = next("--expert-profile-save");

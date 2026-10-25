@@ -66,6 +66,7 @@ struct PlainOptions {
     /// a token.  On the B70 with an i7-14700 (DDR5) the bound changed nothing (llm-jp 8 GB 41.5 / 41.6).  0: none.
     int adapt_mib_per_token = 48;
     float adapt_decay = 0.7f;       ///< the routing counts are multiplied by this after each round
+    float adapt_min_gain = 1.5f;    ///< an expert moves in only when its count is this much over the one it evicts
     /// The experts read from the GGUF in place (the page cache, the drive) instead of loaded into pinned RAM: the
     /// low-RAM mode, taken by itself when the RAM available is less than the experts.  It has no PCIe share.
     bool mmap_experts = false;

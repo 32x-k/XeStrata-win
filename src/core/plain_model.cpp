@@ -1998,7 +1998,7 @@ bool PlainModel::adapt(std::string& err, int64_t max_swaps, int64_t max_evict) {
         std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
                           [](auto& a, auto& b) { return a.first < b.first; });
         for (size_t i = 0; i < nc; ++i) {
-            if (cand[i].first < vict[i].first + 1.5f) break;
+            if (cand[i].first < vict[i].first + opt_.adapt_min_gain) break;
             swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
         }
     }
