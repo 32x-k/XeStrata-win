@@ -4584,7 +4584,7 @@ struct Model::Impl {
         const double share = gpu_expert_share(&exp_b, &room, &other_b);
         if (exp_b <= 0) return false;
         const double lane = exp_b * (1.0 - std::min(1.0, share));
-        return lane > 0 && lane + (double) kRamMargin <= (double) avail;
+        return copy_all_fits(lane, avail, (double) kRamMargin, commit_room());   // (Windows: the commit room too, not only the free RAM)
     }
     mutable bool auto_copy_all = false;   // (set by store_gb(): the auto size is the CPU lane's experts copied in, no demand store)
     double store_cap_gb() const {
