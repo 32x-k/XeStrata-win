@@ -1015,9 +1015,11 @@ class ImageGen:
         with self.lock:
             self.engine.close(shutdown)
 
-    def run(self, job: dict, cancel: threading.Event | None = None) -> tuple[list[bytes], dict]:
-        """Make `job`'s images (parse_request's dict) -> (the PNG files' bytes in order, figures).  The caller holds
-        the GPU turn.  ImageJobFailed when the engine fails, times out or the job is cancelled."""
+    def run(self, job: dict, cancel: threading.Event | None = None, first: int = 0,
+            pause=None) -> tuple[list[bytes], dict]:
+        """Make `job`'s images (parse_request's dict) from image `first` -> (the PNG files' bytes in order, figures).
+        The caller holds the GPU turn; `pause()` true after an image ends the call there (make_images gives the turn
+        to the requests waiting for it).  ImageJobFailed when the engine fails, times out or the job is cancelled."""
         timeout = float(self.cfg.get("timeout_s") or 3600)
         mw, mh = made_size(job)
         t0 = time.monotonic()
@@ -1032,7 +1034,9 @@ class ImageGen:
                 sig = (base_sigmas(job["steps"], mw, mh) if sched == "base" else
                        mage_sigmas(job["steps"]) if sched == "mage" else [])
                 sigmas = " SIGMAS:" + ",".join(f"{x:.7g}" for x in sig) if sig else ""
-                for i in range(job["n"]):
+                for i in range(first, job["n"]):
+                    if i > first and pause is not None and pause():
+                        break
                     if cancel is not None and cancel.is_set():
                         self.totals["failed"] += 1
                         raise ImageJobFailed("cancelled (the client left)")
@@ -1067,7 +1071,7 @@ class ImageGen:
             with contextlib.suppress(OSError):
                 work.rmdir()
         secs = time.monotonic() - t0
-        figures = {"seconds": round(secs, 2), "steps": job["steps"], "cfg": job.get("cfg") or 1.0, "n": job["n"],
+        figures = {"seconds": round(secs, 2), "steps": job["steps"], "cfg": job.get("cfg") or 1.0, "n": len(images),
                    "refs": len(job.get("refs") or ()),
                    "size": f"{job['width']}x{job['height']}", "seed": job["seed"], "engine": "strata-image",
                    "quant": self.cfg.get("quant"),
@@ -1077,8 +1081,9 @@ class ImageGen:
                    "plan": {k: v for k, v in parts[-1].items() if k not in ("text_s", "sampling_s", "decode_s")}}
         if (mw, mh) != (job["width"], job["height"]):      # made larger and cut: the web page says so
             figures["made_size"] = f"{mw}x{mh}"
-        self.totals["jobs"] += 1
-        self.totals["images"] += job["n"]
+        if first + len(images) == job["n"]:
+            self.totals["jobs"] += 1
+        self.totals["images"] += len(images)
         self.totals["seconds"] += secs
         self.last = figures
         return images, figures
@@ -1111,7 +1116,11 @@ class ImageGen:
                     "text": "Reading the prompt", "sampling": "Sampling", "decode": "Decoding the image (VAE)"}
 
     def begin(self, job: dict) -> None:
-        """The job has the GPU's turn (gpu_turn): from here it is the running job."""
+        """The job has the GPU's turn (gpu_turn): from here it is the running job (again, after make_images gave the
+        turn away between its images)."""
+        if self.job is not None:
+            self.job["stage"] = "waiting"
+            return
         self.job = {"started": time.time(), "t0": time.monotonic(), "stage": "waiting", "image": 1, "images": job["n"],
                     "step": 0, "steps": job["steps"], "size": f"{job['width']}x{job['height']}",
                     "refs": len(job.get("refs") or ()), "edit": bool(job.get("refs")), "sampling_at": None}
@@ -1347,8 +1356,7 @@ class ImageTools:
                 job = parse_edit_request(req, [self.normalize(data)], gen.cfg, self.mask)
             else:
                 raise ImageRequestError(f"there is no tool named {name!r}")
-            with gpu_turn(self.svc, gen, job, cancel):
-                images, figures = gen.run(job, cancel)
+            images, figures, _ = make_images(self.svc, gen, job, cancel)
             fmt = job["output_format"]
             names = [gen.store(encode_image(png, fmt, job["output_compression"], job["background"] == "opaque"),
                                fmt) for png in images]
@@ -1429,6 +1437,36 @@ def ram_available_mib() -> int | None:
         return None
 
 
+def make_images(svc, gen: ImageGen, job: dict,
+                cancel: threading.Event | None = None) -> tuple[list[bytes], dict, str]:
+    """`job`'s images in the GPU's turn (gpu_turn) -> (the PNG files' bytes, figures, the policy used).  When a request
+    waits for the turn after an image, the turn is given to it and taken again for the rest, so a chat is not held up
+    by a batch; not under unload (giving it would load the text model and unload it again for each image)."""
+    images: list[bytes] = []
+    parts: list[dict] = []
+    used = "keep"
+    while len(images) < job["n"]:
+        with gpu_turn(svc, gen, job, cancel) as policy:
+            used = policy
+
+            def pause() -> bool:
+                with svc.status_lock:
+                    return used != "unload" and svc.status["queued"] > 0
+            made, figures = gen.run(job, cancel, len(images), pause)
+        images += made
+        parts.append(figures)
+        if len(images) < job["n"]:
+            gen._live(stage="waiting")
+            gen._say(f"image job: {len(images)} of {job['n']} images made; a request waits for the GPU's turn")
+    figures = dict(parts[-1])
+    for k in ("seconds", "text_encode_ms", "sampling_s", "vae_decode_s"):
+        figures[k] = round(sum(p[k] for p in parts), 2)
+    figures["n"], figures["seed"] = len(images), job["seed"]
+    gen.last = figures
+    gen.end(None)
+    return images, figures, used
+
+
 @contextlib.contextmanager
 def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = None):
     """The image job's turn on the GPU: the service's FIFO (and, with parallel requests, the engine's control lines
@@ -1494,7 +1532,8 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
     finally:
         if held_gpu is not None:
             held_gpu.release()
-        gen.end(error, cancelled=cancel is not None and cancel.is_set())
+        if error is not None:                     # a job that ends well: make_images ends it, after its last image
+            gen.end(error, cancelled=cancel is not None and cancel.is_set())
         if queued:
             with svc.status_lock:
                 svc.status["queued"] -= 1

@@ -121,7 +121,7 @@ The config file's (`xestrata-<model>.json`) `"images"` also has entries to set b
 - With Qwen-Image-2.1, a transparent background can be chosen as well.
 - With Qwen-Image-2.1 and a reference image attached, the part of the first image to draw again can be painted on it (brush size, eraser, clear). Only the painted part is drawn again, and the rest keeps the image's pixels (the API's `mask`). Unpainted, the edit takes the whole image.
 - Attaching reference images makes it an edit (PNG, JPEG, GIF, BMP, WebP).
-- Images are made one at a time; a chat request waits meanwhile (and the other way round).
+- Images are made one at a time. A chat request that comes while several are made runs after the image being made, and the rest follow it (under `unload`, which takes the text model off, the images are all made first).
 - The **Monitor** tab shows the stage, the step and the seconds a step takes.
 
 **The chat:** in the web page's chat the model can make and change images itself.

@@ -6104,8 +6104,7 @@ def make_handler(svc: Service):
                   f"seed {job['seed']}" + (f", {len(job['refs'])} reference image(s)" if job.get("refs") else ""),
                   flush=True)
             try:
-                with images_api.gpu_turn(svc, gen, job, cancel) as policy:
-                    images, figures = gen.run(job, cancel)
+                images, figures, policy = images_api.make_images(svc, gen, job, cancel)
             except images_api.ImageJobFailed as e:
                 self._json(500, {"error": {"type": "server_error", "code": "image_generation_failed",
                                            "message": str(e)}})
