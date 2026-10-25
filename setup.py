@@ -5681,7 +5681,9 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     """Steps 2-7 for a model of PLAIN_FAMILIES: its size and context, the engine, the GGUF file (size and SHA-256 at
     the pinned revision), its tokenizer and chat template written out, and the config: `strata --native` with no pack,
     PLE table or MTP layer.  Images, the layer split and the Qwen3.8-Flash-Next options (KV precision, low-RAM modes,
-    the speed projection) do not apply; --gpus with several cards splits the layers across them (docs/MULTIGPU.md)."""
+    the speed projection) do not apply; --low-ram on|mmap reads the experts from the model file instead of RAM
+    (--mmap-experts), the engine's own choice when the RAM is short; --gpus with several cards splits the layers
+    across them (docs/MULTIGPU.md)."""
     models = fam["models"]
     names = list(models)
     if a.model and a.model not in names:
@@ -5777,6 +5779,13 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         args += ["--draft-vocab", str(ROOT / "data" / DRAFT_VOCABS.get(a.draft_vocab or "cjk", "draft_vocab.bin"))]
     if a.vram_reserve_mib is not None:
         args += ["--vram-reserve-mib", str(a.vram_reserve_mib)]
+    # --low-ram: the engine keeps in RAM what the VRAM does not hold as far as the RAM allows and reads the rest from
+    # the file by itself (resident and auto); on and mmap read every expert the VRAM misses from the file
+    if a.low_ram in ("on", "mmap"):
+        args += ["--mmap-experts"]
+        ok("low-RAM mode: the experts the GPU does not hold are read from the model file (--mmap-experts)")
+    elif a.low_ram == "resident":
+        ok("low-RAM mode: the engine keeps in RAM what the GPU does not hold as far as the RAM allows (its default)")
     cfg: dict[str, Any] = {"exe": str(eng / EXE), "args": args, "cwd": str(STATE),
                            "tokenizer": str(tok_dir / "tokenizer"), "model_name": f"{fam['name']}-{model.lower()}",
                            "log": str(STATE / f"xestrata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
