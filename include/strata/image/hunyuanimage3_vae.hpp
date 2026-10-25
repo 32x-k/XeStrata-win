@@ -58,8 +58,12 @@ public:
     /// reference's decoder.* names) and puts the decoder's weights on the current GPU.  `dry`: sizes only,
     /// nothing uploaded; such a part cannot run.
     bool open(const std::string& path, void* stream, std::string& err, bool dry = false, bool encoder = false);
-    /// Whether open() read the encoder's weights too (encode() needs them).
+    /// Whether open() (or open_encoder) read the encoder's weights too (encode() needs them).
     bool has_encoder() const { return enc_open_; }
+    /// The encoder's weights put on the GPU after open (an edit's first reference image); true when they are.
+    bool open_encoder(const std::string& path, std::string& err);
+    /// What the encoder's weights take (after it is open; the dry part's for a plan).
+    uint64_t encoder_bytes() const { return enc_bytes_; }
 
     /// rgb [3][16 h][16 w] (device FP32, about -1 .. 1 - the reference's decoder's own output, the last frame)
     /// from the DiT's latent z [32][h][w] (device FP32, model space: the decode divides by scaling_factor
@@ -75,6 +79,18 @@ public:
                 const std::string& dump = std::string());
     /// The GPU memory an encode of an H x W image works in (the buffers, besides the weights).
     uint64_t encode_scratch_bytes(int64_t H, int64_t W) const;
+
+    /// The reference's spatial tiled decode (autoencoder_kl_3d.py's spatial_tiled_decode, which its pipeline
+    /// leaves off), for an image whose whole decode does not fit: the latent in tiles of 24 x 24 tokens
+    /// (vae.sample_size 384 / 16) every 21, each through the whole decoder, each blended into the one above and the
+    /// one to its left over 48 pixels and cut to 336, in the reference's order (each tile blended in place before it
+    /// is the next one's neighbour).  The group norms and the middle's attention take each tile's own statistics:
+    /// a 1024 x 1024 picture is 46 dB from the whole decode's (B70).  z and rgb as decode's (device).  The encode is
+    /// not tiled: its tiles' latents were 8 - 12% from the whole one's (the reference's walk and one whose last
+    /// tile ends at the edge alike), which an edit copies into its picture.
+    void decode_tiled(const float* z, int64_t h, int64_t w, float* rgb);
+    /// The GPU memory a tiled decode works in: one tile's buffers and its in and out.
+    uint64_t tiled_scratch_bytes() const;
 
     /// The model's vae scaling_factor: the data folder's hy3/config.json `vae.scaling_factor`, what the decode divides by.
     static double scaling_factor() { return kScalingFactor; }
@@ -141,6 +157,7 @@ private:
     const float *gout_ = nullptr, *bout_ = nullptr;
     // the encoder (open(..., encoder = true))
     bool enc_open_ = false;
+    uint64_t enc_bytes_ = 0;
     Conv ecin_, ecout_;
     Down down_[5];
     Res emid0_, emid2_;
@@ -153,6 +170,11 @@ private:
     uint16_t *a16_ = nullptr, *col16_ = nullptr;
 
     static constexpr double kScalingFactor = 0.562679178327931;   // the data folder's hy3/config.json vae.scaling_factor
+    // the reference's tiling: vae.sample_size 384 pixels a tile (24 tokens), its tile_overlap_factor 0.125
+    static constexpr int64_t kTileTokens = 24, kTilePixels = 384;
+    static constexpr double kTileOverlap = 0.125;
+
+
 };
 
 }  // namespace strata::image

@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <functional>
 #include <stdexcept>
 
 namespace strata::image {
@@ -341,35 +342,6 @@ bool HunyuanImage3Vae::open(const std::string& path, void* stream, std::string& 
         s_ = stream;
         dry_ = dry;
         SafeTensors st(path);
-        if (encoder) {
-            // The encoder's time depth (VAE.md's section 4): four frames through conv_in, the down.0 - down.2 levels
-            // and down.2's downsample (temporal: 4 -> 2), two through down.3 and its downsample (2 -> 1), one from
-            // down.4 to the head.  conv_in reads the image's 3 channels padded to the unfold's 8.
-            ecin_ = conv_w(st, "encoder.conv_in", 3, 8);
-            for (int64_t i = 0; i < 5; ++i) {
-                const std::string p = "encoder.down." + std::to_string(i) + ".";
-                const int64_t kt = i <= 3 ? 3 : 1;
-                for (int64_t j = 0; j < 2; ++j)
-                    down_[i].r[j] = res_w(st, p + "block." + std::to_string(j) + ".", kt);
-                if (i < 4) {
-                    down_[i].down = conv_w(st, p + "downsample.conv", kt);
-                    down_[i].temporal = i >= 2 ? 1 : 0;
-                    down_[i].out = down_[i].down.out * 4 * (down_[i].temporal ? 2 : 1);
-                }
-            }
-            emid0_ = res_w(st, "encoder.mid.block_1.", 1);
-            emid2_ = res_w(st, "encoder.mid.block_2.", 1);
-            eag_ = vec(st, "encoder.mid.attn_1.norm.weight");
-            eab_ = vec(st, "encoder.mid.attn_1.norm.bias");
-            eaq_ = point_w(st, "encoder.mid.attn_1.q");
-            eak_ = point_w(st, "encoder.mid.attn_1.k");
-            eav_ = point_w(st, "encoder.mid.attn_1.v");
-            eaproj_ = point_w(st, "encoder.mid.attn_1.proj_out");
-            egout_ = vec(st, "encoder.norm_out.weight");
-            ebout_ = vec(st, "encoder.norm_out.bias");
-            ecout_ = conv_w(st, "encoder.conv_out", 1);
-            enc_open_ = true;
-        }
         // The grid's time depth per stage (VAE.md's decode table): T = 1 through conv_in, the mid blocks and the
         // up.0 level; 2 at up.1; 4 from up.2 to the head - the two temporal DCAE upsamples (ffactor_temporal 4)
         // sit after up.0 and up.1, the spatial ones (x2 each, ffactor_spatial 16) after up.2 and up.3.  So the
@@ -397,13 +369,52 @@ bool HunyuanImage3Vae::open(const std::string& path, void* stream, std::string& 
         gout_ = vec(st, "decoder.norm_out.weight");
         bout_ = vec(st, "decoder.norm_out.bias");
         cout_ = conv_w(st, "decoder.conv_out", 3);
-        if (dry_) return true;
-        if (!gemm_.init(s_, 16, err)) return false;
-        return true;
+        if (!dry_ && !gemm_.init(s_, 16, err)) return false;
     } catch (const std::exception& e) {
         err = e.what();
         return false;
     }
+    return !encoder || open_encoder(path, err);
+}
+
+bool HunyuanImage3Vae::open_encoder(const std::string& path, std::string& err) {
+    if (enc_open_) return true;
+    try {
+        SafeTensors st(path);
+        const uint64_t before = weight_bytes_;
+        // The encoder's time depth (VAE.md's section 4): four frames through conv_in, the down.0 - down.2 levels
+        // and down.2's downsample (temporal: 4 -> 2), two through down.3 and its downsample (2 -> 1), one from
+        // down.4 to the head.  conv_in reads the image's 3 channels padded to the unfold's 8.
+        ecin_ = conv_w(st, "encoder.conv_in", 3, 8);
+        for (int64_t i = 0; i < 5; ++i) {
+            const std::string p = "encoder.down." + std::to_string(i) + ".";
+            const int64_t kt = i <= 3 ? 3 : 1;
+            for (int64_t j = 0; j < 2; ++j)
+                down_[i].r[j] = res_w(st, p + "block." + std::to_string(j) + ".", kt);
+            if (i < 4) {
+                down_[i].down = conv_w(st, p + "downsample.conv", kt);
+                down_[i].temporal = i >= 2 ? 1 : 0;
+                down_[i].out = down_[i].down.out * 4 * (down_[i].temporal ? 2 : 1);
+            }
+        }
+        emid0_ = res_w(st, "encoder.mid.block_1.", 1);
+        emid2_ = res_w(st, "encoder.mid.block_2.", 1);
+        eag_ = vec(st, "encoder.mid.attn_1.norm.weight");
+        eab_ = vec(st, "encoder.mid.attn_1.norm.bias");
+        eaq_ = point_w(st, "encoder.mid.attn_1.q");
+        eak_ = point_w(st, "encoder.mid.attn_1.k");
+        eav_ = point_w(st, "encoder.mid.attn_1.v");
+        eaproj_ = point_w(st, "encoder.mid.attn_1.proj_out");
+        egout_ = vec(st, "encoder.norm_out.weight");
+        ebout_ = vec(st, "encoder.norm_out.bias");
+        ecout_ = conv_w(st, "encoder.conv_out", 1);
+        enc_open_ = true;
+        enc_bytes_ = weight_bytes_ - before;
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+    return true;
 }
 
 void HunyuanImage3Vae::grow(int64_t elems32, int64_t elems16, int64_t col16, int64_t scores) {
@@ -671,6 +682,129 @@ void HunyuanImage3Vae::encode(const float* rgb, int64_t H, int64_t W, float* z, 
                  z, s_);
     gpu::stream_sync(s_);
     dump_.clear();
+}
+
+namespace {
+
+// A tile of planes on the host: C planes of h x w.
+struct HostTile {
+    int64_t h = 0, w = 0;
+    std::vector<float> v;
+};
+
+// The reference's blend_v / blend_h (autoencoder_kl_3d.py), in place on b: its first `extent` rows (columns) take
+// a's last ones at weight 1 - y / extent, its own at y / extent
+void blend_v(const HostTile& a, HostTile& b, int64_t C, int64_t extent) {
+    extent = std::min({a.h, b.h, extent});
+    for (int64_t y = 0; y < extent; ++y) {
+        const double t = (double) y / (double) extent;
+        const float wa = (float) (1.0 - t), wb = (float) t;
+        for (int64_t c = 0; c < C; ++c)
+            for (int64_t x = 0; x < b.w; ++x) {
+                float& d = b.v[(size_t) ((c * b.h + y) * b.w + x)];
+                d = a.v[(size_t) ((c * a.h + a.h - extent + y) * a.w + x)] * wa + d * wb;
+            }
+    }
+}
+
+void blend_h(const HostTile& a, HostTile& b, int64_t C, int64_t extent) {
+    extent = std::min({a.w, b.w, extent});
+    for (int64_t x = 0; x < extent; ++x) {
+        const double t = (double) x / (double) extent;
+        const float wa = (float) (1.0 - t), wb = (float) t;
+        for (int64_t c = 0; c < C; ++c)
+            for (int64_t y = 0; y < b.h; ++y) {
+                float& d = b.v[(size_t) ((c * b.h + y) * b.w + x)];
+                d = a.v[(size_t) ((c * a.h + y) * a.w + a.w - extent + x)] * wa + d * wb;
+            }
+    }
+}
+
+// The reference's stitch: each tile blended in place into the one above and the one to its left over `extent`
+// (in this order, so a blended tile is the next one's neighbour), cut to `limit` and set at its place in out [C][OH][OW]
+void stitch(std::vector<std::vector<HostTile>>& rows, int64_t C, int64_t OH, int64_t OW, int64_t extent, int64_t limit,
+            std::vector<float>& out) {
+    out.assign((size_t) (C * OH * OW), 0.f);
+    int64_t oy = 0;
+    for (size_t i = 0; i < rows.size(); ++i) {
+        int64_t ox = 0, rh = 0;
+        for (size_t j = 0; j < rows[i].size(); ++j) {
+            HostTile& t = rows[i][j];
+            if (i > 0) blend_v(rows[i - 1][j], t, C, extent);
+            if (j > 0) blend_h(rows[i][j - 1], t, C, extent);
+            const int64_t ch = std::min(t.h, limit), cw = std::min(t.w, limit);
+            for (int64_t c = 0; c < C; ++c)
+                for (int64_t y = 0; y < ch; ++y)
+                    std::copy_n(t.v.begin() + (c * t.h + y) * t.w, cw, out.begin() + ((c * OH + oy + y) * OW + ox));
+            ox += cw;
+            rh = ch;
+        }
+        oy += rh;
+    }
+}
+
+// The input's tiles of `tile` every `step` (C planes of H x W), each through `run` into its output tile
+std::vector<std::vector<HostTile>> tiles(const std::vector<float>& in, int64_t C, int64_t H, int64_t W, int64_t tile,
+                                         int64_t step, const std::function<void(const HostTile&, HostTile&)>& run) {
+    std::vector<std::vector<HostTile>> rows;
+    for (int64_t i = 0; i < H; i += step) {
+        std::vector<HostTile> row;
+        for (int64_t j = 0; j < W; j += step) {
+            HostTile t;
+            t.h = std::min(tile, H - i);
+            t.w = std::min(tile, W - j);
+            t.v.resize((size_t) (C * t.h * t.w));
+            for (int64_t c = 0; c < C; ++c)
+                for (int64_t y = 0; y < t.h; ++y)
+                    std::copy_n(in.begin() + ((c * H + i + y) * W + j), t.w, t.v.begin() + (c * t.h + y) * t.w);
+            HostTile o;
+            run(t, o);
+            row.push_back(std::move(o));
+        }
+        rows.push_back(std::move(row));
+    }
+    return rows;
+}
+
+}  // namespace
+
+void HunyuanImage3Vae::decode_tiled(const float* z, int64_t h, int64_t w, float* rgb) {
+    const int64_t zc = cin_.in;
+    std::vector<float> zh((size_t) (zc * h * w));
+    gpu::copy(zh.data(), z, zh.size() * sizeof(float));
+    const int64_t step = (int64_t) ((double) kTileTokens * (1.0 - kTileOverlap));         // 21
+    const int64_t extent = (int64_t) ((double) kTilePixels * kTileOverlap);              // 48
+    float *dz = nullptr, *drgb = nullptr;
+    if (!gpu::alloc_device(&dz, (size_t) (zc * kTileTokens * kTileTokens) * sizeof(float)) ||
+        !gpu::alloc_device(&drgb, (size_t) (3 * kTilePixels * kTilePixels) * sizeof(float))) {
+        if (dz != nullptr) gpu::free(dz);
+        throw std::runtime_error(std::string("image engine (HunyuanImage 3.0 VAE): a tile's buffers: ") +
+                                 gpu::last_error());
+    }
+    std::vector<float> out;
+    try {
+        auto rows = tiles(zh, zc, h, w, kTileTokens, step, [&](const HostTile& t, HostTile& o) {
+            gpu::copy(dz, t.v.data(), t.v.size() * sizeof(float));
+            decode(dz, t.h, t.w, drgb);
+            o.h = t.h * 16;
+            o.w = t.w * 16;
+            o.v.resize((size_t) (3 * o.h * o.w));
+            gpu::copy(o.v.data(), drgb, o.v.size() * sizeof(float));
+        });
+        stitch(rows, 3, h * 16, w * 16, extent, kTilePixels - extent, out);
+    } catch (...) {
+        gpu::free(dz);
+        gpu::free(drgb);
+        throw;
+    }
+    gpu::free(dz);
+    gpu::free(drgb);
+    gpu::copy(rgb, out.data(), out.size() * sizeof(float));
+}
+
+uint64_t HunyuanImage3Vae::tiled_scratch_bytes() const {
+    return scratch_bytes(kTileTokens, kTileTokens) + (uint64_t) (3 * kTilePixels * kTilePixels) * 4 +
+           (uint64_t) (cin_.in * kTileTokens * kTileTokens) * 4;
 }
 
 uint64_t HunyuanImage3Vae::encode_scratch_bytes(int64_t H, int64_t W) const {
