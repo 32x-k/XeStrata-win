@@ -20,6 +20,7 @@
 #include "strata/image/hunyuanimage3_host.hpp"
 #include "strata/image/hunyuanimage3_refs.hpp"
 #include "strata/image/qi_dit.hpp"
+#include "strata/image/safetensors.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -58,7 +59,7 @@ std::string refs_key(const std::vector<QiRef>& refs) {
 }  // namespace
 
 bool HunyuanImage3Pipeline::open(const std::string& dit, const std::string& vae, std::string& err,
-                                 int64_t max_layers, const std::string& vision) {
+                                 int64_t max_layers, const std::string& vision, const std::string& ratio_head) {
     s_ = core::Runtime::get().create_stream();
     dit_path_ = dit;
     vae_path_ = vae;
@@ -75,6 +76,23 @@ bool HunyuanImage3Pipeline::open(const std::string& dit, const std::string& vae,
     if (edits()) {
         vision_size_ = std::make_unique<HunyuanImage3Vision>();
         if (!vision_size_->open(vision, dit, s_, err, true)) return false;
+    }
+    if (!ratio_head.empty()) {   // 300 KB: read whole now, so a wrong file is told at the start
+        try {
+            SafeTensors st(ratio_head);
+            const int64_t hidden = dit_size_->dims().hidden;
+            ratio_norm_ = st.f32("model.ln_f.weight");
+            ratio_rows_ = st.f32("lm_head.img_ratio.weight");
+            if ((int64_t) ratio_norm_.size() != hidden ||
+                (int64_t) ratio_rows_.size() != (int64_t) kHunyuanImage3RatioBuckets * hidden) {
+                err = ratio_head + ": not the final norm and the " + std::to_string(kHunyuanImage3RatioBuckets) +
+                      " ratio rows of a " + std::to_string(hidden) + "-wide model";
+                return false;
+            }
+        } catch (const std::exception& e) {
+            err = e.what();
+            return false;
+        }
     }
     auto_budget_ = vram_cap(free);
     return true;
@@ -175,7 +193,7 @@ void HunyuanImage3Pipeline::reference_rows(const QiRequest& r, const std::vector
                                            int64_t hidden, float* hid) {
     ensure_vision();
     std::string err;
-    for (size_t k = 0; k + 1 < blocks.size(); ++k) {
+    for (size_t k = 0; k < r.refs.size(); ++k) {
         const HunyuanImage3Block& b = blocks[k];
         const QiRef& f = r.refs[k];
         const int64_t H = b.vae_h * kDownsample, W = b.vae_w * kDownsample;
@@ -288,7 +306,19 @@ bool HunyuanImage3Pipeline::read_sequence(const QiRequest& r, std::vector<int32_
               " tokens of a " + std::to_string(r.width) + " x " + std::to_string(r.height) + " image";
         return false;
     }
-    for (size_t k = 0; k < n_ref; ++k) {
+    if (!reference_grids(r, blocks, err)) return false;
+    start = g.vae_start;
+    if (!hunyuanimage3_positions_of(T, blocks, y, x, key_lim, err)) return false;
+    if (start <= 0) {
+        err = "image engine: the sequence holds no text before the image block";
+        return false;
+    }
+    return true;
+}
+
+bool HunyuanImage3Pipeline::reference_grids(const QiRequest& r, std::vector<HunyuanImage3Block>& blocks,
+                                            std::string& err) const {
+    for (size_t k = 0; k < r.refs.size(); ++k) {
         HunyuanImage3Block& b = blocks[k];
         const QiRef& f = r.refs[k];
         if (f.width <= 0 || f.height <= 0 || f.rgba.size() != (size_t) (f.width * f.height * 4)) {
@@ -318,12 +348,6 @@ bool HunyuanImage3Pipeline::read_sequence(const QiRequest& r, std::vector<int32_
                   std::to_string(b.vit_n) + " ViT tokens, not the model's " + std::to_string(slots);
             return false;
         }
-    }
-    start = g.vae_start;
-    if (!hunyuanimage3_positions_of(T, blocks, y, x, key_lim, err)) return false;
-    if (start <= 0) {
-        err = "image engine: the sequence holds no text before the image block";
-        return false;
     }
     return true;
 }
@@ -403,6 +427,90 @@ QiPlan HunyuanImage3Pipeline::plan(int64_t T, int64_t th, int64_t tw) {
     return p;
 }
 
+void HunyuanImage3Pipeline::text_rows(const QiRequest& r, const std::vector<int32_t>& ids, int64_t n,
+                                      const std::vector<HunyuanImage3Block>& blocks, int64_t hidden, float* hid,
+                                      bool& cached) {
+    // the cached rows as far as the ids agree: a size choice's sequence is the generate's up to its block's
+    // `<img_size_N>`, so the generate that follows it reads its reference images' rows from the cache
+    const std::string key = refs_key(r.refs);
+    int64_t have = 0;
+    if (key == refs_key_ && (int64_t) text_ids_.size() <= n &&
+        std::equal(text_ids_.begin(), text_ids_.end(), ids.begin()))
+        have = (int64_t) text_ids_.size();
+    // the references' rows come whole or not at all (reference_rows writes every block's)
+    const int64_t refs_end = r.refs.empty() ? 0 : blocks[r.refs.size() - 1].end;
+    if (have < refs_end) have = 0;
+    std::copy(text_rows_.begin(), text_rows_.begin() + have * hidden, hid);
+    cached = have == n;
+    if (have < n) {
+        std::string err;
+        if (!hunyuanimage3_wte_host(*dit_->file(), ids.data() + have, n - have, hid + have * hidden, err))
+            throw std::runtime_error("image engine: " + err);
+        if (have == 0 && !r.refs.empty()) reference_rows(r, blocks, hidden, hid);
+    }
+    text_ids_.assign(ids.begin(), ids.begin() + n);
+    refs_key_ = key;
+    text_rows_.assign(hid, hid + n * hidden);
+}
+
+int HunyuanImage3Pipeline::choose_ratio(const QiRequest& r, double* seconds) {
+    using clock = std::chrono::steady_clock;
+    const auto t0 = clock::now();
+    if (ratio_rows_.empty())
+        throw std::invalid_argument("image engine: HunyuanImage 3.0 chooses its size with the ratio head's file "
+                                    "(--ratio-head): run setup with --images again");
+    if (r.drop != 0)
+        throw std::invalid_argument("image engine: HunyuanImage 3.0 reads its whole sequence: drop must be 0");
+    const std::vector<int32_t>& ids = r.ids;
+    const int64_t T = (int64_t) ids.size();
+    if (T < 3 || ids[(size_t) (T - 2)] != kHunyuanImage3Boi || ids[(size_t) (T - 1)] < kHunyuanImage3ImgSize256 ||
+        ids[(size_t) (T - 1)] >= kHunyuanImage3ImgRatio0)
+        throw std::invalid_argument("image engine: a size choice's ids end with the image's <boi> <img_size_N>");
+    std::string err;
+    std::vector<HunyuanImage3Block> blocks;
+    if (!hunyuanimage3_blocks(ids.data(), T - 2, blocks, err, false)) throw std::invalid_argument(err);
+    for (const HunyuanImage3Block& b : blocks)
+        if (!b.reference) throw std::invalid_argument("image engine: a size choice's ids hold an image block");
+    if (blocks.size() != r.refs.size())
+        throw std::invalid_argument("image engine: the ids hold " + std::to_string(blocks.size()) +
+                                    " reference image block(s) and the request " + std::to_string(r.refs.size()) +
+                                    " reference image(s)");
+    if (!blocks.empty() && !edits())
+        throw std::invalid_argument("image engine: HunyuanImage 3.0's edits need the vision model's file "
+                                    "(--vision): run setup with --images again");
+    std::vector<int32_t> y, x, key_lim;
+    if (!reference_grids(r, blocks, err) || !hunyuanimage3_positions_of(T, blocks, y, x, key_lim, err))
+        throw std::invalid_argument(err);
+    ensure_open();
+    const int64_t hidden = dit_->dims().hidden;
+    std::vector<float> hid((size_t) (T * hidden));
+    bool cached = false;
+    text_rows(r, ids, T, blocks, hidden, hid.data(), cached);
+    // the sequence as text: no image block (every row before it is causal, a reference's span sees itself)
+    plan(T, 0, 0);
+    if (!dit_->set_sequence(T, 0, y.data(), x.data(), err, blocks.empty() ? nullptr : key_lim.data()))
+        throw std::runtime_error("image engine: " + err);
+    if (!dit_->forward(hid.data(), hid.data(), dit_->layers(), {}, err))
+        throw std::runtime_error("image engine: the DiT: " + err);
+    dit_->drop_sequence();
+    // the last row through ln_f (an RMS norm, the layers' eps) and the 37 rows of lm_head: the largest logit
+    const float* h = hid.data() + (size_t) ((T - 1) * hidden);
+    double ss = 0.0;
+    for (int64_t c = 0; c < hidden; ++c) ss += (double) h[c] * h[c];
+    const double inv = 1.0 / std::sqrt(ss / (double) hidden + (double) dit_->dims().eps);
+    int best = 0;
+    ratio_logits_.assign((size_t) kHunyuanImage3RatioBuckets, 0.0);
+    for (int i = 0; i < kHunyuanImage3RatioBuckets; ++i) {
+        const float* w = ratio_rows_.data() + (size_t) i * (size_t) hidden;
+        double logit = 0.0;
+        for (int64_t c = 0; c < hidden; ++c) logit += (double) h[c] * inv * ratio_norm_[(size_t) c] * w[c];
+        ratio_logits_[(size_t) i] = logit;
+        if (logit > ratio_logits_[(size_t) best]) best = i;
+    }
+    if (seconds != nullptr) *seconds = std::chrono::duration<double>(clock::now() - t0).count();
+    return best;
+}
+
 std::vector<uint8_t> HunyuanImage3Pipeline::generate(const QiRequest& r, QiTimes* times, QiPlan* plan_out,
                                                      const std::function<bool(int, int)>& step,
                                                      const std::function<void(const char*)>& stage) {
@@ -431,18 +539,8 @@ std::vector<uint8_t> HunyuanImage3Pipeline::generate(const QiRequest& r, QiTimes
     // there when this copy is missed.  The references are encoded before the plan takes the card for the banks.
     if (stage) stage(r.refs.empty() ? "text" : "refs");
     std::vector<float> hid((size_t) (T * hidden));
-    const std::string key = refs_key(r.refs);
     bool cached = false;
-    if (ids == text_ids_ && key == refs_key_) {
-        cached = true;
-    } else {
-        if (!hunyuanimage3_wte_host(*dit_->file(), ids.data(), start, hid.data(), err))
-            throw std::runtime_error("image engine: " + err);
-        if (!r.refs.empty()) reference_rows(r, blocks, hidden, hid.data());
-        text_ids_ = ids;
-        refs_key_ = key;
-        text_rows_.assign(hid.begin(), hid.begin() + start * hidden);
-    }
+    text_rows(r, ids, start, blocks, hidden, hid.data(), cached);
     QiPlan p = plan(T, r.height / kDownsample, r.width / kDownsample);
     p.text_cached = cached;
     if (!dit_->set_sequence(T, (T - start), y.data(), x.data(), err, blocks.size() > 1 ? key_lim.data() : nullptr))

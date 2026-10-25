@@ -248,6 +248,16 @@ int serve(si::ImagePipeline& p) {
                 });
                 write_file(out, img);
                 std::printf("IMAGE %s\n", plan_kv(t, pl).c_str());
+            } else if (op == "RATIO") {   // the size a request leaves to the model (serve/images.py)
+                si::QiRequest r;
+                std::string ids;
+                ls >> r.drop >> ids;
+                if (!ls) throw std::invalid_argument("RATIO <drop> <ids> [REF:<path>]...");
+                r.ids = parse_ids(ids);
+                r.refs = read_refs(ls, r);
+                double secs = 0.0;
+                const int i = p.choose_ratio(r, &secs);
+                std::printf("RATIO index=%d ratio_s=%.3f\n", i, secs);
             } else if (op == "NEED") {
                 int64_t w = 0, h = 0, n = 0;
                 ls >> w >> h >> n;
@@ -317,14 +327,14 @@ int main(int argc, char** argv) {
 #endif
     }
     try {
-        std::string dit, vae, text, vision, out, ids;
+        std::string dit, vae, text, vision, ratio_head, out, ids;
         std::vector<std::string> ref_paths;
         si::QiRequest r;
         uint64_t budget = 0;
         int repeat = 1;
         std::string edit_dit;
         int dit_q8 = -1;   // Mage-Flow: by the budget
-        bool serving = false, dit_keep = true;
+        bool serving = false, dit_keep = true, ratio = false;
         for (int i = 1; i < argc; ++i) {
             const std::string a = argv[i];
             auto val = [&]() -> std::string {
@@ -335,6 +345,8 @@ int main(int argc, char** argv) {
             else if (a == "--vae") vae = val();
             else if (a == "--text") text = val();
             else if (a == "--vision") vision = val();
+            else if (a == "--ratio-head") ratio_head = val();
+            else if (a == "--ratio") ratio = true;
             else if (a == "--ref") ref_paths.push_back(val());
             else if (a == "--mask") r.mask = read_image(val());
             else if (a == "--neg-ids") r.neg_ids = parse_ids(val());
@@ -367,7 +379,7 @@ int main(int argc, char** argv) {
         const bool mage = safetensors && !hunyuanimage3;
         const bool need_text = !hunyuanimage3;
         if (dit.empty() || vae.empty() || (need_text && text.empty()) ||
-            (!serving && (out.empty() || ids.empty()))) {
+            (!serving && ((out.empty() && !ratio) || ids.empty()))) {
             std::fprintf(stderr, "usage: %s --dit F --vae F --text F [--vision F] [--budget-mib M] (--ids 1,2,3 "
                          "[--drop N] [--width W] [--height H] [--seed S] [--sigmas 1,...,0] [--ref IMAGE]... "
                          "[--mask IMAGE] [--repeat N] --out IMAGE.rgba | --serve) [--dit-q8 auto|0|1] [--edit-dit F] "
@@ -375,7 +387,9 @@ int main(int argc, char** argv) {
                          argv[0]);
             std::fprintf(stderr, "       %s: HunyuanImage 3.0 (a quantized .safetensors --dit) takes no --text "
                          "(its DiT reads the ids itself); [--steps N] [--guidance G] stand for [--sigmas] [--cfg]; "
-                         "its edits (--ref) take --vision, the model's shard with vision_model.*\n",
+                         "its edits (--ref) take --vision, the model's shard with vision_model.*; --ratio with "
+                         "--ratio-head F prints the size it chooses (the ids ending with <boi> <img_size_N>) in "
+                         "place of an image\n",
                          argv[0]);
             return 2;
         }
@@ -383,7 +397,7 @@ int main(int argc, char** argv) {
         std::string err;
         if (hunyuanimage3) {
             auto h = std::make_unique<si::HunyuanImage3Pipeline>();
-            if (!h->open(dit, vae, err, 0, vision)) throw std::runtime_error(err);
+            if (!h->open(dit, vae, err, 0, vision, ratio_head)) throw std::runtime_error(err);
             pipe = std::move(h);
         } else if (mage) {
             auto m = std::make_unique<si::MfPipeline>();
@@ -403,6 +417,16 @@ int main(int argc, char** argv) {
             f.rgba = si::load_rgba8(path, f.width, f.height, err);
             if (f.rgba.empty()) throw std::runtime_error(err);
             r.refs.push_back(std::move(f));
+        }
+        if (ratio) {
+            double secs = 0.0;
+            const int i = p.choose_ratio(r, &secs);
+            std::printf("RATIO index=%d ratio_s=%.3f", i, secs);
+            if (const auto* h = dynamic_cast<const si::HunyuanImage3Pipeline*>(&p))
+                for (size_t k = 0; k < h->ratio_logits().size(); ++k)
+                    std::printf("%s%.6g", k == 0 ? " logits=" : ",", h->ratio_logits()[k]);
+            std::printf("\n");
+            return 0;
         }
         for (int k = 0; k < repeat; ++k) {
             si::QiTimes t;

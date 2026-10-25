@@ -426,7 +426,8 @@ int64_t hunyuanimage3_trim(const int32_t* ids, int64_t t, std::string& err) {
     return last + 1;
 }
 
-bool hunyuanimage3_blocks(const int32_t* ids, int64_t t, std::vector<HunyuanImage3Block>& blocks, std::string& err) {
+bool hunyuanimage3_blocks(const int32_t* ids, int64_t t, std::vector<HunyuanImage3Block>& blocks, std::string& err,
+                          bool generated) {
     blocks.clear();
     auto is_size = [](int32_t id) { return id >= kHunyuanImage3ImgSize256 && id < kHunyuanImage3ImgRatio0; };
     auto run = [&](int64_t from) {   // the `<img>` run from `from`
@@ -493,6 +494,7 @@ bool hunyuanimage3_blocks(const int32_t* ids, int64_t t, std::vector<HunyuanImag
         blocks.push_back(b);
         i = k;
     }
+    if (!generated) return true;
     err = "hunyuanimage3_blocks: no generated image's block at the end of the sequence";
     return false;
 }

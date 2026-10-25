@@ -34,6 +34,12 @@
 // own.  Those rows are the sequence's constant part, computed once a request with the text rows.  The vision
 // model's file (`--vision`, the model's bf16 shard with `vision_model.*`) opens the edits; without it a request
 // with reference images is refused by name.
+//
+// A size left to the model (the reference's image_size "auto") is its own choice too: choose_ratio runs the
+// sequence up to the generated block's `<boi> <img_size_N>` through the layers as text, and takes the
+// `<img_ratio_i>` whose logit is the largest, through the final norm and those 37 rows of the output projection
+// (`--ratio-head`, the file setup takes them into out of the bf16 shards) - the reference's img_ratio task, greedy.
+// The caller then builds the sequence at that bucket; the rows it shares with the choice's are kept.
 #pragma once
 
 #include "strata/image/hunyuanimage3_dit.hpp"
@@ -60,8 +66,10 @@ public:
     /// `vision`: the file with the model's `vision_model.*` tensors (SigLIP2), which opens the edits - with it the
     /// VAE's encoder is read too; empty, reference images are refused.  False with `err` on a file that is not a
     /// quantized HunyuanImage 3.0 save, or whose shapes are not this walk's.
+    /// `ratio_head`: the final norm and the ratio tokens' output rows (choose_ratio); empty, a size choice is
+    /// refused.
     bool open(const std::string& dit, const std::string& vae, std::string& err, int64_t max_layers = 0,
-              const std::string& vision = std::string());
+              const std::string& vision = std::string(), const std::string& ratio_head = std::string());
     /// Whether the pipeline takes reference images (a vision file was given).
     bool edits() const { return !vision_path_.empty(); }
 
@@ -89,6 +97,14 @@ public:
                 const std::vector<std::pair<int64_t, int64_t>>& refs = {}, bool mask = false,
                 int64_t n_neg = 0) override;
 
+    /// `r.ids`: the request's sequence up to the generated block's `<boi> <img_size_N>` (the system turn and the
+    /// reference images' blocks before it, as generate takes them), `r.refs` the images; width, height and the
+    /// sampling's fields are not read.  Returns the bucket's index; the text and reference rows stay cached for the
+    /// generate that follows.
+    int choose_ratio(const QiRequest& r, double* seconds = nullptr) override;
+    /// The last choice's 37 logits (a check's: `strata-image --ratio` prints them against the CPU golden's).
+    const std::vector<double>& ratio_logits() const { return ratio_logits_; }
+
     /// RGBA8 [height][width][4] of the request (every pixel opaque: the VAE decodes three planes).  `step`: the
     /// sampling's progress over the sigmas' steps, false to stop (QiStopped).  `stage`: "text" as the sequence is
     /// read, "sampling" for the walk, "decode" for the VAE.
@@ -113,6 +129,13 @@ private:
     bool read_sequence(const QiRequest& r, std::vector<int32_t>& ids, int64_t& T, int64_t& start,
                        std::vector<int32_t>& y, std::vector<int32_t>& x, std::vector<int32_t>& key_lim,
                        std::vector<HunyuanImage3Block>& blocks, std::string& err) const;
+    /// The reference blocks' grids (the first `r.refs.size()` of `blocks`): the VAE grid from the bucket the ids
+    /// name, the ViT grid from the image's naflex size.  False with `err`.
+    bool reference_grids(const QiRequest& r, std::vector<HunyuanImage3Block>& blocks, std::string& err) const;
+    /// The text and reference rows of `ids[0 .. n)` into `hid`: the cached ones as far as the last request's ids
+    /// agree (and its reference images are these), `wte` and reference_rows for the rest; then cached for the next.
+    void text_rows(const QiRequest& r, const std::vector<int32_t>& ids, int64_t n,
+                   const std::vector<HunyuanImage3Block>& blocks, int64_t hidden, float* hid, bool& cached);
     /// The reference images' rows into `hid` ([T][hidden], host): each block's VAE latent through patch_embed at
     /// timestep 0, its `<timestep>` row and its SigLIP2 rows.  Opens the vision part on first use; the encoders'
     /// buffers are given back before the walk.
@@ -122,6 +145,8 @@ private:
 
     void* s_ = nullptr;
     std::string dit_path_, vae_path_, vision_path_;
+    std::vector<float> ratio_norm_, ratio_rows_;   // the ratio head: ln_f [hidden], the 37 rows [37][hidden]
+    std::vector<double> ratio_logits_;
     std::unique_ptr<HunyuanImage3Vision> vision_, vision_size_;
     int64_t max_layers_ = 0;
     std::unique_ptr<HunyuanImage3Dit> dit_;

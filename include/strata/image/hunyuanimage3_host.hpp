@@ -96,8 +96,10 @@ struct HunyuanImage3Block {
 };
 
 /// The image blocks of `ids` ([t], already trimmed at the last `<img>`): the references in order, then the
-/// generated image's.  False with `err` on a layout that is not one of the two above.
-bool hunyuanimage3_blocks(const int32_t* ids, int64_t t, std::vector<HunyuanImage3Block>& blocks, std::string& err);
+/// generated image's.  `generated` false: references only, the ids ending before the generated block (a size
+/// choice's sequence).  False with `err` on a layout that is not one of the two above.
+bool hunyuanimage3_blocks(const int32_t* ids, int64_t t, std::vector<HunyuanImage3Block>& blocks, std::string& err,
+                          bool generated = true);
 
 /// The 2D rope positions and the attention's key limits of a sequence with `blocks` (their grids filled): text
 /// keeps y = x = its index; every image grid (a reference's VAE and ViT grids, the generated block's) gets the

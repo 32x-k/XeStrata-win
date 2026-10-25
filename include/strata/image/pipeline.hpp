@@ -87,6 +87,15 @@ public:
     /// image block's markers (HunyuanImage 3.0) fills `r` with a sequence of its own and returns true.
     virtual bool warm_up_request(QiRequest& r) const { (void) r; return false; }
 
+    /// The size a request leaves to the model: i of the `<img_ratio_i>` the model writes after `r.ids` (its
+    /// resolution bucket), as HunyuanImage 3.0's image_size "auto" chooses it; `seconds`: what it took.  A model
+    /// that does not choose its own size throws.
+    virtual int choose_ratio(const QiRequest& r, double* seconds = nullptr) {
+        (void) r;
+        (void) seconds;
+        throw std::invalid_argument("image engine: this model does not choose its own size");
+    }
+
     /// RGBA8 [height][width][4] of the request.  `step`: the sampling's progress, false to stop (QiStopped).
     /// `stage`: each stage as it starts ("refs", "text", "sampling", "decode").
     virtual std::vector<uint8_t> generate(const QiRequest& r, QiTimes* times = nullptr, QiPlan* plan = nullptr,
