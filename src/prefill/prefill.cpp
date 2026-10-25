@@ -2718,8 +2718,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             break;
         }
         if (std::getenv("STRATA_TRACE")) {
-            static thread_local Clock::time_point t0;
-            static thread_local bool set = false;
+            static Clock::time_point t0;   // process-wide: the stages run on different threads
+            static bool set = false;
             if (!set) { t0 = Clock::now(); set = true; }
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
             std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld stage [%lld,%lld) %.1f ms\n", (long long) c0,
@@ -5171,3 +5171,4 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
 }
 
 }  // namespace strata::prefill
+

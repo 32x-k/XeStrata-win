@@ -11026,8 +11026,8 @@ int main(int argc, char** argv) {
         const bool trace = std::getenv("STRATA_TRACE") != nullptr;
         auto tr = [&](const char* what, long long a = -1, long long b = -1) {
             if (!trace) return;
-            static thread_local Clock::time_point t0;
-            static thread_local bool t0_set = false;
+            static Clock::time_point t0;   // process-wide: the stages run on different threads
+            static bool t0_set = false;
             if (!t0_set) { t0 = Clock::now(); t0_set = true; }
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
             std::fprintf(stderr, "strata trace: %s %lld %lld %.1f ms\n", what, a, b, ms);
@@ -17093,3 +17093,4 @@ int main(int argc, char** argv) {
     cudaFree(arena);
     return 0;
 }
+
