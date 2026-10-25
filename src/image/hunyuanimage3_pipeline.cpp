@@ -384,7 +384,9 @@ QiPlan HunyuanImage3Pipeline::plan(int64_t T, int64_t th, int64_t tw) {
         banks_set_ = p.blocks;
     }
     p.resident_layers = dit_->resident_banks();
-    p.streamed = dit_->bank_bytes() - dit_->bank_vram();
+    // the banks past the resident prefix, by their sizes: bank_vram() counts a resident bank only once it is
+    // loaded, which the walk does, not this plan
+    for (int64_t l = p.resident_layers; l < dit_->layers(); ++l) p.streamed += dit_->bank_bytes(l);
     return p;
 }
 
