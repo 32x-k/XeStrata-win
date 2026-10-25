@@ -1405,14 +1405,35 @@ function imgMask() {
   g.drawImage(c, 0, 0);
   return m.toDataURL("image/png");
 }
-// the format: JPEG and WebP take a quality; a transparent background has no JPEG (no alpha channel)
+// whether this browser shows JPEG XL (a 1 x 1 image, decoded); older browsers do not
+const imgJxl = new Promise(ok => {
+  const i = new Image();
+  i.onload = () => ok(i.naturalWidth === 1);
+  i.onerror = () => ok(false);
+  i.src = "data:image/jxl;base64,/woAEBAJCAABABgASxiLFYIB";
+});
+let imgJxlOK = false;
+imgJxl.then(ok => { imgJxlOK = ok; imgFormat(); });
+const IMG_FMT_NAMES = {png: "PNG", jpeg: "JPEG", webp: "WebP", jxl: "JPEG XL"};
+// the format: the server's (/health's formats) that this browser shows; the one chosen last, else JPEG XL (lossless)
+// where it can, else PNG.  JPEG, WebP and JPEG XL take a quality (JPEG XL's 100: lossless), kept per format; a
+// transparent background has no JPEG (no alpha channel)
 function imgFormat() {
+  const d = imgModel().defaults || {};
   const f = $("img-fmt"), bg = $("img-bg").checked && !$("img-bg-f").hidden;
-  f.options[1].disabled = bg;
+  const fmts = (d.formats || ["png", "jpeg", "webp"]).filter(x => x !== "jxl" || imgJxlOK);
+  const was = store.get("img_fmt", fmts.includes("jxl") ? "jxl" : "png");
+  if ([...f.options].map(o => o.value).join() !== fmts.join())
+    f.replaceChildren(...fmts.map(x => new Option(IMG_FMT_NAMES[x] || x, x)));
+  f.value = fmts.includes(was) ? was : "png";
+  for (const o of f.options) o.disabled = bg && o.value === "jpeg";
   if (bg && f.value === "jpeg") f.value = "png";
   $("img-q-f").hidden = f.value === "png";
+  $("img-q").value = String(store.get("img_q_" + f.value, f.value === "jxl" ? 100 : 90));
+  $("img-q-f").title = f.value === "jxl" ? "100: lossless" : "";
 }
-$("img-fmt").onchange = imgFormat;
+$("img-fmt").onchange = () => { store.set("img_fmt", $("img-fmt").value); imgFormat(); };
+$("img-q").onchange = () => store.set("img_q_" + $("img-fmt").value, +$("img-q").value);
 $("img-bg").onchange = imgFormat;
 $("img-neg").oninput = imgNegHint;
 $("img-cfg").oninput = imgNegHint;
