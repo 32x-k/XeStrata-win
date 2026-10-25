@@ -34,8 +34,9 @@
 // shortcut that averages the 1024 channels in 16s to 64 -> norm_out, swish, conv_out (1024 -> 64) + the shortcut
 // = the moments, whose first 32 channels are the posterior's mean.  A DownsampleDCAE is a conv to out / factor
 // channels, then "b c (f r1) (h r2) (w r3) -> b (r1 r2 r3 c) f h w", plus the input folded the same way and
-// averaged in groups of factor * in / out channels.  encode() gives the mean times scaling_factor: the reference
-// samples the posterior with a generator, and the mean is the deterministic choice (the golden takes it too).
+// averaged in groups of factor * in / out channels.  encode() samples the posterior with the caller's noise, as the
+// reference does with its generator, or gives its mean (the golden's deterministic choice) without; both times
+// scaling_factor.
 #pragma once
 
 #include "strata/prefill/gemm.hpp"
@@ -66,10 +67,12 @@ public:
     /// look - every stage boundary is also written to <dump>/NN_name.bin as FP32 [pixels][channels].
     void decode(const float* z, int64_t h, int64_t w, float* rgb, const std::string& dump = std::string());
 
-    /// z [32][H/16][W/16] (device FP32, model space: the posterior's mean times scaling_factor, as the DiT's latent
-    /// is) from an image rgb [3][H][W] (device FP32, -1 .. 1; H and W multiples of 16): the reference's `vae_encode`
-    /// with the mean in place of a sample.  Needs open(..., encoder = true).
-    void encode(const float* rgb, int64_t H, int64_t W, float* z, const std::string& dump = std::string());
+    /// z [32][H/16][W/16] (device FP32, model space: a sample of the posterior times scaling_factor, as the DiT's
+    /// latent is) from an image rgb [3][H][W] (device FP32, -1 .. 1; H and W multiples of 16): the reference's
+    /// `vae_encode`.  `eps`: the sample's standard normal noise, device FP32 [32][H/16][W/16]; null takes the mean.
+    /// Needs open(..., encoder = true).
+    void encode(const float* rgb, int64_t H, int64_t W, float* z, const float* eps = nullptr,
+                const std::string& dump = std::string());
     /// The GPU memory an encode of an H x W image works in (the buffers, besides the weights).
     uint64_t encode_scratch_bytes(int64_t H, int64_t W) const;
 

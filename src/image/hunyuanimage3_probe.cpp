@@ -38,6 +38,7 @@
 #include "strata/image/hunyuanimage3_vae.hpp"
 #include "strata/image/hunyuanimage3_vision.hpp"
 #include "strata/image/pipeline.hpp"
+#include "strata/image/qi_dit.hpp"
 #include "strata/image/qi_image_io.hpp"
 
 #include <algorithm>
@@ -1680,6 +1681,27 @@ int refs_cmd(const std::string& dit_file, const std::string& vae_file, const std
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(),
                 (double) vae.weight_bytes() / 1e9, (double) vae.scratch_held() / 1e9);
     report("cond_latent", z, lat.f32);
+    // the shipped path samples the posterior: the same image with a fixed noise, against the golden's mean and
+    // log-variance taken the reference's way (mean + exp(clamp(logvar, -30, 20) / 2) eps, times scaling_factor)
+    if (Npy lv; npy("cond_latent_logvar.npy", lv) && lv.f32.size() == lat.f32.size()) {
+        const auto eps = si::philox_randn(20261025u, (uint64_t) lat.f32.size());
+        float* d_eps = nullptr;
+        if (!strata::gpu::alloc_device(&d_eps, eps.size() * 4)) {
+            std::fprintf(stderr, "strata-image-hunyuanimage3-probe: GPU memory\n");
+            return 1;
+        }
+        strata::gpu::copy(d_eps, eps.data(), eps.size() * 4);
+        vae.encode(d_img, H, W, d_z, d_eps);
+        std::vector<float> zs(lat.f32.size()), gold(lat.f32.size());
+        strata::gpu::copy(zs.data(), d_z, zs.size() * 4);
+        strata::gpu::free(d_eps);
+        const auto sf = (float) si::HunyuanImage3Vae::scaling_factor();
+        for (size_t i = 0; i < gold.size(); ++i)
+            gold[i] = lat.f32[i] + sf * std::exp(0.5f * std::clamp(lv.f32[i], -30.f, 20.f)) * eps[i];
+        report("cond_latent(sample)", zs, gold);
+        // how far the sample is from the mean, against the encoder's own floor above
+        report("sample vs mean", gold, lat.f32);
+    }
     vae.drop_scratch();
 
     // --- patch_embed(latent, t = 0) and timestep_emb(0): the rows the cond block carries

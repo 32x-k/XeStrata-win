@@ -209,17 +209,24 @@ void dcae_fold_down(const float* conv, const float* x, int64_t T, int64_t H, int
     });
 }
 
-// The encoder's head: z[c][p] = sf * (conv_out[p][c] + mean_{r < group} h[p][c group + r]) for c < zc - the
-// reference's shortcut "b (c r) f h w -> b c r f h w".mean(2) added to conv_out's 2 zc channels, of which the
-// first zc are the posterior's mean; channels-first, as the DiT's latent is
-void encoder_head(const float* conv, const float* h, int64_t P, int64_t Cin, int64_t Cout, int64_t group, int64_t zc,
-                  float sf, float* z, void* s) {
+// The encoder's head: moment m = conv_out[p][m] + mean_{r < group} h[p][m group + r] - the reference's shortcut
+// "b (c r) f h w -> b c r f h w".mean(2) added to conv_out's 2 zc channels, of which the first zc are the
+// posterior's mean and the next zc its log-variance - and z[c][p] = sf * (mean + exp(logvar / 2) eps[c][p])
+// (logvar clamped to -30 .. 20, the reference's DiagonalGaussianDistribution; eps null: the mean); channels-first,
+// as the DiT's latent is
+void encoder_head(const float* conv, const float* h, const float* eps, int64_t P, int64_t Cin, int64_t Cout,
+                  int64_t group, int64_t zc, float sf, float* z, void* s) {
     q_of(s).parallel_for(sycl::range<1>((size_t) (P * zc)), [=](sycl::id<1> id) {
         const auto i = static_cast<int64_t>(id[0]);
         const int64_t c = i / P, p = i % P;
-        float sum = 0.f;
-        for (int64_t r = 0; r < group; ++r) sum += h[p * Cin + c * group + r];
-        z[i] = sf * (conv[p * Cout + c] + sum / (float) group);
+        auto moment = [&](int64_t m) {
+            float sum = 0.f;
+            for (int64_t r = 0; r < group; ++r) sum += h[p * Cin + m * group + r];
+            return conv[p * Cout + m] + sum / (float) group;
+        };
+        float v = moment(c);
+        if (eps != nullptr) v += sycl::exp(0.5f * sycl::clamp(moment(zc + c), -30.f, 20.f)) * eps[i];
+        z[i] = sf * v;
     });
 }
 
@@ -609,7 +616,8 @@ void HunyuanImage3Vae::decode(const float* z, int64_t h, int64_t w, float* rgb, 
     dump_.clear();
 }
 
-void HunyuanImage3Vae::encode(const float* rgb, int64_t H, int64_t W, float* z, const std::string& dump) {
+void HunyuanImage3Vae::encode(const float* rgb, int64_t H, int64_t W, float* z, const float* eps,
+                              const std::string& dump) {
     if (!enc_open_) throw std::runtime_error("image engine (HunyuanImage 3.0 VAE): the encoder is not open");
     if (H % 16 != 0 || W % 16 != 0 || H <= 0 || W <= 0)
         throw std::invalid_argument("image engine (HunyuanImage 3.0 VAE): the image's sides must be multiples of 16");
@@ -659,8 +667,8 @@ void HunyuanImage3Vae::encode(const float* rgb, int64_t H, int64_t W, float* z, 
     groupnorm(x, egout_, ebout_, T * Hc * Wc, C, true, a16_, "enc_head");
     conv(ecout_, a16_, T, Hc, Wc, tmp32_);
     dump_stage(50, "enc_conv_out", tmp32_, T * Hc * Wc * ecout_.out);
-    encoder_head(tmp32_, x, T * Hc * Wc, C, ecout_.out, C / ecout_.out, ecout_.out / 2, (float) kScalingFactor, z,
-                 s_);
+    encoder_head(tmp32_, x, eps, T * Hc * Wc, C, ecout_.out, C / ecout_.out, ecout_.out / 2, (float) kScalingFactor,
+                 z, s_);
     gpu::stream_sync(s_);
     dump_.clear();
 }

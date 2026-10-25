@@ -188,19 +188,32 @@ void HunyuanImage3Pipeline::reference_rows(const QiRequest& r, const std::vector
             throw std::runtime_error(std::string("image engine: GPU memory for a reference image: ") +
                                      gpu::last_error());
         }
+        // the posterior sampled as the reference's generator does, with noise of the seed's own: each reference its
+        // stream, apart from the target's (Mage-Flow's references take the same)
         std::vector<float> z((size_t) (kLatentChannels * b.vae_n));
+        float* d_eps = nullptr;
+        if (!gpu::alloc_device(&d_eps, z.size() * sizeof(float))) {
+            gpu::free(d_img);
+            gpu::free(d_z);
+            throw std::runtime_error(std::string("image engine: GPU memory for a reference image: ") +
+                                     gpu::last_error());
+        }
         try {
             gpu::copy(d_img, img.data(), img.size() * sizeof(float));
-            vae_->encode(d_img, H, W, d_z);
+            const auto n = philox_randn(r.seed ^ (0x9E3779B97F4A7C15ull * (k + 1)), (uint64_t) z.size());
+            gpu::copy(d_eps, n.data(), n.size() * sizeof(float));
+            vae_->encode(d_img, H, W, d_z, d_eps);
             gpu::copy(z.data(), d_z, z.size() * sizeof(float));
         } catch (...) {
             gpu::free(d_img);
             gpu::free(d_z);
+            gpu::free(d_eps);
             vae_->drop_scratch();
             throw;
         }
         gpu::free(d_img);
         gpu::free(d_z);
+        gpu::free(d_eps);
         vae_->drop_scratch();
         if (!around_->set_grid(b.vae_h, b.vae_w, err) ||
             !around_->patch_embed(z.data(), b.vae_h, b.vae_w, 0.0f, hid + b.vae_start * hidden, err))
