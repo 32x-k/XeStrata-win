@@ -6090,7 +6090,9 @@ def make_handler(svc: Service):
                         raise ValueError("mask: {\"image_url\": a data: URL, an http(s) URL or a path}")
                     self._no_local_sources([mask])
                     mask = svc.download(mask) if mask.startswith(("http://", "https://")) else Vision.load(mask)
-            gen = svc.images.pick(req.get("model"))             # the image model it names, else the default
+            # the image model it names; else the default, or where that one makes images only (MageTrail,
+            # HunyuanImage 3.0), the first that edits (the chat's edit_image chooses among those too)
+            gen = svc.images.pick_edit(req.get("model"))
             job = images_api.parse_edit_request(req, [Vision.normalize(d, keep_alpha=True) for d in files], gen.cfg,
                                                 mask)
             self._image_job(gen, job)
@@ -7488,7 +7490,8 @@ def main() -> int:
         if not isinstance(extra, list) or not all(isinstance(m, dict) for m in extra):
             raise SystemExit('[strata] config: "image_models" must be a list of "images" sections')
         icfgs = [{k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
-                      if k in ("exe", "diffusion_model", "vae", "llm", "out_dir") and isinstance(v, str)
+                      if k in ("exe", "diffusion_model", "vae", "llm", "tokenizer", "system_prompt", "out_dir")
+                      and isinstance(v, str)
                       and not os.path.isabs(v) else v)
                   for k, v in section.items()} for section in [cfg["images"], *extra]]
         try:

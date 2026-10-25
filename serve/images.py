@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-"""serve/images.py - image generation (Qwen-Image-2.1-Turbo, Qwen-Image-2.1, Mage-Flow) through XeStrata's own image
-engine, strata-image.
+"""serve/images.py - image generation (Qwen-Image-2.1-Turbo, Qwen-Image-2.1, Mage-Flow, HunyuanImage 3.0) through
+XeStrata's own image engine, strata-image.
 
 POST /v1/images/generations takes OpenAI's request shape (prompt, size, n, response_format b64_json|url) plus Strata's
 own field seed; POST /v1/images/edits the same with reference images (OpenAI's multipart form, image or image[]; or JSON
@@ -23,6 +23,22 @@ shift (mage_sigmas), and guidance by guidance_scale or true_cfg_scale (the one s
 MF_MAX_REFS reference images, in its edit form (MF_EDIT_HEAD, "Image j: <pad>" before the instruction, the 64 ids of
 the system turn dropped) and the config's "edit_steps" (its edit models': Turbo 4, the others 30), on its edit DiT
 ("edit_model"); masks and transparent images it has none of.
+
+HunyuanImage 3.0 ("family": "hunyuan-image-3", "schedule": "hunyuanimage3"): its DiT reads the prompt's ids itself
+(it has no text encoder), so the sequence is built here, by hunyuanimage3_ids: the model's system prompt (the
+en_unified text setup wrote out, the model's own default), "User: " and the prompt, "Assistant: ", then the markers
+its tokenizer carries - <answer>, <boi>, <img_size_1024>, <img_ratio_i>, <timestep>, <guidance>, <timestep_r> - the
+block's <img> tokens (one a 16 x 16 pixel square) and <eoi>.  Its sizes snap to the model's resolution buckets
+(hunyuanimage3_bucket: the config's "resolutions" parameters, the 37 shapes its image processor walks), the bucket's
+shape and ratio index going into the sequence and its tokens being what the response's usage counts; the response's
+size is the bucket's, and "strata" names the size asked for (requested_size) when it differs.  Its guidance is one
+token, not two passes: guidance_scale (true_cfg_scale as its other name), default the config's "guidance" 2.5, and a
+negative prompt has nothing to steer (model_defaults says so with guidance_token, so the web page and the estimate
+treat a guided step as one).  Its steps are the config's (the Distil model's 8) on the model's own schedule - the
+engine builds the sigmas (shift 3.0) from the count, so none are sent.  Its edits are not built yet (the VAE's
+encoder), and masks and transparent images it has none of.  Its weights are under the Tencent Hunyuan Community
+License Agreement, which does not apply in the European Union, the United Kingdom or South Korea:
+https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE
 
 The GPU is shared with the text engine one job at a time: an image job takes the service's turn (the FIFO every chat
 request takes), so no chat turn runs on the GPU meanwhile.  The image engine works in the VRAM it is given: what it
@@ -48,11 +64,17 @@ The config's "images" section (written by setup --images, tools/image/qimage.py)
    "text_encoder": "stock", "text_quant": "Q4_K",
    "quant_lowered": {"from": "Q8_0", "to": "Q6_K", "text_from": "Q8_0", "text_to": "Q4_K", "need_gb": 20.2,
                      "ram_left_gb": 14.0}}
+HunyuanImage 3.0's instead: {"model_name": "hunyuan-image-3-distil", "family": "hunyuan-image-3", "exe",
+"quant": "w4a8"|"int8", "diffusion_model", "vae", "tokenizer": ".../tokenizer.json" (the model's own, read as a
+byte-level BPE: tools/strata_tokenizer.py's Tokenizer.from_hf), "system_prompt": ".../en_unified.txt", "steps": 8,
+"guidance": 2.5, "schedule": "hunyuanimage3", "resolutions": {"base_size": 1024, "step": 64, "align": 16,
+"extra_resolutions": [...]}, "mask": false, "transparency": false} - no "llm" (no text encoder), no "vision".
   max_n: the most images one request makes; budget_s: the longest one request's images may take, by the speed this
   server measured (ImageGen.estimate_s; until it has made an image, at most UNMEASURED_N); schedule: Turbo's own
-  sigmas or the base model's (base_sigmas; no "schedule" is Turbo); steps: the base model's default (a request's
-  "steps", 2 to MAX_STEPS, overrides it); vision: Qwen3-VL's vision encoder (mmproj), for the edits (without it they
-  are refused); max_refs: the reference images an edit takes at most; reserve_mib: VRAM the
+  sigmas or the base model's (base_sigmas; no "schedule" is Turbo), Mage-Flow's static shift (mage_sigmas),
+  HunyuanImage 3.0's the engine's own (from the step count: none is sent); steps: the model's default (a request's
+  "steps" overrides it; Turbo's 8 are its own); vision: Qwen3-VL's vision encoder (mmproj), for the edits (without it
+  they are refused); max_refs: the reference images an edit takes at most; reserve_mib: VRAM the
   image engine leaves free when it sizes itself; spare_mib: the free VRAM that must remain after a job under keep for
   the engine to keep its layers; quant_lowered (only when setup lowered them): the sizes setup took instead of the ones
   asked for, because the RAM the text model leaves was short (note(): the server's log and the web page say so).
@@ -120,6 +142,8 @@ MF_EDIT_REF = "Image {i}: <|vision_start|><|image_pad|><|vision_end|>"
 MF_MAX_REFS = 3                    # the edit models' training takes up to three references
 MF_SHIFT = 6.0                     # Mage-Flow's static time shift
 MF_NEG = " "                       # its pipeline's negative prompt when none is given
+HUNYUANIMAGE3_STEPS = 8            # HunyuanImage 3.0 Instruct-Distil's own (its generation_config's diff_infer_steps)
+HUNYUANIMAGE3_GUIDANCE = 2.5       # its guidance token's default (diff_guidance_scale)
 # an edit's reference image in the prompt: one pad, which the engine widens to the image's tokens
 REF_PROMPT = "{sep}<image{i}><|vision_start|><|image_pad|><|vision_end|>"
 REF_MAX_BYTES = 32 << 20
@@ -166,21 +190,31 @@ def model_defaults(cfg: dict) -> dict:
     cfg_request take theirs from here; the web page shows them): steps (Turbo's fixed, steps_fixed; Mage-Flow's edit
     model's for an edit), the least steps,
     the guidance scale (1: none), the negative prompt when none is given (None: none, so no guidance without one),
-    whether it makes transparent images, and whether its edits take a mask."""
+    whether it makes transparent images, and whether its edits take a mask.  HunyuanImage 3.0's guidance is one token
+    rather than a second pass (guidance_token: no negative prompt, a guided step costs one), and its sizes are its
+    resolution buckets (buckets: [width, height] each; a request's size is made at the one whose shape is nearest)."""
     mage = cfg.get("family") == "mage-flow"
+    hunyuan = cfg.get("family") == "hunyuan-image-3"
     if cfg.get("schedule") == "base":
         steps, least, fixed = int(cfg.get("steps") or 40), 2, False
     elif cfg.get("schedule") == "mage":
         steps, least, fixed = int(cfg.get("steps") or 4), 1, False
+    elif cfg.get("schedule") == "hunyuanimage3":   # HunyuanImage 3.0: any count on the engine's own shift
+        steps, least, fixed = int(cfg.get("steps") or HUNYUANIMAGE3_STEPS), 1, False
     else:
         steps, least, fixed = TURBO_STEPS, TURBO_STEPS, True
     edit = int(cfg.get("edit_steps") or steps) if cfg.get("edit_model") else steps
-    return {"steps": steps, "edit_steps": edit, "steps_min": least, "steps_max": MAX_STEPS, "steps_fixed": fixed,
-            "max_n": int(cfg.get("max_n") or MAX_N), "budget_s": float(cfg.get("budget_s") or BUDGET_S),
-            "formats": output_formats(),
-            "guidance": float(cfg.get("cfg_scale") or 1.0) if mage else 1.0,
-            "negative_prompt": MF_NEG if mage else None, "transparency": cfg.get("transparency") is not False,
-            "mask": cfg.get("mask") is not False}
+    out = {"steps": steps, "edit_steps": edit, "steps_min": least, "steps_max": MAX_STEPS, "steps_fixed": fixed,
+           "max_n": int(cfg.get("max_n") or MAX_N), "budget_s": float(cfg.get("budget_s") or BUDGET_S),
+           "formats": output_formats(),
+           "guidance": (float(cfg.get("guidance") or HUNYUANIMAGE3_GUIDANCE) if hunyuan
+                        else float(cfg.get("cfg_scale") or 1.0) if mage else 1.0),
+           "guidance_token": hunyuan,
+           "negative_prompt": MF_NEG if mage else None, "transparency": cfg.get("transparency") is not False,
+           "mask": cfg.get("mask") is not False}
+    if hunyuan:
+        out["buckets"] = [[b["width"], b["height"]] for b in hunyuanimage3_buckets(cfg)]
+    return out
 
 
 _CJXL: list[str | None] = []
@@ -206,8 +240,10 @@ def parse_request(req: dict, cfg: dict) -> dict:
     lossless); quality low, medium or high (the base model's
     steps, QUALITY_STEPS; an explicit steps wins); background transparent (the prompt in Qwen's form for it, an image
     with alpha; not with jpeg), opaque (alpha flattened on white) or auto.  vLLM-Omni's fields too: num_inference_steps
-    (steps by its name), negative_prompt, guidance_scale and true_cfg_scale (CFG_FIELDS).  Unknown fields (style,
-    user, moderation) are accepted and ignored."""
+    (steps by its name), negative_prompt, guidance_scale and true_cfg_scale (cfg_request).  Unknown fields (style,
+    user, moderation) are accepted and ignored.  HunyuanImage 3.0's size snaps to the model's resolution bucket nearest
+    the shape asked for (the job's "width"/"height" are that bucket's, "bucket" its row of the table, and
+    "requested_size" the size asked for when it is another)."""
     prompt = req.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise ImageRequestError("prompt: a non-empty string")
@@ -233,6 +269,12 @@ def parse_request(req: dict, cfg: dict) -> dict:
     if background == "transparent" and cfg.get("transparency") is False:
         raise ImageRequestError("background transparent: this image model does not make transparent images")
     w, h = parse_size(req.get("size"), int(cfg.get("max_side") or 2048))
+    bucket, requested = None, {}
+    if cfg.get("family") == "hunyuan-image-3":    # its own table: the bucket nearest the shape asked for
+        bucket = hunyuanimage3_bucket(cfg, w, h)
+        if (w, h) != (int(bucket["width"]), int(bucket["height"])):
+            requested = {"requested_size": f"{w}x{h}"}
+        w, h = int(bucket["width"]), int(bucket["height"])
     n = _int_field(req, "n", 1, int(cfg.get("max_n") or MAX_N), 1)
     if "num_inference_steps" in req:            # vLLM-Omni's name for steps
         if req.get("steps") not in (None, req["num_inference_steps"]):
@@ -243,6 +285,8 @@ def parse_request(req: dict, cfg: dict) -> dict:
         steps = _int_field(req, "steps", 2, MAX_STEPS, QUALITY_STEPS.get(quality or "auto") or dflt["steps"])
     elif cfg.get("schedule") == "mage":   # Mage-Flow: any count on its static shift, the config's by default
         steps = _int_field(req, "steps", 1, MAX_STEPS, dflt["steps"])
+    elif cfg.get("schedule") == "hunyuanimage3":   # HunyuanImage 3.0: the count on the engine's own sigmas
+        steps = _int_field(req, "steps", 1, MAX_STEPS, dflt["steps"])
     else:   # Turbo's own sigmas: steps asked for are ignored, as its diffusers pipeline (sample_sigmas) does
         _int_field(req, "steps", 1, MAX_STEPS, None)
         steps = dflt["steps"]
@@ -252,7 +296,7 @@ def parse_request(req: dict, cfg: dict) -> dict:
         seed = random.SystemRandom().randrange(0, 2**31)
     return {"prompt": prompt, "width": w, "height": h, "n": n, "steps": steps, "seed": seed,
             "quality": quality or "auto", "response_format": fmt, "output_format": out_fmt,
-            "output_compression": compression, "background": background, **cfg_fields}
+            "output_compression": compression, "background": background, "bucket": bucket, **requested, **cfg_fields}
 
 
 def cfg_request(req: dict, cfg: dict | None = None) -> dict:
@@ -260,7 +304,9 @@ def cfg_request(req: dict, cfg: dict | None = None) -> dict:
     classifier-free guidance from true_cfg_scale above 1 with a negative_prompt, as diffusers' QwenImage21Pipeline
     does (without one, or at 1, none: "cfg" stays out of the job); guidance_scale it has no use for, and ignores.
     Mage-Flow (cfg "family" mage-flow) has one scale: true_cfg_scale, else guidance_scale, else the config's
-    "cfg_scale"; above 1 it guides, with negative_prompt or its pipeline's " "."""
+    "cfg_scale"; above 1 it guides, with negative_prompt or its pipeline's " ".  HunyuanImage 3.0 has one scale as
+    well, but as a token rather than a second pass: guidance_scale (true_cfg_scale as its other name), else the
+    config's "guidance"; a negative prompt has nothing to steer there, so none is kept."""
     out: dict = {}
     neg = req.get("negative_prompt")
     if neg is not None:
@@ -274,6 +320,15 @@ def cfg_request(req: dict, cfg: dict | None = None) -> dict:
         if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 <= v <= CFG_MAX:
             raise ImageRequestError(f"{key}: a number from 0 to {CFG_MAX:g}")
         out[key] = float(v)
+    if (cfg or {}).get("family") == "hunyuan-image-3":
+        out.pop("negative_prompt", None)
+        scale = out.get("guidance_scale")
+        if scale is None:
+            scale = out.get("true_cfg_scale")
+        if scale is None:
+            scale = float((cfg or {}).get("guidance") or HUNYUANIMAGE3_GUIDANCE)
+        out["guidance"] = float(scale)
+        return out
     if (cfg or {}).get("family") == "mage-flow":
         dflt = model_defaults(cfg or {})
         scale = out.get("true_cfg_scale", out.get("guidance_scale", dflt["guidance"]))
@@ -401,6 +456,9 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
     changes, the rest kept as it is (the engine's inpainting), as job["mask"]; refused by a model whose config says
     "mask": false."""
     mage = cfg.get("family") == "mage-flow"
+    if cfg.get("family") == "hunyuan-image-3":
+        raise ImageRequestError("edits: HunyuanImage 3.0 makes an image from a prompt (its VAE's encoder is not built "
+                                "yet)")
     if not cfg.get("vision") or (mage and not cfg.get("edit_model")):
         raise ImageRequestError("edits need the vision encoder" + (" and the edit model" if mage else "") +
                                 f": run setup with --images {setup_choice(cfg)} again")
@@ -468,12 +526,16 @@ def ref_size(ref_w: int, ref_h: int) -> tuple[int, int]:
 
 def usage(job: dict) -> dict:
     """OpenAI's usage of an image job, in the image engine's tokens: the prompt's ids (the model's chat form) and the
-    reference images' DiT tokens in, the made images' DiT tokens out (a token a 16 x 16 pixel square)."""
+    reference images' DiT tokens in, the made images' DiT tokens out (a token a 16 x 16 pixel square).  HunyuanImage
+    3.0's ids carry the image block itself, so its share is taken out of the text."""
     mw, mh = made_size(job)
     text = len(job.get("ids") or ())
     sizes = (ref_size(*image_dims(r)) for r in job.get("refs") or ())
     refs = sum((w // SIZE_STEP) * (h // SIZE_STEP) for w, h in sizes)
-    out = job["n"] * (mw // SIZE_STEP) * (mh // SIZE_STEP)
+    block = (mw // SIZE_STEP) * (mh // SIZE_STEP)
+    if job.get("bucket") is not None:
+        text -= block
+    out = job["n"] * block
     return {"input_tokens": text + refs, "output_tokens": out, "total_tokens": text + refs + out,
             "input_tokens_details": {"text_tokens": text, "image_tokens": refs}}
 
@@ -513,6 +575,50 @@ def prompt_ids(tok, prompt: str, refs: int = 0, family: str = "qwen-image") -> l
     return tok.encode(text, parse_special=True, plain=[(len(head), len(head) + len(prompt))])
 
 
+def hunyuanimage3_buckets(cfg: dict) -> list[dict]:
+    """HunyuanImage 3.0's resolution buckets (ratio_index, height, width, tokens_h, tokens_w, ratio), from the config's
+    "resolutions" parameters (tools/image/qimage.py's hunyuanimage3_buckets builds the table; the run config keeps the
+    parameters, not the table), or the model's own without them."""
+    params = cfg.get("resolutions")
+    if not isinstance(params, dict) or not params.get("base_size"):
+        params = _qimage().hunyuanimage3_resolutions()
+    return _qimage().hunyuanimage3_buckets(params)
+
+
+def hunyuanimage3_bucket(cfg: dict, width: int, height: int) -> dict:
+    """HunyuanImage 3.0's resolution bucket nearest the shape asked for (|ratio - height / width|, the earlier of two
+    equally near)."""
+    return min(hunyuanimage3_buckets(cfg), key=lambda b: abs(b["ratio"] - height / width))
+
+
+def hunyuanimage3_ids(tok, prompt: str, bucket: dict, base_size: int = 1024, system: str | None = None) -> list[int]:
+    """HunyuanImage 3.0's sequence for an image of `bucket` (hunyuanimage3_bucket), as its tokenizer's "instruct"
+    template writes it: <|startoftext|>, the system prompt (`system`, the model's en_unified text) and a blank line,
+    "User: " and the prompt, a blank line, "Assistant: ", <answer>, <boi>, <img_size_base_size>,
+    <img_ratio_ratio_index>, the three a step writes over (<timestep>, <guidance>, <timestep_r>), the block's <img>
+    tokens, <eoi>, </answer> and a blank line (which the engine's hunyuanimage3_trim drops with the rest after <eoi>).
+    `system` None leaves the system turn out, as the CPU golden's batch_system_prompt=[None] did.  Every section is
+    encoded on its own - as one string the pieces merge across the boundaries, and the reference encodes each section
+    too - and the prompt plain, so a special token spelled in it stays text."""
+    def marker(name: str) -> int:
+        i = tok.special_ids.get(name)
+        if i is None:
+            raise ValueError(f"the tokenizer has no {name}: not HunyuanImage 3.0's tokenizer.json")
+        return i
+
+    ids = [marker("<|startoftext|>")]
+    if system is not None:
+        ids += tok.encode(system, parse_special=False) + tok.encode("\n\n", parse_special=False)
+    for text in ("User: ", prompt, "\n\n", "Assistant: "):
+        ids += tok.encode(text, parse_special=False)
+    ids += [marker("<answer>"), marker("<boi>"), marker(f"<img_size_{int(base_size)}>"),
+            marker(f"<img_ratio_{int(bucket['ratio_index'])}>"), marker("<timestep>"), marker("<guidance>"),
+            marker("<timestep_r>")]
+    ids += [marker("<img>")] * (int(bucket["tokens_h"]) * int(bucket["tokens_w"]))
+    ids += [marker("<eoi>"), marker("</answer>")]
+    return ids + tok.encode("\n\n", parse_special=False)
+
+
 def mage_sigmas(steps: int, shift: float = MF_SHIFT) -> list[float]:
     """Mage-Flow's sigmas for `steps` and the terminal 0: shift t / (1 + (shift - 1) t), t from 1 down to 1 / steps
     (its FlowMatchEulerDiscreteScheduler with a static shift; the engine's own default for Turbo's 4)."""
@@ -523,13 +629,24 @@ def mage_sigmas(steps: int, shift: float = MF_SHIFT) -> list[float]:
     return out + [0.0]
 
 
-def load_tokenizer(gguf: str):
-    """Qwen3-VL's tokenizer from the text encoder's GGUF (tools/strata_tokenizer.py)."""
+def load_tokenizer(path: str, family: str = "qwen-image"):
+    """The prompt's tokenizer (tools/strata_tokenizer.py): HunyuanImage 3.0's own `tokenizer.json` (a byte-level BPE,
+    from_hf) or Qwen3-VL's, from the text encoder's GGUF."""
     tools = str(Path(__file__).resolve().parent.parent / "tools")
     if tools not in sys.path:
         sys.path.insert(0, tools)
     import strata_tokenizer
-    return strata_tokenizer.Tokenizer.from_gguf(gguf)
+    if family == "hunyuan-image-3":
+        return strata_tokenizer.Tokenizer.from_hf(path)
+    return strata_tokenizer.Tokenizer.from_gguf(path)
+
+
+def can_edit(cfg: dict) -> bool:
+    """Whether the image model of the config section `cfg` edits (takes reference images): Qwen-Image-2.1's and
+    Mage-Flow's with their vision encoder (and Mage-Flow's edit model); MageTrail and HunyuanImage 3.0 do not."""
+    if cfg.get("family") == "hunyuan-image-3":
+        return False
+    return bool(cfg.get("vision")) and not (cfg.get("family") == "mage-flow" and not cfg.get("edit_model"))
 
 
 def _kv(line: str) -> dict:
@@ -666,8 +783,9 @@ class ImageEngine:
         self.ended = threading.Event()              # the daemon closed this connection
 
     def command(self) -> list[str]:
-        cmd = [str(self.cfg["exe"]), "--dit", str(self.cfg["diffusion_model"]), "--vae", str(self.cfg["vae"]),
-               "--text", str(self.cfg["llm"])]
+        cmd = [str(self.cfg["exe"]), "--dit", str(self.cfg["diffusion_model"]), "--vae", str(self.cfg["vae"])]
+        if self.cfg.get("llm"):       # the text encoder's GGUF; HunyuanImage 3.0 has none (its DiT reads the ids)
+            cmd += ["--text", str(self.cfg["llm"])]
         if self.cfg.get("vision"):
             cmd += ["--vision", str(self.cfg["vision"])]
         if self.cfg.get("dit_q8") is not None:   # Mage-Flow's DiT: 8 bits or FP16 as the config says, else by the VRAM
@@ -852,14 +970,16 @@ class ImageGen:
         reload = self.cfg.get("reload") or "lazy"
         if reload not in ("lazy", "eager"):
             raise ValueError(f'images "reload" must be lazy or eager, not {reload!r}')
-        for k in ("exe", "diffusion_model", "vae", "llm"):
+        self.family = self.cfg.get("family") or "qwen-image"
+        for k in self._file_keys():
             if not isinstance(self.cfg.get(k), str) or not self.cfg[k]:
                 raise ValueError(f'the config\'s "images" section needs "{k}" (run setup with --images again)')
         if Path(self.cfg["exe"]).name.startswith("sd-cli"):
             raise ValueError('the config\'s "images" section is for stable-diffusion.cpp, which XeStrata no longer '
                              "uses (run setup with --images again)")
         self.policy, self.reload = policy, reload
-        self.drop = MF_DROP if self.cfg.get("family") == "mage-flow" else DROP   # the system turn's ids
+        # the ids the DiT does not take: the leading system turn's (HunyuanImage 3.0's DiT reads all of its own)
+        self.drop = 0 if self.family == "hunyuan-image-3" else MF_DROP if self.family == "mage-flow" else DROP
         self.model = self.cfg.get("model_name") or MODEL_NAME
         self.log = log
         out = self.cfg.get("out_dir")
@@ -872,6 +992,7 @@ class ImageGen:
         self.engine = ImageEngine(self.cfg, dict(os.environ) if env is None else env, self.dir / "strata-image.log",
                                   self._say)
         self.tok = None
+        self._system: str | None = None          # HunyuanImage 3.0's system prompt, read once
         self.totals = {"images": 0, "jobs": 0, "seconds": 0.0, "failed": 0}
         self.last: dict | None = None              # the last job's figures (/v1/status)
         # the measured speed, an edit's apart (its reference images): for each size made (in megapixels), one step's
@@ -952,9 +1073,31 @@ class ImageGen:
             raise ImageRequestError(f"n: {n} images of this size and steps take about {est / 60:.1f} min here, over "
                                     f"the {budget / 60:.0f} min limit (budget_s); at most {most}")
 
+    def _file_keys(self) -> tuple[str, ...]:
+        """The config keys that name this model's files: HunyuanImage 3.0's tokenizer and system prompt stand where the
+        others' text encoder does."""
+        if self.family == "hunyuan-image-3":
+            return ("exe", "diffusion_model", "vae", "tokenizer", "system_prompt")
+        return ("exe", "diffusion_model", "vae", "llm") + (("vision",) if self.cfg.get("vision") else ())
+
     def missing(self) -> list[str]:
-        keys = ("exe", "diffusion_model", "vae", "llm") + (("vision",) if self.cfg.get("vision") else ())
-        return [self.cfg[k] for k in keys if not Path(self.cfg[k]).exists()]
+        return [self.cfg[k] for k in self._file_keys() if not Path(self.cfg[k]).exists()]
+
+    def _tokenizer_path(self) -> str:
+        """HunyuanImage 3.0's tokenizer.json or Qwen3-VL's text encoder GGUF, as the config names them."""
+        return self.cfg["tokenizer"] if self.family == "hunyuan-image-3" else self.cfg["llm"]
+
+    def system_text(self) -> str:
+        """HunyuanImage 3.0's system prompt (setup's en_unified.txt), read once: the ids start with it."""
+        if self._system is None:
+            self._system = Path(self.cfg["system_prompt"]).read_text(encoding="utf-8")
+        return self._system
+
+    def _base_size(self) -> int:
+        """HunyuanImage 3.0's image base size: its <img_size_N> token's N (1024 in the model's config), one for every
+        bucket, as its image processor takes it from the resolution group."""
+        params = self.cfg.get("resolutions")
+        return int((params or {}).get("base_size") or 1024)
 
     def _say(self, text: str) -> None:
         print(f"[strata] {text}", flush=True)
@@ -981,23 +1124,28 @@ class ImageGen:
 
     def _ready(self) -> None:
         if self.tok is None:
-            self.tok = load_tokenizer(self.cfg["llm"])
+            self.tok = load_tokenizer(self._tokenizer_path(), self.family)
         if not self.engine.alive():
             self.engine.start()
 
     def ids(self, job: dict) -> list[int]:
         if self.tok is None:
-            self.tok = load_tokenizer(self.cfg["llm"])
+            self.tok = load_tokenizer(self._tokenizer_path(), self.family)
         if "ids" not in job:
-            fam = self.cfg.get("family") or "qwen-image"
-            job["ids"] = prompt_ids(self.tok, model_prompt(job), len(job.get("refs") or ()), fam)
-            if job.get("cfg"):   # guidance's negative prompt, in the same form (its pads as the prompt's)
-                job["neg_ids"] = prompt_ids(self.tok, job["negative_prompt"], len(job.get("refs") or ()), fam)
+            if self.family == "hunyuan-image-3":   # the DiT reads the whole sequence, the image block in it
+                bucket = job.get("bucket") or hunyuanimage3_bucket(self.cfg, job["width"], job["height"])
+                job["ids"] = hunyuanimage3_ids(self.tok, model_prompt(job), bucket, self._base_size(),
+                                               self.system_text())
+            else:
+                job["ids"] = prompt_ids(self.tok, model_prompt(job), len(job.get("refs") or ()), self.family)
+                if job.get("cfg"):   # guidance's negative prompt, in the same form (its pads as the prompt's)
+                    job["neg_ids"] = prompt_ids(self.tok, job["negative_prompt"], len(job.get("refs") or ()),
+                                                self.family)
         return job["ids"]
 
     def drop_of(self, job: dict) -> int:
         """The system turn's ids the DiT does not take: Mage-Flow's edit form has its own."""
-        return MF_EDIT_DROP if self.cfg.get("family") == "mage-flow" and job.get("refs") else self.drop
+        return MF_EDIT_DROP if self.family == "mage-flow" and job.get("refs") else self.drop
 
     @staticmethod
     def _cfg_words(job: dict) -> str:
@@ -1093,6 +1241,9 @@ class ImageGen:
                 sig = (base_sigmas(job["steps"], mw, mh) if sched == "base" else
                        mage_sigmas(job["steps"]) if sched == "mage" else [])
                 sigmas = " SIGMAS:" + ",".join(f"{x:.7g}" for x in sig) if sig else ""
+                # HunyuanImage 3.0's sigmas are the engine's own (from the step count): its step count and the
+                # guidance token's scale go instead
+                guide = f" STEPS:{job['steps']} GUID:{job['guidance']:g}" if sched == "hunyuanimage3" else ""
                 for i in range(first, job["n"]):
                     if i > first and pause is not None and pause():
                         break
@@ -1112,7 +1263,7 @@ class ImageGen:
                         self._live(stage=name, **({"sampling_at": time.monotonic()} if name == "sampling" else {}))
                     try:
                         r = self.engine.ask(f"IMG {mw} {mh} {job['seed'] + i} {self.drop_of(job)} {out} {ids}{sigmas}"
-                                            f"{self._refs_words(job)}{self._cfg_words(job)}", "IMAGE", timeout,
+                                            f"{guide}{self._refs_words(job)}{self._cfg_words(job)}", "IMAGE", timeout,
                                             cancel, step, stage)
                     except ImageJobFailed as e:
                         self.totals["failed"] += 1
@@ -1138,9 +1289,13 @@ class ImageGen:
                    "text_encode_ms": round(sum(r.get("text_s", 0) for r in parts) * 1000, 1),
                    "sampling_s": round(sum(r.get("sampling_s", 0) for r in parts), 2),
                    "vae_decode_s": round(sum(r.get("decode_s", 0) for r in parts), 2),
-                   "plan": {k: v for k, v in parts[-1].items() if k not in ("text_s", "sampling_s", "decode_s")}}
+                   "plan": {k: v for k, v in parts[-1].items() if k not in ("text_s", "sampling_s", "decode_s")},
+                   **({"guidance": job["guidance"], "ratio": job["bucket"]["ratio_index"]}
+                      if job.get("bucket") is not None else {})}
         if (mw, mh) != (job["width"], job["height"]):      # made larger and cut: the web page says so
             figures["made_size"] = f"{mw}x{mh}"
+        if job.get("requested_size"):                      # made at the model's bucket instead: the web page says so
+            figures["requested_size"] = job["requested_size"]
         if first + len(images) == job["n"]:
             self.totals["jobs"] += 1
         self.totals["images"] += len(images)
@@ -1258,6 +1413,21 @@ class ImageModels:
     def pick(self, name) -> ImageGen:
         return self.gens.get(name, self.default) if isinstance(name, str) else self.default
 
+    def editors(self) -> list[ImageGen]:
+        """The models that edit (take reference images), the default first."""
+        return [g for g in self.gens.values() if can_edit(g.cfg)]
+
+    def pick_edit(self, name) -> ImageGen:
+        """The model of an edit (/v1/images/edits): the one named, as pick gives it; none named, the default when it
+        edits, else the first model that does (the chat's edit_image chooses among those too), so that a default that
+        makes images only (MageTrail, HunyuanImage 3.0) does not refuse every edit.  With no model that edits, the
+        default, whose parse_edit_request says why."""
+        if isinstance(name, str) and name in self.gens:
+            return self.gens[name]
+        if can_edit(self.default.cfg):
+            return self.default
+        return next(iter(self.editors()), self.default)
+
     def activate(self, gen: ImageGen) -> None:
         """Make `gen` the model on the GPU: every other daemon of the GPU ended, this server's other models' and other
         servers' (the caller holds the GPU's turn, GpuTurn)."""
@@ -1286,8 +1456,7 @@ class ImageModels:
 
     def models(self) -> list[dict]:
         """Each model's name, defaults and whether it edits (the web page's choice), the default first."""
-        return [{"id": g.model, "defaults": g.defaults(), "edits": bool(g.cfg.get("vision"))}
-                for g in self.gens.values()]
+        return [{"id": g.model, "defaults": g.defaults(), "edits": can_edit(g.cfg)} for g in self.gens.values()]
 
 
 # ------------------------------------------------------------------------------------------- chat's image tools
@@ -1348,7 +1517,7 @@ class ImageTools:
     def _gens(self, edits: bool = False) -> list[ImageGen]:
         """The image models the tools offer (those that edit, for edit_image), the default first."""
         gens = list(self.models.gens.values()) if self.models is not None else [self.gen]
-        return [g for g in gens if g.cfg.get("vision")] if edits else gens
+        return [g for g in gens if can_edit(g.cfg)] if edits else gens
 
     def template_tools(self, exclude=()) -> list[dict]:
         out = []

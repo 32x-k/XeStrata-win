@@ -1292,7 +1292,9 @@ function readAsDataURL(f) {
 }
 $("img-size").onchange = () => { $("img-custom").hidden = $("img-size").value !== "custom"; };
 // the image model's defaults (/health's image_defaults, what the API gives a request that leaves a field out): the
-// fields' placeholders, the steps hidden where they are fixed (Turbo), the transparent background where it has one
+// fields' placeholders, the steps hidden where they are fixed (Turbo), the transparent background where it has one,
+// the negative prompt hidden where the guidance is one token the model reads (HunyuanImage 3.0: guidance_token), and
+// the sizes snapped to the model's own (buckets) for the estimate
 // the image models (/health's image_models, the default first): a choice where there are several, its defaults and
 // whether it edits; one with no edit model hides the reference images
 function imgModel() {
@@ -1331,7 +1333,10 @@ function imgDefaults() {
   $("img-steps").min = d.steps_min || 1;
   $("img-steps").max = d.steps_max || 100;
   $("img-steps").placeholder = String((refs ? d.edit_steps : d.steps) || "");
-  $("img-cfg").placeholder = d.guidance > 1 ? String(d.guidance) : "off";
+  const token = !!d.guidance_token;   // one token, not a second pass with a negative prompt
+  $("img-neg-f").hidden = token;
+  $("img-cfg-l").textContent = token ? "Guidance" : "Guidance (CFG)";
+  $("img-cfg").placeholder = d.guidance > 1 || token ? String(d.guidance) : "off";
   $("img-bg-f").hidden = !d.transparency;
   imgCount();
   imgFormat();
@@ -1348,9 +1353,13 @@ function imgEstimate(n) {
     : ($("img-size").value === "auto" ? "1024x1024" : $("img-size").value).split("x").map(Number);
   w = Math.ceil((w || 1024) / 16) * 16;
   h = Math.ceil((h || 1024) / 16) * 16;
+  if (d.buckets && d.buckets.length) {   // the model's own sizes: the one whose shape is nearest (the server's choice)
+    const r = h / w;
+    [w, h] = d.buckets.reduce((a, b) => Math.abs(b[1] / b[0] - r) < Math.abs(a[1] / a[0] - r) ? b : a);
+  }
   let steps = d.steps_fixed ? d.steps : (+$("img-steps").value || (refs ? d.edit_steps : d.steps) || 1);
   const g = $("img-cfg").value !== "" ? Number($("img-cfg").value) : (d.guidance || 1);
-  if (g > 1 && (d.negative_prompt != null || $("img-neg").value.trim())) steps *= 2;
+  if (g > 1 && !d.guidance_token && (d.negative_prompt != null || $("img-neg").value.trim())) steps *= 2;
   // as the server's ImageGen.estimate_s: the size measured nearest, a step's time scaled (size_exp above it)
   const mp = w * h / 1e6;
   const [near, stepS, restS] = pts.reduce((a, p) => Math.abs(Math.log(mp / p[0])) < Math.abs(Math.log(mp / a[0])) ? p : a);
@@ -1379,7 +1388,8 @@ function imgNegHint() {
   const g = $("img-cfg").value !== "" ? Number($("img-cfg").value) : (d.guidance || 1);
   const neg = $("img-neg").value.trim() !== "";
   let msg = "";
-  if (neg && g <= 1) msg = "The negative prompt is used only with guidance above 1.";
+  if (d.guidance_token) msg = "";   // no negative prompt: the field is hidden
+  else if (neg && g <= 1) msg = "The negative prompt is used only with guidance above 1.";
   else if (!neg && g > 1 && d.negative_prompt == null) msg = "This image model guides only with a negative prompt.";
   $("img-neg-hint").textContent = msg;
   $("img-neg-hint").hidden = !msg;
@@ -1508,7 +1518,8 @@ $("img-form").onsubmit = async (ev) => {
       img.src = `data:image/${j.output_format || "png"};base64,` + d.b64_json;
       img.alt = prompt;
       const cap = document.createElement("figcaption");
-      const made = j.strata && j.strata.made_size ? ` (made at ${j.strata.made_size}, middle cut out)` : "";
+      const made = j.strata && j.strata.made_size ? ` (made at ${j.strata.made_size}, middle cut out)`
+        : j.strata && j.strata.requested_size ? ` (${j.strata.requested_size} asked: the model's nearest size)` : "";
       const by = $("img-model-f").hidden ? "" : `${j.model}, `;
       cap.textContent = `${by}${j.size}${made}, seed ${d.seed}, ${((performance.now() - t0) / 1000).toFixed(0)} s: ${prompt}`;
       fig.append(img, cap);
@@ -1517,6 +1528,8 @@ $("img-form").onsubmit = async (ev) => {
     $("img-hint").textContent = "Done. Right-click an image to save it.";
     if (j.strata && j.strata.made_size)
       toast("info", `Made at ${j.strata.made_size}`, `The image model needs sides that are multiples of 16: the middle ${j.size} was cut out.`, 8000);
+    else if (j.strata && j.strata.requested_size)
+      toast("info", `Made at ${j.size}`, `This image model makes a fixed set of sizes: ${j.size} is the one whose shape is nearest the ${j.strata.requested_size} asked for.`, 8000);
   } catch (e) {
     $("img-hint").textContent = "";
     toast("error", "No image", String(e.message || e), 8000);
