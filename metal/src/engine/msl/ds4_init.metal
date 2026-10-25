@@ -1776,6 +1776,52 @@ DS4_SPARSE_PACKED_SIG(ds4_sparse_attn_g1) DS4_SPARSE_PACKED_BODY(1)
 #undef DS4_SPARSE_PACKED_SIG
 #undef DS4_SPARSE_PACKED_BODY
 
+#ifndef DS4_MX_PLO
+#define DS4_MX_PLO 1   // 1: the softmax weights as BF16 high + low (rms error vs the scalar kernel 2e-6 instead of 3e-4)
+#endif
+struct Ds4AttnRaw { uint4 v[4]; int kind; };   // a thread's 32 values of one row, as read: kind 0 window (v[0..3] BF16), 1 compressed (v[0] codes, v[1].x the two scale bytes), 2 none
+
+static inline void ds4_attn_ld(device const ushort* wbase, device const uchar* ckv, device const int* sl, int n_win, int t0, int n,
+                               int sr, int pt, thread Ds4AttnRaw& r) {
+    r.kind = 2;
+    if (sr >= n) return;
+    const int jj = t0 + sr;
+    if (jj < n_win) {
+        const device uint4* src = (const device uint4*) (wbase + (size_t) jj * 512u + (size_t) pt * 32u);
+        r.v[0] = src[0]; r.v[1] = src[1]; r.v[2] = src[2]; r.v[3] = src[3];
+        r.kind = 0;
+    } else {
+        const device uchar* rr = ckv + (size_t) sl[jj - n_win] * 288u;
+        r.v[0] = *(const device uint4*) (rr + (size_t) pt * 16u);
+        r.v[1] = uint4(uint(rr[256u + uint(pt) * 2u]), uint(rr[256u + uint(pt) * 2u + 1u]), 0u, 0u);
+        r.kind = 1;
+    }
+}
+
+static inline void ds4_attn_st(thread const Ds4AttnRaw& r, int sr, int pt, threadgroup uint4* tile4) {
+    threadgroup uint4* dst = tile4 + (size_t) sr * 64u + (size_t) pt * 4u;
+    if (r.kind == 0) {
+        dst[0] = r.v[0]; dst[1] = r.v[1]; dst[2] = r.v[2]; dst[3] = r.v[3];
+    } else if (r.kind == 1) {
+        const float k0 = ds4_e4m3(r.v[1].x) * 16384.0f;
+        const float k1 = ds4_e4m3(r.v[1].y) * 16384.0f;
+        const uint wv[4] = {r.v[0].x, r.v[0].y, r.v[0].z, r.v[0].w};
+        uint o[16];
+        for (uint k = 0; k < 16u; ++k) {
+            const uint b = wv[k >> 2] >> (8u * (k & 3u));
+            const float ks = k < 8u ? k0 : k1;
+            const float lo = ds4_e2m1_val14(b) * ks, hi = ds4_e2m1_val14(b >> 4) * ks;
+            o[k] = (as_type<uint>(lo) >> 16) | (as_type<uint>(hi) & 0xffff0000u);
+        }
+        dst[0] = uint4(o[0], o[1], o[2], o[3]);
+        dst[1] = uint4(o[4], o[5], o[6], o[7]);
+        dst[2] = uint4(o[8], o[9], o[10], o[11]);
+        dst[3] = uint4(o[12], o[13], o[14], o[15]);
+    } else {
+        dst[0] = uint4(0); dst[1] = uint4(0); dst[2] = uint4(0); dst[3] = uint4(0);
+    }
+}
+
 // ---------------------------------------------------------------- sparse attention on the matrix units (G = 8 heads a threadgroup)
 //
 // The same attention as ds4_sparse_attn_g8 (a token, eight heads, the window rows plus the selected compressed rows, softmax with the head's
@@ -1821,17 +1867,14 @@ kernel void ds4_sparse_attn_mx(device const float* q [[buffer(0)]], device const
     const int sr = int(tid) >> 4, pt = int(tid) & 15;
     const int total = n_win + n_sel;
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    Ds4AttnRaw raw;
+    raw.kind = 2;
+    if (sr < 8) ds4_attn_ld(wbase, ckv, sl, n_win, 0, min(8, total), sr, pt, raw);
     for (int t0 = 0; t0 < total; t0 += 8) {
         const int n = min(8, total - t0);
-        if (sr < 8) {
-            if (sr < n) {
-                ds4_attn_stage(wbase, ckv, sl, n_win, t0, 0, n, sr, pt, tile4);
-            } else {
-                threadgroup uint4* dst = tile4 + (size_t) sr * 64u + (size_t) pt * 4u;
-                dst[0] = uint4(0); dst[1] = uint4(0); dst[2] = uint4(0); dst[3] = uint4(0);
-            }
-        }
+        if (sr < 8) ds4_attn_st(raw, sr, pt, tile4);
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sr < 8) ds4_attn_ld(wbase, ckv, sl, n_win, t0 + 8, min(8, total - t0 - 8), sr, pt, raw);   // the next pass's rows, in flight during this one
         {   // S = q . K^T over this simdgroup's eighth of the 512 values
             simdgroup_float8x8 acc = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
             for (int kb = int(sg) * 8; kb < int(sg) * 8 + 8; ++kb) {
@@ -1886,7 +1929,9 @@ kernel void ds4_sparse_attn_mx(device const float* q [[buffer(0)]], device const
                 simdgroup_bfloat8x8 v;
                 simdgroup_load(v, kt, 512, ulong2(ulong(sg) * 64ul + ulong(c) * 8ul, 0ul));
                 simdgroup_multiply_accumulate(tmp, ph, v, tmp);
+#if DS4_MX_PLO
                 simdgroup_multiply_accumulate(tmp, pl, v, tmp);
+#endif
                 O[c] = tmp;
             }
         }

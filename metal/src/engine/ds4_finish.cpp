@@ -1151,7 +1151,7 @@ bool sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
     if (heads % 8 != 0) G = heads % 4 == 0 ? 4 : (heads % 2 == 0 ? 2 : 1);
     while (G > 1 && (heads / G) * T < 64) G /= 2;   // keep enough threadgroups on the GPU (CUDA's 2 * SMs, in effect)
 
-    static const int attn_mode = std::getenv("DS4_ATTN_MX") ? std::atoi(std::getenv("DS4_ATTN_MX")) : 0;   // 1: matrix-unit kernel; 2: both, compare
+    static const int attn_mode = std::getenv("DS4_ATTN_MX") ? std::atoi(std::getenv("DS4_ATTN_MX")) : 1;   // 1 (default): matrix-unit kernel; 0: the scalar one; 2: both, compare
     const bool use_mx = ckv_fmt == 2 && G == 8 && attn_mode != 0;
     const char* fn = use_mx ? "ds4_sparse_attn_mx" : ckv_fmt == 2 ? (G == 8 ? "ds4_sparse_attn_g8" : G == 4 ? "ds4_sparse_attn_g4"
                                             : G == 2 ? "ds4_sparse_attn_g2" : "ds4_sparse_attn_g1")
