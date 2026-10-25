@@ -43,6 +43,7 @@
 #include "strata/kernels/rope_scaling.hpp"
 #include "strata/kernels/router_top10.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/kernels/draft_head.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/platform/memory.hpp"
@@ -741,6 +742,7 @@ bool PlainModel::load_qwen(std::string& err) {
         return false;
     }
     if (!strata::gpu::stream_sync(cs_)) { err = "plain model: the uploads failed"; return false; }
+    setup_int2();   // before the expert tier takes what VRAM is left
     if (!open_experts(err)) return false;
     exec_.assign((size_t) opt_.max_t + 1, nullptr);
     segs_.assign((size_t) opt_.max_t + 1, {});
@@ -1810,18 +1812,65 @@ bool PlainModel::record_mtp(int T, strata::gpu::Stream cs, std::string& err) {
     // the last row only: its norm is the next step's trunk row, and its logits pick the draft
     k::native_qsa_rms_norm_weighted(x_ + (size_t) (T - 1) * N, mtp_head_norm_, hn_, (int) N, 1, eps, cs);
     k::copy_from_mapped(mtp_h_, hn_, N, cs);
-    if (dhead_ != nullptr) {   // the subset's rows: logits_[i] is token dvocab_[i]'s
-        if (head_.type == kBF16) {
-            k::bf16_gemv_fp32_mmvf_multi(hn_, head_.n_in, static_cast<const uint16_t*>(dhead_), logits_,
-                                         (int) n_dvocab_, head_.n_in, (int) n_dvocab_, 1, cs);
-        } else {
-            k::native_quantize_q8_1(hn_, xq_, head_.n_in, 1, cs);
-            k::native_mmvq(head_.type, dhead_, xq_, logits_, head_.n_in, (int) n_dvocab_, 1, cs);
-        }
-    } else {
-        head_logits(hn_, 1, cs);
-    }
+    draft_logits(cs);
     return true;
+}
+
+void PlainModel::draft_logits(strata::gpu::Stream cs) {
+    const int n_in = head_.n_in;
+    // the head's own product of n rows in its form (the subset's, the whole head's, or int2_'s candidates)
+    auto exact = [this, n_in](const void* rows, int n, float* y, void* s) {
+        if (head_.type == kBF16) {
+            k::bf16_gemv_fp32_mmvf_multi(hn_, n_in, static_cast<const uint16_t*>(rows), y, n, n_in, n, 1, s);
+        } else {
+            k::native_mmvq(head_.type, rows, xq_, y, n_in, n, 1, s);
+        }
+    };
+    const void* rows = dhead_ != nullptr ? dhead_ : head_.data;   // the subset's rows: logits_[i] is token dvocab_[i]'s
+    const int n = (int) (dhead_ != nullptr ? n_dvocab_ : head_.n_out);
+    if (head_.type != kBF16) k::native_quantize_q8_1(hn_, xq_, n_in, 1, cs);
+    if (int2_ != nullptr)
+        int2_->logits(hn_, static_cast<const uint8_t*>(rows),
+                      [&](const uint8_t* r, int m, float* y, void* s) { exact(r, m, y, s); }, logits_, cs);
+    else
+        exact(rows, n, logits_, cs);
+}
+
+void PlainModel::setup_int2() {
+    const char* v = std::getenv("STRATA_DRAFT_INT2");
+    if (!has_mtp_ || n_snap_ < 1 || head_.n_in % k::kInt2Group != 0 ||
+        (v != nullptr && v[0] != 0 && std::strtol(v, nullptr, 10) == 0))
+        return;
+    size_t at = 0;
+    const TensorInfo* t = model_->find("output.weight", &at);
+    if (t == nullptr) return;
+    const auto* src = static_cast<const uint8_t*>(model_->shard(at).tensor_data(*t));
+    const int type = (int) t->type;
+    const size_t file_row = type == kBF16 ? (size_t) head_.n_in * 2 : k::cpu::native_row_bytes(type, head_.n_in);
+    // the head's rows on the GPU keep their GGUF size in the engine's layouts (upload)
+    const size_t row = head_.type == kBF16 ? (size_t) head_.n_in * 2 : file_row;
+    const int64_t n = dhead_ != nullptr ? n_dvocab_ : head_.n_out;
+    auto h = std::make_unique<DraftHeadInt2>();
+    std::string e;
+    if (file_row == 0 || !h->build(type, n, head_.n_in, [&](int64_t i) {
+            return src + (size_t) (dhead_ != nullptr ? dvocab_[(size_t) i] : i) * file_row;
+        }, row, e)) {
+        std::fprintf(stderr, "strata plain: the drafts' head stays as it is (%s)\n", e.c_str());
+        return;
+    }
+    const void* rows = dhead_ != nullptr ? dhead_ : head_.data;
+    const int n_in = head_.n_in;
+    auto exact = [this, n_in](const uint8_t* r, int m, float* y, void* s) {
+        if (head_.type == kBF16) k::bf16_gemv_fp32_mmvf_multi(hn_, n_in, reinterpret_cast<const uint16_t*>(r), y, m, n_in, m, 1, s);
+        else k::native_mmvq(head_.type, r, xq_, y, n_in, m, 1, s);
+    };
+    strata::gpu::Stream s = strata::gpu::stream_create();
+    const bool on = s != nullptr &&
+                    h->choose(hn_, static_cast<const uint8_t*>(rows), exact,
+                              [&](float* out, void* st) { exact(static_cast<const uint8_t*>(rows), (int) n, out, st); },
+                              logits_, s, "strata plain");
+    if (s != nullptr) strata::gpu::stream_destroy(s);
+    if (on) int2_ = std::move(h);
 }
 
 // The graph of a window of T rows, the trunk's or (`mtp`) the MTP layer's, recorded once.

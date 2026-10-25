@@ -750,6 +750,15 @@ When the start stops with "the draft head does not fit", the engine says how muc
 and the server's start error repeats it.
 setup suggests `--draft-vocab en` on cards under 14 GB; it is only a suggestion, nothing changes unless you pass it.
 
+The draft head's product is timed both ways on the GPU at start, and the faster one is taken:
+the head as it is, or a copy of its rows packed to 2 bits (a minimum and a step for each 128 values) that scores them all roughly,
+the best 16 of them computed again from the head itself.
+Either way only the drafts change, never the answer (the model's own head checks the drafts).
+The 2-bit copy takes about 80 MiB (a token subset) to 180 MiB (every token) of VRAM.
+On the B70 a draft step's head for Qwen3.8-Flash-Next went from 556 to 292 microseconds, a round's drafting about 0.9 ms shorter.
+The MTP layers of the other models (GLM-5.3-Flash, Ornith-1.5, Qwen3.6-35B-A3B) do the same.
+`STRATA_DRAFT_INT2=0` keeps the head as it is, `1` takes the 2-bit copy without timing.
+
 The server also runs without `--mtp` (upstream 3216d271).
 The drafts then come from the suffix and prompt lookup only (one token a round when neither fires), and every token is still verified against the model.
 The draft layer's VRAM (about 0.7-1 GiB with its head) goes to the expert cache: 1,000 to 1,678 slots in upstream's comparison on an 8 GB card.

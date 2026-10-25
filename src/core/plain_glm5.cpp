@@ -368,6 +368,7 @@ bool PlainModel::load_glm5(std::string& err) {
     }
     xq_ = g_xq_;   // the head's q8_1 rows (head_logits)
     if (!strata::gpu::stream_sync(cs_)) { err = "plain model: the uploads failed"; return false; }
+    setup_int2();   // before the expert tier takes what VRAM is left
     if (!open_experts(err)) return false;
     exec_.assign((size_t) opt_.max_t + 1, nullptr);
     segs_.assign((size_t) opt_.max_t + 1, {});
@@ -583,7 +584,7 @@ bool PlainModel::record_mtp_glm5(int T, strata::gpu::Stream cs, std::string& err
     // the last row only: its norm is the next step's trunk row, and its logits pick the draft
     k::native_qsa_rms_norm_weighted(x_ + (size_t) (T - 1) * N, mtp_head_norm_, hn_, (int) N, 1, eps, cs);
     k::copy_from_mapped(mtp_h_, hn_, N, cs);
-    head_logits(hn_, 1, cs);
+    draft_logits(cs);
     return true;
 }
 

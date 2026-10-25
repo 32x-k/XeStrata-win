@@ -29,6 +29,7 @@
 #pragma once
 
 #include "strata/artifact/model_spec.hpp"
+#include "strata/core/draft_head.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/gpu.hpp"
@@ -302,6 +303,11 @@ private:
     bool record_window(int T, strata::gpu::Stream cs, std::string& err);
     /// The head over T normed rows `x` into logits_.
     void head_logits(const float* x, int T, strata::gpu::Stream cs);
+    /// The MTP layer's head for its last row (hn_ into logits_): the drafts' token subset or the whole head, at 2 bits
+    /// where that measured faster on this device (int2_).
+    void draft_logits(strata::gpu::Stream cs);
+    /// int2_ from the model file's head rows, kept where it measures faster (a failure keeps the head as it is).
+    void setup_int2();
     /// One block over the window's T rows of x_ (MoE layer `ml` of the tiers, ring `ring` + 1): a segmented window's
     /// graphs go into `segs`.
     bool record_block(const Block& b, int64_t ml, int T, uint32_t& ring, std::vector<strata::gpu::Graph*>& segs,
@@ -563,6 +569,7 @@ private:
     float* mtp_h_ = nullptr;
     // the drafts' head over opt_.draft_vocab's subset (null: the whole head); a draft's pick is its index there
     void* dhead_ = nullptr;
+    std::unique_ptr<DraftHeadInt2> int2_;   ///< the drafts' head at 2 bits (null: as it is)
     int64_t n_dvocab_ = 0;
     std::vector<int32_t> dvocab_;
     bool mtp_h_set_ = false;   ///< prompt() left the trunk's last row in mtp_h_ (else forward's last row in hn_)
