@@ -11,8 +11,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
-#include <limits>
-#include <numeric>
 #include <stdexcept>
 #include <vector>
 
@@ -76,8 +74,9 @@ uint64_t hunyuanimage3_scratch_bytes(int64_t T, const HunyuanImage3Dims& d) {
     f32(2 * T * d.hidden);                    // xn32, xn232 (the norms, FP32 up to the rotation)
     f32(T * (d.head_dim / 2));                // ang
     f32(rows * d.heads * d.head_dim);         // attn_scratch: the plain attention's FP32 output
-    f32(T * d.topk);                          // d_w
-    b += (uint64_t) std::max<int64_t>(T * d.topk, 1) * sizeof(int32_t);   // d_rows
+    f32(2 * T * d.topk);                      // d_w, d_tw
+    b += (uint64_t) std::max<int64_t>(2 * T * d.topk, 1) * sizeof(int32_t);   // d_rows, d_idx
+    b += (uint64_t) (d.experts + 1) * sizeof(int32_t);                     // d_bounds
     return b;
 }
 
@@ -117,6 +116,9 @@ bool hunyuanimage3_scratch_alloc(int64_t T, const HunyuanImage3Dims& d, HunyuanI
         sc.attn_scratch = take_as<float>(owned, hdots, "attn_scratch");
         sc.d_rows = take_as<int32_t>(owned, T * d.topk, "d_rows");
         sc.d_w = take_as<float>(owned, T * d.topk, "d_w");
+        sc.d_tw = take_as<float>(owned, T * d.topk, "d_tw");
+        sc.d_idx = take_as<int32_t>(owned, T * d.topk, "d_idx");
+        sc.d_bounds = take_as<int32_t>(owned, d.experts + 1, "d_bounds");
         return true;
     } catch (const std::exception& e) {
         for (size_t i = owned.size(); i-- > 0;) gpu::free(owned[i]);
@@ -129,7 +131,7 @@ bool hunyuanimage3_scratch_alloc(int64_t T, const HunyuanImage3Dims& d, HunyuanI
 void hunyuanimage3_scratch_free(HunyuanImage3Scratch& sc) {
     const void* ps[] = {sc.xr16, sc.ar16, sc.xr216, sc.a16, sc.gx16, sc.q16, sc.k16, sc.v16, sc.act16, sc.gact16,
                         sc.egu16, sc.edn16, sc.qkv32, sc.o32, sc.gu32, sc.eg32, sc.ed32, sc.logits, sc.ang,
-                        sc.attn_scratch, sc.d_rows, sc.d_w, sc.xn32, sc.xn232};
+                        sc.attn_scratch, sc.d_rows, sc.d_w, sc.xn32, sc.xn232, sc.d_tw, sc.d_idx, sc.d_bounds};
     for (const void* p : ps)
         if (p != nullptr) gpu::free(p);
     sc = HunyuanImage3Scratch{};
@@ -193,59 +195,16 @@ bool hunyuanimage3_layer_run(const HunyuanImage3LayerWeights& w, HunyuanImage3Ex
         // The router on the same FP32 norm (the gate runs float32 in the reference, and which experts a token
         // takes is a discrete choice no later rounding can undo).
         hunyuanimage3_router_logits(sc.xn232, w.wg, T, d.hidden, d.experts, sc.logits, stream);
+        // softmax, the top `topk`, renormalized over them (norm_topk_prob), and the rows grouped by expert, on the
+        // device: only the experts' bounds come back, for the products' sizes
+        hunyuanimage3_router_topk(sc.logits, T, d.experts, d.topk, sc.d_idx, sc.d_tw, stream);
+        hunyuanimage3_route_lists(sc.d_idx, sc.d_tw, T, d.topk, d.experts, sc.d_bounds, sc.d_rows, sc.d_w, stream);
         gpu::device_sync();
-
-        // softmax (FP32, as the reference casts it), the top `topk` of the experts, renormalized over them
-        // (norm_topk_prob), then one contiguous row list and weight list an expert takes
-        std::vector<float> hl((size_t) T * d.experts);
-        down(hl.data(), sc.logits, (size_t) T * d.experts * sizeof(float));
-        std::vector<int32_t> h_idx((size_t) T * d.topk);
-        std::vector<float> h_w((size_t) T * d.topk), h_p((size_t) d.experts);
-        std::vector<int64_t> count((size_t) d.experts, 0);
-        for (int64_t t = 0; t < T; ++t) {
-            const float* lg = hl.data() + (size_t) t * d.experts;
-            float best = -std::numeric_limits<float>::infinity();
-            for (int64_t e = 0; e < d.experts; ++e) best = std::max(best, lg[e]);
-            double den = 0;
-            for (int64_t e = 0; e < d.experts; ++e) {
-                h_p[(size_t) e] = (float) std::exp((double) lg[e] - (double) best);
-                den += h_p[(size_t) e];
-            }
-            for (int64_t e = 0; e < d.experts; ++e) h_p[(size_t) e] /= (float) den;
-            std::vector<int32_t> order((size_t) d.experts);
-            std::iota(order.begin(), order.end(), 0);
-            std::partial_sort(order.begin(), order.begin() + d.topk, order.end(), [&](int32_t a, int32_t b) {
-                return h_p[(size_t) a] > h_p[(size_t) b];
-            });
-            float sum = 0;
-            for (int64_t j = 0; j < d.topk; ++j) {
-                h_idx[(size_t) t * d.topk + j] = order[(size_t) j];
-                h_w[(size_t) t * d.topk + j] = h_p[(size_t) order[(size_t) j]];
-                sum += h_w[(size_t) t * d.topk + j];
-            }
-            sum = std::max(sum, 1e-8f);
-            for (int64_t j = 0; j < d.topk; ++j) {
-                h_w[(size_t) t * d.topk + j] /= sum;
-                ++count[(size_t) h_idx[(size_t) t * d.topk + j]];
-            }
-        }
-        std::vector<int32_t> flat((size_t) T * d.topk);
-        std::vector<float> wflat((size_t) T * d.topk);
-        std::vector<int64_t> begin((size_t) d.experts + 1, 0);
-        for (int64_t e = 0; e < d.experts; ++e) begin[(size_t) e + 1] = begin[(size_t) e] + count[(size_t) e];
-        std::vector<int64_t> at = begin;
-        for (int64_t t = 0; t < T; ++t)
-            for (int64_t j = 0; j < d.topk; ++j) {
-                const int64_t e = h_idx[(size_t) t * d.topk + j];
-                const int64_t k = at[(size_t) e]++;
-                flat[(size_t) k] = (int32_t) t;
-                wflat[(size_t) k] = h_w[(size_t) t * d.topk + j];
-            }
-        up(sc.d_rows, flat.data(), (size_t) T * d.topk * sizeof(int32_t));
-        up(sc.d_w, wflat.data(), (size_t) T * d.topk * sizeof(float));
+        std::vector<int32_t> begin((size_t) d.experts + 1);
+        down(begin.data(), sc.d_bounds, begin.size() * sizeof(int32_t));
 
         for (int64_t e = 0; e < d.experts; ++e) {
-            const int64_t cnt = count[(size_t) e];
+            const int64_t cnt = begin[(size_t) e + 1] - begin[(size_t) e];
             if (cnt == 0) continue;
             if (!experts.fill(e, sc.egu16, sc.edn16, err)) return false;
             hunyuanimage3_gather16(sc.xr216, sc.d_rows + begin[(size_t) e], cnt, d.hidden, sc.gx16, stream);

@@ -35,6 +35,11 @@ constexpr int64_t kGnGroups = 32;      // every GroupNorm here: nn.GroupNorm(32,
 constexpr int64_t kGnChunk = 256;      // positions a chunk
 constexpr int64_t kGnMaxChunk = 256;   // chunks a reducer's work-group
 
+// The router: its dot products in partial sums of this many terms (FP32 throughout, the reference's own type, and
+// no FP64, which not every GPU has), and the most experts a token takes.
+constexpr int64_t kRouterChunk = 64;
+constexpr int64_t kRouterMaxTopk = 32;
+
 void finish(void* stream, const sycl::event& e, const char* what) {
     if (!stream) core::Runtime::get().wait(e, what);
 }
@@ -82,6 +87,8 @@ using hunyuanimage3_detail::hadamard256;
 using hunyuanimage3_detail::kGnChunk;
 using hunyuanimage3_detail::kGnGroups;
 using hunyuanimage3_detail::kGnMaxChunk;
+using hunyuanimage3_detail::kRouterChunk;
+using hunyuanimage3_detail::kRouterMaxTopk;
 using hunyuanimage3_detail::queue_for;
 
 void hunyuanimage3_rms_norm16(const float* x, const float* w, int64_t rows, int64_t C, float eps, uint16_t* y16,
@@ -340,11 +347,78 @@ void hunyuanimage3_router_logits(const float* x32, const float* w, int64_t T, in
     const auto e = queue_for(stream).parallel_for(
         sycl::range<2>((size_t) T, (size_t) E), [=](sycl::id<2> i) {
             const int64_t t = (int64_t) i[0], ex = (int64_t) i[1];
-            double sum = 0.0;   // the reference's fp32 accumulation, kept exact in double here
-            for (int64_t c = 0; c < C; ++c) sum += (double) x32[t * C + c] * (double) w[ex * C + c];
-            logits[t * E + ex] = (float) sum;
+            const float* xr = x32 + t * C;
+            const float* wr = w + ex * C;
+            float sum = 0.f;
+            for (int64_t c0 = 0; c0 < C; c0 += kRouterChunk) {
+                float part = 0.f;
+                const int64_t c1 = c0 + kRouterChunk < C ? c0 + kRouterChunk : C;
+                for (int64_t c = c0; c < c1; ++c) part += xr[c] * wr[c];
+                sum += part;
+            }
+            logits[t * E + ex] = sum;
         });
     finish(stream, e, "hunyuanimage3_router_logits");
+}
+
+void hunyuanimage3_router_topk(const float* logits, int64_t T, int64_t E, int64_t K, int32_t* idx, float* wt,
+                               void* stream) {
+    if (T <= 0) return;
+    if (K <= 0 || K > kRouterMaxTopk || K > E)
+        throw std::runtime_error("hunyuanimage3_router_topk: " + std::to_string(K) + " of " + std::to_string(E) +
+                                 " experts");
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) T), [=](sycl::id<1> id) {
+        const int64_t t = (int64_t) id[0];
+        const float* lg = logits + t * E;
+        int32_t pick[kRouterMaxTopk];
+        for (int64_t j = 0; j < K; ++j) {
+            int32_t best = -1;
+            for (int64_t ex = 0; ex < E; ++ex) {
+                bool taken = false;
+                for (int64_t i = 0; i < j; ++i) taken = taken || pick[i] == (int32_t) ex;
+                if (!taken && (best < 0 || lg[ex] > lg[best])) best = (int32_t) ex;   // the lower expert on a tie
+            }
+            pick[j] = best;
+        }
+        // softmax over the K picked (norm_topk_prob: the full softmax's denominator cancels), from the largest
+        const float m = lg[pick[0]];
+        float s = 0.f;
+        for (int64_t j = 0; j < K; ++j) s += sycl::exp(lg[pick[j]] - m);
+        for (int64_t j = 0; j < K; ++j) {
+            idx[t * K + j] = pick[j];
+            wt[t * K + j] = sycl::exp(lg[pick[j]] - m) / s;
+        }
+    });
+    finish(stream, e, "hunyuanimage3_router_topk");
+}
+
+void hunyuanimage3_route_lists(const int32_t* idx, const float* wt, int64_t T, int64_t K, int64_t E, int32_t* bounds,
+                               int32_t* rows, float* w, void* stream) {
+    if (T <= 0) return;
+    sycl::queue& q = queue_for(stream);
+    const int64_t n = T * K;
+    // an expert a work-item: its count, then (after the prefix) its rows in token order
+    q.parallel_for(sycl::range<1>((size_t) E), [=](sycl::id<1> id) {
+        const int32_t ex = (int32_t) id[0];
+        int32_t c = 0;
+        for (int64_t i = 0; i < n; ++i) c += idx[i] == ex ? 1 : 0;
+        bounds[ex + 1] = c;
+    });
+    q.single_task([=]() {
+        bounds[0] = 0;
+        for (int64_t ex = 0; ex < E; ++ex) bounds[ex + 1] += bounds[ex];
+    });
+    const auto e = q.parallel_for(sycl::range<1>((size_t) E), [=](sycl::id<1> id) {
+        const int32_t ex = (int32_t) id[0];
+        int32_t at = bounds[ex];
+        for (int64_t i = 0; i < n; ++i)
+            if (idx[i] == ex) {
+                rows[at] = (int32_t) (i / K);
+                w[at] = wt[i];
+                ++at;
+            }
+    });
+    finish(stream, e, "hunyuanimage3_route_lists");
 }
 
 void hunyuanimage3_grid_in16(const float* x, int64_t C, int64_t P, uint16_t* out16, void* stream, uint16_t* lo16) {
