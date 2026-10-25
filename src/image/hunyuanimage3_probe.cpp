@@ -1624,6 +1624,60 @@ int pipeline_cmd(const std::string& dit_file, const std::string& vae_file, const
 // patch_embed at t = 0 on the golden's latent (-> cond_vae_rows.npy) and timestep_emb(0) (-> cond_timestep_row.npy);
 // and, with IMAGE, the engine's own copies of the picture against the golden's two (the reference's PIL resizes).
 //   refs DITFILE VAEFILE VISIONFILE GOLDEN_DIR [IMAGE]
+// The VAE's tiled decode (the reference's spatial tiling) against the whole: IMAGE cut to W x H as an edit's
+// reference is, encoded, and its latent decoded whole and in tiles
+int tiles_cmd(const std::string& vae_file, const std::string& image, int64_t W, int64_t H) {
+    std::string err;
+    si::QiRef f;
+    f.rgba = si::load_rgba8(image, f.width, f.height, err);
+    if (f.rgba.empty()) {
+        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", err.c_str());
+        return 1;
+    }
+    void* stream = strata::core::Runtime::get().create_stream();
+    si::HunyuanImage3Vae vae;
+    if (!vae.open(vae_file, stream, err, false, true)) {
+        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: VAE: %s\n", err.c_str());
+        return 1;
+    }
+    const int64_t h = H / 16, w = W / 16, n = 32 * h * w;
+    const std::vector<float> img = si::hunyuanimage3_vae_copy(f, W, H);
+    float *d_img = nullptr, *d_z = nullptr, *d_rgb = nullptr;
+    if (!strata::gpu::alloc_device(&d_img, img.size() * 4) || !strata::gpu::alloc_device(&d_z, (size_t) n * 4) ||
+        !strata::gpu::alloc_device(&d_rgb, img.size() * 4)) {
+        std::fprintf(stderr, "strata-image-hunyuanimage3-probe: GPU memory\n");
+        return 1;
+    }
+    strata::gpu::copy(d_img, img.data(), img.size() * 4);
+    vae.encode(d_img, H, W, d_z);
+    std::vector<float> zw((size_t) n);
+    strata::gpu::copy(zw.data(), d_z, zw.size() * 4);
+    vae.drop_scratch();
+    auto report = [](const char* what, const std::vector<float>& a, const std::vector<float>& b) {
+        double d2 = 0, n2 = 0, dot = 0, na = 0, mx = 0;
+        for (size_t i = 0; i < a.size(); ++i) {
+            const double e = (double) a[i] - b[i];
+            d2 += e * e, n2 += (double) b[i] * b[i], dot += (double) a[i] * b[i], na += (double) a[i] * a[i];
+            mx = std::max(mx, std::fabs(e));
+        }
+        std::printf("  %-28s rel %.3e  cos %.8f  max|d| %.3e\n", what, std::sqrt(d2 / n2), dot / std::sqrt(na * n2), mx);
+    };
+    std::printf("tiles: %lld x %lld (latent %lld x %lld)\n", (long long) W, (long long) H, (long long) w, (long long) h);
+    std::vector<float> rw(img.size()), rt(img.size());
+    vae.decode(d_z, h, w, d_rgb);
+    strata::gpu::copy(rw.data(), d_rgb, rw.size() * 4);
+    vae.drop_scratch();
+    vae.decode_tiled(d_z, h, w, d_rgb);
+    strata::gpu::copy(rt.data(), d_rgb, rt.size() * 4);
+    vae.drop_scratch();
+    report("decode tiled vs whole", rt, rw);
+    report("decode whole vs the image", rw, img);
+    strata::gpu::free(d_img);
+    strata::gpu::free(d_z);
+    strata::gpu::free(d_rgb);
+    return 0;
+}
+
 int refs_cmd(const std::string& dit_file, const std::string& vae_file, const std::string& vision_file,
              const std::string& golden, const std::string& image) {
     auto npy = [&](const char* name, Npy& out) {
@@ -2384,6 +2438,8 @@ int main(int argc, char** argv) {
                                 argc > 8 ? number(argv[8]) : 8, argc > 9 ? number(argv[9]) : 0,
                                 argc > 10 ? number(argv[10]) : 0, argc > 11 ? argv[11] : std::string(),
                                 argc > 12 ? argv[12] : std::string(), argc > 13 ? argv[13] : std::string());
+        if (argc >= 4 && std::strcmp(argv[1], "tiles") == 0)
+            return tiles_cmd(argv[2], argv[3], argc > 4 ? number(argv[4]) : 1024, argc > 5 ? number(argv[5]) : 1024);
         if (argc >= 6 && std::strcmp(argv[1], "refs") == 0)
             return refs_cmd(argv[2], argv[3], argv[4], argv[5], argc > 6 ? argv[6] : std::string());
         if (argc >= 3 && std::strcmp(argv[1], "vae") == 0)
@@ -2418,6 +2474,7 @@ int main(int argc, char** argv) {
                  "       %s walk QFILE GOLDEN_DIR IDFILE [LAYERS] [BANK_MIB] [OUT.bin]  (the decoder vs the golden)\n"
                  "       %s sample QFILE GOLDEN_DIR IDFILE [STEPS] [LAYERS] [BANK_MIB] [FINAL.bin]"
                  "  (the whole sampler vs the golden)\n"
+                 "       %s tiles VAEFILE IMAGE [W] [H]  (the VAE's tiled decode against the whole)\n"
                  "       %s refs DITFILE VAEFILE VISIONFILE GOLDEN_DIR [IMAGE]  (an edit's reference image's pieces "
                  "vs the edit golden)\n"
                  "       %s vae VAEFILE LATENT[.npy|.bin] [GOLDEN.npy [OUT.bin [PRESCALED [GOLDEN_RAW]]]]"
@@ -2435,7 +2492,8 @@ int main(int argc, char** argv) {
                  "       %s mem                         (the GPU's free and total VRAM, and the cap below it)\n"
                  "       %s sigmas [STEPS] [SHIFT]\n",
                      argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0],
-                     argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
+                     argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0],
+                     argv[0]);
         return 2;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "strata-image-hunyuanimage3-probe: %s\n", e.what());
