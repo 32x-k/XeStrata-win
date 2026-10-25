@@ -22,6 +22,7 @@
 //   * all 512 routed experts live in VRAM (708 MB) and run through the grouped hit kernels.
 #pragma once
 
+#include "strata/core/draft_head.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/kernels/gr.hpp"
@@ -31,6 +32,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -230,6 +232,10 @@ private:
     float *h_prob_ = nullptr, *m_prob_ = nullptr;   // each draft's probability under the draft layer
     // the draft head: the main head's rows for a token subset (rt/draft_vocab.bin), or the whole head
     uint8_t* dhead_ = nullptr;
+    /// The draft head at 2 bits (DraftHeadInt2), where this device drafts faster with it; shared with --batch-mtp's
+    /// drafters as the head itself is.
+    std::shared_ptr<DraftHeadInt2> int2_;
+    void setup_int2();
     int32_t* dvocab_ = nullptr;
     int64_t n_dvocab_ = 0;
     std::string rt_dir_;

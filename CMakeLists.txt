@@ -422,7 +422,7 @@ if(STRATA_ENABLE_XE)
                                    src/core/plain_model.cpp src/core/plain_glm5.cpp src/core/pcie_split.cpp
                                    src/core/mtp.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
                                    src/core/conversation_memory.cpp src/core/conversation_disk.cpp
-                                   src/core/conversation_file.cpp src/core/vmm.cpp)
+                                   src/core/conversation_file.cpp src/core/vmm.cpp src/core/draft_head.cpp)
   target_include_directories(strata_engine PUBLIC include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu)
   # c-blosc2 (libblosc2-dev; free, BSD-3), optional: --conversation-save-compress stores the saved conversations'

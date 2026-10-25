@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/core/mtp.cpp - see include/strata/core/mtp.hpp.
 #include "strata/core/mtp.hpp"
+#include "strata/kernels/draft_head.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/progress.hpp"
@@ -434,6 +435,14 @@ void MtpDrafter::record_top2(int j) {
     top2_[(size_t) j] = b2 < 0 ? -1 : dhead_ != nullptr ? dvocab_host_[(size_t) b2] : (int32_t) b2;
 }
 
+namespace {
+// STRATA_DRAFT_INT2=0: never the draft head at 2 bits (1: always, 0 or 1 skips the measurement)
+bool int2_allowed(int64_t n_embd) {
+    const char* v = std::getenv("STRATA_DRAFT_INT2");
+    return n_embd % strata::kernels::kInt2Group == 0 && (v == nullptr || v[0] == 0 || std::strtol(v, nullptr, 10) != 0);
+}
+}  // namespace
+
 uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const {
     uint64_t bytes = head_logits_ ? 0 : (uint64_t) max_t_ * (uint64_t) n_vocab * sizeof(float);
     if (dhead_ == nullptr && owns_draft_head_ && !full_head_env()) {
@@ -443,6 +452,20 @@ uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const 
             std::fclose(f);
             if (size >= 4 && size % 4 == 0) bytes += (uint64_t) (size / 4) * head_row_bytes + (uint64_t) size;
         }
+    }
+    // the draft head at 2 bits, an upper bound (it is dropped again where it does not measure faster)
+    if (int2_ == nullptr && owns_draft_head_ && !coupled_draft_env() && g_ != nullptr && int2_allowed(g_->n_embd)) {
+        int64_t rows = n_vocab;
+        if (!full_head_env())
+            if (FILE* f = std::fopen((rt_dir_ + "/draft_vocab.bin").c_str(), "rb")) {
+                std::fseek(f, 0, SEEK_END);
+                const long size = std::ftell(f);
+                std::fclose(f);
+                if (size >= 4 && size % 4 == 0) rows = size / 4;
+            }
+        constexpr int kMaxCand = strata::kernels::kTopKMax;
+        bytes += (uint64_t) rows * strata::kernels::int2_row_bytes((int) g_->n_embd) +
+                 (uint64_t) kMaxCand * (8 + head_row_bytes) + strata::kernels::topk_scratch_bytes(rows, kMaxCand);
     }
     // coupled draft sampling (STRATA_SPEC_COUPLED=1 only): an upper bound - the id -> subset map, the penalty ring,
     // the split scratch (64 lists of 64 entries at most) and the parameters
@@ -591,8 +614,42 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
                          (double) (n_dvocab_ * row_bytes) / 1048576.0);
         }
     }
+    if (shared != nullptr) int2_ = shared->int2_;
+    else if (int2_ == nullptr && !coupled_draft_env()) setup_int2();   // coupled sampling reads the whole head's logits
     if (coupled_draft_env() && cparams_ == nullptr && !setup_coupled(err)) return false;
     return true;
+}
+
+// The draft head at 2 bits: its rows (the subset, or the whole head) copied to the host, packed, and kept when this
+// device drafts faster with them.  A failure keeps the head as it is.
+void MtpDrafter::setup_int2() {
+    using namespace strata::kernels;
+    const int64_t N = g_->n_embd;
+    if (!int2_allowed(N)) return;
+    const bool sub = dhead_ != nullptr;
+    const int64_t nv = sub ? n_dvocab_ : n_vocab_;
+    const size_t rb = head_->row_bytes();
+    const auto* rows = (const uint8_t*) (sub ? (const void*) dhead_ : head_->weights());
+    std::vector<uint8_t> host((size_t) nv * rb);
+    std::string e;
+    auto h = std::make_shared<DraftHeadInt2>();
+    if (!strata::gpu::copy(host.data(), rows, host.size()) ||
+        !h->build(head_->type(), nv, (int) N, [&](int64_t i) { return host.data() + (size_t) i * rb; }, rb, e)) {
+        std::fprintf(stderr, "strata mtp: the drafts' head stays as it is (%s)\n", e.empty() ? "copy" : e.c_str());
+        return;
+    }
+    const int type = head_->type();
+    const DraftHeadInt2::Exact exact = [this, type, N](const uint8_t* r, int n, float* y, void* s) {
+        native_mmvq(type, r, xq_, y, (int) N, n, 1, s);
+    };
+    strata::gpu::Stream s = strata::gpu::stream_create();
+    const bool on = s != nullptr &&
+                    h->choose(sample_, rows, exact, [&](float* out, void* st) { native_mmvq(type, rows, xq_, out, (int) N, (int) nv, 1, st); },
+                              head_logits_, s, "strata mtp");
+    if (s != nullptr) strata::gpu::stream_destroy(s);
+    if (!on) return;
+    int2_ = h;
+    vram_ += h->bytes();
 }
 
 // The layer for T rows.  full = false stops after the K/V append (the prompt only needs the cache).
@@ -822,7 +879,16 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
         native_quantize_q8_1(sample_, xq_, (int) N, T, cs);
         const bool sub = dhead_ != nullptr;
         const int64_t nv = sub ? n_dvocab_ : n_vocab_;
-        native_mmvq(head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
+        if (int2_ != nullptr && T == 1) {   // the head at 2 bits, its best rows taken again from the head
+            const int type = head_->type();
+            int2_->logits(sample_, (const uint8_t*) (sub ? (const void*) dhead_ : head_->weights()),
+                          [this, type, N](const uint8_t* r, int n, float* y, void* s) {
+                              native_mmvq(type, r, xq_, y, (int) N, n, 1, s);
+                          },
+                          head_logits_, cs);
+        } else {
+            native_mmvq(head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
+        }
         if (coupled_rec_) {
             // coupled draft sampling: the target's chain and Philox draw for the row that will verify this draft
             // (counter = this cell + 1, from its step record), penalties over the ring; T == 1 (full layer)
