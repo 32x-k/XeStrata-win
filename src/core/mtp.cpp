@@ -146,8 +146,6 @@ MtpDrafter::~MtpDrafter() {
     if (state_arena_) strata::gpu::free(state_arena_);
     if (arena_) strata::gpu::free(arena_);
     if (head_logits_) strata::gpu::free(head_logits_);
-    if (owns_draft_head_ && dhead_) strata::gpu::free(dhead_);
-    if (owns_draft_head_ && dvocab_) strata::gpu::free(dvocab_);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_};
     for (void* h : hosts) if (h) strata::gpu::free(h);
 }
@@ -445,24 +443,12 @@ bool int2_allowed(int64_t n_embd) {
 
 uint64_t MtpDrafter::bind_bytes(uint64_t head_row_bytes, int64_t n_vocab) const {
     uint64_t bytes = head_logits_ ? 0 : (uint64_t) max_t_ * (uint64_t) n_vocab * sizeof(float);
-    if (dhead_ == nullptr && owns_draft_head_ && !full_head_env()) {
-        if (FILE* f = std::fopen((rt_dir_ + "/draft_vocab.bin").c_str(), "rb")) {
-            std::fseek(f, 0, SEEK_END);
-            const long size = std::ftell(f);
-            std::fclose(f);
-            if (size >= 4 && size % 4 == 0) bytes += (uint64_t) (size / 4) * head_row_bytes + (uint64_t) size;
-        }
-    }
+    if (dhead_ == nullptr && owns_draft_head_ && !full_head_env())
+        bytes += (uint64_t) DraftSubset::file_tokens(rt_dir_ + "/draft_vocab.bin") * (head_row_bytes + 4);
     // the draft head at 2 bits, an upper bound (it is dropped again where it does not measure faster)
     if (int2_ == nullptr && owns_draft_head_ && !coupled_draft_env() && g_ != nullptr && int2_allowed(g_->n_embd)) {
-        int64_t rows = n_vocab;
-        if (!full_head_env())
-            if (FILE* f = std::fopen((rt_dir_ + "/draft_vocab.bin").c_str(), "rb")) {
-                std::fseek(f, 0, SEEK_END);
-                const long size = std::ftell(f);
-                std::fclose(f);
-                if (size >= 4 && size % 4 == 0) rows = size / 4;
-            }
+        const int64_t sub = full_head_env() ? 0 : DraftSubset::file_tokens(rt_dir_ + "/draft_vocab.bin");
+        const int64_t rows = sub > 0 ? sub : n_vocab;
         constexpr int kMaxCand = strata::kernels::kTopKMax;
         bytes += (uint64_t) rows * strata::kernels::int2_row_bytes((int) g_->n_embd) +
                  (uint64_t) kMaxCand * (8 + head_row_bytes) + strata::kernels::topk_scratch_bytes(rows, kMaxCand);
@@ -528,43 +514,6 @@ void MtpDrafter::set_draft_history(const int32_t* tail, int64_t n_tail, int32_t 
     coupled_hist_base(tail, n_tail, next, h, h_chist_ + (kCoupledHistCap - h));
 }
 
-namespace {
-// #474 (upstream f2aaba1): what to change when the draft head's token subset does not fit the VRAM left - a smaller
-// subset that setup ships (data/draft_vocab_*.bin; their token counts below), and how to pick it.  Text only, after
-// the failure: nothing changes for a start that fits.
-void draft_head_hint(int64_t n_tokens, int64_t row_bytes) {
-    size_t free_b = 0, total_b = 0;
-    const bool have_free = strata::gpu::mem_info(&free_b, &total_b);
-    auto mib = [&](int64_t n) { return (double) (n * row_bytes) / 1048576.0; };
-    std::string free_s;
-    if (have_free) {
-        char b[64];
-        std::snprintf(b, sizeof(b), " and %.0f MiB is free", (double) free_b / 1048576.0);
-        free_s = b;
-    }
-    std::fprintf(stderr, "strata mtp: the draft head over %lld tokens needs %.0f MiB of VRAM%s.\n",
-                 (long long) n_tokens, mib(n_tokens), free_s.c_str());
-    struct Subset { const char* name; int64_t tokens; const char* what; };
-    static const Subset smaller[] = {{"cyrillic", 58963, "English, code and the Cyrillic script"},
-                                     {"en", 40525, "English and code"}};
-    std::string opts;
-    for (const Subset& s : smaller)
-        if (s.tokens < n_tokens) {
-            char b[160];
-            std::snprintf(b, sizeof(b), "%s--draft-vocab %s (%s, ~%.0f MiB)", opts.empty() ? "" : " or ", s.name,
-                          s.what, mib(s.tokens));
-            opts += b;
-        }
-    if (!opts.empty())
-        std::fprintf(stderr, "strata mtp: hint: a smaller draft vocabulary needs less VRAM: %s. Run ./setup.sh once "
-                             "with it (./setup.sh --draft-vocab en) and the model keeps it (\"draft_vocab\" in its "
-                             "xestrata-*.json config); or a smaller --context in setup.\n",
-                     opts.c_str());
-    else
-        std::fprintf(stderr, "strata mtp: hint: this is already the smallest shipped draft vocabulary: a smaller "
-                             "--context (or closing what else uses the GPU) leaves it room.\n");
-}
-}  // namespace
 
 bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float* window_R, std::string& err,
                       const MtpDrafter* shared) {
@@ -586,32 +535,25 @@ bool MtpDrafter::bind(const WeightTable& wt, const NativeHead* head, const float
             err = "mtp: incompatible shared draft head";
             return false;
         }
+        subset_ = shared->subset_;
         dhead_ = shared->dhead_;
         dvocab_ = shared->dvocab_;
         dvocab_host_ = shared->dvocab_host_;
         n_dvocab_ = shared->n_dvocab_;
         owns_draft_head_ = false;
     }
-    // the draft head's token subset, when tools/draft_vocab.py wrote one
-    if (dhead_ == nullptr && shared == nullptr && !full_head_env()) {
-        std::vector<uint8_t> raw;
-        if (read_file(rt_dir_ + "/draft_vocab.bin", raw) && raw.size() >= 4 && raw.size() % 4 == 0) {
-            n_dvocab_ = (int64_t) (raw.size() / 4);
-            const int64_t row_bytes = (int64_t) head->row_bytes();   // a vocabulary row of the native head
-            if (!strata::gpu::alloc_device((void**) &dvocab_, raw.size()) ||
-                !strata::gpu::alloc_device((void**) &dhead_, (size_t) (n_dvocab_ * row_bytes))) {
-                err = "mtp: the draft head does not fit";
-                draft_head_hint(n_dvocab_, row_bytes);
-                return false;
-            }
-            strata::gpu::copy(dvocab_, raw.data(), raw.size());
-            dvocab_host_.resize((size_t) n_dvocab_);
-            std::memcpy(dvocab_host_.data(), raw.data(), raw.size());
-            strata::kernels::gather_rows((const uint8_t*) head->weights(), row_bytes, dvocab_, n_dvocab_, dhead_, nullptr);
-            strata::gpu::device_sync();
-            vram_ += (uint64_t) (n_dvocab_ * row_bytes) + raw.size();
-            std::fprintf(stderr, "strata mtp: draft head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
-                         (double) (n_dvocab_ * row_bytes) / 1048576.0);
+    // the draft head's token subset, when tools/draft_vocab.py wrote one (the shared part: core/draft_head)
+    const std::string vocab = rt_dir_ + "/draft_vocab.bin";
+    if (dhead_ == nullptr && shared == nullptr && !full_head_env() && DraftSubset::file_tokens(vocab) > 0) {
+        auto sub = std::make_shared<DraftSubset>();
+        if (!sub->load(vocab, n_vocab_, head->weights(), head->row_bytes(), nullptr, "strata mtp", err)) return false;
+        if (sub->size() > 0) {
+            subset_ = sub;
+            dhead_ = const_cast<uint8_t*>(sub->rows());
+            dvocab_ = const_cast<int32_t*>(sub->ids_device());
+            dvocab_host_ = sub->ids();
+            n_dvocab_ = sub->size();
+            vram_ += sub->bytes();
         }
     }
     if (shared != nullptr) int2_ = shared->int2_;

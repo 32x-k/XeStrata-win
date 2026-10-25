@@ -628,40 +628,17 @@ bool PlainModel::load_qwen(std::string& err) {
     // Qwen3.6's 248,320 tokens took 1.7 ms a draft, at the card's bandwidth, 2026-10-15.  The engine's row layouts
     // (upload) rewrite each row in place, so a row keeps its GGUF type's size.
     if (has_mtp_ && n_snap_ > 0 && !opt_.draft_vocab.empty()) {
-        std::vector<int32_t> ids;
-        if (FILE* f = std::fopen(opt_.draft_vocab.c_str(), "rb")) {
-            int32_t v = 0;
-            while (std::fread(&v, sizeof v, 1, f) == 1)
-                if (v >= 0 && v < n_vocab_) ids.push_back(v);
-            std::fclose(f);
-        }
         const int gguf_type = head_.type == k::kNativeQ8Rows    ? kQ80
                               : head_.type == k::kNativeQ6KRows ? kQ6K
                                                                 : head_.type;
         const size_t row = head_.type == kBF16 ? (size_t) head_.n_in * 2
                                                : k::cpu::native_row_bytes(gguf_type, head_.n_in);
-        int32_t* d_ids = nullptr;
-        if (ids.empty() || row == 0) {
-            std::fprintf(stderr, "strata plain: %s: no draft tokens read; the drafts use the whole head\n",
-                         opt_.draft_vocab.c_str());
-        } else if (!strata::gpu::alloc_device(&d_ids, ids.size() * 4) ||
-                   !strata::gpu::alloc_device(&dhead_, ids.size() * row)) {
-            err = "plain model: no VRAM for the drafts' head (" + std::to_string(ids.size()) + " tokens)";
-            return false;
-        } else {
-            allocs_.push_back(d_ids);
-            allocs_.push_back(dhead_);
-            if (!strata::gpu::copy(d_ids, ids.data(), ids.size() * 4)) {
-                err = "plain model: the drafts' head";
-                return false;
-            }
-            k::gather_rows(static_cast<const uint8_t*>(head_.data), (int64_t) row, d_ids, (int64_t) ids.size(),
-                           static_cast<uint8_t*>(dhead_), cs_);
-            if (!strata::gpu::stream_sync(cs_)) { err = "plain model: the drafts' head"; return false; }
-            n_dvocab_ = (int64_t) ids.size();
-            dvocab_ = std::move(ids);
-            std::fprintf(stderr, "strata plain: the drafts' head over %lld tokens (%.1f MiB)\n", (long long) n_dvocab_,
-                         (double) ((size_t) n_dvocab_ * row) / 1048576.0);
+        subset_ = std::make_unique<DraftSubset>();   // the shared part (core/draft_head), as Qwen3.8's drafter's
+        if (!subset_->load(opt_.draft_vocab, n_vocab_, head_.data, row, cs_, "strata plain", err)) return false;
+        if (subset_->size() > 0) {
+            dhead_ = const_cast<uint8_t*>(subset_->rows());
+            dvocab_ = subset_->ids();
+            n_dvocab_ = subset_->size();
         }
     }
     n_pages_ = (opt_.max_cells + qs.page_size - 1) / qs.page_size;

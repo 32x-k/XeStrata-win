@@ -34,6 +34,95 @@ int candidates() {
 
 }  // namespace
 
+namespace {
+
+// #474 (upstream f2aaba1): what to change when the draft head's token subset does not fit the VRAM left - a smaller
+// subset that setup ships (data/draft_vocab_*.bin; their token counts below), and how to pick it.  Text only, after
+// the failure: nothing changes for a start that fits.
+void draft_head_hint(const char* who, int64_t n_tokens, int64_t row_bytes) {
+    size_t free_b = 0, total_b = 0;
+    const bool have_free = gpu::mem_info(&free_b, &total_b);
+    auto mib = [&](int64_t n) { return (double) (n * row_bytes) / 1048576.0; };
+    std::string free_s;
+    if (have_free) {
+        char b[64];
+        std::snprintf(b, sizeof(b), " and %.0f MiB is free", (double) free_b / 1048576.0);
+        free_s = b;
+    }
+    std::fprintf(stderr, "%s: the draft head over %lld tokens needs %.0f MiB of VRAM%s.\n", who, (long long) n_tokens,
+                 mib(n_tokens), free_s.c_str());
+    struct Subset { const char* name; int64_t tokens; const char* what; };
+    static const Subset smaller[] = {{"cyrillic", 58963, "English, code and the Cyrillic script"},
+                                     {"en", 40525, "English and code"}};
+    std::string opts;
+    for (const Subset& s : smaller)
+        if (s.tokens < n_tokens) {
+            char b[160];
+            std::snprintf(b, sizeof(b), "%s--draft-vocab %s (%s, ~%.0f MiB)", opts.empty() ? "" : " or ", s.name,
+                          s.what, mib(s.tokens));
+            opts += b;
+        }
+    if (!opts.empty())
+        std::fprintf(stderr, "%s: hint: a smaller draft vocabulary needs less VRAM: %s. Run ./setup.sh once "
+                             "with it (./setup.sh --draft-vocab en) and the model keeps it (\"draft_vocab\" in its "
+                             "xestrata-*.json config); or a smaller --context in setup.\n",
+                     who, opts.c_str());
+    else
+        std::fprintf(stderr, "%s: hint: this is already the smallest shipped draft vocabulary: a smaller "
+                             "--context (or closing what else uses the GPU) leaves it room.\n", who);
+}
+
+}  // namespace
+
+DraftSubset::~DraftSubset() {
+    if (rows_ != nullptr) gpu::free(rows_);
+    if (d_ids_ != nullptr) gpu::free(d_ids_);
+}
+
+int64_t DraftSubset::file_tokens(const std::string& path) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (f == nullptr) return 0;
+    std::fseek(f, 0, SEEK_END);
+    const long size = std::ftell(f);
+    std::fclose(f);
+    return size >= 4 && size % 4 == 0 ? size / 4 : 0;
+}
+
+bool DraftSubset::load(const std::string& path, int64_t n_vocab, const void* head_rows, size_t row_bytes, void* stream,
+                       const char* who, std::string& err) {
+    ids_.clear();
+    if (std::FILE* f = std::fopen(path.c_str(), "rb")) {
+        int32_t v = 0;
+        while (std::fread(&v, sizeof v, 1, f) == 1)
+            if (v >= 0 && v < n_vocab) ids_.push_back(v);
+        std::fclose(f);
+    }
+    if (ids_.empty() || row_bytes == 0) {
+        std::fprintf(stderr, "%s: %s: no draft tokens read; the drafts use the whole head\n", who, path.c_str());
+        ids_.clear();
+        return true;
+    }
+    const int64_t n = (int64_t) ids_.size();
+    if (!gpu::alloc_device(&d_ids_, ids_.size() * 4) || !gpu::alloc_device(&rows_, (size_t) n * row_bytes)) {
+        err = std::string(who) + ": the draft head does not fit";
+        draft_head_hint(who, n, (int64_t) row_bytes);
+        return false;
+    }
+    if (!gpu::copy(d_ids_, ids_.data(), ids_.size() * 4)) {
+        err = std::string(who) + ": the draft head's tokens";
+        return false;
+    }
+    k::gather_rows(static_cast<const uint8_t*>(head_rows), (int64_t) row_bytes, d_ids_, n, rows_, stream);
+    if (!(stream != nullptr ? gpu::stream_sync(stream) : gpu::device_sync())) {
+        err = std::string(who) + ": the draft head's rows";
+        return false;
+    }
+    bytes_ = (uint64_t) n * row_bytes + ids_.size() * 4;
+    std::fprintf(stderr, "%s: draft head over %lld tokens (%.1f MiB)\n", who, (long long) n,
+                 (double) ((uint64_t) n * row_bytes) / 1048576.0);
+    return true;
+}
+
 DraftHeadInt2::~DraftHeadInt2() {
     for (const void* p : {(const void*) codes_, (const void*) cand_, (const void*) cand_rows_, (const void*) cand_y_,
                           (const void*) scratch_})

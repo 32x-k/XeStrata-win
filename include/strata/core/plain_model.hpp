@@ -576,6 +576,7 @@ private:
     float* mtp_h_ = nullptr;
     // the drafts' head over opt_.draft_vocab's subset (null: the whole head); a draft's pick is its index there
     void* dhead_ = nullptr;
+    std::unique_ptr<DraftSubset> subset_;   ///< the token subset dhead_, dvocab_ and n_dvocab_ come from
     std::unique_ptr<DraftHeadInt2> int2_;   ///< the drafts' head at 2 bits (null: as it is)
     /// --kv-ram: a window's gathered latent rows [max_t][g_gather_stride_][L] and a prompt chunk's layer of cells
     uint16_t *g_lat_gather_ = nullptr, *g_lat_stage_ = nullptr;

@@ -15,8 +15,39 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <vector>
 
 namespace strata::core {
+
+/// The drafts' token subset (tools/draft_vocab.py's int32 ids, setup's data/draft_vocab*.bin) and the head's rows of
+/// those tokens gathered into VRAM, for both engines' MTP drafters: a draft's pick is its index here.  A head over a
+/// subset reads less a draft step (upstream #474); a file with no usable ids leaves size() 0, the whole head.
+class DraftSubset {
+public:
+    DraftSubset() = default;
+    ~DraftSubset();
+    DraftSubset(const DraftSubset&) = delete;
+    DraftSubset& operator=(const DraftSubset&) = delete;
+
+    /// The tokens of the file at `path` (0 when there is none), for planning the VRAM before it is loaded.
+    static int64_t file_tokens(const std::string& path);
+    /// Reads `path`'s ids below `n_vocab` and gathers their `row_bytes` rows of `head_rows` (device) into VRAM.
+    /// False (and `err`) when they do not fit, after a hint of the smaller subsets setup ships; true with size() 0
+    /// when the file has no usable id (`who` names the engine in the lines).
+    bool load(const std::string& path, int64_t n_vocab, const void* head_rows, size_t row_bytes, void* stream,
+              const char* who, std::string& err);
+    int64_t size() const { return (int64_t) ids_.size(); }
+    const uint8_t* rows() const { return rows_; }
+    const int32_t* ids_device() const { return d_ids_; }
+    const std::vector<int32_t>& ids() const { return ids_; }
+    uint64_t bytes() const { return bytes_; }
+
+private:
+    uint8_t* rows_ = nullptr;
+    int32_t* d_ids_ = nullptr;
+    std::vector<int32_t> ids_;
+    uint64_t bytes_ = 0;
+};
 
 class DraftHeadInt2 {
 public:
