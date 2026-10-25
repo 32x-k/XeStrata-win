@@ -118,7 +118,7 @@ All signing happens on the release PC, on the finished files.
 
 **What is built (per OS)**
 
-* *The installer*, one per OS and with no engine inside (0.2.5): built with `--config src-tauri/tauri.update.conf.json`, which drops `engine-bundle`.
+* *The installer*, one per OS (0.2.5). The Windows and Linux ones have no engine inside: built with `--config src-tauri/tauri.update.conf.json`, which drops `engine-bundle`. The Mac dmg keeps its small Metal engine (one Mac variant).
   Windows: `Strata-0.2.5-windows-x64-setup.exe`; Linux: `Strata-0.2.5-linux-x86_64.AppImage`; Mac: `Strata-0.2.5-macos-arm64.dmg` for people and
   `Strata.app.tar.gz` as the updater archive (the updater cannot install from a dmg). The Windows and Linux files are both the first download and the
   file `latest.json` names; the first start of the app downloads the engine for the card (the first-run card), or installs a file the person already has.
