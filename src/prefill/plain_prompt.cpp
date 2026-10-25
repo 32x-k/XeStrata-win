@@ -375,7 +375,14 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
     if (use_mmq && up_xq2) prefill::mmq::quantize(P.hn, P.src, P.xq2, up_type, N, N, T * K, cs);
     else prefill::gather_rows16(P.x16, P.src, P.xs16, T * K, N, cs);
     mark(1);
-    const bool transient = src_->transient(ml, experts.empty() ? 0 : experts[0]);
+    // whether a missed expert's blob is assembled into a short-lived buffer, asked of each: with a RAM copy of part
+    // of the layer the first expert says nothing of the others (as the read-ahead below)
+    bool transient = false;
+    for (int32_t e : experts)
+        if (res_[(size_t) (ml * E + e)] < 0 && src_->transient(ml, e)) {
+            transient = true;
+            break;
+        }
     int64_t max_rows = 0;
     for (int32_t e : experts) max_rows = std::max<int64_t>(max_rows, count[(size_t) e]);
     // a source that assembles its experts from the files (transient: GGUF read in place): each group's missed experts
