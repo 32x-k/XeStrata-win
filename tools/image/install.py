@@ -1,10 +1,10 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-"""tools/image/install.py - image generation (Qwen-Image-2.1-Turbo, Qwen-Image-2.1 or Mage-Flow) for an existing
-XeStrata install: downloads and checks the model files for the image engine setup compiled with the text engine
-(engine/strata-image), and writes the "images" section into a run config (or prints it), as setup.py --images does
-inside the normal setup (setup.py's setup_images).
+"""tools/image/install.py - image generation (Qwen-Image-2.1-Turbo, Qwen-Image-2.1, Mage-Flow or HunyuanImage 3.0) for
+an existing XeStrata install: downloads and checks the model files for the image engine setup compiled with the text
+engine (engine/strata-image), and writes the "images" section into a run config (or prints it), as setup.py --images
+does inside the normal setup (setup.py's setup_images).
 
     python tools/image/install.py --config ~/.config/xestrata/xestrata-iq3_xxs.json
     python tools/image/install.py --quant Q6_K --print
@@ -12,12 +12,18 @@ inside the normal setup (setup.py's setup_images).
 
 --gpu-policy auto|keep|shrink|unload: what the text model does during an image job (serve/images.py).
 --quant: Qwen-Image-2.1's image model's size, lowered (after its text encoder's) when the files would not fit the RAM
-the config's text model leaves, unless --ssd-offload on; Mage-Flow's comes in one size (bf16).
---model qwen-image-turbo|qwen-image-base|mage-flow-turbo|mage-flow|mage-flow-base|magetrail[-uncensored]: the image
-model (setup.py --images), or several, comma-separated (the first the default, the others named by a request's
-"model"), or no (image generation taken out of --config); -uncensored: its text encoder with the refusal direction
-removed.  The text encoder is Q8_0, or lowered
-first.
+the config's text model leaves, unless --ssd-offload on; Mage-Flow's comes in one size (bf16); HunyuanImage 3.0's as
+w4a8 (its default) or int8, which the RAM lowers to w4a8 (it has no text encoder, so only its own size is lowered).
+--model qwen-image-turbo|qwen-image-base|mage-flow-turbo|mage-flow|mage-flow-base|magetrail[-uncensored]|
+hunyuan-image-3-distil: the image model (setup.py --images), or several, comma-separated (the first the default, the
+others named by a request's "model"), or no (image generation taken out of --config); -uncensored: its text encoder
+with the refusal direction removed (HunyuanImage 3.0 has none: it reads its own prompt).  The text encoder is Q8_0, or
+lowered first.
+
+The weights are under their own licenses, which setup prints when it installs them (tools/image/qimage.py's
+license_note): Qwen-Image-2.1's under the Qwen Research License, Mage-Flow's and MageTrail's under MIT, and
+HunyuanImage 3.0's under the Tencent Hunyuan Community License Agreement, which does not apply in the European Union,
+the United Kingdom or South Korea: https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE
 --dit-q8, --dit-keep: Mage-Flow's image model in 8 or 16 bits, and the one not in use kept in RAM (as setup's
 --image-dit-q8 and --image-dit-keep).
 """
@@ -35,7 +41,7 @@ import qimage as QI  # noqa: E402  (beside this file)
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--quant", choices=["Q4_K_M", "Q6_K", "Q8_0"])
+    ap.add_argument("--quant", choices=["Q4_K_M", "Q6_K", "Q8_0", *QI.HUNYUANIMAGE3_QUANTS])
     ap.add_argument("--models-dir", help="where the model files go (default: the data folder's models)")
     ap.add_argument("--config", help="a run config (xestrata-<model>.json) to write the \"images\" section into")
     ap.add_argument("--gpu-policy", choices=["auto", "keep", "shrink", "unload"], default="auto")
@@ -44,9 +50,11 @@ def main(argv=None) -> int:
     ap.add_argument("--model", default=QI.DEFAULT_MODEL,
                     help="qwen-image-turbo (default: Qwen-Image-2.1-Turbo, 8 steps), qwen-image-base "
                          "(Qwen-Image-2.1, 40 steps), mage-flow-turbo (Mage-Flow-Turbo, 4 steps), mage-flow (its RL "
-                         "model, 20 steps), mage-flow-base (its base model, 30 steps) or magetrail (30 steps), or "
-                         "several, comma-separated (the first the default); -uncensored: the text encoder "
-                         "(Qwen3-VL-8B, Mage-Flow's 4B) with the refusal direction removed")
+                         "model, 20 steps), mage-flow-base (its base model, 30 steps), magetrail (30 steps) or "
+                         "hunyuan-image-3-distil (HunyuanImage 3.0 Instruct-Distil, 8 steps, guidance 2.5, its own "
+                         "tokenizer and system prompt: no text encoder), or several, comma-separated (the first the "
+                         "default); -uncensored: the text encoder (Qwen3-VL-8B, Mage-Flow's 4B) with the refusal "
+                         "direction removed")
     ap.add_argument("--dit-q8", choices=["auto", "on", "off"],
                     help="Mage-Flow: its DiT 16-bit in VRAM when it fits there with the text encoder, else 8 bits "
                          "(auto, the default); on always 8 bits, off always 16-bit")
