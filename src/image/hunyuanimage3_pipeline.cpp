@@ -694,6 +694,9 @@ std::vector<uint8_t> HunyuanImage3Pipeline::generate(const QiRequest& r, QiTimes
         gpu::free(dz);
         gpu::free(drgb);
         dz = drgb = nullptr;
+        // the next request's plan counts the decode's buffers beside the banks only while it decodes: kept, they
+        // took the walk's room on a 12 GB card (RTX 4070: the second image's sequence refused)
+        vae_->drop_scratch();
         if (times != nullptr) times->decode = std::chrono::duration<double>(clock::now() - t2).count();
 
         // the reference pipeline's postprocess: [-1,1] -> [0,1], the three planes into RGBA8 rows
@@ -716,6 +719,7 @@ std::vector<uint8_t> HunyuanImage3Pipeline::generate(const QiRequest& r, QiTimes
         if (drgb != nullptr) gpu::free(drgb);
         dit_->drop_sequence();   // a stopped or failed request gives its buffers back
         around_->drop_grid();
+        vae_->drop_scratch();
         throw;
     }
 }
