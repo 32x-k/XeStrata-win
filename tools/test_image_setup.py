@@ -179,7 +179,7 @@ class Config(unittest.TestCase):
     def test_no_text_encoder_of_its_own(self):
         for key in ("llm", "text_encoder", "text_quant", "edit_model"):
             self.assertNotIn(key, self.cfg, key)
-        self.assertFalse(self.cfg["mask"])
+        self.assertNotIn("mask", self.cfg, "every model takes a mask: setup writes no mask flag")
         self.assertFalse(self.cfg["transparency"])
 
 
