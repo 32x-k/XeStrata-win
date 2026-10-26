@@ -31,36 +31,43 @@ static void put(const char* k, const char* v) {
 static void clear_all() {
     for (const char* k : {"STRATA_KVA", "STRATA_KVA_SPLIT", "STRATA_KVA_SUFFIX", "STRATA_KVA_MIN_PROMPT", "STRATA_KVA_PARITY",
                           "STRATA_KVA_CAPTURE", "STRATA_KVA_CAPTURE_FP32", "STRATA_KVA_ORACLE", "STRATA_KVA_ORACLE_FP32",
-                          "STRATA_KVA_PROJECTOR", "STRATA_KVA_MODE", "STRATA_KVA_ONLY", "STRATA_KVA_DRAFT_FLOOR"})
+                          "STRATA_KVA_PROJECTOR", "STRATA_KVA_MODE", "STRATA_KVA_ONLY", "STRATA_KVA_DRAFT_FLOOR", "STRATA_KVA_SKIP", "STRATA_KVA_ANY_MODEL"})
         unset(k);
 }
 static bool is(const char* got, const char* want) { return got != nullptr && std::strcmp(got, want) == 0; }
 
 int main() {
-    // ---- the switch: on by default, STRATA_KVA=0 off, anything else on and chatty
+    // ---- the switch: off unless STRATA_KVA=1 (0.2.7 ships KVA opt-in; unset is the exact 0.2.6 engine)
     clear_all();
     {
         const KvaConfig c = kva_config_from_env();
-        CHECK(c.on && !c.explicit_on);
-        CHECK(c.split == 24 && c.min_prompt == 4096 && c.suffix_env == 0);
+        CHECK(!c.on && !c.explicit_on);                                      // unset: off
+        CHECK(c.split == 36 && c.min_prompt == 4096 && c.suffix_env == 0 && kKvaSplitDefault == 36);
         CHECK(c.mode == KvaConfig::Mode::Identity && c.only == KvaConfig::Only::All && !c.capture);
+        KvaEngine eng;
+        CHECK(!c.wants_cell_floor(eng, true));
+        CHECK(is(c.decline(eng, 0, 30000, 0, -1, 48), "off (STRATA_KVA is not 1)"));   // a 30K cold prompt is read exactly
     }
     put("STRATA_KVA", "0");
     { const KvaConfig c = kva_config_from_env(); CHECK(!c.on && !c.explicit_on); }
     put("STRATA_KVA", "1");
     { const KvaConfig c = kva_config_from_env(); CHECK(c.on && c.explicit_on); }
     put("STRATA_KVA", "");   // an empty value is "not set"
-    { const KvaConfig c = kva_config_from_env(); CHECK(c.on && !c.explicit_on); }
+    { const KvaConfig c = kva_config_from_env(); CHECK(!c.on && !c.explicit_on); }
     clear_all();
+    put("STRATA_KVA", "1");   // everything below runs with KVA switched on
 
-    // ---- the tail: 2048, or STRATA_KVA_SUFFIX; the draft window plays no part (the cell floor protects the draft layer)
+    // ---- switched on: split 36 and a 2048-token tail (the configuration measured), or STRATA_KVA_SPLIT / STRATA_KVA_SUFFIX
     {
         const KvaConfig c = kva_config_from_env();
-        CHECK(c.effective_suffix() == kKvaSuffixDefault && kKvaSuffixDefault == 2048);
+        CHECK(c.on && c.split == 36 && c.effective_suffix() == kKvaSuffixDefault && kKvaSuffixDefault == 2048);
+        put("STRATA_KVA_SPLIT", "30");
+        CHECK(kva_config_from_env().split == 30);
+        unset("STRATA_KVA_SPLIT");
         put("STRATA_KVA_SUFFIX", "3000");
         const KvaConfig e = kva_config_from_env();
         CHECK(e.effective_suffix() == 3000);
-        clear_all();
+        unset("STRATA_KVA_SUFFIX");
     }
 
     // ---- who is turned away, and why (the first reason that holds is the one named)
@@ -68,42 +75,43 @@ int main() {
         const KvaConfig c = kva_config_from_env();
         KvaEngine eng;
         bool routine = false;
-        // a cold 14.6K prompt on one device: applies
+        // a cold 14.6K prompt on one device: applies (14600 > 2048 + 64)
         CHECK(c.decline(eng, 0, 14600, 0, -1, 48) == nullptr);
         CHECK(c.decline(eng, 0, 14600, 0, 48, 48) == nullptr);   // le == n_layers is the whole trunk too
         // a continuation (turn 2 of a chat, a resumed prompt): routine
         CHECK(is(c.decline(eng, 9000, 14600, 0, -1, 48, false, false, &routine), "a continuation read (pos0 != 0)") && routine);
         // short prompts and a prompt the tail would swallow: routine
         CHECK(is(c.decline(eng, 0, 3000, 0, -1, 48, false, false, &routine), "the prompt is shorter than STRATA_KVA_MIN_PROMPT") && routine);
-        CHECK(c.decline(eng, 0, 4096, 0, -1, 48) == nullptr);   // 4096 > 2112 + 64: it applies
-        put("STRATA_KVA_SUFFIX", "5000");
+        CHECK(c.decline(eng, 0, 4096, 0, -1, 48) == nullptr);   // 4096 is the first prompt that is long enough
+        put("STRATA_KVA_SUFFIX", "5000");   // a longer tail swallows a prompt of 5000 and not one of 5065
         { const KvaConfig s = kva_config_from_env();
-          CHECK(is(s.decline(eng, 0, 5000, 0, -1, 48, false, false, &routine), "the suffix leaves too few positions to approximate") && routine); }
-        clear_all();
+          CHECK(is(s.decline(eng, 0, 5000, 0, -1, 48, false, false, &routine), "the suffix leaves too few positions to approximate") && routine);
+          CHECK(s.decline(eng, 0, 5065, 0, -1, 48) == nullptr); }
+        unset("STRATA_KVA_SUFFIX");
         // not routine: the user may want to know
         CHECK(is(c.decline(eng, 0, 14600, 24, -1, 48, false, false, &routine), "a layer split (not the whole trunk)") && !routine);
         CHECK(is(c.decline(eng, 0, 14600, 0, 24, 48), "a layer split (not the whole trunk)"));
         CHECK(is(c.decline(eng, 0, 14600, 0, -1, 48, true), "a prompt with pictures"));
         CHECK(is(c.decline(eng, 0, 14600, 0, -1, 48, false, true), "the DFlash2 drafter reads the late layers' hidden states"));
-        // a model the split and the tail were not measured on reads exactly unless STRATA_KVA=1 asks
-        CHECK(is(c.decline(eng, 0, 14600, 0, -1, 40, false, false, &routine, true),
-                 "KVA was not validated for this model (STRATA_KVA=1 forces it)") && !routine);
-        put("STRATA_KVA", "1");
-        { const KvaConfig f = kva_config_from_env(); CHECK(f.decline(eng, 0, 14600, 0, -1, 40, false, false, nullptr, true) == nullptr); }
-        clear_all();
-        // no draft layer at all: nothing to cover
         // the engine rules the whole process out (batch slots, a layer split, a peer device)
         KvaEngine blocked = eng;
         blocked.blocked = "batch slots (--batch)";
         CHECK(is(c.decline(blocked, 0, 14600, 0, -1, 48, false, false, &routine), "batch slots (--batch)") && !routine);
-        // off wins over everything, capture over the rest
-        put("STRATA_KVA", "0");
-        { const KvaConfig o = kva_config_from_env(); CHECK(is(o.decline(eng, 0, 14600, 0, -1, 48), "off (STRATA_KVA=0)")); }
-        put("STRATA_KVA", "1");
+        // a model whose shape KVA was not measured on (not 48 layers / 512 experts) is turned away, not warned about;
+        // the routine reasons (a short prompt, a continuation) still come first
+        CHECK(is(c.decline(eng, 0, 14600, 0, -1, 40, false, false, &routine, true), kKvaShapeReason) && !routine);
+        CHECK(is(c.decline(eng, 0, 3000, 0, -1, 40, false, false, &routine, true), "the prompt is shorter than STRATA_KVA_MIN_PROMPT") && routine);
+        CHECK(c.decline(eng, 0, 14600, 0, -1, 48, false, false, &routine, false) == nullptr);   // the measured shape applies
+        put("STRATA_KVA_ANY_MODEL", "1");   // the research override allows it (prefill.cpp then warns once)
+        { const KvaConfig a = kva_config_from_env(); CHECK(a.any_model && a.decline(eng, 0, 14600, 0, -1, 40, false, false, nullptr, true) == nullptr); }
+        unset("STRATA_KVA_ANY_MODEL");
+        CHECK(!kva_config_from_env().any_model);
+        // capture wins over the rest
         put("STRATA_KVA_CAPTURE", "/tmp/kva-cap");
         { const KvaConfig o = kva_config_from_env(); CHECK(o.capture && is(o.decline(eng, 0, 14600, 0, -1, 48), "capture mode")); }
-        clear_all();
+        unset("STRATA_KVA_CAPTURE");
     }
+    clear_all();
 
     // ---- the research modes still parse
     put("STRATA_KVA_ORACLE", "/tmp/o");
@@ -118,12 +126,24 @@ int main() {
     }
     clear_all();
 
+    // ---- STRATA_KVA_SKIP: the default is the state-only form; "moe" runs the attention halves and skips the MoE half
+    {
+        CHECK(kva_config_from_env().skip == KvaConfig::Skip::StateOnly);
+        put("STRATA_KVA_SKIP", "moe");
+        CHECK(kva_config_from_env().skip == KvaConfig::Skip::Moe);
+        put("STRATA_KVA_SKIP", "state");
+        CHECK(kva_config_from_env().skip == KvaConfig::Skip::StateOnly);
+        put("STRATA_KVA_SKIP", "bogus");
+        CHECK(kva_config_from_env().skip == KvaConfig::Skip::StateOnly);
+        unset("STRATA_KVA_SKIP");
+    }
     // ---- "not applied => identical to STRATA_KVA=0", the parts that need no GPU
     // (1) by default the draft layer is 0.2.6's own code; the cell floor is a research option, wired only when asked
     {
         KvaEngine eng;
+        put("STRATA_KVA", "1");
         const KvaConfig on = kva_config_from_env();
-        CHECK(!on.draft_floor && !on.wants_cell_floor(eng, true));
+        CHECK(on.on && !on.draft_floor && !on.wants_cell_floor(eng, true));
         put("STRATA_KVA_DRAFT_FLOOR", "1");
         const KvaConfig fl = kva_config_from_env();
         CHECK(fl.draft_floor && fl.wants_cell_floor(eng, true));
