@@ -2719,6 +2719,8 @@ class Vision:
                 return self.cache[key]
             if self.dead:
                 raise ValueError("images are unavailable: " + self.dead)
+            if self.proc is None or self.proc.stdin is None:   # an elastic encoder not started yet, or one unloaded
+                raise ValueError("the picture reader is not running")
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
             img.write_bytes(data)
             try:
@@ -4123,8 +4125,9 @@ class Service:
                         if src.startswith(("http://", "https://")):
                             src = fetched[item["source"]] = self.download(src)   # outside the FIFO, as in prepare()
                         with self._turn(cancel):  # the encoder takes its turn with the requests (see below)
+                            self._vision_up()         # an elastic encoder is not running until a picture needs it
                             self.vision.encode(src)
-                    except (ValueError, OSError) as e:
+                    except (ValueError, OSError, RuntimeError) as e:    # RuntimeError: the encoder did not start
                         why = str(e)
                 if why is not None:
                     print(f"[strata] a picture a tool returned was left out of the prompt: {why}", flush=True)
