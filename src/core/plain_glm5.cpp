@@ -608,7 +608,7 @@ bool PlainModel::record_mtp_glm5(int T, strata::gpu::Stream cs, std::string& err
     // the last row only: its norm is the next step's trunk row, and its logits pick the draft
     k::native_qsa_rms_norm_weighted(x_ + (size_t) (T - 1) * N, mtp_head_norm_, hn_, (int) N, 1, eps, cs);
     k::copy_from_mapped(mtp_h_, hn_, N, cs);
-    draft_logits(cs);
+    draft_logits(step_ + (size_t) (T - 1) * k::kStepCount + k::kStepPos, cs);
     return true;
 }
 

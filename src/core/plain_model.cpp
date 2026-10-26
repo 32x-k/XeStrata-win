@@ -1863,11 +1863,11 @@ bool PlainModel::record_mtp(int T, strata::gpu::Stream cs, std::string& err) {
     // the last row only: its norm is the next step's trunk row, and its logits pick the draft
     k::native_qsa_rms_norm_weighted(x_ + (size_t) (T - 1) * N, mtp_head_norm_, hn_, (int) N, 1, eps, cs);
     k::copy_from_mapped(mtp_h_, hn_, N, cs);
-    draft_logits(cs);
+    draft_logits(pos_ + (size_t) (T - 1) * NH, cs);
     return true;
 }
 
-void PlainModel::draft_logits(strata::gpu::Stream cs) {
+void PlainModel::draft_logits(const int32_t* pos, strata::gpu::Stream cs) {
     const int n_in = head_.n_in;
     // the head's own product of n rows in its form (the subset's, the whole head's, or int2_'s candidates)
     auto exact = [this, n_in](const void* rows, int n, float* y, void* s) {
@@ -1882,7 +1882,7 @@ void PlainModel::draft_logits(strata::gpu::Stream cs) {
     if (head_.type != kBF16) k::native_quantize_q8_1(hn_, xq_, n_in, 1, cs);
     if (int2_ != nullptr)
         int2_->logits(hn_, static_cast<const uint8_t*>(rows),
-                      [&](const uint8_t* r, int m, float* y, void* s) { exact(r, m, y, s); }, logits_, cs);
+                      [&](const uint8_t* r, int m, float* y, void* s) { exact(r, m, y, s); }, logits_, cs, pos);
     else
         exact(rows, n, logits_, cs);
 }

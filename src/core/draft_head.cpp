@@ -178,15 +178,20 @@ bool DraftHeadInt2::build(int type, int64_t n_rows, int n_in, const std::functio
     return true;
 }
 
-void DraftHeadInt2::logits(const float* x, const uint8_t* head_rows, const Exact& exact, float* out, void* stream) const {
+void DraftHeadInt2::logits(const float* x, const uint8_t* head_rows, const Exact& exact, float* out, void* stream,
+                           const int32_t* pos) const {
     k::int2_gemv(codes_, x, out, n_in_, n_rows_, stream);
     k::topk(out, n_rows_, k_, cand_, scratch_, stream);
     k::gather_rows(head_rows, (int64_t) exact_row_bytes_, cand_, k_, cand_rows_, stream);
     exact(cand_rows_, k_, cand_y_, stream);
-    // the coarse products only pick the candidates: left in the softmax, their error raised its sum and lowered every
-    // draft probability, so the drafts stopped early (RTX 4070, 64K serve: 0.45 drafts a token against 0.76 with the
-    // head as it is).  The others are set to -1.7e38 (0xFE bytes), a probability of 0.
-    gpu::memset_async(out, 0xFE, (size_t) n_rows_ * sizeof(float), stream);
+    // From kPadFrom tokens of context the coarse products only pick the candidates: left in the softmax, their error
+    // raised its sum and lowered every draft probability, and at long contexts (flatter distributions, more of the
+    // sum in the rest of the vocabulary) the drafts stopped early: RTX 4070, 64K serve, 0.45 drafts a token against
+    // 0.76 with the head as it is, 56.5 -> 71.8 tok/s with the rest at a probability of 0; RX 9060 XT 64K t07
+    // 51.5 -> 56.7.  Shorter, the rest left out made the draft probabilities too high: RX 9060 XT 32K greedy 149 -> 136
+    // of ~214 drafts accepted (-5%), t07 1K and 32K 5-16% slower; the RTX 4070 the same either way.  Measured at 1K,
+    // 32K and 64K only: the bound sits between 32K and 64K.
+    k::int2_pad_from(pos, kPadFrom, out, n_rows_, stream);
     k::scatter_values(cand_y_, cand_, k_, out, stream);
 }
 

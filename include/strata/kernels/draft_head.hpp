@@ -35,6 +35,10 @@ std::size_t topk_scratch_bytes(int64_t n, int k);
 /// `scratch` holds topk_scratch_bytes(n, k).
 void topk(const float* v, int64_t n, int k, int32_t* ids, void* scratch, void* stream);
 
+/// y[0..n) = -1.7e38 (a probability of 0) when the device value *pos is `from` or more, else nothing: a decision the
+/// device makes, so a captured graph takes it at every replay.
+void int2_pad_from(const int32_t* pos, int32_t from, float* y, int64_t n, void* stream);
+
 /// y[ids[j]] = vals[j] for the `k` values (the chosen rows' products written back over their coarse ones).
 void scatter_values(const float* vals, const int32_t* ids, int k, float* y, void* stream);
 

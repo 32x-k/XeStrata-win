@@ -3,9 +3,9 @@
 // include/strata/core/draft_head.hpp - the MTP drafts' head at 2 bits, for Qwen3.8-Flash-Next's drafter (mtp.cpp) and
 // the other models' (PlainModel): the coarse products of every row of the draft head (its token subset, or the whole
 // vocabulary), the k best of them taken again with the head's own rows and written back.  The logits it leaves are
-// those k alone (the rest at a probability of 0), so the picks and the draft probabilities after it come from the
-// head's own values.  A draft only proposes (the verify window decides with the model's head): a worse pick costs
-// acceptance, not the answer.
+// the coarse ones but for those k (from a long context on, those k alone), so the picks and the draft probabilities
+// after it are taken as before.  A draft only proposes (the verify window decides with the model's head): a worse
+// pick costs acceptance, not the answer.
 //
 // Which form a device takes is measured at load (`choose`), not told by its name: on the 2560 x 106,299 subset of
 // Qwen3.8's Q5_K head, a draft step's head took 556 -> 288 us on the B70 and 400 -> 325 us on the RTX 4070 (k = 16,
@@ -70,8 +70,11 @@ public:
     uint64_t bytes() const { return bytes_; }
 
     /// The logits of the draft head's rows for the float row `x` (device, n_in values): coarse, but the k best, which
-    /// `exact` computes from `head_rows` (the head's rows in the same order as the int2 ones).
-    void logits(const float* x, const uint8_t* head_rows, const Exact& exact, float* out, void* stream) const;
+    /// `exact` computes from `head_rows` (the head's rows in the same order as the int2 ones).  `pos` (device, the
+    /// draft row's position; null: never) at kPadFrom or more leaves the k alone, the rest at a probability of 0.
+    void logits(const float* x, const uint8_t* head_rows, const Exact& exact, float* out, void* stream,
+                const int32_t* pos = nullptr) const;
+    static constexpr int32_t kPadFrom = 49152;
 
     /// Whether this device drafts faster with it than with `full` (the head's own product of every row into `out`):
     /// both timed here, after a warm-up.  STRATA_DRAFT_INT2=0|1 says it instead.  Logs the times.

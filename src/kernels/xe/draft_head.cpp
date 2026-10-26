@@ -171,6 +171,14 @@ void topk(const float* v, int64_t n, int k, int32_t* ids, void* scratch, void* s
     done(stream, e, "topk");
 }
 
+void int2_pad_from(const int32_t* pos, int32_t from, float* y, int64_t n, void* stream) {
+    if (n <= 0 || pos == nullptr) return;
+    const auto e = Q(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) {
+        if (*pos >= from) y[i] = -1.7e38f;
+    });
+    done(stream, e, "int2_pad_from");
+}
+
 void scatter_values(const float* vals, const int32_t* ids, int k, float* y, void* stream) {
     if (k <= 0) return;
     const auto e = Q(stream).parallel_for(sycl::range<1>((size_t) k), [=](sycl::id<1> j) {

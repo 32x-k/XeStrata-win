@@ -827,7 +827,7 @@ bool MtpDrafter::record_forward(int T, int step_row0, strata::gpu::Stream cs, st
                           [this, type, N](const uint8_t* r, int n, float* y, void* s) {
                               native_mmvq(type, r, xq_, y, (int) N, n, 1, s);
                           },
-                          head_logits_, cs);
+                          head_logits_, cs, pos);
         } else {
             native_mmvq(head_->type(), sub ? dhead_ : head_->weights(), xq_, head_logits_, (int) N, (int) nv, T, cs);
         }

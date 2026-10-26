@@ -317,8 +317,8 @@ private:
     /// The head over T normed rows `x` into logits_.
     void head_logits(const float* x, int T, strata::gpu::Stream cs);
     /// The MTP layer's head for its last row (hn_ into logits_): the drafts' token subset or the whole head, at 2 bits
-    /// where that measured faster on this device (int2_).
-    void draft_logits(strata::gpu::Stream cs);
+    /// where that measured faster on this device (int2_); `pos` is that row's position (device).
+    void draft_logits(const int32_t* pos, strata::gpu::Stream cs);
     /// int2_ from the model file's head rows, kept where it measures faster (a failure keeps the head as it is).
     void setup_int2();
     /// One block over the window's T rows of x_ (MoE layer `ml` of the tiers, ring `ring` + 1): a segmented window's
