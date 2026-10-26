@@ -34,6 +34,8 @@ test('the chat screen uses the reader-driven rule, not the 120 px band', async (
   assert.doesNotMatch(chat, /clientHeight < 120/);
   assert.match(chat, /followAfterScroll\(/);
   assert.match(chat, /onWheel=/);
+  // sending a message still brings the reader to it, even from far up
+  assert.match(chat, /pinned\.current \|\| sent/);
   // an upward wheel on a transcript that cannot scroll must not switch following off
   assert.match(chat, /wheelLeavesBottom\(e\.deltaY\) && e\.currentTarget\.scrollTop > 0/);
 });

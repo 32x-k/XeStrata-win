@@ -215,6 +215,7 @@ export function ChatScreen() {
     const pinned = useRef(true);
     /** When the reader last used the wheel, a finger, a key or the scrollbar on the transcript. */
     const readerInput = useRef(0);
+    const messageCount = useRef(0);
     /**
      * Scrolls to the newest message and stays there.
      *
@@ -271,7 +272,11 @@ export function ChatScreen() {
             return;
         // The reader's own scrolling decides (#4014): a wheel notch is about 100 px and used to land inside a 120 px band that pulled
         // the view back on every token. `pinned` is set by the scroller's wheel, touch, key and scroll handlers below.
-        if (pinned.current)
+        const count = session?.messages.length ?? 0;
+        const sent = count > messageCount.current && session?.messages.at(-1)?.role === 'user';
+        messageCount.current = count;
+        // Sending a message always brings the reader to it, as it did before; only the answer's growth waits for the reader.
+        if (pinned.current || sent)
             scrollToLatest();
     }, [session?.messages.length, session?.messages.at(-1)?.content, scrollToLatest]);
     // Scroll position is remembered per conversation, so returning to one puts you
