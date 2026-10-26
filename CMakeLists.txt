@@ -994,6 +994,13 @@ if(STRATA_ENABLE_XE)
     add_executable(qsa_dense_attn_parity src/kernels/qsa_dense_attn_parity.cpp)
     target_link_libraries(qsa_dense_attn_parity PRIVATE strata_kernels)
     add_test(NAME qsa_dense_attn_parity COMMAND qsa_dense_attn_parity)
+    # the plain models' prompt attention (Qwen3.5-9B's 16/4 heads of 256) against FP64 (synthetic): the device's kernel
+    # (WMMA on RDNA3 and RDNA4), and the FMA one
+    add_executable(prompt_attn_parity src/kernels/prompt_attn_parity.cpp)
+    target_link_libraries(prompt_attn_parity PRIVATE strata_kernels)
+    add_test(NAME prompt_attn_parity COMMAND prompt_attn_parity)
+    add_test(NAME prompt_attn_parity_fma COMMAND prompt_attn_parity)
+    set_tests_properties(prompt_attn_parity_fma PROPERTIES ENVIRONMENT "STRATA_PROMPT_ATTN_MMA=0")
     # Plan v0.3 P7 / PR #21: INT8 and Q4_0 KV storage against host references (synthetic, no model).
     add_executable(kv_q8_parity src/kernels/kv_q8_parity.cpp)
     target_link_libraries(kv_q8_parity PRIVATE strata_kernels)
