@@ -2670,6 +2670,14 @@ struct Model::Impl {
                     host_allocs.pop_back();
                 }
                 chunks.clear();
+                if (slab_auto_grew_) {   // the automatic slab did not fit: the 0.2.6 slab first, the chunk only if that does not fit either
+                    slab_auto_grew_ = false;
+                    slab_force_base_ = true;
+                    std::fprintf(stderr, "ds4: the automatic attention slab did not fit (%s): trying the 256-row slab
+", aerr.c_str());
+                    aerr.clear();
+                    continue;
+                }
                 const int was = chunk;
                 chunk = chunk > 512 ? chunk / 2 / 16 * 16 : 0;
                 if (chunk > 0) {
@@ -2960,7 +2968,9 @@ struct Model::Impl {
                          room / 1e9, other_b / 1e9, fit ? 16 : 400);
         return fit ? 16 : 400;
     }
+    bool slab_auto_grew_ = false, slab_force_base_ = false;   // the automatic attention slab: grew this try / must not grow (it did not fit)
     bool alloc_chunks(std::string& err) {
+        slab_auto_grew_ = false;
         chunks.resize(devs.size());
         const int D = g.dim, H = g.hc, HD = g.hd;
         const int cols = (pk.eg_ngram - 1) * pk.eg_heads, ehd = pk.eg_hd;
@@ -2979,10 +2989,29 @@ struct Model::Impl {
             // DS4_ATTN_SLAB=N: the attention slab's rows.  The dense projections (q_b, wo_a/b) are dequantized and GEMM'd
             // once a slab, so a slab of 256 rows dequantizes the same weights 32 times for an 8K prompt (measured: the
             // dense dequant 916 ms of the 8K prompt, rocBLAS 867 ms); a larger slab costs VRAM for c.q/c.o and the oa
-            // buffers (A * HQ x 4 bytes each).
-            if (const char* v = std::getenv("DS4_ATTN_SLAB")) {
-                const int a = std::atoi(v);
-                if (a > 0) c.A = std::max(64, std::min(chunk, a) / 64 * 64);
+            // buffers (A * HQ x 4 bytes each).  0.2.7: unset = automatic (attn_slab_rows: up to 2048 rows where the buffers
+            // take VRAM no expert would have used), 0 = the 0.2.6 rule above, N = that many rows.
+            {
+                int env = -1;
+                if (const char* v = std::getenv("DS4_ATTN_SLAB")) env = std::max(0, std::atoi(v));
+                if (slab_force_base_ && env < 0) env = 0;
+                // per row: c.q + c.o (float), c.o16 (half), c.oa (float), c.oa16 (half)
+                const double bpr = (double) HQ * 10.0 + (double) OG * (double) g.o_lora * 6.0;
+                double spare = 1e18;   // the expert tier off (--vram-experts 0): the buffers cost no expert
+                if (o.vram_experts > 0.0) {
+                    double exp_b = 0, room = 0, other_b = 0;
+                    gpu_expert_share(&exp_b, &room, &other_b);
+                    spare = (room - other_b - exp_b) / (double) std::max<size_t>(1, devs.size());
+                }
+                const int base = c.A;
+                c.A = strata::ds4::attn_slab_rows(env, chunk, base, spare, bpr);
+                if (env < 0 && c.A > base) {
+                    slab_auto_grew_ = true;
+                    if (di == 0 && o.verbose)
+                        std::fprintf(stderr, "ds4: attention slab %d rows (automatic: %.1f GB of VRAM to spare beyond the experts; DS4_ATTN_SLAB=0 keeps %d)
+",
+                                     c.A, spare / 1e9, base);
+                }
             }
             // (the indexer's slab: its scores rows are the context wide - about 64 MB of them)
             c.AI = std::max(32, std::min(128, (int) (((size_t) 64 << 20) / (((size_t) o.max_context + 64) * 4)) / 32 * 32));

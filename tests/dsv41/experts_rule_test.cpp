@@ -8,6 +8,7 @@
 using strata::ds4::experts_per_word;
 using strata::ds4::experts_test_override;
 using strata::ds4::copy_all_fits;
+using strata::ds4::attn_slab_rows;
 
 static int fails = 0;
 #define CHECK_EQ(a, b)                                                                              \
@@ -70,6 +71,25 @@ int main() {
     unsetenv("DS4_TOPK");
 #endif
     CHECK_EQ(experts_test_override(5, 6), 5);
+    // attention slab rows: attn_slab_rows(env, chunk, base, spare_bytes, bytes_per_row).  bpr of this model ~ 32768 * 10 + 8 * 1024 * 6 = 377 KB.
+    {
+        const double bpr = 377000.0;
+        CHECK_EQ(attn_slab_rows(-1, 8192, 256, 1e18, bpr), 2048);         // unset, the expert tier is off (--vram-experts 0): automatic 2048
+        CHECK_EQ(attn_slab_rows(-1, 8192, 256, 4.0e9, bpr), 2048);        // 4 GB of VRAM to spare: automatic
+        CHECK_EQ(attn_slab_rows(-1, 8192, 256, -5.0e9, bpr), 256);        // the 5070: every spare byte is an expert's: the 0.2.6 slab
+        CHECK_EQ(attn_slab_rows(-1, 8192, 256, 0.0, bpr), 256);
+        CHECK_EQ(attn_slab_rows(-1, 8192, 256, 0.9e9, bpr), 256);         // 1792 rows x 377 KB = 676 MB; needs 1.25 x + 256 MB = 1.1 GB
+        CHECK_EQ(attn_slab_rows(-1, 8192, 256, 1.2e9, bpr), 2048);
+        CHECK_EQ(attn_slab_rows(-1, 1024, 256, 1e18, bpr), 1024);         // a 1024 chunk caps the slab
+        CHECK_EQ(attn_slab_rows(-1, 4096, 256, 1e18, bpr), 2048);
+        CHECK_EQ(attn_slab_rows(-1, 128, 64, 1e18, bpr), 128);
+        CHECK_EQ(attn_slab_rows(-1, 8192, 2560, 1e18, bpr), 2560);        // a base already above the automatic size is kept
+        CHECK_EQ(attn_slab_rows(0, 8192, 256, 1e18, bpr), 256);           // DS4_ATTN_SLAB=0: the 0.2.6 rule, whatever the spare
+        CHECK_EQ(attn_slab_rows(1024, 8192, 256, -5.0e9, bpr), 1024);     // N: that many rows, the spare is the user's call
+        CHECK_EQ(attn_slab_rows(100, 8192, 256, 1e18, bpr), 64);          // rounded down to 64, at least 64
+        CHECK_EQ(attn_slab_rows(99999, 8192, 256, 1e18, bpr), 8192);      // at most the chunk
+        CHECK_EQ(attn_slab_rows(300, 8192, 256, 1e18, bpr), 256);
+    }
     // prompt chunk: prefill_chunk_default(own_default, gpu_share, gguf_copy, file_experts, hip, min_vram, big=8192).  What `strata launch` runs on one card
     // passes neither --tp nor --threads, but the engine's default tp is 2, so own_default is false there; a launch with several cards passes --tp 1.
     using strata::ds4::prefill_chunk_default;

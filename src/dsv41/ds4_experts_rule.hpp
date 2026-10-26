@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstdint>
+#include <algorithm>
 #include <cstdlib>
 
 namespace strata::ds4 {
@@ -57,6 +58,24 @@ inline int prefill_chunk_default(bool own_default, double gpu_share, bool gguf_c
 inline bool copy_all_fits(double lane_bytes, uint64_t ram_avail, double ram_margin, double commit_room) {
     if (!(lane_bytes > 0.0) || ram_avail == ~uint64_t{0}) return false;
     return lane_bytes + ram_margin <= (double) ram_avail && lane_bytes <= commit_room;
+}
+
+// The chunked prompt's attention slab (rows a pass: the dense projections q_b / wo_a / wo_b are dequantized and multiplied once a slab, so
+// a 256-row slab dequantizes them 32 times for an 8K prompt).  `base`: the 0.2.6 rule (8 MB of rows / heads width, 256 on this model).
+// DS4_ATTN_SLAB=N (`env` >= 0): 0 gives the 0.2.6 rule back, N > 0 asks for that many rows (64..chunk, a multiple of 64).  Unset (`env` < 0):
+// automatic - up to 2048 rows, but only where the bigger buffers take VRAM no expert would have used: `spare_bytes` is the card's room
+// beyond what its expert tier can use (huge when the tier is off, e.g. --vram-experts 0), `bytes_per_row` the buffers' cost of one row.
+// The answers do not change with the slab (a row's arithmetic is its own), but the experts a card holds do: measured 2026-10-26 on the RTX
+// 5070 (12 GB, 2.25 bpw, 8K prompt): 1024 rows +2.0% prompt, 2048 rows +2.2%, at 29 / 83 fewer experts in VRAM, a -3% decode and different
+// greedy ids (placement); so a card whose room is all experts keeps the 0.2.6 slab, and the automatic size is for cards with VRAM to spare.
+inline int attn_slab_rows(int env, int chunk, int base, double spare_bytes, double bytes_per_row) {
+    auto clampn = [&](int a) { return std::max(64, std::min(chunk, a) / 64 * 64); };
+    if (env == 0) return base;
+    if (env > 0) return clampn(env);
+    const int target = clampn(2048);
+    if (target <= base) return base;
+    const double extra = (double) (target - base) * bytes_per_row;
+    return spare_bytes >= extra * 1.25 + (256.0 * 1048576.0) ? target : base;
 }
 
 // DS4_TOPK=N (a test, not for users): over the flag and the rule; returns the count to use
