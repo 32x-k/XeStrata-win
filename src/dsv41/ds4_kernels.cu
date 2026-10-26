@@ -1998,13 +1998,15 @@ bool split_enabled() {
     }();
     return on;
 }
-// DS4_FAST_ATTN=1: the chunked prompt's packed-KV attention on the matrix cores (sparse_attn_wmma_kernel).  Opt-in: the
-// QK/PV sums are the matrix cores' order, so the outputs differ from the scalar kernel's in the last places (the owner
-// approved the trade for the prefill; the decode path stays on the scalar kernels).
+// The chunked prompt's packed-KV attention on the matrix cores (sparse_attn_wmma_kernel).  ON by default: measured on
+// 4x R9700, 2.25 bpw, 8K code prompts, warm medians of three a load -- 1180 ppts without it, 1354 with it (+14.7%),
+// the same ids (5705e1164a).  The QK/PV sums are the matrix cores' order, so the last places differ from the scalar
+// kernel's and the owner approved that trade for the prefill; the decode path stays on the scalar kernels.
+// DS4_FAST_ATTN=0 turns it off.
 bool fast_attn_enabled() {
     static const bool on = [] {
         const char* e = std::getenv("DS4_FAST_ATTN");
-        return e != nullptr && std::atoi(e) != 0;
+        return e != nullptr ? std::atoi(e) != 0 : true;
     }();
     return on;
 }
