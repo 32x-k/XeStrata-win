@@ -124,6 +124,24 @@ const shots = [
     await sleep(1500);
     return p;
   }],
+  ["18-german-chat", async () => {
+    const p = await openPage(browser, mock, { width: 1280, height: 800, query: "?lang=de", seed: { chat: CHAT, ...on() } });
+    await p.evaluate(() => { openRewind(2); });
+    await sleep(200);
+    return p;
+  }],
+  ["19-german-chat-settings", async () => {
+    const p = await openPage(browser, mock, { width: 1280, height: 900, query: "?lang=de", seed: { chat: CHAT } });
+    await p.click("#sampling-btn"); await sleep(500);
+    await p.$eval(".st-drawer__body", (e) => { e.scrollTop = e.scrollHeight; });
+    await sleep(200);
+    return p;
+  }],
+  ["20-dark-saved-chats", async () => {
+    const p = await openPage(browser, mock, { width: 1280, height: 800, dark: true, seed: { chat: CHAT, ...on() } });
+    await seedChats(p);
+    return p;
+  }],
   ["17-narrow-wide-mid-900", async () => openPage(browser, mock, { width: 900, height: 700, seed: { chat: CHAT, ...on() } })],
 ];
 
