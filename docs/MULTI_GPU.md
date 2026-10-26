@@ -90,6 +90,7 @@ estimated 2 GB of its own buffers.
 - Intel GPUs in a split, and a mix of NVIDIA and AMD cards. An engine drives one make of card. The app, `strata launch` and setup
   offer only the cards the engine can drive, and say so when the other make has the bigger card. AMD cards share a model among
   themselves: `./setup.sh --backend hip --gpus 1,0` ([AMD_HIP.md](AMD_HIP.md)).
+  A prompt read on one card and an answer made on another, with the session handed over in RAM, is a different opt-in: [SPLIT_SERVE.md](SPLIT_SERVE.md).
 
 ## How the split works
 

@@ -43,6 +43,18 @@ def read_ids(path):
     return [int(x) for x in open(path).read().replace("\n", ",").split(",") if x.strip()]
 
 
+def session_dir(cfg):
+    """Where the session files go: cfg["session_dir"], else /dev/shm when it has room (as the server chooses), else cfg["dir"]."""
+    d = cfg.get("session_dir")
+    if not d and os.path.isdir("/dev/shm"):
+        import shutil
+        if shutil.disk_usage("/dev/shm").free > (6 << 30):
+            d = "/dev/shm/strata-split-check"
+    d = d or cfg["dir"]
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
 def mem_available_gib():
     for line in open("/proc/meminfo"):
         if line.startswith("MemAvailable"):
@@ -144,7 +156,7 @@ def cmd_exact(a, cfg):
     for _ in pe.generate(ids, 0, {}, cancel, prefill_only=True):
         pass
     hp = state_hashes(log_tail(pe, pos))
-    path = os.path.join(cfg["dir"], "exact.session")
+    path = os.path.join(session_dir(cfg), "exact.session")
     saved = pe.session_file("save", path)
     print(f"prefill engine: held {saved['tokens']} tokens, saved {saved['bytes'] / 2**20:.0f} MiB in {saved['ms']:.0f} ms",
           flush=True)
@@ -227,7 +239,7 @@ def cmd_bench(a, cfg):
                                                     "min_prompt_tokens": cfg.get("min_prompt_tokens", 2048)}})
         pe = make_engine(cfg, P, "prefill", extra_args=cfg.get("prefill_args", []), arena=arena)
         de = make_engine(cfg, Dg, "decode", extra_args=cfg.get("decode_args", []), arena=arena)
-        eng = split_mod.SplitEngine(pe, de, min_tokens=spec["min_prompt_tokens"], work_dir=cfg["dir"], say=print)
+        eng = split_mod.SplitEngine(pe, de, min_tokens=spec["min_prompt_tokens"], work_dir=session_dir(cfg), say=print)
         closers = [pe, de]
     else:
         raise SystemExit("--arm layer|single|split")
