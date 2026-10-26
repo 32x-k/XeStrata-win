@@ -775,7 +775,7 @@ bool PlainModel::prompt_int8() const {
 }
 
 void PlainModel::prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* host, uint64_t& dev_bytes,
-                              uint64_t& host_bytes) const {
+                              uint64_t& host_bytes, PromptPieces* pieces) const {
     const ModelSpec& s = spec_;
     const auto& lay = k::cpu::expert_layout();
     const uint64_t N = (uint64_t) s.n_embd, NH = (uint64_t) s.n_head, HD = (uint64_t) s.key_length, NKV = (uint64_t) nkv_;
@@ -809,10 +809,30 @@ void PlainModel::prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* h
                            &g.q_b, &g.kv_a, &g.idx_q_b, &g.idx_k, &g.idx_gate, &g.o, &g.ffn_gate, &g.ffn_up, &g.ffn_down})
             b.gemm_elems = std::max<int64_t>(b.gemm_elems, (int64_t) w->n_in * w->n_out);
     b.gemm_elems = std::min<int64_t>(b.gemm_elems, (int64_t) 1 << 25);
-    uint64_t at = 0;
+    uint64_t at = 0, in = 0;   // in: the bytes taken in piece pi
+    size_t pi = 0;
+    const bool sizing = pieces != nullptr && pieces->at.empty();
+    const uint64_t cap = sizing ? max_alloc_bytes() : 0;
+    if (sizing) pieces->bytes.clear();
     auto take = [&](auto*& ptr, uint64_t bytes) {
-        ptr = dev ? (std::remove_reference_t<decltype(ptr)>) (dev + at) : nullptr;
-        at += (std::max<uint64_t>(bytes, 1) + 255) & ~255ull;
+        using P = std::remove_reference_t<decltype(ptr)>;
+        const uint64_t n = (std::max<uint64_t>(bytes, 1) + 255) & ~255ull;
+        if (pieces == nullptr) {
+            ptr = dev ? (P) (dev + at) : nullptr;
+        } else {   // the next piece where this one is full (sizing: at the cap; laying out: at the piece's bytes)
+            const uint64_t room = sizing ? cap : pi < pieces->bytes.size() ? pieces->bytes[pi] : 0;
+            if (in > 0 && in + n > room) {
+                ++pi;
+                in = 0;
+            }
+            if (sizing) {
+                if (pieces->bytes.size() <= pi) pieces->bytes.push_back(0);
+                pieces->bytes[pi] = in + n;
+            }
+            ptr = !sizing && pi < pieces->at.size() ? (P) (pieces->at[pi] + in) : nullptr;
+            in += n;
+        }
+        at += n;
     };
     take(b.x, U * N * 4); take(b.hn, U * N * 4); take(b.mix, U * N * 4); take(b.x16, U * max_in * 2);
     take(b.qkv, U * C * 4); take(b.z, U * ZV * 4); take(b.ab, U * 2 * HV * 4); take(b.gate, U * HV * 4);
@@ -852,7 +872,7 @@ void PlainModel::prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* h
     const uint64_t xq_cols = rep * std::max<uint64_t>(TK * N, U * max_in);   // the routed rows', or a dense input's
     take(b.xq, xq_cols + 2 * (xq_cols / 32) * 4); take(b.hq, rep * (TK * FF + 2 * TK * (FF / 32) * 4));
     take(b.xq2, dup_mixed && b.int8 ? rep * (TK * N + 2 * TK * (N / 32) * 4) : 0);
-    if (!(dup_mixed && b.int8) && dev != nullptr) b.xq2 = nullptr;
+    if (!(dup_mixed && b.int8) && (dev != nullptr || (pieces != nullptr && !sizing))) b.xq2 = nullptr;
     take(b.identity, std::max(TK, U) * 4);   // a dense product's T rows too (a dense model routes none)
     take(b.wtab, E * sizeof(void*)); take(b.rbounds, (2 * E + 2) * 4); take(b.dense_bounds, 2 * sizeof(int32_t));
     // the CPU's share of the missed experts (plain_prompt.cpp): at most a window's tokens an expert, so 8 E rows
@@ -896,6 +916,25 @@ void PlainModel::prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* h
     hold(b.h_nact, U * k::cpu::kNativeActBytes); hold(b.h_dense_bounds, 2 * sizeof(int32_t));
     hold(b.h_stage, 2 * (uint64_t) PromptBufs::kGroup * lay.max_blob);
     host_bytes = at;
+}
+
+bool PlainModel::alloc_prompt_dev(int64_t T, uint64_t room) {
+    PromptPieces p;
+    uint64_t db = 0, hb = 0;
+    PromptBufs sized = pb_;
+    prompt_carve(T, sized, nullptr, nullptr, db, hb, &p);
+    if (db > room) return false;
+    for (const uint64_t n : p.bytes) {
+        void* d = nullptr;
+        if (n > max_alloc_bytes() || !strata::gpu::alloc_device(&d, (size_t) n)) {
+            for (uint8_t* q : p.at) strata::gpu::free(q);
+            return false;
+        }
+        p.at.push_back(static_cast<uint8_t*>(d));
+    }
+    prompt_dev_ = std::move(p);
+    prompt_dev_T_ = T;
+    return true;
 }
 
 bool PlainModel::open_experts(std::string& err) {
@@ -1104,15 +1143,11 @@ bool PlainModel::open_experts(std::string& err) {
     // they fit (prompt_borrow then lends no slot, so the prompt reads no expert from RAM)
     if (q == E && opt_.prompt_chunk > 0 && prompt_host_ != nullptr) {
         const uint64_t left = room - per_layer_b * (uint64_t) q;
-        for (int64_t T = opt_.prompt_chunk; T >= 16; T /= 2) {
-            uint64_t db = 0, hb = 0;
-            prompt_carve(T, pb_, nullptr, nullptr, db, hb);
-            if (db <= left && db <= max_alloc_bytes() && strata::gpu::alloc_device(&prompt_dev_, (size_t) db)) {
-                allocs_.push_back(prompt_dev_);
-                prompt_dev_T_ = T;
+        for (int64_t T = opt_.prompt_chunk; T >= 16; T /= 2)
+            if (alloc_prompt_dev(T, left)) {
+                for (uint8_t* p : prompt_dev_.at) allocs_.push_back(p);
                 break;
             }
-        }
     }
     res_.assign((size_t) (L * E), -1);
     heat_.assign((size_t) (L * E), 0.0);
@@ -1212,7 +1247,7 @@ bool PlainModel::open_experts(std::string& err) {
                 if (res_[(size_t) (l * E + e)] < 0 && !fill_slot(l, e, err)) return false;
     // the slots the prompt path lends for its longest chunk (prompt_borrow): their experts are kept in RAM too
     lend_from_ = -1;
-    if (opt_.prompt_chunk > 0 && prompt_dev_ == nullptr && n_slots_ > 1) {
+    if (opt_.prompt_chunk > 0 && prompt_dev_.at.empty() && n_slots_ > 1) {
         uint64_t db = 0, hb = 0;
         prompt_carve(opt_.prompt_chunk, pb_, nullptr, nullptr, db, hb);
         const uint64_t* off = cache_.slot_offsets();
@@ -1220,7 +1255,7 @@ bool PlainModel::open_experts(std::string& err) {
         lend_from_ = n_slots_;
         while (off != nullptr && lend_from_ > lowest && off[n_slots_] - off[lend_from_] < db) --lend_from_;
     }
-    if (prompt_dev_ != nullptr)
+    if (!prompt_dev_.at.empty())
         std::fprintf(stderr, "strata plain: the prompt's buffers beside the tier, chunks of up to %lld tokens\n",
                      (long long) prompt_dev_T_);
     free_b_ = free_b;
@@ -1252,22 +1287,21 @@ bool PlainModel::open_dense(std::string& err) {
     if (opt_.prompt_chunk > 0) {
         const int64_t asked = opt_.prompt_chunk;
         for (int64_t T = asked; T >= 16; T /= 2) {
+            if (!alloc_prompt_dev(T, room)) continue;
             uint64_t db = 0, hb = 0;
             prompt_carve(T, pb_, nullptr, nullptr, db, hb);
-            if (db > room || db > max_alloc_bytes() || !strata::gpu::alloc_device(&prompt_dev_, (size_t) db)) continue;
             if (strata::gpu::alloc_host(&prompt_host_, hb)) {
-                allocs_.push_back(prompt_dev_);
-                prompt_dev_T_ = T;
+                for (uint8_t* p : prompt_dev_.at) allocs_.push_back(p);
                 opt_.prompt_chunk = T;
                 prompt_carve(T, pb_, nullptr, (uint8_t*) prompt_host_, db, hb);
                 break;
             }
-            strata::gpu::free(prompt_dev_);
-            prompt_dev_ = nullptr;
+            for (uint8_t* p : prompt_dev_.at) strata::gpu::free(p);
+            prompt_dev_ = PromptPieces();
             prompt_host_ = nullptr;
         }
         // a layer split's: the rows between the stages
-        if (prompt_dev_ != nullptr && !(first() && last()) &&
+        if (!prompt_dev_.at.empty() && !(first() && last()) &&
             !strata::gpu::alloc_host(&hand_host_, (size_t) (asked * hand_w_) * 4)) {
             strata::gpu::free(prompt_host_);
             prompt_host_ = nullptr;

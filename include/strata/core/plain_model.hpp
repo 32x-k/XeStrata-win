@@ -418,20 +418,31 @@ private:
         int32_t* g_ids = nullptr;
         float *g_ffg = nullptr, *g_ffu = nullptr;
     };
-    /// Lays the buffers for chunks of `T` tokens out from `dev` / `host` (null: only counts), returning the device and
-    /// host bytes.
+    /// Device buffers in pieces of at most max_alloc_bytes() (a chunk's buffers may take more than a device allots at
+    /// once: the RX 9060 XT's HIP adapter allots 1 GiB): each piece's bytes and, once allocated, where it lies.
+    struct PromptPieces {
+        std::vector<uint64_t> bytes;
+        std::vector<uint8_t*> at;
+    };
     /// The lowest slot of `n` a prompt chunk may borrow from (prefill::lend_pct of them, 128 left).
     int64_t lend_lowest(int64_t n) const;
     /// --prompt-chunk not given: the chunk from the tier, as Qwen3.8-Flash-Next's --prefill auto.
     void auto_prompt_chunk(uint64_t beside);
+    /// Lays the buffers for chunks of `T` tokens out from `dev` / `host` (null: only counts), returning the device and
+    /// host bytes.  With `pieces` the device's go into pieces instead: sized (pieces->bytes, each within
+    /// max_alloc_bytes()) while pieces->at is empty, else laid out within those pieces in turn (a chunk of at most the
+    /// T they were sized for fits: every buffer grows with T).
     void prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* host, uint64_t& dev_bytes,
-                      uint64_t& host_bytes) const;
+                      uint64_t& host_bytes, PromptPieces* pieces = nullptr) const;
+    /// The pieces for chunks of `T` tokens (prompt_dev_, not yet in allocs_) when they take at most `room` bytes;
+    /// false, nothing held, when they do not or an allocation fails.
+    bool alloc_prompt_dev(int64_t T, uint64_t room);
     PromptBufs pb_;
     void* prompt_host_ = nullptr;
     /// The prompt's device buffers of their own, for chunks of up to prompt_dev_T_ tokens, when every expert has a
-    /// slot and the VRAM beside the tier holds them (else null: prompt_borrow lends the tier's last slots), and a dense
-    /// model's always (open_dense; null there: the prompt runs in windows).
-    void* prompt_dev_ = nullptr;
+    /// slot and the VRAM beside the tier holds them (else none: prompt_borrow lends the tier's last slots), and a dense
+    /// model's always (open_dense; none there: the prompt runs in windows).
+    PromptPieces prompt_dev_;
     int64_t prompt_dev_T_ = 0;
     /// The prompt's device buffers, carved from the tier's last slots for one prompt (prompt_borrow) and given back
     /// after it (prompt_return), with the experts that were in them put back: the tier keeps that memory between

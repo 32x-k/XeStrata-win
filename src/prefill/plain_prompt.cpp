@@ -86,7 +86,7 @@ PlainModel::PromptGemm& PlainModel::prompt_gemm() {
 bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
     if (!settle_swaps(true, err)) return false;   // the tier's copies may still be writing the slots lent below
     if (dense_) {   // no tier: the buffers of its own (open_dense), in even chunks of up to their length
-        if (borrow_first_ >= 0 || prompt_dev_ == nullptr || prompt_dev_T_ < 1) {
+        if (borrow_first_ >= 0 || prompt_dev_.at.empty() || prompt_dev_T_ < 1) {
             err = "plain prompt: no buffers for the prompt's chunks";
             return false;
         }
@@ -95,7 +95,7 @@ bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
         borrow_short_ = false;
         borrowed_res_.clear();
         borrow_first_ = 0;
-        prompt_carve((T + pieces - 1) / pieces, pb_, (uint8_t*) prompt_dev_, (uint8_t*) prompt_host_, db, hb);
+        prompt_carve((T + pieces - 1) / pieces, pb_, nullptr, (uint8_t*) prompt_host_, db, hb, &prompt_dev_);
         PromptGemm& g = prompt_gemm();
         g.gemm.rebind(pb_.gemm_scratch, pb_.gemm_elems);
         g.identity = false;
@@ -121,12 +121,12 @@ bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
     }
     // the buffers of their own when their chunk is no shorter than the borrowed one: no slot lent, prompt_return
     // gives back none
-    if (prompt_dev_ != nullptr && (T < least || std::min(want, prompt_dev_T_) >= T)) {
+    if (!prompt_dev_.at.empty() && (T < least || std::min(want, prompt_dev_T_) >= T)) {
         const int64_t pieces = (want + prompt_dev_T_ - 1) / prompt_dev_T_;   // even chunks: no short last one
         T = (want + pieces - 1) / pieces;
         borrowed_res_.clear();
         borrow_first_ = n;
-        prompt_carve(T, pb_, (uint8_t*) prompt_dev_, (uint8_t*) prompt_host_, db, hb);
+        prompt_carve(T, pb_, nullptr, (uint8_t*) prompt_host_, db, hb, &prompt_dev_);
         PromptGemm& g = prompt_gemm();
         g.gemm.rebind(pb_.gemm_scratch, pb_.gemm_elems);
         g.identity = false;
