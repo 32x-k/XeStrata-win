@@ -1,4 +1,4 @@
-// include/strata/prefill/kva.hpp - STRATA_KVA: the optional approximate-prefill plan (research, opt-in).
+// include/strata/prefill/kva.hpp - STRATA_KVA: the approximate late-layer prompt read (on by default since 0.2.7).
 //
 // After layer `split` the prompt's late layers need only their recurrent state (GDN recurrence + conv history)
 // and their KV/indexer caches; the attention output, the output projection, the MoE half and its expert
@@ -14,27 +14,64 @@
 //   oracle    a captured real input per late layer (STRATA_KVA_ORACLE=<dir>; the plumbing/parity mode),
 //   linear    a fitted low-rank projector (STRATA_KVA_PROJECTOR=<file>; not implemented in this step).
 //
-// Everything here is read from the environment once per process and is off unless STRATA_KVA is set, so a
-// default build behaves exactly as before.
+// 0.2.7: the read is ON by default for a cold prompt of STRATA_KVA_MIN_PROMPT tokens or more on one CUDA/HIP
+// device.  STRATA_KVA=0 brings back the exact 0.2.6 prompt path and the 0.2.6 draft window.  Everything is read from
+// the environment once per process.
+//
+// What the engine tells this header at start-up (kva_engine()): whether its configuration rules the read out for the
+// whole process (batch slots, a layer split, a peer device).
+//
+// The draft layer (MTP) builds its K/V from the final rows of the prompt, which an approximated chunk does not have.
+// Its window is NOT changed, and by default neither is anything else: the draft cells of an approximated chunk are
+// built from the rows that chunk has and the draft layer attends to them (measured: draft acceptance after a KVA
+// read stays within noise on the P100).  The research option STRATA_KVA_DRAFT_FLOOR=1 gives the draft layer a "cell
+// floor" per session (MtpDrafter::set_cell_floor; kva_floor.hpp keeps it with the tokens of the session,
+// window_start.hpp is the one rule the kernel and the tests share): the first cell built from a real row, below
+// which no draft cell is built or read.  The target model verifies every token whatever the draft read.
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 
 namespace strata::prefill {
+
+/// Does this build have the state-only late-layer path?  CUDA and HIP: yes.  The Metal engine compiles prefill.cpp
+/// against its own kernel library, which has none.
+#if defined(STRATA_GPU_METAL)
+inline constexpr bool kKvaBackend = false;
+#else
+inline constexpr bool kKvaBackend = true;
+#endif
+
+/// The fully computed tail of every approximated read.
+inline constexpr int64_t kKvaSuffixDefault = 2048;
+
+/// What the running engine knows and the environment cannot say.
+struct KvaEngine {
+    std::string blocked;           ///< non-empty: this process never reads approximately, and why
+};
+
+inline KvaEngine& kva_engine() {
+    static KvaEngine e;
+    return e;
+}
 
 struct KvaConfig {
     enum class Mode { Identity, Oracle, Linear };
     enum class Only { All, Gdn, Qsa };
 
-    bool on = false;             ///< STRATA_KVA=1
+    bool on = true;              ///< on unless STRATA_KVA=0 (or this build has no path)
+    bool explicit_on = false;    ///< STRATA_KVA was set to something other than 0: every declined read says why
     bool capture = false;        ///< STRATA_KVA_CAPTURE=<dir>: dump every late layer's real input rows
     bool capture_fp32 = false;   ///< STRATA_KVA_CAPTURE_FP32=1: fp32 records (else bf16; fp32 is for parity runs)
     bool oracle_fp32 = false;    ///< STRATA_KVA_ORACLE_FP32=1: the oracle files are fp32 (else bf16)
     bool parity = false;         ///< STRATA_KVA_PARITY=1: report the state-only path against the full path
+    bool draft_floor = false;    ///< STRATA_KVA_DRAFT_FLOOR=1: the draft layer skips the cells of approximated chunks (research; default: it reads them)
     int64_t split = 24;          ///< STRATA_KVA_SPLIT: first approximated layer (zero-based)
-    int64_t suffix = 2048;       ///< STRATA_KVA_SUFFIX: fully computed tail positions (rounded up to a chunk)
+    int64_t suffix_env = 0;      ///< STRATA_KVA_SUFFIX: fully computed tail positions (0 = not set: kKvaSuffixDefault)
     int64_t min_prompt = 4096;   ///< STRATA_KVA_MIN_PROMPT: shorter prompts stay on the full path
     Mode mode = Mode::Identity;  ///< STRATA_KVA_MODE=identity|oracle|linear
     Only only = Only::All;       ///< STRATA_KVA_ONLY=all|gdn|qsa: which late layers take the approximate path
@@ -42,12 +79,45 @@ struct KvaConfig {
     std::string capture_dir;     ///< STRATA_KVA_CAPTURE
     std::string projector;       ///< STRATA_KVA_PROJECTOR
 
-    /// Does this run qualify at all?  A cold read of one prompt, on one stage, long enough for a suffix to
-    /// leave approximated positions behind it.
-    bool applies(int64_t pos0, int64_t n, int64_t lb, int64_t le, int64_t n_layers) const {
-        if (!on || capture) return false;   // capture runs are ordinary full reads
-        if (pos0 != 0 || lb != 0 || (le >= 0 && le != n_layers)) return false;
-        return n >= min_prompt && n > suffix + 64;
+    /// The fully computed tail of a read: STRATA_KVA_SUFFIX when set, otherwise 2048.
+    int64_t effective_suffix() const { return suffix_env > 0 ? suffix_env : kKvaSuffixDefault; }
+
+    /// Does the draft layer need the cell floor at all?  Only when a read can approximate something: KVA on, not ruled
+    /// out for the process, and a draft layer loaded.  Otherwise the draft layer's attention is 0.2.6's own code.
+    bool wants_cell_floor(const KvaEngine& e, bool has_drafter) const {
+        return kKvaBackend && on && draft_floor && e.blocked.empty() && has_drafter;
+    }
+
+    /// Why this read cannot take the approximate path, or nullptr when it can: a cold read of one prompt (not a
+    /// continuation, no layer split, no pictures, no DFlash2 taps), on an engine that allows it, long enough for a
+    /// suffix to leave approximated positions behind it.  `routine` (optional) is set when the reason is an
+    /// everyday one (a continuation, a short prompt) that an engine running KVA by default does not log.
+    const char* decline(const KvaEngine& e, int64_t pos0, int64_t n, int64_t lb, int64_t le, int64_t n_layers,
+                        bool pictures = false, bool taps = false, bool* routine = nullptr,
+                        bool unvalidated_model = false) const {
+        if (routine) *routine = false;
+        if (!on) return "off (STRATA_KVA=0)";
+        if (capture) return "capture mode";
+        if (!e.blocked.empty()) return e.blocked.c_str();
+        // The split layer, the state-only layers and the suffix rule were measured on one geometry (Qwen3.8-Flash-Next,
+        // 48 layers, 512 experts).  Another model reads exactly unless STRATA_KVA=1 asks for it.
+        if (unvalidated_model && !explicit_on) return "KVA was not validated for this model (STRATA_KVA=1 forces it)";
+        if (pos0 != 0) {
+            if (routine) *routine = true;
+            return "a continuation read (pos0 != 0)";
+        }
+        if (lb != 0 || (le >= 0 && le != n_layers)) return "a layer split (not the whole trunk)";
+        if (pictures) return "a prompt with pictures";
+        if (taps) return "the DFlash2 drafter reads the late layers' hidden states";
+        if (n < min_prompt) {
+            if (routine) *routine = true;
+            return "the prompt is shorter than STRATA_KVA_MIN_PROMPT";
+        }
+        if (n <= effective_suffix() + 64) {
+            if (routine) *routine = true;
+            return "the suffix leaves too few positions to approximate";
+        }
+        return nullptr;
     }
 };
 
@@ -63,41 +133,49 @@ inline bool kva_env_flag(const char* name, bool dflt) {
     return v[0] != '0';
 }
 
+/// The settings as the environment says now (uncached: the tests call it after changing the environment).
+inline KvaConfig kva_config_from_env() {
+    KvaConfig k;
+    const char* sw = std::getenv("STRATA_KVA");
+    const bool set = sw != nullptr && *sw != '\0';
+    k.on = !set || sw[0] != '0';
+    k.explicit_on = set && sw[0] != '0';
+    if (!kKvaBackend) k.on = false;
+    k.split = kva_env_i64("STRATA_KVA_SPLIT", 24);
+    k.suffix_env = std::max<int64_t>(0, kva_env_i64("STRATA_KVA_SUFFIX", 0));
+    k.min_prompt = kva_env_i64("STRATA_KVA_MIN_PROMPT", 4096);
+    k.parity = kva_env_flag("STRATA_KVA_PARITY", false);
+    k.draft_floor = kva_env_flag("STRATA_KVA_DRAFT_FLOOR", false);
+    if (const char* d = std::getenv("STRATA_KVA_CAPTURE"); d != nullptr && *d != '\0') {
+        k.capture = true;
+        k.capture_dir = d;
+        k.capture_fp32 = kva_env_flag("STRATA_KVA_CAPTURE_FP32", false);
+    }
+    if (const char* d = std::getenv("STRATA_KVA_ORACLE"); d != nullptr && *d != '\0') {
+        k.oracle_dir = d;
+        k.mode = KvaConfig::Mode::Oracle;
+        k.oracle_fp32 = kva_env_flag("STRATA_KVA_ORACLE_FP32", false);
+    }
+    if (const char* d = std::getenv("STRATA_KVA_PROJECTOR"); d != nullptr && *d != '\0') {
+        k.projector = d;
+        k.mode = KvaConfig::Mode::Linear;
+    }
+    if (const char* m = std::getenv("STRATA_KVA_MODE"); m != nullptr && *m != '\0') {
+        if (std::string(m) == "oracle") k.mode = KvaConfig::Mode::Oracle;
+        else if (std::string(m) == "linear") k.mode = KvaConfig::Mode::Linear;
+        else k.mode = KvaConfig::Mode::Identity;
+    }
+    if (const char* o = std::getenv("STRATA_KVA_ONLY"); o != nullptr && *o != '\0') {
+        if (std::string(o) == "gdn") k.only = KvaConfig::Only::Gdn;
+        else if (std::string(o) == "qsa") k.only = KvaConfig::Only::Qsa;
+        else k.only = KvaConfig::Only::All;
+    }
+    return k;
+}
+
 /// The process's KVA settings, parsed once (the engine's own options are parsed once too).
 inline const KvaConfig& kva_config() {
-    static const KvaConfig c = [] {
-        KvaConfig k;
-        k.on = kva_env_flag("STRATA_KVA", false);
-        k.split = kva_env_i64("STRATA_KVA_SPLIT", 24);
-        k.suffix = kva_env_i64("STRATA_KVA_SUFFIX", 2048);
-        k.min_prompt = kva_env_i64("STRATA_KVA_MIN_PROMPT", 4096);
-        k.parity = kva_env_flag("STRATA_KVA_PARITY", false);
-        if (const char* d = std::getenv("STRATA_KVA_CAPTURE"); d != nullptr && *d != '\0') {
-            k.capture = true;
-            k.capture_dir = d;
-            k.capture_fp32 = kva_env_flag("STRATA_KVA_CAPTURE_FP32", false);
-        }
-        if (const char* d = std::getenv("STRATA_KVA_ORACLE"); d != nullptr && *d != '\0') {
-            k.oracle_dir = d;
-            k.mode = KvaConfig::Mode::Oracle;
-            k.oracle_fp32 = kva_env_flag("STRATA_KVA_ORACLE_FP32", false);
-        }
-        if (const char* d = std::getenv("STRATA_KVA_PROJECTOR"); d != nullptr && *d != '\0') {
-            k.projector = d;
-            k.mode = KvaConfig::Mode::Linear;
-        }
-        if (const char* m = std::getenv("STRATA_KVA_MODE"); m != nullptr && *m != '\0') {
-            if (std::string(m) == "oracle") k.mode = KvaConfig::Mode::Oracle;
-            else if (std::string(m) == "linear") k.mode = KvaConfig::Mode::Linear;
-            else k.mode = KvaConfig::Mode::Identity;
-        }
-        if (const char* o = std::getenv("STRATA_KVA_ONLY"); o != nullptr && *o != '\0') {
-            if (std::string(o) == "gdn") k.only = KvaConfig::Only::Gdn;
-            else if (std::string(o) == "qsa") k.only = KvaConfig::Only::Qsa;
-            else k.only = KvaConfig::Only::All;
-        }
-        return k;
-    }();
+    static const KvaConfig c = kva_config_from_env();
     return c;
 }
 

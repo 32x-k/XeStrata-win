@@ -1,7 +1,4 @@
-# KVA: approximate prompt processing for the late layers (opt-in, research)
-
-This is an **experimental, opt-in** feature. Nothing in it runs unless `STRATA_KVA=1` is set, and a build without
-that variable behaves exactly as before.
+# KVA: the faster prompt read for long cold prompts (on by default since 0.2.7)
 
 KVA ("approximate late-layer state") reads a long prompt exactly through layer 23, then for the late layers
 24–47 builds **only their recurrent state** — the GDN recurrence and convolution history, the QSA K/V pages and
@@ -10,41 +7,94 @@ the indexer keys — instead of running the whole layer. The attention output, t
 results. The last positions of the prompt are then read fully, exactly as before, and decode runs the ordinary
 full path against the state KVA built.
 
-## Turning it on
+It is an approximation: the answers can differ from the exact read (see "Measured" for how much). **`STRATA_KVA=0`
+turns it off and gives the exact 0.2.6 prompt path.** The Strata app shows this as the "Faster long prompts" switch
+in Expert settings; it sends `STRATA_KVA=0` when the switch is off.
 
-```sh
-STRATA_KVA=1 \
-STRATA_KVA_SUFFIX=2112 \
-STRATA_KVA_MIN_PROMPT=4096 \
-  strata --serve ... --prefill 1024 --mtp-window 2048
-```
+## When it runs
+
+KVA runs when all of these hold, and says so in the engine log:
+
+- Qwen3.8-Flash-Next on CUDA or HIP (not SYCL, not Metal; Qwen3.6 and the other models read exactly);
+- one GPU, no `--batch` slots, no `--peer-device`, no DFlash2 drafter;
+- the read is cold (it starts at position 0 of the session) and the text has no pictures;
+- the prompt (or the part of it read in one go, see below) has at least `STRATA_KVA_MIN_PROMPT` tokens (4096) and
+  more than the fully computed tail plus 64.
+
+Otherwise the prompt is read exactly. An engine that was started with `STRATA_KVA=1` logs the reason for every
+read it turned away (`strata prefill: KVA configured but NOT applied: <reason>`); with the default it logs only
+a long prompt turned away for an unusual reason (a layer split, pictures), and once at start-up when the engine
+configuration rules KVA out for the whole run.
+
+## The fully computed tail and the draft layer
+
+The last `suffix` positions (2048, or `STRATA_KVA_SUFFIX`) are always read exactly.
+
+The MTP draft layer builds its K/V from the final residuals of the prompt. An approximated chunk has no final
+residual of its own, so its draft cells are built from the rows that chunk does have. By default nothing about the
+draft layer changes: its window is whatever it was (`--mtp-window`, default 32768 cells), it builds the same cells and
+attends to the same cells as with `STRATA_KVA=0`. The target model verifies every token, so the draft only decides
+how many tokens a verify window keeps (decode speed), never the answer.
+
+Measured on the P100 (IQ3_XXS, auto cache and prefill, 14K and 30K prompts, 256 tokens), the draft layer attends to
+those cells with acceptance within noise of the exact read. A forced small window (the first default-on build set
+`--mtp-window 2048` for every session) and the research option below both cost acceptance on faster cards.
+
+`STRATA_KVA_DRAFT_FLOOR=1` (research): the draft layer gets a *cell floor* per session, the first cell built from a real
+row. It builds no draft cell below it and attends to `[max(floor, pos - window), pos)`, the exact tail growing with
+the conversation. The floor follows the tokens of the state a request continues from (`kva_floor.hpp`); a state no KVA
+read produced has floor 0. It is off by default because it costs draft acceptance after long prompts.
+
+## Chats, follow-up turns and checkpoints (`--serve`)
+
+The server reads a prompt in parts: up to the end of a long system prompt (the shared checkpoint), up to the last
+turn header, then the new turn's header and the last token. Each part that starts at position 0 and is long enough
+can take the approximate path; its own last `suffix` positions are exact, and every later part starts at a position
+greater than 0 and is read exactly.
+
+- **Turn 2 and later.** The server continues from the live session or from a conversation checkpoint (the state
+  after the earlier turns) and reads only the new tokens, at positions greater than 0, so they are read in full. They
+  are read exactly *on top of* the cells the first read left: nothing is approximated twice. Questions about the
+  old document in turn 5 are answered from the same cells turn 1 had, so their quality is that of the first read.
+- **Checkpoints and parked conversations** hold whatever cells the session held, approximated or not, and give
+  them back as they were. A checkpoint taken inside an approximated stretch is a consistent state: the read
+  continues from it exactly. Restoring a checkpoint and re-reading the same prompt from 0 (the `STRATA_CKPT_REREAD`
+  debug check) differ with KVA on, as they would between any two reads that take different paths.
+- **A cold read again** (the cache evicted the conversation, a new chat with the same system prompt) approximates
+  its own prefix again.
+- **`STRATA_KVA=0`** restores 0.2.6: every prompt is read exactly, the draft window is 32768 cells, nothing else
+  changes.
+
+## Layer splits, batch slots, SYCL, Metal
+
+These never take the approximate path and say why: a layer split reports "a layer split (not the whole trunk)", the
+batch slots and a peer device switch KVA off for the process (one line at start-up with `STRATA_KVA=1`), the SYCL
+engine has its own prompt path without KVA, and the Metal build has no state-only kernels (`STRATA_KVA` is ignored
+there, with a line when it is set).
+
+## Settings
 
 | variable | default | what it does |
 |---|---:|---|
-| `STRATA_KVA` | off | `1` enables the feature for qualifying requests |
+| `STRATA_KVA` | on | `0` turns KVA off (the exact 0.2.6 prompt read). `1` is the same as the default but logs every read it turned away |
 | `STRATA_KVA_SPLIT` | 24 | first approximated layer (zero-based) |
-| `STRATA_KVA_SUFFIX` | 2048 | fully computed tail positions; rounded **up** to a whole chunk |
+| `STRATA_KVA_SUFFIX` | 2048 | fully computed tail positions; see above |
 | `STRATA_KVA_MIN_PROMPT` | 4096 | shorter prompts stay on the full path |
+| `STRATA_KVA_DRAFT_FLOOR` | off | `1`: the draft layer skips the draft cells of approximated chunks (research) |
 | `STRATA_KVA_ONLY` | all | `gdn` or `qsa`: approximate only that layer type |
 | `STRATA_KVA_MODE` | identity | `identity`, `oracle`, `linear` (linear is not implemented) |
-| `STRATA_KVA_CAPTURE` | — | directory: write every late layer's real input for calibration |
+| `STRATA_KVA_CAPTURE` | — | directory: write every late layer's real input for calibration (the read is exact while capturing) |
 | `STRATA_KVA_CAPTURE_FP32` | off | write fp32 instead of bf16 records |
 | `STRATA_KVA_ORACLE` | — | directory: replay a capture instead of a projector |
 | `STRATA_KVA_GDN_NORM` | off | keep the full GDN recurrence (the A/B control for the state-only one) |
 | `STRATA_LOGITS_DUMP` | — | debug (not KVA-specific): write every verify window's sampler logits to `path`, for KL / top-1 between two runs |
 
-Requirements and limits for this first version:
+Every read says what it did:
 
-- One cold read of one prompt, one device (`pos0 == 0`, one stage). A follow-up read, a resumed prompt or a
-  layer split stays on the full path.
-- The fully computed suffix must cover the MTP drafter's window: use `--mtp-window N` with
-  `STRATA_KVA_SUFFIX >= N + 64`, or the drafter reads state built from approximated positions.
-- **The session state after a KVA read is approximate.** It must not be reused as an exact prefix: no
-  checkpoint of it, no follow-up prompt that reuses it. The engine prints a warning when this happens.
-- The approximation is a quality tradeoff, not a lossless transformation. Measure before using it.
-- Every run says what it did:
-  - applied: `strata prefill: KVA on: split 24, suffix 2112, approximated 5120 of 7533 positions in 5 of 8 chunks, mode identity`
-  - configured but not applied: `strata prefill: KVA configured but NOT applied: <reason> (prompt … positions, min_prompt …, suffix …, split …)`
+- applied: `strata prefill: KVA on: split 24, suffix 2048, approximated 5120 of 7533 positions in 5 of 8 chunks, mode identity`
+- turned away: `strata prefill: KVA configured but NOT applied: <reason> (prompt … positions, min_prompt …, suffix …, split …)`
+
+A quality comparison needs the control arm to say `STRATA_KVA=0` (an unset variable is now KVA).
 
 ## Measured (Tesla P100 16 GB, Qwen3.8-Flash-Next IQ3_XXS, chunk 1024, expert cache 1500, MTP window 2048)
 
@@ -96,7 +146,7 @@ place of a projector; the replay must use the same prompt and the same chunking.
 
 ## Implementation notes
 
-- `src/prefill/kva.hpp` — the plan and the environment variables.
+- `include/strata/prefill/kva.hpp` — the plan, the environment variables and the reasons a read is turned away (`src/prefill/kva_test.cpp` tests them).
 - `src/prefill/prefill.cpp` — the chunk plan (`kva_approx`), the capture/oracle taps, the state-only layer
   exits, the transfer-plan skip, and `give_back()` on a skipped MoE half: a layer that consumes no expert must
   still release its stream entries, or the issuer thread fills the ring and the next fully computed layer waits

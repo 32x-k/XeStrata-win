@@ -72,6 +72,8 @@
 #include "strata/core/dflash2.hpp"
 #include "strata/core/draft_cap.hpp"
 #endif
+#include "strata/prefill/kva.hpp"
+#include "strata/prefill/kva_floor.hpp"
 #include "strata/prefill/prefill.hpp"
 #if defined(STRATA_PREFILL_MMQ)
 #include "strata/prefill/moe_mmq.hpp"
@@ -1982,6 +1984,22 @@ static bool pcie_auto_split_ok() {
 #endif
 }
 
+/// 0.2.7: gfx12 native packs start their decode miss split at 0.15 instead of the x16 share 0.55.  Measured on an R9700
+/// (p620, IQ3_S, 24576 expert pairs of which 13207 resident): --pcie-frac 0.15 decodes 94.6 tok/s at 8K against 86.1 and
+/// 84.4 against 67.2 at 32K (rotated pairs; at 64K the window is attention-bound and it is +4.7%); under serve/server.py a
+/// short chat decodes 93.2 against 84.4.  The CPU lane rounds a missing expert's FP32 rows differently from the GPU lane,
+/// so this changes bits; the first-token KL of 0.0 against 0.55 is 0.0013 mean with the same top-1 in 12 of 12 prompts
+/// (below the engine's own implementation-noise scale).  An explicit --pcie-frac always wins, and
+/// STRATA_PCIE_FRAC_DEFAULT=old restores the old share; the HIP-only gate keeps every CUDA build on its own measured
+/// values.
+[[maybe_unused]] static bool pcie_share_gfx12_default() {
+#if defined(STRATA_USE_HIP)
+    return decode_defaults_arch_ok();
+#else
+    return false;
+#endif
+}
+
 // HIP outside gfx12: the same refinement, opt-in with STRATA_PCIE_FRAC_DEFAULT=auto (#2224).  Its author gate-measured it on an
 // RX 7900 XTX (gfx1100) as "no regression" only (4 alternating starts at 64K, prefill 2189 base vs 2180 with it, decode 65.4 vs
 // 65.4; under serve the share refines 0.55 -> 0.25 from the pool's 42-45 us/missed expert and the probed 28.4-28.5 GB/s link);
@@ -3563,10 +3581,13 @@ int main(int argc, char** argv) {
     if (o.pcie_frac < 0.0) {
         const auto& lay0 = strata::kernels::cpu::expert_layout();
         const bool nvfp4_pack = native_pack && !lay0.fmt.empty() && lay0.fmt[0].gu_type == 40;
-        const double base = nvfp4_pack ? 0.25 : native_pack ? 0.55 : 0.2;
-        std::string bursts;
         const char* pfd = std::getenv("STRATA_PCIE_FRAC_DEFAULT");
         const bool pf_old = pfd != nullptr && std::strcmp(pfd, "old") == 0;
+        // 0.2.7: gfx12 native packs start at 0.15 (see pcie_share_gfx12_default above); other cards and
+        // STRATA_PCIE_FRAC_DEFAULT=old keep the x16 share measured for them.
+        const double base = nvfp4_pack ? 0.25
+                                       : native_pack ? (pcie_share_gfx12_default() && !pf_old ? 0.15 : 0.55) : 0.2;
+        std::string bursts;
 #if !defined(STRATA_USE_HIP) && defined(_WIN32)
         // Windows: opt-in (STRATA_PCIE_AUTO_CANON=1); an RTX 5070 decoded a short Q2_0 answer 3% slower with it, code 2.5% faster
         const char* pac = std::getenv("STRATA_PCIE_AUTO_CANON");
@@ -4092,9 +4113,10 @@ int main(int argc, char** argv) {
                 if (ple_table.open(o.ple_gguf, ram_err, pio)) {
                     ple_auto_ram = true;
                     std::fprintf(stderr, "strata generate: --ple-io ram chosen by the residency policy (the table is "
-                                         "%.1f GiB and %.1f GiB of RAM is available; STRATA_PLE_AUTO_RAM=0 keeps the "
-                                         "direct reads, --ple-io direct forces them)\n",
-                                 (double) need / (1ull << 30), (double) *available / (1ull << 30));
+                                         "%.1f GiB, the expert arena still to fill %.1f GiB and %.1f GiB of RAM is available; "
+                                         "STRATA_PLE_AUTO_RAM=0 keeps the direct reads, --ple-io direct forces them)\n",
+                                 (double) need / (1ull << 30), (double) experts_ram / (1ull << 30),
+                                 (double) *available / (1ull << 30));
                 } else {
                     // Back to what was asked for; a table that cannot be mapped must not stop the engine.
                     std::fprintf(stderr, "strata generate: resident PLE table failed (%s); keeping direct reads\n",
@@ -5507,6 +5529,30 @@ int main(int argc, char** argv) {
     // slots' draft-KV copies use this one too
     static const strata::core::ModelGeometry draft_geometry{};
     std::vector<std::unique_ptr<strata::core::MtpDrafter>> slot_mtp;
+    // KVA (0.2.7: on by default, STRATA_KVA=0 is the exact 0.2.6 path): what only the engine knows.  A layer split and
+    // the batch slots read their prompts in pieces and in stages, which the one-device, one-cold-read rule of the
+    // approximate prompt read cannot follow, so they stay on the exact path (and say so here, once).  The draft layer
+    // (MTP) keeps its window, whatever it is: a session KVA approximated tells it the first cell built from a real row
+    // (the cell floor, set per request below) and every session KVA did not approximate attends exactly as with
+    // STRATA_KVA=0.
+    {
+        const strata::prefill::KvaConfig& kc = strata::prefill::kva_config();
+        strata::prefill::KvaEngine& ke = strata::prefill::kva_engine();
+        if (kc.explicit_on && !strata::prefill::kKvaBackend)
+            std::fprintf(stderr, "strata generate: STRATA_KVA is set, but this build has no state-only late-layer path; "
+                                 "every prompt is read exactly\n");
+        if (kc.on) {
+            if (multi_gpu) ke.blocked = "a layer split across GPUs";
+            else if (o.batch > 0) ke.blocked = "batch slots (--batch)";
+            else if (o.peer_device >= 0) ke.blocked = "a peer device (--peer-device)";
+            if (!ke.blocked.empty()) {
+                if (kc.explicit_on)
+                    std::fprintf(stderr, "strata generate: KVA (the approximate late-layer prompt read) is off here: %s\n",
+                                 ke.blocked.c_str());
+            }
+            mtp.enable_cell_floor(kc.wants_cell_floor(ke, !o.mtp.empty() && o.spec >= 2));
+        }
+    }
     if (!o.mtp.empty()) {
         if (o.spec < 2) {
             std::fprintf(stderr, "strata generate: --mtp is ignored without --spec T (T >= 2)\n");
@@ -9435,6 +9481,9 @@ int main(int argc, char** argv) {
         // a reporter's prompts failed there every time and passed with --short-read 0.
         bool nf_prompt_windows = false, short_read_off_once = false;
         std::vector<ConvCheckpoint> checks;
+        // KVA: which prefixes of token ids a KVA read approximated, so the draft layer knows, for whatever state a request
+        // continues from, the first cell built from a real row (kva_floor.hpp).  Empty without KVA.
+        strata::prefill::KvaFloorRegistry kva_floors;
         // STRATA_CKPT_POOL: the dropped checkpoints' storage, reused.  STRATA_SLOT_CKPT_MOVE turns it on too: a moved
         // checkpoint frees nothing at the next prune, so every save would fault in fresh pages (17 -> 40-60 ms)
         CheckpointPool ckpt_pool(ckpt_pool_env() || slot_ckpt_move_env());
@@ -9944,6 +9993,9 @@ int main(int argc, char** argv) {
         // come from Q8_1 x Q8_0 MMQ rather than mmvq: drafts may differ, the target's tokens never.
         static const bool split_mtp_batch = strata::program::draft_kv::split_env_on(std::getenv("STRATA_SPLIT_MTP_BATCH"));
         sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+            // KVA: a chunk the late layers did not compute has no real final rows: its draft cells are neither built
+            // nor read (the floor rises before the cells are built, so they are skipped)
+            if (use_mtp && mtp.cell_floor_enabled() && sp.kva_floor() > mtp.cell_floor()) mtp.set_cell_floor(sp.kva_floor());
             std::vector<int32_t> nxt((size_t) T);
             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
             // E-9: batched through the prompt path when it can (a layer split: only with STRATA_SPLIT_MTP_BATCH=1)
@@ -13123,6 +13175,10 @@ int main(int argc, char** argv) {
             tr("request", n, geni ? 1 : 0);
             req_times = ReqTimes{};
             if (use_mtp) mtp.set_prompt_len(n);
+            // KVA: the draft layer's first real cell for the state this request continues from (0 for a cold read - the
+            // first segment raises it if KVA approximates it - and for any state no KVA read produced)
+            if (use_mtp && mtp.cell_floor_enabled())
+                mtp.set_cell_floor(resume > 0 && reread_to <= 0 ? kva_floors.floor_for(ids.data(), resume) : 0);
             const int64_t read_from = reread_to > 0 ? 0 : resume;
             conversations.limit_reuse(read_from);
             pp_total = n;
@@ -13565,7 +13621,12 @@ int main(int argc, char** argv) {
                 } seg_plan_scope{seg_plan};
                 auto run = [&](int64_t q, int64_t r) -> bool {
                     if (planned) sp.force_chunk(plan.chunk, plan_single, plan.chunked);
-                    return sp.run(ids.data() + q, r - q, q, e);
+                    const bool run_ok = sp.run(ids.data() + q, r - q, q, e);
+                    if (run_ok && q == 0 && sp.kva_floor() > 0) {   // KVA approximated the start of this prompt: remember which tokens
+                        kva_floors.note(ids.data(), sp.kva_floor());
+                        if (use_mtp && mtp.cell_floor_enabled()) mtp.set_cell_floor(sp.kva_floor());
+                    }
+                    return run_ok;
                 };
                 // (a layer split reads its stages as a pipeline over one run's chunks: beside slots a chunk at a time, with
                 // none decoding in pieces of STRATA_BATCH_YIELD_CHUNKS chunks (default 8; 0 = one run) so a BYIELD is taken)
@@ -15906,6 +15967,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
             prefill.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+                if (mtp.cell_floor_enabled() && prefill.kva_floor() > mtp.cell_floor()) mtp.set_cell_floor(prefill.kva_floor());   // KVA
                 // cell i pairs R_i with the token at i + 1 (every such token is in the prompt)
                 std::vector<int32_t> nxt((size_t) T);
                 for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) o.tokens[(size_t) (p0 + t + 1)];

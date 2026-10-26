@@ -2716,12 +2716,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // STRATA_KVA: the approximate-prefix plan of this run, if it qualifies (a cold read of one long prompt, one
     // stage, no capture).  Positions [0, kva_frontier) are approximated in the layers at and after the split.
     const KvaConfig& kva = kva_config();
-    const bool kva_run = kva.applies(pos0, n, LB, LE < 0 ? -1 : LE, (int64_t) g.n_layers);
+    const KvaEngine& kva_eng = kva_engine();
+    const int64_t kva_suffix = kva.effective_suffix();
+    bool kva_routine = false;
+    const char* kva_why_not = kva.decline(kva_eng, pos0, n, LB, LE < 0 ? -1 : LE, (int64_t) g.n_layers,
+                                          embd_rows != nullptr, !tap_layers_.empty(), &kva_routine,
+                                          g.n_layers != 48 || g.n_expert != 512);
+    const bool kva_run = kva_why_not == nullptr;
     const int64_t kva_split = std::min<int64_t>(std::max<int64_t>(kva.split, 1), g.n_layers);
-    const int64_t kva_frontier = std::max<int64_t>(0, n - kva.suffix);
+    const int64_t kva_frontier = std::max<int64_t>(0, n - kva_suffix);
     static KvaTap kva_capture;   // process-wide: one cold read at a time, so the per-layer position is enough
     static KvaTap kva_oracle;
     int64_t kva_positions = 0, kva_chunks = 0;   // what actually took the approximate path (diagnostics)
+    kva_floor_ = 0;   // this run's: raised below as chunks are approximated
     if (kva.capture && kva_capture.f.empty()) kva_capture.open(kva.capture_dir, kva.capture_fp32);
     if (kva.capture && pos0 == 0 && hand_in_ == nullptr) kva_capture.begin_prompt();   // one prompt per capture
     if (kva_run && kva.mode == KvaConfig::Mode::Oracle && kva_oracle.f.empty())
@@ -2856,6 +2863,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         if (kva_approx) {
             kva_positions += T;
             ++kva_chunks;
+            kva_floor_ = p0 + T;   // the chunks are a prefix of the run: this is the first position with real rows
         }
         core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);   // #251
 #if defined(STRATA_HAVE_DFLASH2)
@@ -5272,25 +5280,31 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                          : kva.only == KvaConfig::Only::Qsa ? ", qsa layers only" : "";
         std::fprintf(stderr, "strata prefill: KVA %s: split %lld, suffix %lld, approximated %lld of %lld positions "
                              "in %lld of %lld chunks, mode %s%s%s\n",
-                     kva_run ? "on" : "off (capture)", (long long) kva_split, (long long) kva.suffix,
+                     kva_run ? "on" : "off (capture)", (long long) kva_split, (long long) kva_suffix,
                      (long long) kva_positions, (long long) n, (long long) kva_chunks,
                      (long long) (n > 0 && m.T > 0 ? (n + m.T - 1) / m.T : 0), mode, only,
                      kva.capture ? ", capturing the late layers' inputs" : "");
-        if (kva_positions > 0)
-            std::fprintf(stderr, "strata prefill: KVA: the session state holds approximated cells; it is not an exact "
-                                 "prefix and must not be reused as one (no checkpoint, no follow-up reuse)\n");
-    } else if (kva.on) {
+        if (kva_positions > 0) {
+            // What a later turn does with this state (serve): it continues from the live session or a checkpoint of
+            // it and reads only the new tokens, exactly, over the cells this read left; nothing is approximated twice.
+            // The answer quality of those turns is that of this read.  STRATA_KVA=0 reads exactly.
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true))
+                std::fprintf(stderr, "strata prefill: KVA: the late layers (%lld and up) hold approximated cells for "
+                                     "the first %lld positions of this prompt; a follow-up turn that continues from "
+                                     "this state reads its new tokens exactly on top of them (nothing is approximated "
+                                     "twice); STRATA_KVA=0 reads every prompt exactly\n",
+                             (long long) kva_split, (long long) kva_frontier);
+        }
+    } else if (kva.on && (kva.explicit_on || (n >= kva.min_prompt && !kva_routine && kva_eng.blocked.empty()))) {
         // KVA-8 (observability): a run that was configured for KVA but fell back completely must say so and why,
-        // or an operator cannot tell it apart from a run where the feature was never asked for.
-        const char* why = pos0 != 0                                   ? "a continuation read (pos0 != 0)"
-                        : (LB != 0 || (LE >= 0 && LE != g.n_layers))  ? "a layer split (not the whole trunk)"
-                        : kva.capture                                 ? "capture mode"
-                        : n < kva.min_prompt                          ? "the prompt is shorter than STRATA_KVA_MIN_PROMPT"
-                        : n <= kva.suffix + 64                        ? "the suffix leaves too few positions to approximate"
-                                                                      : "not applicable";
+        // or an operator cannot tell it apart from a run where the feature was never asked for.  With KVA on by
+        // default only a long prompt that was turned away for an unusual reason is worth a line (STRATA_KVA=1 asks
+        // for every reason).
         std::fprintf(stderr, "strata prefill: KVA configured but NOT applied: %s (prompt %lld positions, "
                              "min_prompt %lld, suffix %lld, split %lld)\n",
-                     why, (long long) n, (long long) kva.min_prompt, (long long) kva.suffix, (long long) kva_split);
+                     kva_why_not != nullptr ? kva_why_not : "not applicable", (long long) n, (long long) kva.min_prompt,
+                     (long long) kva_suffix, (long long) kva_split);
     }
     if (std::getenv("STRATA_STATE_HASH_GDN") != nullptr) {   // debug: the GDN states as the prompt path leaves them
         cudaStreamSynchronize(m.cs);

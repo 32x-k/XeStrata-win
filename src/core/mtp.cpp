@@ -163,7 +163,7 @@ MtpDrafter::~MtpDrafter() {
     if (owns_draft_head_ && dvocab_) cudaFree(dvocab_);
     if (ev_chain_) cudaEventDestroy(ev_chain_);
     for (cudaEvent_t e : ev_step_) if (e) cudaEventDestroy(e);
-    void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_, h_force_};
+    void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_, h_force_, h_floor_};
     for (void* h : hosts) if (h) cudaFreeHost(h);
 }
 
@@ -370,6 +370,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
 
     // ---- buffers
     window_ = (window > 0 && window < max_cells) ? window : 0;
+    if (floor_on_ && !mapped(64, (void**) &h_floor_, (void**) &m_floor_)) { err = "mtp: the window floor does not fit"; return false; }
     cap_ = (((window_ > 0 ? window_ : max_cells) + 63) / 64) * 64;
     attn_scratch_floats_ = (int64_t) strata::kernels::qsa_decode_attn_scratch_floats(cap_, s);
     const uint64_t T = (uint64_t) max_t, N = (uint64_t) g.n_embd, HC = (uint64_t) g.hc, K = (uint64_t) ss.k;
@@ -1027,7 +1028,9 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         if (st_.kv_rot) fwht256_inplace_cuda(qcur_, (int64_t) T * NH, cs);
         g_mp.stamp(5, cs);
         const QsaAttnPools pools = qsa_attn_pools(st_);
-        if (window_ > 0) window_ids(const_cast<int32_t*>(step), T, (int) window_, ident_, cap_, cs);
+        if (floor_on_ && m_floor_ != nullptr)   // KVA: the window (or every cell) from the first real draft cell on
+            window_ids_floor(const_cast<int32_t*>(step), T, window_ > 0 ? (int) window_ : 0x7fffffff, ident_, cap_, m_floor_, cs);
+        else if (window_ > 0) window_ids(const_cast<int32_t*>(step), T, (int) window_, ident_, cap_, cs);
         // STRATA_QSA_SPLIT_ATTN=1: the draft layer's attention over its window, split the same way
         static const bool split_attn = [] { const char* v = std::getenv("STRATA_QSA_SPLIT_ATTN"); return v != nullptr && std::atoi(v) != 0; }();
         if (!(split_attn && qsa_decode_attn_split(qcur_, pools, ident_, step, cap_, s, attn_scratch_, (uint64_t) attn_scratch_floats_, attn_, T, cs)))
@@ -1423,7 +1426,7 @@ bool MtpDrafter::prefill(const float* R_rows, const int32_t* next_tokens, int64_
     const Clock::time_point t0 = Clock::now();
     const int64_t HCN = g_->hc * g_->n_embd;
     // cells the window can never reach again need no K/V
-    const int64_t first_needed = (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0;
+    const int64_t first_needed = this->first_needed();
     // E-4: every group's token / step / position records uploaded at once; each group is then device copies and a
     // graph on the one stream, with a single sync at the end (a group of <= max_t rows used to be staged in mapped
     // memory and synced before the next: ~5,500 host round trips on a 32K prompt).  The same work in the same

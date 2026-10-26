@@ -6,6 +6,7 @@
 #include "strata/core/geometry.hpp"
 #include "strata/core/emulate.hpp"
 #include "strata/kernels/q8_1_finite.hpp"   // #606: q8_1_ds
+#include "strata/kernels/window_start.hpp"  // KVA: the draft layer's window floor
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/pdl.hpp"
 
@@ -1014,6 +1015,30 @@ __global__ void window_ids_kernel(int32_t* steps, int window, int32_t* ids, long
 void window_ids(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_stride, void* stream) {
     window_ids_kernel<<<dim3(8, (unsigned) n), 256, 0, (cudaStream_t) stream>>>(steps, window, ids, (long long) ids_stride);
     check("window_ids");
+}
+
+namespace {
+// window_ids with a floor read from (mapped) memory when the kernel RUNS: the captured graph keeps the pointer, the
+// value changes between sessions.  A floor of 0 gives window_ids' selection exactly (strata::kernels::window_start).
+__global__ void window_ids_floor_kernel(int32_t* steps, int window, int32_t* ids, long long stride,
+                                        const volatile int32_t* floor_cell) {
+    const int q = blockIdx.y;
+    int32_t* st = steps + q * 4;
+    const int n_kv = st[1];
+    const int start = strata::kernels::window_start(n_kv, window, *floor_cell);
+    const int width = n_kv - start;
+    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < width; j += gridDim.x * blockDim.x)
+        ids[q * stride + j] = start + j;
+    __syncthreads();
+    if (blockIdx.x == 0 && threadIdx.x == 0) st[3] = width;
+}
+}  // namespace
+
+void window_ids_floor(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_stride, const int32_t* floor_cell,
+                      void* stream) {
+    window_ids_floor_kernel<<<dim3(8, (unsigned) n), 256, 0, (cudaStream_t) stream>>>(steps, window, ids, (long long) ids_stride,
+                                                                                    floor_cell);
+    check("window_ids_floor");
 }
 
 void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream) {

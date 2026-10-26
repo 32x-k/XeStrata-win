@@ -209,6 +209,10 @@ public:
     /// for its grouping on the host; a policy may count them. Not called on the paths that keep the ids on the GPU.
     std::function<void(int64_t layer, const int32_t* ids, int64_t n)> on_routes;
     int64_t stopped_at() const { return stopped_at_; }
+    /// KVA: the end of the positions the last run approximated (they are a prefix: chunks from the run's first position
+    /// on), i.e. the first position whose final rows are real; 0 when that run approximated nothing.  Raised chunk by
+    /// chunk, before on_chunk reports the chunk, so the draft layer can skip the chunk's cells.  Reset by every run.
+    int64_t kva_floor() const { return kva_floor_; }
     /// Grows this stage's (and the later stages') pinned upload slots to what a text chunk of `T` tokens uploads, so
     /// a run of such chunks allocates no pinned memory (STRATA_PIPED_CONCURRENT: an allocation or free on the read's
     /// thread takes the driver's lock).  Before the run, with nothing of this path in flight.  False: a slot could
@@ -270,6 +274,7 @@ private:
     Prefill* helper_ = nullptr;         ///< set_stage_helper
     bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (set by the stage before)
     int64_t stopped_at_ = -1;           ///< stop_at_chunk ended the last run after this many tokens (-1: it read all)
+    int64_t kva_floor_ = 0;             ///< kva_floor()
     bool pipe_chunked_ = false;         ///< a later stage: the chunks came from a --prefill-pipe plan (set likewise)
     int64_t force_chunk_ = 0;           ///< force_chunk, for the next run (0: none)
     bool force_single_ = false, force_planned_ = false;

@@ -26,6 +26,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -166,7 +167,25 @@ public:
     const uint16_t* tensor_bf16(const char* name) const { return bf16(name); }
     const void* tensor_q8(const char* name) const { return q8(name); }
     QsaState& kv_state_rw() { return st_; }
-    int64_t first_needed() const { return (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0; }
+    /// The first cell whose K/V the draft layer can still read: the window's start for this prompt, and never below
+    /// the KVA floor (cells built from approximated rows are not read, so they are not built either).
+    int64_t first_needed() const {
+        const int64_t w = (window_ > 0 && prompt_len_ > 0) ? prompt_len_ - window_ - 64 : 0;
+        return std::max<int64_t>(w, cell_floor_);
+    }
+    /// The cells the draft layer attends to (0 = every cell), as load() settled it.
+    int64_t window() const { return window_; }
+    /// KVA: call before load().  The draft layer's attention then reads its cell range through a floor, which stays 0
+    /// (the plain window, cell for cell) until set_cell_floor() raises it.  Off (the default): the code is 0.2.6's.
+    void enable_cell_floor(bool on) { floor_on_ = on; }
+    bool cell_floor_enabled() const { return floor_on_ && m_floor_ != nullptr; }
+    /// KVA: the first draft cell that holds a K/V built from a real (not approximated) row.  The attention starts no
+    /// lower; draft_kv / prefill build no cell below it.  Between requests (the drafter idle).  0 = every cell is real.
+    void set_cell_floor(int64_t cell) {
+        cell_floor_ = std::max<int64_t>(0, cell);
+        if (m_floor_ != nullptr) *(volatile int32_t*) h_floor_ = (int32_t) std::min<int64_t>(cell_floor_, 0x7fffffff);
+    }
+    int64_t cell_floor() const { return cell_floor_; }
     int device() const { return device_; }
     bool idle(std::string& err) {
         if (cs_ && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp: its stream failed"; return false; }
@@ -271,6 +290,9 @@ private:
     int64_t n_dvocab_ = 0;
     std::string rt_dir_;
     int64_t window_ = 0;        // attention over the last window_ cells (0 = every cell)
+    int64_t cell_floor_ = 0;    // KVA: no draft cell below this one is read or built (set_cell_floor)
+    bool floor_on_ = false;     // enable_cell_floor: the attention goes through window_ids_floor
+    int32_t *h_floor_ = nullptr, *m_floor_ = nullptr;   // the floor, mapped: the kernel reads it when it runs
     int64_t prompt_len_ = 0;
     const int32_t* rr_res_ = nullptr;
     float rr_margin_ = 0.0f;
