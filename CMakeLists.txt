@@ -174,13 +174,24 @@ elseif(STRATA_ENABLE_CUDA)
   if(MSVC AND STRATA_EXPERIMENTAL_SM60 AND NOT DEFINED CMAKE_CUDA_RUNTIME_LIBRARY)
     set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
   endif()
+  # #4023: the default below has to be set BEFORE enable_language(CUDA): since CMake 3.18 that call fills an unset
+  # CMAKE_CUDA_ARCHITECTURES with nvcc's own default (sm_75 for CUDA 13), so a test after it never saw "undefined" and
+  # a build with no option was an sm_75 build.  -DCMAKE_CUDA_ARCHITECTURES and the CUDAARCHS environment variable win.
+  set(_strata_cuda_arch_defaulted OFF)
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND NOT DEFINED ENV{CUDAARCHS})
+    set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures")
+    set(_strata_cuda_arch_defaulted ON)
+  endif()
   enable_language(CUDA)
   # `enable_language(CUDA)` gives the .cu compile rules but NOT the imported targets, so `CUDA::cudart` has to
   # be brought in explicitly for the host-side tests that call cudaMalloc themselves.
   find_package(CUDAToolkit REQUIRED)
   option(STRATA_EXPERIMENTAL_SM60 "community build for GPUs below compute capability 7.5: Pascal sm_60, Volta sm_70 (#236)" OFF)
-  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures" FORCE)
+  if(_strata_cuda_arch_defaulted)
+    # a recommendation, not a refusal: the release engine is built for 75;86;89;120, a hand build names its card
+    message(WARNING "Strata: CMAKE_CUDA_ARCHITECTURES was not set, so this build is for sm_120 (RTX 50) only. For another "
+                    "card pass it: -DCMAKE_CUDA_ARCHITECTURES=native (the GPUs in this PC), 75 (RTX 20), 86 (RTX 30), "
+                    "89 (RTX 40), or a list like \"86;120\".")
   endif()
   foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
     string(REGEX REPLACE "-.*$" "" _base "${_a}")     # 120-real / 120-virtual are still 120
@@ -1916,6 +1927,12 @@ if(STRATA_NATIVE_EXPERTS)
     # which exists only in the arch-specific target, so its one unit alone is built with 12x -> 12xa (the default
     # binary is unchanged and runs on sm_121; a card without that image falls back to W4A8 at run time)
     set(_strata_w4a4_archs ${CMAKE_CUDA_ARCHITECTURES})
+    # `native` is first replaced by the detected architectures (e.g. 120-real), so the 12x -> 12xa rewrite below applies
+    # to it too: with plain sm_120 ptxas refuses the FP4 MMA of this one unit (#4023)
+    if("native" IN_LIST _strata_w4a4_archs AND CMAKE_CUDA_ARCHITECTURES_NATIVE)
+      list(REMOVE_ITEM _strata_w4a4_archs native)
+      list(APPEND _strata_w4a4_archs ${CMAKE_CUDA_ARCHITECTURES_NATIVE})
+    endif()
     # (two steps: CMake before 3.29 rejects a \2 whose optional group did not match, "120" alone)
     list(TRANSFORM _strata_w4a4_archs REPLACE "^(12[0-9])$" "\\1a")
     list(TRANSFORM _strata_w4a4_archs REPLACE "^(12[0-9])-(real|virtual)$" "\\1a-\\2")
