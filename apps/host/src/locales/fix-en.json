@@ -78,6 +78,8 @@
  "fx77": "This is a very large model. The download is {0} GB and it needs about as much free disk space. It runs on NVIDIA RTX 30, 40 and 50 cards, on a Radeon AI PRO R9700 (Linux) or on a Ryzen AI Max / Strix Halo PC (Windows); how fast it is depends on the memory and card (the line below says what to expect on this computer). What does not fit in memory is read from your SSD, so an NVMe drive matters.",
  "fx78": "Not tested yet. A context this long takes graphics memory from the model and reads long prompts slowly.",
  "fx79": "Off (recommended)",
+ "fx80": "Needs about {0} GB of free disk space. What does not fit in memory is read from your SSD.",
+ "fx81": "{0} RAM + VRAM, plus about {1} GB of disk",
  "fx82": "Faster answers on 12 GB NVIDIA cards",
  "fx83": "Prefers the parts of the model already on the graphics card, which makes answers much faster on 12 GB cards. Turn off if answers look worse than before."
 }
