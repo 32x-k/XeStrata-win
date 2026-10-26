@@ -1933,6 +1933,12 @@ if(STRATA_NATIVE_EXPERTS)
     add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
                 src/prefill/mmq_nvfp4_w4a8.cu
                 src/prefill/ggml_cuda_host.cu ${_strata_quantize_cu})
+    if(STRATA_EXPERIMENTAL_SM60 AND NOT STRATA_HIP_GFX906)
+      # GP100 (sm_60): a resident layer's experts weight-stationary, one launch per product (moe_ws.hpp; opt-in at
+      # run time, STRATA_MMQ_WS=1, and only where every visible GPU is cc 6.0)
+      target_sources(strata_mmq PRIVATE src/prefill/moe_ws.cu src/prefill/moe_ws_gu_iq2.cu src/prefill/moe_ws_gu_iq3.cu
+                     src/prefill/moe_ws_down.cu)
+    endif()
     # q8_0: the drafter's matrices (E-9); STRATA_ORCA_Q4KS_MMQ adds q5_0 (#296, in _strata_mmq_types), and
     # STRATA_MMQ_KQUANTS q4_k q5_k q5_1 q6_k, the experts of Unsloth's UD-Q4/Q5/Q6_K_XL (docs/QUANTS.md; the dispatch
     # follows eddoursul/Strata 7706c1b).  MODEL-UPDATE Phase 1: on CUDA they are a library of their own, strata_kq
@@ -2071,6 +2077,10 @@ if(STRATA_NATIVE_EXPERTS)
     endif()
     target_link_libraries(strata_prefill PUBLIC strata_mmq)
     target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1 STRATA_PREFILL_FUSED=1)
+    if(STRATA_EXPERIMENTAL_SM60 AND NOT STRATA_HIP_GFX906)
+      # the weight-stationary experts (moe_ws.hpp) are in strata_mmq: the prompt path may take them (STRATA_MMQ_WS=1)
+      target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_WS=1)
+    endif()
     if(STRATA_BUILD_TESTS)
       # #136: the fused int8 experts against a double-precision reference and the MMQ path (exit 77 below sm_80)
       add_executable(prefill_fused_moe_test tests/cuda/prefill_fused_moe_test.cpp)
@@ -2094,6 +2104,12 @@ if(STRATA_NATIVE_EXPERTS)
         target_link_libraries(prefill_swiglu_quant_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
         add_test(NAME prefill_swiglu_quant_test COMMAND prefill_swiglu_quant_test)
         set_tests_properties(prefill_swiglu_quant_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+        # the weight-stationary experts (STRATA_MMQ_WS) against the per-group MMQ, byte for byte, on random experts; the
+        # verdict is given on a compute capability 6.0 card only (77 elsewhere)
+        add_executable(prefill_ws_parity_test tests/cuda/prefill_ws_parity_test.cpp)
+        target_link_libraries(prefill_ws_parity_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
+        add_test(NAME prefill_ws_parity_test COMMAND prefill_ws_parity_test)
+        set_tests_properties(prefill_ws_parity_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
       endif()
     endif()
     if(STRATA_BUILD_TESTS AND _strata_mmq_tab_on)
