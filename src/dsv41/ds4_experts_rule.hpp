@@ -9,8 +9,23 @@
 #include <cstdint>
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 
 namespace strata::ds4 {
+
+// DS4_DEFAULTS=026: the master switch.  Every default the DeepSeek engine changed since v0.2.6 goes back to what v0.2.6 did, so "off" in the app's
+// "DeepSeek speed-ups" really is version 0.2.6.  Each rule below takes `v026` (the engine passes defaults_026()); an explicit per-feature variable or
+// flag (DS4_ATTN_SLAB=N, DS4_COPY_PIN=1, DS4_FAST_ATTN=1, --experts N, --prefill-chunk N, ...) still wins over it.  The list, from
+// `git diff v0.2.6..f-027-int2 -- src/dsv41`: the staging ring, the prompt chunk rule, the attention slab (base and growth), the pinned copy,
+// the huge-page arena, the matrix-core attention, the drafter's cumulative cut, the 5-experts default, the store's spare slots and put, the
+// store settle after a prompt, the dense dequantizer, the F16 gate/up operand, the markov head in Q8, the head's column count, the RDNA3 WMMA GEMM.
+inline bool is_026_token(const char* v) {
+    return v != nullptr && (std::strcmp(v, "026") == 0 || std::strcmp(v, "0.2.6") == 0 || std::strcmp(v, "v0.2.6") == 0);
+}
+inline bool defaults_026() {
+    static const bool on = is_026_token(std::getenv("DS4_DEFAULTS"));
+    return on;
+}
 
 constexpr uint64_t kFasterModeVramMax = 16ull << 30;   // GiB of graphics memory in all, at most
 constexpr int kFasterModeExperts = 5;
@@ -21,8 +36,10 @@ constexpr int kFasterModeExperts = 5;
 // multi_rdna4: two or more RDNA4 cards (gfx1200 / gfx1201: R9700, RX 9000) that together hold at least half of the routed experts - the 4 x R9700 box
 // the Marlin stream measured: 5 against 6 experts, 2.25 bpw, 8K prompt 1339 -> 1419 ppts (+6%) and decode 78.1 -> 81.2 tok/s (+4%), reference KL
 // 0.10987 against 0.10833 and top-1 87.59% against 87.53% (the gate is 0.006).  Faster mode there too, by default.
-inline int experts_per_word(int requested, uint64_t vram_bytes, int model_k, bool integrated = false, bool multi_rdna4 = false) {
+inline int experts_per_word(int requested, uint64_t vram_bytes, int model_k, bool integrated = false, bool multi_rdna4 = false,
+                            bool v026 = false) {
     if (model_k <= 1) return model_k;
+    if (v026) multi_rdna4 = false;   // 0.2.6: Faster by default on a small card or an integrated GPU only
     int n = requested;
     if (n < 1) n = integrated || multi_rdna4 || (vram_bytes != 0 && vram_bytes <= kFasterModeVramMax) ? kFasterModeExperts : model_k;
     if (n > model_k) n = model_k;
@@ -45,7 +62,8 @@ constexpr uint64_t kChunkInPlace4096Below = 16ull << 30;
 // gguf_copy: a GGUF pack with --mmap-experts off; file_experts: the experts stay in the files; hip: a HIP build; min_vram_bytes: the
 // smallest card; big: the chunk of the streamed case (the engine's kVlRows, 8192)
 inline int prefill_chunk_default(bool own_default, double gpu_share, bool gguf_copy, bool file_experts, bool hip, uint64_t min_vram_bytes,
-                                 int big = 8192, bool multi_tp = false) {
+                                 int big = 8192, bool multi_tp = false, bool v026 = false) {
+    if (v026) multi_tp = false;   // 0.2.6: the 1024 chunk for a --tp 1 run only
     // The cards hold most of the experts: the small chunk is the measured one.  Two datapoints, both on 4 x R9700: with `--tp 1` (what
     // `strata launch` writes for 4 or more AMD cards), share 0.86: 1024 370 against 214 tok/s at 8192; and with the engine's own default tp
     // (2, pairs of cards, nothing written), where the rule used to fall through to 2048/8192: 2.25 bpw, --dspark auto, ids 5705e1164a, 8K
@@ -86,8 +104,10 @@ inline bool copy_all_fits(double lane_bytes, uint64_t ram_avail, double ram_marg
 // experts), and never less than the base; the automatic growth on top of it still applies where the room is there.  A unified-memory GPU
 // (the caller passes env 0 there) and DS4_ATTN_SLAB=0 never take either branch.  The caller passes 0 for `expert_share` in a build that is not
 // HIP: that branch is the 4 x R9700 measurement.
-inline int attn_slab_rows(int env, int chunk, int base, double spare_bytes, double bytes_per_row, double expert_share = 0.0) {
+inline int attn_slab_rows(int env, int chunk, int base, double spare_bytes, double bytes_per_row, double expert_share = 0.0,
+                          bool v026 = false) {
     auto clampn = [&](int a) { return std::max(64, std::min(chunk, a) / 64 * 64); };
+    if (v026 && env < 0) env = 0;   // 0.2.6: DS4_ATTN_SLAB unset gave the base; DS4_ATTN_SLAB=N still asks for N rows
     if (env == 0) return base;
     if (env > 0) return clampn(env);
     int rows = base;
@@ -113,7 +133,8 @@ inline int attn_slab_rows(int env, int chunk, int base, double spare_bytes, doub
 // A unified-memory GPU never takes the small ring (its datapoint is the 1200 MB one): it keeps the 16 MB "fit" rule at 1/1.3.
 // `hip`: the 0.5..0.82 band and the 0.82 threshold are the 4 x R9700 measurements, so only an RDNA4 system (every device a gfx1200 or gfx1201; the parameter is named hip) takes them; any other build keeps main's
 // rule there (16 MB from 1/1.3, the streamed ring below it) until a CUDA multi-card rig is measured.
-inline int staging_ring_mb(double share, double room_bytes, int n_dev, bool integrated, bool hip) {
+inline int staging_ring_mb(double share, double room_bytes, int n_dev, bool integrated, bool hip, bool v026 = false) {
+    if (v026) return share >= 1.0 / 1.3 ? 16 : 400;   // 0.2.6: 16 MB where the cards hold the experts, a fixed 400 MB otherwise
     const double GB = 1e9;
     const double per_dev = n_dev > 0 ? room_bytes / (double) n_dev : 0.0;
     const double streamed = std::min(1200.0, std::max(400.0, room_bytes / GB * 64.0));
@@ -130,6 +151,72 @@ inline int experts_test_override(int chosen, int model_k) {
         if (n >= 1 && n <= model_k) return n;
     }
     return chosen;
+}
+
+
+// The base of the attention slab, MB of q (rows = MB / the heads' width, rounded to 64): STRATA_DS4_A_MB when given; 0.2.6 and a discrete card 8 MB;
+// a unified-memory GPU 32 MB (main's 3133160ed, Strix Halo).
+inline size_t attn_slab_base_mb(bool unified, size_t env_mb, bool v026 = false) {
+    if (env_mb != 0) return env_mb;
+    return !v026 && unified ? 32 : 8;
+}
+
+// DS4_COPY_PIN (pin the CPU lane's RAM copy so the prompt DMAs it in place): env -1 unset, else 0 / 1.  Explicit wins; 0.2.6: opt-in, so unset = off;
+// 0.2.7: on when the whole arena is on explicit huge pages OR (RDNA4 and the cards hold at least half the experts).
+inline bool copy_pin_default(int env, bool arena_all_huge, bool rdna4, double share, bool have_chunks, bool v026 = false) {
+    if (env >= 0) return env != 0;
+    if (v026) return false;
+    return (arena_all_huge || (rdna4 && share >= 0.5)) && have_chunks;
+}
+
+// DS4_COPY_HUGETLB (the copy arena on explicit 2 MB pages): env -1 unset, else 0 / 1; 0.2.6: opt-in; 0.2.7: on when the reserved pool already holds the whole copy.
+inline bool copy_hugetlb_default(int env, double pool_free_bytes, double copy_bytes, bool v026 = false) {
+    if (env >= 0) return env != 0;
+    if (v026) return false;
+    return pool_free_bytes > 0.0 && pool_free_bytes >= copy_bytes;
+}
+
+// DS4_FAST_ATTN (the chunked prompt's attention on the matrix cores): env -1 unset, else 0 / 1; 0.2.6: opt-in; 0.2.7: on for gfx1200 / gfx1201.
+inline bool fast_attn_default(int env, bool gfx12, bool v026 = false) {
+    if (env >= 0) return env != 0;
+    return !v026 && gfx12;
+}
+
+// The drafter's cumulative confidence cut (STRATA_DS4_DSPARK_CUM, a request's dspark_cum): the variable when set; 0.2.6: 0; 0.2.7: 0.5 on gfx1200 / gfx1201.
+inline float dspark_cum_value(bool has_env, float env_value, bool gfx12, bool v026 = false) {
+    if (has_env) return env_value;
+    return !v026 && gfx12 ? 0.5f : 0.0f;
+}
+
+// DS4_STORE_SPARE (the RAM store takes the spare slots) and DS4_STORE_PUT (an expert the VRAM cache gives back is put into the store from memory):
+// env -1 unset, else 0 / 1; 0.2.6: neither existed (off); 0.2.7: on.
+inline bool store_feature_default(int env, bool v026 = false) {
+    if (env >= 0) return env != 0;
+    return !v026;
+}
+
+// DS4_SETTLE_STORE (the RAM store's post-prompt preload) when the variable is unset: 0.2.6 ran it (1), 0.2.7 does not (0: it cost a 4K prompt 4.7 s).
+inline float settle_store_default(bool v026 = false) { return v026 ? 1.0f : 0.0f; }
+// The preload skips the experts the CPU lane already holds as a RAM copy (0.2.7); 0.2.6 did not.
+inline bool settle_skips_copy_experts(bool v026 = false) { return !v026; }
+
+// The chunked prompt's dense dequantizer: the row-per-lane dq_rows_kernel (0.2.6's values, bit for bit) or dq_rows_kernel2 (the coalesced transpose).
+// DS4_DQ_OLD (-1 unset, else 0 / 1) wins; 0.2.6: the old one; 0.2.7: the old one on gfx11 only.
+inline bool dq_old_default(int env, bool gfx11, bool v026 = false) {
+    if (env >= 0) return env != 0;
+    return v026 || gfx11;
+}
+
+// The head's columns a pass for a GGUF head (DS4_HEAD_PER overrides): 0.2.6 4, 0.2.7 8 (the same logits per column).
+inline int head_per_default(bool v026 = false) { return v026 ? 4 : 8; }
+// The drafter's markov head quantised to Q8_0 as it loads (0.2.7) or read as F16 (0.2.6).
+inline bool markov_head_q8_default(bool v026 = false) { return !v026; }
+// The gate/up tiles read the layer's F16 copy of the activations (0.2.7, bit-identical) or the F32 rows (0.2.6).
+inline bool gate_up_x16_default(bool v026 = false) { return !v026; }
+// STRATA_DENSE_PFGEMM (the RDNA3 WMMA dense GEMM before hipBLAS; -1 unset, else 0 / 1): 0.2.6 did not have it.
+inline bool dense_pfgemm_default(int env, bool v026 = false) {
+    if (env >= 0) return env != 0;
+    return !v026;
 }
 
 }  // namespace strata::ds4

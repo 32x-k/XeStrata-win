@@ -2,6 +2,7 @@
 #include "strata/core/arch_defaults.hpp"
 #include "strata/core/gfx12_platform_defaults.hpp"
 #include "strata/core/sm120_series.hpp"
+#include "strata/core/defaults_026.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -226,6 +227,54 @@ int main() {
     CHECK(!igpu_uma_arena_default("gfx1103", true, false, true));     // the user registers the arena as before
     unset("STRATA_UMA_REGISTER");
     // both platforms: no Windows guard on the iGPU set (the owner wants it there too; untested on Windows is only said in the log)
+    // ---- STRATA_DEFAULTS=026 (defaults_026.hpp): every 0.2.7 Qwen default gives v0.2.6's answer; an explicit variable is decided by the caller first
+    {
+        const double GiB = 1073741824.0;
+        using namespace strata;
+        CHECK(is_026_token("026") && is_026_token("0.2.6") && is_026_token("v0.2.6"));
+        CHECK(!is_026_token(nullptr) && !is_026_token("") && !is_026_token("0") && !is_026_token("027"));
+        // residency-biased routing: 0 under 026 on the card that gets 2.0 otherwise
+        CHECK(route_prior_default(false, false, 12.0 * GiB, false) == 2.0f);
+        CHECK(route_prior_default(false, false, 12.0 * GiB, true) == 0.0f);
+        CHECK(route_prior_default(false, false, 8.0 * GiB, true) == 0.0f);
+        // the wide HC up read: on for a 12.0 card on CUDA, off under 026, off in HIP, off on sm_86 / sm_121
+        CHECK(gr_up_wide_default(false, 12, 0));
+        CHECK(!gr_up_wide_default(false, 12, 0, true));
+        CHECK(!gr_up_wide_default(true, 12, 0));
+        CHECK(!gr_up_wide_default(false, 8, 6));
+        CHECK(!gr_up_wide_default(false, 12, 1));
+        // GR_V3 and IMMA
+        CHECK(gr_v3_default(false, 12, 0, false, 72.0 * GiB, false));
+        CHECK(!gr_v3_default(false, 12, 0, false, 72.0 * GiB, true));
+        CHECK(prompt_attn_imma_default(false, 86, false));
+        CHECK(!prompt_attn_imma_default(false, 86, true));
+        CHECK(!prompt_attn_imma_default(false, 120, true));
+        // the gfx12 decode switches: the arch table is v0.2.6's five prompt switches under 026, nine otherwise; gfx1151 and the others do not move
+        {
+            const auto t26 = strata::core::arch_default_env("gfx1201", true);
+            const auto t27 = strata::core::arch_default_env("gfx1201", false);
+            auto has = [](const std::vector<std::pair<std::string, std::string>>& t, const char* k) {
+                for (const auto& kv : t) if (kv.first == k) return true;
+                return false;
+            };
+            CHECK(t26.size() == 5 && t27.size() == 9);
+            CHECK(has(t26, "STRATA_GDN_HEAD") && has(t26, "STRATA_CVEC_FUSE"));
+            CHECK(!has(t26, "STRATA_ATTN_LANECELL") && !has(t26, "STRATA_ATTN_MERGE_V2") && !has(t26, "STRATA_TSUM") && !has(t26, "STRATA_EXPDEC"));
+            CHECK(has(t27, "STRATA_ATTN_LANECELL") && has(t27, "STRATA_ATTN_MERGE_V2") && has(t27, "STRATA_TSUM") && has(t27, "STRATA_EXPDEC"));
+            CHECK(strata::core::arch_default_env("gfx1200", true).size() == 5);
+            CHECK(strata::core::arch_default_env("gfx1151", true) == strata::core::arch_default_env("gfx1151", false));
+            CHECK(strata::core::arch_default_env("gfx1100", true).empty() && strata::core::arch_default_env("gfx1100", false).empty());
+        }
+        // the decode miss split start value: 0.15 on gfx12 native packs, 0.55 under 026 or STRATA_PCIE_FRAC_DEFAULT=old; the others do not move
+        CHECK(pcie_start_frac(false, true, true, false, false) == 0.15);
+        CHECK(pcie_start_frac(false, true, true, false, true) == 0.55);
+        CHECK(pcie_start_frac(false, true, true, true, false) == 0.55);
+        CHECK(pcie_start_frac(false, true, false, false, false) == 0.55);
+        CHECK(pcie_start_frac(true, true, true, false, true) == 0.25);
+        CHECK(pcie_start_frac(true, true, true, false, false) == 0.25);
+        CHECK(pcie_start_frac(false, false, true, false, true) == 0.2);
+        CHECK(pcie_start_frac(false, false, true, false, false) == 0.2);
+    }
     std::printf(fails ? "arch_defaults_test: %d FAILED\n" : "arch_defaults_test: OK\n", fails);
     // ---- 0.2.7 CUDA defaults (sm120_series.hpp): which cards get which, and which never do
     {

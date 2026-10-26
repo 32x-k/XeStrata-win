@@ -85,6 +85,12 @@ constexpr bool kHipBuild = true;
 constexpr bool kHipBuild = false;
 #endif
 
+// an environment variable as 0 / 1, or -1 when it is not set (the rules in ds4_experts_rule.hpp take this form)
+int env_tri(const char* name) {
+    const char* v = std::getenv(name);
+    return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1;
+}
+
 double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -2067,7 +2073,7 @@ struct Model::Impl {
 #else
         const bool hip_build = false;
 #endif
-        const int rule_chunk = prefill_chunk_default(own_default, gpu_expert_share(), gguf_copy, file_experts, hip_build, vmin_bytes, kVlRows, multi_tp);
+        const int rule_chunk = prefill_chunk_default(own_default, gpu_expert_share(), gguf_copy, file_experts, hip_build, vmin_bytes, kVlRows, multi_tp, defaults_026());
         chunk = prompt_par ? (o.prefill_chunk >= 0 ? o.prefill_chunk : rule_chunk) : 0;
         if (prompt_par && o.prefill_chunk < 0 && rule_chunk == 4096 && gguf_copy)
             std::fprintf(stderr, "ds4: prompts in chunks of 4096 tokens (the experts are copied into RAM, %.0f GiB of graphics memory; --prefill-chunk N changes it)\n",
@@ -2134,7 +2140,7 @@ struct Model::Impl {
                     }
                     // two or more RDNA4 cards holding at least half of the experts (the 4 x R9700 class): Faster by default too
                     const bool multi_rdna4 = rdna4() && devs.size() >= 2 && gpu_expert_share() >= 0.5;
-                    const int n = experts_test_override(experts_per_word(o.experts, vram_all, l.k_exp, integrated, multi_rdna4), l.k_exp);
+                    const int n = experts_test_override(experts_per_word(o.experts, vram_all, l.k_exp, integrated, multi_rdna4, defaults_026()), l.k_exp);
                     experts_used = n;
                     if (n < l.k_exp)
                         std::fprintf(stderr, "ds4: experts per word: %d (%s; full quality: --experts %d)\n", n,
@@ -3002,7 +3008,7 @@ struct Model::Impl {
             cudaDeviceProp ip{};
             if (cudaGetDeviceProperties(&ip, d.id) == cudaSuccess && ip.integrated != 0) unified = true;
         }
-        const size_t mb = (size_t) strata::ds4::staging_ring_mb(exp_b > 0 ? share : 0.0, room, (int) devs.size(), unified, rdna4());
+        const size_t mb = (size_t) strata::ds4::staging_ring_mb(exp_b > 0 ? share : 0.0, room, (int) devs.size(), unified, rdna4(), defaults_026());
         if (o.verbose)
             std::fprintf(stderr, "ds4: staging ring: experts %.1f GB, VRAM room %.1f GB, dense %.1f GB -> %d MB\n", exp_b / 1e9,
                          room / 1e9, other_b / 1e9, (int) mb);
@@ -3039,7 +3045,7 @@ struct Model::Impl {
                 const char* v = std::getenv("STRATA_DS4_A_MB");
                 return (size_t) (v != nullptr ? std::max(1, std::atoi(v)) : 0);
             }();
-            const size_t a_mb = a_mb_env != 0 ? a_mb_env : (unified ? 32 : 8);
+            const size_t a_mb = strata::ds4::attn_slab_base_mb(unified, a_mb_env, defaults_026());
             c.A = std::max(64, (int) ((a_mb << 20) / (size_t) HQ) / 64 * 64);
             // DS4_ATTN_SLAB=N: the attention slab's rows.  The dense projections (q_b, wo_a/b) are dequantized and GEMM'd
             // once a slab, so a slab of 256 rows dequantizes the same weights 32 times for an 8K prompt (measured: the
@@ -3062,7 +3068,7 @@ struct Model::Impl {
                 const int base = c.A;
                 // one rule (ds4_experts_rule.hpp: attn_slab_rows): the chunk's whole slab (<= 1024 rows) where the cards hold half the
                 // experts or more (4 x R9700, +9% prompt), up to 2048 rows where the VRAM is spare, the base otherwise
-                c.A = strata::ds4::attn_slab_rows(env, chunk, base, spare, bpr, rdna4() ? share : 0.0);
+                c.A = strata::ds4::attn_slab_rows(env, chunk, base, spare, bpr, rdna4() ? share : 0.0, defaults_026());
                 if (env < 0 && c.A > base) {
                     slab_auto_grew_ = true;
                     if (di == 0 && o.verbose) {
@@ -3153,10 +3159,7 @@ struct Model::Impl {
               std::string& err) {
         if (rows <= 0) return true;
 #if defined(STRATA_USE_HIP)   // (wmma_gemm.cu is part of the AMD builds only: a CUDA build has no such kernel and keeps cuBLAS)
-        static const bool pf = [] {
-            const char* v = std::getenv("STRATA_DENSE_PFGEMM");
-            return v == nullptr || v[0] != '0';
-        }();
+        static const bool pf = strata::ds4::dense_pfgemm_default(env_tri("STRATA_DENSE_PFGEMM"), defaults_026());
 #endif
         const int cols = std::max(128, (int) std::min<size_t>((size_t) m.n, c.w16_elems / (size_t) m.k) / 128 * 128);
         for (int c0 = 0; c0 < m.n; c0 += cols) {
@@ -3790,7 +3793,7 @@ struct Model::Impl {
                 sa.limit = g.lim;
                 // gate / up read the layer's F16 copy of the activations (the same rounding the tiles make for their
                 // shared tile): with 18-36 column blocks an expert the F32 rows were read that many times
-                sa.x16 = c.x16;
+                sa.x16 = strata::ds4::gate_up_x16_default(defaults_026()) ? c.x16 : nullptr;
                 EkMark ek{};
                 const bool ekp = prof_chunk;
                 if (ekp) {
@@ -3965,7 +3968,9 @@ struct Model::Impl {
                     return false;
                 }
                 if (!dalloc(d, d_mk_embed, te->bytes / 2, err, acct) || !upload(d, *te, d_mk_embed, err) ||
-                    !mk_head_q8(d, Z + "markov_head.head.weight", d_mk_head_q8, err, acct))
+                    (strata::ds4::markov_head_q8_default(defaults_026())
+                         ? !mk_head_q8(d, Z + "markov_head.head.weight", d_mk_head_q8, err, acct)
+                         : !f16raw(d, Z + "markov_head.head.weight", d_mk_head, err, acct)))   // (0.2.6: the head as F16)
                     return false;
             }
         }
@@ -4450,11 +4455,7 @@ struct Model::Impl {
         // 0.2.7: DS4_COPY_HUGETLB unset = ON when the reserved pool already holds the whole copy (HugePages_Free), else the
         // ordinary arena exactly as before; =0 is the off switch, =1 asks for it anyway (a smaller pool is used, the rest warns).
         const uint64_t pool_free = os::huge_free_bytes();
-        const bool huge_arena = [&] {
-            const char* e = std::getenv("DS4_COPY_HUGETLB");
-            if (e != nullptr) return std::atoi(e) != 0;
-            return pool_free > 0 && (double) pool_free >= all;
-        }();
+        const bool huge_arena = strata::ds4::copy_hugetlb_default(env_tri("DS4_COPY_HUGETLB"), (double) pool_free, all, defaults_026());
         if (huge_arena && std::getenv("DS4_COPY_HUGETLB") == nullptr)
             std::fprintf(stderr, "ds4: the reserved huge-page pool (%.1f GB free) holds the whole copy (%.1f GB): the arena on 2 MB pages "
                                  "(DS4_COPY_HUGETLB=0 keeps the ordinary arena)\n", (double) pool_free / 1e9, all / 1e9);
@@ -4620,8 +4621,8 @@ struct Model::Impl {
         // THP arena registers 4 KB pages and the DMA rate was erratic on the 12 GB cell: 11.9 s one prompt, 30.4 s the next), or (b) the
         // cards hold at least half the routed experts on RDNA4 (4 x R9700: the pin was reliable in 4/4 runs there, see above).  =0 is the off
         // switch, =1 pins any arena.
-        const char* cp = std::getenv("DS4_COPY_PIN");
-        const bool pin_copies = cp != nullptr ? std::atoi(cp) != 0 : ((arena_all_huge || (rdna4() && gpu_expert_share() >= 0.5)) && !ram_chunks.empty());
+        const bool pin_copies = strata::ds4::copy_pin_default(env_tri("DS4_COPY_PIN"), arena_all_huge, rdna4(), gpu_expert_share(),
+                                                              !ram_chunks.empty(), defaults_026());
         if (pin_copies) {
             const bool ro = std::getenv("DS4_COPY_PIN_RO") != nullptr && std::atoi(std::getenv("DS4_COPY_PIN_RO")) != 0;
             const double tr = now_ms();
@@ -5013,7 +5014,7 @@ struct Model::Impl {
         // up its coldest to the CPU lane, and a store without them reads each from the SSD while the CPU lane waits - 1.8 misses a
         // token on the 251 GB R9700 box, 2.9 ms of a 49 ms token), then the lane's experts the profile never saw.  Last in the list: they
         // take only the slots the likely ones left.  DS4_STORE_SPARE=0: off.
-        if (!(std::getenv("DS4_STORE_SPARE") && std::atoi(std::getenv("DS4_STORE_SPARE")) == 0)) {
+        if (strata::ds4::store_feature_default(env_tri("DS4_STORE_SPARE"), defaults_026())) {
             std::vector<std::pair<double, std::pair<int, int>>> vr, zero;
             for (const Layer& l : L) {
                 if (l.il >= g.nl) continue;
@@ -5029,7 +5030,7 @@ struct Model::Impl {
         }
         const double t0 = now_ms();
         // (with the spare experts in the list the reserve is theirs: last in the list, so the oldest ticks, so the first a demand read replaces)
-        const bool spare_on = !(std::getenv("DS4_STORE_SPARE") && std::atoi(std::getenv("DS4_STORE_SPARE")) == 0);
+        const bool spare_on = strata::ds4::store_feature_default(env_tri("DS4_STORE_SPARE"), defaults_026());
         const size_t leave = spare_on ? 0 : (size_t) (std::getenv("DS4_STORE_RESERVE") ? std::atoi(std::getenv("DS4_STORE_RESERVE")) : 192) + 64;
         // The first 48 GB (what a store held before it could take every expert) are read before the first token; the rest of the
         // hottest-first list is read after it, in pieces of 128 experts on a thread of its own, behind the model's own reads (a
@@ -6417,7 +6418,7 @@ struct Model::Impl {
             }
             if (got) blob_to_ram(l, sw_b, sw.ram);
             else sw.ram = -1;   // (back to the file's pages then)
-        } else if (ok && store && l.nm == 1 && l.lay.fmt == gg::kFmtMXFP4 && !(std::getenv("DS4_STORE_PUT") && std::atoi(std::getenv("DS4_STORE_PUT")) == 0)) {
+        } else if (ok && store && l.nm == 1 && l.lay.fmt == gg::kFmtMXFP4 && strata::ds4::store_feature_default(env_tri("DS4_STORE_PUT"), defaults_026())) {
             // `out` goes back to the CPU lane: its blob is in VRAM, so it is copied into a store slot now - the lane would otherwise read it from
             // the SSD and wait for it (1-2 misses a token on the 251 GB R9700 box).  DS4_STORE_PUT=0: off.
             uint8_t* dst = store->put_begin(l.il, sw.out);
@@ -6481,7 +6482,7 @@ struct Model::Impl {
         // The RAM store's preload after a chunked prompt is off by default: measured on Strix Halo (code fixture, prompt +
         // 256 tokens, 3 runs a side) it costs the prompt 4.7 s and the decode that follows gains nothing (13.9/14.4 s with it
         // against 14.2 s without).  The swaps above are what the decode actually uses; DS4_SETTLE_STORE=1 restores it.
-        if (store && env_f("DS4_SETTLE_STORE", 0.0f) != 0.0f) {   // the RAM store too: a window prompt fills it through the CPU
+        if (store && env_f("DS4_SETTLE_STORE", strata::ds4::settle_store_default(defaults_026())) != 0.0f) {   // the RAM store too: a window prompt fills it through the CPU
             // lane's picks, a chunked one streams past it - the hottest CPU-lane experts of the prompt into its free slots
             // (copy_mode: an expert already in the CPU lane's RAM copy gains nothing from a second copy of the same bytes -
             // measured on the R9700 12 GB cell: 4152 such experts, 40 GB read at 6.4 GB/s, 6.2 s of an 8K prompt, 0.0 store
@@ -6490,7 +6491,7 @@ struct Model::Impl {
             for (const Layer& l : L) {
                 if (l.mtp) continue;
                 for (int e = 0; e < l.n_exp; ++e)
-                    if (l.slot[(size_t) e] < 0 && !(copy_mode && !l.ram.empty() && l.ram[(size_t) e] >= 0) &&
+                    if (l.slot[(size_t) e] < 0 && !(strata::ds4::settle_skips_copy_experts(defaults_026()) && copy_mode && !l.ram.empty() && l.ram[(size_t) e] >= 0) &&
                         l.heat[(size_t) e] >= 4.0f) hot.push_back({l.heat[(size_t) e], {l.il, e}});
             }
             std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
@@ -7121,7 +7122,8 @@ struct Model::Impl {
                 sp.seed = dq_seed;
             }
             for (int i = 0; i < T; ++i) {   // the markov bias of the token before, then that position's draft
-                markov_add_q8(hd.logits + (size_t) i * V, d_mk_embed, d_mk_head_q8, d_ints + i, V, R, hd.st);
+                if (d_mk_head_q8 != nullptr) markov_add_q8(hd.logits + (size_t) i * V, d_mk_embed, d_mk_head_q8, d_ints + i, V, R, hd.st);
+                else markov_add(hd.logits + (size_t) i * V, d_mk_embed, d_mk_head, d_ints + i, V, R, hd.st);
                 if (drafts_q) {
                     sp.counter = dq_counter + (uint64_t) i;
                     strata::dsv41k::sample_draft(hd.logits + (size_t) i * V, 1, V, sp, d_specq + i, d_ints + i + 1, hd.st);
@@ -8803,7 +8805,7 @@ struct Model::Impl {
         // for a whole one, each pass reading the whole share; a GGUF's: 8, so that every window the engine can build (rows
         // <= kWin = 8) walks the head once instead of twice - measured on the drafter's fixed T=5: 4.55 -> 2.83 ms, its
         // round 14.49 -> 13.46; the verify window's head 3.48 -> 2.68 ms, the same logits.  DS4_HEAD_PER overrides.)
-        const int per = d.head.fmt != 0 ? (std::getenv("DS4_HEAD_PER") ? std::atoi(std::getenv("DS4_HEAD_PER")) : 8)
+        const int per = d.head.fmt != 0 ? (std::getenv("DS4_HEAD_PER") ? std::atoi(std::getenv("DS4_HEAD_PER")) : strata::ds4::head_per_default(defaults_026()))
                                         : std::max(1, x3::mv_cols(d.head));
         for (int c = 0; c < rows; c += per)
             if (!mv(d, {job(d.head, xn + (size_t) c * D, out + (size_t) c * ld, std::min(per, rows - c), D, ld)}, err))

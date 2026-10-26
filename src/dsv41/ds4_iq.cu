@@ -4,6 +4,7 @@
 // ggml's (ggml-common.h, MIT, third_party/ggml/LICENSE); the sign and grid tricks are llama.cpp's vecdotq.cuh.
 #include "ds4_iq.cuh"
 #include "ds4_numerics.cuh"
+#include "ds4_experts_rule.hpp"
 
 #include <cuda_fp16.h>
 #if !defined(STRATA_USE_HIP)
@@ -1393,7 +1394,10 @@ __global__ void __launch_bounds__(kThreads) dq_rows_kernel(const uint8_t* __rest
 // prompt 79.5 -> 88.5 tok/s with it, so a gfx11 device defaults to it.  DS4_DQ_OLD=1 forces it anywhere, DS4_DQ_OLD=0 forces kernel2
 // anywhere.  The detection is the device's gcnArchName (HIP only; a CUDA build has no gfx11).  Decided once per device.
 static bool dq_use_old_kernel() {
-    if (const char* e = std::getenv("DS4_DQ_OLD"); e != nullptr && *e != '\0') return std::atoi(e) != 0;
+    const char* dq_env = std::getenv("DS4_DQ_OLD");
+    const int env = dq_env != nullptr && *dq_env != '\0' ? (std::atoi(dq_env) != 0 ? 1 : 0) : -1;
+    const bool v026 = strata::ds4::defaults_026();   // DS4_DEFAULTS=026: 0.2.6's row-per-lane dequantizer (the same values, bit for bit)
+    if (env >= 0 || v026) return strata::ds4::dq_old_default(env, false, v026);
 #if defined(STRATA_USE_HIP)
     static std::atomic<int> cache[64];   // 0 unknown, 1 no, 2 yes
     int dev = 0;

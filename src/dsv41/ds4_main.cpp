@@ -19,6 +19,7 @@
 // read stops there for a checkpoint, so a request behind the same start - another agent - goes back to it instead of
 // reading it again (also without slots).  STRATA_DS4_REUSE=0 turns every reuse off (each request reads its whole prompt).
 #include "ds4_model.hpp"
+#include "ds4_experts_rule.hpp"
 #include "ds4_os.hpp"
 #include "ds4_packinfo.hpp"
 #include "ds4_slotmeta.hpp"
@@ -158,8 +159,8 @@ static int g_round_nd = 0;
 // Strix keeps 0 until it is; the CUDA measurements in 0.2.7 had it flat, so CUDA keeps 0.  STRATA_DS4_DSPARK_CUM overrides everywhere.
 float dspark_cum_default(const strata::ds4::Model& m) {
     static const char* const e = std::getenv("STRATA_DS4_DSPARK_CUM");
-    if (e != nullptr) return (float) std::atof(e);
-    return m.gpus_are_gfx12() ? 0.5f : 0.0f;
+    return strata::ds4::dspark_cum_value(e != nullptr, e != nullptr ? (float) std::atof(e) : 0.0f, m.gpus_are_gfx12(),
+                                         strata::ds4::defaults_026());
 }
 
 // One round of decoding after `tok` (the token at pos(), not fed yet): with the drafter, its drafts while their

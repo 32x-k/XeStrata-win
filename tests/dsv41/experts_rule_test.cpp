@@ -215,6 +215,98 @@ int main() {
         // a 192 GB Windows PC with a 4 GB page file: 150 GB free RAM but only 100 GB of commit room: no
         CHECK_EQ(copy_all_fits(108 * GB, (uint64_t) (150 * GB), margin, 100 * GB), 0);
     }
+    // ---- DS4_DEFAULTS=026: every rule gives v0.2.6's answer (the last argument v026 = true); an explicit variable / flag still wins; the six old
+    // DS4_*=0 switches keep working with v026 = false
+    {
+        using namespace strata::ds4;
+        const double GB = 1e9;
+        CHECK_EQ(is_026_token("026"), 1);
+        CHECK_EQ(is_026_token("0.2.6"), 1);
+        CHECK_EQ(is_026_token("v0.2.6"), 1);
+        CHECK_EQ(is_026_token("0"), 0);
+        CHECK_EQ(is_026_token(""), 0);
+        CHECK_EQ(is_026_token("027"), 0);
+        CHECK_EQ(is_026_token(nullptr), 0);
+        // the 5-experts default: 4 x R9700 goes back to 6; a small card and an integrated GPU were Faster in 0.2.6 already; --experts wins
+        CHECK_EQ(experts_per_word(-1, 4 * 32 * GiB, 6, false, true, true), 6);
+        CHECK_EQ(experts_per_word(-1, 4 * 32 * GiB, 6, false, true, false), 5);
+        CHECK_EQ(experts_per_word(-1, 12 * GiB, 6, false, false, true), 5);
+        CHECK_EQ(experts_per_word(-1, 91 * GiB, 6, true, false, true), 5);
+        CHECK_EQ(experts_per_word(5, 4 * 32 * GiB, 6, false, true, true), 5);
+        // the chunk rule: the multi-card tp run loses the 1024; a --tp 1 run keeps it (0.2.6 had it); an explicit --prefill-chunk is not this rule
+        CHECK_EQ(prefill_chunk_default(false, 0.86, false, true, true, 32 * GiB, 8192, true, true), 8192);
+        CHECK_EQ(prefill_chunk_default(false, 0.86, false, true, true, 32 * GiB, 8192, true, false), 1024);
+        CHECK_EQ(prefill_chunk_default(true, 0.86, false, true, true, 32 * GiB, 8192, true, true), 1024);
+        CHECK_EQ(prefill_chunk_default(false, 0.30, false, false, false, 24 * GiB, 8192, true, true), 2048);
+        // the slab: the base 8 MB everywhere, no growth, no whole-chunk slab; DS4_ATTN_SLAB=N (env N) and =0 still do what they say
+        CHECK_EQ(attn_slab_base_mb(true, 0, true), 8);
+        CHECK_EQ(attn_slab_base_mb(true, 0, false), 32);
+        CHECK_EQ(attn_slab_base_mb(false, 0, false), 8);
+        CHECK_EQ(attn_slab_base_mb(false, 0, true), 8);
+        CHECK_EQ(attn_slab_base_mb(true, 16, true), 16);                   // STRATA_DS4_A_MB wins
+        CHECK_EQ(attn_slab_rows(-1, 8192, 256, 1e18, 377000.0, 1.0, true), 256);      // spare room: the 0.2.6 slab
+        CHECK_EQ(attn_slab_rows(-1, 1024, 256, -5.0e9, 377000.0, 0.77, true), 256);   // the 4 x R9700 whole-chunk slab: off
+        CHECK_EQ(attn_slab_rows(1024, 1024, 256, -5.0e9, 377000.0, 0.77, true), 1024);   // DS4_ATTN_SLAB=1024 wins
+        CHECK_EQ(attn_slab_rows(0, 8192, 256, 1e18, 377000.0, 1.0, true), 256);
+        CHECK_EQ(attn_slab_rows(0, 8192, 256, 1e18, 377000.0, 1.0, false), 256);       // the old DS4_ATTN_SLAB=0 switch
+        // the staging ring: 16 MB where the cards hold the experts (>= 1/1.3), a fixed 400 MB below, whatever the platform
+        CHECK_EQ(staging_ring_mb(0.86, 4 * 30 * GB, 4, false, true, true), 16);
+        CHECK_EQ(staging_ring_mb(0.77, 4 * 31 * GB, 4, false, true, true), 16);
+        CHECK_EQ(staging_ring_mb(0.72, 4 * 31 * GB, 4, false, true, true), 400);
+        CHECK_EQ(staging_ring_mb(0.06, 10 * GB, 1, false, false, true), 400);
+        CHECK_EQ(staging_ring_mb(0.30, 18.75 * GB, 1, true, false, true), 400);        // Strix Halo: not 1200
+        CHECK_EQ(staging_ring_mb(0.0, 0.0, 0, false, false, true), 400);
+        // the pinned copy and the huge-page arena: opt-in again; =1 / =0 win
+        CHECK_EQ(copy_pin_default(-1, true, true, 0.8, true, true), 0);
+        CHECK_EQ(copy_pin_default(-1, true, true, 0.8, true, false), 1);
+        CHECK_EQ(copy_pin_default(1, false, false, 0.0, false, true), 1);
+        CHECK_EQ(copy_pin_default(0, true, true, 0.8, true, false), 0);               // the old DS4_COPY_PIN=0
+        CHECK_EQ(copy_pin_default(-1, false, true, 0.5, true, false), 1);
+        CHECK_EQ(copy_pin_default(-1, false, true, 0.49, true, false), 0);
+        CHECK_EQ(copy_pin_default(-1, false, false, 0.9, true, false), 0);
+        CHECK_EQ(copy_pin_default(-1, true, false, 0.0, false, false), 0);            // nothing to pin
+        CHECK_EQ(copy_hugetlb_default(-1, 120 * GB, 100 * GB, true), 0);
+        CHECK_EQ(copy_hugetlb_default(-1, 120 * GB, 100 * GB, false), 1);
+        CHECK_EQ(copy_hugetlb_default(-1, 90 * GB, 100 * GB, false), 0);
+        CHECK_EQ(copy_hugetlb_default(1, 0.0, 100 * GB, true), 1);
+        CHECK_EQ(copy_hugetlb_default(0, 120 * GB, 100 * GB, false), 0);              // the old DS4_COPY_HUGETLB=0
+        // the matrix-core attention: opt-in again
+        CHECK_EQ(fast_attn_default(-1, true, true), 0);
+        CHECK_EQ(fast_attn_default(-1, true, false), 1);
+        CHECK_EQ(fast_attn_default(-1, false, false), 0);
+        CHECK_EQ(fast_attn_default(1, false, true), 1);
+        CHECK_EQ(fast_attn_default(0, true, false), 0);                               // the old DS4_FAST_ATTN=0
+        // the drafter's cumulative cut: 0 again; STRATA_DS4_DSPARK_CUM wins
+        CHECK_EQ((int) (dspark_cum_value(false, 0.0f, true, true) * 100), 0);
+        CHECK_EQ((int) (dspark_cum_value(false, 0.0f, true, false) * 100), 50);
+        CHECK_EQ((int) (dspark_cum_value(false, 0.0f, false, false) * 100), 0);
+        CHECK_EQ((int) (dspark_cum_value(true, 0.7f, true, true) * 100), 70);
+        CHECK_EQ((int) (dspark_cum_value(true, 0.0f, true, false) * 100), 0);
+        // the store: spare slots and put off, the post-prompt settle back on (and without the copy-mode skip); the old =0 switches keep working
+        CHECK_EQ(store_feature_default(-1, true), 0);
+        CHECK_EQ(store_feature_default(-1, false), 1);
+        CHECK_EQ(store_feature_default(1, true), 1);
+        CHECK_EQ(store_feature_default(0, false), 0);                                  // the old DS4_STORE_SPARE=0 / DS4_STORE_PUT=0
+        CHECK_EQ((int) settle_store_default(true), 1);
+        CHECK_EQ((int) settle_store_default(false), 0);
+        CHECK_EQ(settle_skips_copy_experts(true), 0);
+        CHECK_EQ(settle_skips_copy_experts(false), 1);
+        // the dense dequantizer, the head, the drafter's markov head, the F16 operand, the RDNA3 GEMM
+        CHECK_EQ(dq_old_default(-1, false, true), 1);
+        CHECK_EQ(dq_old_default(-1, false, false), 0);
+        CHECK_EQ(dq_old_default(-1, true, false), 1);
+        CHECK_EQ(dq_old_default(0, true, true), 0);                                    // DS4_DQ_OLD=0 wins
+        CHECK_EQ(head_per_default(true), 4);
+        CHECK_EQ(head_per_default(false), 8);
+        CHECK_EQ(markov_head_q8_default(true), 0);
+        CHECK_EQ(markov_head_q8_default(false), 1);
+        CHECK_EQ(gate_up_x16_default(true), 0);
+        CHECK_EQ(gate_up_x16_default(false), 1);
+        CHECK_EQ(dense_pfgemm_default(-1, true), 0);
+        CHECK_EQ(dense_pfgemm_default(-1, false), 1);
+        CHECK_EQ(dense_pfgemm_default(1, true), 1);
+        CHECK_EQ(dense_pfgemm_default(0, false), 0);
+    }
     if (fails == 0) std::printf("experts rule: all checks passed\n");
     return fails == 0 ? 0 : 1;
 }
