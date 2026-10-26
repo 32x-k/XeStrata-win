@@ -272,6 +272,8 @@ const int kAda4080[5][3][5] = {
     {{0, 0, 1, 1, 1}, {0, 1, 1, 1, 1}, {0, 1, 1, 1, 1}}};
 int check_tables() {
     int bad = 0;
+    const char* e89 = std::getenv("STRATA_MMVQ_IL_89");
+    const bool opt89 = e89 != nullptr && e89[0] == '1';   // sm_89's own tables are opt-in (#3453)
     for (int type : {23, 12, 13, 14, 11})
         for (int nc = 2; nc <= 4; ++nc)
             for (int n_out : {512, 2560, 6144, 10240, 12288, 248320}) {
@@ -281,11 +283,14 @@ int check_tables() {
                 const int cls = n_out < 2048 ? 0 : n_out < 4096 ? 1 : n_out < 8192 ? 2 : n_out < 12288 ? 3 : 4;
                 const int ti = type == 23 ? 0 : type == 12 ? 1 : type == 13 ? 2 : type == 14 ? 3 : 4;
                 const int b = native_mmvq_il_rows_for(89, type, nc, n_out);
-                const int want = kAda4070[ti][nc - 2][cls] == kAda4080[ti][nc - 2][cls] ? kAda4070[ti][nc - 2][cls] : 0;
+                // STRATA_MMVQ_IL_89=1: the agreement; unset: what sm_89 answered before #3453 (the shared table, which is
+                // sm_86's except Q3_K, a type the shared table has no row for)
+                const int want = opt89 ? (kAda4070[ti][nc - 2][cls] == kAda4080[ti][nc - 2][cls] ? kAda4070[ti][nc - 2][cls] : 0)
+                                       : (type == 11 ? 0 : a);
                 if (b != want) {
                     ++bad;
-                    std::printf("FAIL table: sm_89 is %d, the 4070/4080 agreement says %d at type %d ncols %d n_out %d\n", b, want,
-                                type, nc, n_out);
+                    std::printf("FAIL table: sm_89 is %d, %s says %d at type %d ncols %d n_out %d\n", b,
+                                opt89 ? "the 4070/4080 agreement" : "the shared table", want, type, nc, n_out);
                 }
             }
     // Volta has its own table (PR 1401): Q6_K at 2 columns, 2560 rows -> 1 row a warp; the Ampere table says 0 there
@@ -298,8 +303,9 @@ int check_tables() {
         ++bad;
         std::printf("FAIL table: the sm_60 table is not the P100's\n");
     }
-    // sm_89 one column: only Q3_K (the 4070 and the 4080 agree); wider than 4: the plain kernels
-    if (native_mmvq_il_rows_for(89, 11, 1, 2560) != 0 || native_mmvq_il_rows_for(89, 11, 1, 6144) != 1 || native_mmvq_il_rows_for(89, 12, 1, 6144) != 0) {
+    // sm_89 one column: only Q3_K with STRATA_MMVQ_IL_89=1 (the 4070 and the 4080 agree), else none; wider than 4: the plain kernels
+    if (native_mmvq_il_rows_for(89, 11, 1, 2560) != 0 || native_mmvq_il_rows_for(89, 11, 1, 6144) != (opt89 ? 1 : 0) ||
+        native_mmvq_il_rows_for(89, 12, 1, 6144) != 0) {
         ++bad;
         std::printf("FAIL table: the sm_89 one-column row is not Q3_K only\n");
     }
