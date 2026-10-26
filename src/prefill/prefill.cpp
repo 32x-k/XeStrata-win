@@ -2717,7 +2717,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // stage, no capture).  Positions [0, kva_frontier) are approximated in the layers at and after the split.
     const KvaConfig& kva = kva_config();
     const KvaEngine& kva_eng = kva_engine();
-    const int64_t kva_suffix = kva.effective_suffix(kva_eng);
+    const int64_t kva_suffix = kva.effective_suffix();
     bool kva_routine = false;
     const char* kva_why_not = kva.decline(kva_eng, pos0, n, LB, LE < 0 ? -1 : LE, (int64_t) g.n_layers,
                                           embd_rows != nullptr, !tap_layers_.empty(), &kva_routine,
@@ -2728,6 +2728,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     static KvaTap kva_capture;   // process-wide: one cold read at a time, so the per-layer position is enough
     static KvaTap kva_oracle;
     int64_t kva_positions = 0, kva_chunks = 0;   // what actually took the approximate path (diagnostics)
+    kva_floor_ = 0;   // this run's: raised below as chunks are approximated
     if (kva.capture && kva_capture.f.empty()) kva_capture.open(kva.capture_dir, kva.capture_fp32);
     if (kva.capture && pos0 == 0 && hand_in_ == nullptr) kva_capture.begin_prompt();   // one prompt per capture
     if (kva_run && kva.mode == KvaConfig::Mode::Oracle && kva_oracle.f.empty())
@@ -2862,6 +2863,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         if (kva_approx) {
             kva_positions += T;
             ++kva_chunks;
+            kva_floor_ = p0 + T;   // the chunks are a prefix of the run: this is the first position with real rows
         }
         core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);   // #251
 #if defined(STRATA_HAVE_DFLASH2)
