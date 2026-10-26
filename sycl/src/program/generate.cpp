@@ -9791,6 +9791,9 @@ int main(int argc, char **argv) try {
             // log-probability and the K most likely tokens', from the verify window's head logits (before sampling,
             // penalties and temperature). -1 (absent): no LP lines; a server that does not ask never sees one.
             int req_logprobs = -1;
+            // allowed=a,b,c: with logprobs, print only these token ids (the server renormalises over them; the same key
+            // the CUDA engine reads).  Absent: the K most likely tokens, as before.
+            std::vector<int32_t> req_allowed;
             // ckpt=0: a one-shot call whose turn no later request extends.  No checkpoint at its last turn boundary
             // (so no split there) nor every --prompt-cache-every tokens, and its session is neither continued nor
             // parked after it.  It still resumes from a checkpoint it matches, and still saves the system-prompt root
@@ -9826,6 +9829,17 @@ int main(int argc, char **argv) try {
                     else if (key == "penalty_present") req_penalty_present = fv;
                     else if (key == "seed") req_seed = std::strtoull(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "logprobs") req_logprobs = std::clamp(std::atoi(tok.c_str() + eq + 1), -1, 20);
+                    else if (key == "allowed") {
+                        const std::string csv = tok.substr(eq + 1);
+                        size_t p = 0;
+                        while (p < csv.size()) {
+                            const size_t c = csv.find(",", p);
+                            const std::string one = csv.substr(p, c == std::string::npos ? std::string::npos : c - p);
+                            if (!one.empty()) req_allowed.push_back((int32_t) std::atoi(one.c_str()));
+                            if (c == std::string::npos) break;
+                            p = c + 1;
+                        }
+                    }
                     else if (key == "pcie_frac") req_pcie_frac = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "spec_min_p") req_spec_min_p = std::clamp((double) fv, 0.0, 1.0);
                     else if (key == "img_keys") {
@@ -11724,7 +11738,14 @@ int main(int argc, char **argv) try {
                             for (const float v : lrow) se += std::exp((double) v - mx);
                             const double lse = (double) mx + std::log(se);
                             std::printf("LP %.6f", (double) lrow[(size_t) outv[(size_t) i]] - lse);
-                            if (req_logprobs > 0) {
+                            if (!req_allowed.empty()) {
+                                // only the ids the caller named (never the chosen one, which the head carries, and never an id
+                                // past the engine's own vocabulary); the server renormalises over them
+                                for (const int32_t id : req_allowed) {
+                                    if (id == outv[(size_t) i] || id < 0 || (size_t) id >= lrow.size()) continue;
+                                    std::printf(" %d:%.6f", (int) id, (double) lrow[(size_t) id] - lse);
+                                }
+                            } else if (req_logprobs > 0) {
                                 lord.resize(lrow.size());
                                 for (size_t v = 0; v < lrow.size(); ++v) lord[v] = (int32_t) v;
                                 std::partial_sort(lord.begin(), lord.begin() + req_logprobs, lord.end(),

@@ -502,7 +502,11 @@ applies at the next start. Network, key, MCP and program keys are not editable t
   decoding, with one generation per request. `jsonschema` is used when installed (`python -m pip install "jsonschema>=4.23,<5"`);
   without it the answer is only checked to be one JSON object. Malformed output returns **502** with
   `error.code: structured_output_failed`, an invalid schema **400**. JSON formats combined with tools or MCP are refused.
-  Streaming buffers the answer and emits content only after validation.
+  Streaming buffers the answer and emits content only after validation. Math answers often hold LaTeX such as `\alpha`, which is
+  not a valid JSON escape. Add `"repair_latex_escapes": true` to the `response_format` (or to `text.format` on `/v1/responses`) and,
+  only after the strict parse failed, the server doubles the backslashes that are not valid escapes and checks the answer again.
+  Valid output is never touched. `\b`, `\f`, `\n`, `\r`, `\t` and `\uXXXX` are valid JSON, so they stay: a `\beta` beside a `\alpha`
+  comes back with a backspace. Off by default.
 - `logit_bias` and token/bias pair lists work on CUDA and HIP engines without continuous batching ([LOGIT_BIAS.md](LOGIT_BIAS.md)).
 - Stop strings (`stop`, `stop_sequences`), `temperature`, `top_p`, `top_k`, `min_p` and `seed` are honored per request.
   `top_k` keeps at most 64 candidates. Penalties (`presence_penalty`, `frequency_penalty`, `repetition_penalty`,
@@ -517,6 +521,21 @@ applies at the next start. Network, key, MCP and program keys are not editable t
   `STRATA_SPEC_GUMBEL=1` raise the accepted-draft rate on some machines; `STRATA_SPEC_PROB=1` is speculative rejection
   sampling. `STRATA_SPEC_DEPTH=1` prints acceptance by draft depth and `STRATA_SPEC_MIN_TEMP=0.9` limits sampled drafting
   to hotter requests. Try them on your own card before relying on them.
+- **logprobs: how likely each token was (CUDA/HIP).** `"logprobs": true` with `"top_logprobs": 0..20` on
+  `/v1/chat/completions`, streamed or not, adds `choices[0].logprobs.content[]` to the reply (`token`, `logprob`,
+  `bytes`, `top_logprobs`); with thinking on, the thinking's entries come under `reasoning_content` instead. The
+  tokens, joined, spell the reply exactly (a character split across two tokens lands in the one that finishes it).
+  A reply is bounded by `max_tokens` -- or by the rest of the context when it is not sent -- and by no cap of our
+  own, as on OpenAI and vLLM, neither of which ties a length limit to logprobs. A reply that is not streamed, or
+  that answers a `json_schema` (buffered to be validated), does hold every entry until it ends, so a long one holds
+  a lot of them; a streamed reply hands each entry out with its chunk and keeps none. `"allowed_token_ids": [ids]`
+  keeps only those ids in `top_logprobs`, most likely first, renormalised to sum to 1; the chosen token is one of
+  them when it was named (vLLM's field, but vLLM masks generation with it, while here it filters what is reported,
+  so a token outside the named ids keeps its own `logprob` and an empty list). An id past the model's vocabulary is
+  a 400. A token whose probability could not be read gets no entry, and the reply goes on. On a server started with
+  `--parallel`, only a `max_tokens` 1 request gets them: it is the one a batch slot decodes through the single-token
+  path, which writes an LP line. A longer reply there is a 400, since the slot's `BT` lines carry none -- entries for
+  a prefix only, which a client cannot tell from the model's own answer.
 - **Non-finite logits end the request and drop the cached state (on by default).** If a verify window's logits are NaN, the
   window emits no tokens, the request ends, and the next request drops the live session, checkpoints and parked
   conversations and reads its prompt from token 0. The server retries a request that had sent nothing once, transparently.
@@ -713,9 +732,12 @@ endpoints are refused with an error that says so.
 | `tools` | `function`, `namespace` and `custom` tools. Hosted tools (`web_search`, `file_search`, ...) are left out because the model cannot run them |
 | `tool_choice` | `"none"` hides the tools; anything else lets the model choose (it cannot be forced) |
 | `reasoning.effort` | `none`/`minimal`, `low`, `medium`, `high`/`xhigh`; without it the config's `reasoning_effort`, else the model's default |
-| `max_output_tokens` | The output cap, thinking included. Running out ends the response `incomplete` |
+| `max_output_tokens` | The output cap, thinking included. Running out ends the response `incomplete`. `0` and `-1` (or leaving it out) mean no cap, as for `max_tokens`; anything below `-1` is a 400 |
 | `text.format` | `json_schema` and `json_object` use the JSON formats above (checked, not constrained) |
 | `client_metadata["x-codex-turn-metadata"]` thread-title request | Opt-in `"codex_thread_titles": true`: answered without the engine as `{"title": "<the user's line, cut to 36 characters>"}` so the conversation keeps the prompt cache |
+
+The final event (`response.completed` or `response.incomplete`) and a non-streaming reply carry the same top-level `timings` object as
+`/v1/chat/completions`.
 
 The thinking comes back as a `reasoning` output item with `reasoning_text` content. The model writes no summaries, so `summary` is
 empty. With `"include": ["reasoning.encrypted_content"]` the item also carries an opaque string (base64, not encrypted).

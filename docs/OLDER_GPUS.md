@@ -21,6 +21,7 @@ unchanged. Numbers are the reporters' own, on one machine each, unless the text 
 
 | Cards | Compute capability | How it runs | What is different on it |
 | --- | --- | --- | --- |
+| Quadro M6000, GTX 900 series (Maxwell) | 5.2 | a source build with CUDA 12.x | Opt-in, one reporter, [below](#maxwell-sm_52). No native half-precision arithmetic. Not in the ready-made CUDA 12 engine |
 | Tesla P100 | 6.0 | the CUDA 12 engine | `__dp4a` emulated (bit-exact); BF16 projections through fp32; seven scheduling switches on by default ([below](#tesla-p100-sm_60)); opt-in `STRATA_Q8_SM60=1` ([below](#pascal-gp100-a-q8_0-decode-kernel-opt-in)) |
 | Tesla P40 / P4, GTX 10 series | 6.1 | the CUDA 12 engine | BF16 projections through fp32 (cuBLAS has no BF16 GEMM there); dense weights dequantized by a wide kernel; expert mode 8 and its own interleaved-matvec table; opt-in `STRATA_DENSE_F32=1` ([below](#tesla-p40-sm_61-what-was-measured-and-changed)) |
 | Tesla V100, Titan V | 7.0 | the CUDA 12 engine | BF16 projections on the FP16 tensor cores; prompt attention on `mma.m8n8k4`; a leaner attention kernel. See [NVIDIA_V100.md](NVIDIA_V100.md) |
@@ -40,6 +41,23 @@ too and cannot hold any of the model.
 | RX 5700, 6 GB RX 5600 (RDNA1) | gfx1010 | as above; a 6 GB card leaves about 50 expert slots |
 | Radeon PRO V520 / Pro 5600M (RDNA1) | gfx1011 | built by hand: `-DCMAKE_HIP_ARCHITECTURES=gfx1011`; builds with 0 errors, untested on hardware |
 | Instinct MI50 / MI60, Radeon VII | gfx906 (wave64) | built by hand: `-DSTRATA_HIP_GFX906=ON` |
+
+### Maxwell (sm_52)
+
+One reporter ran Strata v0.1.44.1 on two Quadro M6000 24 GB (Ubuntu, driver 580) with Qwen3.8-Flash-Next at IQ1 and saw about
+22 tokens a second. Nobody has checked the answer text on these cards yet, and Maxwell has no native half-precision arithmetic,
+so treat it as a test. The ready-made CUDA 12 engine holds no sm_52 code; build from source with a CUDA 12.x toolkit (CUDA 13
+cannot compile for Maxwell):
+
+```
+cmake -B build -G Ninja -DSTRATA_EXPERIMENTAL_SM60=ON -DCMAKE_CUDA_ARCHITECTURES=52
+cmake --build build -j
+```
+
+CMake prints a warning for sm_52 and goes on. A release build still needs sm_75 or newer, and without `STRATA_EXPERIMENTAL_SM60=ON`
+the build stops as before. `setup.py` does not install an engine for a Maxwell card, because none of the ready-made engines holds
+code for it. On a PC with only Maxwell cards it lists the card as not supported, prints this recipe as a warning and stops. If you
+try the build, please post a short chat and one code answer from the card.
 
 ## NVIDIA: the CUDA 12 engine
 
