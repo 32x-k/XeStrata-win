@@ -59,6 +59,18 @@ namespace strata::core {
 
 namespace k = strata::kernels;
 
+namespace {
+
+bool dense_int8_env() {   // STRATA_PLAIN_DENSE_MMQ=0: every dense product through Gemm::native
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PLAIN_DENSE_MMQ");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    return on;
+}
+
+}  // namespace
+
 
 void PlainModel::prompt_gemm_free(PromptGemm* g) { delete g; }
 
@@ -255,6 +267,7 @@ bool PlainModel::prompt_warm(std::string& err) {
     if (opt_.prompt_chunk <= 0 || prompt_host_ == nullptr) return true;
     if (!prompt_borrow(std::min<int64_t>(opt_.prompt_chunk, 512), err)) return false;
     const bool ok = prompt_warm_products(err);
+    if (ok && dense_) prompt_dense_calibrate();
     std::string err2;
     if (!prompt_return(err2) && ok) { err = err2; return false; }
     return ok;
@@ -313,6 +326,79 @@ bool PlainModel::prompt_warm_products(std::string& err) {
         return false;
     }
     return true;
+}
+
+bool PlainModel::dense_int8_ok(const W& w) const {
+    return dense_int8_env() && prefill::mmq::chosen() && w.data != nullptr && prefill::mmq::supported(w.type) &&
+           w.n_out % 128 == 0 && w.n_in % 32 == 0;
+}
+
+bool PlainModel::prompt_dense_int8(const W& w, const float* x, int64_t ldx, float* y, int64_t T, int64_t ldy) {
+    if (!dense_int8_ok(w)) return false;
+    PromptBufs& P = pb_;
+    prefill::mmq::quantize(x, nullptr, P.xq, w.type, w.n_in, ldx, T, cs_);
+    prefill::mmq::Product p;
+    p.w = w.data; p.type = w.type; p.w_rows = w.n_out; p.w_cols = w.n_in; p.n = 1; p.xq = P.xq;
+    p.bounds = P.dense_bounds; p.ids = P.identity; p.total_rows = T; p.max_rows = T;
+    p.dst = y; p.ld_dst = ldy > 0 ? ldy : w.n_out;
+    prompt_gemm().mmq.run(p, cs_);
+    return true;
+}
+
+// The int8 products read the weight in its blocks a row tile at a time; Gemm::native dequantizes it to FP16 once a
+// product (a time of its own, whatever the rows) and multiplies it in the products' library.  Each is timed as
+// a + b rows from 16 rows and the chunk's (the best of three, after one), and dense_native_rows_ is where they cross.
+// The RX 9060 XT, Qwen3.5-9B Q4_K_M (2026-10-27): int8 faster at 16 and 23 tokens, FP16 at 128 and above (2289 tok/s
+// at 1K against 843).
+void PlainModel::prompt_dense_calibrate() {
+    PromptBufs& P = pb_;
+    if (blocks_.empty() || P.T < 32) return;
+    const W& w = blocks_.front().sh_gate;   // the dense FFN's gate: the largest of the products a chunk takes
+    if (!dense_int8_ok(w)) return;
+    prefill::Gemm& gm = prompt_gemm().gemm;
+    PromptGemm& pg = prompt_gemm();
+    const int64_t lo = 16, hi = P.T;
+    using Clock = std::chrono::steady_clock;
+    auto best = [&](const std::function<void()>& run) {
+        double t = 1e30;
+        for (int i = 0; i < 4; ++i) {
+            const auto t0 = Clock::now();
+            run();
+            if (!strata::gpu::stream_sync(cs_)) return -1.0;
+            if (i > 0) t = std::min(t, std::chrono::duration<double>(Clock::now() - t0).count());
+        }
+        return t;
+    };
+    try {
+        if (!strata::gpu::memset_async(P.hn, 0, (size_t) (hi * w.n_in) * 4, cs_) ||
+            !strata::gpu::memset_async(P.x16, 0, (size_t) (hi * w.n_in) * 2, cs_))
+            return;
+        if (!pg.identity) {
+            prefill::mmq::iota(P.identity, P.T, cs_);
+            pg.identity = true;
+        }
+        double n[2], q[2];
+        for (int i = 0; i < 2; ++i) {
+            const int64_t T = i == 0 ? lo : hi;
+            P.h_dense_bounds[0] = 0;
+            P.h_dense_bounds[1] = (int32_t) T;
+            if (!strata::gpu::copy_async(P.dense_bounds, P.h_dense_bounds, 2 * sizeof(int32_t), cs_)) return;
+            n[i] = best([&] { gm.native(P.x16, w.type, w.data, P.sh_gate, T, w.n_out, w.n_in, 0); });
+            q[i] = best([&] { prompt_dense_int8(w, P.hn, w.n_in, P.sh_gate, T, 0); });
+            if (n[i] < 0 || q[i] < 0) return;
+        }
+        // native - int8 = d0 + d1 (T - lo): FP16 from where it turns negative
+        const double d0 = n[0] - q[0], d1 = ((n[1] - q[1]) - d0) / (double) (hi - lo);
+        if (d0 <= 0) dense_native_rows_ = 0;
+        else if (d1 < 0) dense_native_rows_ = lo + (int64_t) std::ceil(d0 / -d1);
+        std::fprintf(stderr, "strata plain: dense products in FP16 (the products' library) from %s rows, in int8 below "
+                             "(%.2f / %.2f ms at %lld rows, %.2f / %.2f at %lld)\n",
+                     dense_native_rows_ == INT64_MAX ? "no" : std::to_string(dense_native_rows_).c_str(), 1e3 * n[0],
+                     1e3 * q[0], (long long) lo, 1e3 * n[1], 1e3 * q[1], (long long) hi);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "strata plain: timing the dense products: %s (int8 kept)\n", e.what());
+        dense_native_rows_ = INT64_MAX;
+    }
 }
 
 bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* routes,
@@ -716,23 +802,11 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
     strata::gpu::Stream cs = cs_;
     prefill::Gemm& gm = prompt_gemm().gemm;
     auto f16 = [&](const float* x, int64_t rows, int64_t cols) { prefill::to_f16(x, P.x16, rows * cols, cs); };
-    // a dense product from float rows x (ldx a row) in int8 (iq_mmq, as one expert of T rows) where the weight's type
-    // and shape are the int8 products'; false: the caller takes Gemm::native from the FP16 copy
-    static const bool dense_env = [] {   // STRATA_PLAIN_DENSE_MMQ=0: every dense product through Gemm::native
-        const char* v = std::getenv("STRATA_PLAIN_DENSE_MMQ");
-        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
-    }();
-    const bool dense_on = dense_env && prefill::mmq::chosen();   // as for the experts: PlainModel::prompt_int8
+    // a dense product from float rows x (ldx a row) in int8 below dense_native_rows_ rows where the weight is the int8
+    // products'; false: the caller takes Gemm::native from the FP16 copy
+    const bool dense_on = dense_int8_env() && prefill::mmq::chosen();   // as for the experts: PlainModel::prompt_int8
     auto dense = [&](const W& w, const float* x, int64_t ldx, float* y, int64_t T, int64_t ldy = 0) {
-        if (!dense_on || w.data == nullptr || !prefill::mmq::supported(w.type) || w.n_out % 128 != 0 || w.n_in % 32 != 0)
-            return false;
-        prefill::mmq::quantize(x, nullptr, P.xq, w.type, w.n_in, ldx, T, cs);
-        prefill::mmq::Product p;
-        p.w = w.data; p.type = w.type; p.w_rows = w.n_out; p.w_cols = w.n_in; p.n = 1; p.xq = P.xq;
-        p.bounds = P.dense_bounds; p.ids = P.identity; p.total_rows = T; p.max_rows = T;
-        p.dst = y; p.ld_dst = ldy > 0 ? ldy : w.n_out;
-        prompt_gemm().mmq.run(p, cs);
-        return true;
+        return T < dense_native_rows_ && prompt_dense_int8(w, x, ldx, y, T, ldy);
     };
     auto proj = [&](const W& w, float* y, int64_t T, int64_t ldy = 0) {
         gm.native(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, ldy);
@@ -958,8 +1032,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     f16(P.hn, T, N);
                     proj_hn(b.sh_gate, P.sh_gate);
                     proj_hn(b.sh_up, P.sh_up);
-                    if (dense_on && prefill::mmq::supported(b.sh_down.type) && b.sh_down.n_out % 128 == 0 &&
-                        b.sh_down.n_in % 32 == 0) {
+                    if (T < dense_native_rows_ && dense_int8_ok(b.sh_down)) {
                         // the SwiGLU in FP32 rows for the int8 product: the chunk as one row (the kernel is
                         // element-wise, and takes at most 8 rows)
                         k::native_swiglu_f32(P.sh_gate, P.sh_up, P.sh_gate, (int) (FS * T), 1, cs);

@@ -458,6 +458,19 @@ private:
     bool prompt_one(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits, std::string& err);
     bool prompt_split(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits, std::string& err);
     bool prompt_warm_products(std::string& err);
+    /// W's dense products can go in int8: the int8 products are this GPU's (prefill::mmq::chosen, not turned off by
+    /// STRATA_PLAIN_DENSE_MMQ=0) and take W's type and shape.
+    bool dense_int8_ok(const W& w) const;
+    /// A dense product y = x W^T of T float rows (ldx a row) in int8 (iq_mmq, as one expert of T rows), into y (ldy a
+    /// row, 0: W's n_out); false where dense_int8_ok is not (the caller takes Gemm::native).
+    bool prompt_dense_int8(const W& w, const float* x, int64_t ldx, float* y, int64_t T, int64_t ldy);
+    /// A dense model's: the rows from which a dense product is faster through Gemm::native (dequantized to FP16, the
+    /// products' library) than in int8, from the two timed on the dense FFN's gate at 16 rows and a whole chunk's
+    /// (dense_native_rows_); after prompt_warm_products, in its buffers.
+    void prompt_dense_calibrate();
+    /// Dense products of at least this many rows go through Gemm::native, fewer in int8 (INT64_MAX: always in int8,
+    /// as the MoE models' dense products)
+    int64_t dense_native_rows_ = INT64_MAX;
     /// The chunk's routed experts of MoE layer `ml`: pb_.hn its T normed rows (and pb_.x16 their FP16 copy for the FP16
     /// path), pb_.ids their routes; writes pb_.parts in routing order, the routes into `routes` (null: not kept).
     /// `mark(stage)` is the profile's (1 the grouping, 2 the experts).
