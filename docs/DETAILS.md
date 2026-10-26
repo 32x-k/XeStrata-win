@@ -1016,7 +1016,7 @@ Two options are off by default (both on one GPU).
   An agent that keeps a long history and replaces only the last message does not read the history again.
   It applies to a history of 8,192 tokens or more with a last message of at most 1,024; it splits the prompt's chunks and costs a fresh request the time of the snapshot.
 
-### Several conversations (opt-in)
+### Several conversations
 
 Add `--conversation-cache-mib 8192 --conversation-cache-slots 4` to the engine arguments (the config's `args`) to park up to four conversations in at most 8 GiB of RAM.
 When a request continues another conversation than the one the engine holds, the engine first copies the held one aside
@@ -1025,7 +1025,7 @@ A chat and an agent's subagent can then alternate without re-reading each other.
 
 - Requests still run one at a time.
   Nothing tells conversations apart but their tokens, pictures and control-vector setting.
-- The default is 0 (off); `--prompt-cache 0` turns it off too.
+- Without `--conversation-cache-mib` the budget is sized from the RAM free once the model is loaded (upstream #3493): 40% of what is left above `--conversation-cache-min-free-mib`, at most 8192, in steps of 256, and off when that is under 1024; the start log says which in one line. `--conversation-cache-mib 0` turns it off, and so does `--prompt-cache 0`; with Qwen3.8-Flash-Next, so does running without `--mtp`.
   Parked conversations are not kept across restarts, unless [the next section](#keeping-parked-conversations-across-restarts-opt-in) is set up.
 - Before each copy the engine checks that `--conversation-cache-min-free-mib N` (default 2560) of RAM stays free (the figure is read as below).
   If it does not, it evicts the oldest parked conversations and checks again (upstream 940011da).

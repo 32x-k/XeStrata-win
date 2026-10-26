@@ -147,13 +147,14 @@ void linkless_gpu_adapter() {
 // over, or from the conversation cache).
 namespace {
 
-// The conversation cache (--conversation-cache-mib, off by default as Qwen3.8-Flash-Next's): conversations set aside
+// The conversation cache (--conversation-cache-mib, sized from the free RAM by default as Qwen3.8-Flash-Next's, #3493):
+// conversations set aside
 // in RAM, each its tokens and the state they left (PlainModel::save_state), so a client that comes back to one reads
 // only what it added.  A request takes the live state or a parked one, whichever holds the longer start of it (with a
 // recurrent state, all of the conversation's tokens); the live one is parked before another takes its place, the
 // least recently used one dropped past the slots or the budget, or when the RAM left would fall under the floor.
 struct ConversationCache {
-    int64_t budget = 0;           // bytes; 0: off
+    int64_t budget = -1;          // bytes; 0: off, -1: not given (plain_main sizes it, core's auto_conversation_cache_mib)
     int slots = 4;
     int64_t min_free = 2560ll << 20;
     struct Entry {
@@ -705,7 +706,7 @@ int plain_main(int argc, char** argv) {
         else if (a == "--dump-logits") dump_path = next("--dump-logits");
         else if (a == "--dump-routing") opt.dump_routing = next("--dump-routing");
         else if (a == "--conversation-cache-mib")
-            cache.budget = std::max<int64_t>(0, std::strtoll(next("--conversation-cache-mib"), nullptr, 10)) << 20;
+            cache.budget = std::max<int64_t>(0, std::strtoll(next("--conversation-cache-mib"), nullptr, 10)) * (1ll << 20);
         else if (a == "--conversation-cache-slots")
             cache.slots = std::max(1, (int) std::strtol(next("--conversation-cache-slots"), nullptr, 10));
         else if (a == "--conversation-cache-min-free-mib")
@@ -839,6 +840,16 @@ int plain_main(int argc, char** argv) {
         std::fprintf(stderr, "strata (%s): prompt matrix products on %s; the experts' in %s%s%s\n", arch.c_str(),
                      strata::prefill::Gemm::path(), experts ? "int8 (" : "FP16", experts ? experts : "",
                      experts ? ")" : "");
+    }
+    if (cache.budget < 0) {   // from the RAM free now that the model is loaded, as generate.cpp's (#3493)
+        const int64_t mib = serve && cache.slots > 0
+            ? strata::core::auto_conversation_cache_mib(strata::core::available_host_bytes(), cache.min_free >> 20)
+            : 0;
+        cache.budget = mib << 20;
+        if (mib > 0)
+            std::fprintf(stderr, "strata (%s): conversation cache sized from the free RAM: %lld MiB for up to %d parked "
+                                 "conversations (--conversation-cache-mib N sets it, 0 turns it off)\n", arch.c_str(),
+                         (long long) mib, cache.slots);
     }
     if (serve)
         return plain_serve(model, opt, arch, eos.empty() ? eos_tokens(gguf) : eos, profile_save, save_min, cache);

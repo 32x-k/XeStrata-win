@@ -464,7 +464,7 @@ struct Options {
     int prompt_cache = 6;
     /// --serve: parked conversations (upstream ccc660b): a host-RAM budget for whole sessions put aside when another
     /// conversation takes the session, at most `slots` of them, and the RAM that must stay free when one is parked
-    int64_t conversation_cache_mib = 0;
+    int64_t conversation_cache_mib = -1;   ///< -1: not given, --serve sizes it from the free RAM (#3493); 0: off
     int conversation_cache_slots = 4;
     int64_t conversation_cache_min_free_mib = 2560;
     /// --serve: park only conversations of at least this many tokens.  Every parked conversation costs one of
@@ -622,7 +622,8 @@ void usage() {
                  "  --vision             --serve takes images too (GENI requests; embeddings from strata-vision)\n"
                  "  --prompt-cache N     --serve: keep N conversation checkpoints between requests (default 6, ~118 MB\n"
                  "                       of RAM each; 0 = read every prompt from the start)\n"
-                 "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
+                 "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default: from the free RAM,\n"
+                 "                       up to 8192; 0 = off)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
                  "  --conversation-cache-min-free-mib N  --serve: RAM floor (under MemAvailable, the cgroup limits and\n"
                  "                       --memory-limit-mib) when parking, saving or restoring a session (default 2560)\n"
@@ -2696,7 +2697,7 @@ int main(int argc, char** argv) {
     }
     // the folder keeps what the RAM cache parks: without parking there is nothing to write
     if (!o.conversation_save.empty() &&
-        (o.conversation_cache_mib == 0 || o.conversation_cache_slots == 0 || o.prompt_cache == 0)) {
+        (o.conversation_cache_mib == 0 || o.conversation_cache_slots == 0 || o.prompt_cache == 0)) {   // -1: sized below
         if (o.serve)
             std::fprintf(stderr, "strata serve: warning: --conversation-save needs conversation parking "
                                  "(--conversation-cache-mib); not saving conversations\n");
@@ -7390,6 +7391,25 @@ int main(int argc, char** argv) {
         // host RAM first, and a parked one whose tokens start the request is put back instead of read again.  Saved
         // only on a switch or rewind, not on each continuing request; no graph address changes (the images are
         // ordinary host vectors).
+        // #3493 (upstream f0010a607): no --conversation-cache-mib given: sized for agent use from the RAM free now that
+        // the model is loaded (core's auto_conversation_cache_mib, the other models' engine's too); an agent harness
+        // alternates a long conversation with shorter ones, and with the cache off each request read its whole prompt
+        // again.  An explicit value, 0 included, is kept.
+        if (o.conversation_cache_mib < 0) {
+            o.conversation_cache_mib = o.serve && o.prompt_cache > 0 && o.conversation_cache_slots > 0 && use_mtp
+                ? strata::core::auto_conversation_cache_mib(strata::core::available_host_bytes(),
+                                                            o.conversation_cache_min_free_mib)
+                : 0;
+            if (o.serve && o.conversation_cache_mib > 0)
+                std::fprintf(stderr, "strata serve: conversation cache sized from the free RAM: %lld MiB for up to %d "
+                                     "parked conversations (--conversation-cache-mib N sets it, 0 turns it off)\n",
+                             (long long) o.conversation_cache_mib, o.conversation_cache_slots);
+            if (o.conversation_cache_mib == 0 && !o.conversation_save.empty()) {
+                std::fprintf(stderr, "strata serve: warning: --conversation-save needs conversation parking, and the free "
+                                     "RAM leaves none (--conversation-cache-mib); not saving conversations\n");
+                o.conversation_save.clear();
+            }
+        }
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 && use_mtp ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
             (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens);

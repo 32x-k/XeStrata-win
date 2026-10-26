@@ -4835,20 +4835,6 @@ def two_socket_note(sockets) -> list[str]:
             f"the config's args ({SETUP_CMD} --calibrate measures it on this PC)"]
 
 
-AGENT_CACHE_FREE_GB = 24       # upstream bench #882 #440: RAM left beside the model for the conversation cache
-AGENT_CACHE_MIB = 8192
-
-
-def agent_cache_note(args, ram: float, model_ram_gb: float) -> list[str]:
-    """upstream 3772ded7c (bench #882 #440): for several agents or clients at once, a tip to keep each one's
-    conversation.  Text only: the config is not touched."""
-    if "--conversation-cache-mib" in args or ram - model_ram_gb < AGENT_CACHE_FREE_GB:
-        return []
-    return [f"tip: for several agents or clients at once, --conversation-cache-mib {AGENT_CACHE_MIB} in the config's "
-            "args keeps each one's conversation; without it they were measured re-reading ~90% of their prompts "
-            "(docs/DETAILS.md)"]
-
-
 def gpu_sel(value) -> list:
     """A config's "gpu" as a list of card numbers: 0, [0, 2] or the string form "0,2" (which serve splits
     the same way).  [] when it names none.  Without this, a string "0,1" reached gpu_info() whole and
@@ -6986,8 +6972,7 @@ def main() -> int:
         cfg["images"], cfg["image_models"] = got if got is not None else (None, None)
         if not cfg["image_models"]:
             cfg["image_models"] = None
-    return finish_setup(a, cfg, tag, port, adopted, vision != "none",
-                        notes=agent_cache_note(cfg["args"], ram, MODELS[model]["ram_gb"]))
+    return finish_setup(a, cfg, tag, port, adopted, vision != "none")
 
 
 if __name__ == "__main__":
