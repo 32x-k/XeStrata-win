@@ -129,7 +129,7 @@ in [DETAILS.md](DETAILS.md#rtx-30-series-sm_86-and-tesla-p100-sm_60-bitwise-deco
 ## Pascal GP100: a Q8_0 decode kernel (opt-in)
 
 GP100 (P100, PH402) is the one Pascal chip without `__dp4a`. Its dense projections read their weights at 40-80 GB/s of about
-730, decoding K- and i-quant blocks one int at a time. Two opt-in changes, both measured on a PH402 only:
+730, decoding K- and i-quant blocks one int at a time. Three opt-in changes, all measured on a PH402 only:
 
 - **`STRATA_Q8_SM60=1`** packs every Q8_0 dense matrix and the head into the planes of `STRATA_Q8_PACKED` and runs them on
   `src/kernels/cuda/q8_sm60.cuh`: a warp per row, 16-byte weight loads, activations copied once per workgroup into shared memory,
@@ -141,8 +141,14 @@ GP100 (P100, PH402) is the one Pascal chip without `__dp4a`. Its dense projectio
 - **`STRATA_IQ_STAGE_TABLES=1`** stages IQ3_XXS and IQ3_S codebooks in shared memory in the grouped expert kernels. Bitwise the
   same output. Interleaved A/Bs on a Tesla P100 showed no end-to-end change, so it is off by default. On an RTX 3090 Ti, forced on,
   the same layers took 3-13% longer.
+- **`STRATA_DOWN_WS=1`** (compute capability 6.0 only, CUDA build with `STRATA_EXPERIMENTAL_SM60`): the verify window's IQ4_NL / Q2_0
+  expert down rows (n_ff 640) take `native_down_ws_kernel`. It stages a block's rows in shared memory with 16-byte loads and then
+  runs expert mode 0's row dots on them, so the output is bit for bit mode 0's (and mode 8's, which equals it). The author's numbers
+  on one PH402 die, Swift 1.5 IQ3_S, one-token window: IQ4_NL 72.6 us (mode 8, the cc 6.0 default) and 54.5 us (mode 0) become
+  42.3 us; Q2_0 53.5 / 65.4 us become 38.6 us. It replaces the down step in either expert mode. Not measured end to end on a
+  single card here.
 
-Neither change is measured on compute capability 6.1, which has `__dp4a`. Two practical notes for GP100 cards: the default
+None of these changes is measured on compute capability 6.1, which has `__dp4a`. Two practical notes for GP100 cards: the default
 application clock is 759 MHz and a layer split leaves each die idle most of a window, so lock the clocks
 (`nvidia-smi -i <dies> -ac 715,1050` as administrator). And a second engine pinned to the same logical CPUs halves this one's
 decode; keep two engines on different logical CPUs.
