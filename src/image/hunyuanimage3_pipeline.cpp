@@ -19,6 +19,7 @@
 #include "strata/core/runtime.hpp"
 #include "strata/image/hunyuanimage3_host.hpp"
 #include "strata/image/hunyuanimage3_refs.hpp"
+#include "strata/image/img_start.hpp"
 #include "strata/image/qi_dit.hpp"
 #include "strata/image/safetensors.hpp"
 
@@ -44,6 +45,30 @@ constexpr float kDistilShift = 3.0f, kDistilGuidance = 2.5f;
 constexpr int64_t kLatentChannels = 32, kDownsample = 16;
 
 uint64_t clampu(uint64_t v, uint64_t lo, uint64_t hi) { return std::max(lo, std::min(v, hi)); }
+
+// RGBA8 [th][tw][4] of `f` as hunyuanimage3_vae_copy places it (the aspect kept, the center cropped), nearest: the
+// base image's kept pixels and a mask over it, where the VAE's copy is
+std::vector<uint8_t> crop_rgba8(const QiRef& f, int64_t tw, int64_t th) {
+    const double tr = (double) th / (double) tw, r = (double) f.height / (double) f.width;
+    int64_t rw = 0, rh = 0;
+    if (r < tr) {
+        rh = th;
+        rw = (int64_t) std::nearbyint((double) th / (double) f.height * (double) f.width);
+    } else {
+        rw = tw;
+        rh = (int64_t) std::nearbyint((double) tw / (double) f.width * (double) f.height);
+    }
+    rw = std::max(rw, tw);
+    rh = std::max(rh, th);
+    const int64_t top = (int64_t) std::nearbyint((double) (rh - th) / 2.0);
+    const int64_t left = (int64_t) std::nearbyint((double) (rw - tw) / 2.0);
+    std::vector<uint8_t> out((size_t) (tw * th * 4));
+    for (int64_t y = 0; y < th; ++y)
+        for (int64_t x = 0; x < tw; ++x)
+            std::copy_n(f.rgba.data() + (((y + top) * f.height / rh) * f.width + (x + left) * f.width / rw) * 4, 4,
+                        out.data() + (y * tw + x) * 4);
+    return out;
+}
 
 // the reference images as a key for the cached rows: their sizes and a hash of their pixels
 std::string refs_key(const std::vector<QiRef>& refs) {
@@ -358,7 +383,7 @@ bool HunyuanImage3Pipeline::reference_grids(const QiRequest& r, std::vector<Huny
 }
 
 QiNeed HunyuanImage3Pipeline::need(int64_t n_text, int64_t width, int64_t height,
-                                   const std::vector<std::pair<int64_t, int64_t>>& refs, bool, int64_t) {
+                                   const std::vector<std::pair<int64_t, int64_t>>& refs, bool mask, int64_t) {
     const int64_t th = height / kDownsample, tw = width / kDownsample;
     if (th <= 0 || tw <= 0 || n_text < th * tw + 1) {
         throw std::invalid_argument("image engine: the ids do not hold the image block and some text");
@@ -387,6 +412,11 @@ QiNeed HunyuanImage3Pipeline::need(int64_t n_text, int64_t width, int64_t height
             vae = std::max(vae, enc + ref);
             vae_least = std::max(vae_least, enc + ref);   // the encode is never tiled (hunyuanimage3_vae.hpp)
         }
+    }
+    if (mask) {   // a base image (img_start.hpp): its encode at the image's size, before the walk as a reference's
+        if (refs.empty() || !vision_size_) fixed += vae_size_->encoder_bytes();
+        vae = std::max(vae, base_encode_bytes(tw, th));
+        vae_least = std::max(vae_least, base_encode_bytes(tw, th));
     }
     QiNeed n;
     // least: every bank streamed (two slots of the largest), the DiT's sequence buffers and the VAE's taken in
@@ -418,6 +448,44 @@ QiPlan HunyuanImage3Pipeline::plan(int64_t T, int64_t th, int64_t tw) {
     // loaded, which the walk does, not this plan
     for (int64_t l = p.resident_layers; l < dit_->layers(); ++l) p.streamed += dit_->bank_bytes(l);
     return p;
+}
+
+uint64_t HunyuanImage3Pipeline::base_encode_bytes(int64_t tw, int64_t th) const {
+    const int64_t H = th * kDownsample, W = tw * kDownsample;
+    return vae_size_->encode_scratch_bytes(H, W) + (uint64_t) (3 * H * W + kLatentChannels * th * tw) * sizeof(float);
+}
+
+std::vector<float> HunyuanImage3Pipeline::base_latent(const QiRef& base, int64_t tw, int64_t th) {
+    std::string err;
+    if (!vae_->has_encoder() && !vae_->open_encoder(vae_path_, err)) throw std::runtime_error("image engine: " + err);
+    const int64_t H = th * kDownsample, W = tw * kDownsample;
+    const std::vector<float> img = hunyuanimage3_vae_copy(base, W, H);
+    std::vector<float> z((size_t) (kLatentChannels * th * tw));
+    // the resident banks give way to the encode where it does not fit beside them (as a reference's)
+    const uint64_t have = held();
+    if (base_encode_bytes(tw, th) > (budget() > have ? budget() - have : 0) && dit_->bank_vram() > dit_->bank_min()) {
+        dit_->set_bank_budget(dit_->bank_min());
+        banks_set_ = dit_->bank_min();
+    }
+    float *d_img = nullptr, *d_z = nullptr;
+    if (!gpu::alloc_device(&d_img, img.size() * sizeof(float)) || !gpu::alloc_device(&d_z, z.size() * sizeof(float))) {
+        if (d_img != nullptr) gpu::free(d_img);
+        throw std::runtime_error(std::string("image engine: GPU memory for the base image: ") + gpu::last_error());
+    }
+    try {
+        gpu::copy(d_img, img.data(), img.size() * sizeof(float));
+        vae_->encode(d_img, H, W, d_z, nullptr);   // the posterior's mean
+        gpu::copy(z.data(), d_z, z.size() * sizeof(float));
+    } catch (...) {
+        gpu::free(d_img);
+        gpu::free(d_z);
+        vae_->drop_scratch();
+        throw;
+    }
+    gpu::free(d_img);
+    gpu::free(d_z);
+    vae_->drop_scratch();
+    return z;
 }
 
 uint64_t HunyuanImage3Pipeline::refs_encode_bytes(const std::vector<HunyuanImage3Block>& blocks, size_t n) const {
@@ -551,8 +619,13 @@ std::vector<uint8_t> HunyuanImage3Pipeline::generate(const QiRequest& r, QiTimes
                                                      const std::function<bool(int, int)>& step,
                                                      const std::function<void(const char*)>& stage) {
     using clock = std::chrono::steady_clock;
-    if (!r.mask.rgba.empty())
-        throw std::invalid_argument("image engine: HunyuanImage 3.0's edits take no mask");
+    const bool mask = !r.mask.rgba.empty();
+    const QiRef* base = base_image(r);
+    if ((mask || r.strength < 1.0f) && base == nullptr)
+        throw std::invalid_argument("image engine: a mask or a strength below 1 needs a base image (an init image or "
+                                    "a reference)");
+    if (mask && r.mask.rgba.size() != (size_t) (r.mask.width * r.mask.height * 4))
+        throw std::invalid_argument("image engine: the mask is empty");
     if (!r.neg_ids.empty() || r.cfg > 1.0f)
         throw std::invalid_argument("image engine: HunyuanImage 3.0 samples once: no negative prompt, no cfg");
     if (r.drop != 0)
@@ -574,11 +647,15 @@ std::vector<uint8_t> HunyuanImage3Pipeline::generate(const QiRequest& r, QiTimes
     // reference re-gathers them per step (`hidden_in_host`), which is why the two paths agree at one step and only
     // there when this copy is missed.  The references are encoded before the plan takes the card for the banks.
     if (stage) stage(r.refs.empty() ? "text" : "refs");
-    size_plan(T, r.height / kDownsample, r.width / kDownsample, !r.refs.empty(),
-              refs_encode_bytes(blocks, r.refs.size()));   // refused before the reference images' reading
+    const int64_t th = r.height / kDownsample, tw = r.width / kDownsample;
+    size_plan(T, th, tw, !r.refs.empty() || base != nullptr,
+              std::max(refs_encode_bytes(blocks, r.refs.size()), base != nullptr ? base_encode_bytes(tw, th) : 0));
     std::vector<float> hid((size_t) (T * hidden));
     bool cached = false;
     text_rows(r, ids, start, blocks, hidden, hid.data(), cached);
+    // a base image (img_start.hpp): its latent at the generated block's size, where the references were read
+    std::vector<float> z0;
+    if (base != nullptr) z0 = base_latent(*base, tw, th);
     QiPlan p = plan(T, r.height / kDownsample, r.width / kDownsample);
     p.text_cached = cached;
     if (!dit_->set_sequence(T, (T - start), y.data(), x.data(), err, blocks.size() > 1 ? key_lim.data() : nullptr))
@@ -595,10 +672,10 @@ std::vector<uint8_t> HunyuanImage3Pipeline::generate(const QiRequest& r, QiTimes
         sigmas.resize((size_t) (wanted + 1));
         hunyuanimage3_sigmas(wanted, kDistilShift, sigmas.data());
     }
+    sigmas = strength_sigmas(sigmas, r.strength);
     const int64_t steps = (int64_t) sigmas.size() - 1;
     const float guidance_scale = r.guidance > 0.0f ? r.guidance : kDistilGuidance;
     const float guidance = 1000.0f * guidance_scale;   // the number the guidance token embeds
-    const int64_t th = r.height / kDownsample, tw = r.width / kDownsample;
     const int64_t n_img = th * tw, n_lat = kLatentChannels * n_img;
     float* img = hid.data() + (size_t) (start * hidden);   // the block's rows, where patch_embed writes
     if (!around_->set_grid(th, tw, err)) throw std::runtime_error("image engine: " + err);
@@ -612,6 +689,17 @@ std::vector<uint8_t> HunyuanImage3Pipeline::generate(const QiRequest& r, QiTimes
     } else {
         const auto noise = philox_randn(r.seed, (uint64_t) n_lat);
         std::copy(noise.begin(), noise.end(), lat.begin());
+    }
+    // img2img: from the base image's latent on the flow's path at the first sigma; a mask: the positions it keeps
+    // follow that path after each step (img_start.hpp, here on the host latent [32][th][tw])
+    const std::vector<float> noise = base != nullptr ? lat : std::vector<float>();
+    if (base != nullptr && r.strength < 1.0f)
+        for (size_t i = 0; i < (size_t) n_lat; ++i) lat[i] = (1.f - sigmas[0]) * z0[i] + sigmas[0] * noise[i];
+    std::vector<uint8_t> mask_px;
+    std::vector<float> m;
+    if (mask) {
+        mask_px = crop_rgba8(r.mask, r.width, r.height);
+        m = latent_mask(mask_px, r.width, r.height, kDownsample);
     }
 
     const auto t1 = clock::now();
@@ -643,6 +731,11 @@ std::vector<uint8_t> HunyuanImage3Pipeline::generate(const QiRequest& r, QiTimes
                            : !around_->final_layer(img, th, tw, t, vel.data(), err))
                 throw std::runtime_error("image engine: " + err);
             hunyuanimage3_euler_step(lat.data(), vel.data(), n_lat, sigma, sigma_next);
+            if (mask)
+                for (size_t i = 0; i < (size_t) n_lat; ++i) {
+                    const float k = m[i % (size_t) n_img];
+                    lat[i] = k * lat[i] + (1.f - k) * ((1.f - sigma_next) * z0[i] + sigma_next * noise[i]);
+                }
             if (step && !step((int) (s + 1), (int) steps)) throw QiStopped();
         }
         if (times != nullptr) times->sampling = std::chrono::duration<double>(clock::now() - t1).count();
@@ -708,6 +801,8 @@ std::vector<uint8_t> HunyuanImage3Pipeline::generate(const QiRequest& r, QiTimes
             }
             out[(size_t) (q * 4 + 3)] = 255;
         }
+        // a mask's kept part is the base image's own pixels (not through the VAE), blended by the mask's alpha
+        if (mask) keep_pixels(out, crop_rgba8(*base, r.width, r.height), mask_px);
         if (times != nullptr) times->text = std::chrono::duration<double>(t1 - t0).count();
         if (plan_out != nullptr) {
             p.budget = budget();   // what the next request plans with (the banks may have given room to the VAE)
