@@ -1287,20 +1287,55 @@ __global__ void __launch_bounds__(kThreads) dq_rows_kernel(const uint8_t* __rest
     __syncthreads();
     const int nsb = k / 32;
     const size_t total = (size_t) n * (size_t) nsb;
+    // A warp stages its 32 sub-blocks in shared through contiguous uint4 loads and decodes from there: a lane reading its own
+    // 176-byte block at that stride touched 32 scattered sectors per instruction - the dequant's remaining cost once the stores
+    // were vectorised (15.4 s of a 4K prompt, 23 GB of quantised input at ~1.5 GB/s).  Each lane decodes with the index relative
+    // to the staged buffer (kb - kb0), which is exactly equivalent because kb0 is a multiple of the 8 sub-blocks in a block.
+    constexpr int kQKv = kQK<T>;
+    constexpr int kSpan = (kQKv == 32 ? 32 : 4) * Ty<T>::B;      // bytes of a warp's 32 sub-blocks
+    constexpr bool kCanStage = Ty<T>::TAB == 0;                  // (a codebook table already fills shared for the i-quants)
+    const bool staged = (nsb % 32 == 0) && kCanStage;
+    __shared__ uint4 sin4[kCanStage ? (kThreads / 32) * 44 : 1];
+    const int lane32 = threadIdx.x & 31, wq = threadIdx.x >> 5;
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (size_t) gridDim.x * blockDim.x) {
         const size_t r = i / (size_t) nsb;
         const int kb = (int) (i - r * (size_t) nsb);
         Sub sb;
         sb.m0 = sb.m1 = 0.0f;
-        decode<T>(raw + r * ld, kb, tab, sb);
+        if (staged) {
+            const size_t wbase = i - (size_t) lane32;   // (uniform in the warp: blockDim and the stride are multiples of 32)
+            const size_t r0 = wbase / (size_t) nsb;
+            const int kb0 = (int) (wbase - r0 * (size_t) nsb);
+            const uint8_t* srcp = raw + r0 * ld + (size_t) (kb0 * Ty<T>::B) / (kQKv / 32);
+            uint4* st = sin4 + wq * 44;
+            for (int c = lane32; c < kSpan / 16; c += 32) st[c] = ((const uint4*) srcp)[c];
+            __threadfence_block();
+            __syncwarp();
+            decode<T>((const uint8_t*) st, kb - kb0, tab, sb);
+        } else
+            decode<T>(raw + r * ld, kb, tab, sb);
         const float d0 = __fmul_rn(sb.d, (float) sb.s0), d1 = __fmul_rn(sb.d, (float) sb.s1);
         uint16_t* o = dst + r * (size_t) k + (size_t) kb * 32;
+        // (the 32 halves packed into four 16-byte stores: 32 two-byte stores a lane, each lane 64 bytes from the next, write
+        // ~16x the bytes they carry in DRAM sectors - measured as the dense dequant's whole cost: 6.6 GB to FP16 in 20.0 s)
+        uint32_t hw[16];
 #pragma unroll
-        for (int j = 0; j < 32; ++j) {
-            const int q = (int) (int8_t) ((uint32_t) sb.q[j >> 2] >> (8 * (j & 3)));
-            const float v = j < 16 ? __fsub_rn(__fmul_rn(d0, (float) q), sb.m0) : __fsub_rn(__fmul_rn(d1, (float) q), sb.m1);
-            o[j] = bf16 ? strata::ds4::bf16_rn(v) : __half_as_ushort(__float2half_rn(v));
+        for (int j = 0; j < 16; ++j) {
+            const int q0 = (int) (int8_t) ((uint32_t) sb.q[j >> 1] >> (8 * ((2 * j) & 3)));
+            const int q1 = (int) (int8_t) ((uint32_t) sb.q[j >> 1] >> (8 * ((2 * j + 1) & 3)));
+            const bool lo = (2 * j) < 16;
+            const float v0 = lo ? __fsub_rn(__fmul_rn(d0, (float) q0), sb.m0) : __fsub_rn(__fmul_rn(d1, (float) q0), sb.m1);
+            const bool lo1 = (2 * j + 1) < 16;
+            const float v1 = lo1 ? __fsub_rn(__fmul_rn(d0, (float) q1), sb.m0) : __fsub_rn(__fmul_rn(d1, (float) q1), sb.m1);
+            const uint32_t h0 = bf16 ? strata::ds4::bf16_rn(v0) : __half_as_ushort(__float2half_rn(v0));
+            const uint32_t h1 = bf16 ? strata::ds4::bf16_rn(v1) : __half_as_ushort(__float2half_rn(v1));
+            hw[j] = h0 | (h1 << 16);
         }
+        uint4* o4 = (uint4*) o;
+        o4[0] = make_uint4(hw[0], hw[1], hw[2], hw[3]);
+        o4[1] = make_uint4(hw[4], hw[5], hw[6], hw[7]);
+        o4[2] = make_uint4(hw[8], hw[9], hw[10], hw[11]);
+        o4[3] = make_uint4(hw[12], hw[13], hw[14], hw[15]);
     }
 }
 
