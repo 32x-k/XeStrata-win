@@ -1190,6 +1190,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(gr_upmix_parity PRIVATE strata_prefill )
     add_test(NAME gr_upmix_parity COMMAND gr_upmix_parity)
     set_tests_properties(gr_upmix_parity PROPERTIES SKIP_RETURN_CODE 77)
+    # the two kernels of the layer-major prompt path (STRATA_PREFILL_LAYER_MAJOR=1, #3976): moe_shared_init and
+    # moe_scatter_add against a host reference, bitwise for the scatter (GPU, synthetic, no model)
+    add_executable(lm_kernels_parity src/prefill/lm_kernels_parity.cu)
+    target_link_libraries(lm_kernels_parity PRIVATE strata_prefill )
+    add_test(NAME lm_kernels_parity COMMAND lm_kernels_parity)
+    set_tests_properties(lm_kernels_parity PROPERTIES SKIP_RETURN_CODE 77)
   endif()
   # native_expert_grouped's group stride and fused SwiGLU + q8_1, bitwise vs the launches before them (GPU, synthetic,
   # no model; --bench adds v1/new timings of a window's 48 calls in a graph)
