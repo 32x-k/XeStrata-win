@@ -2913,8 +2913,9 @@ struct Model::Impl {
         // at 64-400 MB, unchanged at 16).  When they do not fit, the stream IS the prompt's expert stage, and its depth
         // is what decides how long the tiles wait: on the 4x R9700 8K prompt a 16 MB ring left 1.7 s of DMA waits in a
         // 5.2 s expert stage, and 1.2-3 GB of ring measured 632 -> 678-684 ppts (+7%) for about -2% decode (off a
-        // fifth more CPU-lane experts).  So: a share of the room, bounded, rather than the fixed 400 MB of 0.2.6.
-        const size_t deep = (size_t) std::min(2000.0, std::max(400.0, room / 1e9 * 0.05 * 1000.0));   // (MB)
+        // fifth more CPU-lane experts).  So: a share of each device's room, bounded, rather than the fixed 400 MB.
+        const double per_dev = devs.empty() ? 0.0 : room / (double) devs.size();
+        const size_t deep = (size_t) std::min(2000.0, std::max(400.0, per_dev / 1e9 * 0.08 * 1000.0));   // (MB)
         const size_t mb = share >= 0.98 ? 16 : deep;
         if (o.verbose)
             std::fprintf(stderr, "ds4: staging ring: experts %.1f GB, VRAM room %.1f GB, dense %.1f GB -> %d MB\n", exp_b / 1e9,
