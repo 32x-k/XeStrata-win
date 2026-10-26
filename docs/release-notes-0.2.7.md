@@ -55,8 +55,8 @@ on the RTX 3060 12 GB (IQ3_XXS), five interleaved pairs of fresh engines:
 | decode behind a 4K document | 45.1 | **62.2 (+37.9%)** |
 
 It holds where it matters most: with **two conversations in flight** the whole recipe reads **31.2 -> 62.0 tok/s aggregate
-(+99%)** and both answers arrive in 4.8 s instead of 9.7 s, and the routing default alone is **+67% aggregate** (59.7 against
-35.6 tok/s) -
+(+99%)** on that card and +22% on the 2x A4000, both answers arriving in half the wall time on the 12 GB box, and the routing
+default alone is **+67% aggregate** there (59.7 against 35.6 tok/s) -
 and on content the tuning was never fitted to it **+29.0%** (43.5 -> 55.0 tok/s on a
 document prompt), and the whole recipe - routing, a workload-fitted expert profile, `--adapt-every 0`, `--vram-reserve-mib
 896` and the English draft vocabulary - gives **+26.5%** there and **+80%** on code in a sustained 80-request session.
