@@ -6129,9 +6129,9 @@ def make_handler(svc: Service):
                         raise ValueError("mask: {\"image_url\": a data: URL, an http(s) URL or a path}")
                     self._no_local_sources([mask])
                     mask = svc.download(mask) if mask.startswith(("http://", "https://")) else Vision.load(mask)
-            # the image model it names; else the default, or where that one makes images only (MageTrail,
-            # HunyuanImage 3.0), the first that edits (the chat's edit_image chooses among those too)
-            gen = svc.images.pick_edit(req.get("model"))
+            # the image model it names; else the default, or where that one has no edits (MageTrail), the first that
+            # edits - unless the request is img2img's (a strength or a mask), which the default takes
+            gen = svc.images.pick_edit(req.get("model"), req.get("strength") is not None or mask is not None)
             job = images_api.parse_edit_request(req, [Vision.normalize(d, keep_alpha=True) for d in files], gen.cfg,
                                                 mask)
             self._image_job(gen, job)

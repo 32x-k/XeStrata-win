@@ -7,7 +7,12 @@ XeStrata's own image engine, strata-image.
 POST /v1/images/generations takes OpenAI's request shape (prompt, size, n, response_format b64_json|url) plus Strata's
 own field seed; POST /v1/images/edits the same with reference images (OpenAI's multipart form, image or image[]; or JSON
 with images: [{"image_url": ...}]), which the image model edits or takes as its subject (Qwen-Image-2.1's edits: the
-vision encoder reads them into the prompt, the VAE's encoder into the DiT's).  The engine (src/image/strata_image.cpp,
+vision encoder reads them into the prompt, the VAE's encoder into the DiT's).  Every model takes a mask there (OpenAI's:
+a PNG of the first image's size whose transparent pixels are where it changes; the engine keeps the rest, its latent
+and its pixels) and a strength (diffusers' img2img strength, above 0 and at most 1: how much of the schedule runs from
+the first image's latent, strength_run; 1, the default of an edit, starts from noise).  A model without edits
+(MageTrail, Mage-Flow without its edit model, one without its vision file) takes one image as img2img's: its
+strength, else STRENGTH_IMG2IMG (with a mask, 1).  src/image/img_start.hpp.  The engine (src/image/strata_image.cpp,
 `strata-image --serve`) starts with the first image and stays, outside the server (serve/image_daemon.py, the next
 server of the same image model and GPU finds it: a model switch does not lose it): its kernels built once, the
 prompt's text states and the layers that fit in VRAM kept between images, one image a request.  It runs Turbo's
@@ -22,7 +27,7 @@ shift (mage_sigmas), and guidance by guidance_scale or true_cfg_scale (the one s
 "cfg_scale": Turbo 1, none; the others 5.0) with negative_prompt (default " ", its pipeline's).  Its edits take up to
 MF_MAX_REFS reference images, in its edit form (MF_EDIT_HEAD, "Image j: <pad>" before the instruction, the 64 ids of
 the system turn dropped) and the config's "edit_steps" (its edit models': Turbo 4, the others 30), on its edit DiT
-("edit_model"); masks and transparent images it has none of.
+("edit_model"); transparent images it has none of.
 
 HunyuanImage 3.0 ("family": "hunyuan-image-3", "schedule": "hunyuanimage3"): its DiT reads the prompt's ids itself
 (it has no text encoder), so the sequence is built here, by hunyuanimage3_ids: the model's system prompt (the
@@ -38,8 +43,8 @@ treat a guided step as one).  Its steps are the config's (the Distil model's 8) 
 engine builds the sigmas (shift 3.0) from the count, so none are sent.  Its edits take up to the config's
 "max_refs" (3) reference images, each a block of its own in the sequence before the prompt (hunyuanimage3_ids: the
 image's VAE latent at the bucket nearest its shape and its 1024 SigLIP2 slots, which the engine fills), and need the
-model's vision file ("vision": the bf16 shard with vision_model.*, which setup downloads); masks and transparent
-images it has none of.  Its weights are under the Tencent Hunyuan Community
+model's vision file ("vision": the bf16 shard with vision_model.*, which setup downloads); transparent images it has
+none of.  Its weights are under the Tencent Hunyuan Community
 License Agreement, which does not apply in the European Union, the United Kingdom or South Korea:
 https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE
 
@@ -72,7 +77,7 @@ HunyuanImage 3.0's instead: {"model_name": "hunyuan-image-3-distil", "family": "
 byte-level BPE: tools/strata_tokenizer.py's Tokenizer.from_hf), "system_prompt": ".../en_unified.txt",
 "vision": ".../model-0032-of-0032.safetensors" (SigLIP2, for the edits), "max_refs": 3, "steps": 8, "guidance": 2.5,
 "schedule": "hunyuanimage3", "resolutions": {"base_size": 1024, "step": 64, "align": 16, "extra_resolutions":
-[...]}, "mask": false, "transparency": false} - no "llm" (no text encoder).
+[...]}, "transparency": false} - no "llm" (no text encoder).
   max_n: the most images one request makes; budget_s: the longest one request's images may take, by the speed this
   server measured (ImageGen.estimate_s; until it has made an image, at most UNMEASURED_N); schedule: Turbo's own
   sigmas or the base model's (base_sigmas; no "schedule" is Turbo), Mage-Flow's static shift (mage_sigmas),
@@ -115,6 +120,9 @@ MIN_SIDE = 256
 MAX_N = 16                         # "max_n": the most images one request makes
 BUDGET_S = 600                     # "budget_s": the longest one request's images may take (ImageGen.check_n)
 UNMEASURED_N = 4                   # the most images a request makes before the server has measured its speed
+# img2img's strength when a request gives none (a model without edits, an image and no mask): diffusers' default for
+# the flow models' img2img pipelines (QwenImageImg2ImgPipeline, FluxImg2ImgPipeline)
+STRENGTH_IMG2IMG = 0.6
 # a step's time against the image's pixels, above the largest size measured (estimate_s): the attention's share grows
 # with them (the B70, Qwen-Image Turbo: 6.5 times the time at 4 times the pixels, 1.35); taken higher, to err long
 SIZE_EXP = 1.5
@@ -197,7 +205,9 @@ def model_defaults(cfg: dict) -> dict:
     cfg_request take theirs from here; the web page shows them): steps (Turbo's fixed, steps_fixed; Mage-Flow's edit
     model's for an edit), the least steps,
     the guidance scale (1: none), the negative prompt when none is given (None: none, so no guidance without one),
-    whether it makes transparent images, and whether its edits take a mask.  HunyuanImage 3.0's guidance is one token
+    whether it makes transparent images, that every model takes a mask, and whether an image it is given is
+    img2img's (a model without edits) with the strength it gets when a request gives none (strength: 1 for an
+    edit).  HunyuanImage 3.0's guidance is one token
     rather than a second pass (guidance_token: no negative prompt, a guided step costs one), and its sizes are its
     resolution buckets (buckets: [width, height] each; a request's size is made at the one whose shape is nearest)."""
     mage = cfg.get("family") == "mage-flow"
@@ -218,7 +228,7 @@ def model_defaults(cfg: dict) -> dict:
                         else float(cfg.get("cfg_scale") or 1.0) if mage else 1.0),
            "guidance_token": hunyuan,
            "negative_prompt": MF_NEG if mage else None, "transparency": cfg.get("transparency") is not False,
-           "mask": cfg.get("mask") is not False}
+           "mask": True, "img2img": not can_edit(cfg), "strength": 1.0 if can_edit(cfg) else STRENGTH_IMG2IMG}
     if hunyuan:
         out["buckets"] = [[b["width"], b["height"]] for b in hunyuanimage3_buckets(cfg)]
     return out
@@ -461,23 +471,51 @@ def not_set_up_message() -> str:
             + ", ".join(choices) + "; -uncensored after one for its uncensored text encoder), see docs/IMAGE.md")
 
 
+def parse_strength(req: dict) -> float | None:
+    """The request's strength (a number, or a form field's text), checked: above 0 and at most 1; None when none."""
+    v = req.get("strength")
+    if v is None:
+        return None
+    if isinstance(v, str):
+        try:
+            v = float(v.strip())
+        except ValueError:
+            raise ImageRequestError("strength: a number above 0 and at most 1") from None
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not 0 < v <= 1:
+        raise ImageRequestError("strength: a number above 0 and at most 1")
+    return float(v)
+
+
+def strength_run(steps: int, strength: float) -> int:
+    """The steps of a `steps`-step schedule a strength runs: diffusers' get_timesteps, which skips the first
+    floor(steps - steps strength) (the engine's strength_skip, src/image/img_start.cpp, counts the same in doubles)."""
+    return steps - int(max(steps - min(steps * strength, steps), 0))
+
+
 def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | None = None) -> dict:
-    """An edit (/v1/images/edits): parse_request's fields with `images` (the reference images' bytes, PNG, JPEG, GIF or
-    BMP) as job["refs"].  size "auto" (or none): the first reference's shape at about 1024 x 1024 pixels, its sides
+    """An edit (/v1/images/edits): parse_request's fields with `images` (PNG, JPEG, GIF or BMP).  A model that edits
+    takes them as its reference images (job["refs"]); one that does not (can_edit) takes one image as img2img's base
+    image (job["init"]).  size "auto" (or none): the first image's shape at about 1024 x 1024 pixels, its sides
     multiples of SIZE_STEP.  `mask` (OpenAI's): a PNG of the first image's size whose transparent pixels are where it
-    changes, the rest kept as it is (the engine's inpainting), as job["mask"]; refused by a model whose config says
-    "mask": false."""
+    changes, the rest kept as it is, as job["mask"].  strength (parse_strength): how much of the schedule runs from
+    the first image (job["strength"] and the steps it runs, job["steps_run"], when below 1); an edit's default 1, an
+    img2img's STRENGTH_IMG2IMG, or 1 with a mask."""
     mage = cfg.get("family") == "mage-flow"
     hunyuan = cfg.get("family") == "hunyuan-image-3"
-    if not cfg.get("vision") or (mage and not cfg.get("edit_model")):
-        raise ImageRequestError("edits need the vision " + ("model's file" if hunyuan else "encoder") +
-                                (" and the edit model" if mage else "") +
-                                f": run setup with --images {setup_choice(cfg)} again")
+    edits = can_edit(cfg)
+    strength = parse_strength(req)
     if not images:
-        raise ImageRequestError("image: one reference image or more")
-    max_refs = int(cfg.get("max_refs") or (MF_MAX_REFS if mage else HUNYUANIMAGE3_MAX_REFS if hunyuan else MAX_REFS))
-    if len(images) > max_refs:
-        raise ImageRequestError(f"image: at most {max_refs} reference images")
+        raise ImageRequestError("image: one reference image or more" if edits else "image: the image to start from")
+    if edits:
+        max_refs = int(cfg.get("max_refs") or (MF_MAX_REFS if mage else HUNYUANIMAGE3_MAX_REFS if hunyuan
+                                               else MAX_REFS))
+        if len(images) > max_refs:
+            raise ImageRequestError(f"image: at most {max_refs} reference images")
+    elif len(images) > 1:
+        raise ImageRequestError("image: one image (this image model has no edits: it starts from one image, "
+                                "img2img)")
+    elif strength is None:
+        strength = 1.0 if mask is not None else STRENGTH_IMG2IMG
     dims = []
     for data in images:
         if len(data) > REF_MAX_BYTES:
@@ -487,7 +525,7 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
             raise ImageRequestError(f"image: {w}x{h} is too small")
         dims.append((w, h))
     if mask is not None:
-        mask = check_mask(mask, dims[0], cfg)
+        mask = check_mask(mask, dims[0])
     if req.get("size") in (None, "auto") and not (hunyuan and cfg.get("ratio_head")):   # else the model chooses
         w0, h0 = dims[0]
         side = int(cfg.get("max_side") or 2048)
@@ -496,18 +534,25 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
         tw, th = (min(side, max(MIN_SIDE, round(v / SIZE_STEP) * SIZE_STEP)) for v in (tw, th))
         req = {**req, "size": f"{tw}x{th}"}
     # Mage-Flow's edit model has its own steps
-    job = parse_request(req, {**cfg, "steps": cfg.get("edit_steps") or cfg.get("steps")} if mage else cfg)
-    job["refs"] = list(images)
+    job = parse_request(req, {**cfg, "steps": cfg.get("edit_steps") or cfg.get("steps")} if mage and edits else cfg)
+    if edits:
+        job["refs"] = list(images)
+    else:
+        job["init"] = images[0]
     if mask is not None:
         job["mask"] = mask
+    if strength is not None and strength < 1:
+        run = strength_run(job["steps"], strength)
+        if run < 1:
+            raise ImageRequestError(f"strength: {strength:g} runs none of the {job['steps']} steps; raise it (or the "
+                                    "steps)")
+        job["strength"], job["steps_run"] = strength, run
     return job
 
 
-def check_mask(data: bytes, size: tuple[int, int], cfg: dict) -> bytes:
+def check_mask(data: bytes, size: tuple[int, int]) -> bytes:
     """An edit's mask, checked as OpenAI checks it (a PNG with an alpha channel, the first image's size) -> RGBA PNG
-    bytes the engine reads."""
-    if cfg.get("mask") is False:          # no "mask" (configs before it) is Qwen-Image-2.1, which takes one
-        raise ImageRequestError("mask: this image model does not take a mask")
+    bytes the engine reads (every model takes one: the configs' "mask": false of before are not read)."""
     if data[:8] != b"\x89PNG\r\n\x1a\n":
         raise ImageRequestError("mask: a PNG with an alpha channel")
     import io
@@ -549,6 +594,8 @@ def usage(job: dict) -> dict:
     else:
         sizes = (ref_size(*image_dims(r)) for r in job.get("refs") or ())
         refs = sum((w // SIZE_STEP) * (h // SIZE_STEP) for w, h in sizes)
+        if job.get("init"):   # img2img's image, read at the made size
+            refs += block
     out = job["n"] * block
     return {"input_tokens": text + refs, "output_tokens": out, "total_tokens": text + refs + out,
             "input_tokens_details": {"text_tokens": text, "image_tokens": refs}}
@@ -1069,9 +1116,10 @@ class ImageGen:
 
     @staticmethod
     def _work(job: dict) -> tuple[float, float]:
-        """One image's (steps, megapixels): a guided step two, the size the engine makes."""
+        """One image's (steps, megapixels): the steps it runs (a strength's), a guided step two, the size the engine
+        makes."""
         mw, mh = made_size(job)
-        return job["steps"] * (2 if job.get("cfg") else 1), round(mw * mh / 1e6, 3)
+        return job.get("steps_run", job["steps"]) * (2 if job.get("cfg") else 1), round(mw * mh / 1e6, 3)
 
     def _measured(self, job: dict, r: dict) -> None:
         """One image's engine figures (its IMAGE line) into the rates of its size, a running mean that follows the
@@ -1220,24 +1268,25 @@ class ImageGen:
         return f" NEG:{','.join(str(i) for i in job['neg_ids'])} CFG:{job['cfg']:g}"
 
     def stage(self, job: dict) -> None:
-        """An edit's reference images and mask into files the engine reads (job["ref_paths"], job["mask_path"]);
-        unstage removes them."""
-        if job.get("refs") and not job.get("ref_paths"):
+        """An edit's reference images, img2img's image and a mask into files the engine reads (job["ref_paths"],
+        job["init_path"], job["mask_path"]); unstage removes them."""
+        if (job.get("refs") or job.get("init")) and not job.get("ref_dir"):
             work = Path(tempfile.mkdtemp(prefix="refs-", dir=self.dir))
             job["ref_dir"] = str(work)
             job["ref_paths"] = []
-            for i, data in enumerate(job["refs"]):
+            for i, data in enumerate(job.get("refs") or ()):
                 p = work / f"ref_{i}"
                 p.write_bytes(data)
                 job["ref_paths"].append(str(p))
-            if job.get("mask"):
-                p = work / "mask"
-                p.write_bytes(job["mask"])
-                job["mask_path"] = str(p)
+            for key in ("init", "mask"):
+                if job.get(key):
+                    p = work / key
+                    p.write_bytes(job[key])
+                    job[f"{key}_path"] = str(p)
 
     @staticmethod
     def unstage(job: dict) -> None:
-        for p in (job.pop("ref_paths", []) or []) + ([job.pop("mask_path")] if job.get("mask_path") else []):
+        for p in (job.pop("ref_paths", []) or []) + [job.pop(k) for k in ("init_path", "mask_path") if job.get(k)]:
             with contextlib.suppress(OSError):
                 os.unlink(p)
         if job.get("ref_dir"):
@@ -1245,9 +1294,19 @@ class ImageGen:
                 os.rmdir(job.pop("ref_dir"))
 
     @staticmethod
-    def _refs_words(job: dict) -> str:
-        return ("".join(f" REF:{p}" for p in job.get("ref_paths") or ())
-                + (f" MASK:{job['mask_path']}" if job.get("mask_path") else ""))
+    def _refs_words(job: dict, need: bool = False) -> str:
+        """The engine's words of a job's images: REF:, MASK: and INIT:, and STRENGTH: below 1 (its repr, the double
+        strength_run counted with).  `need`: NEED's, where a strength's base image (an edit's first reference) is
+        counted by INIT:- when no mask or init image names it."""
+        words = ("".join(f" REF:{p}" for p in job.get("ref_paths") or ())
+                 + (f" MASK:{job['mask_path']}" if job.get("mask_path") else "")
+                 + (f" INIT:{job['init_path']}" if job.get("init_path") else ""))
+        if job.get("strength") is not None:
+            if not need:
+                words += f" STRENGTH:{job['strength']!r}"
+            elif not (job.get("mask_path") or job.get("init_path")):
+                words += " INIT:-"
+        return words
 
     def need(self, job: dict) -> dict:
         """What the image needs, from the engine (started when it is not running): least_mib, full_mib (every layer
@@ -1259,7 +1318,7 @@ class ImageGen:
             self.stage(job)
             n = len(self.ids(job)) - self.drop_of(job)
             neg = f" NEG:{len(job['neg_ids']) - self.drop_of(job)}" if job.get("cfg") else ""
-            return self.engine.ask(f"NEED {w} {h} {n}{self._refs_words(job)}{neg}", "NEED", 600)
+            return self.engine.ask(f"NEED {w} {h} {n}{self._refs_words(job, need=True)}{neg}", "NEED", 600)
 
     def free_mib(self) -> int:
         """The device's free VRAM, as the engine sees it (its parts left as they are)."""
@@ -1317,9 +1376,10 @@ class ImageGen:
                     if cancel is not None and cancel.is_set():
                         self.totals["failed"] += 1
                         raise ImageJobFailed("cancelled (the client left)")
-                    self.progress = (i * job["steps"], job["n"] * job["steps"])
-                    self._live(image=i + 1, step=0, steps=job["steps"], stage="refs" if job.get("refs") else "text",
-                               sampling_at=None)
+                    run = job.get("steps_run", job["steps"])
+                    self.progress = (i * run, job["n"] * run)
+                    self._live(image=i + 1, step=0, steps=run,
+                               stage="refs" if job.get("refs") or job.get("init") else "text", sampling_at=None)
                     out = work / f"img_{i}.rgba"
 
                     def step(done, steps, i=i):
@@ -1349,8 +1409,10 @@ class ImageGen:
             with contextlib.suppress(OSError):
                 work.rmdir()
         secs = time.monotonic() - t0
-        figures = {"seconds": round(secs, 2), "steps": job["steps"], "cfg": job.get("cfg") or 1.0, "n": len(images),
-                   "refs": len(job.get("refs") or ()),
+        figures = {"seconds": round(secs, 2), "steps": job.get("steps_run", job["steps"]), "cfg": job.get("cfg") or 1.0,
+                   "n": len(images), "refs": len(job.get("refs") or ()),
+                   **({"strength": job["strength"]} if job.get("strength") is not None else {}),
+                   **({"img2img": True} if job.get("init") else {}), **({"mask": True} if job.get("mask") else {}),
                    "size": f"{job['width']}x{job['height']}", "seed": job["seed"], "engine": "strata-image",
                    "quant": self.cfg.get("quant"),
                    "text_encode_ms": round(sum(r.get("text_s", 0) for r in parts) * 1000, 1),
@@ -1406,7 +1468,7 @@ class ImageGen:
             self.job["stage"] = "waiting"
             return
         self.job = {"started": time.time(), "t0": time.monotonic(), "stage": "waiting", "image": 1, "images": job["n"],
-                    "step": 0, "steps": job["steps"], "size": f"{job['width']}x{job['height']}",
+                    "step": 0, "steps": job.get("steps_run", job["steps"]), "size": f"{job['width']}x{job['height']}",
                     "refs": len(job.get("refs") or ()), "edit": bool(job.get("refs")), "sampling_at": None}
 
     def _live(self, **kw) -> None:
@@ -1486,14 +1548,14 @@ class ImageModels:
         """The models that edit (take reference images), the default first."""
         return [g for g in self.gens.values() if can_edit(g.cfg)]
 
-    def pick_edit(self, name) -> ImageGen:
+    def pick_edit(self, name, img2img: bool = False) -> ImageGen:
         """The model of an edit (/v1/images/edits): the one named, as pick gives it; none named, the default when it
-        edits, else the first model that does (the chat's edit_image chooses among those too), so that a default that
-        makes images only (MageTrail, HunyuanImage 3.0) does not refuse every edit.  With no model that edits, the
-        default, whose parse_edit_request says why."""
+        edits or the request is img2img's (a strength or a mask, which every model takes), else the first model that
+        edits (the chat's edit_image prefers those too), so that an instruction to a default without edits (MageTrail)
+        is an edit rather than its img2img.  With no model that edits, the default (img2img)."""
         if isinstance(name, str) and name in self.gens:
             return self.gens[name]
-        if can_edit(self.default.cfg):
+        if can_edit(self.default.cfg) or img2img:
             return self.default
         return next(iter(self.editors()), self.default)
 
@@ -1545,11 +1607,16 @@ TOOLS: list[dict[str, Any]] = [
     {"name": "edit_image",
      "description": "Change an image, or make a new one from it (its subject, its style): the conversation's last "
                     "image (one the user attached or one made here) unless `image` names another (a "
-                    "/v1/images/files/... link from an earlier result). The new image is shown to the user.",
+                    "/v1/images/files/... link from an earlier result). The new image is shown to the user. An image "
+                    "model without edits draws the prompt over the image instead (img2img): describe the whole "
+                    "picture there.",
      "parameters": {"type": "object", "properties": {
          "prompt": {"type": "string", "description": "what to change, or what to make from the image"},
          "image": {"type": "string", "description": "the image: a /v1/images/files/... link; default the last one"},
          "size": {"type": "string", "description": "WIDTHxHEIGHT; default the image's shape at about 1024x1024"},
+         "strength": {"type": "number",
+                      "description": "how much of the image may change, above 0 to 1 (lower keeps more of it); "
+                                     "default 1 for an edit, 0.6 for img2img"},
          "seed": {"type": "integer"}},
          "required": ["prompt"]}},
 ]
@@ -1584,9 +1651,10 @@ class ImageTools:
         self.mask = mask                   # an edit's mask (Responses' input_image_mask), over the image it edits
 
     def _gens(self, edits: bool = False) -> list[ImageGen]:
-        """The image models the tools offer (those that edit, for edit_image), the default first."""
+        """The image models the tools offer, the default first; for edit_image those that edit first (every model
+        takes an image: one without edits as img2img's)."""
         gens = list(self.models.gens.values()) if self.models is not None else [self.gen]
-        return [g for g in gens if can_edit(g.cfg)] if edits else gens
+        return [g for g in gens if can_edit(g.cfg)] + [g for g in gens if not can_edit(g.cfg)] if edits else gens
 
     def template_tools(self, exclude=()) -> list[dict]:
         out = []
@@ -1640,6 +1708,8 @@ class ImageTools:
         urls: list[str] = []
         try:
             req = {**{k: args[k] for k in ("prompt", "size", "seed") if args.get(k) not in (None, "")}, **self.options}
+            if name == "edit_image" and args.get("strength") not in (None, ""):
+                req["strength"] = args["strength"]
             gens = self._gens(name == "edit_image")
             asked = args.get("model")
             gen = next((g for g in gens if g.model == asked), gens[0] if gens else self.gen)
