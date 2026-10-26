@@ -9949,16 +9949,23 @@ int main(int argc, char** argv) {
             }
             int64_t resume = 0;
             bool from_live = false;
+            int64_t newest_ckpt = 0;   // the live session's last checkpoint (its last prompt's end)
             // the live session and the checkpoints were read with the control vector one way: a switch reads the
             // prompt again from the start (or from a parked conversation read the other way)
             if (o.prompt_cache > 0 && want_cvec == cvec_cached) {
                 if (live_ok && starts_with(live, live_imgs)) { resume = (int64_t) live.size(); from_live = true; }
-                for (const ConvCheckpoint& c : checks)
+                for (const ConvCheckpoint& c : checks) {
+                    newest_ckpt = std::max(newest_ckpt, (int64_t) c.ids.size());
                     if ((int64_t) c.ids.size() > resume && starts_with(c.ids, c.imgs)) {
                         resume = (int64_t) c.ids.size();
                         from_live = false;
                     }
+                }
             }
+            // the next turn of the live conversation itself: it resumes at that conversation's last checkpoint, past
+            // which the session holds only the last reply as the client no longer sends it (its thinking dropped from
+            // the history) or a reply it asks again
+            const bool next_turn = !from_live && resume > 0 && resume == newest_ckpt;
             // --batch: an idle slot that holds the start of this prompt (the conversation it served last) is a source
             // too - its session is copied back below, so only the new part is read (#465)
             int slot_source = -1;
@@ -10124,8 +10131,11 @@ int main(int argc, char** argv) {
                         return 1;
                     }
                 }
-            } else if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && park_worth &&
-                       !park_current(incoming ? incoming->bytes() : 0)) {
+            // Not on the next turn of the same conversation: the copy would hold only the reply the client dropped,
+            // and the turn after would drop it as superseded - every turn of a chat paid the whole snapshot (B70
+            // 80-141 ms, RX 9060 XT ~120-370 ms of each follow-up's wait).  A switch away parks it as before.
+            } else if ((!from_live || incoming || slot_source >= 0) && !(next_turn && !incoming && slot_source < 0) &&
+                       !pin_sibling && park_worth && !park_current(incoming ? incoming->bytes() : 0)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }

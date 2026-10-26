@@ -292,6 +292,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
     };
     const int64_t ctx = model.max_cells(), V = model.vocab();
     std::vector<int32_t> live;   // the tokens the state holds, positions 0 .. live.size() - 1
+    int64_t live_prompt = 0;     // how many of them the last request sent (its prompt)
     // a session file's identity: the model file (its name and size) and the context, which fix the state's shape
     std::string model_id;
     {
@@ -357,6 +358,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                 if (!session_read(path, model_id, ids, snap, bytes, err)) { refuse("invalid", err); continue; }
                 if (!model.restore_state(snap, err)) { refuse("invalid", err); continue; }
                 live = std::move(ids);
+                live_prompt = 0;
                 std::printf("RESTORED %zu %zu %.1f\n", live.size(), bytes, ms());
             }
             std::fflush(stdout);
@@ -457,7 +459,12 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                 cache.parked.erase(best);
                 resume = best_r;
             } else if (resume < (int64_t) live.size()) {
-                park_live(cache.parked.end());   // the request starts another conversation: keep this one
+                // the request starts another conversation: keep this one.  Not on the next turn of the same one (it
+                // sends the last prompt whole and then the history the client keeps, the reply's thinking dropped):
+                // the copy would hold only that reply, which no request sends again (generate.cpp, next_turn)
+                size_t common = 0;
+                while (common < live.size() && common < (size_t) n && live[common] == ids[common]) ++common;
+                if (live_prompt <= 0 || (int64_t) common < live_prompt) park_live(cache.parked.end());
             }
         }
         if (resume == 0 && !live.empty() && !model.reset(err)) {
@@ -466,6 +473,7 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             return 1;
         }
         live.resize((size_t) resume);
+        live_prompt = n;
         std::printf("RESUME %lld\n", (long long) resume);
         std::fflush(stdout);
         model.set_sampler(sp);
