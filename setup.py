@@ -234,8 +234,9 @@ LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMI
 # tree_sha256() of the zip unpacked with zipfile.
 LLAMA_CPP_TREE_SHA256 = "87b1443f593e9b9159a61fa933e0fd4a2bc29e95f5ad6da422789d1c7cc515ae"
 
-# KV bytes per context token and attention layer: 8-bit 1056, rotated 4-bit 576, hybrid K8V4 (8-bit K, 4-bit V) 816
-KV_CELL_BYTES = {"q4_0": 576, "k8v4": 816}
+# KV bytes per context token and attention layer: 8-bit 1056 (the default), rotated 4-bit 576, hybrid K8V4 (8-bit K,
+# 4-bit V) 816, 16-bit 2112 (8K and less, and --kv fp16)
+KV_CELL_BYTES = {"q4_0": 576, "k8v4": 816, "fp16": 2112}
 PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "pillow", "psutil"]
 REQUIREMENTS = ROOT / "requirements.txt"   # the same packages and their dependencies, pinned (upstream #214)
 # the build helpers, installed into .venv only when an engine or image-encoder build finds none (upstream a24253783)
@@ -5954,9 +5955,10 @@ def main() -> int:
     ap.add_argument("--rope-scale", type=float,
                     help="the extension factor (default: the final context over the trained 262144, at least 1: "
                          "1.5 for 384K, 2 for 512K, 1 inside the trained range)")
-    ap.add_argument("--kv", choices=["int8", "q4_0", "k8v4"],
+    ap.add_argument("--kv", choices=["int8", "q4_0", "k8v4", "fp16"],
                     help="KV cache precision above 8K context: int8 (default), q4_0 (half the memory, a little less "
-                         "precise) or k8v4 (8-bit keys and 4-bit values: about three quarters of the memory)")
+                         "precise), k8v4 (8-bit keys and 4-bit values: about three quarters of the memory) or fp16 "
+                         "(16-bit, twice the memory of int8)")
     ap.add_argument("--vision", choices=["yes", "no", "none", "gpu", "cpu"],
                     help="let the model read images (on by default where the model can; yes = the reader for this "
                          "card: the CPU under 24 GB of VRAM, the GPU from 24 GB; gpu = the encoder on the GPU, the CPU "
@@ -6574,7 +6576,7 @@ def main() -> int:
         kv = ["int8", "q4_0"][int(ask("KV cache?", ["1", "2"], "1", a.yes)) - 1]
     if ctx > 8192:
         ok("KV cache: " + {"int8": "8-bit", "q4_0": "4-bit (Hadamard-rotated)",
-                           "k8v4": "8-bit keys, 4-bit values"}[kv])
+                           "k8v4": "8-bit keys, 4-bit values", "fp16": "16-bit"}[kv])
     if MODELS[model].get("vision", fam.get("vision")) is False:     # a size without images
         vision = "none"
         if a.vision not in (None, "no", "none"):
