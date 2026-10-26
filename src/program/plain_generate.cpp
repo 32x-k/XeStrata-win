@@ -597,7 +597,7 @@ static void plain_usage(const std::string& arch) {
                  "  --prefill-cpu-share S  the CPU pool's share of the prompt's experts the VRAM tier misses (0-1;\n"
                  "                       auto = from the times measured at load, the default; 0: all on the GPU)\n"
                  "  --prompt-chunk N     the prompt's most tokens a chunk through the batched products (default:\n"
-                 "                       the largest of 32768..256 the VRAM tier lends; 0: the prompt in windows)\n"
+                 "                       4096, or up to 32768 where the VRAM tier lends it; 0: the prompt in windows)\n"
                  "  --max-t N            the decode window's most tokens (default 8)\n"
                  "  --spec N             speculative decoding with the model's MTP layer: windows of up to N tokens,\n"
                  "                       the last one and N - 1 drafts (default 3; 0: off; greedy only)\n"

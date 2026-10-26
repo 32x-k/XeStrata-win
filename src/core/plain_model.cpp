@@ -1221,7 +1221,10 @@ void PlainModel::auto_prompt_chunk(uint64_t beside) {
         if (beside > 0) return db <= beside && db <= max_alloc_bytes();
         return off != nullptr && n >= 2 && off[n] - off[lowest] >= db;
     });
-    if (c <= 0 || c == opt_.prompt_chunk) return;
+    // only upward: a chunk below the one asked kept the old way (prompt_borrow halves it until it fits) read faster.
+    // The RX 9060 XT, llm-jp-4.1 16K at 8 GiB of VRAM and 20 GiB of RAM (2026-10-26): the chunk chosen here 2048, 310
+    // tok/s; 4096 asked (borrowed at prompt time) 352, at either lending share
+    if (c <= opt_.prompt_chunk) return;
     uint64_t db = 0, hb = 0;
     prompt_carve(c, pb_, nullptr, nullptr, db, hb);
     void* h = nullptr;
