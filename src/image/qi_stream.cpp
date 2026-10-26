@@ -20,6 +20,28 @@ void check(bool ok, const char* what) {
     if (!ok) throw std::runtime_error(std::string("image engine (layers): ") + what + ": " + gpu::last_error());
 }
 
+// A layer's spans into its relay on several threads: one thread's pass from the page cache was the streamed layer's
+// longest part.  A quarter of the hardware threads, at most 8, and at least 16 MiB each.
+void copy_spans(uint8_t* dst, const std::vector<LayerStream::Span>& spans, uint64_t bytes) {
+    static const int most = std::clamp((int) std::thread::hardware_concurrency() / 4, 1, 8);
+    const int n = (int) std::clamp<uint64_t>(bytes >> 24, 1, (uint64_t) most);
+    auto part = [&](uint64_t lo, uint64_t hi) {   // the bytes [lo, hi) of the spans laid end to end
+        uint64_t at = 0;
+        for (const LayerStream::Span& sp : spans) {
+            const uint64_t a = std::max(lo, at), b = std::min(hi, at + sp.bytes);
+            if (a < b) std::memcpy(dst + sp.offset + (a - at), (const uint8_t*) sp.host + (a - at), b - a);
+            at += sp.bytes;
+        }
+    };
+    uint64_t total = 0;
+    for (const LayerStream::Span& sp : spans) total += sp.bytes;
+    if (n == 1) { part(0, total); return; }
+    std::vector<std::thread> th;
+    for (int k = 1; k < n; ++k) th.emplace_back(part, total * (uint64_t) k / (uint64_t) n, total * (uint64_t) (k + 1) / (uint64_t) n);
+    part(0, total / (uint64_t) n);
+    for (std::thread& t : th) t.join();
+}
+
 }  // namespace
 
 LayerStream::LayerStream() { thread_ = std::thread([this] { worker(); }); }
@@ -84,10 +106,12 @@ void LayerStream::drop() {
         if (s.used != nullptr) gpu::event_destroy(s.used);
         s = Slot{};
     }
-    if (relay_ != nullptr) gpu::free(relay_);
-    if (relay_free_ != nullptr) gpu::event_destroy(relay_free_);
-    relay_ = nullptr;
-    relay_free_ = nullptr;
+    for (int k = 0; k < 2; ++k) {
+        if (relay_[k] != nullptr) gpu::free(relay_[k]);
+        if (relay_free_[k] != nullptr) gpu::event_destroy(relay_free_[k]);
+        relay_[k] = nullptr;
+        relay_free_[k] = nullptr;
+    }
 }
 
 void LayerStream::configure(uint64_t budget, gpu::Stream compute) {
@@ -126,8 +150,8 @@ void LayerStream::configure(uint64_t budget, gpu::Stream compute) {
             if (s.used != nullptr) gpu::event_destroy(s.used);
             s = Slot{};
         }
-        if (relay_ != nullptr) gpu::free(relay_);
-        relay_ = nullptr;
+        if (relay_[1] != nullptr) gpu::free(relay_[1]);
+        relay_[1] = nullptr;
     } else {
         for (Slot& s : slots_) {
             if (s.d == nullptr) check(gpu::alloc_device(&s.d, max_bytes_), "a slot");
@@ -140,10 +164,12 @@ void LayerStream::configure(uint64_t budget, gpu::Stream compute) {
             s.issued = false;
         }
     }
-    if (relay_ == nullptr && (streaming || R > 0)) check(gpu::alloc_host(&relay_, max_bytes_), "the relay");
-    if (relay_free_ == nullptr) {
-        check(gpu::event_create(&relay_free_), "an event");
-        check(gpu::event_record(relay_free_, copy_), "an event");
+    for (int k = 0; k < (streaming ? 2 : 1); ++k) {
+        if (relay_[k] == nullptr && (streaming || R > 0)) check(gpu::alloc_host(&relay_[k], max_bytes_), "the relay");
+        if (relay_free_[k] == nullptr) {
+            check(gpu::event_create(&relay_free_[k]), "an event");
+            check(gpu::event_record(relay_free_[k], copy_), "an event");
+        }
     }
     resident_ = R;
     streaming_ = streaming;
@@ -152,13 +178,13 @@ void LayerStream::configure(uint64_t budget, gpu::Stream compute) {
 void LayerStream::load_resident(int i) {
     Layer& l = layers_[(size_t) i];
     if (l.d == nullptr) check(gpu::alloc_device(&l.d, l.bytes), "a layer");
-    std::lock_guard<std::mutex> lk(relay_mu_);
-    gpu::event_sync(relay_free_);
-    for (const Span& s : l.spans) std::memcpy(relay_ + s.offset, s.host, s.bytes);
-    check(gpu::copy_async(l.d, relay_, l.bytes, copy_), "a layer's copy");
-    check(gpu::event_record(relay_free_, copy_), "an event");
+    std::lock_guard<std::mutex> lk(relay_mu_[0]);
+    gpu::event_sync(relay_free_[0]);
+    copy_spans(relay_[0], l.spans, l.bytes);
+    check(gpu::copy_async(l.d, relay_[0], l.bytes, copy_), "a layer's copy");
+    check(gpu::event_record(relay_free_[0], copy_), "an event");
     // the compute stream waits for the copy where it uses the layer
-    check(gpu::stream_wait_event(compute_, relay_free_), "a wait");
+    check(gpu::stream_wait_event(compute_, relay_free_[0]), "a wait");
     if (prepare_) prepare_(i, l.d);
     l.loaded = true;
 }
@@ -184,13 +210,14 @@ void LayerStream::request(int i) {
 
 void LayerStream::fill(Slot& s, int i) {
     const Layer& l = layers_[(size_t) i];
-    std::lock_guard<std::mutex> lk(relay_mu_);
-    gpu::event_sync(relay_free_);                       // the relay's last copy is done
-    for (const Span& sp : l.spans) std::memcpy(relay_ + sp.offset, sp.host, sp.bytes);
+    const int k = &s == &slots_[0] ? 0 : 1;              // the slot's relay
+    std::lock_guard<std::mutex> lk(relay_mu_[k]);
+    gpu::event_sync(relay_free_[k]);                    // the relay's last copy is done
+    copy_spans(relay_[k], l.spans, l.bytes);
     check(gpu::stream_wait_event(copy_, s.used), "a wait");   // the compute stream past the slot's last layer
-    check(gpu::copy_async(s.d, relay_, l.bytes, copy_), "a layer's copy");
+    check(gpu::copy_async(s.d, relay_[k], l.bytes, copy_), "a layer's copy");
     check(gpu::event_record(s.ready, copy_), "an event");
-    check(gpu::event_record(relay_free_, copy_), "an event");
+    check(gpu::event_record(relay_free_[k], copy_), "an event");
 }
 
 void LayerStream::worker() {

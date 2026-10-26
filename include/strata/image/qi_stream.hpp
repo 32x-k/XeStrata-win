@@ -6,7 +6,8 @@
 //
 // A layer is a list of host spans (the tensors in the mapped file) copied into one device region.  The copy goes from
 // the file's pages (the page cache: nothing is held in RAM for it) through a pinned relay buffer of the largest layer
-// by DMA on a copy stream; a slot is reused once the compute stream has passed the layer that used it.  The layers
+// by DMA on a copy stream; a slot is reused once the compute stream has passed the layer that used it.  Each slot has
+// its relay, so one layer's pass into its relay runs beside the other's DMA, and the pass is split over threads.  The layers
 // are taken in order, as the DiT and the encoder walk them (the next streamed layer is fetched when one begins), so
 // keeping a prefix resident and cycling the rest is what a budget below the whole can do best: an LRU cache over a
 // cyclic walk misses every time.
@@ -94,9 +95,9 @@ private:
     gpu::Stream compute_ = nullptr, copy_ = nullptr;
     Slot slots_[2];
     int next_slot_ = 0;
-    uint8_t* relay_ = nullptr;
-    gpu::Event* relay_free_ = nullptr;
-    std::mutex relay_mu_;                   // the relay: the worker's fills and the resident loads
+    uint8_t* relay_[2] = {};                // slot k's (relay 0 also the resident loads')
+    gpu::Event* relay_free_[2] = {};
+    std::mutex relay_mu_[2];                // a relay: the worker's fills and the resident loads
     // the worker thread and its queue of layers to fill
     std::thread thread_;
     std::mutex mu_;
