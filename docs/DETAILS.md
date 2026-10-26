@@ -947,7 +947,28 @@ that wins in both directions: `STRATA_SM75_IL`, `STRATA_SM75_EXP`, `STRATA_GR_UP
 `STRATA_TOPK_SPLIT`, `STRATA_TOPK_SAMPLE`, `STRATA_ATTN_V3`, `STRATA_Q2_WARP`, `STRATA_FUSE_WAIT=2`, `STRATA_QIL`,
 `STRATA_TC_SM75`, `STRATA_PA_V1_PREFETCH`, `STRATA_SCORES_THREAD` (a thread-per-head block scorer; `=1` works on any CUDA card).
 Options that change answers stay separate: `STRATA_SELECT_SIMT=1|2`, `STRATA_PA_V2T=1`, `STRATA_PF_FUSED=1 STRATA_PF_FUSED_SM75=1`
-(Q2_0 pack, 7.5 card only) and `STRATA_BF16_TC=1` with `STRATA_XN_F16`.
+(Q2_0 pack, 7.5 card only), `STRATA_PF_FUSED_Q2N=1` (the native Q2_0 pack's prompt experts on sm_80+, below) and
+`STRATA_BF16_TC=1` with `STRATA_XN_F16`.
+
+### The native Q2_0 pack's prompt experts on the fused int8 kernels (`STRATA_PF_FUSED_Q2N=1`, opt-in, sm_80+)
+
+A PC whose CPU lacks the AVX-512 set that setup looks for gets the native Q2_0 pack. On a CUDA card of sm_80 or newer its
+Q2_0 / Q2_0 layers read prompts through MMQ's Q2_0 kernel; the fused int8 kernel for that format (#2145) is set up only on a
+7.5 card. `STRATA_PF_FUSED_Q2N=1` sets it up on any sm_80+ card and takes it for those layers. It has its own variable, so
+`STRATA_PF_FUSED=1` keeps its bits, and `STRATA_PF_FUSED=0` or `STRATA_PF_FUSED_NATIVE=0` still turn it off. Unset, the engine
+is unchanged (first-token logits byte-identical to v0.2.2 on 40 prompts of 1-5K tokens, the author's check). With the switch
+the prompt arithmetic changes and the generated text can change.
+
+The author measured it on an RTX 5080 16 GB (sm_120, Linux, CUDA 13.0), i9-14900K, 2,100 experts in VRAM, CPU prompt share off,
+against the same build unset. At the same 4,864-token chunk (4 interleaved rounds) the 4K, 16K and 23K prompts read 2-3.5%
+faster (4/4 rounds each). With `--prefill auto` (5 rounds) the fused path's smaller buffers make the chunk 5,632 tokens instead of
+4,864 and the 16K prompt reads 32-33% faster (2,592 -> 3,438 tok/s), the 23K one 14%, a 4K one 0-2%; so most of the gain is the
+larger chunk, not the kernel. One layer (`prefill_fused_iq_test`, Q2_0 / Q2_0) runs at 1.92x / 1.37x / 1.30x the MMQ path at
+2,048 / 4,864 / 8,192 tokens. First-token KL against the FP16 prompt path over 30 prompts of 1.5-4.6K tokens: 0.0110 (MMQ
+0.0112), top-1 agreement 28/30 (MMQ 29/30). Not measured: a card that holds every expert, other sm_80+ cards, Windows, the
+generated text. On an RTX A4000 the same kernel in #2145 stopped matching the old output and read 4K prompts 4.5% slower, so
+Ampere is not verified. The ctest entry `prefill_fused_iq_test_q2n` runs the Q2_0 / Q2_0 layer with the switch alone (it skips
+below sm_80 and without a card).
 
 ---
 
