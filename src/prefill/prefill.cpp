@@ -5641,7 +5641,12 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
     const bool split = stage_lb_ != 0 || stage_le_ != g.n_layers || next_ != nullptr;
     if (hand_in_ != nullptr) { why = "a layer split's chunk hand-off is in use"; return 0; }
     if (m.pp || helper_ != nullptr || core::peer_portable()) { why = "a peer GPU"; return 0; }
-    if (split && m.ss->ple.ready()) { why = "a layer split with PLE layers"; return 0; }
+    // the PLE block (layer 1) reads the token history: on a split it runs in a first stage that holds layers 0 and 1
+    // (a later stage never reaches it)
+    if (split && m.ss->ple.ready() && stage_lb_ <= 1 && !(stage_lb_ == 0 && stage_le_ >= 2)) {
+        why = "a layer split whose PLE layer is not in the first stage";
+        return 0;
+    }
     if (embd_rows != nullptr) { why = "an image prompt"; return 0; }
     // run_impl's debug hooks on the routing and the rows have no layer-major form
     if (std::getenv("STRATA_DBG_FEAT") || std::getenv("STRATA_DBG_ROUTE_OVERRIDE") || std::getenv("STRATA_PREFILL_DUMP_R_ALL")) {
