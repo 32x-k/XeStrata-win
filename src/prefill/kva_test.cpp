@@ -31,7 +31,7 @@ static void put(const char* k, const char* v) {
 static void clear_all() {
     for (const char* k : {"STRATA_KVA", "STRATA_KVA_SPLIT", "STRATA_KVA_SUFFIX", "STRATA_KVA_MIN_PROMPT", "STRATA_KVA_PARITY",
                           "STRATA_KVA_CAPTURE", "STRATA_KVA_CAPTURE_FP32", "STRATA_KVA_ORACLE", "STRATA_KVA_ORACLE_FP32",
-                          "STRATA_KVA_PROJECTOR", "STRATA_KVA_MODE", "STRATA_KVA_ONLY"})
+                          "STRATA_KVA_PROJECTOR", "STRATA_KVA_MODE", "STRATA_KVA_ONLY", "STRATA_KVA_DRAFT_FLOOR"})
         unset(k);
 }
 static bool is(const char* got, const char* want) { return got != nullptr && std::strcmp(got, want) == 0; }
@@ -117,6 +117,65 @@ int main() {
         CHECK(c.only == KvaConfig::Only::Qsa && c.split == 30 && c.min_prompt == 1024);
     }
     clear_all();
+
+    // ---- "not applied => identical to STRATA_KVA=0", the parts that need no GPU
+    // (1) by default the draft layer is 0.2.6's own code; the cell floor is a research option, wired only when asked
+    {
+        KvaEngine eng;
+        const KvaConfig on = kva_config_from_env();
+        CHECK(!on.draft_floor && !on.wants_cell_floor(eng, true));
+        put("STRATA_KVA_DRAFT_FLOOR", "1");
+        const KvaConfig fl = kva_config_from_env();
+        CHECK(fl.draft_floor && fl.wants_cell_floor(eng, true));
+        CHECK(!fl.wants_cell_floor(eng, false));          // no draft layer: nothing to wire
+        KvaEngine blocked;
+        blocked.blocked = "batch slots (--batch)";
+        CHECK(!fl.wants_cell_floor(blocked, true));       // ruled out for the process: 0.2.6's own attention code
+        put("STRATA_KVA", "0");
+        const KvaConfig off = kva_config_from_env();
+        CHECK(!off.wants_cell_floor(eng, true));          // STRATA_KVA=0: untouched
+        clear_all();
+    }
+    // (2) with a floor of 0 the window is exactly the plain window, for every length and every window
+    {
+        using strata::kernels::window_start;
+        bool same = true;
+        for (int window : {1, 2, 64, 2048, 32768, 0x7fffffff})
+            for (int n_kv : {0, 1, 2, 63, 64, 65, 2047, 2048, 2049, 4096, 14000, 32768, 32769, 100000}) {
+                const int plain = n_kv > window ? n_kv - window : 0;   // what window_ids always selected
+                if (window_start(n_kv, window, 0) != plain) same = false;
+            }
+        CHECK(same);
+        CHECK(window_start(14000, 32768, 11264) == 11264);   // a floor inside the window raises the start
+        CHECK(window_start(14000, 2048, 11264) == 11952);    // a floor below the window changes nothing
+        CHECK(window_start(14000, 32768, 20000) == 13999);   // a floor past the end keeps one cell
+        CHECK(window_start(14000, 32768, 14000) == 13999);
+        CHECK(window_start(1, 32768, 5) == 0);
+        CHECK(window_start(0, 32768, 5) == 0);
+    }
+    // (3) the floor follows the session's tokens: a state no KVA read produced has floor 0
+    {
+        KvaFloorRegistry reg;
+        std::vector<int64_t> doc;
+        for (int i = 0; i < 20000; ++i) doc.push_back(1000 + (i * 7919) % 5000);
+        CHECK(reg.floor_for(doc.data(), (int64_t) doc.size()) == 0);        // nothing remembered
+        reg.note(doc.data(), 11264);                                         // a KVA read approximated [0, 11264)
+        CHECK(reg.floor_for(doc.data(), 20000) == 11264);                    // the live session / a later turn of it
+        CHECK(reg.floor_for(doc.data(), 5000) == 5000);                      // a checkpoint inside the approximated part
+        std::vector<int64_t> other(doc);
+        for (int i = 0; i < 20000; ++i) other[(size_t) i] += 1;             // a different prompt entirely
+        CHECK(reg.floor_for(other.data(), 20000) == 0);                      // short chats, other documents: floor 0
+        std::vector<int64_t> shared(doc.begin(), doc.begin() + 3000);        // a new chat sharing the first 3000 tokens
+        for (int i = 3000; i < 9000; ++i) shared.push_back(900000 + i);
+        CHECK(reg.floor_for(shared.data(), 9000) == 3000);
+        reg.note(doc.data(), 11264);                                         // the same read again: no second entry
+        CHECK(reg.size() == 1);
+        KvaFloorRegistry small(2);
+        for (int k = 0; k < 5; ++k) { std::vector<int64_t> d(100, k); small.note(d.data(), 100); }
+        CHECK(small.size() == 2);                                            // bounded
+        reg.clear();
+        CHECK(reg.floor_for(doc.data(), 20000) == 0);
+    }
 
     if (fails == 0) std::printf("kva_test: ok\n");
     return fails == 0 ? 0 : 1;

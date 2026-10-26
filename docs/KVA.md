@@ -30,26 +30,20 @@ configuration rules KVA out for the whole run.
 
 The last `suffix` positions (2048, or `STRATA_KVA_SUFFIX`) are always read exactly.
 
-The MTP draft layer builds its K/V from the final residuals of the prompt, and an approximated chunk has none. The
-draft layer's window is **not changed**: it stays what it was (`--mtp-window`, default 32768 cells). Instead the
-engine keeps a *cell floor* per session, the first draft cell built from a real row:
+The MTP draft layer builds its K/V from the final residuals of the prompt. An approximated chunk has no final
+residual of its own, so its draft cells are built from the rows that chunk does have. By default nothing about the
+draft layer changes: its window is whatever it was (`--mtp-window`, default 32768 cells), it builds the same cells and
+attends to the same cells as with `STRATA_KVA=0`. The target model verifies every token, so the draft only decides
+how many tokens a verify window keeps (decode speed), never the answer.
 
-- A read that KVA approximated raises the floor to the end of its approximated chunks. The draft layer builds no
-  cell below it and its attention starts no lower, so it reads the window `[max(floor, pos - window), pos)`: the
-  exactly computed tail, growing with the conversation, never an approximated cell. The target model verifies
-  every token either way.
-- The floor follows the *tokens* of the state a request continues from (the live session, a conversation checkpoint,
-  a parked conversation): the engine remembers which token prefixes a KVA read approximated, and a state's floor
-  is how much of its tokens agree with one of them. A state no KVA read produced (a short chat, another document,
-  every prompt of a `STRATA_KVA=0` run) has floor 0.
-- With floor 0 the draft layer attends to exactly the window it attended to with `STRATA_KVA=0`
-  (`window_start`, unit tested for every length). The only added work is one tiny kernel that picks the cells.
-  With `STRATA_KVA=0`, with the engine configurations that rule KVA out and with a build without a draft layer,
-  the draft layer's code is 0.2.6's own.
+Measured on the P100 (IQ3_XXS, auto cache and prefill, 14K and 30K prompts, 256 tokens), the draft layer attends to
+those cells with acceptance within noise of the exact read. A forced small window (the first default-on build set
+`--mtp-window 2048` for every session) and the research option below both cost acceptance on faster cards.
 
-Measured on the P100 (14K prompt, 256 tokens, auto cache and prefill), the draft layer's window made no difference
-to decode (38.7 tok/s with the 32768-cell window, 40.1 with 2048); on faster cards a smaller window costs
-acceptance, which is why the window is left alone.
+`STRATA_KVA_DRAFT_FLOOR=1` (research): the draft layer gets a *cell floor* per session, the first cell built from a real
+row. It builds no draft cell below it and attends to `[max(floor, pos - window), pos)`, the exact tail growing with
+the conversation. The floor follows the tokens of the state a request continues from (`kva_floor.hpp`); a state no KVA
+read produced has floor 0. It is off by default because it costs draft acceptance after long prompts.
 
 ## Chats, follow-up turns and checkpoints (`--serve`)
 
@@ -86,6 +80,7 @@ there, with a line when it is set).
 | `STRATA_KVA_SPLIT` | 24 | first approximated layer (zero-based) |
 | `STRATA_KVA_SUFFIX` | 2048 | fully computed tail positions; see above |
 | `STRATA_KVA_MIN_PROMPT` | 4096 | shorter prompts stay on the full path |
+| `STRATA_KVA_DRAFT_FLOOR` | off | `1`: the draft layer skips the draft cells of approximated chunks (research) |
 | `STRATA_KVA_ONLY` | all | `gdn` or `qsa`: approximate only that layer type |
 | `STRATA_KVA_MODE` | identity | `identity`, `oracle`, `linear` (linear is not implemented) |
 | `STRATA_KVA_CAPTURE` | — | directory: write every late layer's real input for calibration (the read is exact while capturing) |
