@@ -179,7 +179,13 @@ elseif(STRATA_ENABLE_CUDA)
   # a build with no option was an sm_75 build.  -DCMAKE_CUDA_ARCHITECTURES and the CUDAARCHS environment variable win.
   set(_strata_cuda_arch_defaulted OFF)
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND NOT DEFINED ENV{CUDAARCHS})
-    set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures")
+    if(STRATA_BUILD_DSV41)
+      # #3935: the DeepSeek engine's own release shape (sm_86, sm_89, sm_120 + PTX 120, as packaging/build_dsv41_cuda.sh), so a hand
+      # build of strata-dsv41 with no architecture runs on an RTX 30, 40 or 50 card; the Qwen engine's default below is unchanged
+      set(CMAKE_CUDA_ARCHITECTURES "86-real;89-real;120" CACHE STRING "CUDA architectures")
+    else()
+      set(CMAKE_CUDA_ARCHITECTURES 120 CACHE STRING "CUDA architectures")
+    endif()
     set(_strata_cuda_arch_defaulted ON)
   endif()
   enable_language(CUDA)
@@ -189,7 +195,7 @@ elseif(STRATA_ENABLE_CUDA)
   option(STRATA_EXPERIMENTAL_SM60 "community build for GPUs below compute capability 7.5: Pascal sm_60, Volta sm_70 (#236)" OFF)
   if(_strata_cuda_arch_defaulted)
     # a recommendation, not a refusal: the release engine is built for 75;86;89;120, a hand build names its card
-    message(WARNING "Strata: CMAKE_CUDA_ARCHITECTURES was not set, so this build is for sm_120 (RTX 50) only. For another "
+    message(WARNING "Strata: CMAKE_CUDA_ARCHITECTURES was not set, so this build is for ${CMAKE_CUDA_ARCHITECTURES} only (sm_120 = RTX 50). For another "
                     "card pass it: -DCMAKE_CUDA_ARCHITECTURES=native (the GPUs in this PC), 75 (RTX 20), 86 (RTX 30), "
                     "89 (RTX 40), or a list like \"86;120\".")
   endif()

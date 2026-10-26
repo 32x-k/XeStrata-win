@@ -808,6 +808,14 @@ def arch_covers(archs, present: list[str]) -> bool:
     return False
 
 
+def arch_native(archs, present: list[str]) -> bool:
+    """Whether a build with `archs` holds machine code made for one of the `present` cards itself (``sm_89`` on an ``sm_89`` card),
+    not only code that runs there through the same-major rule of `arch_covers` (``sm_86`` on an RTX 40) or as PTX. Only a tie-breaker
+    between packages that fit equally: a package with the card's own image is taken first (#3935)."""
+    cards = {item[3:] for item in present if item.startswith("sm_") and item[3:].isdigit()}
+    return any(arch.startswith("sm_") and arch[3:] in cards for arch in archs)
+
+
 # ----------------------------------------------------------------------------------------------- resolve
 
 def scan(root: Path | None = None) -> tuple[list[EngineComponent], list[dict]]:
@@ -974,7 +982,7 @@ def resolve(root: Path | None = None, *, backend: str | None = None, target: str
                 return item
     # newest version first; with equal versions the build for the newer driver (the CUDA 13 build beside the CUDA 12 one)
     return max(usable, key=lambda item: (_version_key(item.version), _version_key(item.min_driver.get("nvidia", "0")),
-                                         hip_preference(item.hip_archs)))
+                                         hip_preference(item.hip_archs), arch_native(item.cuda_archs, archs_here)))
 
 
 #: A run config can name its engine as "component:strata-engine" instead of a path: the server then asks the

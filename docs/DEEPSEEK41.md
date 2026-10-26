@@ -55,6 +55,12 @@ Measured: an RTX 5070 (12 GB) with 64 GB of RAM and a 3.6 GB/s NVMe drive answer
 tokens/s (4K) to 231 tokens/s (8K, layer-major path); an RTX 3060 (12 GB) with 46 GB of RAM about 8 to 10 tokens/s (code 9.9, agent work 7.8; 149 tokens/s at 8K; DSpark stays off there, `--dspark on` adds 2-13%); four R9700 about 48
 tokens/s on 2.00 and 80 on 2.25 (code, with the shipped hot-expert profile). Under about 40 GB of RAM it is untested and slow; setup says so and still installs.
 
+**RTX 40 series (sm_89).** The engine packages carry machine code for sm_86, sm_89 and sm_120 since 0.2.7 (before, an RTX 40 card ran the sm_86 code through
+CUDA's same-generation rule). We have no RTX 40 card: the sm_89 build was compiled here but not run. A user's own build for sm_89 ran the 2.00 set on an
+RTX 4090 48 GB with 128 GB of RAM (#3935, their numbers): decode 40.2 tokens/s (median of 5 answers of 64 tokens, `--ssd-cache 108 --dspark on --dspark-conf 0.65`),
+prompts 141 tokens/s at 1.2K and 615 at 4.6K. They saw 16 to 22 tokens/s with `--dspark auto`, which decided "off" on their computer. This is one report on one
+computer; other cards and RAM sizes can differ, and `--dspark auto` stays the default.
+
 Setup downloads with resume and SHA-256, packs the model with the plain recipe (`pack_gguf.py --model SET --shards ... --engram
 engram-IQ4_NL.gguf --engram-meta <UD shard 1> --dspark-gguf dspark-...-Q8_0.gguf`; do not add `--skip-tensors` or `--dense-override`:
 that packs without an error and gives garbage text), copies the shipped hot-expert profile (`data/dsv41/profile-2.00.bin` or `-2.25.bin`)
@@ -143,6 +149,28 @@ or put the file in the `engine-dsv41/` folder (setup tells you its exact place w
 Strata checks the package before it uses it: it must be the DeepSeek engine (not the Strata engine) for your system, its manifest must be signed by a key
 Strata trusts, and every file must match the hash in the manifest. A damaged or foreign file is refused with a plain line and nothing is installed.
 The unpacked folder works as well as the archive. The Strata (Qwen) engine is not touched either way.
+
+### Building the engine for your card
+
+The packages hold machine code for these NVIDIA cards (CUDA 13, Windows and Linux): sm_86 (RTX 30), sm_89 (RTX 40) and sm_120 (RTX 50), plus PTX for
+sm_120. If your card is none of these, or you want your own build, compile `strata-dsv41` and put it where Strata looks for it. You need the CUDA toolkit
+(the packages are built with 13.0), a C++ compiler, CMake, Ninja and the llama.cpp checkout Strata pins (`third_party/llama.cpp`).
+
+```
+cmake -S . -B build-dsv41 -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DSTRATA_BUILD_DSV41=ON -DSTRATA_NATIVE_EXPERTS=ON       "-DCMAKE_CUDA_ARCHITECTURES=89-real" -DSTRATA_GGML_DIR=third_party/llama.cpp
+cmake --build build-dsv41 --target strata-dsv41 -j 8
+```
+
+Use your card's number in `CMAKE_CUDA_ARCHITECTURES`: 86 for RTX 30, 89 for RTX 40, 120 for RTX 50, or `native` for the cards in this computer. Without the
+option a DeepSeek build is made for 86, 89 and 120. On Windows, `packaginguild_dsv41_windows.bat BUILD_DIR` does the same (`DSV41_ARCH` names the cards);
+on Linux, `packaging/build_dsv41_cuda.sh` (`ARCH=...`). Then copy the file into the `engine` folder of your Strata install (next to `strata`); setup finds it there and does not download an engine:
+
+```
+python setup.py --family deepseek41 --model IST-DAS-2.00bpw
+```
+
+`strata-dsv41 --version` prints the commit it was built from. A build you made yourself is not signed by Strata, which is fine for your own computer.
+Please tell us how it runs on your card (the speed, and the card and RAM): we only list a card as tested after someone has run it.
 
 ## Compressed experts (trellis), for testing
 
