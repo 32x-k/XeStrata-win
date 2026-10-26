@@ -180,6 +180,79 @@ test("math: off by default, drawn when switched on, source kept", async ({ brows
   await page.close();
 });
 
+// ------------------------------------------------------------------------------------------------ load / unload (#3550)
+const btnText = (page) => page.$eval("#unload-btn", (b) => b.textContent);
+const waitBtn = (page, text) => page.waitForFunction((t) => document.getElementById("unload-btn").textContent === t, { timeout: 8000 }, text);
+const posts = (mock, what) => mock.state.calls.filter((c) => c === "POST " + what).length;
+
+test("load/unload: the header button unloads after a confirmation and loads again", async ({ browser, mock }) => {
+  mock.state.loaded = true; mock.state.calls.length = 0;
+  const page = await openPage(browser, mock);
+  await waitBtn(page, "Unload");
+  await page.click("#unload-btn");
+  assert.match(page.lastDialog, /Unload the model and free the GPU/);
+  await waitBtn(page, "Load");
+  assert.equal(posts(mock, "/unload"), 1);
+  assert.equal(await page.$eval("#pill-text", (e) => e.textContent), "Unloaded");
+  await sleep(2500);                                       // the poll must agree, not flip the button back
+  assert.equal(await btnText(page), "Load");
+  await page.click("#unload-btn");
+  await waitBtn(page, "Unload");
+  assert.equal(posts(mock, "/load"), 1);
+  assert.equal(await page.$eval("#pill-text", (e) => e.textContent), "Idle");
+  await page.close();
+});
+
+test("load/unload: declining the question changes nothing", async ({ browser, mock }) => {
+  mock.state.loaded = true; mock.state.calls.length = 0;
+  const page = await openPage(browser, mock, { dialogs: "dismiss" });
+  await waitBtn(page, "Unload");
+  await page.click("#unload-btn");
+  await sleep(500);
+  assert.equal(posts(mock, "/unload"), 0);
+  assert.equal(await btnText(page), "Unload");
+  await page.close();
+});
+
+test("load/unload: not while an answer is being written", async ({ browser, mock }) => {
+  mock.state.loaded = true;
+  const page = await openPage(browser, mock);
+  await waitBtn(page, "Unload");
+  await say(page, "#hold please");
+  await page.waitForFunction(() => busy !== null);
+  assert.equal(await page.$eval("#unload-btn", (b) => b.disabled), true);
+  assert.match(await page.$eval("#unload-btn", (b) => b.title), /Stop the reply/);
+  await page.click("#stop-btn");
+  await idle(page);
+  await page.waitForFunction(() => !document.getElementById("unload-btn").disabled, { timeout: 8000 });
+  await page.close();
+});
+
+test("load/unload: an unloaded model is loaded by a message and the button follows", async ({ browser, mock }) => {
+  mock.state.loaded = false;
+  const page = await openPage(browser, mock);
+  await waitBtn(page, "Load");
+  await say(page, "hello");
+  await idle(page);
+  await waitBtn(page, "Unload");
+  await page.close();
+});
+
+test("load/unload: the header fits a phone", async ({ browser, mock }) => {
+  mock.state.loaded = true;
+  for (const width of [320, 360, 390, 640]) {
+    const page = await openPage(browser, mock, { width, height: 700 });
+    await waitBtn(page, "Unload");
+    const r = await page.evaluate(() => {
+      const box = (id) => { const b = document.getElementById(id).getBoundingClientRect(); return [b.left, b.right]; };
+      return { unload: box("unload-btn"), theme: box("theme-btn"), scroll: document.documentElement.scrollWidth, width: innerWidth };
+    });
+    for (const [l, rt] of [r.unload, r.theme]) assert.ok(l >= 0 && rt <= r.width, `${width}px: ${JSON.stringify(r)}`);
+    assert.ok(r.scroll <= r.width, `${width}px: the page scrolls sideways: ${JSON.stringify(r)}`);
+    await page.close();
+  }
+});
+
 const mock = await startMock();
 const browser = await launch();
 await run(async () => ({ browser, mock, close: async () => { await browser.close(); await mock.stop(); } }));
