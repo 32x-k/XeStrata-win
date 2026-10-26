@@ -20,6 +20,7 @@
 #include "strata/core/weights.hpp"
 
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <future>
 #include <memory>
@@ -54,6 +55,32 @@ struct PrefillStats {
 void set_cpu_share(double share);
 /// The share in use: STRATA_PREFILL_CPU_SHARE's, else set_cpu_share's; -1 measured.
 double cpu_share_setting();
+
+/// The prompt chunks --prefill auto picks from, the largest first, for both engines (generate.cpp's plan_lend and
+/// PlainModel's): every chunk streams again each expert it routes to, so fewer chunks stream fewer experts.  32768 and
+/// 16384 after upstream ae652b2: on the B70 a 26,292-token IQ3_S prompt read at 1,080 tok/s in 8192-token chunks
+/// (50,356 experts streamed), 1,303 in 16384 and 1,545 in one chunk (17,728), the same logits.
+inline constexpr int64_t kAutoChunks[] = {32768, 16384, 8192, 6144, 4096, 3072, 2048, 1024, 512, 256};
+/// The largest of kAutoChunks that `take(chunk)` accepts (0: none), at most STRATA_PREFILL_AUTO_MAX (32768 unset) and,
+/// past 8192, none above `max_context`.
+template <class Take>
+int64_t auto_chunk(int64_t max_context, Take&& take) {
+    static const int64_t auto_max = [] {
+        const char* v = std::getenv("STRATA_PREFILL_AUTO_MAX");
+        return v ? (int64_t) std::strtoll(v, nullptr, 10) : (int64_t) 32768;
+    }();
+    for (const int64_t c : kAutoChunks) {
+        if (c > auto_max || (c > 8192 && c > max_context)) continue;
+        if (take(c)) return c;
+    }
+    return 0;
+}
+/// The percent of the expert tier's slots a prompt chunk's buffers may borrow (a lent slot's expert is streamed during
+/// the prompt and refilled after it): STRATA_PREFILL_LEND_PCT, else `fallback` (the engine's own, measured).
+inline int64_t lend_pct(int64_t fallback) {
+    const char* v = std::getenv("STRATA_PREFILL_LEND_PCT");
+    return v ? (int64_t) std::strtol(v, nullptr, 10) : fallback;
+}
 
 }  // namespace strata::prefill
 namespace strata::core { class MtpDrafter; class RemoteExperts; }

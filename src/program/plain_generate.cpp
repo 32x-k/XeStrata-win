@@ -4,9 +4,9 @@
 //
 //     strata --native MODEL.gguf --tokens 1,2,3 [options: plain_usage, --help]
 //
-// The prompt runs in chunks of up to N tokens through the batched products (--prompt-chunk, default 4096; 0: in
-// windows of up to T tokens), then one token a window (--spec: the pending token and the MTP layer's drafts, the
-// accepted ones emitted together).  stdout gets one line,
+// The prompt runs in chunks of up to N tokens through the batched products (--prompt-chunk, default from the VRAM
+// tier; 0: in windows of up to T tokens), then one token a window (--spec: the pending token and the MTP layer's
+// drafts, the accepted ones emitted together).  stdout gets one line,
 // `tokens: a,b,c`, the generated ids; --dump-logits writes the logits each generated token was chosen from, n_vocab
 // floats a row.  The report goes to stderr.
 #include "strata/program/plain_generate.hpp"
@@ -595,8 +595,8 @@ static void plain_usage(const std::string& arch) {
                  "                       per 64 values (half the VRAM; the answers differ slightly; not GLM-5.3-Flash)\n"
                  "  --prefill-cpu-share S  the CPU pool's share of the prompt's experts the VRAM tier misses (0-1;\n"
                  "                       auto = from the times measured at load, the default; 0: all on the GPU)\n"
-                 "  --prompt-chunk N     the prompt's most tokens a chunk through the batched products (default\n"
-                 "                       4096; 0: the prompt in windows)\n"
+                 "  --prompt-chunk N     the prompt's most tokens a chunk through the batched products (default:\n"
+                 "                       the largest of 32768..256 the VRAM tier lends; 0: the prompt in windows)\n"
                  "  --max-t N            the decode window's most tokens (default 8)\n"
                  "  --spec N             speculative decoding with the model's MTP layer: windows of up to N tokens,\n"
                  "                       the last one and N - 1 drafts (default 3; 0: off; greedy only)\n"
@@ -721,7 +721,10 @@ int plain_main(int argc, char** argv) {
         else if (a == "--gpu") (void) next("--gpu");
         else if (a == "--no-pcie-split") opt.pcie_split = false;
         else if (a == "--draft-vocab") opt.draft_vocab = next("--draft-vocab");
-        else if (a == "--prompt-chunk") opt.prompt_chunk = std::strtoll(next("--prompt-chunk"), nullptr, 10);
+        else if (a == "--prompt-chunk") {
+            opt.prompt_chunk = std::strtoll(next("--prompt-chunk"), nullptr, 10);
+            opt.prompt_chunk_given = true;
+        }
         else if (a == "--layer-split") {
             const std::string v = next("--layer-split");
             opt.split_auto = v == "auto";

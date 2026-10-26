@@ -394,7 +394,7 @@ The engine's options (added to the settings' `args`):
 | `--vram-elastic` | with `--serve` on one GPU: the experts' VRAM tier in segments (`--vram-segment-mib`, default 512), given back before an image job and taken again after it (`--image-gpu-policy shrink`) |
 | `--prefill-cpu-share S` | the CPU pool's share of the experts outside VRAM in prefill (0-1; the default `auto` takes it from the times measured at start; 0: all on the GPU) |
 | `--pool-workers N` | the CPU threads that compute experts (default one fewer than the physical cores, at most 32; in a Linux container with a CPU quota (cgroup), at most one fewer than the quota) |
-| `--prompt-chunk N` | the most tokens prefill computes at once (default 4096; 0: none at once) |
+| `--prompt-chunk N` | the most tokens prefill computes at once (default: the largest chunk the VRAM tier of experts lends, of 32768 down to 256, its buffers within 85% of the slots; 0: none at once) |
 | `--max-t N` | the decode window's most tokens (default 8) |
 | `--spec N` | the most tokens of a window checking the MTP layer's drafts (default 3: two drafts; 0: off) |
 | `--spec-window all\|auto\|min-p` | how many of the drafts a window checks: `all` (the default) every draft made; `auto`, as Qwen3.8-Flash-Next does, while the drafts' probabilities and the measured window times say a draft raises the tokens per ms; `min-p` while a draft is at least `--spec-min-p P` likely |

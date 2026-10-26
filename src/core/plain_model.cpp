@@ -46,6 +46,7 @@
 #include "strata/kernels/draft_head.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/prefill.hpp"
 #include "strata/platform/memory.hpp"
 
 #include <algorithm>
@@ -1066,6 +1067,8 @@ bool PlainModel::open_experts(std::string& err) {
     }
     if (!slot_bytes.empty() && !cache_.open_sized(slot_bytes, L, E, err)) return false;
     n_slots_ = (int64_t) slot_bytes.size();
+    if (!opt_.prompt_chunk_given && opt_.prompt_chunk > 0 && prompt_host_ != nullptr && first() && last())
+        auto_prompt_chunk(q == E ? room - per_layer_b * (uint64_t) q : 0);
     // every expert has its slot and VRAM is left beside the tier: the prompt's buffers there, for the longest chunk
     // they fit (prompt_borrow then lends no slot, so the prompt reads no expert from RAM)
     if (q == E && opt_.prompt_chunk > 0 && prompt_host_ != nullptr) {
@@ -1182,7 +1185,7 @@ bool PlainModel::open_experts(std::string& err) {
         uint64_t db = 0, hb = 0;
         prompt_carve(opt_.prompt_chunk, pb_, nullptr, nullptr, db, hb);
         const uint64_t* off = cache_.slot_offsets();
-        const int64_t lowest = std::max<int64_t>(n_slots_ / 2, cache_.last_piece_first());
+        const int64_t lowest = lend_lowest(n_slots_);
         lend_from_ = n_slots_;
         while (off != nullptr && lend_from_ > lowest && off[n_slots_] - off[lend_from_] < db) --lend_from_;
     }
@@ -1191,6 +1194,49 @@ bool PlainModel::open_experts(std::string& err) {
                      (long long) prompt_dev_T_);
     free_b_ = free_b;
     return true;
+}
+
+// The prompt path's lending, as Qwen3.8-Flash-Next's --prefill auto (generate.cpp's plan_lend): a chunk's buffers
+// borrow at most prefill::lend_pct of the tier's slots and leave 128 (half of a smaller tier), and only from its last
+// piece.  85%: Qwen3.6 UD-Q4_K_XL's 32K prompt on the B70 (2026-10-26) read at 711 tok/s with the half the tier lent
+// until then (2048-token chunks in 8 GB), 802 at 70-90% (4096); in 16 GB 855 in 4096-token chunks, 897 in 8192 and
+// 917 in 16384 (85%: half the tier held 8192).
+constexpr int64_t kPlainLendPct = 85;
+
+int64_t PlainModel::lend_lowest(int64_t n) const {
+    const int64_t pct = std::clamp<int64_t>(strata::prefill::lend_pct(kPlainLendPct), 1, 99);
+    return std::max({n - n * pct / 100, std::min<int64_t>(128, n / 2), cache_.last_piece_first()});
+}
+
+// --prompt-chunk not given: the largest of prefill.hpp's kAutoChunks (as Qwen3.8's --prefill auto) whose buffers the
+// tier lends (lend_lowest), or that fit in the `beside` bytes left beside a tier that holds every expert; the pinned
+// host buffers made again for it.  One GPU: a layer split's stages share the rows' buffers of the chunk asked.
+void PlainModel::auto_prompt_chunk(uint64_t beside) {
+    const uint64_t* off = cache_.slot_offsets();
+    const int64_t n = n_slots_;
+    const int64_t lowest = lend_lowest(n);
+    const int64_t c = strata::prefill::auto_chunk(opt_.max_cells, [&](int64_t t) {
+        uint64_t db = 0, hb = 0;
+        prompt_carve(t, pb_, nullptr, nullptr, db, hb);
+        if (beside > 0) return db <= beside && db <= max_alloc_bytes();
+        return off != nullptr && n >= 2 && off[n] - off[lowest] >= db;
+    });
+    if (c <= 0 || c == opt_.prompt_chunk) return;
+    uint64_t db = 0, hb = 0;
+    prompt_carve(c, pb_, nullptr, nullptr, db, hb);
+    void* h = nullptr;
+    if (!strata::gpu::alloc_host(&h, hb)) {
+        std::fprintf(stderr, "strata plain: prompt chunks of %lld tokens would fit the tier, but not their %llu MiB of "
+                             "pinned memory: %lld\n", (long long) c, (unsigned long long) (hb >> 20),
+                     (long long) opt_.prompt_chunk);
+        return;
+    }
+    strata::gpu::free(prompt_host_);
+    prompt_host_ = h;
+    opt_.prompt_chunk = c;
+    prompt_carve(c, pb_, nullptr, (uint8_t*) prompt_host_, db, hb);
+    std::fprintf(stderr, "strata plain: prompt chunks of %lld tokens (the largest the tier lends, --prompt-chunk sets "
+                         "it)\n", (long long) c);
 }
 
 // The PCIe split of the missed experts between the CPU and PCIe (after Project Maya's CPU lane): the times measured

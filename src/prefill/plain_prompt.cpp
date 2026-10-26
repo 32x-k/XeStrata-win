@@ -88,13 +88,13 @@ bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
     const int64_t L = n_moe_, E = spec_.n_expert, n = cache_.slots();   // the live slots (--vram-elastic's shrinks)
     const uint64_t* off = cache_.slot_offsets();
     if (borrow_first_ >= 0 || off == nullptr || L <= 0 || n < 2) { err = "plain prompt: no tier to borrow from"; return false; }
-    // the chunk's device bytes from the tier's last slots: halved until they take at most half the tier, within its
-    // last piece (the slots lie back to back only inside one)
+    // the chunk's device bytes from the tier's last slots: halved until they take at most the share lend_lowest
+    // allows, within its last piece (the slots lie back to back only inside one)
     borrow_short_ = false;
     uint64_t db = 0, hb = 0;
     const int64_t want = T;
     int64_t first = n;
-    const int64_t lowest = std::max<int64_t>(n / 2, cache_.last_piece_first());
+    const int64_t lowest = lend_lowest(n);
     const int64_t least = std::clamp<int64_t>(want, 1, 16);   // a prompt under 16 tokens: one chunk of its length
     for (;; T /= 2) {
         if (T < least) break;

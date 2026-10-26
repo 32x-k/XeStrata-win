@@ -6630,11 +6630,7 @@ int main(int argc, char** argv) {
     // and the bigger ring does not buy that back - on the B70 at STRATA_VRAM_LIMIT_MIB=8192, IQ3_S, interleaved:
     // 8K prompt 6144/default ring 532-817 tok/s, 8192/96 717-1161 (6 pairs); 32K 4096/default 565-617, 8192/96
     // 1046-1293 (3 pairs); 4K 405-653, 283-712 (3 pairs).  STRATA_PREFILL_RING still wins.
-    auto lend_pct = [] {
-        const char* v = std::getenv("STRATA_PREFILL_LEND_PCT");
-        return v ? (int64_t) std::strtol(v, nullptr, 10)
-                 : (int64_t) (strata::prefill::Prefill::pinned_share() >= 0.9 ? 90 : 85);
-    };
+    auto lend_pct = [] { return strata::prefill::lend_pct(strata::prefill::Prefill::pinned_share() >= 0.9 ? 90 : 85); };
     auto auto_slots = [&](int64_t c) -> int64_t {
         const int64_t pct = lend_pct();
         auto fits = [&](const strata::core::ExpertCache& x, int64_t k) {
@@ -6660,15 +6656,8 @@ int main(int argc, char** argv) {
     // prompt needs (Prefill::relayout), so a big chunk costs short prompts nothing.  0 = none fits.
     auto plan_lend = [&](int64_t& chunk) -> int64_t {
         // 32768 and 16384 (upstream ae652b2; opt-in there, 3e31eea, as other chunks rounded differently on CUDA):
-        // every chunk streams again each expert it routes to, so on the B70 a 26,292-token IQ3_S prompt read at
-        // 1,080 tok/s in 8192-token chunks (50,356 experts streamed), 1,303 in 16384 and 1,545 in one chunk (17,728),
-        // the same logits.  They take the lend rule below like the others, so a smaller cache picks a smaller chunk,
-        // and none goes past --max-context.  STRATA_PREFILL_AUTO_MAX lowers the ceiling (8192: as before).
-        static constexpr int64_t kAutoChunks[] = {32768, 16384, 8192, 6144, 4096, 3072, 2048, 1024, 512, 256};
-        static const int64_t auto_max = [] {
-            const char* v = std::getenv("STRATA_PREFILL_AUTO_MAX");
-            return v ? (int64_t) std::strtoll(v, nullptr, 10) : (int64_t) 32768;
-        }();
+        // prefill.hpp's kAutoChunks.  They take the lend rule below like the others, so a smaller cache picks a
+        // smaller chunk, and none goes past --max-context.  STRATA_PREFILL_AUTO_MAX lowers the ceiling (8192: as before).
         // #2090 (upstream 1a55fc37, 987548ce): a chunk above 8192 lends the prompt path about twice the slots of 8192
         // (R9700, IQ3_XXS: 3,907 slots / 6.38 GiB at 16384 against 2,068 / 3.37 GiB), and each lent slot's expert is read
         // from the RAM side during the read.  On a 30 GB PC with --resident-experts that was 3.4 GB available, 20 GB in
@@ -6702,12 +6691,14 @@ int main(int argc, char** argv) {
             return false;
         };
         if (o.prefill_auto) {
-            for (const int64_t c : kAutoChunks) {
-                if (c > auto_max || (c > 8192 && c > o.max_context)) continue;
-                if (c > 8192 && !big_chunk_fits(c)) continue;
-                if (const int64_t k = auto_slots(c); k > 0) { chunk = c; return k; }
-            }
-            return 0;
+            int64_t k = 0;
+            const int64_t c = strata::prefill::auto_chunk(o.max_context, [&](int64_t t) {
+                if (t > 8192 && !big_chunk_fits(t)) return false;
+                k = auto_slots(t);
+                return k > 0;
+            });
+            if (c > 0) chunk = c;
+            return c > 0 ? k : (int64_t) 0;
         }
         auto fits = [](const strata::core::ExpertCache& x, int64_t k) { return k + 128 <= x.slots(); };
         for (int64_t c = chunk; c >= 256; c /= 2) {

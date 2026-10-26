@@ -109,6 +109,7 @@ struct PlainOptions {
     /// The most tokens a prompt chunk takes through the batched products (`prompt`; a shorter prompt, one chunk of its
     /// length); 0: the prompt runs in windows.
     int64_t prompt_chunk = 4096;
+    bool prompt_chunk_given = false;   ///< --prompt-chunk was given: no chunk is chosen (auto_prompt_chunk)
     /// Speculative decoding with the model's MTP layer: windows of up to this many tokens, the last accepted one and
     /// spec - 1 drafts (0 or 1: off; a model without the layer: off).  Greedy requests only.  3 by default: two
     /// drafts were the fastest of one to three on the RX 9060 XT (16 and 8 GB), the B70 and the RTX 4070 (Ornith Q6_K
@@ -405,6 +406,10 @@ private:
     };
     /// Lays the buffers for chunks of `T` tokens out from `dev` / `host` (null: only counts), returning the device and
     /// host bytes.
+    /// The lowest slot of `n` a prompt chunk may borrow from (prefill::lend_pct of them, 128 left).
+    int64_t lend_lowest(int64_t n) const;
+    /// --prompt-chunk not given: the chunk from the tier, as Qwen3.8-Flash-Next's --prefill auto.
+    void auto_prompt_chunk(uint64_t beside);
     void prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* host, uint64_t& dev_bytes,
                       uint64_t& host_bytes) const;
     PromptBufs pb_;
