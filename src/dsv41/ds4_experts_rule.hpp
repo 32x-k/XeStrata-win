@@ -47,7 +47,7 @@ inline int prefill_chunk_default(bool own_default, double gpu_share, bool gguf_c
     // `strata launch` writes for 4 or more AMD cards), share 0.86: 1024 370 against 214 tok/s at 8192; and with the engine's own default tp
     // (2, pairs of cards, nothing written), where the rule used to fall through to 2048/8192: 2.25 bpw, --dspark auto, ids 5705e1164a, 8K
     // warm prompts 1024 -> 1247 ppts against 690 at 8192, decode unchanged.  So a multi-card tp run takes it too.  One card with the default
-    // tp, and `--threads on` (it stalled at the first 8K prompt in the 4-card runs), keep their old defaults: not measured with 1024.
+    // tp, `--threads on` (it stalled at the first 8K prompt in the 4-card runs) and a build that is not HIP keep their old defaults: not measured with 1024.
     // An explicit --prefill-chunk N wins over all of this (the call site takes the rule only when none was given).
     if ((own_default || multi_tp) && gpu_share >= 0.5) return 1024;
     if (gguf_copy && !hip && min_vram_bytes >= kChunk4096MinVram) return 4096;
@@ -81,7 +81,8 @@ inline bool copy_all_fits(double lane_bytes, uint64_t ram_avail, double ram_marg
 // ppts with the 256-row rule against 1324 / 1353 / 1363 with a 1024-row slab (+9%), decode 77.7 against 78.1 tok/s, 268 MB a device (1% of
 // the card).  That branch asks for min(chunk, 1024) rows whatever the spare room (the spare of such a box is negative: its room is all
 // experts), and never less than the base; the automatic growth on top of it still applies where the room is there.  A unified-memory GPU
-// (the caller passes env 0 there) and DS4_ATTN_SLAB=0 never take either branch.
+// (the caller passes env 0 there) and DS4_ATTN_SLAB=0 never take either branch.  The caller passes 0 for `expert_share` in a build that is not
+// HIP: that branch is the 4 x R9700 measurement.
 inline int attn_slab_rows(int env, int chunk, int base, double spare_bytes, double bytes_per_row, double expert_share = 0.0) {
     auto clampn = [&](int a) { return std::max(64, std::min(chunk, a) / 64 * 64); };
     if (env == 0) return base;
@@ -107,11 +108,13 @@ inline int attn_slab_rows(int env, int chunk, int base, double spare_bytes, doub
 //     summed room, 64 MB a GB, 400..1200 MB.  Measured on Strix Halo only (400 -> 1200: the queue 3,200 -> 8,087 experts, 4K prompt 27.3
 //     -> 21.3 s, decode unchanged); a discrete card in this band is not measured and takes the same, VRAM-bounded, rule.
 // A unified-memory GPU never takes the small ring (its datapoint is the 1200 MB one): it keeps the 16 MB "fit" rule at 1/1.3.
-inline int staging_ring_mb(double share, double room_bytes, int n_dev, bool integrated) {
+// `hip`: the 0.5..0.82 band and the 0.82 threshold are the 4 x R9700 measurements, so only a HIP build takes them; any other build keeps main's
+// rule there (16 MB from 1/1.3, the streamed ring below it) until a CUDA multi-card rig is measured.
+inline int staging_ring_mb(double share, double room_bytes, int n_dev, bool integrated, bool hip) {
     const double GB = 1e9;
     const double per_dev = n_dev > 0 ? room_bytes / (double) n_dev : 0.0;
     const double streamed = std::min(1200.0, std::max(400.0, room_bytes / GB * 64.0));
-    if (integrated) return share >= 1.0 / 1.3 ? 16 : (int) streamed;
+    if (integrated || !hip) return share >= 1.0 / 1.3 ? 16 : (int) streamed;
     if (share >= 0.82) return 16;
     if (share >= 0.5) return (int) std::min(512.0, std::max(128.0, per_dev / GB * 8.0));
     return (int) streamed;

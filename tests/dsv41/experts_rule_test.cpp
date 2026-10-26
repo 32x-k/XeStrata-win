@@ -104,36 +104,42 @@ int main() {
         CHECK_EQ(attn_slab_rows(512, 1024, 256, 1e18, bpr, 0.77), 512);    // DS4_ATTN_SLAB=N: that many rows whatever the share
         CHECK_EQ(attn_slab_rows(-1, 1024, 1024, -5.0e9, bpr, 0.77), 1024);   // a unified-memory base (32 MB of q = 1024 rows) is kept
     }
-    // the staging ring (MB): staging_ring_mb(share, room_bytes, n_dev, integrated)
+    // the staging ring (MB): staging_ring_mb(share, room_bytes, n_dev, integrated, hip)
     {
         const double GB = 1e9;
         // the cards hold the experts: 16 MB, discrete (4 x R9700 at 0.86 and a card that holds everything)
-        CHECK_EQ(staging_ring_mb(0.86, 4 * 30 * GB, 4, false), 16);
-        CHECK_EQ(staging_ring_mb(1.00, 70 * GB, 1, false), 16);
-        CHECK_EQ(staging_ring_mb(0.82, 4 * 30 * GB, 4, false), 16);
+        CHECK_EQ(staging_ring_mb(0.86, 4 * 30 * GB, 4, false, true), 16);
+        CHECK_EQ(staging_ring_mb(1.00, 70 * GB, 1, false, true), 16);
+        CHECK_EQ(staging_ring_mb(0.82, 4 * 30 * GB, 4, false, true), 16);
         // they hold most of them (4 x R9700, share 0.72-0.77, 31 GB of room a device): 8 MB a GB of one device's room = 248 MB
-        CHECK_EQ(staging_ring_mb(0.77, 4 * 31 * GB, 4, false), 248);
-        CHECK_EQ(staging_ring_mb(0.72, 4 * 31 * GB, 4, false), 248);
-        CHECK_EQ(staging_ring_mb(0.81, 4 * 31 * GB, 4, false), 248);
-        CHECK_EQ(staging_ring_mb(0.77, 4 * 10 * GB, 4, false), 128);       // small devices: at least 128
-        CHECK_EQ(staging_ring_mb(0.60, 3 * 90 * GB, 3, false), 512);       // big devices: at most 512
-        CHECK_EQ(staging_ring_mb(0.50, 2 * 31 * GB, 2, false), 248);       // the per-device room, not the summed one (1 card: 31 GB -> 248 too)
-        CHECK_EQ(staging_ring_mb(0.60, 31 * GB, 1, false), 248);
+        CHECK_EQ(staging_ring_mb(0.77, 4 * 31 * GB, 4, false, true), 248);
+        CHECK_EQ(staging_ring_mb(0.72, 4 * 31 * GB, 4, false, true), 248);
+        CHECK_EQ(staging_ring_mb(0.81, 4 * 31 * GB, 4, false, true), 248);
+        CHECK_EQ(staging_ring_mb(0.77, 4 * 10 * GB, 4, false, true), 128);       // small devices: at least 128
+        CHECK_EQ(staging_ring_mb(0.60, 3 * 90 * GB, 3, false, true), 512);       // big devices: at most 512
+        CHECK_EQ(staging_ring_mb(0.50, 2 * 31 * GB, 2, false, true), 248);       // the per-device room, not the summed one (1 card: 31 GB -> 248 too)
+        CHECK_EQ(staging_ring_mb(0.60, 31 * GB, 1, false, true), 248);
         // they hold under half (discrete): 64 MB a GB of the summed room, 400..1200 (streamed; not measured on a discrete card)
-        CHECK_EQ(staging_ring_mb(0.19, 31 * GB, 1, false), 1200);
-        CHECK_EQ(staging_ring_mb(0.06, 10 * GB, 1, false), 640);           // a 12 GB card
-        CHECK_EQ(staging_ring_mb(0.06, 4 * GB, 1, false), 400);            // a small pool still gets 400
-        CHECK_EQ(staging_ring_mb(0.40, 2 * 31 * GB, 2, false), 1200);      // capped
-        CHECK_EQ(staging_ring_mb(0.49, 4 * 31 * GB, 4, false), 1200);
+        CHECK_EQ(staging_ring_mb(0.19, 31 * GB, 1, false, true), 1200);
+        CHECK_EQ(staging_ring_mb(0.06, 10 * GB, 1, false, true), 640);           // a 12 GB card
+        CHECK_EQ(staging_ring_mb(0.06, 4 * GB, 1, false, true), 400);            // a small pool still gets 400
+        CHECK_EQ(staging_ring_mb(0.40, 2 * 31 * GB, 2, false, true), 1200);      // capped
+        CHECK_EQ(staging_ring_mb(0.49, 4 * 31 * GB, 4, false, true), 1200);
         // a unified-memory GPU (Strix Halo): never the small ring; the streamed 400..1200 MB under 1/1.3, 16 above
-        CHECK_EQ(staging_ring_mb(0.60, 40 * GB, 1, true), 1200);           // share 0.6 would be the small ring on a discrete card
-        CHECK_EQ(staging_ring_mb(0.30, 18.75 * GB, 1, true), 1200);
-        CHECK_EQ(staging_ring_mb(0.30, 12 * GB, 1, true), 768);
-        CHECK_EQ(staging_ring_mb(0.30, 5 * GB, 1, true), 400);
-        CHECK_EQ(staging_ring_mb(0.77, 40 * GB, 1, true), 16);             // main's "fit" threshold, 1/1.3 = 0.769
-        CHECK_EQ(staging_ring_mb(0.76, 40 * GB, 1, true), 1200);
+        CHECK_EQ(staging_ring_mb(0.60, 40 * GB, 1, true, true), 1200);           // share 0.6 would be the small ring on a discrete card
+        CHECK_EQ(staging_ring_mb(0.30, 18.75 * GB, 1, true, true), 1200);
+        CHECK_EQ(staging_ring_mb(0.30, 12 * GB, 1, true, true), 768);
+        CHECK_EQ(staging_ring_mb(0.30, 5 * GB, 1, true, true), 400);
+        CHECK_EQ(staging_ring_mb(0.77, 40 * GB, 1, true, true), 16);             // main's "fit" threshold, 1/1.3 = 0.769
+        CHECK_EQ(staging_ring_mb(0.76, 40 * GB, 1, true, true), 1200);
         // nothing known: no devices
-        CHECK_EQ(staging_ring_mb(0.0, 0.0, 0, false), 400);
+        CHECK_EQ(staging_ring_mb(0.0, 0.0, 0, false, true), 400);
+        // a build that is not HIP keeps main's rule everywhere: 16 MB from 1/1.3, the streamed ring below it (no small band, no 0.82)
+        CHECK_EQ(staging_ring_mb(0.77, 4 * 31 * GB, 4, false, false), 16);
+        CHECK_EQ(staging_ring_mb(0.60, 4 * 31 * GB, 4, false, false), 1200);
+        CHECK_EQ(staging_ring_mb(0.80, 4 * 31 * GB, 4, false, false), 16);
+        CHECK_EQ(staging_ring_mb(0.06, 10 * GB, 1, false, false), 640);
+        CHECK_EQ(staging_ring_mb(0.30, 12 * GB, 1, true, false), 768);
     }
     // prompt chunk: prefill_chunk_default(own_default, gpu_share, gguf_copy, file_experts, hip, min_vram, big=8192, multi_tp=false).  What `strata launch` runs on one card
     // passes neither --tp nor --threads, but the engine's default tp is 2, so own_default is false there; a launch with several cards passes --tp 1.

@@ -78,6 +78,14 @@ namespace gg = strata::ds4::gguf;
 
 namespace {
 
+// The DeepSeek engine's share-based defaults (small chunk, whole-chunk slab, small ring, pinned copy) are the 4 x R9700 measurements: only a HIP
+// build takes them.
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+constexpr bool kHipBuild = true;
+#else
+constexpr bool kHipBuild = false;
+#endif
+
 double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -2032,7 +2040,7 @@ struct Model::Impl {
         // most (4 x R9700: 8192 214, 1024 370) the small one wins; with the experts copied into RAM (--mmap-experts off) 4096 beats 8192 by 7-9%
         // (H100 32 GiB: 2048 502, 4096 538, 8192 495).  A GGUF pack always has file_experts set (copied only by --mmap-experts off).
         const bool own_default = !(par || o.tp > 1);   // (a run with tp 1 and no --threads: `strata launch` writes --tp 1 for 4+ AMD cards, --tp 2 for 2-3 and nothing for one card = the engine's tp 2)
-        const bool multi_tp = !own_default && !o.threads && devs.size() >= 2;   // (the 4-card default-tp run the 1024 chunk was also measured on; an explicit --prefill-chunk below wins over the rule)
+        const bool multi_tp = kHipBuild && !own_default && !o.threads && devs.size() >= 2;   // (the 4-card default-tp run the 1024 chunk was also measured on; an explicit --prefill-chunk below wins over the rule)
         const bool gguf_copy = pk.gguf && (o.mmap_experts == 0 || (store_gb() <= 0.0 && auto_copy_all));
         uint64_t vmin_bytes = ~0ull;
         for (const Dev& dv : devs) vmin_bytes = std::min<uint64_t>(vmin_bytes, (uint64_t) dv.total);
@@ -2975,7 +2983,7 @@ struct Model::Impl {
             cudaDeviceProp ip{};
             if (cudaGetDeviceProperties(&ip, d.id) == cudaSuccess && ip.integrated != 0) unified = true;
         }
-        const size_t mb = (size_t) strata::ds4::staging_ring_mb(exp_b > 0 ? share : 0.0, room, (int) devs.size(), unified);
+        const size_t mb = (size_t) strata::ds4::staging_ring_mb(exp_b > 0 ? share : 0.0, room, (int) devs.size(), unified, kHipBuild);
         if (o.verbose)
             std::fprintf(stderr, "ds4: staging ring: experts %.1f GB, VRAM room %.1f GB, dense %.1f GB -> %d MB\n", exp_b / 1e9,
                          room / 1e9, other_b / 1e9, (int) mb);
@@ -3035,11 +3043,11 @@ struct Model::Impl {
                 const int base = c.A;
                 // one rule (ds4_experts_rule.hpp: attn_slab_rows): the chunk's whole slab (<= 1024 rows) where the cards hold half the
                 // experts or more (4 x R9700, +9% prompt), up to 2048 rows where the VRAM is spare, the base otherwise
-                c.A = strata::ds4::attn_slab_rows(env, chunk, base, spare, bpr, share);
+                c.A = strata::ds4::attn_slab_rows(env, chunk, base, spare, bpr, kHipBuild ? share : 0.0);
                 if (env < 0 && c.A > base) {
                     slab_auto_grew_ = true;
                     if (di == 0 && o.verbose) {
-                        if (share >= 0.5)
+                        if (kHipBuild && share >= 0.5)
                             std::fprintf(stderr, "ds4: attention slab %d rows (automatic: the cards hold %.0f%% of the experts; DS4_ATTN_SLAB=0 keeps %d)\n",
                                          c.A, share * 100.0, base);
                         else
@@ -4591,10 +4599,10 @@ struct Model::Impl {
         // DS4_COPY_PIN_RO=1: cudaHostRegisterReadOnly (the GPU only reads it).
         // 0.2.7: DS4_COPY_PIN unset = ON when EITHER condition measured reliable holds: (a) the whole arena is on explicit 2 MB pages (a pin of a
         // THP arena registers 4 KB pages and the DMA rate was erratic on the 12 GB cell: 11.9 s one prompt, 30.4 s the next), or (b) the
-        // cards hold at least half the routed experts (4 x R9700: the pin was reliable in 4/4 runs there, see above).  =0 is the off
+        // cards hold at least half the routed experts in a HIP build (4 x R9700: the pin was reliable in 4/4 runs there, see above).  =0 is the off
         // switch, =1 pins any arena.
         const char* cp = std::getenv("DS4_COPY_PIN");
-        const bool pin_copies = cp != nullptr ? std::atoi(cp) != 0 : ((arena_all_huge || gpu_expert_share() >= 0.5) && !ram_chunks.empty());
+        const bool pin_copies = cp != nullptr ? std::atoi(cp) != 0 : ((arena_all_huge || (kHipBuild && gpu_expert_share() >= 0.5)) && !ram_chunks.empty());
         if (pin_copies) {
             const bool ro = std::getenv("DS4_COPY_PIN_RO") != nullptr && std::atoi(std::getenv("DS4_COPY_PIN_RO")) != 0;
             const double tr = now_ms();
