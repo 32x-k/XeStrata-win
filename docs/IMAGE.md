@@ -23,8 +23,8 @@ It goes with any version of Qwen3.8-Flash-Next (not yet with the BETA models), a
 | `mage-flow-turbo` | [Mage-Flow-Turbo](https://huggingface.co/Comfy-Org/Mage-Flow) | 4 | The fastest, a small model (4B). For PCs with little RAM or VRAM |
 | `mage-flow` | [Mage-Flow](https://huggingface.co/Comfy-Org/Mage-Flow) | 20 (CFG) | Tuned by reinforcement learning to follow instructions and draw text better |
 | `mage-flow-base` | [Mage-Flow-Base](https://huggingface.co/Comfy-Org/Mage-Flow) | 30 (CFG) | The base model, before that tuning |
-| `magetrail` | [MageTrail](https://huggingface.co/RicemanT/MageTrail) | 30 (CFG) | Mage-Flow tuned on Danbooru and e621 images. For illustrations drawn from booru tags. No edits |
-| `hunyuan-image-3-distil` | [HunyuanImage 3.0 Instruct-Distil](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil) | 8 | Tencent's large MoE model (80B): the most detailed and the slowest. It reads its own prompt, so it needs no text encoder, and it uses the most disk and RAM (about 52 GB). Edits with up to 3 reference images (no masks or transparent backgrounds) |
+| `magetrail` | [MageTrail](https://huggingface.co/RicemanT/MageTrail) | 30 (CFG) | Mage-Flow tuned on Danbooru and e621 images. For illustrations drawn from booru tags. No edits (img2img and masks work) |
+| `hunyuan-image-3-distil` | [HunyuanImage 3.0 Instruct-Distil](https://huggingface.co/tencent/HunyuanImage-3.0-Instruct-Distil) | 8 | Tencent's large MoE model (80B): the most detailed and the slowest. It reads its own prompt, so it needs no text encoder, and it uses the most disk and RAM (about 52 GB). Edits with up to 3 reference images (no transparent backgrounds) |
 
 In this document "Qwen-Image-2.1" means both Turbo and the base model; what holds for one of them only says "Turbo" or "the base model".
 
@@ -34,14 +34,16 @@ In this document "Qwen-Image-2.1" means both Turbo and the base model; what hold
   AtomicChat's Qwen3-VL-8B for Qwen-Image-2.1, huihui-ai's Qwen3-VL-4B (noctrex's GGUF) for Mage-Flow and MageTrail. The image model and the VAE stay the same.
 - **CFG:** `mage-flow`, `mage-flow-base` and `magetrail` apply CFG (pulling toward the prompt by its difference from a negative prompt) at a strength of 5 by default, so each step computes twice.
 - **Guidance:** HunyuanImage 3.0's guidance (2.5 by default) is not a second pass as CFG is: it is one token that carries the number to the model. It has no negative prompt.
-- **Qwen-Image-2.1 and Mage-Flow differ:** Qwen-Image-2.1 takes up to 10 reference images for an edit, and masks and transparent backgrounds.
-  Mage-Flow takes up to 3 reference images (as its edit model was trained), and has no masks or transparent backgrounds.
+- **Qwen-Image-2.1 and Mage-Flow differ:** Qwen-Image-2.1 takes up to 10 reference images for an edit, and transparent backgrounds.
+  Mage-Flow takes up to 3 reference images (as its edit model was trained), and has no transparent backgrounds.
   Mage-Flow has separate image models for generating and for editing; setup installs both, and the engine switches to the edit model for edits only.
-- **MageTrail** is Mage-Flow's image model reshaped and tuned; it has a generation model only, and makes no edits.
+- **MageTrail** is Mage-Flow's image model reshaped and tuned; it has a generation model only, and makes no edits (img2img from one image and masks it takes).
   Its prompts can be booru tags (`1girl, solo, silver hair, ...`) or sentences; `masterpiece, best quality, very aesthetic, aesthetic` raises the quality, and `Drawn by <artist>` at the start takes that artist's style (the 100 artists of the list MageTrail's author publishes).
   Its VAE is the Flux2 VAE its author uses (as Black Forest Labs publishes it with FLUX.2-klein-4B).
-- **HunyuanImage 3.0** edits with up to 3 reference images (the model's own way: a reference goes in as its VAE latent and as SigLIP2's features, before the prompt); it has no masks or transparent backgrounds. The size is made at the one of the model's own 37 sizes (buckets) whose shape is nearest the one asked for (512x512 becomes 1024x1024). With the size `auto`, or none, the model chooses the aspect ratio itself from the prompt (and an edit's reference images), as Tencent's `image_size="auto"` does; the choice takes 4 to 13 seconds on a B70.
+- **HunyuanImage 3.0** edits with up to 3 reference images (the model's own way: a reference goes in as its VAE latent and as SigLIP2's features, before the prompt); it has no transparent backgrounds. The size is made at the one of the model's own 37 sizes (buckets) whose shape is nearest the one asked for (512x512 becomes 1024x1024). With the size `auto`, or none, the model chooses the aspect ratio itself from the prompt (and an edit's reference images), as Tencent's `image_size="auto"` does; the choice takes 4 to 13 seconds on a B70.
   The weights are Tencent's two quantizations (w4a8 and int8). It draws from the prompt at once, not the way Tencent runs it by default (the model reasoning and rewriting the prompt before it draws).
+- **Masks and strength:** every model takes a mask (the part to draw again) and a strength (how much to change the image). Neither is the model's own: both bring the latent back to the image's during the sampling, a way that works with any model (as diffusers and ComfyUI do).
+  A model with edits takes its first reference image as the image; a model without edits (MageTrail, Mage-Flow without its edit model) starts from one image, img2img.
 
 ## Installing
 
@@ -134,7 +136,7 @@ HunyuanImage 3.0's `"images"` also has `steps` (8), `guidance` (2.5), `resolutio
 
 **The Images tab:** with image generation set up, the web page (`http://127.0.0.1:8095`) has an Images tab.
 
-- With several models installed, the model can be chosen; the fields' defaults and which fields there are (steps, transparent background, edits, mask) follow it.
+- With several models installed, the model can be chosen; the fields' defaults and which fields there are (steps, transparent background, an edit or img2img) follow it.
 - Choose the prompt, the size (1024x1024, 1536x1024, 1024x1536, 768x768, 512x512, 1920x1080, 1080x1920, auto, or any size with sides of 256 to 2048) and the seed, and press Generate.
   HunyuanImage 3.0 makes the image at the one of its 37 sizes (buckets) whose shape is nearest the one asked for, and says so when the size differs. With `auto` it makes the image at the size the model chooses.
 - The number of images and the format (PNG, JPEG, WebP or JPEG XL; all but PNG with a quality) can be chosen; a transparent background takes no JPEG.
@@ -144,15 +146,16 @@ HunyuanImage 3.0's `"images"` also has `steps` (8), `guidance` (2.5), `resolutio
   The steps are not shown for Turbo (fixed at 8). The negative prompt takes effect only with CFG above 1, and a line under it says so when it does not.
   With HunyuanImage 3.0 the guidance is one token, so the field is Guidance and there is no negative prompt field.
 - With Qwen-Image-2.1, a transparent background can be chosen as well.
-- With Qwen-Image-2.1 and a reference image attached, the part of the first image to draw again can be painted on it (brush size, eraser, clear). Only the painted part is drawn again, and the rest keeps the image's pixels (the API's `mask`). Unpainted, the edit takes the whole image.
-- Attaching reference images makes it an edit (PNG, JPEG, GIF, BMP, WebP). MageTrail takes no reference images; HunyuanImage 3.0 takes up to 3, with no mask.
+- Attaching an image makes it an edit with a model that edits, and img2img from that one image with a model that does not (MageTrail and the like) (PNG, JPEG, GIF, BMP, WebP). HunyuanImage 3.0 takes up to 3 reference images.
+- With an image attached, the part of the first image to draw again can be painted on it (brush size, eraser, clear). Only the painted part is drawn again, and the rest keeps the image's pixels (the API's `mask`). Unpainted, it is the whole image.
+- With an image attached, the Strength field appears (the API's `strength`): the lower, the more of the image it keeps. Empty is the model's default: 1 for an edit (no start from the image's latent: the edits as before), 0.6 for img2img.
 - Images are made one at a time. A chat request that comes while several are made runs after the image being made, and the rest follow it (under `unload`, which takes the text model off, the images are all made first).
 - The **Monitor** tab shows the stage, the step and the seconds a step takes.
 
 **The chat:** in the web page's chat the model can make and change images itself.
 Ask "draw a cat", and the model calls the image tools; the image appears in the conversation.
 Ask "make the background night", and it changes the conversation's last image (one attached or one made in the conversation).
-With several image models installed, ask in words ("draw it with MageTrail", "like a photograph") and the model picks the image model that fits (none asked for: the default; for a change, one of those that edit).
+With several image models installed, ask in words ("draw it with MageTrail", "like a photograph") and the model picks the image model that fits (none asked for: the default; for a change, those that edit first, and img2img when one without edits is asked for).
 "Images" under the message box chooses the chat's images: `auto` (as above), `off` (no images), or a model's name (the chat's images always with that model); the browser keeps the choice.
 
 ## API
@@ -188,31 +191,33 @@ Other fields (`style`, `user`, `moderation` and the like) are accepted and not u
 ### Changing an image (`POST /v1/images/edits`)
 
 Makes an image from reference images: rewriting a reference image, or making a person or a thing in one the subject.
+A model without edits (MageTrail, Mage-Flow without its edit model) makes it from one image, img2img.
 
 - **The reference images:** OpenAI's multipart form with `image` or `image[]`, or JSON with `"images": [{"image_url": ...}]` (a data: URL or an http(s) URL).
-  Up to 10 for Qwen-Image-2.1, 3 for Mage-Flow and HunyuanImage 3.0; each up to 32 MiB and at least 16x16 pixels.
+  Up to 10 for Qwen-Image-2.1, 3 for Mage-Flow and HunyuanImage 3.0, 1 for a model without edits; each up to 32 MiB and at least 16x16 pixels.
   PNG, JPEG, GIF and BMP are read as they are, other formats (WebP and others) are turned into PNG first.
-- **The model:** `model` chooses it. Without one the default model edits, or, where the default makes images only (MageTrail), the first model that edits, and the answer's `model` says which.
-  An edit that names MageTrail is refused.
+- **The model:** `model` chooses it. Without one it is the default model; where the default does not edit (MageTrail), the default's img2img when there is a `strength` or a `mask`, else the first model that edits, and the answer's `model` says which.
 - **The size:** `size` `auto`, or none, gives the first reference image's aspect ratio at about 1024x1024 pixels. HunyuanImage 3.0 makes the size the model chooses from the reference images and the prompt.
 - **How the references are read:** Qwen-Image-2.1 reads each at about 1024x1024 pixels with its aspect ratio kept, whatever the output's size; more references take more time and memory.
   Mage-Flow's picture reader reads them with the long side at 384 pixels or less, and its VAE at the output's size.
   HunyuanImage 3.0 cuts a reference to the bucket whose shape is nearest and reads it with its VAE (4,096 tokens at 1024x1024) and with SigLIP2 (at most 1,024 patches): about 5,000 tokens a reference, which lengthen each step.
-- **A mask** (Qwen-Image-2.1 only): `mask`, a PNG with an alpha channel the size of the first image, redraws only its transparent part and keeps the rest as the first image's pixels.
-- **The steps:** for Qwen-Image-2.1 and HunyuanImage 3.0 the same as for generating; for Mage-Flow 4 for Turbo, 30 for the other two.
+- **A mask:** `mask`, a PNG with an alpha channel the size of the first image, redraws only its transparent part and keeps the rest as the first image's pixels. Every model takes one.
+- **strength:** above 0 and at most 1: how much of the first image to change; the lower, the more of it is kept. As diffusers' img2img, it skips the first floor(steps × (1 − strength)) of the schedule and starts from the image's latent with that point's share of noise (fewer steps run, so it is faster too).
+  The default is 1 for an edit (the edits as before), 0.6 for img2img (diffusers' default for Flux's and Qwen-Image's img2img), and 1 for img2img with a mask alone. A value that runs no step is refused. ComfyUI's `denoise` is not taken (`denoise` 0.5 at 20 steps is `strength` 0.5 at 40).
+- **The steps:** for Qwen-Image-2.1 and HunyuanImage 3.0 the same as for generating; for Mage-Flow's edits 4 for Turbo, 30 for the other two, and for its img2img those of generating.
 - A reference image's alpha goes to the image model as it is. The other fields are those of generating.
 
 ### The answer
 
 - `data[]`: the images (`b64_json` or `url`), with `revised_prompt` and `seed`.
 - `usage`: counted in the image engine's tokens (the prompt's tokens, and one token for each 16x16 pixels of the reference images and the image made). For HunyuanImage 3.0: the prompt's ids, one for each 16x16 pixels of the image made, and a reference image's VAE tokens and 1,024 SigLIP2 slots.
-- `strata`: the seconds taken, the steps, CFG's strength, the text encoder's, the sampling's and the VAE's times, and what happened to the text model (`gpu_policy`). For HunyuanImage 3.0 it also has the guidance's strength (`guidance`), the bucket's number (`ratio`), when the size asked for was another, that size (`requested_size`), and when the model chose the size, the seconds the choice took (`size_choice_s`).
+- `strata`: the seconds taken, the steps (those a strength ran), `strength` (when below 1), whether it was img2img (`img2img`) and took a mask (`mask`), CFG's strength, the text encoder's, the sampling's and the VAE's times, and what happened to the text model (`gpu_policy`). For HunyuanImage 3.0 it also has the guidance's strength (`guidance`), the bucket's number (`ratio`), when the size asked for was another, that size (`requested_size`), and when the model chose the size, the seconds the choice took (`size_choice_s`).
 - The image model is listed in `/v1/models` too.
 
 ### From the chat
 
 - `/v1/chat/completions` with `"strata_images": true` (the web page sends it) gives the model the `generate_image` and `edit_image` tools; when the model calls one, the server makes the image and shows it there.
-  `edit_image` changes the conversation's last image (one attached or one made in the conversation). One request calls the tools up to 4 times.
+  `edit_image` changes the conversation's last image (one attached or one made in the conversation); it takes a `strength` too, and is img2img with a model without edits. One request calls the tools up to 4 times.
 - `/v1/responses` does the same with OpenAI's built-in `image_generation` tool, and returns the image in an `image_generation_call` item (`result`, the image in base64, with `size`, `quality`, `background`, `output_format` and `revised_prompt`).
   The tool's `size`, `quality`, `output_format`, `output_compression` and `background` are used for the images it makes (`size` `auto`: the size the model asks for).
 
@@ -269,8 +274,9 @@ HunyuanImage 3.0 (`hunyuan-image-3-distil`, w4a8, 1024x1024, 8 steps, one image 
 | `image generation: missing ...` (at start) | Image files are missing. Run setup with `--images` again |
 | `this image needs at least X GiB of VRAM ...` (400) | Not enough VRAM for this image. Use fewer or smaller reference images, or a smaller image |
 | `this image keeps X GiB of its prompt's cache in RAM ...` (400) | Not enough RAM for the reference images' cache. Likewise use fewer or smaller reference images |
-| `edits need the vision encoder ...` (400) | The files for edits are missing. Run setup with `--images` again |
-| `edits need the vision model's file ...` (400) | HunyuanImage 3.0's edits lack the SigLIP2 file. Run setup with `--images` again |
+| `strength: ... runs none of the ... steps` (400) | The strength is too low to run a step. Raise it or the steps |
+| `image: one image (this image model has no edits ...` (400) | img2img with a model without edits takes one image |
+| `the VAE file has no encoder for a base image` | The VAE file has no encoder, so img2img and masks cannot run. Run setup with `--images` again |
 | `the VRAM budget ... is below the weights that always stay` (400) | HunyuanImage 3.0's weights that always stay and its slots (about 10 GB) do not fit the VRAM. It does not run on this GPU |
 | `the image engine did not start ...`, `the image engine ended` | The image engine did not start, or stopped. See the log the message names (`strata-image.log`) |
 | `Image generation runs the image model at Q6_K instead of Q8_0 ...` | The RAM is short, so setup lowered the size ([Sizes and memory](#sizes-and-memory)) |
