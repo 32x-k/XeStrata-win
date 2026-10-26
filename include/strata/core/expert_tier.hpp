@@ -138,6 +138,62 @@ ProfileFill<Pairs> plan_profile_fill(const Pairs& prior, int64_t layers, int64_t
     return f;
 }
 
+/// #463 without the stall (upstream d69424c9, #764): a verify window takes the adaptive tier's previous swaps only once
+/// they are this many windows old, and then waits for their copies (which have landed by then).  The window that first
+/// computes a swapped-in expert on the GPU depends only on the window count, as with #463's wait, so the answers are as
+/// reproducible.  Default 2 (upstream 2725c23f7 on sm_86 and sm_60; on XeStrata's GPUs the RTX 4070's decode 59.1 ->
+/// 64.2 tok/s, IQ2_XS, and the B70's equal, IQ3_XXS 1K and 32K within 0.7%, 2026-10-20); STRATA_ADAPT_LAG=1 is #463's
+/// (the very next window waits for the copies).  Both engines' (generate.cpp, PlainModel); `windows` the engine's
+/// default, STRATA_ADAPT_LAG over it.
+inline int adapt_lag(int windows = 2) {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_ADAPT_LAG");
+        return e ? std::max(1, (int) std::strtol(e, nullptr, 10)) : 0;
+    }();
+    return v > 0 ? v : windows;
+}
+
+/// After a prompt, the adaptive tier's counts start from the prompt's routing instead of from nothing.  A count is the
+/// rows routed to an expert, decayed by `decay` once a period of `period` tokens, so an expert the prompt routed with
+/// probability p holds p * period / (1 - decay) rows at the tier's steady state: that is added for the routings
+/// `routed` holds beyond `seen` (a request's own prompt in serve, where the counts run on from request to request).
+/// `routed` [layers][n_expert], `routed_k` the experts a row takes.  The tier's rounds then swap by the counts as before.
+/// STRATA_USAGE_SEED=0: the counts start from nothing.
+inline void seed_usage(std::vector<float>& usage, const std::vector<int64_t>& routed, int64_t routed_k,
+                       std::vector<int64_t>& seen, int64_t n_expert, int64_t period, double decay) {
+    static const bool on = [] { const char* v = std::getenv("STRATA_USAGE_SEED"); return v == nullptr || *v != '0'; }();
+    if (!on || usage.empty() || routed.empty() || routed_k <= 0 || usage.size() != routed.size() || n_expert <= 0 ||
+        period <= 0)
+        return;
+    if (seen.size() != routed.size()) seen.assign(routed.size(), 0);
+    const double rows = (double) period / std::max(1e-3, 1.0 - decay);
+    for (size_t l0 = 0; l0 + (size_t) n_expert <= routed.size(); l0 += (size_t) n_expert) {
+        int64_t total = 0;
+        for (size_t i = l0; i < l0 + (size_t) n_expert; ++i) total += routed[i] - seen[i];
+        if (total <= 0) continue;   // not a MoE layer, or nothing new
+        for (size_t i = l0; i < l0 + (size_t) n_expert; ++i)
+            usage[i] += (float) ((double) (routed[i] - seen[i]) * (double) routed_k / (double) total * rows);
+    }
+    seen = routed;
+}
+
+/// The decode's counts from the rows a window kept (the drafts the model accepted and the token after them), not from
+/// every row it computed: `rec` [layers][max_t][k] the window's routing (ExpertDispatch::route_rec), its first `rows`
+/// rows counted for the layers in `layers` (Qwen3.8's Verifier::add_routing does the same from its own record).
+template <class Layers>
+void add_route_rows(std::vector<float>& usage, const std::vector<int32_t>& rec, const Layers& layers, int64_t n_expert,
+                    int64_t max_t, int64_t k, int rows) {
+    rows = (int) std::min<int64_t>(rows, max_t);
+    for (int64_t l : layers) {
+        if ((size_t) ((l + 1) * max_t * k) > rec.size()) continue;
+        for (int t = 0; t < rows; ++t)
+            for (int64_t j = 0; j < k; ++j) {
+                const int32_t e = rec[(size_t) ((l * max_t + t) * k + j)];
+                if (e >= 0 && e < n_expert) usage[(size_t) (l * n_expert + e)] += 1.0f;
+            }
+    }
+}
+
 /// A prompt chunk's layer, for the CPU's share of the experts the GPU does not hold: `missed` the routed experts not in
 /// VRAM, `cand` (rows, expert) those the CPU may take, fewest rows first - at most MAXT rows (one multi-token job) and a
 /// blob the CPU reads where it lies, page-locked or not assembled into a short-lived buffer (the CPU's jobs keep their

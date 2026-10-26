@@ -332,16 +332,9 @@ bool PlainModel::prompt_chunks_glm5(const int32_t* tokens, int64_t n, int64_t po
                                  g_pooled_[(size_t) d], cs);
             }
             mark(10);
-            if (!routes.empty()) {   // the windows' counts at the prompt's end, as plain_prompt.cpp leaves them
-                const int64_t W = opt_.max_t, last = (n - 1) / W;
-                for (int64_t t0 = 0; t0 < T; t0 += W) {
-                    const int64_t win = (c0 + t0) / W;
-                    const int64_t rounds = (windows_ + last + 1) / opt_.adapt_every - (windows_ + win) / opt_.adapt_every;
-                    const float wgt = std::pow(opt_.adapt_decay, (float) rounds);
-                    for (int64_t ml : moe_local_)   // this stage's layers' routes
-                        for (int64_t i = t0 * K; i < std::min(T, t0 + W) * K; ++i)
-                            disp_.usage[(size_t) (ml * E + routes[(size_t) (ml * P.T * K + i)])] += wgt;
-                }
+            if (!routes.empty()) {   // the prompt's routings, as plain_prompt.cpp counts them
+                for (int64_t ml : moe_local_)   // this stage's layers' routes (seed_usage at the prompt's end)
+                    for (int64_t i = 0; i < T * K; ++i) ++prompt_routed_[(size_t) (ml * E + routes[(size_t) (ml * P.T * K + i)])];
             }
         }
     } catch (const std::exception& e) {

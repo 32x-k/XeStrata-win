@@ -170,6 +170,23 @@ bool PlainModel::prompt_return(std::string& err) {
     return true;
 }
 
+// After a prompt, as Qwen3.8-Flash-Next's tier (generate.cpp): the counts seeded from its routing at the steady state
+// (seed_usage), and the free slots - which Qwen3.8's cache admits misses into as they come - take what the prompt
+// routed most (an empty tier, no profile, took a hundred windows to fill a round at a time).  Unlike Qwen3.8's, a
+// round's worth of the experts in VRAM (--adapt-swaps) is evicted for them here as well: without it a profiled tier
+// kept the profile's experts through the first rounds, Qwen3.6 UD-Q4_K_XL in 8 GB of the B70 (256 tokens, 2026-10-26)
+// 90.9 -> 92.9 tok/s with it (Ornith-1.5, llm-jp-4.1 and GLM-5.3-Flash equal).  No more than a round's: up to 2,048,
+// after upstream's q36 engine, took the RAM's and the link's bandwidth from GLM-5.3-Flash's decode after a 1K prompt,
+// B70 9.5 -> 13.5 tok/s with one round's (2026-10-20).
+bool PlainModel::prompt_settle(std::string& err) {
+    if (disp_.usage.empty()) return true;
+    seed_usage(disp_.usage, prompt_routed_, spec_.n_expert_used, prompt_seen_, spec_.n_expert, 4 * (int64_t) opt_.adapt_every,
+               opt_.adapt_decay);
+    int64_t n_free = 0;
+    for (const auto& f : free_) n_free += (int64_t) f.size();
+    return (n_free == 0 && opt_.adapt_swaps <= 0) || adapt(err, std::max<int64_t>(n_free, opt_.adapt_swaps), opt_.adapt_swaps);
+}
+
 bool PlainModel::prompt_cpu_experts(int64_t ml, const std::vector<int32_t>& experts, const std::vector<int32_t>& count,
                                     const std::vector<int32_t>& start, std::string& err) {
     // On the host while the GPU computes its share: each routed row's token quantized once to the layer's native
@@ -617,11 +634,9 @@ bool PlainModel::prompt_split(const int32_t* tokens, int64_t n, int64_t pos, int
         if (!st->prompt_return(err2) && ok) { err = err2; ok = false; }
     }
     if (!ok) return false;
-    for (PlainModel* st : c) {   // each tier to the experts its layers routed most (prompt_one)
+    for (PlainModel* st : c) {   // each tier's counts from the prompt, its free slots filled (prompt_one)
         const OnDevice on(st->dev_);
-        int64_t n_free = 0;
-        for (const auto& f : st->free_) n_free += (int64_t) f.size();
-        if (!st->disp_.usage.empty() && !st->adapt(err, std::max<int64_t>(2048, n_free), st->opt_.adapt_swaps)) return false;
+        if (!st->prompt_settle(err)) return false;
     }
     return true;
 }
@@ -658,16 +673,8 @@ bool PlainModel::prompt_one(const int32_t* tokens, int64_t n, int64_t pos, int32
     if (!prompt_return(err2) && ok) { err = err2; return false; }
     if (profile)
         std::fprintf(stderr, "strata plain: the chunks %.1f ms, giving the tier its slots back %.1f ms\n", chunks_ms, since(tc));
-    // the tier to the experts the prompt routed most, at once (upstream's q36 engine: up to 2048 slot replacements
-    // after a prompt): the rounds between windows move at most adapt_swaps each, so an empty tier (no profile) took
-    // a hundred windows to fill.  The copies run on the copy stream beside the first windows.  The free slots take
-    // what the prompt routed; of the experts in VRAM no more are evicted than a round between windows does: GLM-5.3-
-    // Flash's 2,048 evictions after a 1K prompt (17 GB of 8.5 MB experts) took the RAM's and the link's bandwidth from
-    // the decode, 9.5 -> 13.5 tok/s on the B70 and 11.3 -> 12.0 on the RTX 4070 with all of them left out (2026-10-20)
-    int64_t n_free = 0;   // and every free slot: those copies displace nothing
-    for (const auto& f : free_) n_free += (int64_t) f.size();
     const auto t0 = std::chrono::steady_clock::now();
-    if (ok && !disp_.usage.empty() && !adapt(err, std::max<int64_t>(2048, n_free), opt_.adapt_swaps)) return false;
+    if (ok && !prompt_settle(err)) return false;
     if (profile)
         std::fprintf(stderr, "strata plain: the tier after the prompt: %.1f ms\n",
                      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
@@ -966,19 +973,10 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                 last_logits();
             }
             if (!routes.empty()) {
-                // each window's counts as the windows would leave them at the prompt's end: times the decay of every
-                // round that would come after it; the rounds themselves are left to the decode (their swaps would
-                // cost the prompt more than they save)
-                const int64_t W = opt_.max_t, last = (n - 1) / W;
-                for (int64_t t0 = 0; t0 < T; t0 += W) {
-                    const int64_t win = (c0 + t0) / W;
-                    // the adaptive rounds after this window: whole rounds, so integer divisions
-                    const int64_t rounds = (windows_ + last + 1) / opt_.adapt_every - (windows_ + win) / opt_.adapt_every;
-                    const float wgt = std::pow(opt_.adapt_decay, (float) rounds);
-                    for (int64_t ml : moe_local_)   // this stage's layers' routes
-                        for (int64_t i = t0 * K; i < std::min(T, t0 + W) * K; ++i)
-                            disp_.usage[(size_t) (ml * E + routes[(size_t) (ml * P.T * K + i)])] += wgt;
-                }
+                // the counts start from the prompt's routing at the tier's steady state (seed_usage), as Qwen3.8-
+                // Flash-Next's; the rounds themselves are left to the decode
+                for (int64_t ml : moe_local_)   // this stage's layers' routes (seed_usage at the prompt's end)
+                    for (int64_t i = 0; i < T * K; ++i) ++prompt_routed_[(size_t) (ml * E + routes[(size_t) (ml * P.T * K + i)])];
             }
         }
     } catch (const std::exception& e) {

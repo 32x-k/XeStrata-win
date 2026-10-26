@@ -2850,9 +2850,14 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     d.cold_mode = cold_env >= 0 ? cold_env : (d.src->linux_file_defaults() ? 4 : 0);
     d.src->begin_layer(d.layers, ids, n_tok * k);
     pt("begun");
-    if (!d.usage.empty() && !d.usage_by_window)
+    if (!d.usage.empty() && d.usage_by_window && !d.route_rec.empty() && d.layers < d.route_rec_layers &&
+        n_tok <= d.route_rec_t) {
+        int32_t* rec = d.route_rec.data() + (size_t) d.layers * (size_t) (d.route_rec_t * k);
+        std::copy(ids, ids + n_tok * k, rec);
+    } else if (!d.usage.empty() && (!d.usage_by_window || !d.route_rec.empty())) {
         for (int64_t i = 0; i < n_tok * k; ++i)
             if (ids[i] >= 0 && ids[i] < d.n_expert) d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;
+    }
     // ---- plan v0.3 P6: the GPU's share, decided and published FIRST so the GPU starts while the CPU works.
     // Distinct experts in routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
     const int64_t n = n_tok * k;

@@ -466,6 +466,11 @@ struct ExpertDispatch {
     /// The decode loop counts `usage` itself from the windows' accepted rows (Verifier::add_routing): the dispatch
     /// then leaves it alone.
     bool usage_by_window = false;
+    /// With usage_by_window, the window's routing of layers [0, route_rec_layers) kept here for the caller to count
+    /// the rows it accepts (core/expert_tier's add_route_rows): [layer][route_rec_t][k], the layers past it counted as
+    /// they run (PlainModel's MTP layer, run once a draft).  Empty: the caller has its own record (the Verifier's).
+    std::vector<int32_t> route_rec;
+    int64_t route_rec_layers = 0, route_rec_t = 0;
     int64_t multi_misses = 0;      ///< distinct (layer, expert) pairs the CPU computed in verify windows
     int64_t multi_entries = 0;     ///< routed (token, expert) entries the CPU served in verify windows
     /// Set when `dispatch` could not produce an answer.  The loop itself has no error channel, so this is

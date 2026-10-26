@@ -322,8 +322,7 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
     }
     finish_experts();
     strata::gpu::pin_reserve_release();   // loaded: the pinned memory's last reserve goes back
-    for (size_t i = 0; i < next_.size(); ++i)   // the rounds in turn, a share of the interval apart
-        next_[i]->adapt_phase_ = (int64_t) (i + 1) * std::max(opt_.adapt_every, 1) / (int64_t) (next_.size() + 1);
+    set_adapt_period(4 * (int64_t) opt_.adapt_every);
     for (PlainModel* st : chain()) {
         const OnDevice on(st->dev_);
         if (!st->reset(err)) return false;
@@ -1108,7 +1107,17 @@ bool PlainModel::open_experts(std::string& err) {
     disp_.host_res = res_.data();
     disp_.plan = win_.sink();
     disp_.pcie_num = 0;
-    if (opt_.adapt_every > 0 && opt_.adapt_swaps > 0) disp_.usage.assign((size_t) (L * E), 0.0f);
+    if (opt_.adapt_every > 0 && opt_.adapt_swaps > 0) {
+        disp_.usage.assign((size_t) (L * E), 0.0f);
+        // the counts from the rows a window keeps (after_rows), as Qwen3.8-Flash-Next's: the trunk's routing kept
+        // here; the MTP layer's, run once a draft, counted as it runs
+        disp_.usage_by_window = true;
+        disp_.route_rec_layers = s.n_moe_layers();
+        disp_.route_rec_t = opt_.max_t;
+        disp_.route_rec.assign((size_t) (s.n_moe_layers() * opt_.max_t * s.n_expert_used), -1);
+        prompt_routed_.assign((size_t) (L * E), 0);
+    }
+    trunk_layers_.assign(moe_local_.begin(), moe_local_.begin() + moe_trunk_);
     // (also after the RAM copy of what no VRAM tier holds is pinned, and on a later stage once the root's RAM is
     // registered on its GPU: finish_experts)
     if (in_ram_ && root_ == this) pinned_split();
@@ -1934,7 +1943,8 @@ bool PlainModel::launch_serve(strata::gpu::Graph* g, std::vector<strata::gpu::Gr
     return win_.serve(rings, layers, grps.data(), tbs.data(), ns.data(), &PlainModel::pool_fn, this, cs_, err);
 }
 
-bool PlainModel::forward(const int32_t* tokens, int T, int64_t pos, int32_t* out, float* logits, std::string& err) {
+bool PlainModel::forward(const int32_t* tokens, int T, int64_t pos, int32_t* out, float* logits, std::string& err,
+                         bool defer) {
     if (T < 1 || T > opt_.max_t || pos < 0 || pos + T > opt_.max_cells) {
         err = "plain model: the window is out of range";
         return false;
@@ -1942,7 +1952,7 @@ bool PlainModel::forward(const int32_t* tokens, int T, int64_t pos, int32_t* out
     const float* hand = nullptr;   // each stage's rows to the next
     for (PlainModel* st : chain()) {
         const OnDevice on(st->dev_);
-        if (!st->stage_forward(tokens, T, pos, hand, err)) return false;
+        if (!st->stage_forward(tokens, T, pos, hand, err, defer)) return false;
         hand = st->h_hand_;
     }
     PlainModel& t = tail();
@@ -1957,8 +1967,9 @@ bool PlainModel::forward(const int32_t* tokens, int T, int64_t pos, int32_t* out
     return true;
 }
 
-bool PlainModel::stage_forward(const int32_t* tokens, int T, int64_t pos, const float* hand_in, std::string& err) {
-    if (!record(T, false, err) || !settle_swaps(false, err) || !stage(tokens, T, pos, err, first())) return false;
+bool PlainModel::stage_forward(const int32_t* tokens, int T, int64_t pos, const float* hand_in, std::string& err,
+                               bool defer) {
+    if (!record(T, false, err) || !settle_window(err) || !stage(tokens, T, pos, err, first())) return false;
     if (hand_in != nullptr) std::memcpy(h_in_, hand_in, (size_t) T * (size_t) hand_w_ * 4);
     pcie_probe_before();
     const auto t0 = std::chrono::steady_clock::now();
@@ -1978,11 +1989,25 @@ bool PlainModel::stage_forward(const int32_t* tokens, int T, int64_t pos, const 
         return false;
     }
     ++windows_;
-    tokens_since_adapt_ += T;
-    // a layer split's stages take their rounds in turn (adapt_phase_), so that one's copies land before the next's
-    if (!disp_.usage.empty() && (windows_ + adapt_phase_) % opt_.adapt_every == 0 && !adapt(err)) return false;
+    return defer || after_rows(T, pos, err);
+}
+
+bool PlainModel::after_rows(int rows, int64_t pos0, std::string& err) {
+    tokens_since_adapt_ += rows;
+    if (disp_.usage.empty()) return true;
+    add_route_rows(disp_.usage, disp_.route_rec, trunk_layers_, spec_.n_expert, opt_.max_t, spec_.n_expert_used, rows);
+    // a round at fixed positions of the text (window-invariant swaps, #152), a layer split's stages in turn
+    // (adapt_phase_), so that one's copies land before the next's
+    const int64_t period = root_->adapt_period_;
+    if (period > 0 && (pos0 + rows + adapt_phase_) / period != (pos0 + adapt_phase_) / period && !adapt(err)) return false;
     ram_adapt();
     return true;
+}
+
+void PlainModel::set_adapt_period(int64_t period) {
+    adapt_period_ = period;
+    for (size_t i = 0; i < next_.size(); ++i)
+        next_[i]->adapt_phase_ = (int64_t) (i + 1) * std::max<int64_t>(period, 1) / (int64_t) (next_.size() + 1);
 }
 
 // STRATA_RAM_ADAPT, as generate.cpp: the RAM copy is chosen once, at load, so an expert it does not hold is read from
@@ -2031,7 +2056,7 @@ void PlainModel::pcie_probe_after(double ms, int T) {
 }
 
 bool PlainModel::mtp_run(int T, const int32_t* tokens, int64_t pos, int32_t* draft, std::string& err) {
-    if (!record(T, true, err) || !settle_swaps(false, err) || !stage(tokens, T, pos, err)) return false;
+    if (!record(T, true, err) || !stage(tokens, T, pos, err)) return false;   // the swaps: settle_window
     const int64_t ml = n_moe_ - 1;
     if (!launch_serve(mexec_[(size_t) T], msegs_[(size_t) T], 1, &ml, T, err)) return false;
     k::SamplerParams sp;   // the drafts are greedy
@@ -2122,7 +2147,7 @@ bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int3
     for (int i = 0; i < nd; ++i) win[i + 1] = drafts_[(size_t) i];
     const int T = nd + 1;
     const auto t0 = std::chrono::steady_clock::now();
-    if (!root_->forward(win, T, cur_pos_, out, logits, err)) return false;
+    if (!root_->forward(win, T, cur_pos_, out, logits, err, true)) return false;
     const auto t1 = std::chrono::steady_clock::now();
     spec_ms_check_ += std::chrono::duration<double, std::milli>(t1 - t0).count();
     if (follow != nullptr)   // --spec-follow: the continuation in place of the window's picks
@@ -2135,6 +2160,10 @@ bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int3
     ++spec_windows_;
     spec_drafted_ += nd;
     spec_accepted_ += n;
+    for (PlainModel* st : root_->chain()) {   // the rows the window keeps: the accepted drafts and the token after them
+        const OnDevice on(st->dev_);
+        if (!st->after_rows(n + 1, cur_pos_, err)) return false;
+    }
     if (opt_.spec_window == "auto") policy_.observe_mtp_drafts(probs, T, n);
     for (int j = 0; j <= n; ++j) emitted[j] = out[j];
     n_emit = n + 1;
@@ -2289,12 +2318,24 @@ bool PlainModel::adapt(std::string& err, int64_t max_swaps, int64_t max_evict) {
         }
         ++swaps_total_;
     }
+    pending_age_ = 0;
     if (!pending_.empty() && !strata::gpu::event_record(swap_ev_, swap_cs_)) {
         err = std::string("plain model: the adaptive tier's copies: ") + strata::gpu::last_error();
         return false;
     }
     for (float& v : disp_.usage) v *= opt_.adapt_decay;
     return true;
+}
+
+// 3 windows, not Qwen3.8-Flash-Next's 2: a draft's MTP run and the drafts' head between two verify windows are short
+// here, and at 2 the window waited for the copies.  RTX 4070, Ornith-1.5 Q6_K (256 tokens, 2026-10-26): 2 windows
+// 84.9-86.8 tok/s, 3 90.2-91.3, the copies taken as soon as they landed (before C7, not reproducible) 90.3; Qwen3.6
+// UD-Q4_K_XL in 8 GB of the B70 and llm-jp-4.1 equal at 3 with the prompt's round below (92.9 and 37.5 tok/s).
+constexpr int kPlainAdaptLag = 3;
+
+bool PlainModel::settle_window(std::string& err) {
+    if (pending_.empty()) return settle_swaps(false, err);   // a round of blocking fills: its exchanges commit
+    return ++pending_age_ < adapt_lag(kPlainAdaptLag) || settle_swaps(true, err);
 }
 
 bool PlainModel::settle_swaps(bool wait, std::string& err) {

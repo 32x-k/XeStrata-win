@@ -167,7 +167,10 @@ public:
     size_t state_bytes(int64_t tokens) const;
     /// Tokens [0, T) at positions pos .. pos + T - 1 (T <= max_t): out[t] is the greedy token after token t, and with
     /// `logits` the T rows of n_vocab logits.  Positions must follow the previous window's.
-    bool forward(const int32_t* tokens, int T, int64_t pos, int32_t* out, float* logits, std::string& err);
+    /// `defer`: the window's rows are not yet known to be kept (a verify window): spec_step counts the ones it keeps
+    /// (after_rows), else every row counts.
+    bool forward(const int32_t* tokens, int T, int64_t pos, int32_t* out, float* logits, std::string& err,
+                 bool defer = false);
     /// The prompt: tokens [0, n) at positions pos .. pos + n - 1 in chunks of `prompt_chunk` tokens, every projection a
     /// matrix product and the routed experts grouped by expert, all on the GPU (src/prefill/plain_prompt.cpp, in the
     /// prompt path's library).  `out`: the greedy token after the last; `logits`: its row (or null).  The state is left
@@ -256,7 +259,8 @@ private:
     void pinned_split();
     /// One stage's part of a window: its blocks over the T rows (from `hand_in`, the previous stage's rows, after the
     /// first), the last stage's picks into h_out_
-    bool stage_forward(const int32_t* tokens, int T, int64_t pos, const float* hand_in, std::string& err);
+    bool stage_forward(const int32_t* tokens, int T, int64_t pos, const float* hand_in, std::string& err,
+                       bool defer = false);
     /// The recurrent states back to the state after row n (spec_step), every stage's
     bool rollback(int n, std::string& err);
     /// The file's MTP layer is run: by the last stage (has_mtp_); the rest keep the recurrent states' copies for it
@@ -555,8 +559,22 @@ private:
     /// Before a window: the PCIe share of the window, while it is being chosen.  After it: its time.
     void pcie_probe_before();
     void pcie_probe_after(double ms, int T);
-    int64_t tokens_since_adapt_ = 0;
-    int64_t adapt_phase_ = 0;   ///< a layer split's stage: its rounds this many windows after the root's   ///< tokens the windows read since the last adaptive round
+    int64_t tokens_since_adapt_ = 0;   ///< tokens the windows read since the last adaptive round
+    int64_t adapt_phase_ = 0;   ///< a layer split's stage: its rounds this many tokens after the root's
+    int64_t adapt_period_ = 0;   ///< the root's: the tokens between rounds (4 x --adapt-every)
+    /// The root's period and the stages' phases from it: the rounds in turn, a share of the period apart.
+    void set_adapt_period(int64_t period);
+    /// The adaptive tier after a window, as Qwen3.8-Flash-Next's (generate.cpp): its first `rows` rows (from `pos0`)
+    /// counted, and a round when the text passes a multiple of the period (adapt_period_).
+    bool after_rows(int rows, int64_t pos0, std::string& err);
+    /// At a window's start: the last round's swaps taken once they are adapt_lag() windows old (waiting for their
+    /// copies then), as Qwen3.8-Flash-Next's verify windows.
+    bool settle_window(std::string& err);
+    int pending_age_ = 0;
+    /// After a prompt: the counts from its routing (seed_usage) and the free slots filled (prompt_return's caller).
+    bool prompt_settle(std::string& err);
+    std::vector<int64_t> trunk_layers_;            ///< moe_local_ less the MTP layer
+    std::vector<int64_t> prompt_routed_, prompt_seen_;   ///< the prompts' routings so far, for seed_usage
     uint8_t* fill_tmp_ = nullptr;                 ///< pinned staging for a slot fill
 
     // per-sequence device state

@@ -1229,19 +1229,9 @@ private:
     std::thread th_;   // last: started once the members above exist
 };
 
-/// #463 without the stall (upstream d69424c9, #764): a verify window takes the adaptive tier's previous swaps only once
-/// they are this many windows old, and then waits for their copies (which have landed by then).  The window that first
-/// computes a swapped-in expert on the GPU depends only on the window count, as with #463's wait, so the answers are as
-/// reproducible.  Default 2 (upstream 2725c23f7 on sm_86 and sm_60; on XeStrata's GPUs the RTX 4070's decode 59.1 ->
-/// 64.2 tok/s, IQ2_XS, and the B70's equal, IQ3_XXS 1K and 32K within 0.7%, 2026-10-20); STRATA_ADAPT_LAG=1 is #463's
-/// (the very next window waits for the copies).  The batch paths are not lagged.
-int adapt_lag() {
-    static const int v = [] {
-        const char* e = std::getenv("STRATA_ADAPT_LAG");
-        return e ? std::max(1, (int) std::strtol(e, nullptr, 10)) : 2;
-    }();
-    return v;
-}
+/// The windows a swap waits before a verify window takes it (core/expert_tier's adapt_lag, the other models' engine's
+/// as well).  The batch paths are not lagged.
+int adapt_lag() { return strata::core::adapt_lag(); }
 
 /// A window that may start before the adaptive tier's swaps reach the device's residency table (STRATA_ADAPT_NOWAIT=1,
 /// STRATA_ADAPT_LAG > 1) plans every layer on the host: the device-side plan and the resident graph read that table and
@@ -2116,28 +2106,11 @@ int64_t auto_adapt_period(const strata::core::Verifier& v, int64_t period, bool 
     return next;
 }
 
-// After a prompt, the adaptive tier's counts start from the prompt's routing instead of from nothing (as PlainModel's
-// prompt path adds its routing to the counts).  A count is the rows routed to an expert, decayed by `decay` once a
-// period of `period` tokens, so an expert the prompt routed with probability p holds p * period / (1 - decay) rows at
-// the tier's steady state: that is added for the routings `ps` holds beyond `seen` (a request's own prompt in serve,
-// where the stats run on from request to request).  The tier's rounds then swap by the counts as before.
-// STRATA_USAGE_SEED=0: the counts start from nothing, as before (the A/B).
+// After a prompt, the adaptive tier's counts start from the prompt's routing (core/expert_tier's seed_usage, which
+// the other models' engine calls the same way).
 void seed_usage_from_prompt(std::vector<float>& usage, const strata::prefill::PrefillStats& ps,
                             std::vector<int64_t>& seen, int64_t n_expert, int64_t period, double decay) {
-    static const bool on = [] { const char* v = std::getenv("STRATA_USAGE_SEED"); return v == nullptr || *v != '0'; }();
-    if (!on || usage.empty() || ps.routed.empty() || ps.routed_k <= 0 || usage.size() != ps.routed.size() ||
-        n_expert <= 0 || period <= 0)
-        return;
-    if (seen.size() != ps.routed.size()) seen.assign(ps.routed.size(), 0);
-    const double rows = (double) period / std::max(1e-3, 1.0 - decay);
-    for (size_t l0 = 0; l0 + (size_t) n_expert <= ps.routed.size(); l0 += (size_t) n_expert) {
-        int64_t total = 0;
-        for (size_t i = l0; i < l0 + (size_t) n_expert; ++i) total += ps.routed[i] - seen[i];
-        if (total <= 0) continue;   // not a MoE layer, or nothing new
-        for (size_t i = l0; i < l0 + (size_t) n_expert; ++i)
-            usage[i] += (float) ((double) (ps.routed[i] - seen[i]) * (double) ps.routed_k / (double) total * rows);
-    }
-    seen = ps.routed;
+    strata::core::seed_usage(usage, ps.routed, ps.routed_k, seen, n_expert, period, decay);
 }
 }  // namespace
 
