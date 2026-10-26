@@ -5589,6 +5589,12 @@ bool lm_env() {
     static const bool v = [] { const char* e = std::getenv("STRATA_PREFILL_LAYER_MAJOR"); return e && std::atoi(e) != 0; }();
     return v;
 }
+
+bool lm_even_env() {   // even super-chunks (STRATA_PREFILL_LM_EVEN=0: the largest that fits, then the rest)
+    static const bool v = [] { const char* e = std::getenv("STRATA_PREFILL_LM_EVEN"); return !(e && e[0] == '0'); }();
+    return v;
+}
+
 int64_t lm_tokens_env() {   // the super-chunk's target size (0: the default)
     static const int64_t v = [] { const char* e = std::getenv("STRATA_PREFILL_LM_TOKENS"); return e ? (int64_t) std::atoll(e) : (int64_t) 0; }();
     return v;
@@ -5790,7 +5796,25 @@ int64_t Prefill::lm_prepare_chain(int64_t n, std::string& why) {
             if (cap > 0 && s != cap) same = false;
             cap = s;
         }
-        if (same) return cap;
+        if (same) {
+            // even super-chunks (STRATA_PREFILL_LM_EVEN, default on): n split into the same number of super-chunks
+            // of near-equal size (32K at a 28K fit: 2 x 16K, not 28K + 4K), so a stage's residual rows fit VRAM
+            // and a layer split's stages overlap on every super-chunk
+            const int64_t T = impl_->T;
+            const int64_t k = (n + cap - 1) / cap;
+            const int64_t even = ((n + k - 1) / k + T - 1) / T * T;
+            if (k < 2 || even >= cap || !lm_even_env()) return cap;
+            for (Prefill* p = this; p != nullptr; p = p->next_) {
+                p->lm_release();
+                if (p->lm_prepare(n, why, even) != even) {
+                    if (p != this)
+                        why = "layers " + std::to_string(p->stage_lb_) + ".." + std::to_string(p->stage_le_) + ": " + why;
+                    lm_release_chain();
+                    return 0;
+                }
+            }
+            return even;
+        }
     }
     why = "the layer split's stages found no common super-chunk";
     lm_release_chain();
