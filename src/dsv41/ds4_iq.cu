@@ -1278,7 +1278,54 @@ void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
 
 // ---------------------------------------------------------------- whole matrices as 16-bit rows (the chunked prompt's GEMMs)
 // n rows of k values from `raw` (ld bytes a row): one thread a 32-value sub-block, the sub-block's codes and scales from decode<>
-// (value = d s q - m of its half, ggml's dequantize_row_*), rounded to BF16 (bf16) or F16
+// (value = d s q - m of its half, ggml's dequantize_row_*), rounded to BF16 (bf16) or F16.
+// The 32 values go through shared memory and are written coalesced (a warp's 32 threads cover 1024 contiguous values): a
+// thread writing its own 32 values straight to dst wrote 2 bytes every 64 (a warp's store touches 32 cache lines), which
+// measured 0.5 G weights/s on the R9700 - the 8K prompt's q_b stage 4 s.  DS4_DQ_OLD=1 keeps the old kernel for A/B.
+template <int T>
+__global__ void __launch_bounds__(kThreads) dq_rows_kernel2(const uint8_t* __restrict__ raw, size_t ld, int k, int n,
+                                                            uint16_t* __restrict__ dst, bool bf16) {
+    __shared__ uint32_t tab[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1];
+    __shared__ uint16_t sm[kThreads * 32];
+    load_tab<T>(tab);
+    __syncthreads();
+    const int nsb = k / 32;
+    const size_t total = (size_t) n * (size_t) nsb;   // 32-value sub-blocks
+    const size_t vals = (size_t) n * (size_t) k;
+    for (size_t base = (size_t) blockIdx.x * kThreads; base < total; base += (size_t) gridDim.x * kThreads) {
+        const size_t i = base + threadIdx.x;
+        uint16_t* o = sm + threadIdx.x * 32;
+        if (i < total) {
+            const size_t r = i / (size_t) nsb;
+            const int kb = (int) (i - r * (size_t) nsb);
+            Sub sb;
+            sb.m0 = sb.m1 = 0.0f;
+            decode<T>(raw + r * ld, kb, tab, sb);
+            const float d0 = __fmul_rn(sb.d, (float) sb.s0), d1 = __fmul_rn(sb.d, (float) sb.s1);
+#pragma unroll
+            for (int j = 0; j < 32; ++j) {
+                const int q = (int) (int8_t) ((uint32_t) sb.q[j >> 2] >> (8 * (j & 3)));
+                const float v = j < 16 ? __fsub_rn(__fmul_rn(d0, (float) q), sb.m0) : __fsub_rn(__fmul_rn(d1, (float) q), sb.m1);
+                o[j] = bf16 ? strata::ds4::bf16_rn(v) : __half_as_ushort(__float2half_rn(v));
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 32; ++j) o[j] = 0;
+        }
+        __syncthreads();
+        // sm[m] is the block's value m (the sub-blocks are contiguous in the row-major output, rows included): write it
+        // a thread's 32 values apart, so a warp's stores are 512 contiguous bytes each
+        const size_t go = base * 32;
+        uint16_t* d = dst + go;
+#pragma unroll
+        for (int j = 0; j < 32; ++j) {
+            const size_t m = (size_t) j * kThreads + threadIdx.x;
+            if (go + m < vals) d[m] = sm[m];
+        }
+        __syncthreads();
+    }
+}
+
 template <int T>
 __global__ void __launch_bounds__(kThreads) dq_rows_kernel(const uint8_t* __restrict__ raw, size_t ld, int k, int n,
                                                            uint16_t* __restrict__ dst, bool bf16) {
@@ -1309,7 +1356,13 @@ __global__ void __launch_bounds__(kThreads) dq_rows_kernel(const uint8_t* __rest
 bool dequant_rows(int type, const void* raw, size_t ld, int k, int n, uint16_t* dst, bool bf16, cudaStream_t s) {
     if (raw == nullptr || k % 256 != 0 || n <= 0) return false;
     const unsigned blocks = (unsigned) std::min<size_t>(((size_t) n * (size_t) (k / 32) + kThreads - 1) / kThreads, 65535);
-#define DS4_DQ(T) dq_rows_kernel<T><<<blocks, kThreads, 0, s>>>((const uint8_t*) raw, ld, k, n, dst, bf16)
+    static const bool old = std::getenv("DS4_DQ_OLD") != nullptr && std::atoi(std::getenv("DS4_DQ_OLD")) != 0;
+#define DS4_DQ(T) do {                                                                                    \
+        if (old)                                                                                          \
+            dq_rows_kernel<T><<<blocks, kThreads, 0, s>>>((const uint8_t*) raw, ld, k, n, dst, bf16);      \
+        else                                                                                              \
+            dq_rows_kernel2<T><<<blocks, kThreads, 0, s>>>((const uint8_t*) raw, ld, k, n, dst, bf16);     \
+    } while (0)
     switch (type) {
         case kIQ2_XXS: DS4_DQ(kIQ2_XXS); break;
         case kIQ2_XS: DS4_DQ(kIQ2_XS); break;

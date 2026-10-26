@@ -1267,7 +1267,10 @@ struct Model::Impl {
         for (std::thread& t : cache_ths)
             if (t.joinable()) t.join();
         if (ram_th.joinable()) ram_th.join();
-        for (size_t i = 0; i < ram_chunks.size(); ++i) os::anon_free(ram_chunks[i], ram_chunk_bytes[i]);
+        for (size_t i = 0; i < ram_chunks.size(); ++i) {
+            if (ram_pinned) (void) cudaHostUnregister(ram_chunks[i]);
+            os::anon_free(ram_chunks[i], ram_chunk_bytes[i]);
+        }
         for (Dev& d : devs) {
             cudaSetDevice(d.id);
             for (void* p : d.allocs) cudaFree(p);
@@ -2973,6 +2976,14 @@ struct Model::Impl {
             const size_t C = (size_t) chunk;
             c.C = chunk;
             c.A = std::max(64, (int) (((size_t) 8 << 20) / (size_t) HQ) / 64 * 64);
+            // DS4_ATTN_SLAB=N: the attention slab's rows.  The dense projections (q_b, wo_a/b) are dequantized and GEMM'd
+            // once a slab, so a slab of 256 rows dequantizes the same weights 32 times for an 8K prompt (measured: the
+            // dense dequant 916 ms of the 8K prompt, rocBLAS 867 ms); a larger slab costs VRAM for c.q/c.o and the oa
+            // buffers (A * HQ x 4 bytes each).
+            if (const char* v = std::getenv("DS4_ATTN_SLAB")) {
+                const int a = std::atoi(v);
+                if (a > 0) c.A = std::max(64, std::min(chunk, a) / 64 * 64);
+            }
             // (the indexer's slab: its scores rows are the context wide - about 64 MB of them)
             c.AI = std::max(32, std::min(128, (int) (((size_t) 64 << 20) / (((size_t) o.max_context + 64) * 4)) / 32 * 32));
             c.w16_elems = (size_t) 8 << 20;
@@ -3328,8 +3339,10 @@ struct Model::Impl {
             }
         }
         if (in_ram && ram_pinned && store_blob == nullptr) {   // (DMA'd from where it lies)
-            const uint8_t* p = ram_slots[(size_t) l.ram[(size_t) e]];
-            for (int r = 0; r < 3; ++r) it.src[r] = p + l.lay.trellis[r] + mx_read_off(l, mi, r);
+            const uint8_t* p = copy_mode ? ram_part[(size_t) l.ram[(size_t) e]][0]
+                                         : ram_slots[(size_t) l.ram[(size_t) e]];
+            for (int r = 0; r < 3; ++r)
+                it.src[r] = p + (copy_mode ? cp_lay[(size_t) l.il][(size_t) r] : l.lay.trellis[r]) + mx_read_off(l, mi, r);
             ++c.it_ram;
             return;
         }
@@ -4316,7 +4329,11 @@ struct Model::Impl {
         }
         const uint64_t avail = ram_avail();
         // (Windows: the copies are committed memory, within what its commit still has beside the other programs' margin)
-        const double can = std::min(avail == ~uint64_t{0} ? 1e300 : std::max(0.0, (double) avail - (double) kRamMargin),
+        // DS4_COPY_HUGETLB: the arena comes from the kernel's huge-page pool, which MemAvailable does not count: add
+        // its free bytes so the full copy is taken when the pool holds it.
+        static const bool huge_arena = std::getenv("DS4_COPY_HUGETLB") != nullptr && std::atoi(std::getenv("DS4_COPY_HUGETLB")) != 0;
+        const double pool = huge_arena ? (double) os::huge_free_bytes() : 0.0;
+        const double can = std::min(avail == ~uint64_t{0} ? 1e300 : std::max(0.0, (double) avail - (double) kRamMargin) + pool,
                                     commit_room());
         // (auto: none - copies that all fit were measured no faster than the page cache: the CPU lane's rows are
         // compute-bound, ~46 GB/s from either on 2 Xeon sockets, NUMA parts included; a part copied cost decode speed
@@ -4375,13 +4392,28 @@ struct Model::Impl {
             if (ns == 0) continue;
             const size_t part = cp_lay[(size_t) l.il][3], bytes = (size_t) ns * part;
             std::array<uint8_t*, 2> base = {nullptr, nullptr};
+            // DS4_COPY_HUGETLB=1: the arena on explicit 2 MB pages (the pool must be reserved), so a pin of it keeps
+            // 2 MB pages and the prompt's DMA reads stay stable (a THP arena pinned by cudaHostRegister runs in 4 KB
+            // pages: measured 11.9 s one prompt, 30.4 s the next for the same 140 GB)
+            static const bool huge = std::getenv("DS4_COPY_HUGETLB") != nullptr && std::atoi(std::getenv("DS4_COPY_HUGETLB")) != 0;
             bool ok = true;
             for (int X = 0; X < NH && ok; ++X) {
-                base[(size_t) X] = (uint8_t*) node_map(bytes, X, NH);
+                size_t got = bytes;
+                base[(size_t) X] = (uint8_t*) (huge ? os::huge_alloc(bytes, &got) : node_map(bytes, X, NH));
+                if (huge && base[(size_t) X] == nullptr) {   // no pool on this machine: the ordinary arena instead
+                    static bool warned = false;
+                    if (!warned) {
+                        std::fprintf(stderr, "ds4: DS4_COPY_HUGETLB=1 but no 2 MB huge pages are free (reserve them: sysctl "
+                                             "vm.nr_hugepages=N); using the ordinary arena\n");
+                        warned = true;
+                    }
+                    got = bytes;
+                    base[(size_t) X] = (uint8_t*) node_map(bytes, X, NH);
+                }
                 ok = base[(size_t) X] != nullptr;
                 if (ok) {
                     ram_chunks.push_back(base[(size_t) X]);
-                    ram_chunk_bytes.push_back(bytes);
+                    ram_chunk_bytes.push_back(got);
                 }
             }
             if (!ok) {
@@ -4447,6 +4479,26 @@ struct Model::Impl {
         std::fprintf(stderr, "ds4: %zu of the CPU lane's %zu experts copied into RAM (%.1f GB, %d NUMA part%s) in %.1f s%s\n",
                      jobs.size(), hot.size(), cb / 1e9, NH, NH > 1 ? "s" : "", (now_ms() - t0) / 1000.0,
                      jobs.size() < hot.size() ? "; the others read in place" : "");
+        // DS4_COPY_PIN=1: pin the copies, so the prompt path DMAs each expert from where it lies instead of copying it
+        // to the pinned staging first (measured on the R9700 box: the 8K pass streams 122 GB at 6.8 GB/s through the
+        // staging, where the RAM-to-staging and DMA probes are 24 and 28 GB/s).  The CPU lane reads the same memory, and
+        // pinned 4 KB pages can cost its TLB (an earlier registration measured -15% decode), so this stays opt-in.
+        // DS4_COPY_PIN_RO=1: cudaHostRegisterReadOnly (the GPU only reads it).
+        if (const char* cp = std::getenv("DS4_COPY_PIN"); cp != nullptr && std::atoi(cp) != 0) {
+            const bool ro = std::getenv("DS4_COPY_PIN_RO") != nullptr && std::atoi(std::getenv("DS4_COPY_PIN_RO")) != 0;
+            const double tr = now_ms();
+            bool ok = true;
+            for (size_t i = 0; i < ram_chunks.size() && ok; ++i)
+                ok = cudaHostRegister(ram_chunks[i], ram_chunk_bytes[i],
+                                      ro ? cudaHostRegisterReadOnly : cudaHostRegisterPortable) == cudaSuccess;
+            if (ok) {
+                ram_pinned = true;
+                std::fprintf(stderr, "ds4: the copied experts pinned in %.1f s (%s): the prompt path DMAs them in place\n",
+                             (now_ms() - tr) / 1000.0, ro ? "read-only" : "read-write");
+            } else {
+                std::fprintf(stderr, "ds4: pinning the copied experts failed: the prompt path stages them\n");
+            }
+        }
         return true;
     }
 
@@ -4819,8 +4871,28 @@ struct Model::Impl {
         std::vector<std::pair<int, int>> list;
         list.reserve(cand.size());
         for (const auto& c : cand) list.push_back(c.second);
+        // The slots the CPU lane's experts leave over: the experts the VRAM cache holds that the profile counts least (the cache gives
+        // up its coldest to the CPU lane, and a store without them reads each from the SSD while the CPU lane waits - 1.8 misses a
+        // token on the 251 GB R9700 box, 2.9 ms of a 49 ms token), then the lane's experts the profile never saw.  Last in the list: they
+        // take only the slots the likely ones left.  DS4_STORE_SPARE=0: off.
+        if (!(std::getenv("DS4_STORE_SPARE") && std::atoi(std::getenv("DS4_STORE_SPARE")) == 0)) {
+            std::vector<std::pair<double, std::pair<int, int>>> vr, zero;
+            for (const Layer& l : L) {
+                if (l.il >= g.nl) continue;
+                const uint32_t* p = prof.data() + (size_t) l.il * g.n_exp;
+                for (int e = 0; e < l.n_exp; ++e) {
+                    if (l.slot[(size_t) e] >= 0) vr.push_back({(double) p[e] / (double) l.blob, {l.il, e}});
+                    else if (p[e] == 0) zero.push_back({0.0, {l.il, e}});
+                }
+            }
+            std::stable_sort(vr.begin(), vr.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+            for (const auto& c : vr) list.push_back(c.second);
+            for (const auto& c : zero) list.push_back(c.second);
+        }
         const double t0 = now_ms();
-        const size_t leave = (size_t) (std::getenv("DS4_STORE_RESERVE") ? std::atoi(std::getenv("DS4_STORE_RESERVE")) : 192) + 64;
+        // (with the spare experts in the list the reserve is theirs: last in the list, so the oldest ticks, so the first a demand read replaces)
+        const bool spare_on = !(std::getenv("DS4_STORE_SPARE") && std::atoi(std::getenv("DS4_STORE_SPARE")) == 0);
+        const size_t leave = spare_on ? 0 : (size_t) (std::getenv("DS4_STORE_RESERVE") ? std::atoi(std::getenv("DS4_STORE_RESERVE")) : 192) + 64;
         // The first 48 GB (what a store held before it could take every expert) are read before the first token; the rest of the
         // hottest-first list is read after it, in pieces of 128 experts on a thread of its own, behind the model's own reads (a
         // guess's priority) - the same bytes.  Opt-in (DS4_STORE_BG=1): "ready" comes 9 s sooner on the 251 GB R9700 box (24 s against 34), but a prompt sent at
@@ -6207,6 +6279,19 @@ struct Model::Impl {
             }
             if (got) blob_to_ram(l, sw_b, sw.ram);
             else sw.ram = -1;   // (back to the file's pages then)
+        } else if (ok && store && l.nm == 1 && l.lay.fmt == gg::kFmtMXFP4 && !(std::getenv("DS4_STORE_PUT") && std::atoi(std::getenv("DS4_STORE_PUT")) == 0)) {
+            // `out` goes back to the CPU lane: its blob is in VRAM, so it is copied into a store slot now - the lane would otherwise read it from
+            // the SSD and wait for it (1-2 misses a token on the 251 GB R9700 box).  DS4_STORE_PUT=0: off.
+            uint8_t* dst = store->put_begin(l.il, sw.out);
+            if (dst != nullptr) {
+                const Layer& x = member(l, 0);
+                cudaSetDevice(devs[(size_t) x.dev].id);
+                cudaStream_t cs = copy_st[(size_t) x.dev];
+                const bool got = cudaMemcpyAsync(dst, x.vram_base + (size_t) l.slot[(size_t) sw.out] * unit(l), l.blob, cudaMemcpyDeviceToHost, cs) ==
+                                     cudaSuccess &&
+                                 cudaStreamSynchronize(cs) == cudaSuccess;
+                store->put_done(l.il, sw.out, got);
+            }
         }
         if (check_swaps) {   // DS4_CHECK_SWAPS: the slot (and `out`'s RAM copy) against the model file, byte for byte
             std::vector<uint8_t> dev(l.blob), h(unit(l)), file(l.blob);
@@ -6257,11 +6342,15 @@ struct Model::Impl {
         }
         if (store && env_f("DS4_SETTLE_STORE", 1.0f) != 0.0f) {   // the RAM store too: a window prompt fills it through the CPU
             // lane's picks, a chunked one streams past it - the hottest CPU-lane experts of the prompt into its free slots
+            // (copy_mode: an expert already in the CPU lane's RAM copy gains nothing from a second copy of the same bytes -
+            // measured on the R9700 12 GB cell: 4152 such experts, 40 GB read at 6.4 GB/s, 6.2 s of an 8K prompt, 0.0 store
+            // hits in the decode after it; the VRAM swaps above already read them from the copy)
             std::vector<std::pair<float, std::pair<int, int>>> hot;
             for (const Layer& l : L) {
                 if (l.mtp) continue;
                 for (int e = 0; e < l.n_exp; ++e)
-                    if (l.slot[(size_t) e] < 0 && l.heat[(size_t) e] >= 4.0f) hot.push_back({l.heat[(size_t) e], {l.il, e}});
+                    if (l.slot[(size_t) e] < 0 && !(copy_mode && !l.ram.empty() && l.ram[(size_t) e] >= 0) &&
+                        l.heat[(size_t) e] >= 4.0f) hot.push_back({l.heat[(size_t) e], {l.il, e}});
             }
             std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
             std::vector<std::pair<int, int>> list;
