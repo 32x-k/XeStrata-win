@@ -5659,6 +5659,12 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
         return 0;
     }
     if (embd_rows != nullptr) { why = "an image prompt"; return 0; }
+    // features of run_impl this walk does not carry: the DFlash2 drafter's prompt taps, and KVA's approximate late layers
+    // (a prompt that wants them takes the chunk-major path, which has both)
+    if (!tap_layers_.empty()) { why = "the DFlash2 drafter's prompt taps"; return 0; }
+    if (kva_config().on) { why = "STRATA_KVA is on"; return 0; }
+    if (stop_at_chunk) { why = "a batch read that yields at chunk boundaries"; return 0; }
+    if (force_chunk_ > 0) { why = "a --prefill-pipe plan sets the chunks of this read"; return 0; }   // (left set for run_impl)
     // run_impl's debug hooks on the routing and the rows have no layer-major form
     if (std::getenv("STRATA_DBG_FEAT") || std::getenv("STRATA_DBG_ROUTE_OVERRIDE") || std::getenv("STRATA_PREFILL_DUMP_R_ALL")) {
         why = "a routing or row debug dump";
@@ -5856,6 +5862,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
     // the next stage on that super-chunk on a thread while it reads its own next super-chunk (one hand-off buffer:
     // its final pass waits until the next stage has finished the previous one)
     const int64_t LB = stage_lb_, LE = stage_le_;
+    if (hand_in_ == nullptr) stopped_at_ = -1;   // (stop_at_chunk is declined: this run reads every token)
     strata::kernels::QsaShapes s = core::qsa_shapes(g);   // as 0.2.2's run_impl
     const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
