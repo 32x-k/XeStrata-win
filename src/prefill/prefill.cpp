@@ -551,6 +551,8 @@ struct Stager {
     std::vector<cudaEvent_t> dma_done;
     std::vector<Job> jobs;
     std::unique_ptr<std::atomic<int>[]> ready;
+    // layer-major prefill: a job the routing turned out not to need (`skip`) is not read once nobody has claimed it
+    std::unique_ptr<std::atomic<char>[]> skipped;
     size_t ready_cap = 0;
     // gen << 32 | n << 16 | next index: a claim is a CAS on the generation it woke for (a thread late from the
     // previous layer can never take a job of this one - the expert pool's issue #29 lesson)
@@ -630,6 +632,10 @@ struct Stager {
                         else
 #endif
                             while (issued.load(std::memory_order_acquire) <= i - kRing) std::this_thread::yield();
+                        // ...and its own copy into the buffer is done: `issued` is a watermark, so a job nobody waits for
+                        // (the layer-major prefetch reads experts the routing may skip) can be passed while its thread still
+                        // writes the buffer this job is about to fill
+                        while (!ready[(size_t) (i - kRing)].load(std::memory_order_acquire)) std::this_thread::yield();
                     }
                     // and done - for a generation's first kRing jobs that is the previous generation's last DMA from
                     // the buffer, which nothing else waits for when a chunk ends without a sync (no MTP) or the DMA
@@ -641,6 +647,7 @@ struct Stager {
                 size_t nr = 0;
                 core::ExpertSource* from = nullptr;
                 for (int i = j; i < j + k; ++i) {
+                    if (skipped[(size_t) i].load(std::memory_order_acquire)) continue;   // nothing will read it: no copy
                     const Job& jb = jobs[(size_t) i];
                     if (jb.from == nullptr) { std::memcpy(buf[i % kRing], jb.src, jb.bytes); continue; }
                     from = jb.from;
@@ -674,12 +681,30 @@ struct Stager {
         if (ready_cap < jobs.size()) {
             ready_cap = jobs.size() * 2;
             ready.reset(new std::atomic<int>[ready_cap]);
+            skipped.reset(new std::atomic<char>[ready_cap]);
         }
-        for (size_t i = 0; i < jobs.size(); ++i) ready[i].store(0, std::memory_order_relaxed);
+        for (size_t i = 0; i < jobs.size(); ++i) {
+            ready[i].store(0, std::memory_order_relaxed);
+            skipped[i].store(0, std::memory_order_relaxed);
+        }
         issued.store(0);
         ++gen;
         head.store((uint64_t) gen << 32 | (uint64_t) jobs.size() << 16, std::memory_order_release);
         cv.notify_all();
+    }
+    /// Layer-major prefill: job j's bytes are not needed after all (the routing skipped the expert) - a thread that has not
+    /// started it yet marks it ready without reading.  Never waited for, so its buffer's content does not matter.
+    void skip(int j) { skipped[(size_t) j].store(1, std::memory_order_release); }
+    /// Layer-major prefill, before wait(j): the launching thread stages its jobs in increasing order, so a job below j
+    /// it has not issued was skipped and never gets a DMA - the watermark moves to j.  A skipped job is never issued,
+    /// so without this a routed job after about a ring's depth of skipped ones waits for `issued` forever.
+    void pass(int j) {
+        if (issued.load(std::memory_order_relaxed) < j) {
+            issued.store(j, std::memory_order_release);
+#if defined(STRATA_ATOMIC_WAIT)
+            issued.notify_all();
+#endif
+        }
     }
     /// Job j's bytes, in a pinned buffer (waits for the copy).
     const uint8_t* wait(int j) {
