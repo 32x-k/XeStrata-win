@@ -12,7 +12,7 @@ a PNG of the first image's size whose transparent pixels are where it changes; t
 and its pixels) and a strength (diffusers' img2img strength, above 0 and at most 1: how much of the schedule runs from
 the first image's latent, strength_run; 1, the default of an edit, starts from noise).  A model without edits
 (MageTrail, Mage-Flow without its edit model, one without its vision file) takes one image as img2img's: its
-strength, else STRENGTH_IMG2IMG (with a mask, 1).  src/image/img_start.hpp.  The engine (src/image/strata_image.cpp,
+strength, else img2img_strength (with a mask, 1).  src/image/img_start.hpp.  The engine (src/image/strata_image.cpp,
 `strata-image --serve`) starts with the first image and stays, outside the server (serve/image_daemon.py, the next
 server of the same image model and GPU finds it: a model switch does not lose it): its kernels built once, the
 prompt's text states and the layers that fit in VRAM kept between images, one image a request.  It runs Turbo's
@@ -120,9 +120,9 @@ MIN_SIDE = 256
 MAX_N = 16                         # "max_n": the most images one request makes
 BUDGET_S = 600                     # "budget_s": the longest one request's images may take (ImageGen.check_n)
 UNMEASURED_N = 4                   # the most images a request makes before the server has measured its speed
-# img2img's strength when a request gives none (a model without edits, an image and no mask): the denoise of ComfyUI's
-# own img2img example (comfyanonymous.github.io/ComfyUI_examples/img2img).  An edit's, and a mask's alone, is 1.0, the
-# default denoise of ComfyUI's KSampler (nodes.py)
+# img2img's strength when a request gives none (a model without edits, an image and no mask), at most: the denoise of
+# ComfyUI's own img2img example (comfyanonymous.github.io/ComfyUI_examples/img2img), lowered for a model of few steps
+# (img2img_strength).  An edit's, and a mask's alone, is 1.0, the default denoise of ComfyUI's KSampler (nodes.py)
 STRENGTH_IMG2IMG = 0.87
 # a step's time against the image's pixels, above the largest size measured (estimate_s): the attention's share grows
 # with them (the B70, Qwen-Image Turbo: 6.5 times the time at 4 times the pixels, 1.35); taken higher, to err long
@@ -222,6 +222,7 @@ def model_defaults(cfg: dict) -> dict:
     else:
         steps, least, fixed = TURBO_STEPS, TURBO_STEPS, True
     edit = int(cfg.get("edit_steps") or steps) if cfg.get("edit_model") else steps
+    # "strength": an img2img's at most, lowered by the steps as img2img_strength (the web page's imgStrength)
     out = {"steps": steps, "edit_steps": edit, "steps_min": least, "steps_max": MAX_STEPS, "steps_fixed": fixed,
            "max_n": int(cfg.get("max_n") or MAX_N), "budget_s": float(cfg.get("budget_s") or BUDGET_S),
            "formats": output_formats(),
@@ -493,6 +494,12 @@ def strength_run(steps: int, strength: float) -> int:
     return steps - int(max(steps - min(steps * strength, steps), 0))
 
 
+def img2img_strength(steps: int) -> float:
+    """img2img's default strength for a `steps`-step schedule: STRENGTH_IMG2IMG, or less where that skips none of the
+    steps (a few-step model: 4 steps at 0.87 run all 4, the image lost), so that it skips one at least."""
+    return STRENGTH_IMG2IMG if steps < 2 else min(STRENGTH_IMG2IMG, 1 - 1 / steps)
+
+
 def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | None = None) -> dict:
     """An edit (/v1/images/edits): parse_request's fields with `images` (PNG, JPEG, GIF or BMP).  A model that edits
     takes them as its reference images (job["refs"]); one that does not (can_edit) takes one image as img2img's base
@@ -500,7 +507,7 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
     multiples of SIZE_STEP.  `mask` (OpenAI's): a PNG of the first image's size whose transparent pixels are where it
     changes, the rest kept as it is, as job["mask"].  strength (parse_strength): how much of the schedule runs from
     the first image (job["strength"] and the steps it runs, job["steps_run"], when below 1); an edit's default 1, an
-    img2img's STRENGTH_IMG2IMG, or 1 with a mask."""
+    img2img's img2img_strength of its steps, or 1 with a mask."""
     mage = cfg.get("family") == "mage-flow"
     hunyuan = cfg.get("family") == "hunyuan-image-3"
     edits = can_edit(cfg)
@@ -515,8 +522,8 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
     elif len(images) > 1:
         raise ImageRequestError("image: one image (this image model has no edits: it starts from one image, "
                                 "img2img)")
-    elif strength is None:
-        strength = 1.0 if mask is not None else STRENGTH_IMG2IMG
+    elif strength is None and mask is not None:
+        strength = 1.0
     dims = []
     for data in images:
         if len(data) > REF_MAX_BYTES:
@@ -540,6 +547,8 @@ def parse_edit_request(req: dict, images: list[bytes], cfg: dict, mask: bytes | 
         job["refs"] = list(images)
     else:
         job["init"] = images[0]
+        if strength is None:
+            strength = img2img_strength(job["steps"])
     if mask is not None:
         job["mask"] = mask
     if strength is not None and strength < 1:
@@ -1617,7 +1626,7 @@ TOOLS: list[dict[str, Any]] = [
          "size": {"type": "string", "description": "WIDTHxHEIGHT; default the image's shape at about 1024x1024"},
          "strength": {"type": "number",
                       "description": "how much of the image may change, above 0 to 1 (lower keeps more of it); "
-                                     "default 1 for an edit, 0.87 for img2img"},
+                                     "default 1 for an edit, 0.87 for img2img (less with few steps)"},
          "seed": {"type": "integer"}},
          "required": ["prompt"]}},
 ]

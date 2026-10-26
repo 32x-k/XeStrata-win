@@ -1346,7 +1346,6 @@ function imgDefaults() {
   $("img-ref").multiple = !!edits;
   const refs = ($("img-ref").files || []).length > 0;
   $("img-strength-f").hidden = !refs;
-  $("img-strength").placeholder = String(d.strength != null ? d.strength : 1);
   $("img-steps-f").hidden = !!d.steps_fixed;
   $("img-steps").min = d.steps_min || 1;
   $("img-steps").max = d.steps_max || 100;
@@ -1377,7 +1376,7 @@ function imgEstimate(n) {
   }
   let steps = d.steps_fixed ? d.steps : (+$("img-steps").value || (edit ? d.edit_steps : d.steps) || 1);
   if (refs) {   // a strength runs part of the schedule (the server's strength_run)
-    const s = $("img-strength").value !== "" ? Number($("img-strength").value) : (d.strength != null ? d.strength : 1);
+    const s = $("img-strength").value !== "" ? Number($("img-strength").value) : imgStrength(d, steps);
     if (s > 0 && s < 1) steps -= Math.floor(Math.max(steps - steps * s, 0));
   }
   const g = $("img-cfg").value !== "" ? Number($("img-cfg").value) : (d.guidance || 1);
@@ -1388,7 +1387,19 @@ function imgEstimate(n) {
   const scale = mp / near;
   return n * (steps * stepS * scale ** (scale > 1 ? (d.size_exp || 1.5) : 1) + restS * scale);
 }
+// the strength a request without one gets: an edit's 1; an img2img's d.strength at most, lowered with few steps so
+// that it skips one (the server's img2img_strength)
+function imgStrength(d, steps) {
+  const s = d.strength != null ? d.strength : 1;
+  return !d.img2img || s >= 1 || steps < 2 ? s : Math.min(s, 1 - 1 / steps);
+}
+function imgStrengthHint() {
+  const d = imgModel().defaults || {};
+  const steps = d.steps_fixed ? d.steps : (+$("img-steps").value || d.steps || 1);
+  $("img-strength").placeholder = String(+imgStrength(d, steps).toFixed(2));
+}
 function imgCount() {
+  imgStrengthHint();
   const d = imgModel().defaults || {}, n = $("img-n"), was = +n.value || 1;
   const maxN = d.max_n || 16, budget = d.budget_s || 600, one = imgEstimate(1);
   const most = one == null ? Math.min(maxN, 4) : Math.max(1, Math.min(maxN, Math.floor(budget / one)));
