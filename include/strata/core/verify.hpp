@@ -426,10 +426,20 @@ private:
     /// whose graph does not fit used to end the engine ("verify: instantiate: out of memory"); a freed size is captured
     /// again when it is next used.
     bool instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, const std::vector<int>& key, const char* what,
-                              std::string& err, int keep_t = -1);
+                              std::string& err, int keep_t = -1, unsigned long long flags = 0);
     /// Free the graph of the largest window size other than `keep_t` (and the prelaunched one); `evicted`: there was one.
     bool evict_window_graph(int keep_t, bool& evicted, std::string& err);
     bool no_window_eviction_ = false;   ///< capture_all wants every size at once: it must not free one to capture another
+    // STRATA_GRAPH_PRIO (record_window / capture): the captured tails of the priority streams at their joins and the
+    // main stream's tails at their forks, so that a capture that dropped the stream priorities can be repaired per
+    // node (apply_node_priorities walks each tail back to its fork)
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)   // (the three methods are no-ops there)
+    std::vector<cudaGraphNode_t> prio_forks_;
+    std::vector<std::pair<cudaGraphNode_t, int>> prio_tails_;
+#endif
+    void note_prio_fork(cudaStream_t from);
+    void note_prio_tail(cudaStream_t on, int prio);
+    void apply_node_priorities(cudaGraph_t graph, int T);
     void collect_profile();   ///< STRATA_VERIFY_PROFILE: add the last window's stamps to prof_sum_
     void accumulate_profile(const unsigned long long* stamps);
     void accumulate_profile_inner(const unsigned long long* stamps);   ///< one window's stamps (host copy) into prof_sum_
