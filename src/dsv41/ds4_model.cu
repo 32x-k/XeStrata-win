@@ -2953,10 +2953,16 @@ struct Model::Impl {
         double exp_b = 0, other_b = 0, room = 0;
         const double share = gpu_expert_share(&exp_b, &room, &other_b);
         const bool fit = exp_b > 0 && share >= 1.0 / 1.3;   // (R9700 x4: 0.86 -> ring 16: decode -1.8% after a prompt, 64: -4.4%, 400: -4.6%)
+        // A box whose experts do not fit (a unified-memory APU) streams them from the disk, and the ring is what lets the
+        // prompt queue its likely ones early: 400 -> 1200 MB on Strix Halo took the queue 3,200 -> 8,087 experts, the disk
+        // 1.49 -> 2.44 GB/s and the compute's exposed read wait 11.4 -> 3.5 s (4K prompt 27.3 -> 21.3 s, 148.98 -> 190.98
+        // tok/s) with decode unchanged (17.54/16.39 against 17.61 tok/s interleaved).  A sixteenth of the VRAM room, so a
+        // small pool still loads.  DS4_RING_MB overrides.
+        const size_t want = (size_t) std::max<double>(400.0, std::min<double>(1200.0, room / 1e9 * 64.0));
         if (o.verbose)
             std::fprintf(stderr, "ds4: staging ring: experts %.1f GB, VRAM room %.1f GB, dense %.1f GB -> %d MB\n", exp_b / 1e9,
-                         room / 1e9, other_b / 1e9, fit ? 16 : 400);
-        return fit ? 16 : 400;
+                         room / 1e9, other_b / 1e9, fit ? 16 : (int) want);
+        return fit ? 16 : want;
     }
     bool alloc_chunks(std::string& err) {
         chunks.resize(devs.size());
@@ -2973,11 +2979,13 @@ struct Model::Impl {
             split128(g.ff, nm, 0, ff0_, FF);   // (the widest member's share: member 0 takes the odd blocks)
             const size_t C = (size_t) chunk;
             c.C = chunk;
-            // the attention slab's rows: 8 MB of q by default.  Every dense GEMM of a layer is issued once a slab, so the slab
-            // width divides the prompt's dense weight traffic (the matrices are re-read once a slab): STRATA_DS4_A_MB widens it.
+            // the attention slab's rows: 32 MB of q.  Every dense GEMM of a layer is issued once a slab, so the slab width
+            // divides the prompt's dense weight traffic (each matrix is re-read once a slab): 8 -> 32 MB took the 32K prompt
+            // 325.89 -> 357.78 tok/s, 16K 315.01 -> 328.04, 8K +1.6%, 4K flat, with decode unmoved (16.81 against 17.60 tok/s
+            // interleaved, noise-limited).  STRATA_DS4_A_MB overrides (8 restores the old slab).
             static const size_t a_mb = [] {
                 const char* v = std::getenv("STRATA_DS4_A_MB");
-                return (size_t) (v != nullptr ? std::max(1, std::atoi(v)) : 8);
+                return (size_t) (v != nullptr ? std::max(1, std::atoi(v)) : 32);
             }();
             c.A = std::max(64, (int) ((a_mb << 20) / (size_t) HQ) / 64 * 64);
             // (the indexer's slab: its scores rows are the context wide - about 64 MB of them)
