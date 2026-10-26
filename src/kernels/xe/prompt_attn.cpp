@@ -340,6 +340,8 @@ bool prompt_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool,
         if (s.head_dim == 128 && g == 10) launch_wmma<128, 10, 8>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
         else if (s.head_dim == 256 && g == 8) launch_wmma<256, 8, 8>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
         else if (s.head_dim == 256 && g == 12) launch_wmma<256, 12, 4>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
+        // Qwen3.5-9B's 4 query heads a KV head: 16 queries, the 64 rows (4 waves) of 8 queries of 8
+        else if (s.head_dim == 256 && g == 4) launch_wmma<256, 4, 16>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
         else mma = false;
     }
     // local memory: BQ x G rows of FP32 Q and BK cells of K and V, 37 to 42 KiB: within the 48 KiB every GPU gives
@@ -347,6 +349,8 @@ bool prompt_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool,
         if (s.head_dim == 128 && g == 10) launch<128, 10, 4, 32>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
         else if (s.head_dim == 256 && g == 8) launch<256, 8, 2, 16>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
         else if (s.head_dim == 256 && g == 12) launch<256, 12, 2, 16>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
+        // (4 queries of 4 heads: the 16 rows and the local memory of 2 queries of 8)
+        else if (s.head_dim == 256 && g == 4) launch<256, 4, 4, 16>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
         else return false;
     }
     if (stream == nullptr) queue.wait_and_throw();

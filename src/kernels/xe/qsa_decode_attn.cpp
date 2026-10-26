@@ -342,7 +342,7 @@ void run_shape(const float* q, const QsaAttnPools& pools, const int32_t* ids, co
 bool shape_ok(const QsaShapes& s) {
     if (s.n_head_kv <= 0 || s.n_head % s.n_head_kv) return false;
     const int64_t g = s.n_head / s.n_head_kv;
-    return (s.head_dim == 256 && (g == 12 || g == 8)) || (s.head_dim == 128 && g == 10);
+    return (s.head_dim == 256 && (g == 12 || g == 8 || g == 4)) || (s.head_dim == 128 && g == 10);
 }
 
 void run(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
@@ -350,6 +350,7 @@ void run(const float* q, const QsaAttnPools& pools, const int32_t* ids, const in
     const int64_t g = s.n_head / s.n_head_kv;
     if (s.head_dim == 256 && g == 12) run_shape<256, 12>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
     else if (s.head_dim == 256 && g == 8) run_shape<256, 8>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
+    else if (s.head_dim == 256 && g == 4) run_shape<256, 4>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
     else run_shape<128, 10>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
 }
 
