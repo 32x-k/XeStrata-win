@@ -41,6 +41,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace strata::image {
@@ -106,6 +107,11 @@ public:
                 const std::function<void(float*, float)>& after = {});
 
     int64_t hidden() const { return C_; }
+    /// The time of `rows` image rows through the MLP's first product (the hidden width to the MLP's, a block's largest)
+    /// in each of the two forms on this stream's GPU, the best of three after one: {FP16 weights and activations, FP32
+    /// sums; W8A8: the activations rotated and quantized, int32 sums scaled} in seconds, 0 for a form the GPU's library
+    /// does not take (W8A8: prefill::Gemm::i8_usable) or the memory for it short.  Needs only the file's sizes (dry).
+    std::pair<double, double> time_forms(int64_t rows) const;
     int64_t latent_channels() const { return in_ch_; }
     bool q8() const { return q8_; }
     int64_t text_dim() const { return txt_dim_; }

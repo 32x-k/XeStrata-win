@@ -17,9 +17,11 @@
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <stdexcept>
 #include <thread>
 
@@ -685,6 +687,55 @@ bool MfDit::open(const std::string& path, void* stream, std::string& err, bool d
         err = e.what();
         return false;
     }
+}
+
+std::pair<double, double> MfDit::time_forms(int64_t rows) const {
+    const int64_t T = rows, K = C_, N = F_;
+    if (T <= 0 || K <= 0 || N <= 0) return {0.0, 0.0};
+    std::vector<void*> held;
+    auto get = [&](size_t bytes) -> void* {
+        void* p = nullptr;
+        if (!gpu::alloc_device(&p, bytes)) return nullptr;
+        held.push_back(p);
+        gpu::memset_async(p, 0, bytes, s_);
+        return p;
+    };
+    auto best = [&](const std::function<void()>& run) {
+        double t = 1e30;
+        for (int i = 0; i < 4; ++i) {
+            const auto t0 = std::chrono::steady_clock::now();
+            run();
+            if (!gpu::stream_sync(s_)) return 0.0;
+            if (i > 0) t = std::min(t, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        }
+        return t;
+    };
+    double f16 = 0.0, w8 = 0.0;
+    try {
+        auto* x16 = static_cast<uint16_t*>(get((size_t) (T * K) * 2));
+        auto* w16 = static_cast<uint16_t*>(get((size_t) (N * K) * 2));
+        auto* y = static_cast<float*>(get((size_t) (T * N) * 4));
+        prefill::Gemm g;
+        std::string err;
+        if (x16 != nullptr && w16 != nullptr && y != nullptr && g.init(s_, 0, err))
+            f16 = best([&] { g.f16(x16, w16, y, T, N, K); });
+        if (x16 != nullptr && y != nullptr && prefill::Gemm::i8_usable(s_)) {
+            auto* x8 = static_cast<int8_t*>(get((size_t) (T * K)));
+            auto* w8p = static_cast<int8_t*>(get((size_t) (N * K)));
+            auto* sx = static_cast<float*>(get((size_t) T * 4));
+            auto* sw = static_cast<float*>(get((size_t) N * 4));
+            if (x8 != nullptr && w8p != nullptr && sx != nullptr && sw != nullptr)
+                w8 = best([&] {
+                    qi_rows_i8(x16, false, T, K, x8, sx, nullptr, s_);
+                    prefill::Gemm::i8(x8, w8p, reinterpret_cast<int32_t*>(y), T, N, K, N, s_);
+                    qi_i8_scale(y, T, N, N, sx, sw, nullptr, s_);
+                });
+        }
+    } catch (const std::exception&) {   // a form the library could not run: not chosen
+    }
+    gpu::stream_sync(s_);
+    for (void* p : held) gpu::free(p);
+    return {f16, w8};
 }
 
 MfOut MfDit::product(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y, int64_t T,
