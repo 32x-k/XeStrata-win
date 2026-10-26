@@ -390,6 +390,66 @@ compares the tier as a whole, not "batch windows only": the solo decode speed mo
 more varied workload the gain may be smaller (not measured). Upstream main runs no tier in batch windows, and this
 was not measured against an upstream binary.
 
+## MTP drafts in the pipelined groups (`STRATA_PIPED_MTP`, opt-in)
+
+The pipelined groups run no drafts. `--batch-mtp` with serial windows (`--batch-groups 1`) keeps one card busy at a
+time. `STRATA_PIPED_MTP=N` together with `--batch-mtp` gives both: the pipeline stays, and each slot drafts in it.
+Off by default. Without the variable nothing changes.
+
+How it works. A group's window carries, for each of its slots, the slot's token and up to N MTP proposals (at most
+`--spec` - 1; the first always, each further one while the draft layer was at least `--spec-min-p` sure of the one
+before). The last stage judges each slot's proposals on their own. How many rows to keep is known only then, and by
+then the earlier stages already run other groups' windows, which reuse the scratch the commit replays from. So a
+small save graph copies those rows right behind each window (`Verifier::batch_launch_rows`), and after the verdict every
+stage queues the commit of the kept rows (`Verifier::batch_commit_rows`). The slot's drafter catches up on its own rows
+and drafts the next proposals as an asynchronous chain (`MtpDrafter::chain_launch`). A group whose chain has not landed
+lets another group start first. Anything that reads a slot's state (an admission, a parked conversation, the solo path
+taking a slot back) first drains the pipeline, which also waits for the queued commits.
+
+It needs a layer split with two or more groups, any number of slots per group (as long as a group's window,
+slots x (1 + N), is at most 8 rows). When it cannot run, the engine says why and goes on without it: fewer than two
+groups left, `STRATA_BATCH_SELF_COMMIT` on, or a window of more than 8 rows.
+
+Measured on a box with 2x RTX A6000 48 GB (`--layer-split auto`), Qwen3.8-Flash-Next IQ3_S, every expert resident in
+VRAM, `--batch 4 --batch-groups auto` (2 groups of 2 slots), `tools/serve_load.py`, 256 tokens per request, reasoning
+off. Total output tokens per second: the median of the pairs, each pair the median of 3 bursts on a fresh engine start. The base arm
+(pipelined groups, no drafts) and `STRATA_PIPED_MTP=2` were run in 5 interleaved pairs, the other arms in 3 pairs. "Default" is
+`--batch 4` with no `--batch-groups`, which on exactly two NVIDIA cards means one serial group (`STRATA_BATCH_GROUPS_NV_SERIAL`):
+
+| streams | pipelined, no drafts | `=1` | `=2` | `=3` | serial `--batch-mtp` (`--batch-groups 1`) | default (no flags) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 (solo path) | 101.7 | 101.4 | 101.5 | 103.0 | 101.5 | 101.7 |
+| 2 | 125.7 | 146.3 (+16.0%) | 145.1 (+15.4%) | 138.4 (+10.0%) | 124.0 (-1.3%) | 107.4 (-14.8%) |
+| 4 | 171.4 | 188.8 (+10.2%) | 179.5 (+4.7%) | 165.6 (-3.4%) | 139.9 (-18.5%) | 141.0 (-17.8%) |
+
+Gains are the median of the per-pair ratios. `=2` was faster than the base in 5 of 5 pairs at 2 and at 4 streams, `=1` in 3 of 3
+pairs at both, `=3` in 3 of 3 at 2 streams and in none at 4. With `--batch 2` (2 groups of 1 slot) and 2 streams `=2` gave 146.8 against 125.7 tok/s (+16.4%, 5 of 5 pairs). One
+stream runs on the solo path in every arm and does not change. About 55% of the checked proposals were kept at `=2`
+and about 67% at `=1`. The acceptance falls as the window grows, which is why `=1` or `=2` is the choice and `=3` is not.
+
+Best setting here: `=2` with two streams, `=1` with four. More than four streams was not measured, and the gain at
+four streams is smaller than at two (not explained). Cost: the slot
+drafters and a save buffer per stage (25.5 MiB at `=1` and 38.2 MiB at `=2` with 4 slots), taken from the expert cache.
+On the A6000 box the cache stayed fully resident. On a 2x RTX A4000 box where the experts do not all fit, `--batch-mtp` took
+165 of 6959 cache slots on the second card; that changes which experts are in VRAM and so, in the last digits, which tokens come out.
+
+The first version of this was written by wannagoxuf (PR #4121), who measured +39% on 4x RTX 4090 with 4 streams
+(366 to 510 tok/s at `=2`). That is a different rig and not repeated here.
+
+Exact. Checked with the engine's batch protocol (the method of `tools/batch_test.py`: each prompt alone, then the
+prompts together in the slots, token ids compared). On the A6000 box, 4 slots (2 groups of 2) and 2 slots (2 groups of 1)
+with the feature unset and with `=1`, `=2` and `=3` (`=2` only for 2 slots): greedy streams, greedy and seeded sampled streams
+together, slots that finish at different lengths, a slot cancelled in the middle of a draft, and a 3,000-token prompt read beside the
+others. Every slot got the tokens it gets alone, and the same tokens as the build without the feature (a cancelled slot stops one
+or two tokens apart, so its tokens are compared up to the shorter). Through the server the same cases (and two clients on four
+slots) gave the same text as the build without the feature, apart from one or two streams of 19 per run; two runs of the
+build without the feature differ from each other in the same way, so this is not the feature. On a box where the experts
+do not all fit in VRAM the drafters' memory changes which experts are cached, and then the text of a feature run differs from a
+run without it; inside one run every slot still equals its own solo decode.
+
+Not run: AMD (HIP), the draft layer on the first stage, helper expert caches, more than two stages, SYCL (the SYCL
+tree has its own copy of the batch code and does not have this).
+
 ## Exactness
 
 A batch row's arithmetic is the single-token window's, so with greedy decoding **every conversation of a batch
@@ -423,8 +483,9 @@ counter-based draw (Philox(seed, position)).
 - By default, batch windows carry no MTP drafts: a conversation in a slot decodes one token per window (the solo
   path keeps its drafts, which is why a request alone is not put in a slot, and goes back to it when left alone).
 - `--batch-mtp` uses one proposal per slot. With a layer split it needs each stage on its own GPU, does not combine
-  with `--batch-groups` above 1 (pipelined slot groups run no drafts, #1413) and has not been run with helper expert
-  caches.
+  with `--batch-groups` above 1 (pipelined slot groups run no drafts, #1413) unless `STRATA_PIPED_MTP` is set with
+  one slot per group ([above](#mtp-drafts-in-the-pipelined-groups-strata_piped_mtp-opt-in)), and has not been run
+  with helper expert caches.
 - Repetition / frequency / presence penalties are not applied in batch windows.
 - A prompt shorter than one chunk is read in one piece (the slots wait for it); a read gives way only at a chunk
   boundary, and not for pictures.
