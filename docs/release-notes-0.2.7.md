@@ -24,6 +24,23 @@
     decode on the RTX PRO 5000 with identical tokens**, about +1.5% together with the switch above. On 2x RTX A4000 and the
     RTX 3060 it was slower, so those cards keep the old read. Off switch: `STRATA_GR_V3=0`.
 
+## Going back to 0.2.6
+
+Two switches bring back every default that 0.2.7 changed, in one step, for a test or for a PC where something looks wrong. The app's
+"off" for its speed switches sends them.
+
+- **`DS4_DEFAULTS=026`** (DeepSeek): the staging ring, the prompt chunk rule, the attention slab (its base and its growth), the pinned
+  copy and the huge-page arena, the matrix-core attention, the drafter's cumulative cut, the 5-experts default on several Radeon cards,
+  the RAM store's spare slots and put and its settle after a prompt, the dense dequantizer, the F16 gate/up operand, the drafter's
+  markov head and the head's column count, and the RDNA3 dense GEMM all go back to what 0.2.6 did.
+- **`STRATA_DEFAULTS=026`** (Qwen): the residency-biased routing, the wide and the stream-split hyper-connection reads, the int8
+  prompt attention, the four gfx12 decode switches, the PLE residency policy and the gfx12 decode split of 0.15 (back to 0.55).
+  Long prompts on the approximate read (`STRATA_KVA`) are off by default and stay as `STRATA_KVA` says.
+
+A variable or flag you set yourself (`DS4_ATTN_SLAB=N`, `STRATA_ROUTE_PRIOR=2`, `--experts 5`, `--prefill-chunk N`, `--pcie-frac`,
+`--ple-io`) still wins over the switch. The older single switches (`DS4_FAST_ATTN=0`, `DS4_ATTN_SLAB=0`, `DS4_COPY_PIN=0`,
+`DS4_COPY_HUGETLB=0`, `DS4_STORE_SPARE=0`, `DS4_STORE_PUT=0`, `STRATA_ROUTE_PRIOR=0`, ...) work as before.
+
 ## What is faster if your PC is set up for it
 
 These need no engine change; they are settings. Each was measured on the same boxes.
