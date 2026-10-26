@@ -71,6 +71,7 @@
 #include "strata/core/dflash2.hpp"
 #include "strata/core/draft_cap.hpp"
 #endif
+#include "strata/prefill/kva.hpp"
 #include "strata/prefill/prefill.hpp"
 #if defined(STRATA_PREFILL_MMQ)
 #include "strata/prefill/moe_mmq.hpp"
@@ -680,6 +681,7 @@ struct Options {
     /// Plan v0.3 P6: the MTP draft layer's runtime directory (tools/mtp_rt.py); drafts come from it.
     std::string mtp;
     int64_t mtp_window = 32768;   ///< the draft layer attends to the last N cells (0 = every cell)
+    bool mtp_window_given = false;   ///< --mtp-window was given (KVA picks the window itself only when it was not)
     /// Plan v0.3 P6: the share (0..1) of each layer's distinct missed experts the GPU reads over PCIe from the
     /// pinned arena while the CPU computes the rest (verify windows).
     double pcie_frac = -1.0;   ///< < 0: the model's default (0.2 direct for the Q2_0 pack, 0.55 DMA for native packs)
@@ -2626,7 +2628,7 @@ int main(int argc, char** argv) {
         else if (a == "--spec-follow") o.spec_follow = next("--spec-follow");
         else if (a == "--window-hashes") o.window_hashes = next("--window-hashes");
         else if (a == "--mtp") o.mtp = next("--mtp");
-        else if (a == "--mtp-window") o.mtp_window = std::atoll(next("--mtp-window"));
+        else if (a == "--mtp-window") { o.mtp_window = std::atoll(next("--mtp-window")); o.mtp_window_given = true; }
         else if (a == "--pcie-frac") o.pcie_frac = std::atof(next("--pcie-frac"));
         else if (a == "--adapt-every") { o.adapt_every = std::atoi(next("--adapt-every")); o.adapt_every_given = true; }
         else if (a == "--adapt-decay") o.adapt_decay = (float) std::atof(next("--adapt-decay"));
@@ -5496,6 +5498,37 @@ int main(int argc, char** argv) {
     // slots' draft-KV copies use this one too
     static const strata::core::ModelGeometry draft_geometry{};
     std::vector<std::unique_ptr<strata::core::MtpDrafter>> slot_mtp;
+    // KVA (0.2.7: on by default, STRATA_KVA=0 is the exact 0.2.6 path): what only the engine knows.  A layer split and
+    // the batch slots read their prompts in pieces and in stages, which the one-device, one-cold-read rule of the
+    // approximate prompt read cannot follow, so they stay on the exact path (and say so here, once).  The draft layer
+    // (MTP) must find exact cells in its window: with no --mtp-window given the window becomes 2048 cells (the 0.2.6
+    // default, 32768, is every cell of a chat up to that length, which no fully computed tail could cover) and the
+    // tail 2112; a window the user gave keeps its value and sets the tail (window + 64).
+    {
+        const strata::prefill::KvaConfig& kc = strata::prefill::kva_config();
+        strata::prefill::KvaEngine& ke = strata::prefill::kva_engine();
+        if (kc.explicit_on && !strata::prefill::kKvaBackend)
+            std::fprintf(stderr, "strata generate: STRATA_KVA is set, but this build has no state-only late-layer path; "
+                                 "every prompt is read exactly\n");
+        if (kc.on) {
+            if (multi_gpu) ke.blocked = "a layer split across GPUs";
+            else if (o.batch > 0) ke.blocked = "batch slots (--batch)";
+            else if (o.peer_device >= 0) ke.blocked = "a peer device (--peer-device)";
+            if (!ke.blocked.empty()) {
+                if (kc.explicit_on)
+                    std::fprintf(stderr, "strata generate: KVA (the approximate late-layer prompt read) is off here: %s\n",
+                                 ke.blocked.c_str());
+            } else if (!o.mtp.empty() && o.spec >= 2 && !o.mtp_window_given && kc.suffix_env <= 0) {
+                if (o.mtp_window != strata::prefill::kKvaDrafterWindow)
+                    std::fprintf(stderr, "strata generate: KVA on (the faster prompt read for long cold prompts): the draft layer "
+                                         "attends to the last %lld cells (--mtp-window %lld); STRATA_KVA=0 keeps the "
+                                         "exact 0.2.6 prompt read and its %lld-cell window\n",
+                                 (long long) strata::prefill::kKvaDrafterWindow, (long long) strata::prefill::kKvaDrafterWindow,
+                                 (long long) o.mtp_window);
+                o.mtp_window = strata::prefill::kKvaDrafterWindow;
+            }
+        }
+    }
     if (!o.mtp.empty()) {
         if (o.spec < 2) {
             std::fprintf(stderr, "strata generate: --mtp is ignored without --spec T (T >= 2)\n");
@@ -5515,6 +5548,11 @@ int main(int argc, char** argv) {
         if (o.pipeline_windows >= 2) mtp.set_force_capture(true);
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st && !mtp_first ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
         mtp.set_ple_session(&ss);
+        if (!o.mtp.empty()) {   // KVA: the cells the draft layer attends to now (0 = every cell) set the tail that must be exact
+            strata::prefill::KvaEngine& ke = strata::prefill::kva_engine();
+            ke.has_drafter = true;
+            ke.drafter_window = mtp.window();
+        }
 #if defined(STRATA_HAVE_DFLASH2)
         if (o.draft == "dflash2") {
             const char* why = o.mtp.empty() ? "it needs --mtp (the fallback) and --spec 2 or more"
