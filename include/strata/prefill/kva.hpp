@@ -16,9 +16,9 @@
 //
 // 0.2.7: the read is OFF unless STRATA_KVA=1 is set (the quality runs found lost records and invented rows in long
 // extraction and agent tasks, docs/KVA.md).  Unset, nothing here runs and the engine is 0.2.6's.  Switched on, it applies
-// to a cold prompt of STRATA_KVA_MIN_PROMPT tokens or more on one CUDA/HIP device, with an 8192-token exact tail
-// (the safest configuration measured).  Everything is read from
-// the environment once per process.
+// to a cold prompt of STRATA_KVA_MIN_PROMPT tokens or more on one CUDA/HIP device, approximating only the layers from
+// 36 on, with a 2048-token exact tail (the configuration the 0.2.7 quality runs found cleanest; STRATA_KVA_SPLIT and
+// STRATA_KVA_SUFFIX override).  Everything is read from the environment once per process.
 //
 // What the engine tells this header at start-up (kva_engine()): whether its configuration rules the read out for the
 // whole process (batch slots, a layer split, a peer device).
@@ -52,7 +52,9 @@ inline constexpr bool kKvaBackend = true;
 inline constexpr const char* kKvaShapeReason = "this model's shape is not one KVA was measured on";
 
 /// The fully computed tail of every approximated read.
-inline constexpr int64_t kKvaSuffixDefault = 8192;
+inline constexpr int64_t kKvaSuffixDefault = 2048;
+/// The first approximated layer when switched on: 36 of 48 (the cleanest measured; 24 lost records and agent loops).
+inline constexpr int64_t kKvaSplitDefault = 36;
 
 /// What the running engine knows and the environment cannot say.
 struct KvaEngine {
@@ -80,7 +82,7 @@ struct KvaConfig {
     bool parity = false;         ///< STRATA_KVA_PARITY=1: report the state-only path against the full path
     bool any_model = false;      ///< STRATA_KVA_ANY_MODEL=1 (research): also run on a shape KVA was not measured on, with a warning
     bool draft_floor = false;    ///< STRATA_KVA_DRAFT_FLOOR=1: the draft layer skips the cells of approximated chunks (research; default: it reads them)
-    int64_t split = 24;          ///< STRATA_KVA_SPLIT: first approximated layer (zero-based)
+    int64_t split = kKvaSplitDefault;   ///< STRATA_KVA_SPLIT: first approximated layer (zero-based)
     int64_t suffix_env = 0;      ///< STRATA_KVA_SUFFIX: fully computed tail positions (0 = not set: kKvaSuffixDefault)
     int64_t min_prompt = 4096;   ///< STRATA_KVA_MIN_PROMPT: shorter prompts stay on the full path
     Mode mode = Mode::Identity;  ///< STRATA_KVA_MODE=identity|oracle|linear
@@ -90,7 +92,7 @@ struct KvaConfig {
     std::string capture_dir;     ///< STRATA_KVA_CAPTURE
     std::string projector;       ///< STRATA_KVA_PROJECTOR
 
-    /// The fully computed tail of a read: STRATA_KVA_SUFFIX when set, otherwise 8192.
+    /// The fully computed tail of a read: STRATA_KVA_SUFFIX when set, otherwise 2048.
     int64_t effective_suffix() const { return suffix_env > 0 ? suffix_env : kKvaSuffixDefault; }
 
     /// Does the draft layer need the cell floor at all?  Only when a read can approximate something: KVA on, not ruled
@@ -152,7 +154,7 @@ inline KvaConfig kva_config_from_env() {
     k.on = set && sw[0] != '0';
     k.explicit_on = k.on;
     if (!kKvaBackend) k.on = false;
-    k.split = kva_env_i64("STRATA_KVA_SPLIT", 24);
+    k.split = kva_env_i64("STRATA_KVA_SPLIT", kKvaSplitDefault);
     k.suffix_env = std::max<int64_t>(0, kva_env_i64("STRATA_KVA_SUFFIX", 0));
     k.min_prompt = kva_env_i64("STRATA_KVA_MIN_PROMPT", 4096);
     k.parity = kva_env_flag("STRATA_KVA_PARITY", false);

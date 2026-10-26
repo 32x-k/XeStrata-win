@@ -42,7 +42,7 @@ int main() {
     {
         const KvaConfig c = kva_config_from_env();
         CHECK(!c.on && !c.explicit_on);                                      // unset: off
-        CHECK(c.split == 24 && c.min_prompt == 4096 && c.suffix_env == 0);
+        CHECK(c.split == 36 && c.min_prompt == 4096 && c.suffix_env == 0 && kKvaSplitDefault == 36);
         CHECK(c.mode == KvaConfig::Mode::Identity && c.only == KvaConfig::Only::All && !c.capture);
         KvaEngine eng;
         CHECK(!c.wants_cell_floor(eng, true));
@@ -57,10 +57,13 @@ int main() {
     clear_all();
     put("STRATA_KVA", "1");   // everything below runs with KVA switched on
 
-    // ---- the tail: 8192 when switched on (the safest configuration measured), or STRATA_KVA_SUFFIX
+    // ---- switched on: split 36 and a 2048-token tail (the configuration measured), or STRATA_KVA_SPLIT / STRATA_KVA_SUFFIX
     {
         const KvaConfig c = kva_config_from_env();
-        CHECK(c.on && c.effective_suffix() == kKvaSuffixDefault && kKvaSuffixDefault == 8192);
+        CHECK(c.on && c.split == 36 && c.effective_suffix() == kKvaSuffixDefault && kKvaSuffixDefault == 2048);
+        put("STRATA_KVA_SPLIT", "30");
+        CHECK(kva_config_from_env().split == 30);
+        unset("STRATA_KVA_SPLIT");
         put("STRATA_KVA_SUFFIX", "3000");
         const KvaConfig e = kva_config_from_env();
         CHECK(e.effective_suffix() == 3000);
@@ -72,17 +75,18 @@ int main() {
         const KvaConfig c = kva_config_from_env();
         KvaEngine eng;
         bool routine = false;
-        // a cold 14.6K prompt on one device: applies (14600 > 8192 + 64)
+        // a cold 14.6K prompt on one device: applies (14600 > 2048 + 64)
         CHECK(c.decline(eng, 0, 14600, 0, -1, 48) == nullptr);
         CHECK(c.decline(eng, 0, 14600, 0, 48, 48) == nullptr);   // le == n_layers is the whole trunk too
         // a continuation (turn 2 of a chat, a resumed prompt): routine
         CHECK(is(c.decline(eng, 9000, 14600, 0, -1, 48, false, false, &routine), "a continuation read (pos0 != 0)") && routine);
-        // short prompts and a prompt the 8192-token tail would swallow: routine
+        // short prompts and a prompt the tail would swallow: routine
         CHECK(is(c.decline(eng, 0, 3000, 0, -1, 48, false, false, &routine), "the prompt is shorter than STRATA_KVA_MIN_PROMPT") && routine);
-        CHECK(is(c.decline(eng, 0, 8256, 0, -1, 48, false, false, &routine), "the suffix leaves too few positions to approximate") && routine);
-        CHECK(c.decline(eng, 0, 8257, 0, -1, 48) == nullptr);
-        put("STRATA_KVA_SUFFIX", "2048");
-        { const KvaConfig s = kva_config_from_env(); CHECK(s.decline(eng, 0, 4096, 0, -1, 48) == nullptr); }
+        CHECK(c.decline(eng, 0, 4096, 0, -1, 48) == nullptr);   // 4096 is the first prompt that is long enough
+        put("STRATA_KVA_SUFFIX", "5000");   // a longer tail swallows a prompt of 5000 and not one of 5065
+        { const KvaConfig s = kva_config_from_env();
+          CHECK(is(s.decline(eng, 0, 5000, 0, -1, 48, false, false, &routine), "the suffix leaves too few positions to approximate") && routine);
+          CHECK(s.decline(eng, 0, 5065, 0, -1, 48) == nullptr); }
         unset("STRATA_KVA_SUFFIX");
         // not routine: the user may want to know
         CHECK(is(c.decline(eng, 0, 14600, 24, -1, 48, false, false, &routine), "a layer split (not the whole trunk)") && !routine);
