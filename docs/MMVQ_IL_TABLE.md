@@ -15,18 +15,19 @@ Which table a card gets:
 |---|---|
 | sm_86 (Ampere consumer) and sm_120 cards with fewer than 80 SMs (RTX 5070 and smaller) | `kIlRowsShared`, measured on an RTX 3060 and an RTX 5070 together (a cell is non-zero only if the worse of the two cards still gains 3%) |
 | sm_120 cards with 80 or more SMs (RTX PRO 5000 / 6000 Blackwell, RTX 5080 / 5090) | `kIlRows_120`, measured on an RTX PRO 5000 Blackwell (110 SMs); `STRATA_MMVQ_IL_120=0` gives them the shared table |
-| sm_89 (Ada) and every other sm_80+ card | `kIlRowsShared` too. Nobody has measured sm_89 yet (we have no such card). |
+| sm_89 (Ada) | `kIlRows_89`: the cells where an RTX 4070 (46 SMs) and an RTX 4080 (48 SMs) community run gave the same rows count, else 0 (the plain kernel); one column: Q3_K only. No 5-8 column table: the 4080's changed in 10-14 of 20 entries between runs of the same card, so it is not taken until it reproduces. No end-to-end decode change was seen on a 4090 or a 4080 (issue 3453), so this is a microbenchmark gain only. |
+| every other sm_80+ card | `kIlRowsShared` |
 | sm_75 and older | the path is off; the plain kernels run |
 | a card listed in `kIlArch` | its own table |
 
-## Measuring sm_89 (or any other card)
+## Measuring a card that has no table yet
 
 1. Build with tests: `cmake -S . -B build -DSTRATA_BUILD_TESTS=ON` and `cmake --build build --target mmvq_il_parity`.
 2. Close everything else on the GPU, then run `build/mmvq_il_parity --bench --emit-table` (a few minutes).
    It first checks bit-for-bit parity of every shape and every rows choice (it must end with `mmvq_il_parity: OK`),
    prints a `BENCH` line per shape and token count, and last a ready-to-paste block, one line per type.
-3. Post the whole output on the issue. A maintainer pastes the block as `kIlRows_89[]` and adds
-   `{89, kIlRows_89, sizeof(kIlRows_89) / sizeof(IlRows)}` to `kIlArch`.
+3. Post the whole output on the issue. A maintainer pastes the block as `kIlRows_<cc>[]` and adds
+   `{<cc>, kIlRows_<cc>, sizeof(kIlRows_<cc>) / sizeof(IlRows)}` to `kIlArch`.
 4. To try a table without rebuilding, set `STRATA_MMVQ_IL_ROWS="type:ncols:r0,r1,r2,r3,r4;..."`, for example
    `STRATA_MMVQ_IL_ROWS="23:3:0,0,2,4,4;12:2:0,1,1,1,1"` (the five numbers are the row classes below 2048, 4096, 8192,
    12288 and above; each is 0, 1, 2 or 4). Then A/B the decode: same flags, `STRATA_MMVQ_IL_ROWS` set or unset, 10
