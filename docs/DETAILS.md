@@ -919,7 +919,8 @@ measured. "Exact" means the 10-prompt and 4K/20K identity gate with the switch o
 | `STRATA_B6_MMVQ_ROWS=1` | Exact multi-column MMVQ reusing the activation fragment across rows | Exact; on by default on sm_86 and sm_60 |
 | `STRATA_QSA_SPLIT_ATTN=1` | Decode attention split across blocks on the int8 mma path (sm_80+, int8 KV) | Rounding level |
 | `STRATA_HC_UPMIX=1` | Hyper-connection up projection and `gr_mix_r` in one kernel (sm_80+) | Exact |
-| `STRATA_PROMPT_ATTN_IMMA=1` | Int8-KV prompt attention on INT8 tensor cores | Rounding level |
+| `STRATA_PROMPT_ATTN_IMMA` | Int8-KV prompt attention on INT8 tensor cores | Rounding level. On by default since 0.2.7 on NVIDIA Ampere and newer (+1.1% to +1.8% prompt at 8K/16K on an RTX PRO 5000 and 2x RTX A4000); `=0` brings the 0.2.6 kernel back. |
+| `STRATA_GR_V3` | The hyper-connection read split over two kernels | Rounding level. On by default since 0.2.7 on a discrete compute capability 12.0 card (RTX 50, RTX PRO Blackwell) with more than 13 GiB (RTX PRO 5000: +1.2% decode with identical tokens); slower on sm_86, so off there. `=0` / `=1` forces it off / on. |
 | `STRATA_HC_REQ8=1` | Hyper-connection projections as int8 plus a scale per 32 (more expert-cache slots) | Rounding level |
 | `STRATA_QUANT_GATHER=1`, `STRATA_PREFILL_GROUP_GATHER=0` | Per-row gather for the MoE input quantization; the short-prompt grouped gather off | No gain measured; keep the defaults |
 

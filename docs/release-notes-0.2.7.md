@@ -16,6 +16,14 @@
   - Off switch: `STRATA_GR_UP_WIDE=0`. `STRATA_SM120_PERF=0` still turns off the whole Blackwell set.
   - Other cards are untouched: the old kernel runs everywhere else.
 
+- **Two more kernel switches are on by default where they were measured.** Both sum in another order (about 1e-7), so a
+  tie between two near-equal words can flip and a reply can differ from 0.2.6 here and there.
+  - The prompt attention on int8 tensor cores (NVIDIA Ampere and newer): **+1.6% / +1.8% prompt at 8K / 16K on the RTX PRO 5000
+    and +1.1% / +1.3% on 2x RTX A4000**, decode unchanged, five pairs each. Off switch: `STRATA_PROMPT_ATTN_IMMA=0`.
+  - The hyper-connection read split over two kernels (a discrete RTX 50 / RTX PRO Blackwell card with more than 13 GiB): **+1.2%
+    decode on the RTX PRO 5000 with identical tokens**, about +1.5% together with the switch above. On 2x RTX A4000 and the
+    RTX 3060 it was slower, so those cards keep the old read. Off switch: `STRATA_GR_V3=0`.
+
 ## What is faster if your PC is set up for it
 
 These need no engine change; they are settings. Each was measured on the same boxes.
