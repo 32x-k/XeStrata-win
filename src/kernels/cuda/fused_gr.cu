@@ -430,6 +430,90 @@ __global__ void __launch_bounds__(THREADS) gr_up_multi_kernel(GrMulti m) {
     if (m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0);   // S26 STRATA_QFUSE
 }
 
+// 149-cuda: the same up projection with one warp per row instead of eight rows per warp.  A block still covers
+// all HC streams x a few columns, so the cross-stream sum stays in shared memory, and every row's dot, xor tree
+// and epilogue are gr_up_multi_kernel's - bitwise the same outputs.  8 warps cover 2 columns x 4 streams (8
+// rows), so the grid grows from UPM_BLOCKS (160) to N/2 (1280): the card's SMs get ~8x the warps, which is what
+// this read is short of on a 12.0 card (160 blocks do not fill 192 SMs; measured 2.6 ms per round for 1.26 GB,
+// about 0.5 TB/s).  Not used when the S26 q8_1 tail is on (its counter assumes UPM_COLS columns a block).
+constexpr int UPW_COLS = 2;
+constexpr int UPW_BLOCKS = N / UPW_COLS;
+
+/// STRATA_GR_UP_WIDE: the wide up read.  ON BY DEFAULT on a 12.0 card (sm120_series.hpp; STRATA_SM120_PERF=0 or
+/// STRATA_GR_UP_WIDE=0 turns it off, =1 forces it on any card).  Measured on the RTX PRO 5000 (IQ3_S, all experts
+/// resident, 5 interleaved pairs of fresh engines): story 197.6 -> 201.3 tok/s (+1.9%), code 243.5 -> 245.1 (+0.7%),
+/// the produced token ids identical in 6/6 runs; the isolated read (fused_gr_bench) is bitwise the old kernel's.
+bool gr_up_wide_on() {
+    static const int env = [] {
+        const char* v = std::getenv("STRATA_GR_UP_WIDE");
+        return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1;
+    }();
+    if (env >= 0) return env != 0;
+    static int per_dev[64];   // 0 unknown, 1 no, 2 yes
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    if (!per_dev[dev]) {
+        int major = 0, minor = 0;
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev);
+        per_dev[dev] = strata::sm120_default(major, minor) ? 2 : 1;
+        cudaGetLastError();   // drop what an attribute query on a CPU-only box leaves behind
+    }
+    return per_dev[dev] == 2;
+}
+
+template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false>
+__global__ void __launch_bounds__(THREADS) gr_up_wide_kernel(GrMulti m) {
+    __shared__ __align__(16) float lo[MAX_T][LR];
+    __shared__ float g[MAX_T][HC][UPW_COLS];
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int T = EXACT_T ? MAX_T : m.T;
+    const int d0 = blockIdx.x * UPW_COLS;
+    for (int i = t; i < T * LR; i += THREADS) lo[i / LR][i % LR] = m.a[i / LR].lo[i % LR];
+    __syncthreads();
+    if (warp < HC * UPW_COLS) {
+        const int c = warp / UPW_COLS, dd = warp - c * UPW_COLS, i = c * N + d0 + dd;
+        const uint4* w4 = reinterpret_cast<const uint4*>(m.a[0].w_up + (size_t) i * LR);
+        const Bf16x8 wa = unpack8(__ldg(w4 + lane));
+        const Bf16x8 wb = unpack8(lane < LR / 8 - 32 ? __ldg(w4 + 32 + lane) : make_uint4(0, 0, 0, 0));
+        float rv = 0.0f, wn = 0.0f, rsc = 0.0f, bo = 0.0f, ip = 0.0f;
+        bool apply = false;
+        if (lane < T) {
+            const FusedGrArgs& a = m.a[lane];
+            rv = a.R[i];
+            wn = a.w_norm[i];
+            rsc = a.rs[c];
+            apply = a.apply;
+            if (apply) { bo = a.bo_prev[d0 + dd]; ip = a.inj_prev[c]; }
+        }
+        float mine = 0.0f;
+#pragma unroll
+        for (int k = 0; k < MAX_T; ++k) {
+            if (!EXACT_T && k >= T) break;
+            float acc = dot8u_ptr(wa, lo[k] + lane * 8);
+            if (lane < LR / 8 - 32) acc += dot8u_ptr(wb, lo[k] + (32 + lane) * 8);
+            acc = warp_sum(acc);
+            if (lane == k) mine = acc;
+        }
+        if (lane < T) {
+            if (apply) {
+                rv = fmaf(bo, 2.0f * sigmoidf_(ip / (float) HC), rv);
+                m.a[lane].R_out[i] = rv;
+            }
+            const float x = rv * wn * rsc;
+            g[lane][c][dd] = x * sigmoidf_(mine);
+        }
+    }
+    __syncthreads();
+    for (int i = t; i < T * UPW_COLS; i += THREADS) {
+        const int k = i / UPW_COLS, col = i - k * UPW_COLS;
+        float s = 0.0f;
+#pragma unroll
+        for (int c = 0; c < HC; ++c) s += g[k][c][col];
+        m.a[k].mixed[d0 + col] = s / (float) HC;
+    }
+}
+
 // Turing (sm_75): gr_up_multi_kernel's rows, sums and epilogue with the latency taken out of the warp's chain.  A warp's
 // 8 rows of w_up are all loaded before any dot (was: one row's load after the previous row's epilogue: ~9k of the
 // warp's ~22k cycles were waits on memory, ncu on an RTX 2080 Ti); a token's 8 activations per lane are read from
@@ -1317,6 +1401,19 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
         }
     }
     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
+    // 149-cuda: the wide up read (test arm; STRATA_GR_UP_WIDE=1).  The q8_1 tail of S26 needs the 16-column
+    // blocks, so the wide kernel is only used when no q8_1 image is written.
+    if (!q8w && m.a[0].q8_mixed == nullptr && gr_up_wide_on()) {
+        switch (no_multi_gr ? kFusedGrMaxT : n_tok) {
+            case 1: gr_up_wide_kernel<1, true><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
+            case 2: gr_up_wide_kernel<2, true><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
+            case 3: gr_up_wide_kernel<3, true><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
+            case 4: gr_up_wide_kernel<4, true><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
+            case 5: gr_up_wide_kernel<5, true><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
+            case 6: gr_up_wide_kernel<6, true><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
+            default: gr_up_wide_kernel<kFusedGrMaxT, false><<<UPW_BLOCKS, THREADS, 0, st>>>(m); break;
+        }
+    } else
 #if STRATA_GR_FAST_BUILD
     if (fast && !q8w) gr_up_fast_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
     else
@@ -2598,7 +2695,7 @@ void hc_q8_to_bf16(const void* codes, const float* scales, uint16_t* out, long l
     hc_q8_bf16_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, (cudaStream_t) stream>>>((const int8_t*) codes, scales, out, n);
 }
 
-// ===================================== the read as ONE persistent kernel (opt-in STRATA_HC_PERSIST=1, HIP) ==============
+// ================================== the read as ONE persistent kernel (opt-in STRATA_HC_PERSIST=1, CUDA + HIP) ==============
 // 80 blocks that must all be resident (a start-up run per T decides; larger T keep the default read) and two grid
 // barriers on an atomic counter.  Block b: (A) stages R' * w_norm for columns [128 b, 128 b + 128) (one stream) and writes
 // that slice's sum of squares and the UNSCALED partial dots of the 320 down + 4 inject rows (the v3 identity
@@ -2606,9 +2703,18 @@ void hc_q8_to_bf16(const void* codes, const float* scales, uint16_t* out, long l
 // barrier; (C) the up projection read straight from VRAM, a thread pair per row, the epilogue as gr_up_kernel.
 // ANOTHER SUMMATION ORDER than the default read (not bitwise; the init check bounds the difference).  Only the verifier's hyper-connection reads use it: they run on one stream per card (both pipeline
 // verifiers share it), so two of these kernels never wait on each other; the drafter's reads keep the default kernels.
-#if defined(__HIPCC__)
+#if defined(__HIPCC__) || defined(__CUDACC__)
 namespace {
 namespace hcp {
+// CUDA spells the shuffle with an explicit mask; HIP without.  One helper so the kernel body below stays portable.
+template <typename T>
+__device__ __forceinline__ T shfl_xor_persist(T v, int mask) {
+#if defined(__HIPCC__)
+    return __shfl_xor(v, mask);
+#else
+    return __shfl_xor_sync(0xffffffffu, v, mask);
+#endif
+}
 // Measured on gfx1030 (bench/results/2026-10-12-hc-persist-gfx1030): the gain over the three-kernel read is (1) the down
 // projection split by column slices over all 80 blocks (the default read runs 41 blocks staging the activations through
 // LDS) and (2) one launch with two grid barriers instead of three launches and the gaps between them.  Prefetching the
@@ -2636,6 +2742,35 @@ __device__ __forceinline__ bool grid_sync(unsigned* bar, unsigned long long tick
     (void) ticks;
     if (threadIdx.x == 0) __hip_atomic_store(&bar[48], 1u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     return false;
+#elif defined(__CUDACC__)
+    // CUDA: the same generation barrier.  clock64() counts SM clocks (~2 GHz), so the tick constants below are scaled;
+    // the timeout turns a card that cannot hold all NB blocks resident into a wrong-but-slow read rather than a hang.
+    __shared__ int s_abort;
+    volatile unsigned* vb = bar;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int ab = 0;
+        const unsigned gen = vb[32];
+        __threadfence();
+        const unsigned arrived = atomicAdd(&bar[0], 1u);
+        if (arrived == NB - 1) {
+            atomicExch(&bar[0], 0u);
+            __threadfence();
+            atomicAdd(&bar[32], 1u);
+        } else {
+            const long long t0 = clock64();
+            while (vb[32] == gen) {
+                if (vb[48] != 0u) { ab = 1; break; }
+                if (clock64() - t0 > (long long) ticks) { atomicExch(&bar[48], 1u); ab = 1; break; }
+                __nanosleep(64);
+            }
+        }
+        if (vb[48] != 0u) ab = 1;
+        s_abort = ab;
+    }
+    __syncthreads();
+    __threadfence();
+    return s_abort == 0;
 #else
     __shared__ int s_abort;
     __syncthreads();
@@ -2704,7 +2839,7 @@ __global__ void __launch_bounds__(THREADS) persist_kernel(PArgs f) {
         if constexpr (DP) {
             double ss = (double) r.x * r.x + (double) r.y * r.y + (double) r.z * r.z + (double) r.w * r.w;
 #pragma unroll
-            for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor(ss, o);
+            for (int o = 16; o > 0; o >>= 1) ss += shfl_xor_persist(ss, o);
             if (lane == 0) f.sspd[k * NB + b] = ss;
         } else {
             const float ss = warp_sum(r.x * r.x + r.y * r.y + r.z * r.z + r.w * r.w);   // warp k = token k
@@ -2726,7 +2861,7 @@ __global__ void __launch_bounds__(THREADS) persist_kernel(PArgs f) {
             A v;
             if constexpr (DP) v = dot8d(w, &xs[k][hl * 8]); else v = dot8(w, &xs[k][hl * 8]);
 #pragma unroll
-            for (int o = 8; o > 0; o >>= 1) v += __shfl_xor(v, o);
+            for (int o = 8; o > 0; o >>= 1) v += shfl_xor_persist(v, o);
             acc[k] = v;
         }
 #pragma unroll
@@ -2814,7 +2949,7 @@ __global__ void __launch_bounds__(THREADS) persist_kernel(PArgs f) {
         }
         float acc[T];
 #pragma unroll
-        for (int k = 0; k < T; ++k) acc[k] = (float) (v[k] + __shfl_xor(v[k], 1));
+        for (int k = 0; k < T; ++k) acc[k] = (float) (v[k] + shfl_xor_persist(v[k], 1));
         if (uh == 0) {
             const float wn = a0.w_norm[ui];
 #pragma unroll
@@ -2870,7 +3005,13 @@ bool dp_on() {
 KFn kernel_for(int T) { return dp_on() ? kernel_t<true>(T) : kernel_t<false>(T); }
 // s_memrealtime runs at 100 MHz on RDNA: a barrier gives up after 2 s in a read (never in a working run; it only turns a
 // hang into a wrong read) and after 50 ms in the start-up check (where a timeout means "not resident here")
+#if defined(__CUDACC__)
+// clock64() counts SM clocks (~2 GHz on these cards): 2 s a read, 50 ms the start-up check, the same wall times the
+// HIP constants give at s_memrealtime's 100 MHz
+constexpr unsigned long long kTicksRun = 4000000000ULL, kTicksCheck = 100000000ULL;
+#else
 constexpr unsigned long long kTicksRun = 200000000ULL, kTicksCheck = 5000000ULL;
+#endif
 void launch(const FusedGrArgs* a, int n_tok, const DevState& st, cudaStream_t s, unsigned long long ticks) {
     PArgs f;
     for (int t = 0; t < n_tok; ++t) f.a[t] = a[t];
@@ -2898,11 +3039,13 @@ void fused_gr_persist_init() {
                              "(this card runs %d)\n", dev, prop.warpSize);
         return;
     }
+#if defined(__HIPCC__)
     if (strata::kernels::gfx_arch_is_gfx12(prop.gcnArchName) || strata::kernels::gfx_arch_is_gfx11_wmma(prop.gcnArchName)) {
         std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_PERSIST=1 is off here: gfx11 / gfx12 have no s_memrealtime for the barrier "
                              "timeout (written and measured for gfx1030; an R9700 saw no gain from it, #2226)\n", dev);
         return;
     }
+#endif
     const int mp = prop.multiProcessorCount;   // only for the confirmation line (WGPs on RDNA)
     bool ok = cudaMalloc((void**) &st.part, (size_t) kFusedGrMaxT * hcp::NR * hcp::NB * sizeof(float)) == cudaSuccess &&
               cudaMalloc((void**) &st.ssp, (size_t) kFusedGrMaxT * hcp::NB * sizeof(float)) == cudaSuccess &&
@@ -3042,3 +3185,6 @@ bool fused_gr_read_persist(const FusedGrArgs*, int, void*) { return false; }
 #endif
 
 }  // namespace strata::kernels
+
+
+
