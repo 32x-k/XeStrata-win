@@ -32,4 +32,13 @@ inline size_t copy_event_entry(size_t k, size_t recorded, IsRecorded is_recorded
     return recorded - 1;
 }
 
+/// STRATA_PREFILL_COPY_WAIT_DEDUPE: the copy stream may skip its wait on the release event of entry `idx`'s slot (`rel`)
+/// when the wait it made for the previous entry was on the same event (`prev_rel`).  That holds only when both slots were
+/// released in the current walk (idx - 1 >= ring), because the event of an earlier walk can be re-recorded by this walk's
+/// first flush, and when the ring is longer than one MMQ group of `group` experts, because a flush of a whole ring would
+/// re-record the event right after the previous slot's wait.
+inline bool copy_wait_dedupe_ok(size_t idx, int ring, int group, int rel, int prev_rel) {
+    return ring > group && idx > (size_t) ring && rel == prev_rel;
+}
+
 }  // namespace strata::prefill

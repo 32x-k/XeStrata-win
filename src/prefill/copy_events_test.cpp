@@ -71,6 +71,83 @@ int main() {
                 check(ok && consumed == total, what);
             }
 
+    // copy_wait_dedupe_ok: skipping the copy stream's wait on a slot's release event must never leave a slot's refill
+    // without a wait on a record at or after the flush that released it.  Two walks of random length with random group
+    // sizes (1..group), the issuer and the consumer interleaved at random.  A "record" is a counter tick of the event.
+    auto simulate = [&](int ring, int group, bool original_rule, unsigned seed) -> bool {
+        std::srand(seed);
+        std::vector<int> used_of((size_t) ring);
+        std::vector<long long> rec_time((size_t) ring, 0), last_flush((size_t) ring, 0);
+        for (int i = 0; i < ring; ++i) used_of[(size_t) i] = i;
+        long long tick = 0;
+        for (int walk = 0; walk < 3; ++walk) {
+            const size_t n = (size_t) ring * (size_t) (2 + std::rand() % 3) + (size_t) (std::rand() % (ring + 1));
+            std::vector<size_t> group_end;   // the last entry of each group, in order
+            for (size_t s = 0; s < n;) {
+                size_t len = (size_t) (1 + std::rand() % group);
+                if (s + len > n) len = n - s;
+                s += len;
+                group_end.push_back(s - 1);
+            }
+            size_t issued = 0, consumed = 0, g = 0;
+            const int issue_pct = std::vector<int>{50, 90, 99}[(size_t) (std::rand() % 3)];   // how far ahead the issuer runs
+            int prev_rel = -1;
+            long long prev_cap = 0;
+            std::vector<bool> live((size_t) ring, walk > 0);   // the first walk starts with empty slots
+            size_t guard = 0;
+            while (consumed < n && ++guard < 1000000) {
+                const bool can_issue = issued < n && issued < consumed + (size_t) ring;
+                const bool can_flush = g < group_end.size() && group_end[g] < issued;
+                if (can_issue && (!can_flush || std::rand() % 100 < issue_pct)) {
+                    const size_t idx = issued++;
+                    const int sl = (int) (idx % (size_t) ring);
+                    if (live[(size_t) sl]) {
+                        const int rel = used_of[(size_t) sl];
+                        const bool skip = original_rule ? (idx >= (size_t) ring && rel == prev_rel)
+                                                        : copy_wait_dedupe_ok(idx, ring, group, rel, prev_rel);
+                        const long long cap = skip ? prev_cap : rec_time[(size_t) rel];
+                        if (cap < last_flush[(size_t) sl]) return false;   // the refill would not wait for its release
+                        prev_cap = cap;
+                        prev_rel = rel;
+                    } else {
+                        prev_rel = -1;
+                    }
+                    live[(size_t) sl] = true;
+                } else if (can_flush) {
+                    size_t first = consumed;
+                    const size_t last = group_end[g++];
+                    const int rel = (int) (last % (size_t) ring);
+                    rec_time[(size_t) rel] = ++tick;
+                    for (size_t e = first; e <= last; ++e) {
+                        used_of[e % (size_t) ring] = rel;
+                        last_flush[e % (size_t) ring] = tick;
+                    }
+                    consumed = last + 1;
+                } else {
+                    return false;   // stuck: the model is wrong
+                }
+            }
+        }
+        return true;
+    };
+    for (int ring : {17, 18, 24, 32, 96, 1024})
+        for (unsigned seed = 1; seed <= 300; ++seed) {
+            char what[96];
+            std::snprintf(what, sizeof what, "dedupe never skips a needed wait (ring %d, seed %u)", ring, seed);
+            if (!simulate(ring, 16, false, seed)) { check(false, what); break; }
+        }
+    {
+        bool rule_ok = true;   // the rule refuses a ring that a group can fill
+        for (size_t idx : {20u, 1000u}) rule_ok = rule_ok && !copy_wait_dedupe_ok(idx, 16, 16, 3, 3);
+        check(rule_ok, "a ring of one group never dedupes");
+        check(!copy_wait_dedupe_ok(32, 32, 16, 3, 3) && copy_wait_dedupe_ok(33, 32, 16, 3, 3), "the first round never dedupes");
+        check(!copy_wait_dedupe_ok(40, 32, 16, 3, 4) && !copy_wait_dedupe_ok(40, 32, 16, 3, -1), "different events or none: wait");
+        // the control: the PR's first rule (idx >= ring) is caught by this model
+        bool caught = false;
+        for (int ring : {17, 18, 20, 24, 32}) for (unsigned seed = 1; seed <= 600 && !caught; ++seed) caught = !simulate(ring, 16, true, seed);
+        check(caught, "the model finds the stale-event race in the rule 'idx >= ring'");
+    }
+
     if (g_fail == 0) std::printf("copy_events_test: all checks passed\n");
     return g_fail == 0 ? 0 : 1;
 }

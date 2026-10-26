@@ -3262,10 +3262,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const auto th = Clock::now();
                     const size_t bytes = (size_t) lay0.blob_bytes(en.l);
                     if (m.stage_live[sl]) {
-                        // from the second round on, both slots were released in this walk: the same event means the same
-                        // flush, and the wait for the previous slot already covers this one
+                        // Both this slot and the previous one must have been released in THIS walk (idx - 1 >= ring: the
+                        // previous slot's event of an earlier walk could be re-recorded by this walk's first flush), and
+                        // the ring must be longer than one MMQ group (a flush of a whole ring would re-record the event
+                        // after the previous slot's wait).  Then the same event means the same flush, and the wait for
+                        // the previous slot already covers this one.
                         const int rel = m.used_of[sl];
-                        if (copy_wait_dedupe && idx >= (size_t) m.ring && rel == prev_rel) {
+                        if (copy_wait_dedupe && strata::prefill::copy_wait_dedupe_ok(idx, m.ring, MMQ_GROUP, rel, prev_rel)) {
                             ++iss_dedup;
                         } else {
                             cudaStreamWaitEvent(m.copy, m.used[rel], 0);
