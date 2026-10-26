@@ -115,6 +115,7 @@ screens; leave out what you do not care about.
 | `MODEL` | model size: `IQ2_XS`, `IQ3_XXS`, `IQ3_S`, `Q2_0`, `UD-Q4_K_XL`, ... ([MODELS.md](MODELS.md)) | Strata picks what suits the card, and says so in the log |
 | `FAMILY` | `qwen`, `unsloth`, `gyro`, `coder`, `swift`, ...; use `qwen` for the original ISTA-DASLab packs | installer recommendation; may differ by hardware |
 | `MODEL_PATH` | GGUF files you already have: a folder or one `.gguf`, **inside the container** (mount it with `-v`, `:ro` is fine) | download |
+| `ALLOW_DOWNLOAD` | `1`: go on and download the model although model files of the older layout were left unread in `/data/models` (see [From the older image](#from-the-older-image)) | stop |
 | `CONTEXT` | how much text it remembers at once: `32k`, `64k`, `128k`, `256k` or a number | the largest that fits |
 | `PARALLEL` | requests answered at the same time, 1 to 8 | fitted to the card |
 | `VISION` | `off`, `on` (the model reads pictures), `gpu`, `cpu`; the picture-reader file (about 0.9 GB) is downloaded with the model | `off` |
@@ -276,7 +277,10 @@ package and start through `strata launch`. Mapping:
 A volume from the older image is picked up: the first start moves `/data/models`, `/data/packs` and `/data/mtp` into
 `/data/Strata-data` (a rename inside the volume: nothing is copied or downloaded again, and the prepared pack is kept). The old
 `/data/config` is not read; the run settings are made again from the files. A folder you mounted yourself at one of those places
-is left alone: point `MODEL_PATH` at it. The container name, the volume and the port can stay as they were.
+is left alone: point `MODEL_PATH` at it. If model files are still in `/data/models` when the container starts (a folder you mounted there, or
+a move that failed) and `MODEL_PATH` is not set, the start **stops at once and says where the files are**: it would otherwise download the model
+again, tens of GB, because this image does not read that place. Name the folder in `MODEL_PATH`, or set `ALLOW_DOWNLOAD=1` to download anyway.
+The container name, the volume and the port can stay as they were.
 
 ## Build it yourself
 
@@ -296,13 +300,14 @@ to the system or the graphics driver (`packaging/binary_deps.py`); finally it ch
 library inside the finished image. A package that fails any of these stops the build. Nothing is pushed anywhere.
 `docker/smoke-test.sh` runs the checks we ran on real cards (serves, key, chat, tool call, monitor, clean stop, memory freed, restart); see its first lines for the variables.
 
-**From source.** `docker build -t strata:src .` in the repository compiles the CUDA 13 engine inside Docker, makes the package
-and puts it in the same kind of image (`--build-arg CUDA_ARCHITECTURES=89` for one card only, much faster). For a GTX 10, P100 or
-V100 build the CUDA 12 variant: `docker build -t strata:src-cuda12 --build-arg CUDA_IMAGE=nvidia/cuda:12.9.1-devel-ubuntu24.04
---build-arg CUDA_ARCHITECTURES="60;61;70;75;80;86;89" --build-arg BUILD_VISION=0 .` (the build turns on the Pascal / Volta code by itself
-when an architecture below 75 is listed, and names the package `cuda12` with driver 575.51). For AMD and Intel
-builds from source see [AMD_HIP.md](AMD_HIP.md) and [INTEL.md](INTEL.md); then package the result with
-`packaging/package_engine.py` and use `docker/build.sh`.
+**From source.** `docker build -t strata:src --build-arg STRATA_COMMIT=$(git rev-parse HEAD) .` in the repository compiles the CUDA 13
+engine inside Docker, makes the package and puts it in the same kind of image (`--build-arg CUDA_ARCHITECTURES=89` for one card only,
+much faster). `.git` is not copied into the build, so the commit comes in as `STRATA_COMMIT`; without it the Terminal stage stops.
+For a GTX 10, P100 or V100 build the CUDA 12 variant: `docker build -t strata:src-cuda12 --build-arg STRATA_COMMIT=$(git rev-parse HEAD)
+--build-arg CUDA_IMAGE=nvidia/cuda:12.9.1-devel-ubuntu24.04 --build-arg CUDA_ARCHITECTURES="60;61;70;75;80;86;89" --build-arg BUILD_VISION=0 .`
+(the build turns on the Pascal / Volta code by itself when an architecture below 75 is listed, and names the package `cuda12` with
+driver 575.51). For AMD and Intel builds from source see [AMD_HIP.md](AMD_HIP.md) and [INTEL.md](INTEL.md); then package the result
+with `packaging/package_engine.py` and use `docker/build.sh`.
 
 ## Publishing the images (for maintainers)
 

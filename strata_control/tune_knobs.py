@@ -16,6 +16,7 @@ bit-exact run to run). Only ``exact`` is picked on its own; the others need the 
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from typing import Any, Callable, Sequence
 
@@ -152,6 +153,7 @@ BOUNDS: dict[str, dict[str, Any]] = {
 #: in plain words. ``when`` names facts from `condition_holds`; empty = always.
 NEVER: tuple[dict[str, Any], ...] = (
     {"env": "STRATA_SH_STREAM", "when": ("gfx12",), "reason": "it halves decode speed on this graphics card"},
+    {"env": "STRATA_SH_STREAM", "when": ("windows_amd_kv_stream",), "reason": "with KV streaming on Windows it made the engine fail on the first request on one RX 6000 PC (#3895)"},
     {"env": "STRATA_RDNA2_SGEMM", "value": "all", "when": ("gfx12",), "reason": "it makes long prompts five times slower"},
     {"env": "STRATA_SELECT_SIMT", "reason": "its gain is below the 3% margin"},
     {"env": "STRATA_HIP_WMMA", "reason": "it changes the numbers (a quality setting)"},
@@ -220,6 +222,7 @@ def condition_holds(name: str, ctx: Context) -> bool:
         "vram_ge_24g": ctx.vram_mib >= 24000,
         "vram_le_8g": 0 < ctx.vram_mib <= 8400,
         "gfx12": bool(ctx.arch and ctx.arch.startswith("gfx12")),
+        "windows_amd_kv_stream": ctx.backend == "hip" and sys.platform == "win32" and "--kv-resident" in ctx.base_args,
         "pcie_bound": 0 < ctx.vram_mib < 24000,
         "ram_bound": bool(ctx.ram_gib and ctx.model_gib and ctx.ram_gib - ctx.model_gib < 30),
         "ctx_ge_128k": ctx.context_tokens >= 98304,

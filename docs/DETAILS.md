@@ -292,7 +292,9 @@ files, read time; `routing prefetch`: how many file reads had been warmed). The 
 `GET /metrics` lists `ram_blobs`, `file_blobs`, `file_mb`, `drafts_offered` and `drafts_accepted` per recent request, with
 `totals` since the start. `hit_rate` is the VRAM share of the experts looked up; experts the GPU reads over PCIe
 (`--pcie-frac`) are not in it, so a higher `--pcie-frac` raises it even when decoding gets slower. `pcie_share` is their
-share of all routed experts. The Monitor tab shows both.
+share of all routed experts. The Monitor tab shows both. The request list in the Monitor tab also shows the prompt's own speed: what the cache already held is not read
+again, so it is the fresh tokens (`prompt_tokens` minus `reused`) over the prompt time (`prompt_ms`), and a request that read no
+new token shows no number.
 
 Profiling: start the server with `STRATA_DECODE_TIMING=1` (and `STRATA_VERIFY_PROFILE=1` for the GPU side). After each request
 the engine log has a `strata decode timing:` line and a `strata decode GPU stages (ms/window):` line. The GPU profile slows
@@ -542,6 +544,8 @@ tables per token). The scaling is fixed for the whole run, because the KV cache 
   `--host 0.0.0.0 --api-key some-long-secret`, or add `"host": "0.0.0.0"` and `"api_key": "..."` to the config. A key is
   recommended, not required: without one the server starts and warns that anyone who can reach the port can use the model
   and its tools. `--no-api-key` (or `"api_key": "none"`) says it is on purpose. The server window prints this PC's addresses.
+  For IPv6 use `--host ::` (or `"host": "::"`, all IPv6 interfaces) and put the address in brackets in URLs, for example
+  `http://[2001:db8::7]:8080/v1`.
   On Windows allow the port in the firewall for private networks:
   `New-NetFirewallRule -DisplayName "Strata 8080" -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow -Profile Private`
   (admin PowerShell).
@@ -620,7 +624,7 @@ system prompt with a billing header that changes on every request; the server pi
 | Option | Effect |
 | --- | --- |
 | `--prompt-cache N` | Number of checkpoints (`0` = off, which also disables parking). |
-| `--prompt-cache-every N`, `--prompt-cache-root N`, `--turn-token ID` | Checkpoint interval, the system-prompt checkpoint (`0` = none) and the turn token. |
+| `--prompt-cache-every N`, `--prompt-cache-root N`, `--turn-token ID` | Checkpoint interval, the system-prompt checkpoint (`0` = none) and the turn token. The interval is not a piece-size setting: [what it does](PROMPT_CACHE_TAIL.md#prompt-cache-every-does-not-set-the-size-of-the-pieces-a-prompt-is-read-in). |
 | `--prompt-cache-spread` (opt-in) | The checkpoint that leaves is the one whose removal leaves the smallest gap, so the kept points thin out geometrically back from the end. An agent that rewrites its history a few thousand tokens back then resumes near the edit instead of at the system prompt. Same RAM. |
 | `"strata_checkpoint": false` (per request) | A one-shot request that no later request continues saves no checkpoints and keeps no session. |
 | `"strata_prefix": {"messages": 1}` (per request, opt-in) | One long document, many questions. Marks where the document ends: `{"messages": 1}`, `{"message": 0, "chars": 210000}` or `{"tokens": 12345}`. The checkpoint at the boundary is pinned, so 20 questions cost one read of the document. One pinned prefix at a time per engine; needs `--prompt-cache 3` or more; a malformed field is a 400. See [RESEARCH_RUNS.md](RESEARCH_RUNS.md). |

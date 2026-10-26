@@ -426,8 +426,14 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
     # 6. HIP: the shared-expert stream fork (a restart each), with everything chosen so far.  Both values are set
     # explicitly, so a value the config carried before does not decide the baseline.
     env = {}
-    if hip:
-        tuned = apply(base_args, settings)
+    tuned = apply(base_args, settings)
+    if hip and fork_is_unsafe(tuned):
+        # #3895: one Windows RX 6000 PC faulted the engine on the first request with the fork and KV streaming together. The fork is off by
+        # default on AMD, so skipping the measurement changes nothing; whoever wants it sets the variable by hand.
+        say("  Not measuring the shared expert on its own stream: on Windows with KV streaming (--kv-resident) it made the engine fail on the first "
+            f"request on one PC (#3895). To try it anyway, put {SH_STREAM}=1 in the config's env.")
+        report["sh_stream_skipped"] = "windows with --kv-resident"
+    elif hip:
         by_fork = {}
         for v in ("0", "1"):
             _check_cancel(cancel_event)
@@ -453,6 +459,12 @@ def measure(base_args: list[str], ids_list, start_engine, say=print, extra_worke
     report["tok_s"] = round(base_rate, 1) if base_rate else None
     _check_cancel(cancel_event)
     return {"settings": settings, "env": env, "report": report}
+
+
+def fork_is_unsafe(args) -> bool:
+    """The shared-expert fork (STRATA_SH_STREAM) with KV streaming on Windows: the one combination that has made an engine fail on its first
+    request (#3895, an RX 6900 XT). Not measured there; a person can still set the variable."""
+    return sys.platform == "win32" and arg_value(args, "--kv-resident") is not None
 
 
 def restart(start_engine, args, what, say, report):

@@ -32,6 +32,8 @@ change BIOS or kernel settings. The manual Linux toolchain below is for reproduc
 DeepSeek V4.1-Flash comes with its own engine package on Windows and needs nothing extra: pick the model and the app or `strata launch`
 downloads it ([DeepSeek on Strix Halo](#deepseek-v41-flash)).
 
+On Windows, [STRIX_HALO_WINDOWS.md](STRIX_HALO_WINDOWS.md) has the speeds measured on 0.2.7 with Qwen IQ3_S and DeepSeek, how memory is used and the traps.
+
 ## DeepSeek V4.1-Flash
 
 The model runs through its own engine, `strata-dsv41`, as on the other platforms ([DEEPSEEK41.md](DEEPSEEK41.md)); on Windows the
