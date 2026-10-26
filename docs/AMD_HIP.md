@@ -193,6 +193,13 @@ the card's name, its architecture and the build's list.
 - CMake fetches the pinned llama.cpp revision. For an offline build, point `STRATA_GGML_DIR` at a checkout of that exact
   revision.
 - Linux engine packages: `VARIANT=rx6000 packaging/build_hip_linux.sh`.
+- **A hand-built engine has no tuning table.** The packaged engines carry `tuning/<arch>-hipblaslt-<version>.txt` beside the binary
+  ([Ready-made packages](#ready-made-packages) lists which); a build made with plain `cmake` and started
+  through `serve/server.py` has none, and the prompt GEMMs fall back to plain hipBLAS. On Strix Halo (gfx1151) that read prompts
+  20-25% slower in one report (1,043 against 826 tok/s at 8K, hipBLASLt 1.4.1, a single run per arm, not a paired A/B). Point
+  `STRATA_HIPBLASLT_TUNING` at the file in `tools/hip/` (`gfx1151-hipblaslt-100401.txt` for hipBLASLt 1.4.1), or copy it into a
+  `tuning/` folder next to the `strata` binary. The start log then has the line `prefill gemm: hipBLASLt tuning enabled (N rows,
+  gfx1151, version 100401)`; without it, no table was taken.
 
 Run the registered checks with:
 
