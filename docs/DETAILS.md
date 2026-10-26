@@ -1420,3 +1420,27 @@ The times below were measured by the author of the change (linxuhao, PR #3779) o
 An independent user (bitaccesscomau, one RTX 3090 on PCIe 3.0 x16) tried the `STRATA_CKPT_ASYNC=1` commit on its own on 0.2.6: the checkpoint save went from 73.2 to 62.4 ms, the first token of a short prompt came about 13 ms of 350 ms sooner (median of 4 pairs), and the answers were byte-identical. On a fast link the gain is small.
 
 The serve loop's `strata trace:` lines (`STRATA_TRACE`) now end with `@<ms>`, a steady-clock timestamp.
+
+## CUDA opt-in decode switches measured on a CMP 170HX (sm_80; off unless you set them)
+
+The author of the change (linxuhao, PR #3779) measured these on one CMP 170HX (GA100, 70 SMs) with the Qwen3.8-Flash-Next IQ3_S native pack, `--spec 3`, decode after a prompt of about 3,000 words, a fresh engine per run, reference and switch runs interleaved. We have no sm_80 card and did not measure them. Both switches keep every output bit by construction (the greedy answers to 11 prompts were the same with the switch on and off, on their card). Neither does anything on HIP, gfx906 or Metal.
+
+| Switch | What | Answers | Reporter's figure (CMP 170HX) |
+|---|---|---|---|
+| `STRATA_GRAPH_PRIO=1` | The verify window graph's kernel nodes run at their capturing stream's priority (`cudaGraphInstantiateFlagUseNodePriority`): the GDN gates and the QSA indexer branch at the highest, the shared expert at the lowest. Nothing changes on a card whose priority range is 0..0. | bit-exact | decode +1.8 % with `STRATA_QIL=1` (both runs above every reference run) |
+| `STRATA_MMVQ_IL_PF=1` | Hoisted-load, exact-integer kernels for the interleaved small-batch matvec where the sm_80 table picks them (Q6_K only so far, [MMVQ_IL_TABLE.md](MMVQ_IL_TABLE.md)). On a card that is not sm_80 the value 1 does nothing. `=2` to `=6` force one variant everywhere (A/B only). | bit-exact | decode +1.4 % (two reference / on / reference / on sets) |
+
+Two sm_80 defaults come with the same change and are on without a switch, only on a compute capability 8.0 card: the wide dense dequant kernels (`STRATA_DEQUANT_WIDE=0` turns them off) and the sm_80 rows tables of the interleaved matvec (`STRATA_MMVQ_IL_SM80=0` turns them off). Both are bitwise. The reporter's figures: prompt GPU time of a 3,259-token prompt 857 -> 792 ms for the dequant, decode +2.7..+3.2 % for the tables.
+
+## CUDA opt-in prompt switches for sm_80 cards (off unless you set them)
+
+Also from PR #3779, measured by its author on the same CMP 170HX; none of the figures was measured here. `STRATA_PF_FUSED_NT=256` and `STRATA_PF_BATCH=N` keep every output bit. `STRATA_PF_FUSED_F16=1`, `STRATA_PF_FUSED_WS=1` and `STRATA_GDN_TC=1` change the output at rounding level: the author's teacher-forced KL against the bitwise base on 20 prompts is mean 0.0062 (F16 / WS) and 0.0157 (GDN_TC), top-1 agreement 100 %.
+
+| Switch | What | Reporter's figure (CMP 170HX) |
+|---|---|---|
+| `STRATA_PF_FUSED_NT=256` | The fused prompt-expert kernels with 256 threads and two blocks a multiprocessor (bitwise). Adds device code to every CUDA build. | one MoE layer of 3,256 tokens 8.27 ms |
+| `STRATA_PF_BATCH=N` | Up to N experts per launch (above 128 only with the 256-thread kernels; bitwise). | with NT=256: prompts +7.6 % (4K), +4.9 % (16K), +4.3 % (52K) |
+| `STRATA_PF_FUSED_F16=1` | f16 mma instead of the int8 products in the 256-thread kernels (rounding level). | 7.90 ms for the same layer |
+| `STRATA_PF_FUSED_WS=1` | Warp-specialized kernel with the same F16 products; needs about 101 KB of shared memory, so sm_80 and sm_90 only (it says "not available" elsewhere). | 7.65 ms for the same layer |
+| `STRATA_GDN_TC=1` | The DeltaNet recurrence of a prompt as a chunked scan on the tensor cores; needs 122 KB of shared memory a block (sm_80, sm_90). | recurrence 105 -> 34 ms at 3.3K tokens; prompts +3.9 % (4K), +6.0 % (16K), +6.7 % (52K) |
+| `STRATA_PLE_COMPACT=1`, `STRATA_PLE_COPY_STREAM=1`, `STRATA_EMBED_VRAM=1`, `STRATA_DEQUANT_SIDE=1` | The PLE rows go up raw and are dequantized on the card, on their own stream; the token-embedding table in VRAM; the dense dequant on a side stream (CUDA only). All bitwise. | prompts +2.2 % to +2.6 % for the four together |

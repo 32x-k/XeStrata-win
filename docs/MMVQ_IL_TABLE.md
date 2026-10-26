@@ -15,6 +15,7 @@ Which table a card gets:
 |---|---|
 | sm_86 (Ampere consumer) and sm_120 cards with fewer than 80 SMs (RTX 5070 and smaller) | `kIlRowsShared`, measured on an RTX 3060 and an RTX 5070 together (a cell is non-zero only if the worse of the two cards still gains 3%) |
 | sm_120 cards with 80 or more SMs (RTX PRO 5000 / 6000 Blackwell, RTX 5080 / 5090) | `kIlRows_120`, measured on an RTX PRO 5000 Blackwell (110 SMs); `STRATA_MMVQ_IL_120=0` gives them the shared table |
+| sm_80 (A100, A30, CMP 170HX) | `kIlRows_80`, `kIlRows58_80` and `kIl1Rows_80`, read off `--emit-table` by the author of PR #3779 on one CMP 170HX (not an A100: re-measure there); `STRATA_MMVQ_IL_SM80=0` gives the card the shared table again |
 | sm_89 (Ada) and every other sm_80+ card | `kIlRowsShared` too. Nobody has measured sm_89 yet (we have no such card). |
 | sm_75 and older | the path is off; the plain kernels run |
 | a card listed in `kIlArch` | its own table |
@@ -34,3 +35,18 @@ Which table a card gets:
 
 The emit rule: per cell, the fastest rows count if it takes at least 3% off the plain kernel's time, else 0; shapes of one
 class that disagree give 0; a class with no measured shape copies its neighbour below.
+
+## The hoisted-load kernels (STRATA_MMVQ_IL_PF, sm_80 only so far)
+
+`STRATA_MMVQ_IL_PF=1` lets a second table pick, per cell, a variant of `native_mmvq_il` that issues every weight load of a
+group before its dots and forms the dots as exact integers (`kIlPf_80` for 2-4 tokens and `kIlPf58_80` for 5-8, in
+`src/kernels/cuda/native_mmvq.cu`; a cell is `variant << 4 | rows`, 0 = the rows table above with the plain kernel). Every
+variant gives the same bits as the plain kernels. Only Q6_K has cells so far: on the CMP 170HX the variants tie the plain
+kernel for Q4_K / Q5_K / IQ4_XS within the run-to-run noise. Unset or 0 keeps today's kernels; `=2` to `=6` run one variant
+for every type and shape (A/B only).
+
+To measure a card: `build/mmvq_il_parity --bench --emit-table --pf 0,3,4` (`--emit-table` must come right after `--bench`).
+Every listed variant is bit-checked against native_mmvq first, then timed interleaved per case (`--rounds N` rounds of 100
+calls, default 5; the median per variant on the `PFBENCH` lines). The last block (`variant << 4 | rows over --pf`) is in the
+source form of `kIlPf_<cc>`. `il_pf_table` reads only sm_80's table today, so a new card's block also needs its lookup
+there. Post the whole output on the issue.
