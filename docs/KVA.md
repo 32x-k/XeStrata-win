@@ -28,20 +28,28 @@ configuration rules KVA out for the whole run.
 
 ## The fully computed tail and the draft layer
 
-The last `suffix` positions are always read exactly. The MTP draft layer builds its K/V from the final
-residuals of the prompt, and those rows are only real where the layers ran in full, so the tail must cover the
-draft layer's window plus the 64 cells its catch-up reaches back:
+The last `suffix` positions (2048, or `STRATA_KVA_SUFFIX`) are always read exactly.
 
-- no `--mtp-window` given (what the app and the Terminal write): with KVA on, the engine sets the draft window to
-  2048 cells and the tail to 2112 tokens. The 0.2.6 window was 32768, which is every cell of a chat up to that
-  length and could never be covered. The engine prints one line at start-up when it does this.
-- `--mtp-window N` given: the window stays N and the tail is N + 64 (a 32768-cell window never leaves a
-  prompt shorter than 32 K approximated; the log says "the draft layer attends to every cell" when no tail can cover it).
-- `STRATA_KVA_SUFFIX=N` fixes the tail by hand.
-- no draft layer (`--mtp` not given): the tail is 2048.
+The MTP draft layer builds its K/V from the final residuals of the prompt, and an approximated chunk has none. The
+draft layer's window is **not changed**: it stays what it was (`--mtp-window`, default 32768 cells). Instead the
+engine keeps a *cell floor* per session, the first draft cell built from a real row:
 
-A draft layer that reads an approximated cell costs only draft acceptance (speed); the target model verifies every
-emitted token, so the answer does not depend on it.
+- A read that KVA approximated raises the floor to the end of its approximated chunks. The draft layer builds no
+  cell below it and its attention starts no lower, so it reads the window `[max(floor, pos - window), pos)`: the
+  exactly computed tail, growing with the conversation, never an approximated cell. The target model verifies
+  every token either way.
+- The floor follows the *tokens* of the state a request continues from (the live session, a conversation checkpoint,
+  a parked conversation): the engine remembers which token prefixes a KVA read approximated, and a state's floor
+  is how much of its tokens agree with one of them. A state no KVA read produced (a short chat, another document,
+  every prompt of a `STRATA_KVA=0` run) has floor 0.
+- With floor 0 the draft layer attends to exactly the window it attended to with `STRATA_KVA=0`
+  (`window_start`, unit tested for every length). The only added work is one tiny kernel that picks the cells.
+  With `STRATA_KVA=0`, with the engine configurations that rule KVA out and with a build without a draft layer,
+  the draft layer's code is 0.2.6's own.
+
+Measured on the P100 (14K prompt, 256 tokens, auto cache and prefill), the draft layer's window made no difference
+to decode (38.7 tok/s with the 32768-cell window, 40.1 with 2048); on faster cards a smaller window costs
+acceptance, which is why the window is left alone.
 
 ## Chats, follow-up turns and checkpoints (`--serve`)
 
@@ -76,7 +84,7 @@ there, with a line when it is set).
 |---|---:|---|
 | `STRATA_KVA` | on | `0` turns KVA off (the exact 0.2.6 prompt read). `1` is the same as the default but logs every read it turned away |
 | `STRATA_KVA_SPLIT` | 24 | first approximated layer (zero-based) |
-| `STRATA_KVA_SUFFIX` | 2112 with the default draft window | fully computed tail positions; see above |
+| `STRATA_KVA_SUFFIX` | 2048 | fully computed tail positions; see above |
 | `STRATA_KVA_MIN_PROMPT` | 4096 | shorter prompts stay on the full path |
 | `STRATA_KVA_ONLY` | all | `gdn` or `qsa`: approximate only that layer type |
 | `STRATA_KVA_MODE` | identity | `identity`, `oracle`, `linear` (linear is not implemented) |
@@ -88,7 +96,7 @@ there, with a line when it is set).
 
 Every read says what it did:
 
-- applied: `strata prefill: KVA on: split 24, suffix 2112, approximated 5120 of 7533 positions in 5 of 8 chunks, mode identity`
+- applied: `strata prefill: KVA on: split 24, suffix 2048, approximated 5120 of 7533 positions in 5 of 8 chunks, mode identity`
 - turned away: `strata prefill: KVA configured but NOT applied: <reason> (prompt … positions, min_prompt …, suffix …, split …)`
 
 A quality comparison needs the control arm to say `STRATA_KVA=0` (an unset variable is now KVA).

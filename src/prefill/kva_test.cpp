@@ -1,10 +1,13 @@
 // src/prefill/kva_test.cpp - the KVA switch, the automatic tail and the reasons a read is turned away (no GPU needed).
+#include "strata/kernels/window_start.hpp"
 #include "strata/prefill/kva.hpp"
+#include "strata/prefill/kva_floor.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 using namespace strata::prefill;
 
@@ -50,25 +53,13 @@ int main() {
     { const KvaConfig c = kva_config_from_env(); CHECK(c.on && !c.explicit_on); }
     clear_all();
 
-    // ---- the automatic tail: 2048, or the draft layer's window + 64 when that is larger; STRATA_KVA_SUFFIX wins
+    // ---- the tail: 2048, or STRATA_KVA_SUFFIX; the draft window plays no part (the cell floor protects the draft layer)
     {
         const KvaConfig c = kva_config_from_env();
-        KvaEngine none;                                   // no draft layer
-        CHECK(c.effective_suffix(none) == kKvaSuffixDefault);
-        KvaEngine d;                                      // the window the engine picks (no --mtp-window given)
-        d.has_drafter = true;
-        d.drafter_window = kKvaDrafterWindow;
-        CHECK(c.effective_suffix(d) == 2112);
-        d.drafter_window = 8192;                          // --mtp-window 8192
-        CHECK(c.effective_suffix(d) == 8256);
-        d.drafter_window = 512;                           // a small window: the default tail still holds
-        CHECK(c.effective_suffix(d) == 2048);
-        d.drafter_window = 0;                             // every cell: no tail can cover it, the plain tail is returned
-        CHECK(c.effective_suffix(d) == 2048);
+        CHECK(c.effective_suffix() == kKvaSuffixDefault && kKvaSuffixDefault == 2048);
         put("STRATA_KVA_SUFFIX", "3000");
         const KvaConfig e = kva_config_from_env();
-        d.drafter_window = 8192;
-        CHECK(e.effective_suffix(d) == 3000);
+        CHECK(e.effective_suffix() == 3000);
         clear_all();
     }
 
@@ -76,8 +67,6 @@ int main() {
     {
         const KvaConfig c = kva_config_from_env();
         KvaEngine eng;
-        eng.has_drafter = true;
-        eng.drafter_window = kKvaDrafterWindow;
         bool routine = false;
         // a cold 14.6K prompt on one device: applies
         CHECK(c.decline(eng, 0, 14600, 0, -1, 48) == nullptr);
@@ -102,16 +91,7 @@ int main() {
         put("STRATA_KVA", "1");
         { const KvaConfig f = kva_config_from_env(); CHECK(f.decline(eng, 0, 14600, 0, -1, 40, false, false, nullptr, true) == nullptr); }
         clear_all();
-        // a draft layer that attends to every cell has no tail that covers it
-        KvaEngine all = eng;
-        all.drafter_window = 0;
-        CHECK(is(c.decline(all, 0, 14600, 0, -1, 48), "the draft layer attends to every cell (set --mtp-window)"));
-        put("STRATA_KVA_SUFFIX", "2112");   // ... unless the user fixes the tail by hand
-        { const KvaConfig s = kva_config_from_env(); CHECK(s.decline(all, 0, 14600, 0, -1, 48) == nullptr); }
-        clear_all();
         // no draft layer at all: nothing to cover
-        KvaEngine nod;
-        CHECK(c.decline(nod, 0, 14600, 0, -1, 48) == nullptr);
         // the engine rules the whole process out (batch slots, a layer split, a peer device)
         KvaEngine blocked = eng;
         blocked.blocked = "batch slots (--batch)";
