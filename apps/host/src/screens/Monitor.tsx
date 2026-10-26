@@ -2,7 +2,7 @@ import {localeTag} from '../lib/i18n';
 import { tr } from '../lib/i18n';
 import { scopedMonitor, instanceLabel, deviceLabel } from '../lib/runtime-models';
 /** The original Strata dashboard, adapted to the current shell and device inventory. */
-import { useRef, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { flushSync } from 'react-dom';
 import { SnapshotDialog } from '../components/SnapshotDialog';
 import { requestSummary } from '../lib/monitor-summary';
@@ -14,6 +14,7 @@ import { Screen } from '../components/layout';
 import { contextLabel, duration, tokens, tps } from '../lib/format';
 import { defaultGpuSet, gpuCapacity, gpuId, gpuMetric, gpuReported, hasReading, shortGpuName } from '../lib/monitor-hardware';
 import { useStore } from '../lib/store';
+import { api } from '../lib/client';
 import { useKept } from '../lib/kept-state';
 import type { Hardware, MonitorState, ServeRequest } from '../lib/types';
 import { useNative, nativeRouting, type NativeState } from '../lib/native';
@@ -57,6 +58,14 @@ function requestStatus(request: ServeRequest) {
 }
 export function MonitorScreen() {
     const native = useNative();
+    // While this screen is open and visible the host reads the graphics card every 3 s; otherwise it asks only every 30 s (#4066).
+    useEffect(() => {
+        const ask = () => { if (typeof document === 'undefined' || document.visibilityState !== 'hidden')
+            void api.get('/api/monitor').catch(() => undefined); };
+        ask();
+        const timer = setInterval(ask, 10000);
+        return () => clearInterval(timer);
+    }, []);
     return <LegacyMonitorScreen native={native?.instances.length ? native : null}/>;
 }
 function LegacyMonitorScreen({ native }: {

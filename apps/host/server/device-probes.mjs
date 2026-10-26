@@ -73,14 +73,15 @@ export async function detectDrmGpus() {
   }
   return result;
 }
-export async function readGpuTelemetry(gpus) {
+/** `transfer: false` skips the PCIe throughput sample (a second nvidia-smi); it only means something while a model runs. */
+export async function readGpuTelemetry(gpus, { transfer: wantTransfer = true, run = probe } = {}) {
   const now=new Date().toISOString();
   const hasNvidia=gpus.some(g=>g.vendor==='nvidia');
-  let raw=hasNvidia?await probe('nvidia-smi',['--query-gpu=uuid,temperature.gpu,utilization.gpu,memory.used,power.draw,power.limit,pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current','--format=csv,noheader,nounits'],2000):'';
+  let raw=hasNvidia?await run('nvidia-smi',['--query-gpu=uuid,temperature.gpu,utilization.gpu,memory.used,power.draw,power.limit,pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current','--format=csv,noheader,nounits'],2000):'';
   // Older drivers can reject a field; retain their basic sensors in that case.
-  if(hasNvidia&&!raw)raw=await probe('nvidia-smi',['--query-gpu=uuid,temperature.gpu,utilization.gpu,memory.used','--format=csv,noheader,nounits'],2000);
+  if(hasNvidia&&!raw)raw=await run('nvidia-smi',['--query-gpu=uuid,temperature.gpu,utilization.gpu,memory.used','--format=csv,noheader,nounits'],2000);
   const nvidia=new Map(parseNvidiaReadings(raw).map(r=>[r.id,r]));
-  const transfer=hasNvidia?parsePcieThroughput(await probe('nvidia-smi',['dmon','-s','t','-c','1'],1500)):new Map();
+  const transfer=hasNvidia&&wantTransfer?parsePcieThroughput(await run('nvidia-smi',['dmon','-s','t','-c','1'],1500)):new Map();
   return Promise.all(gpus.map(async gpu=>{
     let reading=nvidia.get(gpu.id)??{id:gpu.id??`${gpu.vendor}:${gpu.index}`,temperatureC:null,utilizationPct:null,memoryUsedGb:null,powerW:null,powerLimitW:null,pcieGen:null,pcieGenMax:null,pcieWidth:null,pcieRxMbs:null};
     if(gpu.vendor==='nvidia')reading={...reading,pcieRxMbs:transfer.get(gpu.sensorIndex??gpu.index)??null};

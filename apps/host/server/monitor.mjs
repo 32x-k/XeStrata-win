@@ -3,6 +3,7 @@ import { variant as catalogVariant, footprint } from './catalog.mjs';
 import { detect, cachedHardware } from './hardware.mjs';
 import { readGpuTelemetry, gpuMemoryTotals } from './device-probes.mjs';
 import { createSystemSampler } from './system-telemetry.mjs';
+import { sensorPace, WATCH_MS } from './sensor-pace.mjs';
 import { state as servingState } from './serving.mjs';
 import { originalDashboard } from './monitor-dashboard.mjs';
 import { get as getStore } from './store.mjs';
@@ -58,6 +59,14 @@ let hwCache = null;
 let ticker = null;
 let memoryWarningShown = false;
 let sensorsPending = false, sensorsAt = 0;
+/* The Monitor screen asks (GET /api/monitor) every few seconds while it is open; a model that is loaded counts as live (#4066). */
+let watchedUntil = 0, liveProbe = () => false;
+export function watch() {
+  const wasIdle = Date.now() >= watchedUntil;
+  watchedUntil = Date.now() + WATCH_MS;
+  if (wasIdle) sensorsAt = 0;                                    // opening the Monitor after a quiet spell reads the card at once
+}
+export function setLiveProbe(probe) { liveProbe = typeof probe === 'function' ? probe : () => false; }
 let systemReading=null;
 const sampleSystem=createSystemSampler();
 const finite = value => typeof value==='number'&&Number.isFinite(value);
@@ -108,10 +117,11 @@ function approach(current, target, factor = 0.22) {
 }
 
 function tick() {
-  if(!sensorsPending&&Date.now()-sensorsAt>=3000){
+  const pace=sensorPace({live:supervisor.status().running||!!liveProbe(),watchedUntil});
+  if(!sensorsPending&&Date.now()-sensorsAt>=pace.intervalMs){
     sensorsPending=true;sensorsAt=Date.now();
     const hardware=cachedHardware()??hwCache;
-    void Promise.all([readGpuTelemetry(hardware?.gpus??[]),sampleSystem(hardware?.processors??[])])
+    void Promise.all([readGpuTelemetry(hardware?.gpus??[],{transfer:pace.transfer}),sampleSystem(hardware?.processors??[])])
       .then(([readings,system])=>{state.hardware.gpus=readings;systemReading=system;})
       .catch(()=>{state.hardware.gpus=[];systemReading=null;})
       .finally(()=>{sensorsPending=false;});

@@ -224,6 +224,7 @@ models.init(hub);
 engine.init(hub);
 engineInstall.init(hub);
 monitor.init(hub, boot);
+monitor.setLiveProbe(() => native.hasLive());
 serving.init(hub, { port: PORT, host: HOST });
 runtimeModels=createRuntimeModels({hardware:()=>hardware.cachedHardware()??boot,library:()=>models.library(),requests:()=>serving.state().requests,real:models.REAL,changed:value=>{
   if(!models.REAL){const primary=value.instances.find(i=>i.id===value.defaultId);if(store.get().loaded!==(primary?.variantId??null))store.update({loaded:primary?.variantId??null});}
@@ -1586,7 +1587,7 @@ async function api(req, res, path, method, url) {
   if (cancelMatch && method === 'POST') return json(res, 200, serving.cancel(cancelMatch[1]));
 
   // --- monitor ------------------------------------------------------------
-  if (path === '/api/monitor') return json(res, 200, monitor.snapshot());
+  if (path === '/api/monitor') { monitor.watch(); return json(res, 200, monitor.snapshot()); }
 
   // --- skills / workspace -------------------------------------------------
   if (path === '/api/skills' && method === 'GET') {
