@@ -58,6 +58,8 @@ Requirements and limits for this first version:
 - Layer type matters more than the count: approximating only the 6 late QSA layers cost a 0.153 residual error
   at 1.08×; approximating 18 GDN layers cost 0.339 at 1.18×. A gated recurrence integrates its input over the
   whole prefix, so a wrong input keeps biasing the state, while a wrong QSA K/V only misplaces attention keys.
+- On IQ2_XS the same 14.6K-token three-needle test gives 208.0 → 328.7 prompt tok/s (1.58×) with all three
+  codes retrieved, against 201.6 → 320.7 (1.59×) on IQ3_XXS: the feature is not tied to one quantization.
 - The control is not bit-reproducible on this box (identical runs differ in the last chunks by ~0.85 %), so the
   residual figures are quoted against that measured floor, never as bit equality.
 

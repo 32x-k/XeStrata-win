@@ -2606,9 +2606,11 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
     gdn_l2_kernel<<<dim3(2 * HK, (unsigned) T), S, 0, (cudaStream_t) stream>>>(h, eps);
     check("gdn_conv");
 }
-void gdn_recurrence_variant(int variant, float* state, const float* h, const float* gate, const float* beta,
-                            const float* z, const float* gamma, float eps, float* y, uint16_t* y16, int64_t T,
-                            void* stream, int64_t ld16, bool with_out) {
+// The recurrence dispatch, shared by the two entry points below so the state-only form cannot drift from the full
+// one.  `with_out` false runs exactly the same kernels minus the output normalization (the CUDA-only KVA path).
+static void gdn_recurrence_impl(int variant, float* state, const float* h, const float* gate, const float* beta,
+                                const float* z, const float* gamma, float eps, float* y, uint16_t* y16, int64_t T,
+                                void* stream, int64_t ld16, bool with_out) {
     if (ld16 <= 0) ld16 = (int64_t) HV * S;
     static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;   // the one-block-per-head kernel (A/B)
 #if defined(__HIPCC__)
@@ -2727,6 +2729,11 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
     }
     check("gdn_recurrence");
 }
+void gdn_recurrence_variant(int variant, float* state, const float* h, const float* gate, const float* beta,
+                            const float* z, const float* gamma, float eps, float* y, uint16_t* y16, int64_t T,
+                            void* stream, int64_t ld16) {
+    gdn_recurrence_impl(variant, state, h, gate, beta, z, gamma, eps, y, y16, T, stream, ld16, /*with_out=*/true);
+}
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream, int64_t ld16) {
     // Aurora (S23): four lanes per column + the grid-stride norm, the same bits (tests/hip/gdn_rec_head.cpp);
@@ -2734,7 +2741,7 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
     // (AMD builds only; the arch defaults set STRATA_GDN_HEAD=1 on gfx1151 and leave other cards on the earlier kernels)
     static const bool head = [] { const char* v = std::getenv("STRATA_GDN_HEAD"); return v != nullptr && std::atoi(v) != 0; }();
     static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;
-    gdn_recurrence_variant(head && !serial ? 1 : 0, state, h, gate, beta, z, gamma, eps, y, y16, T, stream, ld16);
+    gdn_recurrence_impl(head && !serial ? 1 : 0, state, h, gate, beta, z, gamma, eps, y, y16, T, stream, ld16, true);
 }
 /// KVA: the same recurrence, bit for bit, without the output normalisation (its readers - the output projection
 /// and the gated residual write - have no consumer when only the state advances).  `y` is still the scratch the
@@ -2743,8 +2750,8 @@ void gdn_recurrence_state_only(float* state, const float* h, const float* gate, 
                                int64_t T, void* stream) {
     static const bool head = [] { const char* v = std::getenv("STRATA_GDN_HEAD"); return v != nullptr && std::atoi(v) != 0; }();
     static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;
-    gdn_recurrence_variant(head && !serial ? 1 : 0, state, h, gate, beta, nullptr, nullptr, 0.0f, y, nullptr, T,
-                           stream, 0, /*with_out=*/false);
+    gdn_recurrence_impl(head && !serial ? 1 : 0, state, h, gate, beta, nullptr, nullptr, 0.0f, y, nullptr, T,
+                        stream, 0, /*with_out=*/false);
 }
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream) {
     if (n_expert == 512)
