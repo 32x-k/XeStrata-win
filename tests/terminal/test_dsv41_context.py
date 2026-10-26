@@ -117,6 +117,17 @@ class Terminal(unittest.TestCase):
 
 
 class SetupAndApp(unittest.TestCase):
+    def test_nobody_gets_a_bigger_context_than_before_unless_they_choose_it(self):
+        """The default stays 8K everywhere: setup writes it, the Terminal recommends it, the app starts a new DeepSeek version at it and shows an installed one at
+        the context it was prepared with (so a 0.2.5 / 0.2.6 user's load is the saved file's, as it was)."""
+        import setup
+        self.assertEqual(setup.DSV41_CONTEXT, 8192)
+        with Home(), mock.patch.object(Catalog, "hardware", lambda self, fresh=False: dict(HW_4X32)):
+            self.assertEqual(catalog(HW_4X32).max_context("deepseek41", "UD-Q8_K_XL"), 8192)
+        screen = (ROOT / "apps" / "host" / "src" / "components" / "NativeModels.tsx").read_text(encoding="utf-8")
+        self.assertRegex(screen, r"if \(selectedSize\.multi_file\)\s+setContext\(8192\)")
+        self.assertRegex(screen, r"if \(installed\.context\)\s+setContext\(installed\.context\)")
+
     def test_setup_stops_before_any_download_and_checks_the_pack_again(self):
         source = (ROOT / "setup.py").read_text(encoding="utf-8")
         early = source.index("ctx = a.context or DSV41_CONTEXT")

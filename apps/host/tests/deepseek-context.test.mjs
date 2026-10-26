@@ -83,6 +83,8 @@ test('the Models screen honours the choice (it no longer forces 8K), offers the 
   assert.match(screen, /contextChoices\(selectedSize\?\.multi_file \? deepseekContexts\(installed\?\.contextMax\) : native\?\.catalog\?\.contexts \?\? \[8192, 32768, 65536, 131072, 262144\], context\)/);
   assert.match(screen, /selectedSize\?\.multi_file && deepseekContextNote\(context\) \? <p className="small muted native-spill-note"><Icon name="info" size=\{16\}\/>\{tr\(deepseekContextNote\(context\)\)\}<\/p> : null/);
   assert.match(screen, /if \(selectedSize\.multi_file\)\s+setContext\(8192\)/, 'the default for a DeepSeek version that is not installed stays 8K');
+  assert.match(screen, /if \(installed\.context\)\s+setContext\(installed\.context\)/, 'an installed DeepSeek model shows and loads the context it was prepared with, whatever was kept from another model');
+  assert.match(screen, /installed\?\.ready && context === installed\.context/, 'a load at the prepared context starts from the saved file; only a changed choice runs setup again');
 });
 
 test('the note is in the catalog in all eight languages, translated', () => {
