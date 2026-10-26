@@ -40,7 +40,12 @@ constexpr uint64_t kChunkInPlace4096Below = 16ull << 30;
 // smallest card; big: the chunk of the streamed case (the engine's kVlRows, 8192)
 inline int prefill_chunk_default(bool own_default, double gpu_share, bool gguf_copy, bool file_experts, bool hip, uint64_t min_vram_bytes,
                                  int big = 8192) {
-    if (own_default && gpu_share >= 0.5) return 1024;
+    // The cards hold most of the experts: the small chunk is the measured one, and it is not a single-card matter.  The
+    // 4 x R9700 datapoint above (1024: 370 against 214 tok/s at 8192) is a multi-card run, and on that box the rule used
+    // to fall through to 2048/8192: measured here again (2.25 bpw, 4 cards, --dspark auto, ids 5705e1164a) 8K warm
+    // prompts 1024 -> 1247 ppts against 690 at 8192, with the decode unchanged, so the share alone decides it now.
+    (void) own_default;
+    if (gpu_share >= 0.5) return 1024;
     if (gguf_copy && !hip && min_vram_bytes >= kChunk4096MinVram) return 4096;
     // the experts read in place on a card under 16 GiB (the 12 GB PCs; not measured on HIP): 4096 keeps ~120 more experts resident than 8192 (RTX 5070
     // 287 against 165, RTX 3060 386 against 277) - 5 interleaved pairs, 4096 against 8192, decode: 5070 agent x1.020 (5/5) code x1.004 (3/5), 3060
