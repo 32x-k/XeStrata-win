@@ -518,6 +518,12 @@ int pcie_split_m(const PcieSplitTimes& t, bool overlap, int f, int h);
 /// computing experts from its memory, the PCIe fetch of experts in RAM, and the CPU's and the link's sides beside each
 /// other from the rate the memory serves.  False, with `why`, when a side cannot be timed (too few experts in RAM).
 bool measure_pcie_split(ExpertDispatch& d, int64_t n_layers, PcieSplitTimes& t, std::string& why);
+/// Both engines' (generate.cpp, PlainModel): the split measured into `t` and set on `d` (`overlap`: the fetch beside
+/// the VRAM hits), unless `keep` says why the share stays `frac` (a --pcie-frac given, a layer split, ...) or a side
+/// cannot be timed; logs which, and the split's row (of f = 1..16 missed experts with as many hits, the number read
+/// over PCIe).  `who` names the engine.  True when the measured split is set.
+bool setup_pcie_split(ExpertDispatch& d, int64_t n_layers, PcieSplitTimes& t, bool overlap, const char* keep, double frac,
+                      const char* who);
 /// The memory's rate for measure_pcie_split, read now (before a long prompt, where the split is set up after it: after a
 /// 64K prompt the reading came out up to 3x low on the RX 9060 XT's machine).
 void read_memory_rate_before(const ExpertDispatch& d, int64_t n_layers);

@@ -2019,27 +2019,14 @@ int kernel_bench(const std::string& pack) {
     return 0;
 }
 
+// The PCIe split: core's setup_pcie_split, which the other models' engine calls the same way.
 void setup_pcie_split(strata::core::ExpertDispatch& d, int64_t n_layers, const Options& o, bool pcie_given,
                       bool layer_split, bool overlap, strata::core::PcieSplitTimes& t) {
     const char* keep = pcie_given ? "--pcie-frac is given"
                        : layer_split ? "a layer split (each GPU's link)"
                        : (o.pcie_mode == "dma" || o.pcie_mode == "direct") ? "--pcie-mode is not the copy kernel"
                                                                             : nullptr;
-    std::string why;
-    if (keep == nullptr && !measure_pcie_split(d, n_layers, t, why)) keep = why.c_str();
-    if (keep != nullptr) {
-        std::fprintf(stderr, "strata generate: PCIe split: the share %.2f of the missed experts (%s)\n", o.pcie_frac, keep);
-        return;
-    }
-    d.pcie_split = &t;
-    d.pcie_overlap = overlap;
-    // a row of the split: of f = 1..16 missed experts with as many VRAM hits, the number read over PCIe
-    std::string row;
-    for (int f = 1; f <= 16; ++f) row += " " + std::to_string(strata::core::pcie_split_m(t, overlap, f, f));
-    std::fprintf(stderr, "strata generate: PCIe split, measured: an expert %.3f ms on the CPU (%.3f beside the link), "
-                         "%.3f ms over PCIe (%.3f beside the CPU), %.3f ms on the GPU, layer %lld -> of 1..16 missed "
-                         "experts (as many hits) PCIe takes%s%s\n",
-                 t.c, t.cb, t.p, t.pb, t.q, (long long) t.layer, row.c_str(), overlap ? " (beside the hits)" : "");
+    (void) strata::core::setup_pcie_split(d, n_layers, t, overlap, keep, o.pcie_frac, "strata generate");
 }
 
 // The expert arena moves into host USM (seconds: Gyro-M's 30 GB took 12 s on the B70) only where the GPU cannot read

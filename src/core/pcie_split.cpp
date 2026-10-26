@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <string>
@@ -293,6 +294,25 @@ bool measure_pcie_split(strata::core::ExpertDispatch& d, int64_t n_layers, strat
     const double factor = mem > 0.0 ? std::max(1.0, (cpu_rate + link_rate) / mem) : 1.0;
     t.cb0 = t.c0; t.cb = t.c * factor;
     t.pb0 = t.p0; t.pb = t.p * factor;
+    return true;
+}
+
+bool setup_pcie_split(ExpertDispatch& d, int64_t n_layers, PcieSplitTimes& t, bool overlap, const char* keep, double frac,
+                      const char* who) {
+    std::string why;
+    if (keep == nullptr && !measure_pcie_split(d, n_layers, t, why)) keep = why.c_str();
+    if (keep != nullptr) {
+        std::fprintf(stderr, "%s: PCIe split: the share %.2f of the missed experts (%s)\n", who, frac, keep);
+        return false;
+    }
+    d.pcie_split = &t;
+    d.pcie_overlap = overlap;
+    std::string row;
+    for (int f = 1; f <= 16; ++f) row += " " + std::to_string(pcie_split_m(t, overlap, f, f));
+    std::fprintf(stderr, "%s: PCIe split, measured: an expert %.3f ms on the CPU (%.3f beside the link), %.3f ms over "
+                         "PCIe (%.3f beside the CPU), %.3f ms on the GPU, layer %lld -> of 1..16 missed experts (as "
+                         "many hits) PCIe takes%s%s\n",
+                 who, t.c, t.cb, t.p, t.pb, t.q, (long long) t.layer, row.c_str(), overlap ? " (beside the hits)" : "");
     return true;
 }
 

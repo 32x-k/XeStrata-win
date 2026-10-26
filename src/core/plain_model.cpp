@@ -1203,29 +1203,27 @@ void PlainModel::pinned_split() {
         const char* v = std::getenv("STRATA_WSL_PCIE_SPLIT");
         return v != nullptr && std::strtol(v, nullptr, 10) != 0;
     }();
-    if (opt_.pcie_split && strata::platform::under_wsl() && !wsl_split) {
-        std::fprintf(stderr, "strata plain: no PCIe split under WSL 2 (the GPU reading the experts' RAM failed "
-                             "there; STRATA_WSL_PCIE_SPLIT=1 tries it): the CPU takes every missed expert\n");
-        return;
-    }
-    if (!opt_.pcie_split || moe_local_.empty()) return;
-    std::string why;
-    if (!measure_pcie_split(disp_, n_moe_, split_, why)) {
-        std::fprintf(stderr, "strata plain: no PCIe split (%s): the CPU takes every missed expert\n", why.c_str());
-        return;
-    }
-    disp_.pcie_split = &split_;
-    // the decode's PCIe share (its size from the times: pcie_split_m): chosen by the first windows (pcie_probe);
-    // STRATA_PLAIN_DECODE_PCIE=1 / 0: on / off
+    if (moe_local_.empty()) return;
+    const char* keep = !opt_.pcie_split ? "--no-pcie-split"
+                       : strata::platform::under_wsl() && !wsl_split
+                           ? "under WSL 2: the GPU reading the experts' RAM failed there; STRATA_WSL_PCIE_SPLIT=1 tries it"
+                           : nullptr;
+    if (!setup_pcie_split(disp_, n_moe_, split_, false, keep, 0.0, "strata plain")) return;   // overlap: after the hits
+    // the decode's PCIe share (its size from the times: pcie_split_m): chosen by the first windows (pcie_probe), which
+    // Qwen3.8-Flash-Next's engine does not do; STRATA_PLAIN_DECODE_PCIE=1 / 0: on / off
     if (const char* v = std::getenv("STRATA_PLAIN_DECODE_PCIE")) {
         disp_.pcie_num = std::strtol(v, nullptr, 10) != 0 ? 256 : 0;
     } else {
         disp_.pcie_num = 256;
         pcie_probe_ = 0;
     }
-    disp_.pcie_overlap = false;   // the window reads the PCIe share after its VRAM hits
+    // The arena moves where the GPU can read it (Level Zero's registration is for copies) here, when the split's
+    // table reads any expert over PCIe - not after the first prompt by its routing, as generate.cpp's
+    // (pcie_move_if_pays): there the move's seconds went into the first answer's wait, the B70's prompt of llm-jp-4.1
+    // 0.5-0.8 -> 8.5 s and of Qwen3.6 0.6 -> 5.8 s (both moved: 7.5 and 5.2 s), the load as much shorter (2026-10-26).
     bool any = false;
     for (int f = 1; f <= 16 && !any; ++f) any = pcie_split_m(split_, false, f, f) > 0;
+    std::string why;
     if (any && !src_->pcie_layer(split_.layer) && !src_->make_kernel_readable(why)) {
         std::fprintf(stderr, "strata plain: the experts stay registered for copies (%s): the CPU takes every "
                              "missed expert\n", why.c_str());
@@ -1233,8 +1231,6 @@ void PlainModel::pinned_split() {
         disp_.pcie_num = 0;
         pcie_probe_ = -1;
     }
-    std::fprintf(stderr, "strata plain: PCIe split: an expert %.3f ms on the CPU, %.3f ms over PCIe, %.3f ms on "
-                         "the GPU%s\n", split_.c, split_.p, split_.q, any ? "" : " (the CPU takes them all)");
 }
 
 // After every stage's tier: the experts that do not all fit in RAM, the ones no VRAM tier holds pinned there, as far
