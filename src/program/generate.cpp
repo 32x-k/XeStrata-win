@@ -1981,6 +1981,22 @@ static bool pcie_auto_split_ok() {
 #endif
 }
 
+/// 0.2.7: gfx12 native packs start their decode miss split at 0.15 instead of the x16 share 0.55.  Measured on an R9700
+/// (p620, IQ3_S, 24576 expert pairs of which 13207 resident): --pcie-frac 0.15 decodes 94.6 tok/s at 8K against 86.1 and
+/// 84.4 against 67.2 at 32K (rotated pairs; at 64K the window is attention-bound and it is +4.7%); under serve/server.py a
+/// short chat decodes 93.2 against 84.4.  The CPU lane rounds a missing expert's FP32 rows differently from the GPU lane,
+/// so this changes bits; the first-token KL of 0.0 against 0.55 is 0.0013 mean with the same top-1 in 12 of 12 prompts
+/// (below the engine's own implementation-noise scale).  An explicit --pcie-frac always wins, and
+/// STRATA_PCIE_FRAC_DEFAULT=old restores the old share; the HIP-only gate keeps every CUDA build on its own measured
+/// values.
+[[maybe_unused]] static bool pcie_share_gfx12_default() {
+#if defined(STRATA_USE_HIP)
+    return decode_defaults_arch_ok();
+#else
+    return false;
+#endif
+}
+
 // HIP outside gfx12: the same refinement, opt-in with STRATA_PCIE_FRAC_DEFAULT=auto (#2224).  Its author gate-measured it on an
 // RX 7900 XTX (gfx1100) as "no regression" only (4 alternating starts at 64K, prefill 2189 base vs 2180 with it, decode 65.4 vs
 // 65.4; under serve the share refines 0.55 -> 0.25 from the pool's 42-45 us/missed expert and the probed 28.4-28.5 GB/s link);
@@ -3562,10 +3578,13 @@ int main(int argc, char** argv) {
     if (o.pcie_frac < 0.0) {
         const auto& lay0 = strata::kernels::cpu::expert_layout();
         const bool nvfp4_pack = native_pack && !lay0.fmt.empty() && lay0.fmt[0].gu_type == 40;
-        const double base = nvfp4_pack ? 0.25 : native_pack ? 0.55 : 0.2;
-        std::string bursts;
         const char* pfd = std::getenv("STRATA_PCIE_FRAC_DEFAULT");
         const bool pf_old = pfd != nullptr && std::strcmp(pfd, "old") == 0;
+        // 0.2.7: gfx12 native packs start at 0.15 (see pcie_share_gfx12_default above); other cards and
+        // STRATA_PCIE_FRAC_DEFAULT=old keep the x16 share measured for them.
+        const double base = nvfp4_pack ? 0.25
+                                       : native_pack ? (pcie_share_gfx12_default() && !pf_old ? 0.15 : 0.55) : 0.2;
+        std::string bursts;
 #if !defined(STRATA_USE_HIP) && defined(_WIN32)
         // Windows: opt-in (STRATA_PCIE_AUTO_CANON=1); an RTX 5070 decoded a short Q2_0 answer 3% slower with it, code 2.5% faster
         const char* pac = std::getenv("STRATA_PCIE_AUTO_CANON");
