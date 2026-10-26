@@ -234,6 +234,9 @@ def cmd_bench(a, cfg):
     elif arm == "single":
         eng = make_engine(cfg, Dg, "single")
         closers = [eng]
+    elif arm == "single_shared":                 # one card, the arena in the shared file: what the split's engines read from
+        eng = make_engine(cfg, Dg, "single_shared", arena=arena)
+        closers = [eng]
     elif arm == "split":
         spec = split_mod.split_spec({"split_serve": {"prefill_gpu": P, "decode_gpu": Dg,
                                                     "min_prompt_tokens": cfg.get("min_prompt_tokens", 2048)}})
@@ -251,12 +254,15 @@ def cmd_bench(a, cfg):
         for _ in range(3):                                       # warm-up: graphs, the adaptive tier (discarded)
             run_gen(eng, warm, 100)
         if arm == "split":
-            run_gen(eng, read_ids(os.path.join(cfg["prompts"], "pp_4096.txt")), 16)    # one hand-over: warms the file path
+            wp = read_ids(os.path.join(cfg["prompts"], "pp_4096.txt"))
+            wp[0] = 2999                                     # its own prompt: no workload below finds it in a cache
+            run_gen(eng, wp, 16)                             # one hand-over: warms the file path
         for rep in range(a.reps):
-            for name, w in WORKLOADS:
+            for widx, (name, w) in enumerate(WORKLOADS):
                 if a.only and name not in a.only:
                     continue
                 ids = read_ids(os.path.join(cfg["prompts"], f"pp_{w['prompt']}.txt"))[:w["prompt"]]
+                ids[0] = 3000 + rep * 16 + widx              # a prompt of its own: a cold start in every arm, every rep
                 if "turns" not in w:
                     # a fresh conversation each time: a tiny unrelated request first, so no session is continued
                     run_gen(eng, warm[:40], 1)
@@ -300,7 +306,7 @@ def main():
     ap.add_argument("out")
     ap.add_argument("--tokens", type=int, default=64)
     ap.add_argument("--prompt", type=int, default=4096)
-    ap.add_argument("--arm", default="split")
+    ap.add_argument("--arm", default="split", choices=["layer", "single", "single_shared", "split"])
     ap.add_argument("--reps", type=int, default=2)
     ap.add_argument("--only", nargs="*", default=None)
     a = ap.parse_args()
