@@ -138,9 +138,6 @@ if(STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(conversation_memory_test src/core/conversation_memory_test.cpp src/core/conversation_memory.cpp)
   target_include_directories(conversation_memory_test PRIVATE include)
   add_test(NAME conversation_memory_test COMMAND conversation_memory_test)
-  add_executable(ple_residency_test src/core/ple_residency_test.cpp)
-  target_include_directories(ple_residency_test PRIVATE include)
-  add_test(NAME ple_residency_test COMMAND ple_residency_test)
   add_executable(conversation_file_test src/core/conversation_file_test.cpp src/core/conversation_file.cpp)
   target_include_directories(conversation_file_test PRIVATE include)
   add_test(NAME conversation_file_test COMMAND conversation_file_test)
@@ -1489,6 +1486,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(ple_reader_test PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(ple_reader_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME ple_reader_selftest COMMAND ple_reader_test --selftest)
+
+  # 0.2.7: the PLE residency rule (table + expert arena + headroom); header-only, needs nothing
+  add_executable(ple_residency_test src/core/ple_residency_test.cpp)
+  target_include_directories(ple_residency_test PRIVATE include)
+  add_test(NAME ple_residency_test COMMAND ple_residency_test)
 
   # The GPU test runs ON THE TARGET PC. `--selftest` allocates
   # and writes real VRAM, so a machine without a device fails this test rather than skipping it silently -
