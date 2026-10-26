@@ -29,6 +29,8 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/sm75_series.hpp"
+#include "strata/core/sm120_series.hpp"
+#include "strata/core/defaults_026.hpp"
 #include "s26_tsum.cuh"
 #if !defined(__HIPCC__)
 #include "q8_1_il.cuh"
@@ -3158,10 +3160,14 @@ bool il_env_on(const char* name) {
 }
 bool il_t1_on() { static const bool on = il_env_on("STRATA_MMVQ_IL_T1"); return on; }
 bool il_q3k_on() { static const bool on = il_env_on("STRATA_MMVQ_IL_Q3K"); return on; }
-// #3453: sm_89's own tables (kIlRows_89 / kIl1Rows_89) are opt-in with STRATA_MMVQ_IL_89=1 until an sm_89 card has run
-// mmvq_il_parity and an end-to-end A/B (docs/MMVQ_IL_TABLE.md).  Unset, an Ada card answers what it answered before: the
-// shared table, no one-column row.  Cached once; the lookup runs on the host once a launch.
-bool il_89_opt_in() { static const bool on = [] { const char* v = std::getenv("STRATA_MMVQ_IL_89"); return v != nullptr && v[0] == '1'; }(); return on; }
+// #3453: sm_89's own tables (kIlRows_89 / kIl1Rows_89) are ON by default on compute capability 8.9 only (owner decision, 0.2.7; no sm_89 card
+// has run mmvq_il_parity or an end-to-end A/B for us, the reporter tests and reports back).  STRATA_MMVQ_IL_89=0 gives an Ada card what it
+// answered before (the shared table, no one-column row) and so does STRATA_DEFAULTS=026; STRATA_MMVQ_IL_89=1 wins over that master switch
+// (sm120_series.hpp mmvq_il_89_resolve).  Cached once; the lookup runs on the host once a launch.
+bool il_89_opt_in() {
+    static const bool on = strata::mmvq_il_89_resolve(std::getenv("STRATA_MMVQ_IL_89"), false, 89, strata::qwen_defaults_026());
+    return on;
+}
 struct IlArch { int cc; const IlRows* t; size_t n; };
 constexpr IlArch kIlArch[] = {
     {60, kIlRows_60, sizeof(kIlRows_60) / sizeof(IlRows)},   // Pascal GP100: measured on a Tesla P100

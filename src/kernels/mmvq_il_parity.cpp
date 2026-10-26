@@ -10,6 +10,8 @@
 // the block scales rewritten as normal fp16 values, so every output is finite (a NaN would compare equal whatever
 // produced it). The bench cycles through enough copies of the weights to miss the L2 cache, as a layer's call does.
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/core/defaults_026.hpp"
+#include "strata/core/sm120_series.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
 #include <cuda_runtime.h>
@@ -273,7 +275,8 @@ const int kAda4080[5][3][5] = {
 int check_tables() {
     int bad = 0;
     const char* e89 = std::getenv("STRATA_MMVQ_IL_89");
-    const bool opt89 = e89 != nullptr && e89[0] == '1';   // sm_89's own tables are opt-in (#3453)
+    // sm_89's own tables are ON by default (#3453, 0.2.7) unless STRATA_MMVQ_IL_89=0 or STRATA_DEFAULTS=026
+    const bool opt89 = strata::mmvq_il_89_resolve(e89, false, 89, strata::qwen_defaults_026());
     for (int type : {23, 12, 13, 14, 11})
         for (int nc = 2; nc <= 4; ++nc)
             for (int n_out : {512, 2560, 6144, 10240, 12288, 248320}) {
@@ -283,7 +286,7 @@ int check_tables() {
                 const int cls = n_out < 2048 ? 0 : n_out < 4096 ? 1 : n_out < 8192 ? 2 : n_out < 12288 ? 3 : 4;
                 const int ti = type == 23 ? 0 : type == 12 ? 1 : type == 13 ? 2 : type == 14 ? 3 : 4;
                 const int b = native_mmvq_il_rows_for(89, type, nc, n_out);
-                // STRATA_MMVQ_IL_89=1: the agreement; unset: what sm_89 answered before #3453 (the shared table, which is
+                // tables on (the default): the agreement; off (=0 or STRATA_DEFAULTS=026): what sm_89 answered before #3453 (the shared table, which is
                 // sm_86's except Q3_K, a type the shared table has no row for)
                 const int want = opt89 ? (kAda4070[ti][nc - 2][cls] == kAda4080[ti][nc - 2][cls] ? kAda4070[ti][nc - 2][cls] : 0)
                                        : (type == 11 ? 0 : a);
@@ -303,7 +306,7 @@ int check_tables() {
         ++bad;
         std::printf("FAIL table: the sm_60 table is not the P100's\n");
     }
-    // sm_89 one column: only Q3_K with STRATA_MMVQ_IL_89=1 (the 4070 and the 4080 agree), else none; wider than 4: the plain kernels
+    // sm_89 one column: only Q3_K with the tables on (the 4070 and the 4080 agree), else none; wider than 4: the plain kernels
     if (native_mmvq_il_rows_for(89, 11, 1, 2560) != 0 || native_mmvq_il_rows_for(89, 11, 1, 6144) != (opt89 ? 1 : 0) ||
         native_mmvq_il_rows_for(89, 12, 1, 6144) != 0) {
         ++bad;

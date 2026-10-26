@@ -1186,6 +1186,8 @@ On 12.0 cards (sm_120) these also apply:
 
 - The interleaved small-batch matvec (`native_mmvq_il`, [MMVQ_IL_TABLE.md](MMVQ_IL_TABLE.md)) runs 5 to 8 tokens, with a 12.0 table
   and, on cards with 80 or more SMs, its own 2-4 token table. `STRATA_MMVQ_IL_WIDE=0` and `STRATA_MMVQ_IL_120=0` turn them off.
+  RTX 40 cards (compute capability 8.9) have their own 2-4 token tables and a one-token Q3_K row, on by default in 0.2.7 and not yet measured
+  on an RTX 40 card by us (same output bit for bit): `STRATA_MMVQ_IL_89=0` or `STRATA_DEFAULTS=026` turns them off.
 - With 80 or more SMs the native packs' prompt experts run on the fused int8 kernels (`STRATA_PF_FUSED`) for IQ2_S, IQ3_XXS,
   IQ3_S and IQ4_XS gate/up. IQ2_XXS and IQ2_XS keep MMQ. Smaller 12.0 cards (an RTX 5070 with 48 SMs) keep MMQ because the fused
   kernels were 4.7% slower on 20K prompts there. `STRATA_PF_FUSED=0` keeps MMQ.

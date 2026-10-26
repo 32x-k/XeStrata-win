@@ -243,6 +243,20 @@ int main() {
         CHECK(!gr_up_wide_default(true, 12, 0));
         CHECK(!gr_up_wide_default(false, 8, 6));
         CHECK(!gr_up_wide_default(false, 12, 1));
+        // #3453: the sm_89 MMVQ-IL tables: on by default for compute capability 8.9 only, off under 026 and in HIP; "1" and "0" win
+        CHECK(mmvq_il_89_default(false, 89));
+        CHECK(!mmvq_il_89_default(false, 86) && !mmvq_il_89_default(false, 80) && !mmvq_il_89_default(false, 90) &&
+              !mmvq_il_89_default(false, 120) && !mmvq_il_89_default(false, 75) && !mmvq_il_89_default(false, 70) &&
+              !mmvq_il_89_default(false, 60) && !mmvq_il_89_default(false, 0));
+        CHECK(!mmvq_il_89_default(true, 89));
+        CHECK(!mmvq_il_89_default(false, 89, true));                       // STRATA_DEFAULTS=026
+        CHECK(mmvq_il_89_resolve(nullptr, false, 89, false));              // unset: the rule
+        CHECK(!mmvq_il_89_resolve(nullptr, false, 89, true));              // unset + 026: off
+        CHECK(!mmvq_il_89_resolve(nullptr, false, 86, false));             // another card: off
+        CHECK(!mmvq_il_89_resolve("0", false, 89, false));                 // STRATA_MMVQ_IL_89=0 turns it off
+        CHECK(mmvq_il_89_resolve("1", false, 89, true));                   // an explicit =1 wins over the master switch
+        CHECK(mmvq_il_89_resolve("1", false, 86, false));                  // (the tables are only looked up for cc 89 anyway)
+        CHECK(mmvq_il_89_resolve("", false, 89, false) && !mmvq_il_89_resolve("", false, 89, true));   // empty text: the rule
         // GR_V3 and IMMA
         CHECK(gr_v3_default(false, 12, 0, false, 72.0 * GiB, false));
         CHECK(!gr_v3_default(false, 12, 0, false, 72.0 * GiB, true));

@@ -23,6 +23,10 @@
   - The hyper-connection read split over two kernels (a discrete RTX 50 / RTX PRO Blackwell card with more than 13 GiB): **+1.2%
     decode on the RTX PRO 5000 with identical tokens**, about +1.5% together with the switch above. On 2x RTX A4000 and the
     RTX 3060 it was slower, so those cards keep the old read. Off switch: `STRATA_GR_V3=0`.
+  - RTX 40 cards (Ada, compute capability 8.9): new decode row tables for the interleaved matrix kernels, on by default. The output is the
+    same bit for bit; only how many rows a warp takes changes. **We have not measured them on an RTX 40 card**: the tables come from two
+    community runs (an RTX 4070 and an RTX 4080), and the report with the 4090 saw no change in decode speed. If you have an RTX 40
+    card, please try 0.2.7 and post your decode numbers on issue 3453. Off switch: `STRATA_MMVQ_IL_89=0`.
 
 ## Going back to 0.2.6
 
@@ -34,7 +38,7 @@ Two switches bring back every default that 0.2.7 changed, in one step, for a tes
   the RAM store's spare slots and put and its settle after a prompt, the dense dequantizer, the F16 gate/up operand, the drafter's
   markov head and the head's column count, and the RDNA3 dense GEMM all go back to what 0.2.6 did.
 - **`STRATA_DEFAULTS=026`** (Qwen): the residency-biased routing, the wide and the stream-split hyper-connection reads, the int8
-  prompt attention, the four gfx12 decode switches, the PLE residency policy and the gfx12 decode split of 0.15 (back to 0.55).
+  prompt attention, the RTX 40 (sm_89) decode tables, the four gfx12 decode switches, the PLE residency policy and the gfx12 decode split of 0.15 (back to 0.55).
   Long prompts on the approximate read (`STRATA_KVA`) are off by default and stay as `STRATA_KVA` says.
 
 A variable or flag you set yourself (`DS4_ATTN_SLAB=N`, `STRATA_ROUTE_PRIOR=2`, `--experts 5`, `--prefill-chunk N`, `--pcie-frac`,
