@@ -106,11 +106,7 @@ std::vector<int32_t> eos_tokens(const std::string& path) {
 // The id of the token spelled `text` in the GGUF's vocabulary, -1 when it has none
 int32_t token_id(const std::string& path, const char* text) {
     try {
-        const GgufModel m = GgufModel::open(path);
-        const MetaValue* v = m.meta().get("tokenizer.ggml.tokens");
-        if (v != nullptr && v->type == MetaType::ARRAY)
-            for (size_t i = 0; i < v->items.size(); ++i)
-                if (v->items[i].s == text) return (int32_t) i;
+        return (int32_t) GgufModel::open(path).meta().string_index("tokenizer.ggml.tokens", text);
     } catch (const std::exception&) {
     }
     return -1;
