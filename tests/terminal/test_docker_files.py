@@ -197,6 +197,18 @@ class Publishing(unittest.TestCase):
         for item in payload:
             self.assertTrue(any(item == p or item.startswith(p.rstrip("/") + "/") for p in listed), f"build.sh does not copy {item}")
 
+    def test_the_source_build_passes_the_commit_to_the_terminal_stage(self):
+        """.git is not in the build context (.dockerignore), so the root Dockerfile's terminal stage gets the commit as a build argument, the way
+        docker/Dockerfile does; without it package_terminal.py stops (#3644). The documented source-build commands pass it."""
+        for dockerfile in (ROOT / "Dockerfile", DOCKER / "Dockerfile"):
+            text = dockerfile.read_text(encoding="utf-8")
+            self.assertRegex(text, r"(?m)^ARG STRATA_COMMIT=", dockerfile.name)
+            self.assertIn("ENV STRATA_BUILD_COMMIT=${STRATA_COMMIT}", text, dockerfile.name)
+        self.assertIn(".git", (ROOT / ".dockerignore").read_text(encoding="utf-8").split())
+        doc = (ROOT / "docs" / "DOCKER.md").read_text(encoding="utf-8")
+        self.assertEqual(doc.count("docker build -t strata:src"), doc.count("--build-arg STRATA_COMMIT=$(git rev-parse HEAD)"))
+        self.assertIn("/data/install/", (ROOT / ".dockerignore").read_text(encoding="utf-8"))
+
     def test_workflow_is_manual_and_pushes_only_on_request(self):
         data = yaml.safe_load(self.WORKFLOW.read_text(encoding="utf-8"))
         triggers = data.get("on", data.get(True))            # YAML 1.1 reads a bare `on` as True
