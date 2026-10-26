@@ -164,7 +164,9 @@ In **Manual**:
 - **These ask:** writing or editing a file, any command that is not on a short list of look-only commands, and every tool
   you connect. In the browser tool, opening a page, clicking and typing ask.
 - **These do not ask:** reading files, listing and searching folders, and look-only commands such as `ls`, `cat` and
-  `git status`. A command with a redirect, a chain (`;`, `&&`), a variable or anything else the check does not recognise asks.
+  `git status`. Each of those commands runs unasked only with options that just look: `sort -o FILE`, `rg --pre PROGRAM`,
+  `tail -f`, `date -s` and `git grep -O` ask, as does any option the check does not know. A command with a redirect, a
+  chain (`;`, `&&`), a variable or anything else the check does not recognise asks.
 - **Web search and opening web pages ask once per chat.** The first one in a chat shows a card with the search words and the
   service they go to, or with the address of the page. **Approve** covers the rest of that chat. **Deny** tells the assistant
   you did not allow the web, and it carries on without it. Plan and Bypass do not ask. The model picks the search words and
