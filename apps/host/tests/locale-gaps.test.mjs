@@ -5,7 +5,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { build } from 'esbuild';
 
-const languages = ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko'];
+const languages = ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr'];
 const read = async name => JSON.parse(await readFile(`src/locales/${name}.json`, 'utf8'));
 const built = await build({ stdin: { contents: "export * from './src/lib/i18n';", resolveDir: process.cwd() }, bundle: true, write: false, format: 'esm', platform: 'node', loader: { '.json': 'json' } });
 const { tr, setTranslationLanguage } = await import(`data:text/javascript;base64,${Buffer.from(built.outputFiles[0].text).toString('base64')}`);
@@ -38,7 +38,7 @@ test('every tr("...") literal and every command hint has a key in the English ca
   assert.deepEqual(missing, []);
 });
 
-test('the fix catalogs have the same keys and placeholders in all eight languages', async () => {
+test('the fix catalogs have the same keys and placeholders in all nine languages', async () => {
   const en = await read('fix-en');
   for (const language of languages) {
     const catalog = await read(`fix-${language}`);

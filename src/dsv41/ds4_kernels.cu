@@ -7,6 +7,7 @@
 #include "ds4_q6k.cuh"
 #include "ds4_attn_split.cuh"
 #include "ds4_wmma.cuh"
+#include "ds4_experts_rule.hpp"
 
 #include <cuda_fp16.h>
 
@@ -2032,6 +2033,8 @@ bool split_enabled() {
 // 0.2.7: ON by default on gfx1200 / gfx1201 (RDNA4: the R9700, RX 9000), where it was measured and gated (KL 0.0003 against the
 // 0.006 gate, ids identical); gfx11 and gfx1151 (Strix Halo) are untested and keep the scalar kernels.  DS4_FAST_ATTN=0 is the
 // off switch (exactly the 0.2.6 arithmetic), DS4_FAST_ATTN=1 turns it on elsewhere.  Decided per device (the first call there).
+// The Marlin stream measured it ON on 4x R9700 (gfx1201), 2.25 bpw, 8K code prompts: 1180 -> 1354 ppts (+14.7%), the same ids,
+// KL 0.10833 against 0.10925 for the scalar path.  It stays gfx12-only until Strix Halo (gfx1151) is tested.
 #if defined(STRATA_USE_HIP)
 bool device_is_gfx12() {
     static std::atomic<int> cache[64];   // 0 unknown, 1 no, 2 yes
@@ -2054,11 +2057,10 @@ bool fast_attn_enabled() {
         const char* e = std::getenv("DS4_FAST_ATTN");
         return e == nullptr ? -1 : (std::atoi(e) != 0 ? 1 : 0);
     }();
-    if (env >= 0) return env == 1;
 #if defined(STRATA_USE_HIP)
-    return device_is_gfx12();
+    return strata::ds4::fast_attn_default(env, device_is_gfx12(), strata::ds4::defaults_026());
 #else
-    return false;
+    return strata::ds4::fast_attn_default(env, false, strata::ds4::defaults_026());
 #endif
 }
 attnsplit::AttnSplitScratch split_scratch(cudaStream_t s, int heads) {
