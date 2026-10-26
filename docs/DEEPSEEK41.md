@@ -78,6 +78,13 @@ Setup needs `strata-dsv41` next to the engine (or `STRATA_DSV41_EXE`) and says s
 `cmake -DSTRATA_BUILD_DSV41=ON`. The default context is 8192 tokens, the size it was checked at; `--context` asks for more.
 Loading takes a few minutes (the config sets `"engine_ready_s": 3600`).
 
+**Context up to 1M.** The model reads 1,048,576 positions natively, so `--context` takes 8K to 1M (`--context 512k`, `--context 1m`; the Terminal's context step
+lists 8K, 32K, 64K, 128K, 256K, 512K and 1M, and the app lists them up to the limit its pack states in `ds4.txt`, `max_position_embeddings`). A size past what the
+pack reads is refused before anything is downloaded. Nothing past 256K has been tested by us: the owner's decision is to offer 512K and 1M and let users try them
+(Project Maya v1.1.28 did the same, #442 by @needmorevram, MIT). The cost is real. The context's cache lives in graphics memory, so every position takes memory from
+the expert cache and fewer experts stay on the card; and a very long prompt is read slowly, because the indexer's work grows with the square of its length. Start
+with 256K or less, and expect the first reply of a 512K or 1M prompt to take many minutes.
+
 ## Through the API
 
 The server speaks to the engine as it does for the other models, so `/v1/chat/completions`, `/v1/messages`, streaming, stop and

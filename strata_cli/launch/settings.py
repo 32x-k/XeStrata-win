@@ -78,6 +78,8 @@ def parse_context(text: Any) -> int:
 def context_label(tokens: int | None) -> str:
     if not tokens:
         return "default"
+    if tokens >= 1048576 and tokens % 1048576 == 0:        # DeepSeek-V4.1-Flash reads 1,048,576 positions: "1M"
+        return f"{tokens // 1048576}M"
     if tokens % 1024 == 0:
         return f"{tokens // 1024}K"
     if tokens >= 1000:
@@ -226,8 +228,17 @@ def check_parallel(s: LaunchSettings, *, vram_gb: float | None, fitted: int | No
     return out
 
 
-def check_context(s: LaunchSettings, *, max_fit_tokens: int | None = None) -> list[Notice]:
+def check_context(s: LaunchSettings, *, max_fit_tokens: int | None = None, deepseek: bool = False, pack_limit: int | None = None) -> list[Notice]:
     out: list[Notice] = []
+    if deepseek:                                   # DeepSeek-V4.1-Flash: 8K to 1M, its own words (strata_control/dsv41_context.py), no rope scaling of ours
+        from strata_control import dsv41_context
+        if s.context is not None:
+            why = dsv41_context.problem(int(s.context), pack_limit)
+            if why:
+                out.append(Notice("error", why, "Choose a smaller context."))
+            elif dsv41_context.note(s.context):
+                out.append(Notice("warn", f"{context_label(s.context)}: {dsv41_context.note(s.context)}", ""))
+        return out
     if s.context is not None and s.context > 262144:
         out.append(Notice("warn", f"{context_label(s.context)} is more than the model was trained on (256K).",
                           "Setup adds rope scaling for it (experimental); answers may get less reliable."))

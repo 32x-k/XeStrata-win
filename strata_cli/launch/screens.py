@@ -24,6 +24,7 @@ from strata_cli.launch import access as acc
 from strata_cli.launch import params as P
 from strata_cli.launch import settings as S
 from strata_cli.launch import store
+from strata_control import dsv41_context
 from strata_cli.launch.widgets import (ACCENT, BAD, DARK, FG, LIGHT, MUTE, WARN, Cell, Item, Menu, bar)
 
 STEPS = (("model", "Model"), ("cards", "Cards"), ("folder", "Folder"), ("context", "Context"), ("pictures", "Pictures"),
@@ -898,20 +899,25 @@ class ContextScreen(Base):
         s, cat = self.ctx.settings, self.ctx.catalog
         items = []
         sel = 0
-        for i, c in enumerate(cat.contexts()):
+        deepseek = bool(s.family and cat.strata.multi_family(s.family))     # DeepSeek-V4.1-Flash: 8K to 1M, not Qwen's list or its rope scaling
+        sizes = cat.contexts_for(s.family, s.model)
+        for i, c in enumerate(sizes):
             kvgb = cat.kv_gb(c, self.kv())
             note, style = "", ""
             if c == self.rec:
                 note = "recommended"
+            elif deepseek:
+                if dsv41_context.note(c):
+                    note, style = "not tested yet: takes memory from the model", WARN
             elif c > max(self.rec * 2, 131072) and c <= 262144:
                 note, style = "tight on this computer", WARN
             elif c > 262144:
                 note, style = "experimental: rope scaling", WARN
-            items.append(Item([S.context_label(c), S.words_for(c), f"+{kvgb:.1f} GB", Cell(note, style)], key=c))
+            items.append(Item([S.context_label(c), S.words_for(c), "" if deepseek else f"+{kvgb:.1f} GB", Cell(note, style)], key=c))
             if c == s.context:
                 sel = i
-        if s.context and s.context not in cat.contexts():
-            items.append(Item([S.context_label(s.context), S.words_for(s.context), f"+{cat.kv_gb(s.context, self.kv()):.1f} GB",
+        if s.context and s.context not in sizes:
+            items.append(Item([S.context_label(s.context), S.words_for(s.context), "" if deepseek else f"+{cat.kv_gb(s.context, self.kv()):.1f} GB",
                                Cell("your own size", "")], key=s.context))
             sel = len(items) - 1
         items.append(Item(["Custom…"], key="custom"))
@@ -932,8 +938,13 @@ class ContextScreen(Base):
         cur = self.menu().current if self.menu() else None
         out = Text("More context lets agents read bigger projects. It uses more memory and the first reply of a long chat is slower. "
                    "The memory shown is only the extra for the conversation itself.", style=MUTE)
+        s = self.ctx.settings
+        deepseek = bool(s.family and self.ctx.catalog.strata.multi_family(s.family))
         if cur is not None and isinstance(cur.key, int) and cur.key > 262144:
-            out.append("\nThis is past what the model was trained on; setup adds rope scaling and answers may get less reliable.", style=WARN)
+            if deepseek:
+                out.append("\n" + dsv41_context.NOTE, style=WARN)
+            else:
+                out.append("\nThis is past what the model was trained on; setup adds rope scaling and answers may get less reliable.", style=WARN)
         return out
 
     def action_memory(self) -> None:
@@ -956,6 +967,12 @@ class ContextScreen(Base):
         except ValueError as e:
             self.say(str(e), True)
             return
+        s = self.ctx.settings
+        if s.family and self.ctx.catalog.strata.multi_family(s.family):       # DeepSeek: a size the pack cannot read is the one refusal
+            why = dsv41_context.problem(n, self.ctx.catalog.pack_limit(s.family, s.model))
+            if why:
+                self.say(why, True)
+                return
         self.ctx.settings.context = n
         self.close_field("custom")
         self.build()
