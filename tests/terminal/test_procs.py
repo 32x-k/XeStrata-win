@@ -180,9 +180,11 @@ class SubreaperOrphans(unittest.TestCase):
 
     def test_ending_waits_on_the_start_token_not_on_an_empty_command_line(self):
         record = {"pid": 4242, "token": "t1", "cmd": ["engine", "--serve"]}
-        tokens = iter(["t1", "t1", None])                       # still exiting twice, then gone
+        answers = ["t1", "t1"]                                   # still exiting twice, then gone
+        def token(pid):
+            return answers.pop(0) if answers else None
         with mock.patch.object(procs, "WINDOWS", False), mock.patch.object(procs, "is_same", side_effect=[True, False, False]) as same, \
-                mock.patch.object(procs, "_signal_verified"), mock.patch.object(procs, "start_token", side_effect=lambda pid: next(tokens)), \
+                mock.patch.object(procs, "_signal_verified"), mock.patch.object(procs, "start_token", side_effect=token), \
                 mock.patch.object(procs, "drop_record"), mock.patch.object(procs.time, "sleep"):
             self.assertEqual(procs.end_one(record, grace=5), "ended")
         self.assertGreaterEqual(same.call_count, 1)
