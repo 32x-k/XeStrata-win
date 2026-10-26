@@ -3152,6 +3152,21 @@ def _installed(name: str) -> bool:
         return False
 
 
+def pip_stamp_is_ours(stamp: Path) -> bool:
+    """The list of installed packages was written for this system (upstream fb3bae20c, #3634): a .venv on a disk that
+    Windows and Linux both start from keeps the other one's list, which then says "already installed" about packages
+    this Python does not have.  A marker beside the list names the system that wrote it; an older list without one is
+    believed only while the packages every run needs can be imported."""
+    marker = stamp.with_name(stamp.name + ".os")
+    try:
+        if marker.exists():
+            return marker.read_text(encoding="utf-8").strip() == sys.platform
+    except OSError:
+        return False
+    import importlib.util
+    return all(importlib.util.find_spec(m) is not None for m in ("numpy", "jinja2", "regex", "yaml"))
+
+
 def pip_install(packages, what):
     """pip install into .venv, skipped when the same list was installed before.  An install from before the pinned
     requirements recorded bare names: those packages are kept as they are (nothing is reinstalled), and the pinned
@@ -3159,7 +3174,7 @@ def pip_install(packages, what):
     # a Python whose prefix this user cannot write (the system's, run without setup.sh's .venv): pip installs into the
     # user's site, and the list is kept there
     stamp = (Path(sys.prefix) if os.access(sys.prefix, os.W_OK) else Path(site.getuserbase())) / ".strata-pip.json"
-    have = json.loads(stamp.read_text()) if stamp.exists() else []
+    have = json.loads(stamp.read_text()) if stamp.exists() and pip_stamp_is_ours(stamp) else []
     bare = {p.lower() for p in have if req_name(p) == p.lower()}
     need = [p for p in packages if p not in have and req_name(p) not in bare
             and not (bare and "==" in p and _installed(req_name(p)))]
@@ -3171,6 +3186,7 @@ def pip_install(packages, what):
     try:
         stamp.parent.mkdir(parents=True, exist_ok=True)
         stamp.write_text(json.dumps(sorted(set(have) | set(need)), indent=0))
+        stamp.with_name(stamp.name + ".os").write_text(sys.platform, encoding="utf-8")
     except OSError as e:                                 # only costs asking pip again next time
         warn(f"could not record the installed packages in {stamp} ({e}): the next run checks them again")
     ok(f"{what} installed")
