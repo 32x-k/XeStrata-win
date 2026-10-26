@@ -21,11 +21,17 @@ ROOT = Path(__file__).resolve().parents[2]
 
 ENV = {      # what each switch writes outside its default
     "faster_long_prompts": {"STRATA_KVA": "1"},
+    "faster_12gb_nvidia": {"STRATA_ROUTE_PRIOR": "0"},
     "faster_radeon_9000": {"STRATA_PCIE_FRAC_DEFAULT": "old"},
-    "deepseek_speedups": {"DS4_FAST_ATTN": "0", "DS4_ATTN_SLAB": "0", "DS4_COPY_PIN": "0", "DS4_COPY_HUGETLB": "0",
+    "deepseek_speedups": {"DS4_DEFAULTS": "026", "DS4_FAST_ATTN": "0", "DS4_ATTN_SLAB": "0", "DS4_COPY_PIN": "0", "DS4_COPY_HUGETLB": "0",
                           "DS4_STORE_SPARE": "0", "DS4_STORE_PUT": "0"},
+    "qwen_defaults_026": {"STRATA_DEFAULTS": "026"},         # the Terminal's troubleshooting switch: not in the app
 }
-DEFAULT = {"faster_long_prompts": "off", "faster_radeon_9000": "on", "deepseek_speedups": "on"}
+DEFAULT = {"faster_long_prompts": "off", "faster_12gb_nvidia": "on", "faster_radeon_9000": "on", "deepseek_speedups": "on", "qwen_defaults_026": "off"}
+SIX = ("DS4_FAST_ATTN", "DS4_ATTN_SLAB", "DS4_COPY_PIN", "DS4_COPY_HUGETLB", "DS4_STORE_SPARE", "DS4_STORE_PUT")
+RTX3060 = {"name": "NVIDIA GeForce RTX 3060", "vendor": "nvidia", "arch": "86", "vram_gb": 12.0}
+RTX4070S = {"name": "NVIDIA GeForce RTX 4070 SUPER", "vendor": "nvidia", "arch": "89", "vram_gb": 12.0}
+RTX4060TI16 = {"name": "NVIDIA GeForce RTX 4060 Ti 16GB", "vendor": "nvidia", "arch": "89", "vram_gb": 16.0}
 R9700 = {"name": "AMD Radeon AI PRO R9700", "vendor": "amd", "arch": "gfx1201"}
 RX7900 = {"name": "AMD Radeon RX 7900 XTX", "vendor": "amd", "arch": "gfx1100"}
 STRIX = {"name": "AMD Radeon 8060S", "vendor": "amd", "arch": "gfx1151", "uma": True}
@@ -37,11 +43,12 @@ DEEPSEEK = {"arch": "deepseek41", "exe": "C:/s/engine-dsv41/0.1.52-win/strata-ds
 
 
 def ids(cfg, gpus, backend=None):
-    return [s.id for s in W.applicable(cfg, gpus, backend)]
+    """The switches the app would show (the Terminal-only one is tested apart)."""
+    return [s.id for s in W.applicable(cfg, gpus, backend) if not s.terminal_only]
 
 
 class Contract(unittest.TestCase):
-    def test_three_switches_with_the_contract_names_and_their_defaults(self):
+    def test_five_switches_with_the_contract_names_and_their_defaults(self):
         self.assertEqual([s.id for s in W.SWITCHES], list(ENV))
         for s in W.SWITCHES:
             self.assertEqual(dict(s.env), ENV[s.id], s.id)
@@ -49,7 +56,8 @@ class Contract(unittest.TestCase):
 
     def test_an_effect_text_says_what_the_feature_does_in_plain_words(self):
         for s in W.SWITCHES:
-            self.assertRegex(s.effect, r"Off by default" if s.default == "off" else r"[Tt]urn off", s.id)
+            if not s.terminal_only:
+                self.assertRegex(s.effect, r"Off by default" if s.default == "off" else r"[Tt]urn off", s.id)
             self.assertNotRegex(s.effect, r"STRATA_|DS4_|--|env", s.id)
         self.assertEqual(W.SWITCHES[0].effect, "Reads very long prompts faster by approximating part of the work. Off by default: answers about long documents can miss or mix up details.")
 
@@ -66,6 +74,59 @@ class Contract(unittest.TestCase):
         self.assertEqual(ids(DEEPSEEK, [R9700]), ["deepseek_speedups"])
         self.assertEqual(ids({**DEEPSEEK, "backend": "cuda"}, [RTX]), ["deepseek_speedups"])
         self.assertEqual(ids({"exe": "C:/x/strata-dsv41.exe"}, [RTX]), ["deepseek_speedups"], "found by the engine's name too")
+
+    def test_faster_answers_on_12gb_nvidia_cards_only_where_the_engine_routing_default_applies(self):
+        """The engine turns residency-biased routing on by default on a DISCRETE NVIDIA card of 13 GiB or less in a CUDA build (the Flash-Next shape)."""
+        self.assertEqual(ids(QWEN, [RTX3060]), ["faster_long_prompts", "faster_12gb_nvidia"])
+        self.assertEqual(ids(QWEN, [RTX4070S]), ["faster_long_prompts", "faster_12gb_nvidia"])
+        self.assertEqual(ids(QWEN, [{**RTX3060, "vram_gb": 13.0}]), ["faster_long_prompts", "faster_12gb_nvidia"], "13 GiB counts")
+        self.assertEqual(ids(QWEN, [{**RTX3060, "vram_gb": 13.5}]), ["faster_long_prompts"])
+        self.assertEqual(ids(QWEN, [RTX4060TI16]), ["faster_long_prompts"], "16 GB is not a 12 GB card")
+        self.assertEqual(ids(QWEN, [RTX]), ["faster_long_prompts"])
+        self.assertEqual(ids(QWEN, [RTX3060, RTX]), ["faster_long_prompts", "faster_12gb_nvidia"], "one small card among others")
+        self.assertEqual(ids(QWEN, [{**RTX3060, "uma": True}]), ["faster_long_prompts"], "not a chip that shares system memory")
+        self.assertEqual(ids(QWEN, [{**RTX3060, "integrated": True}]), ["faster_long_prompts"])
+        self.assertEqual(ids(QWEN, [{**RTX3060, "usable": False}]), ["faster_long_prompts"])
+        self.assertEqual(ids({**QWEN, "backend": "hip"}, [{"name": "AMD Radeon RX 7700 XT", "vendor": "amd", "arch": "gfx1101", "vram_gb": 12.0}]), ["faster_long_prompts"], "not a Radeon")
+        self.assertEqual(ids({**QWEN, "backend": "sycl"}, [RTX3060]), [], "not a CUDA build")
+        self.assertEqual(ids(QWEN36, [RTX3060]), [], "Qwen3.6-35B-A3B: the routing needs 512 experts")
+        self.assertEqual(ids(DEEPSEEK, [RTX3060]), ["deepseek_speedups"])
+        self.assertEqual(ids(QWEN, [{"name": "GeForce RTX 3060", "vram_gb": 12.0}]), ["faster_long_prompts", "faster_12gb_nvidia"], "no vendor reported: the name decides")
+        self.assertEqual(ids(QWEN, [{"name": "Mystery card", "vram_gb": 12.0}]), ["faster_long_prompts"])
+
+    def test_the_12gb_switch_off_writes_route_prior_zero_and_on_removes_it(self):
+        env = {"PATH": "/bin"}
+        off = W.set_switch(env, "faster_12gb_nvidia", False)
+        self.assertEqual(off, {"PATH": "/bin", "STRATA_ROUTE_PRIOR": "0"})
+        self.assertFalse(W.is_on(off, "faster_12gb_nvidia"))
+        self.assertTrue(W.is_on({}, "faster_12gb_nvidia"))
+        self.assertEqual(W.set_switch(off, "faster_12gb_nvidia", True), env)
+        self.assertTrue(W.is_on({"STRATA_ROUTE_PRIOR": "2.0"}, "faster_12gb_nvidia"), "any other value is the user's own and reads as the default")
+
+    def test_deepseek_off_writes_the_master_switch_and_the_six_and_on_removes_all_seven(self):
+        env = {"DS4_ASYNC_T": "4"}
+        off = W.set_switch(env, "deepseek_speedups", False)
+        self.assertEqual(list(off)[:2], ["DS4_ASYNC_T", "DS4_DEFAULTS"], "the master switch first")
+        self.assertEqual(off, {"DS4_ASYNC_T": "4", "DS4_DEFAULTS": "026", **{k: "0" for k in SIX}})
+        self.assertFalse(W.is_on(off, "deepseek_speedups"))
+        self.assertEqual(W.set_switch(off, "deepseek_speedups", True), env)
+        # an earlier test build wrote only the six: it still reads as off, and turning it on removes them
+        six = {"DS4_ASYNC_T": "4", **{k: "0" for k in SIX}}
+        self.assertFalse(W.is_on(six, "deepseek_speedups"))
+        self.assertEqual(W.set_switch(six, "deepseek_speedups", True), env)
+        self.assertTrue(W.is_on({"DS4_DEFAULTS": "026"}, "deepseek_speedups"), "the master switch alone is not the whole switch: a hand-edited file is left alone")
+
+    def test_the_terminal_only_switch_is_for_qwen_and_never_in_the_app(self):
+        sw = W.BY_ID["qwen_defaults_026"]
+        self.assertTrue(sw.terminal_only)
+        self.assertEqual(dict(sw.env), {"STRATA_DEFAULTS": "026"})
+        self.assertNotIn("qwen_defaults_026", [s.id for s in W.app_switches()])
+        for cfg, gpus in ((QWEN, [RTX]), (QWEN36, [RTX]), ({**QWEN, "backend": "sycl"}, []), ({**QWEN, "backend": "cpu"}, [])):
+            self.assertIn("qwen_defaults_026", [s.id for s in W.applicable(cfg, gpus)])
+        self.assertNotIn("qwen_defaults_026", [s.id for s in W.applicable(DEEPSEEK, [RTX])], "DeepSeek has its own master switch (DS4_DEFAULTS)")
+        self.assertEqual(W.set_switch({"PATH": "/bin"}, sw, True), {"PATH": "/bin", "STRATA_DEFAULTS": "026"})
+        self.assertFalse(W.is_on({}, sw))
+        self.assertEqual(W.set_switch({"STRATA_DEFAULTS": "026"}, sw, False), {})
 
     def test_faster_long_prompts_is_for_qwen38_flash_next_only(self):
         """KVA was measured on the 48-layer / 512-expert Flash-Next shape and the engine declines other shapes: no row for Qwen3.6-35B-A3B (arch qwen35moe) or DeepSeek."""
@@ -130,10 +191,23 @@ class Terminal(unittest.TestCase):
         def names(cfg, gpus, extra=None):
             rows = P.build_rows(None, cfg["args"], None, cfg["env"], None, extra or {}, P.switch_params(W.applicable(cfg, gpus)))
             return [r.name for r in rows if r.name in W.env_names()]
-        self.assertEqual(names(QWEN, [RTX]), ["STRATA_KVA"])
-        self.assertEqual(names({**QWEN, "backend": "hip"}, [R9700]), ["STRATA_KVA", "STRATA_PCIE_FRAC_DEFAULT"])
-        self.assertEqual(names(DEEPSEEK, [R9700]), list(ENV["deepseek_speedups"]), "the six, in the contract order")
-        self.assertEqual(names({**QWEN, "backend": "sycl"}, [R9700]), [])
+        # (STRATA_DEFAULTS, the Qwen "0.2.6 behaviour" row, closes every Qwen table; the DeepSeek table has DS4_DEFAULTS instead)
+        self.assertEqual(names(QWEN, [RTX]), ["STRATA_KVA", "STRATA_DEFAULTS"])
+        self.assertEqual(names(QWEN, [RTX3060]), ["STRATA_KVA", "STRATA_ROUTE_PRIOR", "STRATA_DEFAULTS"])
+        self.assertEqual(names({**QWEN, "backend": "hip"}, [R9700]), ["STRATA_KVA", "STRATA_PCIE_FRAC_DEFAULT", "STRATA_DEFAULTS"])
+        self.assertEqual(names(DEEPSEEK, [R9700]), list(ENV["deepseek_speedups"]), "the master switch and the six, in the contract order")
+        self.assertEqual(names({**QWEN, "backend": "sycl"}, [R9700]), ["STRATA_DEFAULTS"])
+        self.assertEqual(names(QWEN36, [RTX]), ["STRATA_DEFAULTS"])
+
+    def test_the_qwen_0_2_6_row_in_the_advanced_table(self):
+        rows = P.build_rows(None, QWEN["args"], None, QWEN["env"], None, {}, P.switch_params(W.applicable(QWEN, [RTX])))
+        row = next(r for r in rows if r.name == "STRATA_DEFAULTS")
+        self.assertEqual((row.default, row.yours, row.known), ("off", "", True))
+        self.assertIn("Qwen: 0.2.6 behaviour", row.description)
+        self.assertIn("off by default; set 026 to turn on", row.description)
+        cfg = derive_config(QWEN, S.LaunchSettings(extra=S.settings_from_pairs(["STRATA_DEFAULTS=026"])), bool_flags=frozenset())
+        self.assertEqual(cfg["env"], {**QWEN["env"], "STRATA_DEFAULTS": "026"})
+        self.assertEqual(derive_config(QWEN, S.LaunchSettings(), bool_flags=frozenset())["env"], QWEN["env"], "a default launch carries nothing")
 
     def test_a_row_shows_its_default_until_it_is_changed_and_explains_itself(self):
         rows = P.build_rows(None, QWEN["args"], None, QWEN["env"], None, {}, P.switch_params(W.applicable(QWEN, [RTX])))
@@ -151,7 +225,7 @@ class Terminal(unittest.TestCase):
 
     def test_the_six_deepseek_rows_say_they_go_together(self):
         text = W.env_words("DS4_COPY_PIN")
-        self.assertIn("all 6 speed-up rows go together", text)
+        self.assertIn("all 7 speed-up rows go together", text)
         self.assertEqual({W.env_names()[n].id for n in ENV["deepseek_speedups"]}, {"deepseek_speedups"})
 
 
@@ -159,15 +233,16 @@ class SameAsTheApp(unittest.TestCase):
     @unittest.skipUnless(shutil.which("node"), "node is not installed")
     def test_the_apps_table_has_the_same_names_and_words(self):
         script = ("import {SPEED_SWITCHES} from './apps/host/server/native-settings.mjs';"
-                  "console.log(JSON.stringify(SPEED_SWITCHES.map(s=>({id:s.id,label:s.label,hint:s.hint,default:s.default,env:s.env}))))")
+                  "console.log(JSON.stringify(SPEED_SWITCHES.map(s=>({id:s.id,label:s.label,hint:s.hint,default:s.default,env:s.env,legacy:s.legacy??{}}))))")
         out = subprocess.run(["node", "--input-type=module", "-e", script], cwd=ROOT, capture_output=True, text=True, timeout=60, check=True).stdout
         app = json.loads(out)
-        self.assertEqual([a["id"] for a in app], [s.id for s in W.SWITCHES])
-        for a, s in zip(app, W.SWITCHES):
+        self.assertEqual([a["id"] for a in app], [s.id for s in W.app_switches()], "the Terminal-only switch is not in the app's table")
+        for a, s in zip(app, W.app_switches()):
             self.assertEqual(a["label"], s.label)
             self.assertEqual(a["hint"], s.effect, s.id)
             self.assertEqual(a["env"], dict(s.env), s.id)
             self.assertEqual(a["default"], s.default, s.id)
+            self.assertEqual(a["legacy"], dict(s.legacy), s.id)
 
 
 if __name__ == "__main__":
