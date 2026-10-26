@@ -3,7 +3,12 @@ import pathlib
 import sys
 
 import numpy as np
-import pytest
+import unittest
+
+try:
+    import pytest
+except ImportError:                                  # not in requirements.txt: python -m unittest skips this module instead of failing to import it (#3325)
+    raise unittest.SkipTest("pytest is not installed")
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import nvfp4_local_pack as P  # noqa: E402
