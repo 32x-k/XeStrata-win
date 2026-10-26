@@ -26,6 +26,43 @@ export const NATIVE_FIELDS=[
  {id:'mcp_max_rounds',label:'Maximum tool rounds',group:'Tools',type:'number',min:1,max:100},
  {id:'mcp_max_result_chars',label:'Maximum tool result characters',group:'Tools',type:'number',min:100,max:1000000},
 ];
+/** Engine environment names the app shows and edits: STRATA_* and the DeepSeek engine's DS4_*. Any other name in a model's file is kept untouched and not shown. */
+export const ENV_FLAG=/^(?:STRATA|DS4)_[A-Z0-9_]+$/;
+/**
+ * The three speed features that are on by default in 0.2.7 and have an off switch in Expert settings. Each switch, when off, writes exactly the
+ * environment entries below into the model's settings file ("env"); turning it on again removes them, so a default launch carries none of them.
+ * The names are the engine switch contract (phaseA-tests/notes-027-plan.md); strata_control/speed_switches.py says the same for the Terminal
+ * (tests/terminal/test_speed_switches.py compares the two).
+ */
+export const SPEED_SWITCHES=[
+ {id:'faster_long_prompts',label:'Faster long prompts',group:'Speed',
+  hint:'Reads long prompts faster by approximating part of the work. Turn off if answers about long documents look wrong.',
+  off:{STRATA_KVA:'0'}},
+ {id:'faster_radeon_9000',label:'Faster answers on Radeon RX 9000 / AI PRO R9700',group:'Speed',
+  hint:'Shares the work between the graphics card and the processor in a way that makes answers faster on these cards. Turn off to go back to the previous setting, which is slower.',
+  off:{STRATA_PCIE_FRAC_DEFAULT:'old'}},
+ {id:'deepseek_speedups',label:'DeepSeek speed-ups',group:'Speed',
+  hint:'Reads long prompts faster and loads the parts of the model it needs faster. Turn off if DeepSeek stops working or its answers look wrong; it then runs as in version 0.2.6.',
+  off:{DS4_FAST_ATTN:'0',DS4_ATTN_SLAB:'0',DS4_COPY_PIN:'0',DS4_COPY_HUGETLB:'0',DS4_STORE_SPARE:'0',DS4_STORE_PUT:'0'}},
+];
+const GFX12=/^gfx120[01]$/i, RADEON_9000=/\b(?:RX\s*9\d{3}|AI\s*PRO\s*R97\d{2}|R97\d{2})\b/i;
+/** Which switches make sense for this model on this PC: only those are shown. `backend` is the engine's (cuda, hip, sycl, metal, cpu). */
+export function speedSwitchApplies(id,{deepseek=false,backend=null,gpus=[]}={}){
+ if(id==='deepseek_speedups')return !!deepseek;
+ if(deepseek)return false;                                              // the Qwen engine's switches
+ if(id==='faster_long_prompts')return backend==='cuda'||backend==='hip';
+ if(id==='faster_radeon_9000')return backend==='hip'&&(gpus??[]).some(g=>(!g.vendor||g.vendor==='amd')&&(GFX12.test(String(g.arch??''))||(!g.arch&&RADEON_9000.test(String(g.name??'')))));
+ return false;
+}
+/** A switch is off when every entry it writes is in the environment with its value; anything less (a hand-edited file) reads as on and is left alone. */
+export function speedSwitchIsOff(env,id){const sw=SPEED_SWITCHES.find(s=>s.id===id);return !!sw&&Object.entries(sw.off).every(([name,value])=>env?.[name]===value);}
+/** The environment with the switch turned off (its entries written) or on (its entries removed). Nothing else in it changes. */
+export function setSpeedSwitch(env,id,on){
+ const sw=SPEED_SWITCHES.find(s=>s.id===id);if(!sw)throw new Error(`Unknown speed switch: ${id}`);
+ const next={...(env??{})};for(const [name,value] of Object.entries(sw.off)){if(on)delete next[name];else next[name]=value;}return next;
+}
+/** What the settings answer carries: each switch that applies, with its words, the entries it writes when off, and whether it is on. */
+export function speedSwitchRows(env,context){return SPEED_SWITCHES.filter(s=>speedSwitchApplies(s.id,context)).map(s=>({...s,on:!speedSwitchIsOff(env,s.id)}));}
 /** Settings the app itself applies when it starts a model (they are not read from the engine's source, so the engine's text never says it supports them). */
 export const APP_OWNED_FIELDS=['mtp','batchMtp','drafting','ds_experts'];
 /** The engine arguments without the draft layer: --mtp <folder or count>, --spec-min-p <p> (its confidence threshold) and --batch-mtp. --spec stays: prompt lookup still uses its windows. Same rule as strata_control/draft_layer.py. */
@@ -40,7 +77,7 @@ export function validateNativeSettings(values){
  for(const [key,value] of Object.entries(values)){
 
   if(key==='args'){if(!Array.isArray(value)||value.length>200||value.some(v=>typeof v!=='string'||v.length>4000||/[\n\r\0]/.test(v))||value.some(v=>['--host','--port','--api-key'].includes(v)))throw new Error('Engine arguments must be text values. Network access stays managed by Strata.');result.args=[...value];continue;}
-  if(key==='env'){if(!value||typeof value!=='object'||Array.isArray(value))throw new Error('Engine environment must be an object.');const env={};for(const [name,text] of Object.entries(value)){if(!/^STRATA_[A-Z0-9_]+$/.test(name)||typeof text!=='string'||text.length>4000||text.includes('\0'))throw new Error('Use STRATA_ environment flags with text values.');env[name]=text;}result.env=env;continue;}
+  if(key==='env'){if(!value||typeof value!=='object'||Array.isArray(value))throw new Error('Engine environment must be an object.');const env={};for(const [name,text] of Object.entries(value)){if(!ENV_FLAG.test(name)||typeof text!=='string'||text.length>4000||text.includes('\0'))throw new Error('Use STRATA_ environment flags with text values.');env[name]=text;}result.env=env;continue;}
   if(key==='sampling'){if(!value||typeof value!=='object'||Array.isArray(value))throw new Error('Sampling must be an object.');const limits={temperature:[0,10],top_p:[Number.MIN_VALUE,1],top_k:[1,64],min_p:[0,1],repetition_penalty:[Number.MIN_VALUE,10],presence_penalty:[0,10],frequency_penalty:[0,10],penalty_last_n:[0,1048576],seed:[1,2147483647]};for(const [name,n] of Object.entries(value)){if(name==='experimental_speed_projection'){if(typeof n!=='boolean')throw new Error('Speed projection must be on or off.');continue;}if(!limits[name]||!Number.isFinite(n)||(['top_k','seed','penalty_last_n'].includes(name)&&!Number.isInteger(n))||n<limits[name][0]||n>limits[name][1])throw new Error(`Choose a valid sampling ${name}.`);}result.sampling={...value};continue;}
   const field=NATIVE_FIELDS.find(f=>f.id===key);if(!field)throw new Error(`Unknown native setting: ${key}`);
   if(value===null||value===''){result[key]=null;continue;}
@@ -75,5 +112,5 @@ export function validateMcpServers(servers,previous={}){
 }
 
 const sensitive=name=>/KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL/i.test(name);
-export function publicNativeEnv(env){return Object.fromEntries(Object.entries(env).filter(([name])=>/^STRATA_[A-Z0-9_]+$/.test(name)).map(([name,value])=>[name,sensitive(name)?MASK:value]));}
-export function restoreNativeEnv(env,previous={}){const result=Object.fromEntries(Object.entries(previous).filter(([name])=>!/^STRATA_[A-Z0-9_]+$/.test(name)));for(const [name,value] of Object.entries(env)){if(value===MASK){if(previous[name]===undefined)throw new Error(`Enter a new value for ${name}.`);result[name]=previous[name];}else result[name]=value;}return result;}
+export function publicNativeEnv(env){return Object.fromEntries(Object.entries(env).filter(([name])=>ENV_FLAG.test(name)).map(([name,value])=>[name,sensitive(name)?MASK:value]));}
+export function restoreNativeEnv(env,previous={}){const result=Object.fromEntries(Object.entries(previous).filter(([name])=>!ENV_FLAG.test(name)));for(const [name,value] of Object.entries(env)){if(value===MASK){if(previous[name]===undefined)throw new Error(`Enter a new value for ${name}.`);result[name]=previous[name];}else result[name]=value;}return result;}
