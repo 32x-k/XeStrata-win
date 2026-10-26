@@ -961,6 +961,7 @@ uint64_t MfVae::encode_scratch_bytes(int64_t h, int64_t w) const {
 }
 
 void MfVae::encode_moments(const float* rgb, int64_t h, int64_t w, float* moments) {
+    if (f2_) throw std::runtime_error("image engine (Flux2 VAE): its encoder gives the latent only (encode)");
     if (!has_encoder()) throw std::runtime_error("image engine (Mage-VAE): the encoder is not loaded");
     const int64_t n = h * w, Ch = enc_head_[0].c1.out, Fh = enc_head_[0].c4.out;
     std::vector<void*> tmp;

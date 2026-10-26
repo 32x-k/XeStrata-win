@@ -66,6 +66,7 @@ public:
     bool flux2() const { return f2_; }
     uint64_t encoder_bytes() const { return enc_bytes_; }
     /// The posterior's mean and log-variance [h w][256] (device FP32) of rgb [3][16 h][16 w] (device FP32, -1 .. 1).
+    /// Mage-VAE's only: the Flux2 VAE's encode gives its latent alone.
     void encode_moments(const float* rgb, int64_t h, int64_t w, float* moments);
     /// The latent tokens z [h w][128] (device FP32) of rgb: the posterior's mean, plus exp(logvar / 2) eps when `eps`
     /// (device [h w][128] standard normal) is given (the reference samples the posterior).  The Flux2 VAE's is the
