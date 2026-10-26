@@ -5643,6 +5643,18 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why) {
     if (!mp.any || (int64_t) mp.layer.size() < g.n_layers) { why = "the experts are not on MMQ"; return 0; }
     for (int64_t l = 0; l < g.n_layers; ++l)
         if (!mp.layer[(size_t) l]) { why = "a layer's experts are not on MMQ"; return 0; }
+    // 0.2.2's expert formats this path's MMQ pass does not carry (port, 2026-10-24): APR's Hadamard-folded layers,
+    // NVFP4's tails and w4a4 activations, and IQ1_M layers that only the WMMA tiles run
+    {
+        const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
+        for (int64_t l = 0; l < g.n_layers; ++l) {
+            if (l < (int64_t) mp.wmma_only.size() && mp.wmma_only[(size_t) l]) { why = "a layer needs the WMMA tiles"; return 0; }
+            if (!lay.native) continue;
+            const auto& f = lay.fmt[(size_t) l];
+            if (f.had_gu || f.had_d) { why = "an APR (Hadamard-folded) layer"; return 0; }
+            if (f.tail_off || mmq::fp4_activations(f.gu_type)) { why = "an NVFP4 layer"; return 0; }
+        }
+    }
     if (m.fused_bufs) { why = "the fused expert layout"; return 0; }
     if (!m.grp_gu || !m.grp_d || !m.Xq || !m.GU || !m.H || !m.Hq || !m.Dm || !m.ids_identity || !m.tok_dev) {
         why = "the MoE buffers are missing"; return 0;
@@ -5821,12 +5833,12 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
         std::fill(pf_job.begin(), pf_job.end(), -1);
         if (m.src == nullptr || !pf_on) return true;
         std::vector<Stager::Job> js;
-        const bool pdirect = m.src->prefill_direct();
+        const bool pdirect = false;   // (STRATA_PREFILL_DIRECT, #1670's other commit, is not ported)
         for (int32_t e = 0; e < NE; ++e) {
             if ((m.host_res && m.cache && m.host_res[(size_t) l * NE + e] >= 0) || m.src->pinned(l, e)) continue;
             pf_job[(size_t) e] = (int) js.size();
             if (pdirect || m.src->transient(l, e)) {
-                js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e, pdirect});
+                js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
                 continue;
             }
             const uint8_t* b = m.src->blob_stable(l, e);
@@ -5883,13 +5895,13 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
             if (cnt[(size_t) e] == 0 && pf_job[(size_t) e] >= 0) m.stager->skip(pf_job[(size_t) e]);
         if (!pf_on && m.src != nullptr) {   // STRATA_LM_PREFETCH=0: the routed experts only, started now
             std::vector<Stager::Job> js;
-            const bool pdirect = m.src->prefill_direct();
+            const bool pdirect = false;   // (STRATA_PREFILL_DIRECT, #1670's other commit, is not ported)
             for (size_t u = 0; u < uniq.size(); ++u) {
                 const int32_t e = uniq[u];
                 if (resident(e) || m.src->pinned(l, e)) continue;
                 job_of[u] = (int) js.size();
                 if (pdirect || m.src->transient(l, e)) {
-                    js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e, pdirect});
+                    js.push_back({nullptr, (size_t) lay.blob_bytes(l), m.src, (int32_t) l, e});
                     continue;
                 }
                 const uint8_t* b = m.src->blob_stable(l, e);
@@ -6288,6 +6300,16 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                     const core::WeightRef *wn = need(v, sn.c_str(), err), *wd = need(v, sd.c_str(), err),
                                           *wu = need(v, su.c_str(), err), *wi = need(v, si.c_str(), err);
                     if (!wn || !wd || !wu || !wi) return false;
+                    // STRATA_HC_Q8 without a bf16 copy (0.2.2's run_impl): this path's GEMMs read bf16, so the matrices
+                    // are dequantized per half
+                    core::WeightRef wd_q8, wu_q8;
+                    if (!wd->data && wd->hc_q8 && !wu->data && wu->hc_q8) {
+                        wd_q8 = *wd; wu_q8 = *wu;
+                        wd_q8.data = core::NativeDense::hc_bf16_view(*wd, cs, 0, 0);
+                        wu_q8.data = core::NativeDense::hc_bf16_view(*wu, cs, 1, 0);
+                        if (!wd_q8.data || !wu_q8.data) { err = "prefill: the Q8_0 hyper-connection projections could not be dequantized"; return false; }
+                        wd = &wd_q8; wu = &wu_q8;
+                    }
                     pt.mark(kPfHc, cs);
                     if (gr_unfused()) gr_norm(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, cs, m.xn16_lo);
                     else if (!normed) gr_norm_rs(m.R, (const float*) wn->data, EPS, m.grs, m.xn16, T, cs, m.xn16_lo);
@@ -6299,6 +6321,10 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                     if (gr_unfused()) gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, cs, m.mixed_h, m.mixed_bf_lo);
                     else gr_mix_r(m.R, m.grs, (const float*) wn->data, m.gated, m.mixed, m.mixed_bf, T, cs, m.mixed_h,
                                   m.mixed_bf_lo);
+                    if (wd_q8.data) {   // the HC GEMMs that read the scratch are enqueued: the next user waits for them
+                        core::NativeDense::hc_bf16_release(cs, 0, 0);
+                        core::NativeDense::hc_bf16_release(cs, 1, 0);
+                    }
                     if (half == 0 && !core::is_qsa_layer(g, l)) {
                         // ======================= GDN (run_impl's) =======================
                         const core::WeightRef *wqkv = need(v, "attn_qkv.weight", err), *wg = need(v, "attn_gate.weight", err),
@@ -6392,7 +6418,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                         if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(m.q, T * 24, cs);
                         rms_rows(m.q_idx, (const float*) wiqn->data, T * 4, 128, 128, EPS, cs);
                         rope(m.q_idx, T, 4, 128, 512, p0, strata::kernels::rope_scaling(), cs);
-                        const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos, st.idx_pooled_i8, st.idx_pooled_scale};
+                        const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                         pt.mark(kPfQsaIdx, cs);
                         try {
                             static const bool per_token = std::getenv("STRATA_INDEXER_PER_TOKEN") != nullptr;
@@ -6415,10 +6441,10 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                             const int64_t active = (int64_t) m.steps_host[(size_t) ((q0 + nb - 1) * strata::kernels::kStepCount +
                                                                                     strata::kernels::kStepNBid)] + 1;
                             static const bool old_sel = std::getenv("STRATA_SELECT_OLD") != nullptr;
-                            if (old_sel || !strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_pooled_i8, st.idx_pooled_scale, st.idx_dead, m.q_idx + q0 * 512,
+                            if (old_sel || !strata::kernels::qsa_block_scores_tc(st.idx_pooled, st.idx_dead, m.q_idx + q0 * 512,
                                                                                  steps0, nb, m.max_blocks, s, m.sel_scores,
                                                                                  cs, active))
-                                strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_pooled_i8, st.idx_pooled_scale, st.idx_dead, m.q_idx + q0 * 512, steps0, nb,
+                                strata::kernels::qsa_block_scores(st.idx_pooled, st.idx_dead, m.q_idx + q0 * 512, steps0, nb,
                                                                   m.max_blocks, s, m.sel_scores, cs, active);
                             strata::kernels::qsa_block_topk(m.sel_scores, steps0, nb, m.max_blocks, m.cap, s,
                                                             m.sel_ids + q0 * m.cap, cs, active);
