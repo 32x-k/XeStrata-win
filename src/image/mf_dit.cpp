@@ -1034,7 +1034,7 @@ void MfDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n, fl
 }
 
 void MfDit::sample(float* x, int64_t h, int64_t w, const std::vector<float>& sigmas, float cfg,
-                   const std::function<bool(int, int)>& step) {
+                   const std::function<bool(int, int)>& step, const std::function<void(float*, float)>& after) {
     const int n = cfg > 1.f && ctx_[1].rows > 0 ? 2 : 1;
     const int64_t HW = h * w;
     float* out = alloc<float>(allocs_, n * HW * in_ch_);
@@ -1042,6 +1042,7 @@ void MfDit::sample(float* x, int64_t h, int64_t w, const std::vector<float>& sig
     for (int i = 0; i < steps; ++i) {
         forward(x, sigmas[(size_t) i], h, w, n, out);
         euler(x, out, HW * in_ch_, n, cfg, sigmas[(size_t) i + 1] - sigmas[(size_t) i], s_);
+        if (after) after(x, sigmas[(size_t) i + 1]);
         if (step && !step(i + 1, steps)) {
             gpu::stream_sync(s_);
             release(allocs_, out);

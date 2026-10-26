@@ -99,9 +99,11 @@ public:
 
     /// Sampling: x [h w][128] (device FP32, the initial noise) stepped through sigmas (descending, the last 0) by
     /// Euler; with cfg > 1 and a negative context, the velocity neg + cfg (pos - neg).  step(i, n) after each step:
-    /// false stops (QiStopped).
+    /// false stops (QiStopped).  `after` (if set) is given x and the step's new sigma first, on the sampler's stream
+    /// (a mask: img_start.hpp's blend).
     void sample(float* x, int64_t h, int64_t w, const std::vector<float>& sigmas, float cfg,
-                const std::function<bool(int, int)>& step = {});
+                const std::function<bool(int, int)>& step = {},
+                const std::function<void(float*, float)>& after = {});
 
     int64_t hidden() const { return C_; }
     int64_t latent_channels() const { return in_ch_; }
