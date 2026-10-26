@@ -4111,9 +4111,10 @@ int main(int argc, char** argv) {
                 if (ple_table.open(o.ple_gguf, ram_err, pio)) {
                     ple_auto_ram = true;
                     std::fprintf(stderr, "strata generate: --ple-io ram chosen by the residency policy (the table is "
-                                         "%.1f GiB and %.1f GiB of RAM is available; STRATA_PLE_AUTO_RAM=0 keeps the "
-                                         "direct reads, --ple-io direct forces them)\n",
-                                 (double) need / (1ull << 30), (double) *available / (1ull << 30));
+                                         "%.1f GiB, the expert arena still to fill %.1f GiB and %.1f GiB of RAM is available; "
+                                         "STRATA_PLE_AUTO_RAM=0 keeps the direct reads, --ple-io direct forces them)\n",
+                                 (double) need / (1ull << 30), (double) experts_ram / (1ull << 30),
+                                 (double) *available / (1ull << 30));
                 } else {
                     // Back to what was asked for; a table that cannot be mapped must not stop the engine.
                     std::fprintf(stderr, "strata generate: resident PLE table failed (%s); keeping direct reads\n",
