@@ -55,8 +55,9 @@ cmake --build build -j
 ```
 
 CMake prints a warning for sm_52 and goes on. A release build still needs sm_75 or newer, and without `STRATA_EXPERIMENTAL_SM60=ON`
-the build stops as before. For `setup.py` to list a Maxwell card as usable, set `STRATA_EXPERIMENTAL_SM52=1`; setup warns and uses
-the CUDA 12 path. If you try it, please post a short chat and one code answer from the card.
+the build stops as before. `setup.py` does not install an engine for a Maxwell card, because none of the ready-made engines holds
+code for it. On a PC with only Maxwell cards it lists the card as not supported, prints this recipe as a warning and stops. If you
+try the build, please post a short chat and one code answer from the card.
 
 ## NVIDIA: the CUDA 12 engine
 
