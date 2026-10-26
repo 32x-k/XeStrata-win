@@ -5665,7 +5665,7 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why) {
         }
     }
     if (m.fused_bufs) { why = "the fused expert layout"; return 0; }
-    if (!m.GU || !m.Dm || !m.ids_identity || !m.tok_dev) { why = "the MoE buffers are missing"; return 0; }
+    if (!m.GU || !m.Dm || (n_mmq > 0 && !m.ids_identity)) { why = "the MoE buffers are missing"; return 0; }
     // (an explicit STRATA_PREFILL_LM_TOKENS may be one chunk: the A/B against the default path, experts aside)
     const int64_t min_s = lm_tokens_env() > 0 ? m.T : 2 * m.T;
     if (n < min_s) { why = "a short prompt"; return 0; }
