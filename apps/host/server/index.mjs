@@ -71,6 +71,8 @@ import { createRuntimeModels } from './runtime-models.mjs';
 import { createNativeControl } from './native-control.mjs';
 import { nativeUnloadPlan } from './storage-check.mjs';
 import { installBundledEngine, cleanupAfterInstall } from './bundled-engine.mjs';
+import { systemLocale } from './region.mjs';
+import { createShellNotifier, DEFAULT_PORT, parsePortNotice, readShellPrefs, writeShellPrefs } from './shell-prefs.mjs';
 import { findControl, createControl, componentsDirectory } from './control-runtime.mjs';
 import { forbidden as acquisitionForbidden } from './acquisition.mjs';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
@@ -127,6 +129,19 @@ const appUi = createAppUi({ shutdown: () => shutdown() });
 /* The app's version has one source: the desktop shell passes it (STRATA_APP_VERSION, from apps/desktop/src-tauri/Cargo.toml). Outside the app it is read from the same file in a checkout, else 'dev'. */
 function appVersion() { return appVersionFrom({ env: process.env, here: HERE }); }
 const appUpdater = appUi.updater;
+const shellNotifier = createShellNotifier();
+/** What the page needs for the desktop settings: whether this is the desktop app, the port in use, the saved choices and a busy-port notice. */
+function shellState() {
+  const saved = readShellPrefs();
+  const desktop = !!shellNotifier;
+  return {
+    desktop,
+    tray: desktop && process.platform !== 'linux',
+    port: PORT, defaultPort: DEFAULT_PORT,
+    pinnedPort: saved.port || null, minimizeToTray: saved.tray,
+    portNotice: parsePortNotice(process.env.STRATA_PORT_NOTICE),
+  };
+}
 /* The engine that ships inside the installer is put in the components folder when this PC has none (or an older one); no network, hashes checked. The model list waits for it. */
 const bundledEngine = control && !process.env.STRATA_NO_BUNDLED_ENGINE
   ? installBundledEngine({ bundleDir: process.env.STRATA_ENGINE_BUNDLE_DIR || resolve(HERE, '..', '..', 'engine-bundle'), components: componentsDirectory(), log: line => console.log(line) })
@@ -1931,6 +1946,19 @@ async function api(req, res, path, method, url) {
     if (typeof b.sessionId !== 'string' || typeof b.toolId !== 'string' || !['approve', 'deny'].includes(b.decision)) return error(res, 400, 'sessionId, toolId and decision (approve or deny) are required');
     try { return json(res, 200, await agent.approve({ chatId: b.sessionId, callId: b.toolId, decision: b.decision })); }
     catch (e) { return error(res, e.code === 'approval-gone' ? 409 : 400, e.message); }
+  }
+  /* The desktop shell's own choices (#3402, #3477): the port it asks for, the tray, and a desktop notification through the shell. */
+  if (path === '/api/locale' && method === 'GET') return json(res, 200, systemLocale());
+  if (path === '/api/shell' && method === 'GET') return json(res, 200, shellState());
+  if (path === '/api/shell/prefs' && method === 'POST') {
+    const b = await readBody(req);
+    try { writeShellPrefs(b); } catch (e) { return error(res, 400, e.message); }
+    return json(res, 200, shellState());
+  }
+  if (path === '/api/shell/notify' && method === 'POST') {
+    const b = await readBody(req);
+    if (!shellNotifier || typeof b.title !== 'string') return json(res, 200, { shown: false });
+    try { return json(res, 200, await shellNotifier.notify({ title: b.title, body: String(b.body ?? '') })); } catch { return json(res, 200, { shown: false }); }
   }
   /* The person changed the chat's mode while a turn runs: it applies to the next tool call, goal and helpers included. */
   if (path === '/api/chat/mode' && method === 'POST') {
