@@ -998,7 +998,10 @@ int64_t int8_rows_below(const strata::kernels::cpu::NativeFmt& f, size_t blob) {
             char buf[64];
             std::snprintf(buf, sizeof buf, "%s%lld: %.0f/%.0f", said.empty() ? "" : ", ", (long long) r, us8, us16);
             said += buf;
-            if (us8 >= us16) {
+            // FP16 only when it is 3% faster: above the crossover the int8 group scratch no longer bounds the chunk, so
+            // --prefill auto takes a smaller one.  The RTX 4070's 1024 rows are within 1% either way (int8 1972-1982 us,
+            // FP16 1957-1976), and a run that took FP16 there read a 32K serve prompt in 8192-token chunks: 1,687 -> 1,162 tok/s.
+            if (us16 * 1.03 < us8) {
                 const int64_t below = won == 0 ? 0 : (int64_t) std::llround(std::sqrt((double) won * (double) r));
                 std::fprintf(stderr, "strata: the experts' prompt products: int8 below %lld rows an expert, FP16 from "
                                      "there (us int8/FP16 at rows %s)\n", (long long) below, said.c_str());
