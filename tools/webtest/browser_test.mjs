@@ -253,6 +253,354 @@ test("load/unload: the header fits a phone", async ({ browser, mock }) => {
   }
 });
 
+// ------------------------------------------------------------------------------------------------ chat history (#1787, #2615, #3823, #4004)
+const on = (extra = {}) => ({ sampling: { chatList: true, chatEdit: true, ...extra } });
+const texts = (page) => page.evaluate(() => messages.map((m) => m.role[0] + ":" + (m.text || "")));
+const sidebarTitles = (page) => page.$$eval(".chat-item__title", (e) => e.map((x) => x.textContent));
+const ask = async (page, text) => { await say(page, text); await idle(page); await sleep(80); };
+const requestTexts = (mock, n = -1) => mock.state.requests.at(n).messages.map((m) => m.role[0] + ":" + (typeof m.content === "string" ? m.content : m.content[0].text));
+const clickAction = async (page, i, label) => {
+  const handle = await page.evaluateHandle((n, text) => [...document.querySelector(`[data-i="${n}"] .history-actions`).querySelectorAll("button")].find((b) => b.textContent === text), i, label);
+  await handle.asElement().click();
+};
+const reset = (mock) => { mock.state.requests.length = 0; mock.state.aborted = 0; mock.state.completed = 0; mock.state.answers = 0; };
+const htest = (name, fn) => test(name, async (ctx) => { reset(ctx.mock); await fn(ctx); });
+// (a toast sits over the drawer's Apply button for a few seconds: clear it, as a person would wait for it)
+const openSettings = async (page) => { await page.click("#sampling-btn"); await page.waitForSelector('#drawer[data-open="true"]'); await sleep(320); await page.evaluate(() => document.querySelectorAll(".st-toast").forEach((t) => t.remove())); };
+
+htest("history: everything is off by default - the page is the page it was", async ({ browser, mock }) => {
+  reset(mock);
+  const page = await openPage(browser, mock);
+  assert.equal(await page.$eval("#sidebar", (e) => e.hidden), true, "no list");
+  assert.equal(await page.$eval("#new-btn", (e) => e.hidden), false, "the New chat button is there");
+  await ask(page, "hello");
+  assert.equal(await page.$$eval(".history-actions", (e) => e.length), 0, "no edit buttons");
+  assert.deepEqual(mock.state.requests[0].messages, [{ role: "user", content: "hello" }]);
+  assert.equal(Object.keys(mock.state.requests[0]).sort().join(), "messages,model,reasoning_effort,stream", "the request has no new field");
+  assert.equal(await page.evaluate(() => settings.whileBusy), "wait");
+  const dbs = await page.evaluate(async () => (indexedDB.databases ? (await indexedDB.databases()).map((d) => d.name) : []));
+  assert.ok(!dbs.includes("strata"), "the browser store is never opened while the list is off");
+  assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem("strata.chat")).length), 2, "one chat in localStorage, as before");
+  // Enter while an answer is being written does nothing
+  await say(page, "#hold one");
+  await page.waitForFunction(() => busy !== null);
+  await page.type("#input", "second");
+  await page.keyboard.press("Enter");
+  await sleep(300);
+  assert.equal(await page.$eval("#input", (e) => e.value), "second", "the text stays in the box");
+  assert.equal(await page.$("#pending"), null);
+  assert.equal(await page.$eval("#send-btn", (b) => b.disabled), true);
+  assert.equal(mock.state.requests.length, 2);
+  await page.click("#stop-btn");
+  await idle(page);
+  await page.close();
+});
+
+htest("list: chats are kept, found, renamed, deleted with an Undo, and survive a reload", async ({ browser, mock }) => {
+  const page = await openPage(browser, mock, { seed: on() });
+  assert.equal(await page.$eval("#sidebar", (e) => e.hidden), false);
+  assert.equal(await page.$eval("#new-btn", (e) => e.hidden), true, "the list has its own New chat");
+  await ask(page, "alpha question");
+  await page.click("#sidebar-new");
+  await ask(page, "beta question");
+  assert.deepEqual((await sidebarTitles(page)).sort(), ["alpha question", "beta question"]);
+  assert.equal(await page.$$eval(".sidebar-group", (e) => e.map((x) => x.textContent).join()), "Today");
+  assert.equal(await page.$eval("#sidebar-foot", (e) => e.textContent), "2 chats · kept in this browser");
+  // search: titles and message text
+  await page.type("#sidebar-search", "alpha");
+  assert.deepEqual(await sidebarTitles(page), ["alpha question"]);
+  await page.$eval("#sidebar-search", (e) => { e.value = "Mock answer"; e.dispatchEvent(new Event("input")); });
+  assert.equal((await sidebarTitles(page)).length, 2, "the search reads the answers too");
+  await page.$eval("#sidebar-search", (e) => { e.value = ""; e.dispatchEvent(new Event("input")); });
+  // rename: Enter keeps, Escape gives up, a click inside the field does not end it
+  const row = async (title) => (await page.evaluateHandle((t) => [...document.querySelectorAll(".chat-item")].find((r) => r.querySelector(".chat-item__title") && r.querySelector(".chat-item__title").textContent === t), title)).asElement();
+  await (await row("alpha question")).hover();
+  await (await (await row("alpha question")).$("[data-rename]")).click();
+  await page.click(".chat-item__input");                 // a click in the field
+  assert.ok(await page.$(".chat-item__input"), "the rename is still open");
+  await page.keyboard.down("Control"); await page.keyboard.press("a"); await page.keyboard.up("Control");
+  await page.keyboard.type("Garden plan");
+  await page.keyboard.press("Enter");
+  assert.ok((await sidebarTitles(page)).includes("Garden plan"));
+  // delete (not the open one), then Undo
+  await (await row("Garden plan")).hover();
+  await (await (await row("Garden plan")).$("[data-delete]")).click();
+  assert.deepEqual(await sidebarTitles(page), ["beta question"]);
+  await page.evaluate(() => { const b = document.querySelectorAll(".st-toast .st-btn"); b[b.length - 1].click(); });
+  await sleep(100);
+  assert.deepEqual((await sidebarTitles(page)).sort(), ["Garden plan", "beta question"], "the chat is back");
+  // a reload: both chats, the open one is the same, the answers are there
+  await page.reload({ waitUntil: "networkidle0" });
+  assert.deepEqual((await sidebarTitles(page)).sort(), ["Garden plan", "beta question"]);
+  assert.deepEqual(await texts(page), ["u:beta question", "a:Mock answer 2."]);
+  await (await row("Garden plan")).click();
+  assert.deepEqual(await texts(page), ["u:alpha question", "a:Mock answer 1."]);
+  assert.deepEqual(page.errors, []);
+  await page.close();
+});
+
+htest("list: switching it on keeps the chat on the screen; off keeps it as the single chat", async ({ browser, mock }) => {
+  const page = await openPage(browser, mock);
+  await ask(page, "before the list");
+  await openSettings(page);
+  await page.click("#s-list");
+  await page.click("#s-apply");
+  await page.waitForFunction(() => document.querySelectorAll(".chat-item").length === 1);
+  assert.deepEqual(await sidebarTitles(page), ["before the list"], "the chat on the screen is the first one in the list");
+  await page.click("#sidebar-new");
+  await openSettings(page);
+  await page.click("#s-list");
+  await page.click("#s-apply");
+  await page.waitForFunction(() => document.getElementById("sidebar").hidden);
+  assert.equal(await page.evaluate(() => JSON.parse(localStorage.getItem("strata.chat")).length), 0, "the empty chat you were in is the single chat now");
+  await page.close();
+});
+
+htest("rewind: edit and send again here, with an Undo that brings everything back", async ({ browser, mock }) => {
+  reset(mock);
+  const page = await openPage(browser, mock, { seed: on() });
+  await ask(page, "q1"); await ask(page, "q2");
+  await page.type("#input", "a draft");
+  await clickAction(page, 2, "Rewind to here");
+  assert.equal(await page.$$eval(".history-panel .st-btn", (e) => e.map((x) => x.textContent).join("|")), "Edit and send again here|Branch from here|Cancel");
+  assert.equal(await page.$eval("#send-btn", (b) => b.disabled), true, "nothing can be sent while the panel is open");
+  await page.$eval(".history-panel .st-btn--primary", (b) => b.click());
+  assert.deepEqual(await texts(page), ["u:q1", "a:Mock answer 1."]);
+  assert.equal(await page.$eval("#input", (e) => e.value), "q2", "the question is in the box");
+  assert.equal(await page.$eval("#history-undo span", (e) => e.textContent), "2 messages hidden");
+  await page.click("#history-undo button");
+  assert.deepEqual(await texts(page), ["u:q1", "a:Mock answer 1.", "u:q2", "a:Mock answer 2."]);
+  assert.equal(await page.$eval("#input", (e) => e.value), "a draft", "the draft that was in the box is back");
+  assert.equal(await page.$("#history-undo"), null);
+  // go back again, change the question, send: the request has only what is left, and the Undo is gone
+  await clickAction(page, 2, "Rewind to here");
+  await page.$eval(".history-panel .st-btn--primary", (b) => b.click());
+  await page.click("#input");
+  await page.keyboard.down("Control"); await page.keyboard.press("a"); await page.keyboard.up("Control");
+  await page.keyboard.type("q2 better");
+  await page.keyboard.press("Enter");
+  await idle(page);
+  assert.deepEqual(requestTexts(mock), ["u:q1", "a:Mock answer 1.", "u:q2 better"]);
+  assert.equal(await page.$("#history-undo"), null, "a new question ends the Undo");
+  await page.close();
+});
+
+htest("rewind: an answer - continue from here; the box is untouched", async ({ browser, mock }) => {
+  const page = await openPage(browser, mock, { seed: on() });
+  await ask(page, "q1"); await ask(page, "q2");
+  await page.type("#input", "keep me");
+  await clickAction(page, 1, "Rewind to here");
+  assert.equal(await page.$eval(".history-panel .st-btn--primary", (b) => b.textContent), "Continue from here");
+  await page.$eval(".history-panel .st-btn--primary", (b) => b.click());
+  assert.deepEqual(await texts(page), ["u:q1", "a:Mock answer 1."]);
+  assert.equal(await page.$eval("#input", (e) => e.value), "keep me");
+  await page.click("#history-undo button");
+  assert.equal((await texts(page)).length, 4);
+  await page.close();
+});
+
+htest("rewind: with the list off there is no branch, only a hint", async ({ browser, mock }) => {
+  const page = await openPage(browser, mock, { seed: { sampling: { chatEdit: true } } });
+  await ask(page, "q1");
+  await clickAction(page, 0, "Rewind to here");
+  assert.equal(await page.$$eval(".history-panel .st-btn", (e) => e.map((x) => x.textContent).join("|")), "Edit and send again here|Cancel");
+  assert.match(await page.$eval(".history-panel p", (e) => e.textContent), /turn on Saved chats/);
+  await page.keyboard.press("Escape");
+  assert.equal(await page.$(".history-panel"), null, "Escape closes it");
+  await page.close();
+});
+
+htest("branch: a new chat from here; the original stays; the title stays; a link back", async ({ browser, mock }) => {
+  const page = await openPage(browser, mock, { seed: on() });
+  await ask(page, "q1"); await ask(page, "q2");
+  await clickAction(page, 2, "Rewind to here");
+  await page.evaluate(() => [...document.querySelectorAll(".history-panel .st-btn")].find((b) => b.textContent === "Branch from here").click());
+  assert.deepEqual(await texts(page), ["u:q1", "a:Mock answer 1."]);
+  assert.equal(await page.$eval("#input", (e) => e.value), "q2");
+  assert.equal(await page.$eval("#chat-parent", (e) => e.textContent), "Branched from “q1”Open the original");
+  assert.deepEqual((await sidebarTitles(page)).sort(), ["Branch of q1", "q1"]);
+  await ask(page, "a new second question");
+  assert.deepEqual((await sidebarTitles(page)).sort(), ["Branch of q1", "q1"], "sending does not rename the branch");
+  await page.click("#chat-parent .st-btn");
+  assert.deepEqual(await texts(page), ["u:q1", "a:Mock answer 1.", "u:q2", "a:Mock answer 2."], "the original is untouched");
+  assert.equal(await page.$("#chat-parent:not([hidden])"), null);
+  // a branch at the very first message: an empty chat that keeps its name after the first send
+  await clickAction(page, 0, "Rewind to here");
+  await page.evaluate(() => [...document.querySelectorAll(".history-panel .st-btn")].find((b) => b.textContent === "Branch from here").click());
+  assert.deepEqual(await texts(page), []);
+  assert.equal(await page.$eval("#input", (e) => e.value), "q1");
+  await ask(page, "something else entirely");
+  assert.ok((await sidebarTitles(page)).filter((t) => t === "Branch of q1").length === 2, "both branches keep their names: " + (await sidebarTitles(page)));
+  await page.close();
+});
+
+htest("regenerate: a new answer to the same question; Undo brings the old one back", async ({ browser, mock }) => {
+  reset(mock);
+  const page = await openPage(browser, mock, { seed: on() });
+  await ask(page, "q1"); await ask(page, "q2");
+  await clickAction(page, 3, "Regenerate");
+  await idle(page);
+  assert.deepEqual(requestTexts(mock), ["u:q1", "a:Mock answer 1.", "u:q2"], "the old answer is not sent");
+  assert.deepEqual(await texts(page), ["u:q1", "a:Mock answer 1.", "u:q2", "a:Mock answer 3."]);
+  await page.click("#history-undo button");
+  assert.deepEqual(await texts(page), ["u:q1", "a:Mock answer 1.", "u:q2", "a:Mock answer 2."]);
+  await page.close();
+});
+
+htest("edit answer: the text is saved, thinking and tools go, later messages are hidden, no request", async ({ browser, mock }) => {
+  reset(mock);
+  const page = await openPage(browser, mock, { seed: on() });
+  await ask(page, "#think q1"); await ask(page, "q2");
+  const before = mock.state.requests.length;
+  await clickAction(page, 1, "Edit answer");
+  assert.match(await page.$eval(".history-editor p", (e) => e.textContent), /Saving hides the 2 messages after it\./);
+  await page.$eval(".history-editor textarea", (e) => { e.value = "The corrected answer"; });
+  await page.click("[data-edit-save]");
+  assert.deepEqual(await texts(page), ["u:#think q1", "a:The corrected answer"]);
+  assert.equal(mock.state.requests.length, before, "no request");
+  assert.equal(await page.evaluate(() => messages[1].reasoning), undefined, "the old thinking is gone");
+  assert.equal(await page.$eval("#history-undo span", (e) => e.textContent), "Answer edited, 2 messages hidden");
+  await ask(page, "q3");
+  assert.deepEqual(requestTexts(mock), ["u:#think q1", "a:The corrected answer", "u:q3"], "the corrected text is what the model reads");
+  await page.close();
+});
+
+htest("history: the buttons wait while an answer is written, and while something is open", async ({ browser, mock }) => {
+  const page = await openPage(browser, mock, { seed: on() });
+  await ask(page, "q1");
+  await say(page, "#hold q2");
+  await page.waitForFunction(() => busy !== null);
+  assert.equal(await page.$$eval(".history-actions button:not([disabled])", (e) => e.length), 0);
+  assert.equal(await page.$eval("#s-list", (e) => e.disabled), true, "the list switch waits too");
+  await page.click("#stop-btn");
+  await idle(page);
+  assert.ok((await page.$$eval(".history-actions button:not([disabled])", (e) => e.length)) > 0);
+  await clickAction(page, 1, "Edit answer");
+  assert.equal(await page.$$eval(".history-actions button:not([disabled])", (e) => e.length), 0, "while an editor is open");
+  await page.keyboard.press("Escape");
+  assert.equal(await page.$(".history-editor"), null);
+  await page.close();
+});
+
+htest("history: an attachment that was only kept by name is not sent as if it were whole", async ({ browser, mock }) => {
+  reset(mock);
+  const lost = [{ role: "user", text: "see file", time: 1, files: [{ name: "notes.txt" }], images: [] }, { role: "assistant", text: "ok", time: 2 }];
+  const page = await openPage(browser, mock, { seed: { ...on(), chat: lost, sampling: { chatEdit: true } } });
+  await clickAction(page, 1, "Regenerate");
+  await sleep(200);
+  assert.equal(mock.state.requests.length, 0, "no request with a missing file");
+  assert.match(await page.$eval(".st-toast__title", (e) => e.textContent), /Attachments need to be added again/);
+  await clickAction(page, 0, "Rewind to here");
+  await page.$eval(".history-panel .st-btn--primary", (b) => b.click());
+  assert.equal(await page.$eval("#input", (e) => e.value), "see file");
+  assert.equal(await page.$$eval("#attachments .chip", (e) => e.length), 0);
+  await page.close();
+});
+
+// ---- sending while an answer is written (#4004)
+htest("while answering - send after: the message waits and goes when the answer is done", async ({ browser, mock }) => {
+  reset(mock);
+  const page = await openPage(browser, mock, { seed: on({ whileBusy: "queue" }) });
+  await say(page, "#long first");
+  await page.waitForFunction(() => busy !== null);
+  assert.equal(await page.$eval("#send-btn", (b) => b.disabled), false);
+  assert.match(await page.$eval("#composer-hint", (e) => e.textContent), /sends when the answer is done/);
+  await say(page, "second");
+  assert.match(await page.$eval("#pending .pending__text", (e) => e.textContent), /Sends when this answer is done: “second”/);
+  assert.equal(await page.$eval("#input", (e) => e.value), "", "the box is empty: the message is parked");
+  await page.waitForFunction(() => messages.length === 4 && busy === null, { timeout: 20000 });
+  assert.equal(await page.$("#pending"), null);
+  assert.equal(mock.state.requests.length, 2);
+  assert.deepEqual(requestTexts(mock).map((t) => t.slice(0, 10)), ["u:#long fi", "a:This is ", "u:second"], "the first answer is whole, then the second question");
+  assert.equal(mock.state.aborted, 0, "nothing was cut");
+  await page.close();
+});
+
+htest("while answering - interrupt: the answer stops where it is and the message goes at once", async ({ browser, mock }) => {
+  reset(mock);
+  const page = await openPage(browser, mock, { seed: on({ whileBusy: "interject" }) });
+  await say(page, "#long first");
+  await page.waitForFunction(() => busy && busy.msg.text.length > 12);
+  await say(page, "actually, second");
+  await page.waitForFunction(() => messages.length === 4 && busy === null, { timeout: 20000 });
+  assert.equal(mock.state.aborted, 1, "the first stream was cut");
+  const got = await page.evaluate(() => messages.map((m) => ({ r: m.role, t: m.text, i: !!m.interrupted, meta: m.meta })));
+  assert.equal(got[1].i, true); assert.ok(got[1].t.length > 12 && got[1].t.length < 200, "what was written stays: " + got[1].t.length);
+  assert.match(got[1].meta, /nterrupted/);
+  assert.deepEqual(requestTexts(mock).map((t) => t.slice(0, 10)), ["u:#long fi", "a:This is ", "u:actually"], "the partial answer and the new message go to the model, in that order");
+  assert.equal(requestTexts(mock)[1], "a:" + got[1].t.trim() || true);
+  assert.equal(await page.$("#pending"), null);
+  assert.equal(await page.$eval(".st-msg--assistant .meta-text", (e) => /nterrupted/.test(e.textContent)), true);
+  await page.close();
+});
+
+htest("while answering - interrupt waits for a running tool, then stops", async ({ browser, mock }) => {
+  reset(mock);
+  // the mock engine here has an MCP server for the page to offer
+  const page = await openPage(browser, mock, { seed: on({ whileBusy: "interject" }) });
+  await say(page, "#tool find it");
+  await page.waitForFunction(() => busy && (busy.msg.tools || []).some((t) => t.state === "running"));
+  await say(page, "never mind, second");
+  assert.match(await page.$eval("#pending .pending__text", (e) => e.textContent), /Waiting for the tool to finish, then sending: “never mind, second”/);
+  assert.equal(await page.evaluate(() => busy.cut), false, "the tool is not killed");
+  await page.waitForFunction(() => messages.length === 4 && busy === null, { timeout: 20000 });
+  const tool = await page.evaluate(() => messages[1].tools[0]);
+  assert.equal(tool.state, "done"); assert.equal(tool.result, "The file says hello.", "the tool finished and its result is kept");
+  assert.equal(mock.state.aborted, 1);
+  assert.equal(requestTexts(mock).at(-1), "u:never mind, second");
+  await page.close();
+});
+
+htest("while answering - a waiting message can be taken back, or sent now", async ({ browser, mock }) => {
+  reset(mock);
+  const page = await openPage(browser, mock, { seed: on({ whileBusy: "queue" }) });
+  await say(page, "#hold one");
+  await page.waitForFunction(() => busy !== null);
+  await say(page, "later");
+  await page.click("[data-pending-back]");
+  assert.equal(await page.$eval("#input", (e) => e.value), "later", "back in the box");
+  assert.equal(await page.$("#pending"), null);
+  await page.$eval("#input", (e) => { e.value = ""; });
+  await say(page, "now");
+  await page.click("[data-pending-now]");                  // queue -> interrupt
+  await page.waitForFunction(() => messages.length === 4 && busy === null || (busy && busy.msg.text === "Working on it" && messages.length === 4), { timeout: 20000 });
+  assert.equal(requestTexts(mock).at(-1), "u:now");
+  await page.click("#stop-btn").catch(() => {});
+  await page.close();
+});
+
+htest("while answering - Stop keeps a waiting message for you to decide", async ({ browser, mock }) => {
+  reset(mock);
+  const page = await openPage(browser, mock, { seed: on({ whileBusy: "queue" }) });
+  await say(page, "#hold one");
+  await page.waitForFunction(() => busy !== null);
+  await say(page, "later");
+  await page.click("#stop-btn");
+  await idle(page);
+  await sleep(300);
+  assert.equal(mock.state.requests.length, 1, "a stopped answer does not send the queued message by itself");
+  assert.match(await page.$eval("#pending .pending__text", (e) => e.textContent), /Not sent yet: “later”/);
+  await page.click("[data-pending-now]");
+  await idle(page);
+  await page.waitForFunction(() => messages.length === 4);
+  assert.equal(requestTexts(mock).at(-1), "u:later");
+  await page.close();
+});
+
+htest("history: another chat or New chat does not lose a waiting message", async ({ browser, mock }) => {
+  const page = await openPage(browser, mock, { seed: on({ whileBusy: "queue" }) });
+  await ask(page, "first chat");
+  await say(page, "#hold running");
+  await page.waitForFunction(() => busy !== null);
+  await say(page, "parked");
+  await page.click("#stop-btn");
+  await idle(page);
+  await page.click("#sidebar-new");
+  assert.equal(await page.$eval("#input", (e) => e.value), "parked", "back in the box");
+  assert.equal(await page.$("#pending"), null);
+  await page.close();
+});
+
 const mock = await startMock();
 const browser = await launch();
 await run(async () => ({ browser, mock, close: async () => { await browser.close(); await mock.stop(); } }));
