@@ -3,8 +3,8 @@
 // src/kernels/qsa_dense_attn_parity.cpp - the decode attention over every cell (`qsa_dense_attn_step`) for the shapes it
 // is built for, against an FP64 host reference (GPU, synthetic, no model):
 //
-//   Qwen3.8's 24/2 heads of 256, Ornith-1.5's 16/2 of 256 and llm-jp-4.1's 40/4 of 128, on FP16 pools behind a
-//   shuffled page table, with a context that ends inside a chunk;
+//   Qwen3.8's 24/2 heads of 256, Ornith-1.5's 16/2 of 256, Qwen3.5-9B's 16/4 of 256 and llm-jp-4.1's 40/4 of 128, on
+//   FP16 pools behind a shuffled page table, with a context that ends inside a chunk;
 //   1. the output agrees with FP64 to 1e-4 of the output's scale;
 //   2. it is bit for bit `qsa_decode_attn_step` given the selection 0, 1, ..., n-1 (the same kernels, cell c in slot c).
 #include "strata/kernels/qsa.hpp"
@@ -105,6 +105,7 @@ int main() {
     int bad = 0;
     bad += check("Qwen3.8 QSA (24/2 x 256)", 24, 2, 256);
     bad += check("Ornith-1.5 (16/2 x 256)", 16, 2, 256);
+    bad += check("Qwen3.5-9B (16/4 x 256)", 16, 4, 256);
     bad += check("llm-jp-4.1 (40/4 x 128)", 40, 4, 128);
     std::printf("qsa_dense_attn: %d failures\n", bad);
     return bad ? 1 : 0;
