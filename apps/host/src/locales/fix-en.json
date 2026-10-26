@@ -67,5 +67,12 @@
  "fx66": "Default (Faster on this PC)",
  "fx67": "Default (Full quality on this PC)",
  "fx68": "Faster (default on this PC)",
- "fx69": "Full quality (default on this PC)"
+ "fx69": "Full quality (default on this PC)",
+ "fx70": "Faster long prompts",
+ "fx71": "Faster answers on Radeon RX 9000 / AI PRO R9700",
+ "fx72": "DeepSeek speed-ups",
+ "fx73": "Reads long prompts faster by approximating part of the work. Turn off if answers about long documents look wrong.",
+ "fx74": "Shares the work between the graphics card and the processor in a way that makes answers faster on these cards. Turn off to go back to the previous setting, which is slower.",
+ "fx75": "Reads long prompts faster and loads the parts of the model it needs faster. Turn off if DeepSeek stops working or its answers look wrong; it then runs as in version 0.2.6.",
+ "fx76": "On (recommended)"
 }
