@@ -1309,7 +1309,7 @@ $("img-size").onchange = () => { $("img-custom").hidden = $("img-size").value !=
 // the negative prompt hidden where the guidance is one token the model reads (HunyuanImage 3.0: guidance_token), and
 // the sizes snapped to the model's own (buckets) for the estimate
 // the image models (/health's image_models, the default first): a choice where there are several, its defaults and
-// whether it edits; one with no edit model hides the reference images
+// whether it edits; one without edits takes one image to start from (img2img) instead of reference images
 function imgModel() {
   const ms = health.image_models || [];
   return ms.find(m => m.id === $("img-model").value) || ms[0] || {defaults: health.image_defaults || {}, edits: true};
@@ -1334,18 +1334,23 @@ function imgModels() {
   imgDefaults();
 }
 $("img-model").onchange = () => {
-  if (!imgModel().edits) $("img-ref").value = "";
+  if (!imgModel().edits && ($("img-ref").files || []).length > 1) $("img-ref").value = "";
   imgDefaults();
   imgMaskSetup();
 };
 function imgDefaults() {
-  const d = imgModel().defaults || {};
-  $("img-ref-f").hidden = !imgModel().edits;
+  const d = imgModel().defaults || {}, edits = imgModel().edits;
+  // an image: an edit's references, or (a model without edits) the one image img2img starts from; its strength
+  // (how much of the schedule runs from it) beside it, the model's default as the placeholder
+  $("img-ref-l").textContent = edits ? "Edit an image (optional)" : "Start from an image (optional, img2img)";
+  $("img-ref").multiple = !!edits;
   const refs = ($("img-ref").files || []).length > 0;
+  $("img-strength-f").hidden = !refs;
+  $("img-strength").placeholder = String(d.strength != null ? d.strength : 1);
   $("img-steps-f").hidden = !!d.steps_fixed;
   $("img-steps").min = d.steps_min || 1;
   $("img-steps").max = d.steps_max || 100;
-  $("img-steps").placeholder = String((refs ? d.edit_steps : d.steps) || "");
+  $("img-steps").placeholder = String((refs && edits ? d.edit_steps : d.steps) || "");
   const token = !!d.guidance_token;   // one token, not a second pass with a negative prompt
   $("img-neg-f").hidden = token;
   $("img-cfg-l").textContent = token ? "Guidance" : "Guidance (CFG)";
@@ -1359,8 +1364,8 @@ function imgDefaults() {
 // made an image, 4), with the time the images chosen take (the server refuses more, ImageGen.check_n)
 function imgEstimate(n) {
   const d = imgModel().defaults || {}, rates = d.rates || {};
-  const refs = ($("img-ref").files || []).length > 0;
-  const pts = rates[refs ? "edit" : "generate"] || rates.generate || rates.edit;
+  const refs = ($("img-ref").files || []).length > 0, edit = refs && imgModel().edits;
+  const pts = rates[edit ? "edit" : "generate"] || rates.generate || rates.edit;
   if (!pts || !pts.length) return null;
   let [w, h] = $("img-size").value === "custom" ? [+$("img-w").value, +$("img-h").value]
     : ($("img-size").value === "auto" ? "1024x1024" : $("img-size").value).split("x").map(Number);
@@ -1370,7 +1375,11 @@ function imgEstimate(n) {
     const r = h / w;
     [w, h] = d.buckets.reduce((a, b) => Math.abs(b[1] / b[0] - r) < Math.abs(a[1] / a[0] - r) ? b : a);
   }
-  let steps = d.steps_fixed ? d.steps : (+$("img-steps").value || (refs ? d.edit_steps : d.steps) || 1);
+  let steps = d.steps_fixed ? d.steps : (+$("img-steps").value || (edit ? d.edit_steps : d.steps) || 1);
+  if (refs) {   // a strength runs part of the schedule (the server's strength_run)
+    const s = $("img-strength").value !== "" ? Number($("img-strength").value) : (d.strength != null ? d.strength : 1);
+    if (s > 0 && s < 1) steps -= Math.floor(Math.max(steps - steps * s, 0));
+  }
   const g = $("img-cfg").value !== "" ? Number($("img-cfg").value) : (d.guidance || 1);
   if (g > 1 && !d.guidance_token && (d.negative_prompt != null || $("img-neg").value.trim())) steps *= 2;
   // as the server's ImageGen.estimate_s: the size measured nearest, a step's time scaled (size_exp above it)
@@ -1392,7 +1401,7 @@ function imgCount() {
   $("img-n-f").title = one == null ? "Up to 4 until the server has made an image and measured its speed"
     : `Up to ${most}: the images one request makes in ${Math.round(budget / 60)} min at most (budget_s)`;
 }
-for (const id of ["img-size", "img-w", "img-h", "img-steps", "img-cfg", "img-n"])
+for (const id of ["img-size", "img-w", "img-h", "img-steps", "img-cfg", "img-n", "img-strength"])
   $(id).addEventListener("input", imgCount);
 $("img-size").addEventListener("change", imgCount);
 // whether the negative prompt is used: only with guidance above 1, and some models guide only with one
@@ -1407,8 +1416,8 @@ function imgNegHint() {
   $("img-neg-hint").textContent = msg;
   $("img-neg-hint").hidden = !msg;
 }
-// the edit's mask (models whose edits take one): the first reference image under a canvas of its own size, painted
-// where it is to change; sent as OpenAI's mask, a PNG of that size transparent where it was painted
+// the mask (every model takes one): the first image (an edit's reference, or img2img's) under a canvas of its own
+// size, painted where it is to change; sent as OpenAI's mask, a PNG of that size transparent where it was painted
 let imgMaskURL = null;
 function imgMaskSetup() {
   const d = imgModel().defaults || {};
@@ -1510,6 +1519,7 @@ $("img-form").onsubmit = async (ev) => {
   if ($("img-steps").value !== "" && !$("img-steps-f").hidden) body.steps = Number($("img-steps").value);
   if ($("img-cfg").value !== "") body.true_cfg_scale = Number($("img-cfg").value);
   if ($("img-bg").checked && !$("img-bg-f").hidden) body.background = "transparent";
+  if (refs.length && $("img-strength").value !== "") body.strength = Number($("img-strength").value);
   if (+$("img-n").value > 1) body.n = +$("img-n").value;
   body.output_format = $("img-fmt").value;
   if (body.output_format !== "png") body.output_compression = Math.max(0, Math.min(100, +$("img-q").value || 0));
@@ -1517,8 +1527,8 @@ $("img-form").onsubmit = async (ev) => {
   const t0 = performance.now();
   $("img-hint").textContent = "Generating\u2026 (a minute or more on a small GPU)";
   try {
-    // with reference images: an edit, in JSON with data: URLs (without an API key the server takes only JSON from a
-    // browser page, so that another site's form cannot use it)
+    // with an image: an edit (or a model without edits, img2img), in JSON with data: URLs (without an API key the
+    // server takes only JSON from a browser page, so that another site's form cannot use it)
     if (refs.length) body.images = await Promise.all(refs.map(async f => ({image_url: await readAsDataURL(f)})));
     const mask = refs.length ? imgMask() : null;
     if (mask) body.mask = {image_url: mask};
