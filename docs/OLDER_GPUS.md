@@ -182,6 +182,50 @@ decode; keep two engines on different logical CPUs.
 
 `tools/q8_sm60_check.cu` checks the kernel against a CPU reference on these shapes (1-8 columns).
 
+### Pascal GP100: 4-bit gate/up expert slots (opt-in, `STRATA_EXPERT_NIBBLE=1`)
+
+On a GP100 die the verify window's gate/up expert kernels wait on each block's serial chain (the weights, two codebook
+lookups per four weights, the emulated dp4a, the reduction), not on memory bandwidth. IQ2_S, IQ3_XXS and IQ3_S have
+only 3 or 8 magnitudes in their grids, so every weight is one of at most 16 signed values: `STRATA_EXPERT_NIBBLE=1`
+keeps those layers' gate/up experts in VRAM as 16 bytes of 4-bit codes per 32 weights (one 16-byte load), with the
+integer scale and the fp16 `d` of each block kept as they are, and decodes four weights in 1-4 integer instructions. The
+down rows stay GGUF blocks. The host copy, the pack and its tools do not change: the conversion runs on the GPU while
+the slots are filled. Only the CUDA build with `STRATA_EXPERIMENTAL_SM60` has the kernels.
+
+- **The answers are meant to be bit for bit the default's.** The 4-bit kernels run the production integer chain and float tail in
+  the production order (`native_gu_multi_kernel`'s sub-16 rows), and SwiGLU, the q8_1 step and the down projection are
+  the layout's own (mode 8 on a GP100). At every start each item is decoded with the production loader, encoded,
+  decoded from the written code and compared, and the GGUF blocks are rebuilt from every slot and compared with the
+  blob byte for byte; any difference refuses the start and names the layer. The prompt path's MMQ gathers the GGUF
+  blocks rebuilt from the slots (the copy it makes today, with the 4-bit codes read instead): the same bytes. The kernels that
+  existed before this change have the same SASS in the sm_60 build with and without it (446 kernels in `iq_kernels.cu` compared).
+  `iq_nibble_parity --synthetic-only` checks the codec, the rebuilt blocks and the expert step on random experts of every format
+  pair with no model file; `iq_nibble_parity <model shard>` does the same on a model's layers, against the GGUF blobs in mode 8 and
+  in the CUDA layout (`STRATA_SM60_TABLE=0`). Both need a GP100.
+- **It needs every expert in VRAM** on the card that runs its layer: a profile that ranks every pair, room for the
+  larger slots (per layer of 512 experts: +175 MiB for IQ3_S, +250 MiB for IQ3_XXS, +350 MiB for IQ2_S), and a prompt
+  path with its own buffers, no loan of cache slots (`--no-prefill-borrow` on one GPU; a layer split's stages keep
+  their own when their cards have room, #340). `STRATA_EXPERT_NIBBLE_SKIP=<layers>` keeps layers in their GGUF slots;
+  `STRATA_EXPERT_NIBBLE_FMTS=22,18,21` picks the formats.
+- **It does not start with what it cannot serve.** With the switch set, a build without `STRATA_EXPERIMENTAL_SM60`, a card other
+  than compute capability 6.0, `--peer-device`, `--expert-cache-device1..3`, `--kv-grow`, `--vram-elastic`, no `--expert-profile`,
+  `--expert-cache 0`, `STRATA_MMQ_DIRECT`, `STRATA_PREFILL_MMQ=0`, `STRATA_PF_FUSED=1`, `STRATA_FS_SLOTS`, `STRATA_EXPERT_V2=1` or
+  `STRATA_EXP_MODE` other than 0 or 8 make the engine say so in a warning and start with the usual GGUF slots. What is only known
+  later (a layer with an expert out of VRAM, a loan of cache slots, a prompt chunk other than the one the run without the switch
+  reads) still refuses the start with the reason. The adaptive tier is off with the switch. `STRATA_EXPERT_NIBBLE_RECHECK=1` (debug)
+  hashes every 4-bit slot again after each request.
+- **Opt-in `STRATA_NIB_GU_PROTO=1`** (with `STRATA_EXPERT_NIBBLE=1`): the 4-bit gate/up runs `nibx_gu_kernel`
+  (`nib_gu_proto.cuh`), the same row dot with the group's activations staged once per two row blocks by 16-byte
+  loads. The author measured, on one GP100 die, a layer's gate/up at 54-57 us instead of 67-72 us at one token (x1.24-1.27) and
+  x1.22-1.39 at two to four tokens.
+- The author measured the switch on a PH402 SKU 200 (two boards, four GP100 dies of 48 SMs and 32 GB each, clocks locked at 715 /
+  1050 MHz), Windows 11, CUDA 12.9, engine 0.1.45.3, Swift 1.5 IQ3_S (abliterated) pack, layer split 12,24,36,
+  `--trim-stage-weights`, MTP with `--spec-min-p 0.85`, `--pipeline-windows 2`, 1M context, every expert resident: 47 of 48 layers
+  converted (+12.7 GiB of VRAM over the four dies, +3.1 s of start-up). Decode of eight prompts (8K, 26K and 88K-token contexts),
+  token-weighted: 47.3 -> 51.9 tok/s (+9.7%; each prompt +9.5..+10.9%). Prompt reading 2.3..3.0% slower (the gather rebuilds the
+  GGUF blocks). The replies of 15 requests, including a 260K-token read, matched the engine without the switch. We have not
+  measured it on this code.
+
 ## Tesla P40 (sm_61): what was measured and changed
 
 Three things run differently on compute capability 6.1 by default and a fourth is opt-in. Each gives the same bits as what it
