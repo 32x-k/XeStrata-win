@@ -33,7 +33,11 @@ struct QiRequest {
     int64_t steps = 0;          // with no sigmas: the sampler's steps (0: the model's own).  HunyuanImage 3.0's
                                 // schedule is the shift of its own sampler; a fixed-schedule model leaves this.
     std::vector<QiRef> refs;    // an edit's reference images, in the order of their pads
-    QiRef mask;                 // an edit's mask over refs[0] (OpenAI's: alpha 0 where the image changes); empty: none
+    QiRef mask;                 // a mask over the base image (img_start.hpp: the init image, else refs[0]; OpenAI's:
+                                // alpha 0 where the image changes); empty: none
+    QiRef init;                 // img2img's base image for a model without edits (img_start.hpp); empty: none
+    float strength = 1.0f;      // how much of the base image's schedule runs (diffusers' strength, 0 .. 1]: below 1,
+                                // the sampler starts from the base image's latent (img_start.hpp); 1 from noise
     std::vector<int32_t> neg_ids;   // classifier-free guidance's negative prompt, as ids (its pads as the prompt's)
     float cfg = 1.0f;               // its scale (diffusers' true_cfg_scale): above 1 with neg_ids, guidance
     float guidance = 0.0f;          // HunyuanImage 3.0's: the scale its guidance token embeds (the model's own 2.5

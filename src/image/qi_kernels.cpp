@@ -587,14 +587,23 @@ void qi_axpy(float* x, const float* v, float a, int64_t n, void* stream) {
 }
 
 void qi_inpaint_blend(float* x, const float* z0, const float* noise, const float* m, float s, int64_t C, int64_t HW,
-                      void* stream) {
+                      void* stream, bool tokens) {
     if (C * HW <= 0) return;
     const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (C * HW)), [=](sycl::id<1> id) {
         const auto i = static_cast<int64_t>(id[0]);
-        const float k = m[i % HW];
+        const float k = m[tokens ? i / C : i % HW];
         x[i] = k * x[i] + (1.f - k) * ((1.f - s) * z0[i] + s * noise[i]);
     });
     finish(stream, e, "qi_inpaint_blend");
+}
+
+void qi_noise_mix(float* x, const float* z0, const float* noise, float s, int64_t n, void* stream) {
+    if (n <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        x[i] = (1.f - s) * z0[i] + s * noise[i];
+    });
+    finish(stream, e, "qi_noise_mix");
 }
 
 void qi_bias_add(float* y, const float* b, int64_t T, int64_t N, void* stream) {

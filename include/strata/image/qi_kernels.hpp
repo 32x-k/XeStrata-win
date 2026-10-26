@@ -119,9 +119,11 @@ void qi_axpy(float* x, const float* v, float a, int64_t n, void* stream);
 
 /// An edit with a mask, after a sampler's step to time s: x [C][HW] where m [HW] is 0 (the part kept) becomes the
 /// base image's latent z0 at that time, (1 - s) z0 + s noise (the flow's path from the same noise); where m is 1 it
-/// stays the DiT's.
+/// stays the DiT's.  `tokens`: x, z0 and noise are [HW][C] instead (Mage-Flow's latent tokens).
 void qi_inpaint_blend(float* x, const float* z0, const float* noise, const float* m, float s, int64_t C, int64_t HW,
-                      void* stream);
+                      void* stream, bool tokens = false);
+/// x = (1 - s) z0 + s noise over n values: the base image's latent at time s on the flow's path (img2img's start).
+void qi_noise_mix(float* x, const float* z0, const float* noise, float s, int64_t n, void* stream);
 
 // --- the vision encoder (Qwen3-VL's ViT, src/image/qi_vision.cpp)
 
