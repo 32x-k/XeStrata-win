@@ -323,6 +323,7 @@ bool PlainModel::load(const PlainOptions& opt, std::string& err) {
     finish_experts();
     strata::gpu::pin_reserve_release();   // loaded: the pinned memory's last reserve goes back
     set_adapt_period(4 * (int64_t) opt_.adapt_every);
+    adapt_auto_ = adapt_period_ > 0 && !opt_.adapt_every_given;
     for (PlainModel* st : chain()) {
         const OnDevice on(st->dev_);
         if (!st->reset(err)) return false;
@@ -1972,6 +1973,7 @@ bool PlainModel::stage_forward(const int32_t* tokens, int T, int64_t pos, const 
     if (!record(T, false, err) || !settle_window(err) || !stage(tokens, T, pos, err, first())) return false;
     if (hand_in != nullptr) std::memcpy(h_in_, hand_in, (size_t) T * (size_t) hand_w_ * 4);
     pcie_probe_before();
+    const double pool0 = disp_.ms_plan + disp_.ms_actq + disp_.ms_jobs + disp_.ms_run;
     const auto t0 = std::chrono::steady_clock::now();
     if (!launch_serve(exec_[(size_t) T], segs_[(size_t) T], moe_trunk_, moe_local_.data(), T, err)) return false;
     if (last()) {
@@ -1983,11 +1985,14 @@ bool PlainModel::stage_forward(const int32_t* tokens, int T, int64_t pos, const 
         err = std::string("plain model: the window: ") + strata::gpu::last_error();
         return false;
     }
-    pcie_probe_after(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(), T);
+    const double win_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    pcie_probe_after(win_ms, T);
     if (disp_.failed) {
         err = std::string("plain model: the CPU experts: ") + (disp_.fail ? disp_.fail : "failed");
         return false;
     }
+    pool_ms_ += disp_.ms_plan + disp_.ms_actq + disp_.ms_jobs + disp_.ms_run - pool0;
+    win_ms_ += win_ms;
     ++windows_;
     return defer || after_rows(T, pos, err);
 }
@@ -1996,6 +2001,26 @@ bool PlainModel::after_rows(int rows, int64_t pos0, std::string& err) {
     tokens_since_adapt_ += rows;
     if (disp_.usage.empty()) return true;
     add_route_rows(disp_.usage, disp_.route_rec, trunk_layers_, spec_.n_expert, opt_.max_t, spec_.n_expert_used, rows);
+    if (this == root_ && adapt_auto_) adapt_rows_ += rows;
+    if (this == root_ && adapt_auto_ && adapt_rows_ >= kAdaptDecideAt) {   // the whole chain's windows
+        adapt_auto_ = false;
+        double pool = 0, win = 0;
+        for (PlainModel* st : chain()) {
+            pool += st->pool_ms_;
+            win += st->win_ms_;
+        }
+        // the experts the GPU does not hold are read from the files, some or all (no RAM copy, or one that does not
+        // hold them all): a swap's blob is a file read too, and the period stays.  llm-jp-4.1 Q4_K_M at 20 GB of RAM
+        // and 8 GB of VRAM on the B70 (2026-10-26, the pool's share 0.81): every 16 tokens 23.8 tok/s, every 4 20.1.
+        int64_t pairs = 0, on_gpu = 0;
+        for (PlainModel* st : chain()) {
+            pairs += (int64_t) st->res_.size();
+            on_gpu += (int64_t) std::count_if(st->res_.begin(), st->res_.end(), [](int32_t r) { return r >= 0; });
+        }
+        const bool from_files = !in_ram_ && (complement_ == nullptr || !complement_->complement_ready() ||
+                                             complement_->resident_count() < pairs - on_gpu);
+        set_adapt_period(auto_adapt_period(win > 0.0 ? pool / win : 0.0, adapt_period_, from_files, "strata plain"));
+    }
     // a round at fixed positions of the text (window-invariant swaps, #152), a layer split's stages in turn
     // (adapt_phase_), so that one's copies land before the next's
     const int64_t period = root_->adapt_period_;

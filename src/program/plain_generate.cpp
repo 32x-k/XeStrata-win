@@ -645,6 +645,7 @@ int plain_main(int argc, char** argv) {
     strata::program::SharedOptionFields shared;
     shared.who = who.c_str();
     shared.adapt_every = &opt.adapt_every;
+    shared.adapt_every_given = &opt.adapt_every_given;
     shared.adapt_swaps = &opt.adapt_swaps;
     shared.adapt_min_gain = &opt.adapt_min_gain;
     shared.adapt_decay = &opt.adapt_decay;

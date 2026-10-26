@@ -2078,32 +2078,13 @@ bool pcie_move_if_pays(strata::core::ExpertDispatch& d, bool overlap, const stra
     return true;
 }
 
-// The adaptive tier's period when --adapt-every is not given, chosen once, after kAdaptDecideAt tokens of output: a
-// round every 4 windows (16 tokens) while the CPU pool takes a small share of the verify windows, every window (4
-// tokens) once it takes kAdaptPoolShare or more.  A round more often moves the experts the text has turned to into
-// VRAM sooner, which pays where the CPU computes many missed experts; where it computes few the rounds cost more than
-// they save.  Measured 2026-10-23 on one 512-token text that every setting followed (decode, 3 runs each): the pool's
-// share and every window against every 4 - B70 0.10-0.13, IQ3_XXS 1K equal, Gyro-M 1K 6% slower; RX 9060 XT
-// 0.49-0.52, IQ3_XXS +1.7%, Gyro-M +8%; RTX 4070 0.61-0.64, IQ3_XXS +5.5%, Gyro-M +6%.  The share depends on the
-// card's VRAM against the model, the CPU and the link, not on a device's name.  Chosen once and at a position of the
-// text, so the swaps stay at fixed positions (window-invariant output, #152); the 4-token positions include the
-// 16-token ones before them.
-// `from_files`: the experts the GPU does not hold are read from the model files (--mmap-experts, no RAM copy), and a
-// swap's blob is a file read too: there the period stays.  Measured 2026-10-24 on the RX 9060 XT in a 32 GiB cgroup
-// (IQ3_XXS, the page cache emptied before each run, decode): every 4 tokens 23.6-24.2 tok/s at 1K and 14.7 at 32K,
-// every 16 25.5 and 16.9, every 32 25.3-26.5 and 16.4, every 64 25.8 and 15.9 - the pool's share was 0.85.
-constexpr int64_t kAdaptDecideAt = 32;
-constexpr double kAdaptPoolShare = 0.3;
+// The adaptive tier's period when --adapt-every is not given: core/expert_tier's auto_adapt_period, by the CPU pool's
+// share of the verify windows (the other models' engine gives it its own windows' share).
+using strata::core::kAdaptDecideAt;
 
 int64_t auto_adapt_period(const strata::core::Verifier& v, int64_t period, bool from_files, const char* who) {
     const double all = v.ms_wait + v.ms_pool + v.ms_host + v.ms_commit;
-    const double share = all > 0.0 ? v.ms_pool / all : 0.0;
-    const int64_t next = share >= kAdaptPoolShare && !from_files ? std::min<int64_t>(period, 4) : period;
-    std::fprintf(stderr, "strata %s: adaptive tier every %lld tokens: the CPU pool took %.0f%% of the verify windows "
-                         "(a round every window from %.0f%%%s; --adapt-every sets it)\n",
-                 who, (long long) next, 100.0 * share, 100.0 * kAdaptPoolShare,
-                 from_files ? ", not while the experts are read from the files" : "");
-    return next;
+    return strata::core::auto_adapt_period(all > 0.0 ? v.ms_pool / all : 0.0, period, from_files, who);
 }
 
 // After a prompt, the adaptive tier's counts start from the prompt's routing (core/expert_tier's seed_usage, which
@@ -11725,7 +11706,7 @@ int main(int argc, char** argv) {
                     for (int st = 0; st < n_stages; ++st) stage_ver(st).add_routing(drive.d.usage.data(), g.n_expert, a + 1);
                 if (adapt_auto && produced_n >= kAdaptDecideAt) {
                     adapt_auto = false;
-                    adapt_period = auto_adapt_period(ver, adapt_period, srcp == &src && !src.complement_ready(), "serve");
+                    adapt_period = auto_adapt_period(ver, adapt_period, srcp == &src && !src.complement_ready(), "strata serve");
                 }
                 if (!drive.d.usage.empty() && !ajob &&
                     (adapt_period > 0 ? (p + a + 1) / adapt_period > p / adapt_period : ((rounds + 1) % o.adapt_every) == 0))
@@ -12881,7 +12862,7 @@ int main(int argc, char** argv) {
             if (adapt_period > 0) ver.add_routing(drive.d.usage.data(), g.n_expert, a + 1);
             if (adapt_auto && (int64_t) produced.size() >= kAdaptDecideAt) {
                 adapt_auto = false;
-                adapt_period = auto_adapt_period(ver, adapt_period, srcp == &src && !src.complement_ready(), "generate");
+                adapt_period = auto_adapt_period(ver, adapt_period, srcp == &src && !src.complement_ready(), "strata generate");
             }
             if (adapt_period > 0 && (p + a + 1) / adapt_period > p / adapt_period)
                 adapt_thr = std::thread([&] {

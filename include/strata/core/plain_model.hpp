@@ -75,6 +75,7 @@ struct PlainOptions {
     int64_t vram_free_mib = -1;     ///< the free VRAM the tier is sized from at most (-1: what the device reports)
     int64_t expert_slots = -1;      ///< the VRAM tier's slots at most, over all the layers (-1: what fits)
     int adapt_every = 4;            ///< windows between adaptive rounds (0: off)
+    bool adapt_every_given = false; ///< --adapt-every was given: its period stays (no auto_adapt_period)
     int adapt_swaps = 96;           ///< the most experts one round moves into the VRAM tier
     /// ... and at most this many MiB of experts for each token the windows read since the last round: the copies share
     /// the RAM's bandwidth with the missed experts.  48: on the RX 9060 XT with a Ryzen 7 5700X (DDR4, 2026-10-12),
@@ -561,7 +562,12 @@ private:
     void pcie_probe_after(double ms, int T);
     int64_t tokens_since_adapt_ = 0;   ///< tokens the windows read since the last adaptive round
     int64_t adapt_phase_ = 0;   ///< a layer split's stage: its rounds this many tokens after the root's
-    int64_t adapt_period_ = 0;   ///< the root's: the tokens between rounds (4 x --adapt-every)
+    /// The root's: the tokens between rounds (4 x --adapt-every, or core/expert_tier's auto_adapt_period after
+    /// kAdaptDecideAt tokens of output when --adapt-every is not given, from the CPU pool's share of the windows' time).
+    int64_t adapt_period_ = 0;
+    bool adapt_auto_ = false;
+    int64_t adapt_rows_ = 0;
+    double pool_ms_ = 0, win_ms_ = 0;   ///< this stage's windows: the CPU pool's host time and the whole
     /// The root's period and the stages' phases from it: the rounds in turn, a share of the period apart.
     void set_adapt_period(int64_t period);
     /// The adaptive tier after a window, as Qwen3.8-Flash-Next's (generate.cpp): its first `rows` rows (from `pos0`)

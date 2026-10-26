@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <utility>
 #include <vector>
 
@@ -151,6 +152,32 @@ inline int adapt_lag(int windows = 2) {
         return e ? std::max(1, (int) std::strtol(e, nullptr, 10)) : 0;
     }();
     return v > 0 ? v : windows;
+}
+
+/// The adaptive tier's period when --adapt-every is not given, for both engines (generate.cpp, PlainModel): chosen once,
+/// after kAdaptDecideAt tokens of output, from `share`, the CPU pool's share of the verify windows' time.  A round
+/// every 4 windows (16 tokens) while the pool takes a small share, every window (4 tokens) once it takes
+/// kAdaptPoolShare or more.  A round more often moves the experts the text has turned to into VRAM sooner, which pays
+/// where the CPU computes many missed experts; where it computes few the rounds cost more than they save.  Measured
+/// 2026-10-23 on one 512-token text that every setting followed (decode, 3 runs each): the pool's share and every
+/// window against every 4 - B70 0.10-0.13, IQ3_XXS 1K equal, Gyro-M 1K 6% slower; RX 9060 XT 0.49-0.52, IQ3_XXS
+/// +1.7%, Gyro-M +8%; RTX 4070 0.61-0.64, IQ3_XXS +5.5%, Gyro-M +6%.  The share depends on the card's VRAM against the
+/// model, the CPU and the link, not on a device's name.  Chosen once and at a position of the text, so the swaps stay
+/// at fixed positions (window-invariant output, #152); the 4-token positions include the 16-token ones before them.
+/// `from_files`: the experts the GPU does not hold are read from the model files (--mmap-experts, no RAM copy), and a
+/// swap's blob is a file read too: there the period stays.  Measured 2026-10-24 on the RX 9060 XT in a 32 GiB cgroup
+/// (IQ3_XXS, the page cache emptied before each run, decode): every 4 tokens 23.6-24.2 tok/s at 1K and 14.7 at 32K,
+/// every 16 25.5 and 16.9, every 32 25.3-26.5 and 16.4, every 64 25.8 and 15.9 - the pool's share was 0.85.
+inline constexpr int64_t kAdaptDecideAt = 32;
+inline constexpr double kAdaptPoolShare = 0.3;
+
+inline int64_t auto_adapt_period(double share, int64_t period, bool from_files, const char* who) {
+    const int64_t next = share >= kAdaptPoolShare && !from_files ? std::min<int64_t>(period, 4) : period;
+    std::fprintf(stderr, "%s: adaptive tier every %lld tokens: the CPU pool took %.0f%% of the verify windows "
+                         "(a round every window from %.0f%%%s; --adapt-every sets it)\n",
+                 who, (long long) next, 100.0 * share, 100.0 * kAdaptPoolShare,
+                 from_files ? ", not while the experts are read from the files" : "");
+    return next;
 }
 
 /// After a prompt, the adaptive tier's counts start from the prompt's routing instead of from nothing.  A count is the
