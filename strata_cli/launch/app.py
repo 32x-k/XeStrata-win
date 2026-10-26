@@ -166,7 +166,10 @@ class Ctx:
                                "The engine's own list could not be read here; names are not checked."
         if not cfg and not s.extra:
             self.engine_note = self.engine_note or "The model is not installed yet; the defaults and tuned values appear after it is."
-        self._adv = P.build_rows(text, base_args, tuned_args, base_env, tuned_env, s.extra)
+        from strata_control import speed_switches
+        gpus = list(getattr(self.computer, "gpus", None) or [])
+        switches = P.switch_params(speed_switches.applicable(cfg, gpus, self.catalog.installed_backend()))
+        self._adv = P.build_rows(text, base_args, tuned_args, base_env, tuned_env, s.extra, switches)
         return self._adv
 
     def command_text(self) -> str:
