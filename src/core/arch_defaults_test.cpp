@@ -293,8 +293,8 @@ int main() {
         using namespace strata;
         CHECK(is_026_token("026") && is_026_token("0.2.6") && is_026_token("v0.2.6"));
         CHECK(!is_026_token(nullptr) && !is_026_token("") && !is_026_token("0") && !is_026_token("027"));
-        // residency-biased routing: 0 under 026 on the card that gets 2.0 otherwise
-        CHECK(route_prior_default(false, false, 12.0 * GiB, false) == 2.0f);
+        // residency-biased routing: 0 under 026 on the card that gets 1.5 otherwise
+        CHECK(route_prior_default(false, false, 12.0 * GiB, false) == 1.5f);
         CHECK(route_prior_default(false, false, 12.0 * GiB, true) == 0.0f);
         CHECK(route_prior_default(false, false, 8.0 * GiB, true) == 0.0f);
         // the wide HC up read: on for a 12.0 card on CUDA, off under 026, off in HIP, off on sm_86 / sm_121
@@ -340,11 +340,12 @@ int main() {
     {
         const double GiB = 1073741824.0;
         using namespace strata;
-        // residency-biased routing: 2.0 on a discrete CUDA card of 13 GiB or less, nothing else
-        CHECK(route_prior_default(false, false, 11.9 * GiB) == 2.0f);       // RTX 3060 / 5070 12 GB
-        CHECK(route_prior_default(false, false, 12.0 * GiB) == 2.0f);
-        CHECK(route_prior_default(false, false, 8.0 * GiB) == 2.0f);        // an 8 GB card
-        CHECK(route_prior_default(false, false, 13.0 * GiB) == 2.0f);       // the boundary is inclusive
+        // residency-biased routing: 1.5 on a discrete CUDA card of 13 GiB or less, nothing else
+        CHECK(route_prior_default(false, false, 11.9 * GiB) == 1.5f);       // RTX 3060 / 5070 12 GB
+        CHECK(route_prior_default(false, false, 12.0 * GiB) == 1.5f);
+        CHECK(route_prior_default(false, false, 8.0 * GiB) == 1.5f);        // an 8 GB card
+        CHECK(route_prior_default(false, false, 13.0 * GiB) == 1.5f);       // the boundary is inclusive
+        CHECK(route_prior_default(false, false, 12.0 * GiB) == strata::kRoutePriorSmallCard);   // the one place the value lives (1.5 by the owner decision of 2026-10-26; 2.0 before)
         CHECK(route_prior_default(false, false, 13.5 * GiB) == 0.0f);
         CHECK(route_prior_default(false, false, 15.7 * GiB) == 0.0f);       // 16 GB card: z440's A4000, P100
         CHECK(route_prior_default(false, false, 72.0 * GiB) == 0.0f);       // RTX PRO 5000
