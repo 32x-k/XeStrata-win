@@ -152,11 +152,19 @@ static int g_round_nd = 0;
 // The drafts' cut on the product of their confidences (DeepInfer's cumulative rule): a draft is verified while the chance
 // that it and every draft before it are kept stays at least this - a long window whose later drafts are likely lost is
 // not verified whole.  STRATA_DS4_DSPARK_CUM=F, a request's dspark_cum key; 0: off, only the floor on each draft's own
-// confidence (dspark_conf).  Off by default (not measured faster on code: H100 / owner PC); Project Maya runs 0.5 (a Radeon 8065S: decode +6.5%, the same tokens)
+// confidence (dspark_conf).  On AMD 0.5 is the default: measured on 4x R9700, DeepSeek 2.25 bpw, six 128-token
+// decodes an arm in one load - 71.7 -> 76.9 tok/s (medians), the same ids; Project Maya runs 0.5 on a Radeon 8065S
+// too (+6.5% decode, the same tokens), while the CUDA measurements in 0.2.7 had it flat, so CUDA keeps 0.
+// STRATA_DS4_DSPARK_CUM overrides either way.
 float dspark_cum_default() {
     static const float v = [] {
         const char* e = std::getenv("STRATA_DS4_DSPARK_CUM");
-        return e != nullptr ? (float) std::atof(e) : 0.0f;
+        if (e != nullptr) return (float) std::atof(e);
+#if defined(STRATA_USE_HIP)
+        return 0.5f;
+#else
+        return 0.0f;
+#endif
     }();
     return v;
 }
