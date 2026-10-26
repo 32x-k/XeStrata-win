@@ -705,6 +705,23 @@ class Strata:
         return once, once_d
 
     @staticmethod
+    def with_shards(files: list) -> list:
+        """The files plus the other parts of every multi-part GGUF among them (name-00001-of-00004.gguf: the config names only the
+        first), so deleting a model takes all its parts and never leaves 100 GB behind (#3716)."""
+        out, seen = [], set()
+        for f in files:
+            names = [Path(f)]
+            m = SHARD_NAME.match(str(f))
+            if m:
+                names += [Path(f"{m.group(1)}-{i:05d}-of-{m.group(3)}.gguf") for i in range(1, int(m.group(3)) + 1)]
+            for n in names:
+                key = norm(n)
+                if key not in seen:
+                    seen.add(key)
+                    out.append(n)
+        return out
+
+    @staticmethod
     def tree_bytes(path: Path) -> int:
         if path.is_file():
             try:
@@ -791,11 +808,13 @@ class Strata:
         (the shared MTP draft, a shared PLE shard) is kept; so is anything outside Strata's own folders."""
         cfg = self.read_config(config)
         files, dirs = self.model_paths(cfg)
+        files = self.with_shards(files)
         used_files, used_dirs = set(), set()
         for other in self.configs():
             if norm(other) == norm(config):
                 continue
             f, d = self.model_paths(self.read_config(other))
+            f = self.with_shards(f)
             used_files |= {norm(x) for x in f}
             used_dirs |= {norm(x) for x in d}
         remove, keep = [], []
