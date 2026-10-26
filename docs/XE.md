@@ -30,6 +30,38 @@ A smaller card is checked by making the B70 look like one.
 `STRATA_NO_XMX=1` takes the paths without the matrix engines.
 The processor's own graphics (a UHD 770 on the development machine) is a second, real configuration for checks.
 
+## Integration through Strata 0.2.6
+
+The changes of upstream Strata 0.2.2 to 0.2.6 (`4b9e05a2`) are carried into Xe.
+Most of upstream's changes in this range are for DeepSeek V4.1-Flash (left for later work), the app, the terminal and the Mac, and are not carried in.
+
+What was carried in:
+
+- serve: without `--conversation-cache-mib`, the conversation cache is sized from the free RAM (both Qwen3.8-Flash-Next and PlainModel). A chat request with no messages is a 400. A one-token reply gives no decode speed. The tool-call aliases and the edges of the wrappers follow upstream, and a fenced tool call left unclosed is read too. An image a tool returned wakes the parked image encoder. The image token limit has a default, and an image above it is refused.
+- Web page: an API key rewritten there is used at once, even when the browser refuses to store it. Long words, wide tables and the model settings rows stay inside a narrow screen.
+- setup: `--kv fp16` is taken. The record of the packages it installed keeps the OS that wrote it. Build tools in the virtualenv come first, and an old cmake counts as none. A download that gets no data for 2 minutes says so, with how far it got and what to do next.
+- Speculative decoding: the cost-aware improvements to the `--spec-window auto` window (a cost table per context length, outlier rounds counted as a fraction, looking one or two drafts ahead before keeping a draft) are opt-in with `STRATA_SPEC_COST=1`; PlainModel's speculative decoding uses the same part. They are not the default because the decode of a 1K prompt is 1.4 to 4.7% slower on the B70 and the RTX 4070 (1.3 to 3.2% faster at 32K).
+
+What XeStrata changed on its side during this integration:
+
+- What Qwen3.8-Flash-Next and PlainModel (GLM, Ornith, llm-jp, Qwen3.6) do alike is now one part both call: the option parsing, the DONE line, the expert tier's swap rules and its filling from the profile, the automatic interval when `--adapt-every` is not given, the PCIe split's measurement, the `--prefill auto` chunk choice, the prompt's candidates for experts on the CPU, and the MTP draft head over a vocabulary subset. llm-jp-4.1 does not shorten the swap interval by itself (it is slower when it does). A prompt chunk PlainModel picks from the VRAM tier is taken only when it is larger than 4096.
+- PlainModel takes `--vram-elastic`, `--low-ram on|mmap`, `--kv int8` (not GLM), `--prefill-cpu-share`, `STRATA_RAM_ADAPT`, `--adapt-min-gain`, `STRATA_FETCH_THREADS` and `--spec-window` as well. GLM-5.3-Flash keeps the DSA latent in RAM and gives the freed VRAM to the experts (`--kv-ram`, on by default).
+- The MTP draft head takes a 2-bit coarse product and a re-pick of the top 16 where that is faster on the GPU (both Qwen3.8-Flash-Next and PlainModel).
+- `STRATA_DISK_SKIP_FROM` skips experts read from the SSD by rank (opt-in, from Project Maya's #109).
+- The copies of the image layers streamed in go through a relay per slot and a multi-threaded memcpy.
+- The three places that time paths at start-up to choose one no longer take the slower one on a noisy sample or short VRAM. The two forms of the DeltaNet recurrence are timed on the chunk's first 1024 tokens at most (for a 16384-token chunk the timing's copy did not fit in VRAM, which left the 5x slower form on: the RTX 4070's 32K serve prompt 1,687 -> 1,958 tok/s). The experts' products take FP16 only where it is 3% faster than int8. The hyper-connection read times its three forms in turn, three times.
+
+Compared with upstream v0.2.6 on the three makers' GPUs (the B70: generate for IQ3_XXS, Q2_0, IQ2_XS, IQ3_S and UD-Q4_K_XL; the RTX 4070: the IQ3_XXS serve path; the RX 9060 XT: IQ3_XXS through generate and serve).
+On IQ3_XXS through generate, the B70 reads prompts 1.8 to 2.7 times and decodes 24 to 48% faster than upstream's `sycl/` port; on the other types at 32K, prompts 1.7 to 2.5 times and decode from 12% to 2.9 times faster.
+The RX 9060 XT reads prompts 2.1 to 2.8 times and decodes 8 to 10% faster.
+Through serve, prompts are read 1.16 to 1.75 times faster on the RTX 4070 and 1.9 to 2.6 times on the RX 9060 XT. The serve decode is 6 to 55% faster on the RTX 4070 and 4 to 22% on the RX 9060 XT at 1K and 32K. At 64K it is 10 to 12% slower on the RTX 4070 and 6.5% slower at temperature 0.7 on the RX 9060 XT, in runs where both engines' texts change from the second turn and XeStrata writes longer (on the first turn the RTX 4070 is 2 to 6% faster, and 29% faster through generate at 64K, where it follows the same text).
+
+Not carried in: the DeepSeek V4.1-Flash support, the app and the terminal, the Mac, upstream's `sycl/`, the DFlash2 drafter,
+the AVX-512 rows of the CPU i-quants (what reaches the main model is one IQ3 token only, on top of the DeepSeek CPU lane's set; there is no AVX-512 machine to measure them on),
+the new trellis types (TQK5X, TQK4X and others: experimental, with no model released in them), the gfx1151 HIP experiments,
+the start-up swaps of speculative decoding (upstream made them opt-in again), choosing the asynchronous tier by measurement (on XeStrata's tier, asynchronous was not faster in the RTX 4070's serve),
+and the hipBLASLt tuning tables (XeStrata's AMD products go through oneMath's rocBLAS).
+
 ## Integration through Strata 0.2.2
 
 The changes of upstream Strata 0.2.1.1 to 0.2.2 (`011c9e60`) are carried into Xe.

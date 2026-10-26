@@ -32,6 +32,38 @@ Qwen3.8 の prompt は、xmx_gemm が動く GPU では FP16 の経路のまま�
 `STRATA_NO_XMX=1` は XMX を使わない経路を選ばせます。
 CPU 内蔵のグラフィックス（開発機では UHD 770）は、確認用の 2 つ目の実機として使います。
 
+## Strata 0.2.6 の取り込み
+
+upstream の Strata 0.2.2 から 0.2.6（`4b9e05a2`）までの変更を Xe に移しています。
+この間の upstream の変更の多くは、DeepSeek V4.1-Flash への対応（後の作業に回しました）、アプリ・ターミナル・Mac のもので、移していません。
+
+移したものは次のとおりです。
+
+- serve: `--conversation-cache-mib` を省くと、会話のキャッシュの大きさを RAM の空きから決める（Qwen3.8-Flash-Next と PlainModel の両方）。メッセージのないチャットの要求は 400 にする。1 トークンの返答には decode の速さを出さない。ツール呼び出しの別名と包みの境目を upstream に合わせ、閉じていない囲みのツール呼び出しも読む。ツールが返した画像では、止めてある画像のエンコーダーを起こす。画像のトークン数の上限に既定を持たせ、超えたものを断る。
+- Web ページ: 書き換えた API キーを、ブラウザーの保存が断られてもすぐ使う。狭い画面で長い語・広い表・モデルの設定の行を画面の内に収める。
+- setup: `--kv fp16` を受ける。入れたパッケージの記録に、書いた OS を残す。ビルドの道具は virtualenv のものを先に使い、古い cmake は無いものとする。2 分データが来ないダウンロードは、割合と次の一手を添えてそう言う。
+- 推測デコード: `--spec-window auto` に、費用を見る窓の改良（文脈の長さごとの費用の表、外れた回を薄めて数える、1〜2 個先まで見て下書きを続けるか決める）を `STRATA_SPEC_COST=1` で opt-in に。PlainModel の推測デコードも同じ部品を使います。既定にしないのは、B70 と RTX 4070 の 1K の decode で 1.4〜4.7% 遅いためです（32K では 1.3〜3.2% 速い）。
+
+この取り込みの間に XeStrata の側で変えたもの:
+
+- Qwen3.8-Flash-Next と PlainModel（GLM・Ornith・llm-jp・Qwen3.6）で同じ働きの部分を、両方が呼ぶ部品にまとめました: オプションの解析、DONE 行、エキスパートの層の入れ替えの規則とプロファイルからの埋め方、`--adapt-every` を省いたときの間隔の自動の判定、PCIe の分担の測り方、`--prefill auto` の塊の選び方、prompt で CPU に回すエキスパートの候補、MTP の語彙の部分集合のドラフトヘッド。llm-jp-4.1 は入れ替えの間隔を自動で縮めません（縮めると遅くなるため）。PlainModel が VRAM の枠から選ぶ prompt の塊は、4096 より大きくするときだけ使います。
+- PlainModel にも、`--vram-elastic`、`--low-ram on|mmap`、`--kv int8`（GLM を除く）、`--prefill-cpu-share`、`STRATA_RAM_ADAPT`、`--adapt-min-gain`、`STRATA_FETCH_THREADS`、`--spec-window` を通しました。GLM-5.3-Flash は DSA の潜在を RAM に置き、空いた VRAM をエキスパートに回します（`--kv-ram`、既定 on）。
+- MTP の下書きのヘッドを、その GPU で速ければ 2 ビットの粗い積と上位 16 個の選び直しにします（Qwen3.8-Flash-Next と PlainModel の両方）。
+- SSD から読むエキスパートを順位で飛ばす `STRATA_DISK_SKIP_FROM`（opt-in、Project Maya の #109 から）。
+- 画像の層を流すときの写しを、スロットごとのリレーと複数スレッドの memcpy にしました。
+- 起動時に経路を測って選ぶ 3 か所を、ぶれや VRAM の不足で遅い方を選ばないようにしました。DeltaNet の 2 つの形は塊の先頭 1024 トークンまでで測ります（16384 トークンの塊では測りの写しが VRAM に入らず、5 倍遅い形のままでした: RTX 4070 の serve の 32K の prompt が 1,687 → 1,958 tok/s）。エキスパートの積を FP16 にするのは int8 より 3% 以上速いときだけにします。hyper-connection の読み方は 3 つの形を 3 回交互に測ります。
+
+upstream v0.2.6 と 3 社の GPU で比べました（B70 は IQ3_XXS・Q2_0・IQ2_XS・IQ3_S・UD-Q4_K_XL の generate、RTX 4070 は IQ3_XXS の serve、RX 9060 XT は IQ3_XXS の generate と serve）。
+IQ3_XXS の generate では、B70 は upstream の `sycl/` 版より prefill が 1.8〜2.7 倍、decode が 24〜48% 速いです。ほかの型の 32K では prefill が 1.7〜2.5 倍、decode が 12% から 2.9 倍まで速いです。
+RX 9060 XT は prefill が 2.1〜2.8 倍、decode が 8〜10% 速いです。
+serve の prompt は、RTX 4070 で 1.16〜1.75 倍、RX 9060 XT で 1.9〜2.6 倍速いです。serve の decode は 1K と 32K で RTX 4070 が 6〜55%、RX 9060 XT が 4〜22% 速いです。64K では RTX 4070 が 10〜12%、RX 9060 XT の温度 0.7 が 6.5% 遅いですが、どちらも 2 ターン目から両方の文が変わり、XeStrata が長く書いた回です（最初のターンでは RTX 4070 が 2〜6% 速く、同じ文をなぞらせる generate の 64K では 29% 速いです）。
+
+移していないのは、DeepSeek V4.1-Flash への対応、アプリとターミナル、Mac、upstream の `sycl/`、DFlash2 のドラフター、
+CPU の i-quant の AVX-512 の行（本体に効くのは IQ3 の 1 トークンだけで、DeepSeek の CPU の経路の一式に乗るため。AVX-512 の機械がなく速さを測れません）、
+trellis の新しい型（TQK5X・TQK4X ほか、実験的で配布のモデルがありません）、gfx1151 の HIP の実験、
+推測デコードの起動直後の入れ替え（upstream 自身が opt-in に戻しました）、非同期の段を測って選ぶ形（XeStrata の段では、非同期にしても RTX 4070 の serve で速くなりませんでした）、
+hipBLASLt の調整表（XeStrata の AMD の積は oneMath の rocBLAS です）です。
+
 ## Strata 0.2.2 の取り込み
 
 upstream の Strata 0.2.1.1 から 0.2.2（`011c9e60`）までの変更を Xe に移しています。
