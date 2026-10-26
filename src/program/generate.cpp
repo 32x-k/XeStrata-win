@@ -13061,6 +13061,13 @@ int main(int argc, char** argv) {
                     const bool move_cks = slot_ckpt_move_env() && admit_slot == slot_source;
                     const int64_t ck_len = slot_ck != nullptr ? (int64_t) slot_ck->ids.size() : -1;
                     std::vector<ConvCheckpoint>& sc = bs[(size_t) slot_source].checks;
+                    // a shorter checkpoint comes along only when it is a prefix of the tokens copied back (text only):
+                    // its cells are then the ones the main session holds
+                    const std::vector<int32_t> copied_back = slot_ck != nullptr ? slot_ck->ids : bs[(size_t) slot_source].ids;
+                    auto prefix_of_copied = [&](const ConvCheckpoint& c) {
+                        return c.imgs.empty() && c.ids.size() <= copied_back.size() &&
+                               std::equal(c.ids.begin(), c.ids.end(), copied_back.begin());
+                    };
                     // the one continued from first, exactly as before this change (its copy is the one the request needs)
                     const ConvCheckpoint* first = slot_ck;
                     if (first != nullptr) {
@@ -13075,7 +13082,7 @@ int main(int argc, char** argv) {
                     // then the shorter ones: an optimization, so a host allocation that fails skips them
                     try {
                         for (auto it = sc.begin(); it != sc.end();) {
-                            if ((int64_t) it->ids.size() > slot_tokens || &*it == first) {
+                            if ((int64_t) it->ids.size() > slot_tokens || &*it == first || !prefix_of_copied(*it)) {
                                 ++it;
                             } else if (move_cks) {
                                 checks.push_back(std::move(*it));

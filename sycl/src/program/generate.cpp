@@ -10116,8 +10116,12 @@ int main(int argc, char **argv) try {
                     // copies of this conversation a turn back - whose deepest checkpoint the chain holds again - go
                     // as superseded (#342) instead of taking a parked entry each until the cache evicts another chat
                     try {   // an optimization: a host allocation that fails skips the rest
+                        // (a shorter checkpoint only when it is a prefix of the tokens copied back, text only)
+                        const std::vector<int32_t>& copied_back = slot_ck != nullptr ? slot_ck->ids : bs[(size_t) slot_source].ids;
                         for (const ConvCheckpoint& c : bs[(size_t) slot_source].checks)
-                            if ((int64_t) c.ids.size() <= slot_tokens) checks.push_back(c);
+                            if ((int64_t) c.ids.size() <= slot_tokens && c.imgs.empty() && c.ids.size() <= copied_back.size() &&
+                                std::equal(c.ids.begin(), c.ids.end(), copied_back.begin()))
+                                checks.push_back(c);
                     } catch (const std::bad_alloc&) {
                         std::fprintf(stderr, "strata batch: slot %d: its checkpoints were not all copied (out of memory); the rest are skipped\n", slot_source);
                     }
