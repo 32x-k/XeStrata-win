@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
@@ -35,9 +36,20 @@ inline cudaError_t private_stream(cudaStream_t& s) {
     return cudaSuccess;
 }
 
+/// STRATA_TEST_COPY_FAIL_AT=N (tests only, #3350): the N-th snapshot / checkpoint copy of the process fails with
+/// cudaErrorMemoryAllocation, as when a card has no memory left for the copy.  Unset: nothing.
+inline long test_copy_fail_at() {
+    static const long v = [] { const char* e = std::getenv("STRATA_TEST_COPY_FAIL_AT"); return e ? std::atol(e) : 0L; }();
+    return v;
+}
+
 /// `queued`: the copy is only queued on the private stream, and the caller synchronizes the device (or orders a
 /// later launch after it with order_after_queued) before anything reads the target or writes the source.
 inline cudaError_t copy_nonblocking(void* dst, const void* src, size_t bytes, bool queued = false) {
+    if (const long at = test_copy_fail_at(); at > 0) {
+        static std::atomic<long> copies{0};
+        if (++copies == at) return cudaErrorMemoryAllocation;
+    }
     cudaStream_t s = nullptr;
     cudaError_t e = private_stream(s);
     if (e != cudaSuccess) return e;
