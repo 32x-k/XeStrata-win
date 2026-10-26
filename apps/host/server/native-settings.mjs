@@ -39,12 +39,17 @@ export const SPEED_SWITCHES=[
  {id:'faster_long_prompts',label:'Faster long prompts',group:'Speed',
   hint:'Reads very long prompts faster by approximating part of the work. Off by default: answers about long documents can miss or mix up details.',
   default:'off',env:{STRATA_KVA:'1'}},
+ {id:'faster_12gb_nvidia',label:'Faster answers on 12 GB NVIDIA cards',group:'Speed',
+  hint:'Prefers the parts of the model already on the graphics card, which makes answers much faster on 12 GB cards. Turn off if answers look worse than before.',
+  default:'on',env:{STRATA_ROUTE_PRIOR:'0'}},
  {id:'faster_radeon_9000',label:'Faster answers on Radeon RX 9000 / AI PRO R9700',group:'Speed',
   hint:'Shares the work between the graphics card and the processor in a way that makes answers faster on these cards. Turn off to go back to the previous setting, which is slower.',
   default:'on',env:{STRATA_PCIE_FRAC_DEFAULT:'old'}},
  {id:'deepseek_speedups',label:'DeepSeek speed-ups',group:'Speed',
   hint:'Reads long prompts faster and loads the parts of the model it needs faster. Turn off if DeepSeek stops working or its answers look wrong; it then runs as in version 0.2.6.',
-  default:'on',env:{DS4_FAST_ATTN:'0',DS4_ATTN_SLAB:'0',DS4_COPY_PIN:'0',DS4_COPY_HUGETLB:'0',DS4_STORE_SPARE:'0',DS4_STORE_PUT:'0'}},
+  default:'on',env:{DS4_DEFAULTS:'026',DS4_FAST_ATTN:'0',DS4_ATTN_SLAB:'0',DS4_COPY_PIN:'0',DS4_COPY_HUGETLB:'0',DS4_STORE_SPARE:'0',DS4_STORE_PUT:'0'},
+  /* an earlier test build wrote only these six for the same state: they read as the switch being set, and go with it */
+  legacy:{DS4_FAST_ATTN:'0',DS4_ATTN_SLAB:'0',DS4_COPY_PIN:'0',DS4_COPY_HUGETLB:'0',DS4_STORE_SPARE:'0',DS4_STORE_PUT:'0'}},
 ];
 const GFX12=/^gfx120[01]$/i, RADEON_9000=/\b(?:RX\s*9\d{3}|AI\s*PRO\s*R97\d{2}|R97\d{2})\b/i;
 /**
@@ -53,21 +58,29 @@ const GFX12=/^gfx120[01]$/i, RADEON_9000=/\b(?:RX\s*9\d{3}|AI\s*PRO\s*R97\d{2}|R
  * the Qwen3.8-Flash-Next files (the original, Swift, Coder, Unsloth, Gyro, NVFP4) have none. KVA was measured on the Flash-Next shape (48 layers, 512
  * experts) and the engine declines it on any other, so "Faster long prompts" is shown for a model without an "arch" only.
  */
+/** A discrete NVIDIA card of 13 GiB or less: the engine's rule for residency-biased routing (not an integrated chip, not a card that shares system memory). */
+const smallNvidia=gpus=>(gpus??[]).some(g=>{
+ if(g.usable===false||g.uma||g.integrated||(g.unified_gb??0)>0)return false;
+ const vendor=String(g.vendor??'').toLowerCase();
+ if(vendor!=='nvidia'&&!(vendor===''&&/nvidia|geforce|\brtx\b|\bgtx\b|quadro|tesla/i.test(String(g.name??''))))return false;
+ return g.vram_gb>0&&g.vram_gb<=13;
+});
 export function speedSwitchApplies(id,{deepseek=false,backend=null,gpus=[],arch=null}={}){
  if(id==='deepseek_speedups')return !!deepseek;
  if(deepseek)return false;                                              // the Qwen engine's switches
  if(id==='faster_long_prompts')return !arch&&(backend==='cuda'||backend==='hip');
+ if(id==='faster_12gb_nvidia')return !arch&&backend==='cuda'&&smallNvidia(gpus);   // the engine's routing needs the Flash-Next shape (512 experts, top-10) and a CUDA build
  if(id==='faster_radeon_9000')return backend==='hip'&&(gpus??[]).some(g=>(!g.vendor||g.vendor==='amd')&&(GFX12.test(String(g.arch??''))||(!g.arch&&RADEON_9000.test(String(g.name??'')))));
  return false;
 }
 /** The switch is outside its default when every entry it writes is in the environment with its value; anything less or other (a hand-edited file, STRATA_KVA=0) is the default state and is left alone. */
-export function speedSwitchIsSet(env,id){const sw=SPEED_SWITCHES.find(s=>s.id===id);return !!sw&&Object.entries(sw.env).every(([name,value])=>env?.[name]===value);}
+export function speedSwitchIsSet(env,id){const sw=SPEED_SWITCHES.find(s=>s.id===id),has=entries=>!!entries&&Object.keys(entries).length>0&&Object.entries(entries).every(([name,value])=>env?.[name]===value);return !!sw&&(has(sw.env)||has(sw.legacy));}
 /** Is the feature on for a launch with this environment? */
 export function speedSwitchIsOn(env,id){const sw=SPEED_SWITCHES.find(s=>s.id===id);return !!sw&&speedSwitchIsSet(env,id)!==(sw.default==='on');}
 /** The environment with the feature on or off: its default removes the switch's entries, the other state writes them. Nothing else in it changes. */
 export function setSpeedSwitch(env,id,on){
  const sw=SPEED_SWITCHES.find(s=>s.id===id);if(!sw)throw new Error(`Unknown speed switch: ${id}`);
- const write=on!==(sw.default==='on'),next={...(env??{})};for(const [name,value] of Object.entries(sw.env)){if(write)next[name]=value;else delete next[name];}return next;
+ const write=on!==(sw.default==='on'),next={...(env??{})};for(const [name,value] of Object.entries(sw.env)){if(write)next[name]=value;else delete next[name];}if(!write)for(const name of Object.keys(sw.legacy??{}))delete next[name];return next;
 }
 /** What the settings answer carries: each switch that applies, with its words, its default, the entries it writes outside the default, and whether the feature is on. */
 export function speedSwitchRows(env,context){return SPEED_SWITCHES.filter(s=>speedSwitchApplies(s.id,context)).map(s=>({...s,on:speedSwitchIsOn(env,s.id)}));}
