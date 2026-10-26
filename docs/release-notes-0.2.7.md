@@ -27,12 +27,21 @@ These need no engine change; they are settings. Each was measured on the same bo
   vocabulary instead of 425 KB, so it reads less per guess: **+2.7..3.1% story and +2.2..3.0% code** decode on both
   big boxes. The big model checks every guess, so the answers are unchanged (identical tokens in every run where
   the machine is deterministic). A CJK or Cyrillic user should keep the wider subset.
-- **`--prefill-pipe <R>`** - on a two-card layer split, plan the prompt's chunks for the pipeline: **+12.0% at 4K,
-  +22.3% at 8K, +2.9% at 16K** prompt on 2x RTX A4000. `R` is the PC's own ratio; `setup --calibrate` measures it
+- **`--prefill-pipe <R>`** - on a two-card layer split, plan the prompt's chunks for the pipeline: **+15.4% at 4K,
+  +22.5% at 8K, +2.7% at 16K** prompt on 2x RTX A4000 (5 interleaved pairs). `R` is the PC's own ratio; `setup --calibrate` measures it
   (1,500 on that box).
-- **`--kv q4_0` on a 12 GB card** - the KV cache at 4 bits leaves room for ~1,000 more experts: **+12.0% story
-  decode** on an RTX 3060 12 GB (IQ3_XXS). It costs KV precision on long documents (document perplexity +8% at 1K,
-  +12% at 8K in `bench/results/2026-09-27-kv-q4`), so it is a choice, not a default.
+- **`--kv q4_0` on a 12 GB card** - the KV cache at 4 bits leaves room for ~1,000 more experts. On the RTX 3060
+  12 GB (IQ3_XXS) the gain did **not** reproduce: +12.0% story over three pairs, -2.9% over five, with that box's
+  own baseline moving 41.6 -> 49.0 tok/s between sessions, so no speed claim is made for it. It costs KV precision
+  on long documents (document perplexity +8% at 1K, +12% at 8K in `bench/results/2026-09-27-kv-q4`), so it is a
+  choice, not a default.
+
+## A setting that is much faster on a 12 GB card, but changes the answers
+
+STRATA_ROUTE_PRIOR (now on by default at 2.0 on a card with 13 GB of memory or less, =0 turns it off) gives the router a bonus for experts already in VRAM. On an RTX 3060 12 GB (IQ3_XXS) it
+measured **+37.6% story and +35.2% code decode over five interleaved pairs** - by far the largest single gain found on
+that card. It works by choosing a slightly different set of experts, so the replies change: it is **opt-in and needs a
+quality check before anyone calls it a default**. STRATA_ROUTE_PRIOR=1.0 is the conservative end (+22.6% / +24.6%).
 
 ## What was tried and did not make it
 
@@ -52,3 +61,6 @@ above 8K, and every Blackwell default switch turned off one at a time. The numbe
 Strata is free and open source. If it runs well on your PC, a coffee keeps the work on it going:
 
 <a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a>
+
+
+
