@@ -3198,6 +3198,34 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     for (int t = 0; t < T; ++t) out[t] = ((volatile int32_t*) h_out_)[t];
     if (tap_file_ != nullptr && !batch_rec_) tap_write(T, tokens, pos0);
     note_nonfinite(T, nullptr);
+    // STRATA_LOGITS_DUMP=<path> (debug tap, off by default): the window's logits as the sampler saw them, written
+    // AFTER the window (the stream is synchronised above and the graph capture is over, so a plain copy is legal -
+    // the same place STRATA_DBG_NAN copies from).  One record is
+    // {int32 magic, int32 T, int32 n_vocab, int32 record, int64 position}, then T * n_vocab FP32 rows; row 0 is
+    // the window's first position (the last prompt token of a prefill), which is what a KL comparison wants.
+    if (const char* logits_path = std::getenv("STRATA_LOGITS_DUMP")) {
+        static std::FILE* lf = std::fopen(logits_path, "wb");
+        static int32_t lrec = 0;
+        if (lf != nullptr) {
+            std::vector<float> h((size_t) T * (size_t) n_vocab_);
+            const cudaError_t le = cudaMemcpy(h.data(), head_logits_, h.size() * sizeof(float), cudaMemcpyDeviceToHost);
+            if (le == cudaSuccess) {
+                const int32_t hdr[4] = {0x53474F4C /*"LOGS"*/, T, (int32_t) n_vocab_, lrec++};
+                const int64_t hpos = pos0;
+                std::fwrite(hdr, sizeof hdr, 1, lf);
+                std::fwrite(&hpos, sizeof hpos, 1, lf);
+                std::fwrite(h.data(), sizeof(float), h.size(), lf);
+                std::fflush(lf);
+            } else {
+                static bool said = false;
+                if (!said) {
+                    said = true;
+                    std::fprintf(stderr, "strata verify: STRATA_LOGITS_DUMP copy failed: %s\n", cudaGetErrorString(le));
+                    (void) cudaGetLastError();
+                }
+            }
+        }
+    }
     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {   // debug: the first non-finite head
         static bool reported = false;
         if (!reported) {

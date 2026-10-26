@@ -31,6 +31,7 @@ STRATA_KVA_MIN_PROMPT=4096 \
 | `STRATA_KVA_CAPTURE_FP32` | off | write fp32 instead of bf16 records |
 | `STRATA_KVA_ORACLE` | — | directory: replay a capture instead of a projector |
 | `STRATA_KVA_GDN_NORM` | off | keep the full GDN recurrence (the A/B control for the state-only one) |
+| `STRATA_LOGITS_DUMP` | — | debug (not KVA-specific): write every verify window's sampler logits to `path`, for KL / top-1 between two runs |
 
 Requirements and limits for this first version:
 
@@ -51,13 +52,17 @@ Requirements and limits for this first version:
 |---:|---:|---:|---:|---:|---:|
 | 5,642 | 203.3 | 265.7 | 1.31× | 54 % | 0.357 |
 | 14,581 | 202.5 | 311.2 | 1.54× | 85 % | not measured |
-| 29,997 | 198.7 | 326.5 | 1.64× | 92 % | 0.451 |
+| 29,997 | 199.7 | 338.3 | 1.69× | 92 % | 0.451 |
 
 - Decode throughput was unchanged within the run-to-run spread (24–28 tok/s) in every arm: KVA changes prompt
   processing only.
 - Quality: on a 14.6K-token prompt with a fact inserted at 10/50/90 %, the KVA arm retrieved the fact at all
   three positions and produced the identical answer string. On a "summarise this documentation" prompt the
   answers stayed coherent and semantically identical, with different wording after 4–12 tokens.
+- **Likelihood** (`STRATA_LOGITS_DUMP`): at the first generated token the approximation moves the next-token
+  distribution by KL 0.018 nats at a 5.6K prompt (two control runs differ by 0.0013) and 0.020 nats at 30K
+  (control floor 0.0032). The top-1 token is the same and 9 of the top 10 are shared in both cases. The effect
+  does not grow with context even though the residual error does.
 - Layer type matters more than the count: approximating only the 6 late QSA layers cost a 0.153 residual error
   at 1.08×; approximating 18 GDN layers cost 0.339 at 1.18×. A gated recurrence integrates its input over the
   whole prefix, so a wrong input keeps biasing the state, while a wrong QSA K/V only misplaces attention keys.
