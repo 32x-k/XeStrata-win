@@ -5764,15 +5764,14 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
     const cudaStream_t cs = (cudaStream_t) m.cs;
     Impl::LmBufs& lb = m.lm;
     const int64_t S = lb.S, L = g.n_layers;
-    strata::kernels::QsaShapes s = strata::kernels::qsa_real_shapes();
-    s.n_head = g.n_head; s.n_head_kv = g.n_head_kv; s.head_dim = g.head_dim; s.idx_n_head = g.idx_q_heads;
-    s.idx_dim = g.idx_key_dim;
+    strata::kernels::QsaShapes s = core::qsa_shapes(g);   // as 0.2.2's run_impl
     const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
     int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
     PfTimer pt;
     // the MMQ row table lives in the borrowed cache slots when the prompt path borrows: written for every prompt
-    mmq::iota(m.ids_identity, m.T * K, m.cs);
+    // (none without an MMQ layer: the FP16 path has no such table)
+    if (m.ids_identity) mmq::iota(m.ids_identity, m.T * K, m.cs);
     // ---- the PLE rows, read per chunk on a thread as run_impl does (the same state machine, in chunk order)
     const bool ple_on = ss.ple.ready();
     static const bool ple_batch_env = [] {
