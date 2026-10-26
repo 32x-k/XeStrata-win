@@ -108,8 +108,8 @@ int32_t token_id(const std::string& path, const char* text) {
     try {
         return (int32_t) GgufModel::open(path).meta().string_index("tokenizer.ggml.tokens", text);
     } catch (const std::exception&) {
+        return -1;   // an unreadable file has no such token; loading it reports why
     }
-    return -1;
 }
 
 // FNV-1a over `n` bytes, from `h`
@@ -309,13 +309,13 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
     const int64_t ctx = model.max_cells(), V = model.vocab(), N = model.spec().n_embd;
     // the tokens the state holds, positions 0 .. live.size() - 1; a picture's cells as keys of their own (below)
     std::vector<int32_t> live;
-    // --vision: the pictures' rows (img_rows, row_ptr by position), the cells' M-RoPE positions (thw, the identity
+    // --vision: the pictures' rows (img_rows, row_ptr by position), the cells' M-RoPE positions (pos3, the identity
     // while no request has pictures)
     const int32_t image_pad = opt.vision ? token_id(opt.gguf, "<|image_pad|>") : -1;
     std::vector<float> img_rows;
     std::vector<const float*> row_ptr;
-    std::vector<int32_t> thw;
-    bool thw_identity = true;
+    std::vector<int32_t> pos3;
+    bool pos3_identity = true;
     // a session file's identity: the model file (its name and size) and the context, which fix the state's shape
     std::string model_id;
     {
@@ -459,14 +459,14 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         // (else its rows) and its other cells -1, so that a conversation is taken up again only as far as its pictures
         // are the same ones; and with pictures, their rows and every cell's position
         std::vector<int32_t> keys = ids;
-        if (geni || !thw_identity) {
+        if (geni || !pos3_identity) {
             std::string ve;
-            thw.resize((size_t) ctx * 3);
+            pos3.resize((size_t) ctx * 3);
             row_ptr.assign(geni ? (size_t) n : 0, nullptr);
             auto put = [&](int64_t c, int64_t t, int64_t h, int64_t w) {
-                thw[(size_t) c * 3] = (int32_t) t;
-                thw[(size_t) c * 3 + 1] = (int32_t) h;
-                thw[(size_t) c * 3 + 2] = (int32_t) w;
+                pos3[(size_t) c * 3] = (int32_t) t;
+                pos3[(size_t) c * 3 + 1] = (int32_t) h;
+                pos3[(size_t) c * 3 + 2] = (int32_t) w;
             };
             struct Img { int64_t n, nx, ny; size_t off; };
             std::vector<Img> imgs;
@@ -516,15 +516,15 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             }
             if (ve.empty() && k != imgs.size()) ve = "the embeddings file has more pictures than the prompt";
             for (int64_t c = n; ve.empty() && c < ctx; ++c, ++p) put(c, p, p, p);   // the answer's cells
-            if (ve.empty() && !model.set_positions(thw.data(), ctx, err)) ve = err;
+            if (ve.empty() && !model.set_positions(pos3.data(), ctx, err)) ve = err;
             if (!ve.empty()) {
                 // the table may be half written: the next request writes it again
-                thw_identity = false;
+                pos3_identity = false;
                 std::printf("ERR %s\n", ve.c_str());
                 std::fflush(stdout);
                 continue;
             }
-            thw_identity = !geni;
+            pos3_identity = !geni;
         }
         // what of the conversation to keep: the common prefix, at least the last prompt token read again (its
         // logits pick the first token); with a recurrent state, all of it or nothing

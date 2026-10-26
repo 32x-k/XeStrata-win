@@ -699,10 +699,11 @@ bool PlainModel::load_qwen(std::string& err) {
     // --vision: every cell's rotary position from the table (kernels/mrope.hpp), the identity until a request with
     // pictures writes it; set before any graph is recorded, which reads the pointer
     if (opt_.vision) {
-        std::vector<int32_t> thw((size_t) opt_.max_cells * 3);
+        std::vector<int32_t> pos3((size_t) opt_.max_cells * 3);
         for (int64_t c = 0; c < opt_.max_cells; ++c)
-            for (int i = 0; i < 3; ++i) thw[(size_t) (c * 3 + i)] = (int32_t) c;
-        if (!strata::gpu::alloc_device(&mrope_, thw.size() * 4) || !strata::gpu::copy(mrope_, thw.data(), thw.size() * 4)) {
+            for (int i = 0; i < 3; ++i) pos3[(size_t) (c * 3 + i)] = (int32_t) c;
+        if (!strata::gpu::alloc_device(&mrope_, pos3.size() * 4) ||
+            !strata::gpu::copy(mrope_, pos3.data(), pos3.size() * 4)) {
             err = "plain model: the rotary positions' table";
             return false;
         }
@@ -1617,12 +1618,12 @@ std::vector<int64_t> PlainModel::split_points() const {
     return at;
 }
 
-bool PlainModel::set_positions(const int32_t* thw, int64_t n, std::string& err) {
+bool PlainModel::set_positions(const int32_t* pos3, int64_t n, std::string& err) {
     if (n < 0 || n > opt_.max_cells) { err = "plain model: positions past the context"; return false; }
     for (PlainModel* st : chain()) {
         const OnDevice on(st->dev_);
         if (st->mrope_ == nullptr) { err = "plain model: the engine was started without --vision"; return false; }
-        if (n > 0 && !strata::gpu::copy(st->mrope_, thw, (size_t) n * 3 * 4)) {
+        if (n > 0 && !strata::gpu::copy(st->mrope_, pos3, (size_t) n * 3 * 4)) {
             err = std::string("plain model: the rotary positions: ") + strata::gpu::last_error();
             return false;
         }

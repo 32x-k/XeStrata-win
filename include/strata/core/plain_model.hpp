@@ -157,9 +157,9 @@ public:
     int64_t max_cells() const { return opt_.max_cells; }
     /// The prompt's chunk (0: the prompt runs in windows; GLM-5.3-Flash's for now, whatever the options asked).
     int64_t prompt_chunk() const { return opt_.prompt_chunk; }
-    /// --vision: the M-RoPE positions (t, h, w) of cells 0 .. n - 1, `thw` 3 n of them on the host (kernels/mrope.hpp's
-    /// table, every stage's; the cells after n keep theirs).  Between requests.
-    bool set_positions(const int32_t* thw, int64_t n, std::string& err);
+    /// --vision: the M-RoPE positions (t, h, w) of cells 0 .. n - 1, `pos3` 3 n of them on the host
+    /// (kernels/mrope.hpp's table, every stage's; the cells after n keep theirs).  Between requests.
+    bool set_positions(const int32_t* pos3, int64_t n, std::string& err);
     /// --vision: (*rows)[p], n_embd floats, in place of the embedding of the token at position p where it is not null
     /// (a picture's rows; null `rows`: none).  The vector outlives the prompt it is set for.
     void set_embeddings(const std::vector<const float*>* rows);
