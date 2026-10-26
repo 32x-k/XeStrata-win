@@ -36,12 +36,27 @@ These need no engine change; they are settings. Each was measured on the same bo
   on long documents (document perplexity +8% at 1K, +12% at 8K in `bench/results/2026-09-27-kv-q4`), so it is a
   choice, not a default.
 
-## A setting that is much faster on a 12 GB card, but changes the answers
+## The 12 GB default: residency-biased routing
 
-STRATA_ROUTE_PRIOR (now on by default at 2.0 on a card with 13 GB of memory or less, =0 turns it off) gives the router a bonus for experts already in VRAM. On an RTX 3060 12 GB (IQ3_XXS) it
-measured **+37.6% story and +35.2% code decode over five interleaved pairs** - by far the largest single gain found on
-that card. It works by choosing a slightly different set of experts, so the replies change: it is **opt-in and needs a
-quality check before anyone calls it a default**. STRATA_ROUTE_PRIOR=1.0 is the conservative end (+22.6% / +24.6%).
+**On by default at 2.0 on a card with 13 GiB of memory or less** (`STRATA_ROUTE_PRIOR=0` turns it off). The router prefers
+experts that are already resident, so a window stops waiting on a page-in that the next window would need again. Measured
+on the RTX 3060 12 GB (IQ3_XXS), five interleaved pairs of fresh engines:
+
+| axis | before | after |
+|---|---|---|
+| decode story | 45.9 | **61.6 (+34.1%)** |
+| decode code | 43.6 | **73.1 (+67.6%)** |
+| prompt 1K | 333.6 | **451.5 (+35.3%)** |
+| prompt 4K, in a 4K context | 248.5 | **291.0 (+17.1%)** |
+| decode behind a 4K document | 45.1 | **62.2 (+37.9%)** |
+
+It holds where it matters most: on content the tuning was never fitted to it measures **+29.0%** (43.5 -> 55.0 tok/s on a
+document prompt), and the whole recipe - routing, a workload-fitted expert profile, `--adapt-every 0`, `--vram-reserve-mib
+896` and the English draft vocabulary - gives **+26.5%** there and **+80%** on code in a sustained 80-request session.
+
+It works by choosing a slightly different set of experts, so replies change: the owner approved that trade for 12 GB cards.
+**Do not raise the bonus beyond 2.0.** 3.0 measures +17.7% / +24.0% on the test prompts but **-4.5% on held-out content**,
+and 4.0 breaks outright - 2.0 is the setting that generalises.
 
 ## What was tried and did not make it
 
@@ -61,6 +76,7 @@ above 8K, and every Blackwell default switch turned off one at a time. The numbe
 Strata is free and open source. If it runs well on your PC, a coffee keeps the work on it going:
 
 <a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a>
+
 
 
 
