@@ -94,11 +94,6 @@ SPDX-FileCopyrightText = "1907 Natsume Soseki"
 SPDX-License-Identifier = "LicenseRef-PublicDomain"
 
 [[annotations]]
-path = ["third_party/main/xz/COPYING.0BSD"]
-SPDX-FileCopyrightText = "The XZ Utils authors and contributors"
-SPDX-License-Identifier = "0BSD"
-
-[[annotations]]
 path = ["third_party/main/aotriton/LICENSE.triton"]
 SPDX-FileCopyrightText = ["2018-2020 Philippe Tillet", "2020-2022 OpenAI"]
 SPDX-License-Identifier = "MIT"
