@@ -88,6 +88,21 @@ class OptIn(unittest.TestCase):
         self.assertIn("only kind", setup.old_gpus_opt_in([V100]))
         self.assertIsNone(setup.old_gpus_opt_in([V100], other=True))            # an AMD card it can use instead
         self.assertIsNone(setup.old_gpus_opt_in([card(0, "GTX 980", 4.0, "52")]))
+        # #3218: Maxwell only for a tester who sets STRATA_EXPERIMENTAL_SM52=1 (the default stays unchanged)
+        m6000 = card(0, "Quadro M6000", 24.0, "52")
+        self.assertFalse(setup.sm60_card("52"))
+        self.assertTrue(setup.sm60_card("60") and setup.sm60_card("70") and not setup.sm60_card("75"))
+        self.assertIn("not supported", setup.gpu_problem(m6000))
+        self.assertNotIn("experimental: choose it", setup.gpu_problem(m6000))
+        with mock.patch.dict(os.environ, {"STRATA_EXPERIMENTAL_SM52": "1"}):
+            self.assertTrue(setup.sm60_card("52"))
+            self.assertFalse(setup.sm60_card("50"))
+            self.assertIn("experimental: choose it", setup.gpu_problem(m6000))
+            self.assertIn("only kind", setup.old_gpus_opt_in([m6000]))
+            self.assertIsNone(setup.old_gpus_opt_in([rtx, m6000]))              # a newer card keeps winning
+            self.assertEqual(setup.cuda_choice([52])[0], 12)
+            with mock.patch.dict(os.environ, {"STRATA_EXPERIMENTAL_SM60": "1"}):
+                self.assertIsNone(setup.gpu_problem(m6000))                      # warned, not refused
         with mock.patch.dict(os.environ, {"STRATA_EXPERIMENTAL_SM60": "1"}):
             self.assertEqual(setup.old_gpus_opt_in([rtx, v100]), "STRATA_EXPERIMENTAL_SM60=1")
 

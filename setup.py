@@ -1548,7 +1548,12 @@ def experimental_sm60() -> bool:
 
 
 def sm60_card(arch) -> bool:
-    return 60 <= int(arch) <= 70
+    """Pascal (6.x) and Volta (7.0) cards; Maxwell 5.2 (#3218) only for a tester who set STRATA_EXPERIMENTAL_SM52=1,
+    because the ready-made CUDA 12 engine holds no sm_52 code: a Maxwell card is built from source, by that tester."""
+    a = int(arch)
+    if a == 52:
+        return os.environ.get("STRATA_EXPERIMENTAL_SM52", "").strip() == "1"
+    return 60 <= a <= 70
 
 
 def old_gpus_opt_in(found, named=(), cuda=None, other=False):
@@ -8881,6 +8886,10 @@ def main() -> int:
     if OLD_GPUS and a.backend != "hip":
         warn(f"older NVIDIA GPUs (Pascal / Volta) can be used ({OLD_GPUS}): experimental, through a second engine "
              "built with CUDA 12 (docs/OLDER_GPUS.md)")
+        if any(int(g["arch"]) == 52 for g in found):
+            warn("a Maxwell card (compute capability 5.2) has no fast half-precision path; it was tested by one reporter "
+                 "only, on a source build (-DSTRATA_EXPERIMENTAL_SM60=ON, CUDA 12.x). Check that the answer text reads "
+                 "correctly (docs/OLDER_GPUS.md)")
     nv_ok = any(gpu_problem(g) is None for g in found)
     hip = a.backend == "hip" or (a.backend is None and not nv_ok and bool(amd_ok))
     if a.backend is None and nv_ok and amd_ok:
