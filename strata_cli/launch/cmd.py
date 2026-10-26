@@ -147,7 +147,8 @@ def add_parsers(sp: argparse._SubParsersAction) -> list[argparse.ArgumentParser]
     m.add_argument("--delete-preset", metavar="NAME", help="delete a saved preset")
     m.add_argument("--status", action="store_true", help="show what this command is serving now")
     m.add_argument("--stop", action="store_true", help="stop what this command started (with --preset NAME: that one)")
-    m.add_argument("--show-key", action="store_true", help="print the API key of --preset NAME (or of the running launch)")
+    m.add_argument("--show-key", action="store_true", help="print the API key of --preset NAME (or of the running launch); with none of those, the key of a model setup.py set up "
+                                                                    "(--model NAME picks one when several have a key)")
 
     c = sp.add_parser(
         "connect", help="print (or write) the setup for an app that uses the running server", epilog=EXAMPLES,
@@ -650,6 +651,31 @@ def launch_info(name: str | None = None) -> dict | None:
             "port": port, "access": preset.access if preset else None}
 
 
+def setup_config_keys(wanted: str | None = None) -> list[tuple[str, Path, str]]:
+    """(model id, config file, API key) for the models setup.py set up (strata-<model>.json in the install folders) that carry a key, #3570.
+    `wanted` keeps the model whose id is that name or ends with it (coder-iq1_m for IQ1_M); case does not matter."""
+    from strata_control import models
+    try:
+        listed = models.list_installed().get("models", [])
+    except Exception:                                    # noqa: BLE001 - a folder that cannot be read has no key to show
+        return []
+    found = []
+    for entry in listed:
+        source = entry.get("source_config")
+        if not source:
+            continue
+        model_id = str(entry.get("id") or Path(source).stem)
+        if wanted and not (model_id.lower() == wanted.lower() or model_id.lower().endswith(wanted.lower())):
+            continue
+        try:
+            key = str(json.loads(Path(source).read_text(encoding="utf-8-sig")).get("api_key") or "").strip()
+        except (OSError, ValueError, AttributeError):
+            continue
+        if key and key.lower() != "none":
+            found.append((model_id, Path(source), key))
+    return found
+
+
 def run_launch(a: argparse.Namespace) -> int:
     from strata_cli.launch import store
     from strata_cli.launch.catalog import Catalog, CatalogUnavailable
@@ -694,10 +720,22 @@ def run_launch(a: argparse.Namespace) -> int:
             return 0
         if a.show_key:
             info = launch_info(a.preset)
-            if not info or not info.get("key"):
-                return fail("There is no API key for that launch." + ("" if a.preset else " Name a preset with --preset NAME."), 5)
-            _say(info["key"])
-            return 0
+            if info and info.get("key"):
+                _say(info["key"])
+                return 0
+            if not a.preset:
+                # not a launch: a model set up by setup.py keeps its key in its own strata-<model>.json (#3570)
+                found = setup_config_keys(getattr(a, "model", None))
+                if len(found) == 1:
+                    _say(found[0][2])
+                    if not machine:
+                        print(f"(the key of {found[0][0]}, from {found[0][1]})", file=sys.stderr)
+                    return 0
+                if len(found) > 1:
+                    return fail("Several models set up by setup.py have an API key: " + ", ".join(f[0] for f in found) + ". Name one with --model NAME.", 5)
+                if getattr(a, "model", None):
+                    return fail(f"No model set up by setup.py matches '{a.model}' and has an API key, and no launch is running.", 5)
+            return fail("There is no API key for that launch." + ("" if a.preset else " Name a preset with --preset NAME, or a model set up by setup.py with --model NAME."), 5)
 
         try:
             catalog = Catalog()
