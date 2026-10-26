@@ -62,6 +62,10 @@ inline KvaEngine& kva_engine() {
 struct KvaConfig {
     enum class Mode { Identity, Oracle, Linear };
     enum class Only { All, Gdn, Qsa };
+    /// What a late layer of an approximated chunk still does: StateOnly (the default) advances only its state (GDN
+    /// recurrence, K/V and indexer pages); Moe runs the whole attention half (outputs into the residual) and skips only
+    /// the MoE half and its expert transfers.
+    enum class Skip { StateOnly, Moe };
 
     bool on = true;              ///< on unless STRATA_KVA=0 (or this build has no path)
     bool explicit_on = false;    ///< STRATA_KVA was set to something other than 0: every declined read says why
@@ -75,6 +79,7 @@ struct KvaConfig {
     int64_t min_prompt = 4096;   ///< STRATA_KVA_MIN_PROMPT: shorter prompts stay on the full path
     Mode mode = Mode::Identity;  ///< STRATA_KVA_MODE=identity|oracle|linear
     Only only = Only::All;       ///< STRATA_KVA_ONLY=all|gdn|qsa: which late layers take the approximate path
+    Skip skip = Skip::StateOnly; ///< STRATA_KVA_SKIP=moe: skip only the MoE half of the late layers (opt-in)
     std::string oracle_dir;      ///< STRATA_KVA_ORACLE
     std::string capture_dir;     ///< STRATA_KVA_CAPTURE
     std::string projector;       ///< STRATA_KVA_PROJECTOR
@@ -165,6 +170,7 @@ inline KvaConfig kva_config_from_env() {
         else if (std::string(m) == "linear") k.mode = KvaConfig::Mode::Linear;
         else k.mode = KvaConfig::Mode::Identity;
     }
+    if (const char* sk = std::getenv("STRATA_KVA_SKIP"); sk != nullptr && std::string(sk) == "moe") k.skip = KvaConfig::Skip::Moe;
     if (const char* o = std::getenv("STRATA_KVA_ONLY"); o != nullptr && *o != '\0') {
         if (std::string(o) == "gdn") k.only = KvaConfig::Only::Gdn;
         else if (std::string(o) == "qsa") k.only = KvaConfig::Only::Qsa;

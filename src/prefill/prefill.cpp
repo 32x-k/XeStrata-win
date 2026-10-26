@@ -3272,6 +3272,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             const bool kva_layer = kva_approx && l >= kva_split &&
                                    (kva.only == KvaConfig::Only::All ||
                                     (kva.only == KvaConfig::Only::Gdn) == !core::is_qsa_layer(g, l));
+            // STRATA_KVA_SKIP=moe: the layer's attention half (GDN or QSA, outputs included) runs in full and only the MoE
+            // half is skipped; `kva_state_only` is the default form, where only the state advances
+            const bool kva_moe_only = kva_layer && kva.skip == KvaConfig::Skip::Moe;
+            const bool kva_state_only = kva_layer && !kva_moe_only;
             const bool kva_subst = kva_layer && kva.mode == KvaConfig::Mode::Oracle;
             const bool kva_cap_layer = kva.capture && LB == 0 && (LE < 0 || LE == g.n_layers) && l >= kva_split;
             if (l == std::max<int64_t>(LB, 1)) {   // the PLE rows, read from layer 1 on (a wait for the SSD read of the first chunk lands on "ple")
@@ -3341,6 +3345,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 normed = false;   // the previous half's norm of R is stale once the input is replaced
             }
             for (int half = 0; half < 2; ++half) {
+                if (kva_moe_only && half == 1) {
+                    // KVA moe-skip: the attention half wrote its output into R; this layer's MoE half has no consumer
+                    // left for an approximated chunk, so it (and its expert transfers) is skipped.  R is not normed for
+                    // it (the write after the attention half normed it with this layer's FFN weights).
+                    normed = false;
+                    consumed = std::max(consumed, seq_start[(size_t) l + 1]);
+                    give_back(consumed);
+                    break;
+                }
                 // ---- the hyper-connection read of this half
                 const char* pre = half == 0 ? "hc_attn_" : "hc_ffn_";
                 const std::string sn = std::string(pre) + "norm.weight", sd = std::string(pre) + "down.weight",
@@ -3441,7 +3454,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const char* v = std::getenv("STRATA_KVA_GDN_NORM");
                         return v != nullptr && std::atoi(v) != 0;
                     }();
-                    if ((!kva_layer || kva_gdn_norm) &&
+                    if ((!kva_state_only || kva_gdn_norm) &&
                         !native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                     if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
@@ -3450,16 +3463,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs);
                     pt.mark(kPfGdnRec, cs);
                     const int64_t ld_y = pf_pad() && T >= std::max<int64_t>(pf_switch_min_t(), 64) ? ZV + ZV_PAD : 0;
-                    if (kva_layer && !kva_gdn_norm)   // KVA: the recurrence without the output normalization
+                    if (kva_state_only && !kva_gdn_norm)   // KVA: the recurrence without the output normalization
                         gdn_recurrence_state_only(state, m.hbuf, m.gate, m.beta, m.y, T, m.cs);
                     else
                         gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs,
                                        ld_y);
                     pt.mark(kPfGdnOut, cs);
-                    if (!kva_layer)   // KVA: the out projection feeds only the residual write and the MoE half
+                    if (!kva_state_only)   // KVA: the out projection feeds only the residual write and the MoE half
                         if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err, 0, ld_y)) return false;
                     ++gdn_index;
-                    if (kva_layer) {
+                    if (kva_state_only) {
                         // the layer consumed no expert: its stream entries must still be released, or the issuer
                         // thread fills the ring and the next fully computed layer waits for a copy that never comes
                         consumed = std::max(consumed, seq_start[(size_t) l + 1]);
@@ -3481,9 +3494,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
                     if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
                     // KVA: the query projections have no consumer when only the KV/indexer state advances
-                    if (!kva_layer && !native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
+                    if (!kva_state_only && !native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
-                    if (!kva_layer && !bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
+                    if (!kva_state_only && !bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                     rms_rows(m.Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, m.cs);
                     rope(m.Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), m.cs);
                     // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
@@ -3575,7 +3588,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // KVA: the KV pages and the indexer's keys/pool are complete for this chunk.  Nothing that
                     // reads them (query side, selection, attention, output projection, the MoE half) has a
                     // consumer left, so the layer ends here.
-                    if (kva_layer) {
+                    if (kva_state_only) {
                         ++qsa_index;
                         if (!kv_prefetch_after(l + 1, qsa_index)) return false;
                         // no expert is consumed here: release the stream entries so the issuer cannot stall
@@ -5274,7 +5287,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
     }
     if (kva_run || kva.capture) {
-        const char* mode = kva.mode == KvaConfig::Mode::Oracle ? "oracle"
+        const char* mode = kva.skip == KvaConfig::Skip::Moe ? "moe-skip"
+                         : kva.mode == KvaConfig::Mode::Oracle ? "oracle"
                          : kva.mode == KvaConfig::Mode::Linear ? "linear" : "identity";
         const char* only = kva.only == KvaConfig::Only::Gdn ? ", gdn layers only"
                          : kva.only == KvaConfig::Only::Qsa ? ", qsa layers only" : "";

@@ -81,6 +81,7 @@ there, with a line when it is set).
 | `STRATA_KVA_SUFFIX` | 2048 | fully computed tail positions; see above |
 | `STRATA_KVA_MIN_PROMPT` | 4096 | shorter prompts stay on the full path |
 | `STRATA_KVA_DRAFT_FLOOR` | off | `1`: the draft layer skips the draft cells of approximated chunks (research) |
+| `STRATA_KVA_SKIP` | state | `moe` (opt-in): the late layers of an approximated chunk run their whole attention half (GDN and QSA outputs into the residual) and skip only the MoE half and its expert transfers; the log line says `mode moe-skip`. Slower than the default state-only form, closer to the exact residual |
 | `STRATA_KVA_ONLY` | all | `gdn` or `qsa`: approximate only that layer type |
 | `STRATA_KVA_MODE` | identity | `identity`, `oracle`, `linear` (linear is not implemented) |
 | `STRATA_KVA_CAPTURE` | — | directory: write every late layer's real input for calibration (the read is exact while capturing) |

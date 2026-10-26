@@ -31,7 +31,7 @@ static void put(const char* k, const char* v) {
 static void clear_all() {
     for (const char* k : {"STRATA_KVA", "STRATA_KVA_SPLIT", "STRATA_KVA_SUFFIX", "STRATA_KVA_MIN_PROMPT", "STRATA_KVA_PARITY",
                           "STRATA_KVA_CAPTURE", "STRATA_KVA_CAPTURE_FP32", "STRATA_KVA_ORACLE", "STRATA_KVA_ORACLE_FP32",
-                          "STRATA_KVA_PROJECTOR", "STRATA_KVA_MODE", "STRATA_KVA_ONLY", "STRATA_KVA_DRAFT_FLOOR"})
+                          "STRATA_KVA_PROJECTOR", "STRATA_KVA_MODE", "STRATA_KVA_ONLY", "STRATA_KVA_DRAFT_FLOOR", "STRATA_KVA_SKIP"})
         unset(k);
 }
 static bool is(const char* got, const char* want) { return got != nullptr && std::strcmp(got, want) == 0; }
@@ -118,6 +118,17 @@ int main() {
     }
     clear_all();
 
+    // ---- STRATA_KVA_SKIP: the default is the state-only form; "moe" runs the attention halves and skips the MoE half
+    {
+        CHECK(kva_config_from_env().skip == KvaConfig::Skip::StateOnly);
+        put("STRATA_KVA_SKIP", "moe");
+        CHECK(kva_config_from_env().skip == KvaConfig::Skip::Moe);
+        put("STRATA_KVA_SKIP", "state");
+        CHECK(kva_config_from_env().skip == KvaConfig::Skip::StateOnly);
+        put("STRATA_KVA_SKIP", "bogus");
+        CHECK(kva_config_from_env().skip == KvaConfig::Skip::StateOnly);
+        unset("STRATA_KVA_SKIP");
+    }
     // ---- "not applied => identical to STRATA_KVA=0", the parts that need no GPU
     // (1) by default the draft layer is 0.2.6's own code; the cell floor is a research option, wired only when asked
     {
