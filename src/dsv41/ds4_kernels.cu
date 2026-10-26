@@ -1218,7 +1218,34 @@ __global__ void __launch_bounds__(kThreads) markov_kernel(float* __restrict__ lo
     if (lane == 0) logits[v] += a;
 }
 
-// ---------------------------------------------------------------- the markov bias over a head group (markov_share)
+// the same bias with the head quantised to Q8_0 blocks of 32 (34 B: an F16 d and 32 int8): half the bytes read for the same sums.
+// A lane's 8 values sit inside one block (8 divides 32), so a lane reads one d and 8 codes; the sums are the same terms, in the
+// block's own order, with the quantisation's error the only difference.
+__global__ void __launch_bounds__(kThreads) markov_kernel_q8(float* __restrict__ logits, const uint16_t* __restrict__ E,
+                                                            const uint8_t* __restrict__ Hq, const int* __restrict__ tok,
+                                                            int V, int R) {
+    extern __shared__ float er[];
+    const uint16_t* erow = E + (size_t) (*tok) * R;
+    for (int i = threadIdx.x; i < R; i += blockDim.x) er[i] = bf16f(erow[i]);
+    __syncthreads();
+    const int lane = threadIdx.x & 31;
+    const int v = blockIdx.x * (kThreads / 32) + (threadIdx.x >> 5);
+    if (v >= V) return;
+    const uint8_t* hr = Hq + (size_t) v * (size_t) (R / 32) * 34;
+    float a = 0.0f;
+    for (int c = lane * 8; c < R; c += 32 * 8) {
+        const uint8_t* blk = hr + (size_t) (c >> 5) * 34;
+        const float d = __half2float(*(const __half*) blk);
+        const int8_t* q = (const int8_t*) (blk + 2 + (c & 31));
+        float t = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) t += (float) q[i] * er[c + i];
+        a += d * t;
+    }
+    a = warp_sum(a);
+    if (lane == 0) logits[v] += a;
+}
+
 // a member's rows [v0, v0 + vn) of the bias (markov_kernel's sums, the prev token's E row already on the device, BF16)
 __global__ void __launch_bounds__(kThreads) markov_share_kernel(float* __restrict__ logits,
                                                                 const uint16_t* __restrict__ H,
@@ -2134,6 +2161,9 @@ void hc_mean(const float* h, int T, int hc, int dim, float* out, long long out_s
 void iota_rows(int* out, int T, int n, int stride, cudaStream_t s) { iota_rows_kernel<<<T, 64, 0, s>>>(out, n, stride); }
 void markov_add(float* logits, const uint16_t* E, const uint16_t* H, const int* tok, int V, int R, cudaStream_t s) {
     markov_kernel<<<cdiv(V, kThreads / 32), kThreads, (size_t) R * sizeof(float), s>>>(logits, E, H, tok, V, R);
+}
+void markov_add_q8(float* logits, const uint16_t* E, const uint8_t* Hq, const int* tok, int V, int R, cudaStream_t s) {
+    markov_kernel_q8<<<cdiv(V, kThreads / 32), kThreads, (size_t) R * sizeof(float), s>>>(logits, E, Hq, tok, V, R);
 }
 void markov_share(float* logits, const uint16_t* H, const uint16_t* erow, int vn, int R, cudaStream_t s) {
     markov_share_kernel<<<cdiv(vn, kThreads / 32), kThreads, (size_t) R * sizeof(float), s>>>(logits, H, erow, vn, R);
