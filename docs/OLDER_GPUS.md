@@ -129,7 +129,7 @@ in [DETAILS.md](DETAILS.md#rtx-30-series-sm_86-and-tesla-p100-sm_60-bitwise-deco
 ## Pascal GP100: a Q8_0 decode kernel (opt-in)
 
 GP100 (P100, PH402) is the one Pascal chip without `__dp4a`. Its dense projections read their weights at 40-80 GB/s of about
-730, decoding K- and i-quant blocks one int at a time. Four opt-in changes, all measured on a PH402 only:
+730, decoding K- and i-quant blocks one int at a time. Five opt-in changes, all measured on a PH402 only:
 
 - **`STRATA_Q8_SM60=1`** packs every Q8_0 dense matrix and the head into the planes of `STRATA_Q8_PACKED` and runs them on
   `src/kernels/cuda/q8_sm60.cuh`: a warp per row, 16-byte weight loads, activations copied once per workgroup into shared memory,
@@ -155,6 +155,14 @@ GP100 (P100, PH402) is the one Pascal chip without `__dp4a`. Its dense projectio
   chunk's attention at 43.3 -> 30.8 ms per QSA layer at 26K context on one GP100 die, and 2-3% less time on 8K-150K token prompts
   on four dies; we have not measured it here, and nobody has measured compute capability 6.1. `qsa_pattn_parity` (built with the
   tests in this build) checks the bytes on random data.
+- **`STRATA_SELECT_LONG=1`** (decode, CUDA build with `STRATA_EXPERIMENTAL_SM60`, compute capability 6.x by default): past
+  `STRATA_SELECT_LONG_AT` cells (default 65,536) a decode window's QSA select runs a top-k over several CTAs a query (six kernels)
+  and a decode block scorer without warp shuffles, in place of one CTA a query. They return the same ids and the same score bits
+  (`qsa_select_long_parity` checks this on random data). Each costs a few more kernels a call, which only a long context pays
+  back, so the verifier keeps a second set of window graphs for it: expect some more VRAM for graphs, and nothing changes below
+  the threshold. `STRATA_TOPK_MULTI=0` and `STRATA_SCORES_DX=0` turn one half off. The author measured, on four GP100 dies with
+  every expert resident and `--pipeline-windows 3`, 51.0 -> 52.5 tok/s (+2.9%) decoding 400 tokens at 115K context, and no change
+  below 64K; we have not measured it. A build without the sm_6x kernels ignores the switch with a warning.
 
 None of these changes is measured on compute capability 6.1, which has `__dp4a`. Two practical notes for GP100 cards: the default
 application clock is 759 MHz and a layer split leaves each die idle most of a window, so lock the clocks
