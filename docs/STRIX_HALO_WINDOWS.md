@@ -98,11 +98,10 @@ in turn (on, off, on, off, on, off), the same quick suite after every start:
 | 5 | 1 | 43.2 | 745.5 |
 | 6 | 0 | 46.6 | 739.4 |
 
-With the switch off, decode was **6.9% faster** (46.6 against 43.6, the median of the three starts) and the code-like question 14% faster
+With the switch off, decode was 6.9% faster (46.6 against 43.6, the median of the three starts) and the code-like question 14% faster
 (67 against 59 tok/s); all three pairs went the same way. The prompt speed did not change. Setting it takes `strata launch ... --set
 STRATA_SH_STREAM=0`; it changes only the order the work runs in, so the answers stay the same. Whether Windows `gfx1151` gets this by
 default is a separate decision. This is one model, one PC and short answers; DeepSeek was not tested with it.
-
 
 ## 5. Traps
 
