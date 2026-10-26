@@ -238,8 +238,12 @@ When the RAM cannot hold them beside the system (the experts plus about 10 GB), 
 - The adaptive tier (`--adapt-every`) keeps following the conversation in the resident mode. `--adapt-async 1` (opt-in,
   `--serve`) moves the swaps between decode windows on a helper thread. With `--batch` slots it works between their
   windows too, but not with `--batch-groups` or `--peer-device`. It is not bit-exact from run to run.
-- `STRATA_RAM_ADAPT=<n>` (opt-in, `--serve`, one GPU, needs `--adapt-every`): the RAM copy also follows the conversation,
-  with up to `n` experts swapped per round.
+- `STRATA_RAM_ADAPT=<n>` (opt-in, `--serve`, one GPU, needs `--adapt-every`): the RAM copy also follows the conversation.
+  A layer swaps up to 4 pairs per window: the experts the windows keep routing to (decayed count 2 or more) take the
+  RAM places of unused experts of the same layer (count below 0.5), largest difference first. The incoming expert was
+  usually read for the window before; when its blob still sits in that read's stage buffer it is copied from there and
+  no file read is made. `n` caps only the pairs that need a file read (`=1` is enough in practice). The log counts how
+  many experts moved and how many came out of a stage buffer.
 - Several GPUs: setup recommends one GPU in the low-RAM mode and asks. `--gpus 0,1` shares the model across both cards
   ([MULTI_GPU.md](MULTI_GPU.md#using-it)). `--yes` keeps one GPU.
 - With a page-locked copy the GPU also takes its share of the misses over PCIe (`--pcie-frac`). `--pcie-frac 0` (or
@@ -299,6 +303,12 @@ the engine log has a `strata decode timing:` line and a `strata decode GPU stage
 decoding a little: use it to compare, not to measure speed. `STRATA_LOOKAHEAD_STATS=1` scores the next-layer expert
 prediction every 100 windows and costs CPU. `tools/replay_cache_policy.py` replays a `--dump-routing` trace through the
 adaptive tier's swap policy offline.
+
+In the serial serve loop the timing line lists the wall-time parts in the order they run: `adapt wait + verify +
+commit/emit + draft + adapt join + other`. `other` is the decode time minus the named parts, not a step of its own.
+The times are host wall times, averaged over every decode window, and the bracketed parts of verify are already inside
+verify. The pipelined decode keeps the older line (`ms/window = verify ...`) and batch slots are not covered, so a script
+that reads this line must accept `ms/window = adapt wait` for a serial run.
 
 ### Draft layer
 
@@ -937,7 +947,28 @@ that wins in both directions: `STRATA_SM75_IL`, `STRATA_SM75_EXP`, `STRATA_GR_UP
 `STRATA_TOPK_SPLIT`, `STRATA_TOPK_SAMPLE`, `STRATA_ATTN_V3`, `STRATA_Q2_WARP`, `STRATA_FUSE_WAIT=2`, `STRATA_QIL`,
 `STRATA_TC_SM75`, `STRATA_PA_V1_PREFETCH`, `STRATA_SCORES_THREAD` (a thread-per-head block scorer; `=1` works on any CUDA card).
 Options that change answers stay separate: `STRATA_SELECT_SIMT=1|2`, `STRATA_PA_V2T=1`, `STRATA_PF_FUSED=1 STRATA_PF_FUSED_SM75=1`
-(Q2_0 pack, 7.5 card only) and `STRATA_BF16_TC=1` with `STRATA_XN_F16`.
+(Q2_0 pack, 7.5 card only), `STRATA_PF_FUSED_Q2N=1` (the native Q2_0 pack's prompt experts on sm_80+, below) and
+`STRATA_BF16_TC=1` with `STRATA_XN_F16`.
+
+### The native Q2_0 pack's prompt experts on the fused int8 kernels (`STRATA_PF_FUSED_Q2N=1`, opt-in, sm_80+)
+
+A PC whose CPU lacks the AVX-512 set that setup looks for gets the native Q2_0 pack. On a CUDA card of sm_80 or newer its
+Q2_0 / Q2_0 layers read prompts through MMQ's Q2_0 kernel; the fused int8 kernel for that format (#2145) is set up only on a
+7.5 card. `STRATA_PF_FUSED_Q2N=1` sets it up on any sm_80+ card and takes it for those layers. It has its own variable, so
+`STRATA_PF_FUSED=1` keeps its bits, and `STRATA_PF_FUSED=0` or `STRATA_PF_FUSED_NATIVE=0` still turn it off. Unset, the engine
+is unchanged (first-token logits byte-identical to v0.2.2 on 40 prompts of 1-5K tokens, the author's check). With the switch
+the prompt arithmetic changes and the generated text can change.
+
+The author measured it on an RTX 5080 16 GB (sm_120, Linux, CUDA 13.0), i9-14900K, 2,100 experts in VRAM, CPU prompt share off,
+against the same build unset. At the same 4,864-token chunk (4 interleaved rounds) the 4K, 16K and 23K prompts read 2-3.5%
+faster (4/4 rounds each). With `--prefill auto` (5 rounds) the fused path's smaller buffers make the chunk 5,632 tokens instead of
+4,864 and the 16K prompt reads 32-33% faster (2,592 -> 3,438 tok/s), the 23K one 14%, a 4K one 0-2%; so most of the gain is the
+larger chunk, not the kernel. One layer (`prefill_fused_iq_test`, Q2_0 / Q2_0) runs at 1.92x / 1.37x / 1.30x the MMQ path at
+2,048 / 4,864 / 8,192 tokens. First-token KL against the FP16 prompt path over 30 prompts of 1.5-4.6K tokens: 0.0110 (MMQ
+0.0112), top-1 agreement 28/30 (MMQ 29/30). Not measured: a card that holds every expert, other sm_80+ cards, Windows, the
+generated text. On an RTX A4000 the same kernel in #2145 stopped matching the old output and read 4K prompts 4.5% slower, so
+Ampere is not verified. The ctest entry `prefill_fused_iq_test_q2n` runs the Q2_0 / Q2_0 layer with the switch alone (it skips
+below sm_80 and without a card).
 
 ---
 
@@ -1224,6 +1255,7 @@ which about doubled prompt speed on the measured card.
 | 0.2.0 | RTX PRO 5000 emulating a 12 GB card (`--expert-cache 4448`, Q2_0 GGUF in place, cgroup RAM limit), 3 interleaved pairs | Zero-copy, io prefetch and the decode gate vs 0.1.4x: 32 GB RAM decode 1.70 / 2.56 / 2.88x (story / code / doc8k; 34.0 / 28.0 / 21.7 -> 57.6 / 71.7 / 62.6 tok/s), prompts 1.54 / 1.91x; 16 GB decode 1.16 / 1.25 / 1.25x (the gate stays closed), prompts 1.63 / 1.68x. On a real RTX 3060 12 GB (32 GB cgroup) zero-copy alone gave 1.14 / 1.44 / 1.47x decode |
 | 0.2.1 | RTX 3060 12 GB, IQ3_XXS `experts.bin` pack (43 GB), `--mmap-experts`, cgroup RAM limit, 5 pairs | io prefetch and the gate: 32 GB decode 1.38x / 1.21x / 1.33x (story / code / doc8k), prompts 4K 1.04x, 20K 1.06x. At 16 GB decode +3..8% but the cold 4K prompt 4-6% slower, so it stays off (room 38%) |
 | 0.1.43 | RTX 3060 12 GB, 32 GB, Linux, IQ2_XS, 20.5 GiB experts in RAM, v0.1.43 as baseline, 47 frozen Korean requests replayed in fresh engines | `STRATA_RAM_ADAPT`: decode 43.26 -> 50.40 tok/s (+16.5%); file-tier demand reads per generated token 14.15 -> 2.67. One machine, one quantization |
+| 0.2.1 (#3060) | RTX 3060 12 GB, 32 GB RAM, Linux NVMe, IQ2_XS and IQ3_XXS read in place, 20.5 GiB of experts in RAM, `--adapt-async 1`, `--spec 3`, fresh engine and dropped page cache per run, 3 interleaved runs | `STRATA_RAM_ADAPT` with the stage-buffer copy and `=1` against `=8` before it, 120 ShareGPT requests: IQ2_XS decode 48.71 -> 51.40 tok/s, prompt 137.4 -> 141.5, storage reads 408 -> 308 GB; IQ3_XXS decode 33.07 -> 38.71, prompt 97.8 -> 104.2, reads 1105 -> 717 GB (off: 37.70 and 23.24 tok/s). `standard-v1`: within noise. One machine; the author's numbers, not yet repeated here |
 | 0.1.45.3 | RTX 3060 12 GB, IQ2_XS, 20 GiB of experts in RAM, cgroup 34 GB, SATA emulated at 450 MB/s, 5 pairs | Prompt-chunk planner `8192 -> 3840`: 4,101 tokens 138.1 vs 138.2 tok/s (one chunk either way); 20,400 tokens 334.0 -> 822.3 tok/s (2.46x, drive read 26.1 -> 2.7 GB, decode after 25.4 -> 42.6); 28,887 tokens 418.8 -> 910.4 (2.17x). With a real NVMe and a 32 GB cap it picks 8192 again |
 | 2026-10-11 reports | RTX 3090 + Ryzen 5 5600X | `--adapt-async 1` on the arena: x1.07-1.11 decode, 12 of 12 prompts faster ([report](../bench/results/2026-10-11-community-rtx3090-5600x-arena-async/README.md)). `STRATA_PIN_BY_NEED=1`: prompt read +5-7% at 56K-117K tokens ([report](../bench/results/2026-10-11-community-rtx3090-5600x-arena-pin-by-need/README.md)) |
 | 2026-10-11 report | RTX 5090 / Ryzen 9 9950X, paired 4K three-prompt test | `STRATA_ADAPT_CALLBACK_WARMUP`: 142.82 -> 207.75 tok/s ([report](../bench/results/2026-10-11-rtx-5090-callback-affinity/README.md)) |
@@ -1281,6 +1313,7 @@ with `--batch 2` at 262,144 context saw 538 MiB at the free line become 395 MiB 
 | `STRATA_SPEC_COUPLED` / `STRATA_SPEC_PROB` (0.1.40.2) | RTX 3060 IQ3_XXS, 200-token answers, 10 pairs | Median tok/s at temperature 0.3 / 0.7 / 1.0: default 42.4 / 43.2 / 43.3, coupled 40.6 / 42.4 / 43.3, rejection sampling 41.0 / 42.6 / 42.6 |
 | `STRATA_STAGER_SLEEP=1` | Ryzen 9 7940HS laptop, RTX 4070, IQ3_S, 64K (issue #1101) | Prompts of 5,914 and 22,305 tokens read 5-6% slower; whole-machine CPU use 77-90% -> 21-25%. An RTX 5070 read an 8K Q2_0 prompt 1.2% faster with spinning |
 | Stager threads for a GGUF read in place | Big-RAM box, 124K-token Q8 prompt | 57 -> 350-410 tok/s with the 4-thread RAM profile instead of the 32-thread SSD profile (#1353) |
+| `STRATA_VRAM_FREE=device` (Windows, NVIDIA, #1911) | RTX 5090 (WDDM), Core i7-13700K, 64 GB, 128K context, image encoder loaded, `--expert-cache auto` | The switch reads the free VRAM of the whole card through NVML: with 6 GiB held by another process CUDA still read 30,994 MiB free where NVML read 24,348. Default starts ended with 336 to 602 MiB free (0.1.42, three starts) and 93 MiB to 10 GiB (0.1.40.3 and 0.1.41, six starts); with the switch and `--vram-reserve-mib 1500` 973 to 1,392 MiB free over seven starts and 1,107 to 1,288 over three on 0.1.42. A run that filled the card to 0 MiB free decoded 80-115 tok/s where the same text ran at 205-230 with 900 MiB or more free. The cache can only get smaller. Not measured: AMD cards and Linux (the switch is compiled for Windows CUDA builds only). |
 
 ### Threads, sockets and sessions
 
