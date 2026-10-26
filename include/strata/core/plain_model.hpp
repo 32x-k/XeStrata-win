@@ -11,6 +11,9 @@
 // and whose head is rms_norm, then the output projection.  Qwen3.8 (four residual streams, the QSA indexer, PLE) keeps
 // its own engine.
 //
+// qwen35 (Qwen3.5-9B) is qwen35moe's block with a dense SwiGLU in place of the MoE (`dense_`): every weight in VRAM, a
+// window one graph with nothing for the host to answer, the prompt's buffers of their own; no tiers, no CPU pool.
+//
 // glm5-next (GLM-5.3-Flash, plain_glm5.cpp) runs here too, with its own block: four mHC streams read before and written
 // after every mixer and FFN, KDA (per-channel decay) and DSA (a k-pool indexer, the MLA attention over its selection)
 // mixers, leading dense FFN layers, a sigmoid router and the clamped SwiGLU; the expert tiers and the windows as above.
@@ -296,7 +299,7 @@ private:
         const float *q_norm = nullptr, *k_norm = nullptr;
         const float* router = nullptr;                        // F32 [n_embd, n_expert]
         const float* sh_gate_inp = nullptr;                   // F32 [n_embd]
-        W sh_gate, sh_up, sh_down;
+        W sh_gate, sh_up, sh_down;                            // the shared expert, or qwen35's dense FFN
     };
 
     /// A projection's GGUF tensor into VRAM: its first dimension the input, every other the outputs (a 3-D tensor, the
@@ -309,6 +312,8 @@ private:
     /// in BF16).
     bool upload_f32(const GgufModel& m, const std::string& name, uint64_t elements, const float*& out, std::string& err);
     bool open_experts(std::string& err);
+    /// qwen35's in place of open_experts: no tiers, the prompt's buffers beside the weights
+    bool open_dense(std::string& err);
     bool record(int T, bool mtp, std::string& err);
     /// The window's inputs (embeddings, steps, positions) for `tokens` at pos .. pos + T - 1 into the mapped staging;
     /// `emb` false: no embeddings (a later stage's window, which reads the rows handed on).
@@ -415,7 +420,8 @@ private:
     PromptBufs pb_;
     void* prompt_host_ = nullptr;
     /// The prompt's device buffers of their own, for chunks of up to prompt_dev_T_ tokens, when every expert has a
-    /// slot and the VRAM beside the tier holds them (else null: prompt_borrow lends the tier's last slots).
+    /// slot and the VRAM beside the tier holds them (else null: prompt_borrow lends the tier's last slots), and a dense
+    /// model's always (open_dense; null there: the prompt runs in windows).
     void* prompt_dev_ = nullptr;
     int64_t prompt_dev_T_ = 0;
     /// The prompt's device buffers, carved from the tier's last slots for one prompt (prompt_borrow) and given back
@@ -518,6 +524,7 @@ private:
     int64_t nkv_ = 0;                ///< the attention blocks' K/V heads (the same in every one)
     bool has_gate_ = false;          ///< the attention's output gate: [q | gate] per head (qwen35moe)
     bool has_shared_ = false;        ///< the gated shared expert (qwen35moe)
+    bool dense_ = false;             ///< a dense FFN in every block and no experts (qwen35)
     int emb_type_ = -1;
     const uint8_t* emb_ = nullptr;   ///< token_embd in the GGUF mapping (rows dequantized on the host)
     size_t emb_row_ = 0;

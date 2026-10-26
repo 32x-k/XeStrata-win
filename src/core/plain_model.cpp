@@ -15,7 +15,9 @@
 //               + sigmoid(ffn_gate_inp_shexp . h) * shared(h)
 //
 // and qwen3moe's (llm-jp-4.1, src/models/qwen3moe.cpp): every block a full attention without the gate, rotated over the
-// whole head; the MoE without the shared expert; the second norm named ffn_norm.
+// whole head; the MoE without the shared expert; the second norm named ffn_norm.  qwen35's (Qwen3.5-9B,
+// src/models/qwen35.cpp at de7fa0a3) is qwen35moe's with the MoE replaced by a dense SwiGLU, down(silu(gate(h)) * up(h)),
+// in every block and in the MTP layer: no experts, so none of the tiers, the CPU pool or the window protocol.
 #include "strata/core/plain_model.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
@@ -185,7 +187,7 @@ bool PlainModel::upload_f32(const GgufModel& m, const std::string& name, uint64_
 
 bool PlainModel::load_block(const GgufModel& m, int64_t l, Block& b, std::string& err) {
     const ModelSpec& s = spec_;
-    const bool q35 = s.arch == ModelArch::Qwen35Moe;
+    const bool q35 = s.arch == ModelArch::Qwen35Moe || s.arch == ModelArch::Qwen35;
     const uint64_t N = (uint64_t) s.n_embd, E = (uint64_t) s.n_expert;
     const std::string p = "blk." + std::to_string(l) + ".";
     if (!upload_f32(m, p + "attn_norm.weight", N, b.attn_norm, err) ||
@@ -220,6 +222,17 @@ bool PlainModel::load_block(const GgufModel& m, int64_t l, Block& b, std::string
             return false;
         }
         nkv_ = nkv;
+    }
+    if (dense_) {   // qwen35's FFN, in the shared expert's fields (the same products, without the gate or the router)
+        if (!upload(m, p + "ffn_gate.weight", b.sh_gate, err) || !upload(m, p + "ffn_up.weight", b.sh_up, err) ||
+            !upload(m, p + "ffn_down.weight", b.sh_down, err))
+            return false;
+        if (b.sh_gate.n_in != s.n_embd || b.sh_gate.n_out != s.n_ff || b.sh_up.n_in != s.n_embd ||
+            b.sh_up.n_out != s.n_ff || b.sh_down.n_in != s.n_ff || b.sh_down.n_out != s.n_embd) {
+            err = "plain model: block " + std::to_string(l) + "'s FFN has other shapes";
+            return false;
+        }
+        return true;
     }
     if (!upload_f32(m, p + "ffn_gate_inp.weight", N * E, b.router, err)) return false;
     if (!has_shared_) return true;
@@ -460,19 +473,20 @@ bool PlainModel::split_auto_points(std::string& err) {
 
 bool PlainModel::load_qwen(std::string& err) {
     const ModelSpec& s = spec_;
-    if (s.arch != ModelArch::Qwen35Moe && s.arch != ModelArch::Qwen3Moe) {
+    if (s.arch != ModelArch::Qwen35Moe && s.arch != ModelArch::Qwen3Moe && s.arch != ModelArch::Qwen35) {
         err = "plain model: " + s.arch_name + " is not run by this engine yet";
         return false;
     }
-    const bool q35 = s.arch == ModelArch::Qwen35Moe;
+    const bool q35 = s.arch == ModelArch::Qwen35Moe || s.arch == ModelArch::Qwen35;
+    dense_ = s.arch == ModelArch::Qwen35;
     has_gate_ = q35;
-    has_shared_ = q35;
+    has_shared_ = q35 && !dense_;
     bool shape_ok = s.key_length == s.value_length && (s.key_length == 128 || s.key_length == 256) &&
                     (s.rope_dims == 64 || s.rope_dims == s.key_length) && s.n_expert_used <= 15 && s.n_dense_lead == 0;
     if (q35)
         shape_ok = shape_ok && s.ssm_d_state == 128 && s.ssm_d_conv == 4 && s.ssm_n_group > 0 &&
                    s.ssm_dt_rank % s.ssm_n_group == 0 && s.ssm_d_inner == s.ssm_dt_rank * s.ssm_d_state &&
-                   s.n_ff_shexp > 0;
+                   (dense_ ? s.n_ff > 0 : s.n_ff_shexp > 0);
     if (!shape_ok) {
         err = "plain model: a shape this engine's kernels are not built for";
         return false;
@@ -685,7 +699,7 @@ bool PlainModel::load_qwen(std::string& err) {
     // the window's buffers
     const uint64_t T = (uint64_t) opt_.max_t, NH = (uint64_t) s.n_head, HD = (uint64_t) s.key_length;
     const uint64_t NKV = (uint64_t) qs.n_head_kv, HV = (uint64_t) s.ssm_dt_rank, ZV = (uint64_t) s.ssm_d_inner;
-    const uint64_t K = (uint64_t) s.n_expert_used, FS = (uint64_t) s.n_ff_shexp;
+    const uint64_t K = (uint64_t) s.n_expert_used, FS = (uint64_t) (dense_ ? s.n_ff : s.n_ff_shexp);
     hand_w_ = s.n_embd;
     if (!mapped(T * N * 4, (void**) &h_emb_, (void**) &m_emb_) ||
         !mapped(T * k::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) ||
@@ -721,7 +735,7 @@ bool PlainModel::load_qwen(std::string& err) {
     }
     if (!strata::gpu::stream_sync(cs_)) { err = "plain model: the uploads failed"; return false; }
     setup_int2();   // before the expert tier takes what VRAM is left
-    if (!open_experts(err)) return false;
+    if (!(dense_ ? open_dense(err) : open_experts(err))) return false;
     exec_.assign((size_t) opt_.max_t + 1, nullptr);
     segs_.assign((size_t) opt_.max_t + 1, {});
     mexec_.assign((size_t) opt_.max_t + 1, nullptr);
@@ -752,7 +766,9 @@ void PlainModel::prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* h
     const uint64_t N = (uint64_t) s.n_embd, NH = (uint64_t) s.n_head, HD = (uint64_t) s.key_length, NKV = (uint64_t) nkv_;
     const uint64_t HV = (uint64_t) s.ssm_dt_rank, ZV = (uint64_t) s.ssm_d_inner;
     const uint64_t C = (uint64_t) (2 * s.ssm_n_group * s.ssm_d_state) + ZV, E = (uint64_t) s.n_expert;
-    const uint64_t K = (uint64_t) s.n_expert_used, FS = (uint64_t) s.n_ff_shexp, FF = (uint64_t) s.n_ff_exp;
+    // FS: the shared expert's width, or qwen35's dense FFN's (its products go through the same buffers)
+    const uint64_t K = (uint64_t) s.n_expert_used, FS = (uint64_t) (dense_ ? s.n_ff : s.n_ff_shexp);
+    const uint64_t FF = (uint64_t) s.n_ff_exp;
     // the MTP layer's input rows ([embedding | trunk row], 2 N wide) go through qfull and x16
     const uint64_t U = (uint64_t) T, TK = U * K, QW = std::max<uint64_t>((has_gate_ ? 2u : 1u) * NH * HD, has_mtp_ ? 2 * N : 0);
     // GLM-5.3-Flash's widest inputs: the four streams (the mHC's mixes), the MLA's output, the dense FFN's down, KDA's
@@ -822,7 +838,7 @@ void PlainModel::prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* h
     take(b.xq, xq_cols + 2 * (xq_cols / 32) * 4); take(b.hq, rep * (TK * FF + 2 * TK * (FF / 32) * 4));
     take(b.xq2, dup_mixed && b.int8 ? rep * (TK * N + 2 * TK * (N / 32) * 4) : 0);
     if (!(dup_mixed && b.int8) && dev != nullptr) b.xq2 = nullptr;
-    take(b.identity, TK * 4);
+    take(b.identity, std::max(TK, U) * 4);   // a dense product's T rows too (a dense model routes none)
     take(b.wtab, E * sizeof(void*)); take(b.rbounds, (2 * E + 2) * 4); take(b.dense_bounds, 2 * sizeof(int32_t));
     // the CPU's share of the missed experts (plain_prompt.cpp): at most a window's tokens an expert, so 8 E rows
     b.cpu_cap = std::min<int64_t>((int64_t) TK, (int64_t) k::cpu::MAXT * (int64_t) E);
@@ -1196,6 +1212,64 @@ bool PlainModel::open_experts(std::string& err) {
     return true;
 }
 
+// qwen35's part of the load in place of open_experts: every weight is in VRAM already (load_qwen uploaded them), and
+// the prompt path's buffers of their own (prompt_dev_) take the longest chunk up to --prompt-chunk that fits beside
+// them.  No longer chunk is chosen by itself, as the MoE models' auto_prompt_chunk does: a chunk streams no experts
+// here, so a longer one saves only launches, and the VRAM stays for the picture reader and the image engine.
+bool PlainModel::open_dense(std::string& err) {
+    n_moe_ = 0;
+    moe_local_.clear();
+    moe_trunk_ = 0;
+    level_zero_ = Runtime::get().device().get_backend() == sycl::backend::ext_oneapi_level_zero;
+    uint64_t free_b = 0;
+    {
+        size_t f = 0, t = 0;
+        if (!strata::gpu::mem_info(&f, &t)) { err = "plain model: the device's memory is unknown"; return false; }
+        free_b = f;
+        total_b_ = t;
+        apply_vram_limit(free_b, total_b_);
+        if (opt_.vram_free_mib >= 0) free_b = std::min<uint64_t>(free_b, (uint64_t) opt_.vram_free_mib << 20);
+    }
+    // what is allocated after (the products' libraries, the graphs) and the driver's margin, as open_experts leaves
+    const uint64_t reserve = opt_.reserve_mib >= 0 ? (uint64_t) opt_.reserve_mib << 20
+                                                   : std::clamp<uint64_t>(total_b_ / 32, 192ull << 20, 768ull << 20);
+    const uint64_t room = free_b > reserve ? free_b - reserve : 0;
+    if (opt_.prompt_chunk > 0) {
+        const int64_t asked = opt_.prompt_chunk;
+        for (int64_t T = asked; T >= 16; T /= 2) {
+            uint64_t db = 0, hb = 0;
+            prompt_carve(T, pb_, nullptr, nullptr, db, hb);
+            if (db > room || db > max_alloc_bytes() || !strata::gpu::alloc_device(&prompt_dev_, (size_t) db)) continue;
+            if (strata::gpu::alloc_host(&prompt_host_, hb)) {
+                allocs_.push_back(prompt_dev_);
+                prompt_dev_T_ = T;
+                opt_.prompt_chunk = T;
+                prompt_carve(T, pb_, nullptr, (uint8_t*) prompt_host_, db, hb);
+                break;
+            }
+            strata::gpu::free(prompt_dev_);
+            prompt_dev_ = nullptr;
+            prompt_host_ = nullptr;
+        }
+        // a layer split's: the rows between the stages
+        if (prompt_dev_ != nullptr && !(first() && last()) &&
+            !strata::gpu::alloc_host(&hand_host_, (size_t) (asked * hand_w_) * 4)) {
+            strata::gpu::free(prompt_host_);
+            prompt_host_ = nullptr;
+        }
+        if (prompt_host_ == nullptr) {
+            std::fprintf(stderr, "strata plain: no memory for the prompt path's chunks (%lld tokens asked): prompts are "
+                                 "read through the decode windows\n", (long long) asked);
+            opt_.prompt_chunk = 0;
+        } else if (opt_.prompt_chunk != asked) {
+            std::fprintf(stderr, "strata plain: the prompt path's chunks are %lld tokens (the memory for %lld was not "
+                                 "there)\n", (long long) opt_.prompt_chunk, (long long) asked);
+        }
+    }
+    free_b_ = free_b;
+    return true;
+}
+
 // The prompt path's lending, as Qwen3.8-Flash-Next's --prefill auto (generate.cpp's plan_lend): a chunk's buffers
 // borrow at most prefill::lend_pct of the tier's slots and leave 128 (half of a smaller tier), and only from its last
 // piece.  85%: Qwen3.6 UD-Q4_K_XL's 32K prompt on the B70 (2026-10-26) read at 711 tok/s with the half the tier lent
@@ -1288,6 +1362,12 @@ void PlainModel::pinned_split() {
 // allocations are made by then, and on the B70 GLM-5.3-Flash ran with 88.5 GiB pinned here and 26 GiB left
 // (2026-10-19).
 void PlainModel::finish_experts() {
+    if (dense_) {   // no experts: every stage's weights in its VRAM
+        for (PlainModel* st : chain())
+            std::fprintf(stderr, "strata plain: a dense model, every weight in VRAM, %lld MiB free after it, prompt "
+                                 "chunks of %lld tokens\n", (long long) (st->free_b_ >> 20), (long long) st->opt_.prompt_chunk);
+        return;
+    }
     const int64_t E = spec_.n_expert;
     if (!in_ram_ && !opt_.mmap_experts) {
         auto* file = static_cast<FileExpertSource*>(src_);
@@ -1505,15 +1585,16 @@ int64_t PlainModel::offloaded() const {
 
 // the arena holds every expert in RAM; read in place, the RAM copy and the files count apart (FileExpertSource)
 int64_t PlainModel::ram_reads() const {
+    if (src_ == nullptr) return 0;   // a dense model
     return in_ram_ ? src_->reads() : static_cast<const FileExpertSource*>(src_)->ram_reads();
 }
 
 int64_t PlainModel::file_reads() const {
-    return in_ram_ ? 0 : static_cast<const FileExpertSource*>(src_)->file_reads();
+    return in_ram_ || src_ == nullptr ? 0 : static_cast<const FileExpertSource*>(src_)->file_reads();
 }
 
 uint64_t PlainModel::file_read_bytes() const {
-    return in_ram_ ? 0 : static_cast<const FileExpertSource*>(src_)->file_read_bytes();
+    return in_ram_ || src_ == nullptr ? 0 : static_cast<const FileExpertSource*>(src_)->file_read_bytes();
 }
 
 std::vector<int64_t> PlainModel::split_points() const {
@@ -1684,7 +1765,7 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
     const ModelSpec& s = spec_;
     const int64_t N = s.n_embd, NH = s.n_head, HD = s.key_length, HV = s.ssm_dt_rank, HK = s.ssm_n_group;
     const int64_t ZV = s.ssm_d_inner, S = s.ssm_d_state, C = 2 * HK * S + ZV, E = s.n_expert, K = s.n_expert_used;
-    const int64_t FS = s.n_ff_shexp;
+    const int64_t FS = dense_ ? s.n_ff : s.n_ff_shexp;
     const float eps = (float) s.rms_eps;
     const k::QsaShapes qs = attn_shapes(s, nkv_);
     const int64_t NKV = qs.n_head_kv;
@@ -1768,6 +1849,29 @@ bool PlainModel::record_block(const Block& b, int64_t ml, int T, uint32_t& ring,
         }
     }
     k::add_inplace(x_, mix_, (int64_t) T * N, cs);
+
+    if (dense_) {   // qwen35's FFN: the shared expert's products, from the norm's q8_1 rows where the weights take them
+        const bool q8 = b.sh_gate.type != kBF16 && b.sh_up.type != kBF16 && b.sh_down.type != kBF16;
+        if (!q8) {
+            k::native_qsa_rms_norm_weighted(x_, b.post_norm, hn_, (int) N, T, eps, cs);
+            proj(b.sh_gate, hn_, sh_gate_, T, true);   // (each quantizes hn_ again: a file may mix the types)
+            proj(b.sh_up, hn_, sh_up_, T, true);
+            k::native_swiglu_f32(sh_gate_, sh_up_, sh_gate_, (int) FS, T, cs);
+            proj(b.sh_down, sh_gate_, moe_out_, T, true);
+        } else {
+            k::native_qsa_rms_norm_weighted_q8_1(x_, b.post_norm, hn_, xq_, (int) N, T, eps, cs);
+            if (b.sh_gate.type != b.sh_up.type ||
+                !k::native_mmvq_pair(b.sh_gate.type, b.sh_gate.data, b.sh_up.data, xq_, sh_gate_, sh_up_, (int) N,
+                                     (int) FS, T, cs)) {
+                k::native_mmvq(b.sh_gate.type, b.sh_gate.data, xq_, sh_gate_, (int) N, (int) FS, T, cs);
+                k::native_mmvq(b.sh_up.type, b.sh_up.data, xq_, sh_up_, (int) N, (int) FS, T, cs);
+            }
+            k::native_swiglu_q8_1(sh_gate_, sh_up_, xq_, (int) FS, T, cs);
+            k::native_mmvq(b.sh_down.type, b.sh_down.data, xq_, moe_out_, (int) FS, (int) N, T, cs);
+        }
+        k::add_inplace(x_, moe_out_, (int64_t) T * N, cs);
+        return true;
+    }
 
     // the MoE: route, publish, the shared expert while the host serves, then the experts and the combine
     const bool sh_q8 = has_shared_ && b.sh_gate.type != kBF16 && b.sh_down.type != kBF16;
@@ -1977,6 +2081,11 @@ bool PlainModel::stage(const int32_t* tokens, int T, int64_t pos, std::string& e
 
 bool PlainModel::launch_serve(strata::gpu::Graph* g, std::vector<strata::gpu::Graph*>& segs, int64_t rings,
                               const int64_t* layers, int T, std::string& err) {
+    if (dense_) {   // no rings to answer: the window's graph alone
+        if (strata::gpu::graph_launch(g, cs_)) return true;
+        err = std::string("plain model: launch: ") + strata::gpu::last_error();
+        return false;
+    }
     win_.reset();
     const bool seg = win_.segmented();
     if (!strata::gpu::graph_launch(seg ? segs[0] : g, cs_)) {
@@ -2306,6 +2415,7 @@ bool PlainModel::fill_slot(int64_t layer, int32_t expert, std::string& err) {
 }
 
 bool PlainModel::save_profile(const std::string& path, std::string& err) const {
+    if (dense_) { err = "plain model: a dense model has no experts to profile"; return false; }
     const int64_t L = n_moe_, E = spec_.n_expert;
     std::vector<uint8_t> resident((size_t) (L * E), 0);
     std::vector<double> heat = heat_;

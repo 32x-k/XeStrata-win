@@ -835,7 +835,11 @@ int plain_main(int argc, char** argv) {
         return 1;
     }
     opt.prompt_chunk = model.prompt_chunk();   // the model may take the prompt in windows (short of pinned memory)
-    if (opt.prompt_chunk > 0) {
+    if (opt.prompt_chunk > 0 && model.spec().n_expert == 0) {   // a dense model (qwen35)
+        std::fprintf(stderr, "strata (%s): prompt matrix products on %s, the int8 ones on %s\n", arch.c_str(),
+                     strata::prefill::Gemm::path(),
+                     strata::prefill::mmq::chosen() ? strata::prefill::mmq::path() : "none (FP16 for all)");
+    } else if (opt.prompt_chunk > 0) {
         const char* experts = model.prompt_int8() ? strata::prefill::mmq::path() : nullptr;
         std::fprintf(stderr, "strata (%s): prompt matrix products on %s; the experts' in %s%s%s\n", arch.c_str(),
                      strata::prefill::Gemm::path(), experts ? "int8 (" : "FP16", experts ? experts : "",

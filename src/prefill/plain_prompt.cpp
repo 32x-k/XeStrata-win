@@ -85,6 +85,22 @@ PlainModel::PromptGemm& PlainModel::prompt_gemm() {
 
 bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
     if (!settle_swaps(true, err)) return false;   // the tier's copies may still be writing the slots lent below
+    if (dense_) {   // no tier: the buffers of its own (open_dense), in even chunks of up to their length
+        if (borrow_first_ >= 0 || prompt_dev_ == nullptr || prompt_dev_T_ < 1) {
+            err = "plain prompt: no buffers for the prompt's chunks";
+            return false;
+        }
+        const int64_t pieces = (T + prompt_dev_T_ - 1) / prompt_dev_T_;
+        uint64_t db = 0, hb = 0;
+        borrow_short_ = false;
+        borrowed_res_.clear();
+        borrow_first_ = 0;
+        prompt_carve((T + pieces - 1) / pieces, pb_, (uint8_t*) prompt_dev_, (uint8_t*) prompt_host_, db, hb);
+        PromptGemm& g = prompt_gemm();
+        g.gemm.rebind(pb_.gemm_scratch, pb_.gemm_elems);
+        g.identity = false;
+        return true;
+    }
     const int64_t L = n_moe_, E = spec_.n_expert, n = cache_.slots();   // the live slots (--vram-elastic's shrinks)
     const uint64_t* off = cache_.slot_offsets();
     if (borrow_first_ >= 0 || off == nullptr || L <= 0 || n < 2) { err = "plain prompt: no tier to borrow from"; return false; }
@@ -143,6 +159,7 @@ bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
 
 bool PlainModel::prompt_return(std::string& err) {
     const int64_t LS = (int64_t) moe_local_.size(), n = cache_.slots();
+    if (dense_) borrow_first_ = -1;   // its own buffers: nothing to give back
     if (borrow_first_ < 0 || LS <= 0) return true;   // a borrow needs slots, and slots need MoE layers
     const auto& lay = k::cpu::expert_layout();
     if (!strata::gpu::stream_sync(cs_)) { err = std::string("plain prompt: ") + strata::gpu::last_error(); return false; }
@@ -281,7 +298,7 @@ bool PlainModel::prompt_warm_products(std::string& err) {
                 warm(b.v, P.vcur);
                 warm(b.o, P.mix);
             }
-            if (has_shared_) {
+            if (has_shared_ || dense_) {   // the shared expert, or the dense FFN in its fields
                 warm(b.sh_gate, P.sh_gate);
                 warm(b.sh_up, P.sh_up);
                 warm(b.sh_down, P.shared);
@@ -688,7 +705,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
     const ModelSpec& s = spec_;
     const int64_t N = s.n_embd, NH = s.n_head, HD = s.key_length, NKV = nkv_, HV = s.ssm_dt_rank, HK = s.ssm_n_group;
     const int64_t E = s.n_expert, K = s.n_expert_used;
-    const int64_t FS = s.n_ff_shexp, qw = (has_gate_ ? 2 : 1) * NH * HD;
+    const int64_t FS = dense_ ? s.n_ff : s.n_ff_shexp, qw = (has_gate_ ? 2 : 1) * NH * HD;
     const float eps = (float) s.rms_eps;
     const k::QsaShapes qs = [&] {
         k::QsaShapes q = k::qsa_real_shapes();
@@ -738,8 +755,9 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     PromptGemm& pg = prompt_gemm();
+    const int64_t rows_id = P.T * std::max<int64_t>(K, 1);   // the identity's rows: the routed ones, or a dense chunk's
     if (use_mmq && !pg.identity) {
-        prefill::mmq::iota(P.identity, P.T * K, cs);
+        prefill::mmq::iota(P.identity, rows_id, cs);
         pg.identity = true;
     }
     // STRATA_PROMPT_PROFILE=1: the time of each stage, the stream synchronized after each (slower; for finding where it
@@ -793,7 +811,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                 return false;
             }
             if (dense_on && !pg.identity) {   // the dense products' row map (the experts' sets it too)
-                prefill::mmq::iota(P.identity, P.T * K, cs);
+                prefill::mmq::iota(P.identity, rows_id, cs);
                 pg.identity = true;
             }
             // from the normed rows: int8 where it can, else FP16 (x16, written once a layer if any product needs it)
@@ -935,6 +953,26 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                 }
                 k::add_inplace(P.x, P.mix, T * N, cs);
                 mark(b.recurrent ? 0 : 4, t_mark);
+
+                if (dense_) {   // qwen35's FFN: gate and up from the normed rows, the SwiGLU, down; int8 where it can
+                    k::native_qsa_rms_norm_weighted(P.x, b.post_norm, P.hn, (int) N, (int) T, eps, cs);
+                    f16(P.hn, T, N);
+                    proj_hn(b.sh_gate, P.sh_gate);
+                    proj_hn(b.sh_up, P.sh_up);
+                    if (dense_on && prefill::mmq::supported(b.sh_down.type) && b.sh_down.n_out % 128 == 0 &&
+                        b.sh_down.n_in % 32 == 0) {
+                        // the SwiGLU in FP32 rows for the int8 product: the chunk as one row (the kernel is
+                        // element-wise, and takes at most 8 rows)
+                        k::native_swiglu_f32(P.sh_gate, P.sh_up, P.sh_gate, (int) (FS * T), 1, cs);
+                        dense(b.sh_down, P.sh_gate, FS, P.moe_out, T);
+                    } else {   // into FP16 (x16 is free again) for Gemm::native
+                        prefill::swiglu_pair(P.sh_gate, P.sh_up, P.x16, T, cs, FS);
+                        proj(b.sh_down, P.moe_out, T);
+                    }
+                    k::add_inplace(P.x, P.moe_out, T * N, cs);
+                    mark(3, t_mark);
+                    continue;
+                }
 
                 // the MoE
                 k::native_qsa_rms_norm_weighted(P.x, b.post_norm, P.hn, (int) N, (int) T, eps, cs);
