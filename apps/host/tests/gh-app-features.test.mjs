@@ -143,9 +143,9 @@ test('approval notifications: shell first, the page second, nothing when off or 
 });
 
 test('every new string exists in all eight languages with the same slots, and does not collide with another catalog', async () => {
-  const languages = ['en', 'zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko'];
+  const languages = ['en', 'zh', 'ja', 'de', 'fr', 'es', 'ru', 'pt', 'ko'];
   const read = async name => JSON.parse(readFileSync(new URL(`../src/locales/${name}.json`, import.meta.url), 'utf8'));
-  const withFrench = [...languages, 'fr'];   // French is a ninth language of this catalog; the app learns it with the i18n work
+  const withFrench = languages;
   const gh = Object.fromEntries(await Promise.all(withFrench.map(async l => [l, await read(`gh-${l}`)])));
   const slots = text => [...text.matchAll(/\{\d+\}/g)].map(m => m[0]).sort();
   const others = new Set();
