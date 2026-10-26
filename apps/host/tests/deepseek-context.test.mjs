@@ -87,12 +87,12 @@ test('the Models screen honours the choice (it no longer forces 8K), offers the 
   assert.match(screen, /installed\?\.ready && context === installed\.context/, 'a load at the prepared context starts from the saved file; only a changed choice runs setup again');
 });
 
-test('the note is in the catalog in all eight languages, translated', () => {
+test('the note is in the catalog in all nine languages, translated', () => {
   const find = lang => Object.values(JSON.parse(read(`../src/locales/fix-${lang}.json`)));
   assert.ok(find('en').includes(UNTESTED_NOTE));
   const en = JSON.parse(read('../src/locales/fix-en.json'));
   const id = Object.keys(en).find(k => en[k] === UNTESTED_NOTE);
-  for (const lang of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko']) {
+  for (const lang of ['zh', 'ja', 'de', 'es', 'ru', 'pt', 'ko', 'fr']) {
     const text = JSON.parse(read(`../src/locales/fix-${lang}.json`))[id];
     assert.ok(text && text !== UNTESTED_NOTE, `${lang} is translated`);
   }
