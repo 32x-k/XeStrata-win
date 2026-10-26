@@ -38,6 +38,15 @@ int main() {
     CHECK_EQ(experts_per_word(-1, 24 * GiB, 6, false), 6);   // a discrete 24 GB card
     CHECK_EQ(experts_per_word(-1, 12 * GiB, 6, false), 5);   // a discrete 12 GB card
     CHECK_EQ(experts_per_word(6, 91 * GiB, 6, true), 6);     // --experts 6 wins on the unified-memory GPU too
+    // two or more RDNA4 cards that hold at least half of the experts (4 x R9700, 128 GiB in all): faster mode by default (the 5th argument)
+    CHECK_EQ(experts_per_word(-1, 4 * 32 * GiB, 6, false, true), 5);
+    CHECK_EQ(experts_per_word(-1, 3 * 32 * GiB, 6, false, true), 5);
+    CHECK_EQ(experts_per_word(-1, 4 * 32 * GiB, 6, false, false), 6);   // the same cards when they hold under half (or are not RDNA4): the model's 6
+    CHECK_EQ(experts_per_word(6, 4 * 32 * GiB, 6, false, true), 6);     // --experts 6 (the app's / Terminal's "Full quality") wins
+    CHECK_EQ(experts_per_word(4, 4 * 32 * GiB, 6, false, true), 4);     // so does any other --experts N
+    CHECK_EQ(experts_per_word(5, 4 * 32 * GiB, 6, false, false), 5);
+    CHECK_EQ(experts_per_word(-1, 4 * 32 * GiB, 1, false, true), 1);    // a model of one expert a word has nothing to drop
+    CHECK_EQ(experts_test_override(experts_per_word(-1, 4 * 32 * GiB, 6, false, true), 6), 5);
     CHECK_EQ(experts_per_word(-1, 91 * GiB, 4, true), 4);    // never raised
     // unknown memory (0): the model's count, never a silent cut
     CHECK_EQ(experts_per_word(-1, 0, 6), 6);

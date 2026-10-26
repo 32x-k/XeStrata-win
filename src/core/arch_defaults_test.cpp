@@ -1,6 +1,7 @@
 // src/core/arch_defaults_test.cpp - the per-architecture default table (no GPU needed).
 #include "strata/core/arch_defaults.hpp"
 #include "strata/core/gfx12_platform_defaults.hpp"
+#include "strata/core/sm120_series.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -226,5 +227,46 @@ int main() {
     unset("STRATA_UMA_REGISTER");
     // both platforms: no Windows guard on the iGPU set (the owner wants it there too; untested on Windows is only said in the log)
     std::printf(fails ? "arch_defaults_test: %d FAILED\n" : "arch_defaults_test: OK\n", fails);
+    // ---- 0.2.7 CUDA defaults (sm120_series.hpp): which cards get which, and which never do
+    {
+        const double GiB = 1073741824.0;
+        using namespace strata;
+        // residency-biased routing: 2.0 on a discrete CUDA card of 13 GiB or less, nothing else
+        CHECK(route_prior_default(false, false, 11.9 * GiB) == 2.0f);       // RTX 3060 / 5070 12 GB
+        CHECK(route_prior_default(false, false, 12.0 * GiB) == 2.0f);
+        CHECK(route_prior_default(false, false, 8.0 * GiB) == 2.0f);        // an 8 GB card
+        CHECK(route_prior_default(false, false, 13.0 * GiB) == 2.0f);       // the boundary is inclusive
+        CHECK(route_prior_default(false, false, 13.5 * GiB) == 0.0f);
+        CHECK(route_prior_default(false, false, 15.7 * GiB) == 0.0f);       // 16 GB card: z440's A4000, P100
+        CHECK(route_prior_default(false, false, 72.0 * GiB) == 0.0f);       // RTX PRO 5000
+        CHECK(route_prior_default(true, false, 12.0 * GiB) == 0.0f);        // a HIP build: a 12 GB RX 6700 XT / 7700 XT
+        CHECK(route_prior_default(true, true, 12.0 * GiB) == 0.0f);         // Strix Halo with a small carve-out
+        CHECK(route_prior_default(false, true, 8.0 * GiB) == 0.0f);         // an integrated GPU on CUDA (Jetson-like)
+        CHECK(route_prior_default(false, false, 0.0) == 0.0f);              // unknown memory
+        // the stream-split hyper-connection read: a discrete 12.0 card above 13 GiB (RTX PRO 5000 72 GB, RTX 5090 32 GB), nothing else
+        CHECK(gr_v3_default(false, 12, 0, false, 72.0 * GiB));
+        CHECK(gr_v3_default(false, 12, 0, false, 31.4 * GiB));              // RTX 5090
+        CHECK(!gr_v3_default(false, 12, 0, false, 11.9 * GiB));             // RTX 5070 12 GB: streams most experts, unmeasured
+        CHECK(gr_v3_default(false, 12, 0, false, 15.6 * GiB));               // a 16 GB sm_120 card (RTX 5060 Ti / 5070 Ti): above 13 GiB, on (unmeasured size, same arch)
+        CHECK(!gr_v3_default(false, 8, 6, false, 15.7 * GiB));              // 2x RTX A4000 (sm_86): measured -3.0% / -5.9%
+        CHECK(!gr_v3_default(false, 8, 6, false, 72.0 * GiB));              // any sm_86
+        CHECK(!gr_v3_default(false, 8, 9, false, 24.0 * GiB));              // sm_89
+        CHECK(!gr_v3_default(false, 12, 1, false, 128.0 * GiB));            // sm_121 (DGX Spark class): not 12.0
+        CHECK(!gr_v3_default(false, 12, 0, true, 128.0 * GiB));             // integrated
+        CHECK(!gr_v3_default(true, 12, 0, false, 32.0 * GiB));              // a HIP build: gfx1201 reports 12.0 too
+        CHECK(!gr_v3_default(false, 6, 0, false, 16.0 * GiB));              // P100
+    }
+    {
+        using namespace strata;
+        // the prompt attention on int8 tensor cores: every CUDA card from sm_80 on, not Turing / Volta / Pascal, not HIP
+        CHECK(prompt_attn_imma_default(false, 120));                        // RTX PRO 5000 / RTX 50: measured +1.6-1.8%
+        CHECK(prompt_attn_imma_default(false, 86));                         // 2x RTX A4000 / RTX 3060: measured +1.1-1.3%
+        CHECK(prompt_attn_imma_default(false, 80));
+        CHECK(prompt_attn_imma_default(false, 89));
+        CHECK(!prompt_attn_imma_default(false, 75));                        // Turing (also a forced STRATA_QSA_WARP=1 card)
+        CHECK(!prompt_attn_imma_default(false, 70));                        // Volta
+        CHECK(!prompt_attn_imma_default(false, 60));                        // Pascal (P100)
+        CHECK(!prompt_attn_imma_default(true, 120));                        // HIP
+    }
     return fails ? 1 : 0;
 }

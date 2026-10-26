@@ -18,10 +18,13 @@ constexpr int kFasterModeExperts = 5;
 // requested: --experts (-1: not given, the rule decides); vram_bytes: the total memory of the cards the engine uses;
 // model_k: the experts a word takes in the model; integrated: a GPU that shares the PC's RAM (Strix Halo: part of the experts live only on
 // the SSD, each expert dropped is less read - measured 5 against 6 on a Radeon 8065S: decode +11..13%, prompts +5..7%).  The result is in 1 .. model_k.
-inline int experts_per_word(int requested, uint64_t vram_bytes, int model_k, bool integrated = false) {
+// multi_rdna4: two or more RDNA4 cards (gfx1200 / gfx1201: R9700, RX 9000) that together hold at least half of the routed experts - the 4 x R9700 box
+// the Marlin stream measured: 5 against 6 experts, 2.25 bpw, 8K prompt 1339 -> 1419 ppts (+6%) and decode 78.1 -> 81.2 tok/s (+4%), reference KL
+// 0.10987 against 0.10833 and top-1 87.59% against 87.53% (the gate is 0.006).  Faster mode there too, by default.
+inline int experts_per_word(int requested, uint64_t vram_bytes, int model_k, bool integrated = false, bool multi_rdna4 = false) {
     if (model_k <= 1) return model_k;
     int n = requested;
-    if (n < 1) n = integrated || (vram_bytes != 0 && vram_bytes <= kFasterModeVramMax) ? kFasterModeExperts : model_k;
+    if (n < 1) n = integrated || multi_rdna4 || (vram_bytes != 0 && vram_bytes <= kFasterModeVramMax) ? kFasterModeExperts : model_k;
     if (n > model_k) n = model_k;
     return n < 1 ? 1 : n;
 }

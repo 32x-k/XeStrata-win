@@ -225,7 +225,7 @@ inline float g_route_prior() {
         cudaDeviceProp p;
         const bool ok = cudaGetDeviceProperties(&p, dev) == cudaSuccess;
         if (!ok) cudaGetLastError();
-        per_dev[dev] = 1.0f + (ok && !p.integrated && (double) p.totalGlobalMem / 1073741824.0 <= 13.0 ? 2.0f : 0.0f);
+        per_dev[dev] = 1.0f + (ok ? strata::route_prior_default(false, p.integrated != 0, (double) p.totalGlobalMem) : 0.0f);
     }
     return per_dev[dev] - 1.0f;
 #endif

@@ -2302,6 +2302,32 @@ int g_gr_fast = -1;
 #endif
 void fused_gr_set_fast(int on) { g_gr_fast = on; }
 
+// STRATA_GR_V3: the stream-split hyper-connection read (gr_down_v3_kernel / gr_up_v3_kernel).  Another summation order than the default
+// read (~1e-7; a greedy tie can flip, so the answers are not byte-identical to 0.2.6's).  0.2.7: ON by default on a compute capability 12.0
+// card (RTX 50 / RTX PRO Blackwell: sm120_series.hpp, STRATA_SM120_PERF=0 turns the set off) with more than 13 GiB of memory, discrete;
+// measured on the RTX PRO 5000 72 GB with every expert resident: code decode 245.1 -> 248.1 tok/s (+1.2%, identical tokens), a story prompt
+// +6.4% (tokens changed, not a claim), held-out document prompt +4.3%, with STRATA_PROMPT_ATTN_IMMA=1 +1.5% decode / +1.6-1.8% prompt together,
+// 5 pairs.  NOT a default elsewhere: it measured -3.0% / -5.9% on 2x RTX A4000 (sm_86) and +1.0% / -3.4% on an RTX 3060 (sm_86), and a 12 GB
+// sm_120 card (RTX 5070: streams most experts, the read is a small share of its window) is unmeasured.  STRATA_GR_V3=0 / 1 forces it off / on
+// on any card; never in a HIP build (gfx12 reports compute capability 12.0 too).  Decided per card, first asked in fused_gr_check (before any
+// graph capture).
+static bool gr_v3_default_on(int dev) {
+#if defined(__HIPCC__)
+    (void) dev;
+    return false;
+#else
+    static int per_dev[64];   // 0 unknown, 1 no, 2 yes
+    if (dev < 0 || dev >= 64) return false;
+    if (!per_dev[dev]) {
+        cudaDeviceProp p;
+        const bool ok = cudaGetDeviceProperties(&p, dev) == cudaSuccess;
+        if (!ok) cudaGetLastError();
+        per_dev[dev] = ok && strata::gr_v3_default(false, p.major, p.minor, p.integrated != 0, (double) p.totalGlobalMem) ? 2 : 1;
+    }
+    return per_dev[dev] == 2;
+#endif
+}
+
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
                          int stamp_i0) {
     if (n_tok < 1 || n_tok > kFusedGrMaxT || xn_scratch == nullptr) {
@@ -2337,12 +2363,13 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         }
         return q8;
     }
-    // STRATA_GR_V3=1: the two-kernel read above (another summation order - opt-in)
-    static const bool v3 = [] { const char* v = std::getenv("STRATA_GR_V3"); return v != nullptr && std::atoi(v) != 0; }();
+    // the two-kernel read above (another summation order): STRATA_GR_V3=0 / 1, unset = gr_v3_default_on (a 12.0 card with > 13 GiB)
+    static const int v3_env = [] { const char* v = std::getenv("STRATA_GR_V3"); return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1; }();
     static int split3[64] = {};   // per device: 0 = not decided yet, 1 / 2 = column halves S, -1 = does not fit
     int dev3 = 0;
+    cudaGetDevice(&dev3);
+    const bool v3 = v3_env >= 0 ? v3_env == 1 : gr_v3_default_on(dev3);
     if (v3) {
-        cudaGetDevice(&dev3);
         if (dev3 >= 0 && dev3 < 64 && split3[dev3] == 0) {
             int optin = 0;
             cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev3);
@@ -2653,6 +2680,7 @@ int fused_gr_variant() {
 void fused_gr_check() {
     int dev = 0;
     cudaGetDevice(&dev);
+    (void) gr_v3_default_on(dev);   // decided here, before any graph capture asks
     if (dev < 0 || dev >= 64 || g_variant[dev].load() > 0) return;
     const int want = env_variant();
     if (want == kHcPlain) {
