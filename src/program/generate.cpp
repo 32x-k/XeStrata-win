@@ -29,6 +29,7 @@
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
+#include "strata/core/ple_residency.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/foresight_swap.hpp"
@@ -4084,6 +4085,10 @@ int main(int argc, char** argv) {
         // prompt 2125 / 2368 / 2611 tok/s, and the answer md5 was identical in all three.  The RAM cost is the
         // table itself; the policy needs 8 GiB of headroom on top of it (available_host_bytes accounts for
         // cgroups and --memory-limit-mib), an explicit --ple-io always wins, and STRATA_PLE_AUTO_RAM=0 turns it off.
+        // The expert arena is filled AFTER this point and wants its own RAM (51 GiB for IQ3_S), so the table is admitted
+        // only when RAM holds table + arena + headroom (strata/core/ple_residency.hpp).  Measured on the 64 GB RTX 5070 PC
+        // (2026-10-26): table + 8 GiB alone admitted it, the table's lock took the lockable memory and the expert load
+        // died with error 1453 (ERROR_WORKING_SET_QUOTA).
         bool ple_auto_ram = false;
         if (pio.mode == strata::kernels::PleIo::Direct && !o.ple_io_explicit) {
             const strata::kernels::PleIoOptions direct_pio = pio;
@@ -4091,7 +4096,13 @@ int main(int argc, char** argv) {
             const bool allowed = auto_ram == nullptr || std::atoi(auto_ram) != 0;
             const uint64_t need = ple_table.table_bytes();
             const auto available = strata::core::available_host_bytes();
-            if (allowed && need > 0 && strata::core::conversation_memory_admit(available, need, 8ull << 30)) {
+            uint64_t experts_ram = 0;   // every routed expert's blob, the arena the engine copies into RAM at start
+            {
+                const auto& elay = strata::kernels::cpu::expert_layout();
+                for (int64_t l = 0; l < elay.n_layers; ++l)
+                    experts_ram += elay.blob_bytes(l) * (uint64_t) elay.n_expert;
+            }
+            if (allowed && need > 0 && strata::core::ple_resident_admit(available, need, experts_ram, 8ull << 30)) {
                 ple_table.close();
                 pio.mode = strata::kernels::PleIo::Mmap;
                 pio.lock = true;
