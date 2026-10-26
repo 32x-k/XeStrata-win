@@ -2797,7 +2797,9 @@ __device__ __forceinline__ bool grid_sync(unsigned* bar, unsigned long long tick
             while (vb[32] == gen) {
                 if (vb[48] != 0u) { ab = 1; break; }
                 if (clock64() - t0 > (long long) ticks) { atomicExch(&bar[48], 1u); ab = 1; break; }
-                __nanosleep(64);
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700
+                __nanosleep(64);   // (sm_60 has no nanosleep: the barrier spins)
+#endif
             }
         }
         if (vb[48] != 0u) ab = 1;
