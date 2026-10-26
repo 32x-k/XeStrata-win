@@ -70,17 +70,6 @@ std::vector<uint8_t> crop_rgba8(const QiRef& f, int64_t tw, int64_t th) {
     return out;
 }
 
-// the reference images as a key for the cached rows: their sizes and a hash of their pixels
-std::string refs_key(const std::vector<QiRef>& refs) {
-    std::string key;
-    for (const QiRef& f : refs) {
-        uint64_t h = 1469598103934665603ull;
-        for (uint8_t b : f.rgba) h = (h ^ b) * 1099511628211ull;
-        key += std::to_string(f.width) + "x" + std::to_string(f.height) + ":" + std::to_string(h) + ";";
-    }
-    return key;
-}
-
 }  // namespace
 
 bool HunyuanImage3Pipeline::open(const std::string& dit, const std::string& vae, std::string& err,

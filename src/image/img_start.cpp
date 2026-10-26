@@ -21,6 +21,16 @@ const QiRef* base_image(const QiRequest& r) {
     return nullptr;
 }
 
+std::string refs_key(const std::vector<QiRef>& refs) {
+    std::string key;
+    for (const QiRef& f : refs) {
+        uint64_t h = 1469598103934665603ull;
+        for (uint8_t b : f.rgba) h = (h ^ b) * 1099511628211ull;
+        key += std::to_string(f.width) + "x" + std::to_string(f.height) + ":" + std::to_string(h) + ";";
+    }
+    return key;
+}
+
 int64_t strength_skip(int64_t steps, double strength) {
     if (!(strength > 0.0 && strength <= 1.0))
         throw std::invalid_argument("image engine: the strength must be above 0 and at most 1");

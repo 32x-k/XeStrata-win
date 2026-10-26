@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <vector>
 
 namespace strata::image {
@@ -31,6 +32,10 @@ int64_t strength_skip(int64_t steps, double strength);
 
 /// The schedule `sigmas` (n steps and the terminal 0) as the strength runs it: the sigmas from the first step it runs.
 std::vector<float> strength_sigmas(const std::vector<float>& sigmas, double strength);
+
+/// The reference images as a key for the states made from them (a pipeline's cache): their sizes and a hash of their
+/// pixels; empty for none.
+std::string refs_key(const std::vector<QiRef>& refs);
 
 /// RGBA8 [H][W][4] of `f` at W x H, nearest (the base image and the mask as the pipelines take them).
 std::vector<uint8_t> resize_nearest(const QiRef& f, int64_t W, int64_t H);
