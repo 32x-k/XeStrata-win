@@ -3110,18 +3110,22 @@ struct Model::Impl {
     bool gemm(Dev& d, Chunk& c, const x3::Mat& m, const uint16_t* x16, int ldx, int rows, float* y, int ldy, float beta,
               std::string& err) {
         if (rows <= 0) return true;
+#if defined(STRATA_USE_HIP)   // (wmma_gemm.cu is part of the AMD builds only: a CUDA build has no such kernel and keeps cuBLAS)
         static const bool pf = [] {
             const char* v = std::getenv("STRATA_DENSE_PFGEMM");
             return v == nullptr || v[0] != '0';
         }();
+#endif
         const int cols = std::max(128, (int) std::min<size_t>((size_t) m.n, c.w16_elems / (size_t) m.k) / 128 * 128);
         for (int c0 = 0; c0 < m.n; c0 += cols) {
             const int nc = std::min(cols, m.n - c0);
             if (m.fmt != 0) gg::rows(nc == m.n ? m : gg::view(m, c0, nc), c.w16, false, d.st);   // (a GGUF's)
             else x3::reconstruct_rows(nc == m.n ? m : x3::view(m, c0, nc), c.w16, false, d.st);
+#if defined(STRATA_USE_HIP)
             if (pf && rows >= 64 && ((uintptr_t) x16 & 15u) == 0 &&
                 strata_pf_gemm_f16_ld(x16, ldx, c.w16, m.k, y + c0, rows, nc, m.k, ldy, beta, d.st))
                 continue;
+#endif
             const float one = 1.0f;
             const cublasStatus_t st = cublasGemmEx(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, nc, rows, m.k, &one, c.w16, CUDA_R_16F,
                                                    m.k, x16, CUDA_R_16F, ldx, &beta, y + c0, CUDA_R_32F, ldy,
