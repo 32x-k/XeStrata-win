@@ -11565,6 +11565,7 @@ int main(int argc, char** argv) {
             };
             policy.set_scale_all(req_minp_rule);
             while (!pl_ran && !cancelled && produced_n < max_new) {
+                policy.set_context(p);         // STRATA_SPEC_COST: the round costs of this context length
                 int T = use_mtp ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
                 if (use_mtp && !req_minp_rule) T = policy.mtp_window(dprob.data(), S_mtp);
                 else if (use_mtp && req_spec_min_p > 0.0) {
@@ -12748,6 +12749,7 @@ int main(int argc, char** argv) {
         while ((int64_t) produced.size() < max_new) {
             const Clock::time_point t0 = Clock::now();
             strata::core::progress_at("spec loop: choosing the window", (int64_t) produced.size());
+            policy.set_context(p);   // STRATA_SPEC_COST: the round costs of this context length
             int T = S_mtp;
             if (use_mtp && !minp_rule) T = policy.mtp_window(dprob.data(), S_mtp);
             else if (use_mtp && o.spec_min_p > 0.0) {

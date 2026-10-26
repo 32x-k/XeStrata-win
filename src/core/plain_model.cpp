@@ -2212,6 +2212,7 @@ bool PlainModel::spec_step(const std::vector<int32_t>& stop, int64_t limit, int3
     // the window rule (--spec-window) over the drafts' probabilities
     float probs[strata::spec::DraftPolicy::kMaxT + 1] = {};
     for (int j = 0; j < nd && j < (int) dprob_.size() && j < strata::spec::DraftPolicy::kMaxT; ++j) probs[j] = dprob_[(size_t) j];
+    policy_.set_context(cur_pos_);   // STRATA_SPEC_COST: the round costs of this context length
     if (opt_.spec_window == "auto") nd = std::min(nd, policy_.mtp_window(probs, n_snap_ + 1) - 1);
     else if (opt_.spec_window == "min-p") {
         int keep = 0;
