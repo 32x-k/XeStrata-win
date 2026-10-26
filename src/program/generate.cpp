@@ -253,6 +253,10 @@ bool admit_merge_first_env() {
 // checkpoints it drops (evicted, pruned, a batch slot's old one) and saves the next checkpoint into them, so a save
 // resizes nothing (no zero-fill of ~118 MB of fresh vectors) and a slot's copy reuses their pages.  Every byte is
 // overwritten by the copy, so the checkpoints are the same
+bool park_async_env() {   // STRATA_PARK_ASYNC (strata/core/conversation_snapshot.hpp)
+    static const bool on = [] { const char* v = std::getenv("STRATA_PARK_ASYNC"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
 bool ckpt_pool_env() {
     static const bool on = [] {
         const char* v = std::getenv("STRATA_CKPT_POOL");
@@ -9673,6 +9677,10 @@ int main(int argc, char** argv) {
         };
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
+        // STRATA_PARK_ASYNC: set by the request around its park - the live checkpoints it drops right after (they move
+        // into the parked image instead of being copied); a background allocation then refills STRATA_CKPT_POOL
+        std::function<bool(const ConvCheckpoint&)> park_drops;
+        std::future<void> pool_refill;
         auto park_source = [&](const ParkSource& src, size_t held) -> bool {
             // #2049: parking copies the outgoing conversation's running checkpoints and K/V into host memory, which
             // is a silent stretch of the "request" stage; when the OS has paged that memory out it takes minutes.
@@ -9813,8 +9821,39 @@ int main(int argc, char** argv) {
                                  (long long) o.conversation_cache_min_free_mib);
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
-                if (!strata::core::conversation_snapshot_save(image, view, src.session, g, draft0, err,
-                        std::move(reuse), &reused_bytes)) return false;
+                // STRATA_CKPT_POOL: the running state and the checkpoint copies go into dropped checkpoints' vectors
+                // (the ones this request drops refill the pool right after); what is left goes back
+                std::vector<ConvCheckpoint> storage;
+                if (ckpt_pool.on() && n_st == 0)
+                    for (size_t k = 0; k <= view.checkpoints.size(); ++k) {
+                        ConvCheckpoint c = ckpt_pool.take();
+                        if (c.gdn.empty()) break;
+                        storage.push_back(std::move(c));
+                    }
+                std::vector<ConvCheckpoint> moved;   // STRATA_PARK_ASYNC: the ones this request drops (view: the rest)
+                if (park_drops && n_st == 0 && src.with_reuse) {   // (the main session's checkpoints only, not an idle slot's)
+                    size_t w = 0;
+                    for (size_t i = 0; i < checks.size(); ++i) {
+                        if (park_drops(static_cast<const ConvCheckpoint&>(checks[i]))) { moved.push_back(std::move(checks[i])); continue; }
+                        if (w != i) checks[w] = std::move(checks[i]);
+                        ++w;
+                    }
+                    checks.erase(checks.begin() + (std::ptrdiff_t) w, checks.end());
+                }
+                const size_t moved_gdn = moved.empty() ? 0 : moved.front().gdn.size();
+                const bool saved = strata::core::conversation_snapshot_save(image, view, src.session, g, draft0, err,
+                        std::move(reuse), &reused_bytes, storage.empty() ? nullptr : &storage,
+                        moved.empty() ? nullptr : &moved);
+                for (ConvCheckpoint& c : storage) ckpt_pool.give(std::move(c));
+                if (!saved) return false;
+                // the next checkpoint save would fault in fresh pages for what moved out: one is allocated now
+                if (moved_gdn > 0 && ckpt_pool.on() &&
+                    (!pool_refill.valid() || pool_refill.wait_for(std::chrono::seconds(0)) == std::future_status::ready))
+                    pool_refill = std::async(std::launch::async, [&ckpt_pool, moved_gdn] {
+                        ConvCheckpoint c;
+                        c.gdn.resize(moved_gdn);
+                        ckpt_pool.give(std::move(c));
+                    });
                 for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
                     auto& st = stages[k];
                     const strata::core::OnDevice on(st->dev);
@@ -12449,6 +12488,7 @@ int main(int argc, char** argv) {
                 // the background copy of the last turn checkpoint (STRATA_CKPT_ASYNC) lands before anything below copies, frees
                 // or writes the checkpoints (a join inside the session file writer would match only the copy of a checkpoint)
                 strata::core::conversation_checkpoint_join(nullptr);
+                strata::core::conversation_park_join();   // (STRATA_PARK_ASYNC: the last park's K/V)
                 if (path.empty()) { refuse("missing path"); continue; }
                 if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
                 if (o.peer_device >= 1) { refuse("session files do not support --peer-device"); continue; }
@@ -13122,6 +13162,19 @@ int main(int argc, char** argv) {
                                          : 0;
             const bool park_worth = o.conversation_cache_park_gain <= 0 || park_held == 0 ||
                                     (int64_t) live.size() >= (int64_t) park_held + o.conversation_cache_park_gain;
+            // STRATA_PARK_ASYNC: the checkpoints this request drops after its park - all of them when another state
+            // comes in (a parked conversation, a borrow, a batch slot) or the cvec changes, else the ones off this
+            // prompt's path (off_path below) - move into the parked image
+            struct ParkDrops {
+                std::function<bool(const ConvCheckpoint&)>& f;
+                ~ParkDrops() { f = nullptr; }
+            } park_drops_reset{park_drops};
+            if (park_async_env()) {
+                const bool drops_all = incoming.has_value() || borrow || slot_source >= 0 || want_cvec != cvec_cached;
+                park_drops = [&, drops_all](const ConvCheckpoint& c) {
+                    return drops_all || (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
+                };
+            }
             if (borrow && !pin_sibling && park_worth) {
                 conversations.guard(parked.serial);   // parking the outgoing conversation must not evict the donor
                 const bool parked_ok = park_current(0);
