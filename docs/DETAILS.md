@@ -544,6 +544,8 @@ tables per token). The scaling is fixed for the whole run, because the KV cache 
   `--host 0.0.0.0 --api-key some-long-secret`, or add `"host": "0.0.0.0"` and `"api_key": "..."` to the config. A key is
   recommended, not required: without one the server starts and warns that anyone who can reach the port can use the model
   and its tools. `--no-api-key` (or `"api_key": "none"`) says it is on purpose. The server window prints this PC's addresses.
+  For IPv6 use `--host ::` (or `"host": "::"`, all IPv6 interfaces) and put the address in brackets in URLs, for example
+  `http://[2001:db8::7]:8080/v1`.
   On Windows allow the port in the firewall for private networks:
   `New-NetFirewallRule -DisplayName "Strata 8080" -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow -Profile Private`
   (admin PowerShell).
