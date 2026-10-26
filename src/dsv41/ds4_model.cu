@@ -30,6 +30,7 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/dsv41/moe_win.hpp"
 #include "strata/dsv41/sampler.hpp"
+#include "wmma_gemm.h"   // strata_pf_gemm_f16_ld: the RDNA3 WMMA dense GEMM (gemm() prefers it over hipBLAS on gfx11; -Isrc/prefill)
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -2962,10 +2963,16 @@ struct Model::Impl {
         double exp_b = 0, other_b = 0, room = 0;
         const double share = gpu_expert_share(&exp_b, &room, &other_b);
         const bool fit = exp_b > 0 && share >= 1.0 / 1.3;   // (R9700 x4: 0.86 -> ring 16: decode -1.8% after a prompt, 64: -4.4%, 400: -4.6%)
+        // A box whose experts do not fit (a unified-memory APU) streams them from the disk, and the ring is what lets the
+        // prompt queue its likely ones early: 400 -> 1200 MB on Strix Halo took the queue 3,200 -> 8,087 experts, the disk
+        // 1.49 -> 2.44 GB/s and the compute's exposed read wait 11.4 -> 3.5 s (4K prompt 27.3 -> 21.3 s, 148.98 -> 190.98
+        // tok/s) with decode unchanged (17.54/16.39 against 17.61 tok/s interleaved).  A sixteenth of the VRAM room, so a
+        // small pool still loads.  DS4_RING_MB overrides.
+        const size_t want = (size_t) std::max<double>(400.0, std::min<double>(1200.0, room / 1e9 * 64.0));
         if (o.verbose)
             std::fprintf(stderr, "ds4: staging ring: experts %.1f GB, VRAM room %.1f GB, dense %.1f GB -> %d MB\n", exp_b / 1e9,
-                         room / 1e9, other_b / 1e9, fit ? 16 : 400);
-        return fit ? 16 : 400;
+                         room / 1e9, other_b / 1e9, fit ? 16 : (int) want);
+        return fit ? 16 : want;
     }
     bool slab_auto_grew_ = false, slab_force_base_ = false;   // the automatic attention slab: grew this try / must not grow (it did not fit)
     bool alloc_chunks(std::string& err) {
@@ -2984,7 +2991,22 @@ struct Model::Impl {
             split128(g.ff, nm, 0, ff0_, FF);   // (the widest member's share: member 0 takes the odd blocks)
             const size_t C = (size_t) chunk;
             c.C = chunk;
-            c.A = std::max(64, (int) (((size_t) 8 << 20) / (size_t) HQ) / 64 * 64);
+            // the base slab: STRATA_DS4_A_MB megabytes of q.  Every dense GEMM of a layer is issued once a slab, so the slab width divides
+            // the prompt's dense weight traffic.  A unified-memory GPU (Strix Halo, main 3133160ed) takes 32 MB: measured 8 -> 32 MB took
+            // its 32K prompt 325.89 -> 357.78 tok/s, 16K 315.01 -> 328.04, 8K +1.6%, 4K flat, decode unmoved.  A discrete card keeps 8 MB
+            // (the 0.2.6 slab): its VRAM is the expert tier's, and on the RTX 5070 a bigger slab bought +2% prompt for -3% decode.
+            // STRATA_DS4_A_MB overrides the base on any GPU (8 restores the old slab).
+            bool unified = false;
+            {
+                cudaDeviceProp ip{};
+                unified = cudaGetDeviceProperties(&ip, d.id) == cudaSuccess && ip.integrated != 0;
+            }
+            static const size_t a_mb_env = [] {
+                const char* v = std::getenv("STRATA_DS4_A_MB");
+                return (size_t) (v != nullptr ? std::max(1, std::atoi(v)) : 0);
+            }();
+            const size_t a_mb = a_mb_env != 0 ? a_mb_env : (unified ? 32 : 8);
+            c.A = std::max(64, (int) ((a_mb << 20) / (size_t) HQ) / 64 * 64);
             // DS4_ATTN_SLAB=N: the attention slab's rows.  The dense projections (q_b, wo_a/b) are dequantized and GEMM'd
             // once a slab, so a slab of 256 rows dequantizes the same weights 32 times for an 8K prompt (measured: the
             // dense dequant 916 ms of the 8K prompt, rocBLAS 867 ms); a larger slab costs VRAM for c.q/c.o and the oa
@@ -2993,7 +3015,7 @@ struct Model::Impl {
             {
                 int env = -1;
                 if (const char* v = std::getenv("DS4_ATTN_SLAB")) env = std::max(0, std::atoi(v));
-                if (slab_force_base_ && env < 0) env = 0;
+                if ((slab_force_base_ || unified || a_mb_env != 0) && env < 0) env = 0;   // (no automatic growth on a unified-memory GPU, or when STRATA_DS4_A_MB chose the base)
                 // per row: c.q + c.o (float), c.o16 (half), c.oa (float), c.oa16 (half)
                 const double bpr = (double) HQ * 10.0 + (double) OG * (double) g.o_lora * 6.0;
                 double spare = 1e18;   // the expert tier off (--vram-experts 0): the buffers cost no expert
@@ -3079,15 +3101,31 @@ struct Model::Impl {
         return true;
     }
 
-    // y[r][c] = x16[r] . W[:, c] (+ beta y) for r < rows: W reconstructed to FP16 in whole 128-column blocks, cuBLAS
+    // y[r][c] = x16[r] . W[:, c] (+ beta y) for r < rows: W reconstructed to FP16 in whole 128-column blocks, then the product.
+    // The product prefers the engine's own RDNA3 WMMA kernel (src/prefill/wmma_gemm.cu) over hipBLAS: on gfx1151 hipBLAS
+    // measures 4.97 TFLOPS at this call convention while that kernel measures 20-40 (BM 128 x BN 256, grouped tile order), and
+    // the chunked prompt's dense GEMM is 11.1 s of a 4K prompt at the library's rate.  Same operands and the same values (the
+    // k order differs, so it is rounding-level: the quality gate and the acceptance gate cover it); STRATA_DENSE_PFGEMM=0 keeps
+    // hipBLAS for an A/B.
     bool gemm(Dev& d, Chunk& c, const x3::Mat& m, const uint16_t* x16, int ldx, int rows, float* y, int ldy, float beta,
               std::string& err) {
         if (rows <= 0) return true;
+#if defined(STRATA_USE_HIP)   // (wmma_gemm.cu is part of the AMD builds only: a CUDA build has no such kernel and keeps cuBLAS)
+        static const bool pf = [] {
+            const char* v = std::getenv("STRATA_DENSE_PFGEMM");
+            return v == nullptr || v[0] != '0';
+        }();
+#endif
         const int cols = std::max(128, (int) std::min<size_t>((size_t) m.n, c.w16_elems / (size_t) m.k) / 128 * 128);
         for (int c0 = 0; c0 < m.n; c0 += cols) {
             const int nc = std::min(cols, m.n - c0);
             if (m.fmt != 0) gg::rows(nc == m.n ? m : gg::view(m, c0, nc), c.w16, false, d.st);   // (a GGUF's)
             else x3::reconstruct_rows(nc == m.n ? m : x3::view(m, c0, nc), c.w16, false, d.st);
+#if defined(STRATA_USE_HIP)
+            if (pf && rows >= 64 && ((uintptr_t) x16 & 15u) == 0 &&
+                strata_pf_gemm_f16_ld(x16, ldx, c.w16, m.k, y + c0, rows, nc, m.k, ldy, beta, d.st))
+                continue;
+#endif
             const float one = 1.0f;
             const cublasStatus_t st = cublasGemmEx(c.blas, CUBLAS_OP_T, CUBLAS_OP_N, nc, rows, m.k, &one, c.w16, CUDA_R_16F,
                                                    m.k, x16, CUDA_R_16F, ldx, &beta, y + c0, CUDA_R_32F, ldy,
@@ -6383,7 +6421,10 @@ struct Model::Impl {
             if (sw_inflight == 0) break;   // (nothing queued: every layer's best CPU-lane expert is not hotter than its coldest VRAM one)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
-        if (store && env_f("DS4_SETTLE_STORE", 1.0f) != 0.0f) {   // the RAM store too: a window prompt fills it through the CPU
+        // The RAM store's preload after a chunked prompt is off by default: measured on Strix Halo (code fixture, prompt +
+        // 256 tokens, 3 runs a side) it costs the prompt 4.7 s and the decode that follows gains nothing (13.9/14.4 s with it
+        // against 14.2 s without).  The swaps above are what the decode actually uses; DS4_SETTLE_STORE=1 restores it.
+        if (store && env_f("DS4_SETTLE_STORE", 0.0f) != 0.0f) {   // the RAM store too: a window prompt fills it through the CPU
             // lane's picks, a chunked one streams past it - the hottest CPU-lane experts of the prompt into its free slots
             // (copy_mode: an expert already in the CPU lane's RAM copy gains nothing from a second copy of the same bytes -
             // measured on the R9700 12 GB cell: 4152 such experts, 40 GB read at 6.4 GB/s, 6.2 s of an 8K prompt, 0.0 store
