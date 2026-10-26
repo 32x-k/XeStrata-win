@@ -27,6 +27,10 @@ These need no engine change; they are settings. Each was measured on the same bo
   vocabulary instead of 425 KB, so it reads less per guess: **+2.7..3.1% story and +2.2..3.0% code** decode on both
   big boxes. The big model checks every guess, so the answers are unchanged (identical tokens in every run where
   the machine is deterministic). A CJK or Cyrillic user should keep the wider subset.
+- **`--slots 2`** - when the engine serves more than one conversation at a time (an agent with several sessions), decoding two
+  requests together returns **+10% aggregate throughput on the RTX PRO 5000 and +12% on the RTX 3060**, for a slightly higher
+  latency per token. Three and four slots add nothing measurable (+8.4% and +11.7%): the gain is all in the second slot, and
+  more slots cost KV memory. A single conversation gains nothing from it.
 - **`--prefill-pipe <R>`** - on a two-card layer split, plan the prompt's chunks for the pipeline: **+15.4% at 4K,
   +22.5% at 8K, +2.7% at 16K** prompt on 2x RTX A4000 (5 interleaved pairs). `R` is the PC's own ratio; `setup --calibrate` measures it
   (1,500 on that box).
