@@ -2720,14 +2720,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const int64_t kva_suffix = kva.effective_suffix();
     bool kva_routine = false;
     const char* kva_why_not = kva.decline(kva_eng, pos0, n, LB, LE < 0 ? -1 : LE, (int64_t) g.n_layers,
-                                          embd_rows != nullptr, !tap_layers_.empty(), &kva_routine);
+                                          embd_rows != nullptr, !tap_layers_.empty(), &kva_routine,
+                                          g.n_layers != 48 || g.n_expert != 512);
     if (kva_why_not == nullptr && (g.n_layers != 48 || g.n_expert != 512)) {
-        // the split layer and the tail were measured on one geometry; STRATA_KVA=1 is the user's call, but say so once
+        // STRATA_KVA_ANY_MODEL=1 (research): allowed on a shape KVA was not measured on, with a warning once
         static std::atomic<bool> warned{false};
         if (!warned.exchange(true))
-            std::fprintf(stderr, "strata prefill: WARNING: KVA was only validated on Qwen3.8-Flash-Next (48 layers, 512 "
-                                 "experts); this model has %lld layers and %lld experts\n", (long long) g.n_layers,
-                         (long long) g.n_expert);
+            std::fprintf(stderr, "strata prefill: WARNING: STRATA_KVA_ANY_MODEL=1: KVA was only measured on Qwen3.8-Flash-Next "
+                                 "(48 layers, 512 experts); this model has %lld layers and %lld experts\n",
+                         (long long) g.n_layers, (long long) g.n_expert);
     }
     const bool kva_run = kva_why_not == nullptr;
     const int64_t kva_split = std::min<int64_t>(std::max<int64_t>(kva.split, 1), g.n_layers);
@@ -5321,10 +5322,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // KVA-8 (observability): a run that was configured for KVA but fell back completely must say so and why,
         // or an operator cannot tell it apart from a run where the feature was never asked for.  (KVA only runs
         // when STRATA_KVA=1 asked for it, so every reason is worth a line.)
-        std::fprintf(stderr, "strata prefill: KVA configured but NOT applied: %s (prompt %lld positions, "
-                             "min_prompt %lld, suffix %lld, split %lld)\n",
-                     kva_why_not != nullptr ? kva_why_not : "not applicable", (long long) n, (long long) kva.min_prompt,
-                     (long long) kva_suffix, (long long) kva_split);
+        if (kva_why_not == kKvaShapeReason)
+            std::fprintf(stderr, "strata prefill: KVA configured but NOT applied: this model's shape (%lld layers, %lld experts) "
+                                 "is not one KVA was measured on (STRATA_KVA_ANY_MODEL=1 allows it)\n",
+                         (long long) g.n_layers, (long long) g.n_expert);
+        else
+            std::fprintf(stderr, "strata prefill: KVA configured but NOT applied: %s (prompt %lld positions, "
+                                 "min_prompt %lld, suffix %lld, split %lld)\n",
+                         kva_why_not != nullptr ? kva_why_not : "not applicable", (long long) n, (long long) kva.min_prompt,
+                         (long long) kva_suffix, (long long) kva_split);
     }
     if (std::getenv("STRATA_STATE_HASH_GDN") != nullptr) {   // debug: the GDN states as the prompt path leaves them
         cudaStreamSynchronize(m.cs);

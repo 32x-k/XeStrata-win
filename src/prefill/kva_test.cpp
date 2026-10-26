@@ -31,7 +31,7 @@ static void put(const char* k, const char* v) {
 static void clear_all() {
     for (const char* k : {"STRATA_KVA", "STRATA_KVA_SPLIT", "STRATA_KVA_SUFFIX", "STRATA_KVA_MIN_PROMPT", "STRATA_KVA_PARITY",
                           "STRATA_KVA_CAPTURE", "STRATA_KVA_CAPTURE_FP32", "STRATA_KVA_ORACLE", "STRATA_KVA_ORACLE_FP32",
-                          "STRATA_KVA_PROJECTOR", "STRATA_KVA_MODE", "STRATA_KVA_ONLY", "STRATA_KVA_DRAFT_FLOOR", "STRATA_KVA_SKIP"})
+                          "STRATA_KVA_PROJECTOR", "STRATA_KVA_MODE", "STRATA_KVA_ONLY", "STRATA_KVA_DRAFT_FLOOR", "STRATA_KVA_SKIP", "STRATA_KVA_ANY_MODEL"})
         unset(k);
 }
 static bool is(const char* got, const char* want) { return got != nullptr && std::strcmp(got, want) == 0; }
@@ -93,6 +93,15 @@ int main() {
         KvaEngine blocked = eng;
         blocked.blocked = "batch slots (--batch)";
         CHECK(is(c.decline(blocked, 0, 14600, 0, -1, 48, false, false, &routine), "batch slots (--batch)") && !routine);
+        // a model whose shape KVA was not measured on (not 48 layers / 512 experts) is turned away, not warned about;
+        // the routine reasons (a short prompt, a continuation) still come first
+        CHECK(is(c.decline(eng, 0, 14600, 0, -1, 40, false, false, &routine, true), kKvaShapeReason) && !routine);
+        CHECK(is(c.decline(eng, 0, 3000, 0, -1, 40, false, false, &routine, true), "the prompt is shorter than STRATA_KVA_MIN_PROMPT") && routine);
+        CHECK(c.decline(eng, 0, 14600, 0, -1, 48, false, false, &routine, false) == nullptr);   // the measured shape applies
+        put("STRATA_KVA_ANY_MODEL", "1");   // the research override allows it (prefill.cpp then warns once)
+        { const KvaConfig a = kva_config_from_env(); CHECK(a.any_model && a.decline(eng, 0, 14600, 0, -1, 40, false, false, nullptr, true) == nullptr); }
+        unset("STRATA_KVA_ANY_MODEL");
+        CHECK(!kva_config_from_env().any_model);
         // capture wins over the rest
         put("STRATA_KVA_CAPTURE", "/tmp/kva-cap");
         { const KvaConfig o = kva_config_from_env(); CHECK(o.capture && is(o.decline(eng, 0, 14600, 0, -1, 48), "capture mode")); }

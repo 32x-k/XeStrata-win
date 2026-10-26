@@ -48,6 +48,9 @@ inline constexpr bool kKvaBackend = false;
 inline constexpr bool kKvaBackend = true;
 #endif
 
+/// The reason decline() gives for a model whose shape KVA was not measured on (prefill.cpp prints it with the numbers).
+inline constexpr const char* kKvaShapeReason = "this model's shape is not one KVA was measured on";
+
 /// The fully computed tail of every approximated read.
 inline constexpr int64_t kKvaSuffixDefault = 8192;
 
@@ -75,6 +78,7 @@ struct KvaConfig {
     bool capture_fp32 = false;   ///< STRATA_KVA_CAPTURE_FP32=1: fp32 records (else bf16; fp32 is for parity runs)
     bool oracle_fp32 = false;    ///< STRATA_KVA_ORACLE_FP32=1: the oracle files are fp32 (else bf16)
     bool parity = false;         ///< STRATA_KVA_PARITY=1: report the state-only path against the full path
+    bool any_model = false;      ///< STRATA_KVA_ANY_MODEL=1 (research): also run on a shape KVA was not measured on, with a warning
     bool draft_floor = false;    ///< STRATA_KVA_DRAFT_FLOOR=1: the draft layer skips the cells of approximated chunks (research; default: it reads them)
     int64_t split = 24;          ///< STRATA_KVA_SPLIT: first approximated layer (zero-based)
     int64_t suffix_env = 0;      ///< STRATA_KVA_SUFFIX: fully computed tail positions (0 = not set: kKvaSuffixDefault)
@@ -100,7 +104,8 @@ struct KvaConfig {
     /// suffix to leave approximated positions behind it.  `routine` (optional) is set when the reason is an
     /// everyday one (a continuation, a short prompt) that is not worth a log line.
     const char* decline(const KvaEngine& e, int64_t pos0, int64_t n, int64_t lb, int64_t le, int64_t n_layers,
-                        bool pictures = false, bool taps = false, bool* routine = nullptr) const {
+                        bool pictures = false, bool taps = false, bool* routine = nullptr,
+                        bool unmeasured_shape = false) const {
         if (routine) *routine = false;
         if (!on) return "off (STRATA_KVA is not 1)";
         if (capture) return "capture mode";
@@ -120,6 +125,9 @@ struct KvaConfig {
             if (routine) *routine = true;
             return "the suffix leaves too few positions to approximate";
         }
+        // the split layer, the state-only layers and the tail were measured on one geometry (Qwen3.8-Flash-Next, 48
+        // layers, 512 experts); another model reads exactly unless the research override asks for it
+        if (unmeasured_shape && !any_model) return kKvaShapeReason;
         return nullptr;
     }
 };
@@ -149,6 +157,7 @@ inline KvaConfig kva_config_from_env() {
     k.min_prompt = kva_env_i64("STRATA_KVA_MIN_PROMPT", 4096);
     k.parity = kva_env_flag("STRATA_KVA_PARITY", false);
     k.draft_floor = kva_env_flag("STRATA_KVA_DRAFT_FLOOR", false);
+    k.any_model = kva_env_flag("STRATA_KVA_ANY_MODEL", false);
     if (const char* d = std::getenv("STRATA_KVA_CAPTURE"); d != nullptr && *d != '\0') {
         k.capture = true;
         k.capture_dir = d;

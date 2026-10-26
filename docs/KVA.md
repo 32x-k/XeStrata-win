@@ -37,7 +37,10 @@ than the figures above, which were measured with the 2048-token tail.
 
 KVA runs when all of these hold, and says so in the engine log:
 
-- Qwen3.8-Flash-Next on CUDA or HIP (not SYCL, not Metal; Qwen3.6 and the other models read exactly);
+- Qwen3.8-Flash-Next on CUDA or HIP (not SYCL, not Metal). The split layer and the tail were measured on one shape, 48
+  layers and 512 experts. Any other model (Qwen3.6-35B-A3B, other layer or expert counts) reads exactly even with
+  `STRATA_KVA=1` and logs `KVA configured but NOT applied: this model's shape (L layers, E experts) is not one KVA was
+  measured on`. `STRATA_KVA_ANY_MODEL=1` (research) lets it run there anyway, with one warning;
 - one GPU, no `--batch` slots, no `--peer-device`, no DFlash2 drafter;
 - the read is cold (it starts at position 0 of the session) and the text has no pictures;
 - the prompt (or the part of it read in one go, see below) has at least `STRATA_KVA_MIN_PROMPT` tokens (4096) and
@@ -98,6 +101,7 @@ there, with a line when it is set).
 | variable | default | what it does |
 |---|---:|---|
 | `STRATA_KVA` | off | `1` turns KVA on (with the 8192-token tail). Unset or `0`: the exact 0.2.6 prompt read and draft layer |
+| `STRATA_KVA_ANY_MODEL` | off | `1` (research): also run KVA on a model whose shape (layers, experts) it was not measured on, with a warning |
 | `STRATA_KVA_SPLIT` | 24 | first approximated layer (zero-based) |
 | `STRATA_KVA_SUFFIX` | 8192 | fully computed tail positions; see above. 2048 is the fastest setting and the one the extraction and agent defects were found with |
 | `STRATA_KVA_MIN_PROMPT` | 4096 | shorter prompts stay on the full path |
