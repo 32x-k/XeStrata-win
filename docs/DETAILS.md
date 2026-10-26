@@ -703,7 +703,7 @@ endpoints are refused with an error that says so.
 | `tools` | `function`, `namespace` and `custom` tools. Hosted tools (`web_search`, `file_search`, ...) are left out because the model cannot run them |
 | `tool_choice` | `"none"` hides the tools; anything else lets the model choose (it cannot be forced) |
 | `reasoning.effort` | `none`/`minimal`, `low`, `medium`, `high`/`xhigh`; without it the config's `reasoning_effort`, else the model's default |
-| `max_output_tokens` | The output cap, thinking included. Running out ends the response `incomplete` |
+| `max_output_tokens` | The output cap, thinking included. Running out ends the response `incomplete`. `0` and `-1` (or leaving it out) mean no cap, as for `max_tokens`; anything below `-1` is a 400 |
 | `text.format` | `json_schema` and `json_object` use the JSON formats above (checked, not constrained) |
 | `client_metadata["x-codex-turn-metadata"]` thread-title request | Opt-in `"codex_thread_titles": true`: answered without the engine as `{"title": "<the user's line, cut to 36 characters>"}` so the conversation keeps the prompt cache |
 
