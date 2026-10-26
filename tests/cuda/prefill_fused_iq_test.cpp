@@ -83,7 +83,10 @@ struct Geo {
 // STRATA_PF_F16=1: the covered formats run on F16 weights (moe_f16_kq.cu, native_f16_kernel), not the int8 kernels
 bool f16_on() {
     const char* v = std::getenv("STRATA_PF_F16");
-    return v != nullptr && v[0] == '1';
+    // STRATA_PF_FUSED_F16=1 / STRATA_PF_FUSED_WS=1 (the int8 kernels' f16 mma form, #3779): F16 products too, so the same limits
+    const char* f = std::getenv("STRATA_PF_FUSED_F16");
+    const char* w = std::getenv("STRATA_PF_FUSED_WS");
+    return (v != nullptr && v[0] == '1') || (f != nullptr && f[0] == '1') || (w != nullptr && w[0] == '1');
 }
 
 // that the weights' typical size is that of a 2-3 bit expert (a few hundredths)
@@ -668,6 +671,18 @@ int main(int argc, char** argv) {
             int major = 0;
             cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, 0);
             if (strata::cc_major_of(major) < 8) { std::printf("STRATA_PF_FUSED unset: nothing is set up below sm_80 (skipped)\n"); return 77; }
+        }
+        // the opt-in kernel sets (STRATA_PF_FUSED_NT=256, _F16=1, _WS=1): a card that cannot set them up (shared memory,
+        // occupancy) falls back to the 512-thread kernels, and a run of those would pass for the wrong kernels - skip it
+        {
+            const char* nt = std::getenv("STRATA_PF_FUSED_NT");
+            const char* f16 = std::getenv("STRATA_PF_FUSED_F16");
+            const char* ws = std::getenv("STRATA_PF_FUSED_WS");
+            const bool asked = (nt && std::atoi(nt) == 256) || (f16 && f16[0] == '1') || (ws && ws[0] == '1');
+            if (asked && !fused::native_wide()) {
+                std::printf("STRATA_PF_FUSED_NT / _F16 / _WS: those kernels are not set up on this device (skipped)\n");
+                return 77;
+            }
         }
         if (!mmq::built()) { std::printf("no MMQ in this build\n"); return 1; }
         const std::vector<Pair> pairs = {
