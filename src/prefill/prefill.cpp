@@ -5779,6 +5779,16 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
 
 // A layer split: every stage gets the same super-chunk (the smallest any of them fits), re-sized until they agree.
 int64_t Prefill::lm_prepare_chain(int64_t n, std::string& why) {
+    // a later stage's hand_in_ still points at the last chunk a chunk-major prompt handed it (run_impl never clears it):
+    // with no hand-off in flight that is stale, not in use (a short prompt first would otherwise turn layer-major off
+    // for every later prompt)
+    for (Prefill* p = this; p->next_ != nullptr; p = p->next_)
+        if (p->next_run_.valid()) { why = "a layer split's chunk hand-off is in flight"; return 0; }
+    for (Prefill* p = next_; p != nullptr; p = p->next_) {
+        p->hand_in_ = nullptr;
+        p->hand_ev_ = nullptr;
+        p->hand_pieces_ = 0;
+    }
     int64_t cap = 0;
     for (int round = 0; round < 4; ++round) {
         bool same = true;
