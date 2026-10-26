@@ -78,6 +78,8 @@ Tested on an RTX 3060 (Linux), an RTX 5070 (Windows), four R9700 cards (Linux) a
 and Strix Halo on Linux do not run it yet; on Strix Halo Windows the graphics memory is the RAM, so most of the experts are
 read from the SSD and an NVMe drive matters.
 
+RTX 40 cards are covered by the engine packages since 0.2.7 (sm_89 code); we have not run one ourselves, see [DEEPSEEK41.md](DEEPSEEK41.md#the-engine-package) for a user's measurement.
+
 **What you need:** a graphics card with 12 GB or more, 46 GB of RAM at least (64 GB is the tested comfortable size),
 an NVMe SSD, and the disk space above. Setup warns when disk or RAM is short and does not stop you.
 
