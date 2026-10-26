@@ -306,6 +306,16 @@ void launch_wmma(sycl::queue& q, const float* qv, const uint16_t* kp, const uint
     });
 }
 
+// The work-group of WmmaKernel<HD, G, BQ> fits the device: its waves within the work-group size, its K, V and
+// probabilities within the local memory
+template <int HD, int G, int BQ>
+bool wmma_fits(const sycl::device& d) {
+    using KT = WmmaKernel<HD, G, BQ>;
+    const size_t bytes = (size_t) (KT::BK * KT::KS + HD * KT::VS + KT::W * 16 * KT::PS) * sizeof(uint16_t);
+    return (size_t) KT::W * 32 <= d.get_info<sycl::info::device::max_work_group_size>() &&
+           bytes <= d.get_info<sycl::info::device::local_mem_size>();
+}
+
 template <int HD, int G, int BQ, int BK>
 void launch(sycl::queue& q, const float* qv, const uint16_t* kp, const uint16_t* vp, const int32_t* table, int64_t pos0,
             int64_t T, const QsaShapes& s, float* attn) {
@@ -340,8 +350,16 @@ bool prompt_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool,
         if (s.head_dim == 128 && g == 10) launch_wmma<128, 10, 8>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
         else if (s.head_dim == 256 && g == 8) launch_wmma<256, 8, 8>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
         else if (s.head_dim == 256 && g == 12) launch_wmma<256, 12, 4>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
-        // Qwen3.5-9B's 4 query heads a KV head: 16 queries, the 64 rows (4 waves) of 8 queries of 8
-        else if (s.head_dim == 256 && g == 4) launch_wmma<256, 4, 16>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
+        // Qwen3.5-9B's 4 query heads a KV head: the most queries a work-group the device takes, every wave's 16 rows
+        // reading the step's K and V from local memory, so that fewer work-groups read them from the pool.  The RX
+        // 9060 XT takes 64 (16 waves, 57 KiB): its 32K prompt's attention 5.1 s against 11.3 s at 16 (2026-10-27)
+        else if (s.head_dim == 256 && g == 4) {
+            const sycl::device d = queue.get_device();
+            if (wmma_fits<256, 4, 64>(d)) launch_wmma<256, 4, 64>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
+            else if (wmma_fits<256, 4, 32>(d))
+                launch_wmma<256, 4, 32>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
+            else launch_wmma<256, 4, 16>(queue, q, k_pool, v_pool, page_table, pos0, T, s, attn);
+        }
         else mma = false;
     }
     // local memory: BQ x G rows of FP32 Q and BK cells of K and V, 37 to 42 KiB: within the 48 KiB every GPU gives
