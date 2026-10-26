@@ -2908,11 +2908,18 @@ struct Model::Impl {
     size_t ring_mb_auto() const {
         double exp_b = 0, other_b = 0, room = 0;
         const double share = gpu_expert_share(&exp_b, &room, &other_b);
-        const bool fit = exp_b > 0 && share >= 1.0 / 1.3;   // (R9700 x4: 0.86 -> ring 16: decode -1.8% after a prompt, 64: -4.4%, 400: -4.6%)
+        // The prompt path streams the experts the cards cannot hold.  When every expert fits, the ring is worth
+        // nothing (16 MB): the VRAM is better as slots for the decode after the prompt (measured: decode -1.8 to -4.6%
+        // at 64-400 MB, unchanged at 16).  When they do not fit, the stream IS the prompt's expert stage, and its depth
+        // is what decides how long the tiles wait: on the 4x R9700 8K prompt a 16 MB ring left 1.7 s of DMA waits in a
+        // 5.2 s expert stage, and 1.2-3 GB of ring measured 632 -> 678-684 ppts (+7%) for about -2% decode (off a
+        // fifth more CPU-lane experts).  So: a share of the room, bounded, rather than the fixed 400 MB of 0.2.6.
+        const size_t deep = (size_t) std::min(2000.0, std::max(400.0, room / 1e9 * 0.05 * 1000.0));   // (MB)
+        const size_t mb = share >= 0.98 ? 16 : deep;
         if (o.verbose)
             std::fprintf(stderr, "ds4: staging ring: experts %.1f GB, VRAM room %.1f GB, dense %.1f GB -> %d MB\n", exp_b / 1e9,
-                         room / 1e9, other_b / 1e9, fit ? 16 : 400);
-        return fit ? 16 : 400;
+                         room / 1e9, other_b / 1e9, (int) mb);
+        return mb;
     }
     bool alloc_chunks(std::string& err) {
         chunks.resize(devs.size());
@@ -3629,6 +3636,9 @@ struct Model::Impl {
                 sa.n_embd = D;
                 sa.n_ff = FF;
                 sa.limit = g.lim;
+                // gate / up read the layer's F16 copy of the activations (the same rounding the tiles make for their
+                // shared tile): with 18-36 column blocks an expert the F32 rows were read that many times
+                sa.x16 = c.x16;
                 EkMark ek{};
                 const bool ekp = prof_chunk;
                 if (ekp) {
