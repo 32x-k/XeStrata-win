@@ -5,6 +5,8 @@
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/core/tc_sm75.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/core/defaults_026.hpp"
+#include "strata/core/sm120_series.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -294,7 +296,9 @@ bool dequant_wide_on() {
         int major = 0, minor = 0;
         if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess ||
             cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, dev) != cudaSuccess) { (void) cudaGetLastError(); return false; }
-        per_dev[dev] = (major == 6 && minor == 1) || (major == 8 && (minor == 6 || minor == 0)) ? 2 : 1;
+        // sm_80 is the 0.2.7 addition (#3779): STRATA_DEFAULTS=026 gives it the per-group kernels again, as 0.2.6 had
+        per_dev[dev] = (major == 6 && minor == 1) || (major == 8 && minor == 6) ||
+                       (major == 8 && minor == 0 && strata::sm80_default_on(nullptr, strata::qwen_defaults_026())) ? 2 : 1;
     }
     return per_dev[dev] == 2;
 }

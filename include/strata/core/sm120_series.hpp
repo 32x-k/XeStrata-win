@@ -72,6 +72,14 @@ inline bool prompt_attn_imma_default(bool hip, int cc, bool v026 = false) { retu
 /// measured on an Ada card by us), off under STRATA_DEFAULTS=026 and in HIP builds.  `cc` = 10 * major + minor as the engine resolves it.
 inline bool mmvq_il_89_default(bool hip, int cc, bool v026 = false) { return !v026 && !hip && cc == 89; }
 
+/// The two sm_80-only defaults of 0.2.7 (#3779: the wide dense dequant and the MMVQ-IL sm_80 tables, both bitwise the old output, measured on a
+/// CMP 170HX only) given the text of their variable (nullptr = unset): "1" on and "0" off win, unset is on unless STRATA_DEFAULTS=026.
+inline bool sm80_default_on(const char* env, bool v026 = false) {
+    if (env != nullptr && env[0] == '1') return true;
+    if (env != nullptr && env[0] == '0') return false;
+    return !v026;
+}
+
 /// The answer for STRATA_MMVQ_IL_89 given the variable's text (nullptr = unset): "1" on and "0" off win over everything, anything else (unset,
 /// empty, other text) is the rule above.
 inline bool mmvq_il_89_resolve(const char* env, bool hip, int cc, bool v026 = false) {

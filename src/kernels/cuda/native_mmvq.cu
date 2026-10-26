@@ -3810,7 +3810,7 @@ int il_cc() {
         if (cc[dev] == 120 && cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev) == cudaSuccess && sms >= 80)
             cc[dev] = 1201;
         // STRATA_MMVQ_IL_SM80=0: an sm_80 card takes the shared table as before kIlRows_80 (A/B)
-        if (cc[dev] == 80) { const char* v = std::getenv("STRATA_MMVQ_IL_SM80"); if (v != nullptr && v[0] == '0') cc[dev] = 81; }
+        if (cc[dev] == 80 && !strata::sm80_default_on(std::getenv("STRATA_MMVQ_IL_SM80"), strata::qwen_defaults_026())) cc[dev] = 81;   // =0 or STRATA_DEFAULTS=026
         cudaGetLastError();
     }
     return cc[dev];

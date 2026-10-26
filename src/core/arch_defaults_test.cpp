@@ -257,6 +257,10 @@ int main() {
         CHECK(mmvq_il_89_resolve("1", false, 89, true));                   // an explicit =1 wins over the master switch
         CHECK(mmvq_il_89_resolve("1", false, 86, false));                  // (the tables are only looked up for cc 89 anyway)
         CHECK(mmvq_il_89_resolve("", false, 89, false) && !mmvq_il_89_resolve("", false, 89, true));   // empty text: the rule
+        // #3779: the two sm_80-only defaults (wide dequant, MMVQ-IL sm_80 tables): on unless STRATA_DEFAULTS=026; "1" and "0" win
+        CHECK(sm80_default_on(nullptr, false) && !sm80_default_on(nullptr, true));
+        CHECK(!sm80_default_on("0", false) && sm80_default_on("1", true));
+        CHECK(sm80_default_on("", false) && !sm80_default_on("", true));
         // GR_V3 and IMMA
         CHECK(gr_v3_default(false, 12, 0, false, 72.0 * GiB, false));
         CHECK(!gr_v3_default(false, 12, 0, false, 72.0 * GiB, true));
