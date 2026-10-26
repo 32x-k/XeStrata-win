@@ -4,6 +4,7 @@
 #include "strata/core/sm120_series.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/verify.hpp"
+#include "strata/core/window_evict.hpp"
 #include "strata/core/pin_budget.hpp"
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
 #include "strata/core/host_graph_launch.hpp"
@@ -2575,7 +2576,7 @@ bool Verifier::capture(int T, std::string& err) {
 #endif
     }
 #endif
-    const bool made = instantiate_evicting(exec_t, graph, {}, "verify: instantiate: ", err);
+    const bool made = instantiate_evicting(exec_t, graph, {}, "verify: instantiate: ", err, T);
     cudaGraphDestroy(graph);
     if (!made) return false;
     const cudaError_t ue = cudaGraphUpload(exec_t, cs_);
@@ -3695,8 +3696,27 @@ bool Verifier::evict_batch_graph(const std::vector<int>& keep, bool& evicted, st
     return true;
 }
 
+bool Verifier::evict_window_graph(int keep_t, bool& evicted, std::string& err) {
+    evicted = false;
+    if (no_window_eviction_ || keep_t < 1) return true;
+    bool have[9] = {};
+    for (int t = 1; t <= max_t_ && t < 9; ++t) have[t] = (ar_off_ ? exec_nr_[t] : exec_[t]) != nullptr;
+    const int victim = strata::core::pick_window_victim(have, std::min(max_t_, 8), keep_t, prelaunched_);
+    if (victim == 0) return true;
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+        err = "verify: synchronizing before window graph eviction failed";
+        return false;
+    }
+    cudaGraphExec_t& e = ar_off_ ? exec_nr_[victim] : exec_[victim];
+    cudaGraphExecDestroy(e);
+    e = nullptr;
+    (ar_off_ ? launched_nr_ : launched_)[victim] = false;   // the next graph of that size is a cold first launch again
+    evicted = true;
+    return true;
+}
+
 bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, const std::vector<int>& key,
-                                   const char* what, std::string& err) {
+                                   const char* what, std::string& err, int keep_t) {
     // #997: every layout of active slots keeps its own graph pair (20-30 MiB each on an L40S), and with an expert cache
     // sized to the reserve the next window graph - a batch layout or a one-request window captured on first use - can
     // find no VRAM left: free the least recently used layouts until it fits (they are captured again when needed)
@@ -3713,6 +3733,20 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
     if (freed > 0)
         std::fprintf(stderr, "strata verify: no VRAM for a new window graph: freed the graphs of %d older batch slot "
                              "layouts, %zu kept (a larger --vram-reserve-mib keeps more)\n", freed, exec_bm_.size());
+    // #3702: a single-request window with nothing of a batch left to free: free the graphs of other window sizes
+    int freed_sizes = 0;
+    for (bool evicted = true; ie == cudaErrorMemoryAllocation && evicted && keep_t > 0;) {
+        (void) cudaGetLastError();
+        if (!evict_window_graph(keep_t, evicted, err)) return false;
+        if (evicted) {
+            ++freed_sizes;
+            ie = cudaGraphInstantiate(&ex, graph, 0);
+        }
+    }
+    if (freed_sizes > 0)
+        std::fprintf(stderr, "strata verify: no VRAM for the %d-token window graph: freed the graphs of %d other window "
+                             "sizes (they are captured again when used; a larger --vram-reserve-mib or "
+                             "--vram-reserve-later-mib keeps them)\n", keep_t, freed_sizes);
     if (ie != cudaSuccess) {
         err = std::string(what) + cudaGetErrorString(ie);
         return false;
@@ -4204,6 +4238,11 @@ bool Verifier::capture_all(std::string& err) {
     if (g_ == nullptr) { err = "verify: capture_all before init"; return false; }
     if (remote_opt_ != nullptr) { err = "verify: pipelined windows do not serve --remote-expert-opt"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
+    struct NoEvict {   // every size is wanted at once here: a capture must not free another size's graph
+        bool& f;
+        explicit NoEvict(bool& flag) : f(flag) { f = true; }
+        ~NoEvict() { f = false; }
+    } no_evict(no_window_eviction_);
     for (int T = 1; T <= max_t_; ++T)
         if (!capture(T, err)) return false;
     if (!capture_commit(err)) return false;

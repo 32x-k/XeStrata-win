@@ -421,9 +421,15 @@ private:
     bool capture_batch(const int* rows, int S, int hbase, std::string& err);
     /// Free the graph pair of the least recently used batch layout other than `keep` (`evicted`: there was one).
     bool evict_batch_graph(const std::vector<int>& keep, bool& evicted, std::string& err);
-    /// cudaGraphInstantiate; out of VRAM, batch layouts other than `key` are evicted (LRU) until it fits.
+    /// cudaGraphInstantiate; out of VRAM, batch layouts other than `key` are evicted (LRU) until it fits, and then (a
+    /// single-request window, `keep_t` > 0) the graphs of the other window sizes, largest first (#3702): a window size
+    /// whose graph does not fit used to end the engine ("verify: instantiate: out of memory"); a freed size is captured
+    /// again when it is next used.
     bool instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, const std::vector<int>& key, const char* what,
-                              std::string& err);
+                              std::string& err, int keep_t = -1);
+    /// Free the graph of the largest window size other than `keep_t` (and the prelaunched one); `evicted`: there was one.
+    bool evict_window_graph(int keep_t, bool& evicted, std::string& err);
+    bool no_window_eviction_ = false;   ///< capture_all wants every size at once: it must not free one to capture another
     void collect_profile();   ///< STRATA_VERIFY_PROFILE: add the last window's stamps to prof_sum_
     void accumulate_profile(const unsigned long long* stamps);
     void accumulate_profile_inner(const unsigned long long* stamps);   ///< one window's stamps (host copy) into prof_sum_
