@@ -7,6 +7,7 @@
 #include "ds4_q6k.cuh"
 #include "ds4_attn_split.cuh"
 #include "ds4_wmma.cuh"
+#include "ds4_experts_rule.hpp"
 
 #include <cuda_fp16.h>
 
@@ -2056,11 +2057,10 @@ bool fast_attn_enabled() {
         const char* e = std::getenv("DS4_FAST_ATTN");
         return e == nullptr ? -1 : (std::atoi(e) != 0 ? 1 : 0);
     }();
-    if (env >= 0) return env == 1;
 #if defined(STRATA_USE_HIP)
-    return device_is_gfx12();
+    return strata::ds4::fast_attn_default(env, device_is_gfx12(), strata::ds4::defaults_026());
 #else
-    return false;
+    return strata::ds4::fast_attn_default(env, false, strata::ds4::defaults_026());
 #endif
 }
 attnsplit::AttnSplitScratch split_scratch(cudaStream_t s, int heads) {

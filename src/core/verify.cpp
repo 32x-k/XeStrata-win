@@ -2,6 +2,7 @@
 #include "strata/core/batch_rows.hpp"
 #include "strata/core/sm75_series.hpp"
 #include "strata/core/sm120_series.hpp"
+#include "strata/core/defaults_026.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/pin_budget.hpp"
@@ -225,7 +226,7 @@ inline float g_route_prior() {
         cudaDeviceProp p;
         const bool ok = cudaGetDeviceProperties(&p, dev) == cudaSuccess;
         if (!ok) cudaGetLastError();
-        per_dev[dev] = 1.0f + (ok ? strata::route_prior_default(false, p.integrated != 0, (double) p.totalGlobalMem) : 0.0f);
+        per_dev[dev] = 1.0f + (ok ? strata::route_prior_default(false, p.integrated != 0, (double) p.totalGlobalMem, strata::qwen_defaults_026()) : 0.0f);
     }
     return per_dev[dev] - 1.0f;
 #endif

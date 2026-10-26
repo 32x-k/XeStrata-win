@@ -44,25 +44,31 @@ inline bool sm120_default(int major, int minor) { return is_sm120(major, minor) 
 
 // ---- 0.2.7 defaults of the CUDA speed work (pure rules; the engine reads the device and calls these; tests in arch_defaults_test)
 // `hip`: a HIP build, where a gfx1200 / gfx1201 reports compute capability 12.0 as well and none of these is measured or wanted.
+// `v026`: STRATA_DEFAULTS=026 (defaults_026.hpp qwen_defaults_026()): every one of these is then off, as in v0.2.6.  An explicit variable
+// (STRATA_ROUTE_PRIOR=2, STRATA_GR_V3=1, ...) is decided by the caller before it asks the rule, so it still wins.
 // `total_bytes`: the card's memory (cudaDeviceProp::totalGlobalMem); `integrated`: a GPU that shares the PC's memory.
 constexpr double kSmallCardGiB = 13.0;   // "a 12 GB card": 12 GB cards report 11.6 - 12.0 GiB, 16 GB ones 15.6 - 16.0
 
 /// STRATA_ROUTE_PRIOR when the user set nothing: 2.0 (residency-biased routing, changes which experts run; owner-approved for 12 GB cards) on a
 /// discrete CUDA card of 13 GiB or less, 0 everywhere else.  Measured on an RTX 3060 12 GB only.
-inline float route_prior_default(bool hip, bool integrated, double total_bytes) {
-    return !hip && !integrated && total_bytes > 0.0 && total_bytes / 1073741824.0 <= kSmallCardGiB ? 2.0f : 0.0f;
+inline float route_prior_default(bool hip, bool integrated, double total_bytes, bool v026 = false) {
+    return !v026 && !hip && !integrated && total_bytes > 0.0 && total_bytes / 1073741824.0 <= kSmallCardGiB ? 2.0f : 0.0f;
 }
 
 /// STRATA_GR_V3 (the stream-split hyper-connection read, another summation order) when the user set nothing: ON for a discrete compute capability
 /// 12.0 card (STRATA_SM120_PERF=0 turns the set off) with more than 13 GiB, CUDA builds only.  Measured: RTX PRO 5000 72 GB +1.2% decode clean,
 /// -3.0% / -5.9% on 2x RTX A4000 (sm_86), +1.0% / -3.4% on an RTX 3060 (sm_86): so not those; a 12 GB sm_120 card is unmeasured.
-inline bool gr_v3_default(bool hip, int major, int minor, bool integrated, double total_bytes) {
-    return !hip && !integrated && sm120_default(major, minor) && total_bytes / 1073741824.0 > kSmallCardGiB;
+inline bool gr_v3_default(bool hip, int major, int minor, bool integrated, double total_bytes, bool v026 = false) {
+    return !v026 && !hip && !integrated && sm120_default(major, minor) && total_bytes / 1073741824.0 > kSmallCardGiB;
 }
 
 /// STRATA_PROMPT_ATTN_IMMA (the prompt attention on int8 tensor cores, another summation order) when the user set nothing: ON for every CUDA card of
 /// compute capability 8.0 or newer (the int8 m16n8k32 MMA), not Turing / Volta / Pascal, not HIP.  `cc` = 10 * major + minor as the engine
 /// resolves it (an emulated or forced Turing counts as 75).  Measured on sm_120 (RTX PRO 5000) and sm_86 (2x RTX A4000): +1.1 .. +1.8% prompt.
-inline bool prompt_attn_imma_default(bool hip, int cc) { return !hip && cc >= 80; }
+inline bool prompt_attn_imma_default(bool hip, int cc, bool v026 = false) { return !v026 && !hip && cc >= 80; }
+
+/// STRATA_GR_UP_WIDE (the hyper-connection up projection, one warp a row; bitwise the old kernel) when the user set nothing: ON for a compute
+/// capability 12.0 card (STRATA_SM120_PERF=0 turns the set off), CUDA builds only.
+inline bool gr_up_wide_default(bool hip, int major, int minor, bool v026 = false) { return !v026 && !hip && sm120_default(major, minor); }
 
 }  // namespace strata

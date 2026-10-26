@@ -1,6 +1,7 @@
 // src/kernels/cuda/qsa_prompt_attn.cu - see include/strata/kernels/qsa_prompt_attn.hpp.
 #include "strata/core/emulate.hpp"
 #include "strata/core/sm120_series.hpp"
+#include "strata/core/defaults_026.hpp"
 #include "strata/core/sm75_series.hpp"
 #include "strata/core/geometry.hpp"
 #include "strata/core/gfx12_platform_defaults.hpp"
@@ -2428,7 +2429,7 @@ bool qsa_prompt_attn_batch(const float* q, const QsaAttnPools& pools, const int3
             const char* v = std::getenv("STRATA_PROMPT_ATTN_IMMA");
             g_pa_imma = v == nullptr ? 2 : (v[0] == '1' ? 1 : 0);   // 2: the default (on where the kernel can run)
         }
-        if (!turing && (g_pa_imma == 1 || (g_pa_imma == 2 && strata::prompt_attn_imma_default(false, 80)))) return launch_i8v3(q, pools, ids, steps, cap, s, attn, n_q, st);
+        if (!turing && (g_pa_imma == 1 || (g_pa_imma == 2 && strata::prompt_attn_imma_default(false, 80, strata::qwen_defaults_026())))) return launch_i8v3(q, pools, ids, steps, cap, s, attn, n_q, st);
         return launch_i8(q, pools, ids, steps, cap, s, attn, n_q, st);
     }
     if (!pools.k_pool || !pools.v_pool) return false;
