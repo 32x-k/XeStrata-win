@@ -2243,15 +2243,25 @@ bool native_q8_0_packed_eligible(int n_in, int n_out) {
 }
 
 namespace {
-std::unordered_map<const void*, void*>& q8_sm60_owned() {   // packed copies made here (the head), freed by release
+// packed copies made here (the head), freed by release; null: packed in place (release only unregisters it)
+std::unordered_map<const void*, void*>& q8_sm60_owned() {
     static std::unordered_map<const void*, void*> owned;
     return owned;
 }
+bool q8_sm60_pack_impl(const void* weights, int n_in, int n_out, const char* what, bool quiet);
 } // namespace
 
 bool native_q8_0_sm60_pack(const void* weights, int n_in, int n_out, const char* what) {
+    return q8_sm60_pack_impl(weights, n_in, n_out, what, false);
+}
+bool native_q8_0_sm60_pack_quiet(const void* weights, int n_in, int n_out, const char* what) {
+    return q8_sm60_pack_impl(weights, n_in, n_out, what, true);
+}
+
+namespace {
+bool q8_sm60_pack_impl(const void* weights, int n_in, int n_out, const char* what, bool quiet) {
 #if defined(__HIPCC__)
-    (void) weights; (void) n_in; (void) n_out; (void) what;
+    (void) weights; (void) n_in; (void) n_out; (void) what; (void) quiet;
     return false;
 #else
     if (!q8_sm60_on() || !weights || !native_q8_0_packed_eligible(n_in, n_out)) return false;
@@ -2276,18 +2286,20 @@ bool native_q8_0_sm60_pack(const void* weights, int n_in, int n_out, const char*
     }
     q8_packed_registry()[weights] = Q8Packed{qs, d, n_in, n_out};
     q8_sm60_owned()[weights] = packed;
-    std::fprintf(stderr, "strata q8 sm60: packed %s (%d x %d, %.0f MiB more VRAM)\n", what, n_out, n_in,
-                 double(bytes) / 1048576.0);
+    if (!quiet)
+        std::fprintf(stderr, "strata q8 sm60: packed %s (%d x %d, %.0f MiB more VRAM)\n", what, n_out, n_in,
+                     double(bytes) / 1048576.0);
     return true;
 #endif
 }
+} // namespace
 
 void native_q8_0_sm60_release(const void* weights) {
     auto& owned = q8_sm60_owned();
     const auto it = owned.find(weights);
     if (it == owned.end()) return;
     q8_packed_registry().erase(weights);
-    cudaFree(it->second);
+    if (it->second) cudaFree(it->second);
     owned.erase(it);
 }
 
@@ -2312,6 +2324,40 @@ void native_q8_0_packed_register(const void* gguf_weights, const void* packed, i
 }
 
 void native_q8_0_packed_unregister(const void* gguf_weights) { q8_packed_registry().erase(gguf_weights); }
+
+bool native_q8_0_sm60_pack_in_place(void* weights, int n_in, int n_out, const char* what) {
+#if defined(__HIPCC__)
+    (void) weights; (void) n_in; (void) n_out; (void) what;
+    return false;
+#else
+    if (!q8_sm60_on() || !weights || !native_q8_0_packed_eligible(n_in, n_out)) return false;
+    if (q8_packed_registry().count(weights)) return true;
+    // The GGUF blocks are gone afterwards, so only where q8_packed_mmvq can never fall back to the GGUF-layout kernels
+    // (every column count fits the kernel's shared-memory planes) and its 16-byte weight loads stay aligned
+    if (q8sm60::smem_bytes(MAX_NCOLS, n_in) > q8sm60::MAX_SMEM || reinterpret_cast<std::uintptr_t>(weights) % 16 != 0)
+        return native_q8_0_sm60_pack(weights, n_in, n_out, what);
+    const std::size_t bytes = std::size_t(n_in / 32) * std::size_t(n_out) * 34;   // both layouts: 34 bytes per 32
+    std::vector<uint8_t> blocks(bytes), planes(bytes);
+    if (cudaMemcpy(blocks.data(), weights, bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        cudaGetLastError();
+        std::fprintf(stderr, "strata q8 sm60: reading the %s failed; it keeps the GGUF layout\n", what);
+        return false;
+    }
+    native_q8_0_pack_host(blocks.data(), planes.data(), n_in, n_out);
+    if (cudaMemcpy(weights, planes.data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaGetLastError();
+        // a partial write leaves neither layout: put the blocks back
+        const bool restored = cudaMemcpy(weights, blocks.data(), bytes, cudaMemcpyHostToDevice) == cudaSuccess;
+        cudaGetLastError();
+        std::fprintf(stderr, "strata q8 sm60: writing the packed %s failed; %s\n", what,
+                     restored ? "it keeps the GGUF layout" : "its GGUF blocks could not be restored either");
+        return false;
+    }
+    native_q8_0_packed_register(weights, weights, n_in, n_out);
+    q8_sm60_owned()[weights] = nullptr;
+    return true;   // the caller says what it packed
+#endif
+}
 
 bool native_q6_k_packed_enabled() {
     static const bool enabled = [] {
@@ -2991,10 +3037,9 @@ constexpr IlRows kIlRowsShared[] = {   // sm_86 + sm_120, and the fallback for e
     {14, {{0, 0, 1, 1, 0}, {0, 0, 1, 1, 2}, {0, 0, 1, 1, 1}}},   // Q6_K
 };
 // Per-architecture tables (P10).  A card whose compute capability (major * 10 + minor) is listed here uses its own table;
-// every other sm_80+ card uses kIlRowsShared.  sm_89 (Ada) has none yet: nobody measured it (we have no such card), so
-// it takes the shared table, which sits between the measured sm_86 and sm_120.  To add one, run
+// every other sm_80+ card uses kIlRowsShared.  sm_89 (Ada) has an opt-in table (kIlRows_89, below; STRATA_MMVQ_IL_89=1).  To add one, run
 // `mmvq_il_parity --bench --emit-table` on the card (docs/MMVQ_IL_TABLE.md), paste the printed block as a
-// `constexpr IlRows kIlRows_89[]` and add {89, kIlRows_89, sizeof(kIlRows_89) / sizeof(IlRows)} below.  Each choice
+// `constexpr IlRows kIlRows_<cc>[]` and add {<cc>, kIlRows_<cc>, sizeof(kIlRows_<cc>) / sizeof(IlRows)} below.  Each choice
 // is bitwise the same output, so a table is only speed.  Without a rebuild: STRATA_MMVQ_IL_ROWS (see il_env_rows).
 // Volta (sm_70): read off mmvq_il_parity --bench on a V100-SXM2-32GB (two runs, mean), the same rule - per cell the
 // rows count whose every measured shape takes at least 3% off native_mmvq's time (e.g. the Q5_K head at 3 columns
@@ -3045,6 +3090,19 @@ constexpr IlRows kIlRows_120[] = {
     {14, {{0, 0, 2, 1, 1}, {0, 0, 4, 2, 4}, {0, 2, 2, 2, 2}}},   // Q6_K
     {11, {{0, 1, 2, 2, 2}, {0, 2, 4, 2, 2}, {0, 2, 2, 2, 2}}},   // Q3_K
 };
+// Ada (sm_89): the cells where two cards agree.  mmvq_il_parity --bench --emit-table was run on an RTX 4070 (46 SMs,
+// #3453) and on an RTX 4080 (48 SMs, same issue); a cell is kept only where both runs give the same rows count, else 0
+// (the plain kernel), so a card that disagrees never gets a split it did not measure.  The 5-8 column table of that
+// issue is not taken: the 4080 reproduced the 2-4 column table byte for byte in four runs, and the 5-8 column table
+// changed in 10-14 of 20 entries between runs.  Bitwise equal to native_mmvq, so the table is only speed.
+// mmvq_il_parity's check_tables rebuilds the table from the two source runs and compares.
+constexpr IlRows kIlRows_89[] = {
+    {23, {{0, 0, 0, 0, 0}, {0, 0, 1, 1, 1}, {0, 0, 1, 1, 1}}},   // IQ4_XS
+    {12, {{0, 0, 1, 1, 1}, {0, 0, 1, 1, 1}, {0, 0, 1, 1, 1}}},   // Q4_K
+    {13, {{0, 0, 1, 1, 0}, {0, 0, 1, 1, 0}, {0, 0, 1, 0, 0}}},   // Q5_K
+    {14, {{0, 0, 0, 0, 0}, {0, 0, 1, 0, 0}, {0, 0, 0, 1, 1}}},   // Q6_K
+    {11, {{0, 0, 1, 0, 1}, {0, 1, 1, 1, 1}, {0, 1, 1, 1, 1}}},   // Q3_K
+};
 // Turing (sm_75): read off mmvq_il_parity --bench --emit-table on an RTX 2080 Ti 22 GB (SM 1650 MHz), the same 3% rule.
 // The plain multi-column kernels are bound by dp4a throughput on Turing from 2 columns on (IQ4_XS 2560x10240 at 4
 // columns 81.1 -> 37.4 us, the Q5_K head 1671 -> 1045 us); bitwise equal to native_mmvq.  No one-column table here:
@@ -3078,6 +3136,10 @@ struct Il1Rows { int type; uint8_t r[5]; };
 constexpr Il1Rows kIl1Rows_86[] = {
     {11, {0, 1, 1, 1, 1}},   // Q3_K: 2560x10240 60 -> 43 us, 6144x2560 30 -> 26 us on the A4000
 };
+// Ada (sm_89): the RTX 4070 and the RTX 4080 runs gave the same one-column row (only Q3_K takes the interleaved kernel)
+constexpr Il1Rows kIl1Rows_89[] = {
+    {11, {0, 0, 1, 1, 1}},   // Q3_K
+};
 // Tesla P40 (sm_61), the same three runs: IQ4_XS 2560x10240 102 -> 58 us, the Q5_K head 1754 -> 1507 us
 constexpr Il1Rows kIl1Rows_61[] = {
     {23, {2, 2, 4, 4, 4}},   // IQ4_XS
@@ -3088,6 +3150,7 @@ struct Il1Arch { int cc; const Il1Rows* t; size_t n; };
 constexpr Il1Arch kIl1Arch[] = {
     {61, kIl1Rows_61, sizeof(kIl1Rows_61) / sizeof(Il1Rows)},
     {86, kIl1Rows_86, sizeof(kIl1Rows_86) / sizeof(Il1Rows)},
+    {89, kIl1Rows_89, sizeof(kIl1Rows_89) / sizeof(Il1Rows)},   // Ada: the RTX 4070 and 4080 agree
 };
 bool il_env_on(const char* name) {
     const char* v = std::getenv(name);
@@ -3095,6 +3158,10 @@ bool il_env_on(const char* name) {
 }
 bool il_t1_on() { static const bool on = il_env_on("STRATA_MMVQ_IL_T1"); return on; }
 bool il_q3k_on() { static const bool on = il_env_on("STRATA_MMVQ_IL_Q3K"); return on; }
+// #3453: sm_89's own tables (kIlRows_89 / kIl1Rows_89) are opt-in with STRATA_MMVQ_IL_89=1 until an sm_89 card has run
+// mmvq_il_parity and an end-to-end A/B (docs/MMVQ_IL_TABLE.md).  Unset, an Ada card answers what it answered before: the
+// shared table, no one-column row.  Cached once; the lookup runs on the host once a launch.
+bool il_89_opt_in() { static const bool on = [] { const char* v = std::getenv("STRATA_MMVQ_IL_89"); return v != nullptr && v[0] == '1'; }(); return on; }
 struct IlArch { int cc; const IlRows* t; size_t n; };
 constexpr IlArch kIlArch[] = {
     {60, kIlRows_60, sizeof(kIlRows_60) / sizeof(IlRows)},   // Pascal GP100: measured on a Tesla P100
@@ -3102,6 +3169,7 @@ constexpr IlArch kIlArch[] = {
     {75, kIlRows_75, sizeof(kIlRows_75) / sizeof(IlRows)},   // Turing: measured on an RTX 2080 Ti
     {70, kIlRows_70, sizeof(kIlRows_70) / sizeof(IlRows)},   // Volta: PR 1401, measured on a V100-SXM2
     {86, kIlRows_86, sizeof(kIlRows_86) / sizeof(IlRows)},   // 143-dense: RTX A4000 with the real shapes (Q3_K added)
+    {89, kIlRows_89, sizeof(kIlRows_89) / sizeof(IlRows)},   // Ada: the cells where an RTX 4070 and an RTX 4080 agree
     // 147-verify: RTX PRO 5000 Blackwell (110 SMs).  Only 12.0 cards with 80+ SMs (il_cc's 1201) take it: the shared table
     // was measured on an RTX 5070 (48 SMs) and stays that card's
     {1201, kIlRows_120, sizeof(kIlRows_120) / sizeof(IlRows)},
@@ -3158,7 +3226,7 @@ int native_mmvq_il_rows_for(int cc, int type, int ncols, int n_out) {
     if (ncols == 1) {   // 143-dense: one column (the plain q8_1 blocks, no interleaved copy); STRATA_MMVQ_IL_T1=0 turns it off
         if (!il_t1_on()) return 0;
         for (const Il1Arch& a : kIl1Arch)
-            if (a.cc == cc)
+            if (a.cc == cc && (cc != 89 || il_89_opt_in()))
                 for (size_t i = 0; i < a.n; ++i)
                     if (a.t[i].type == type) return a.t[i].r[cls];
         return 0;
@@ -3168,7 +3236,7 @@ int native_mmvq_il_rows_for(int cc, int type, int ncols, int n_out) {
     size_t n = sizeof(kIlRowsShared) / sizeof(IlRows);
     static const bool own120 = il_env_on("STRATA_MMVQ_IL_120");   // 147-verify: =0 gives a big 12.0 card the shared table again
     for (const IlArch& a : kIlArch)
-        if (a.cc == cc && a.t != nullptr && (cc != 1201 || own120)) { t = a.t; n = a.n; }
+        if (a.cc == cc && a.t != nullptr && (cc != 1201 || own120) && (cc != 89 || il_89_opt_in())) { t = a.t; n = a.n; }
     for (size_t i = 0; i < n; ++i)
         if (t[i].type == type) return t[i].r[ncols - 2][cls];
     return 0;

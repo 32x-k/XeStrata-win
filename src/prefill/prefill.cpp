@@ -39,13 +39,16 @@
 #include "strata/core/native_head.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
+#include "strata/kernels/qsa_pattn.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_fused.hpp"
+#include "strata/prefill/moe_ws.hpp"
 #include "strata/prefill/moe_fused_iq.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/core/peer_experts.hpp"
+#include "strata/core/expert_nibble.hpp"
 #include "strata/prefill/kernels.hpp"
 #include "strata/prefill/kva.hpp"   // STRATA_KVA: the optional approximate-prefill plan (research, off by default)
 
@@ -87,6 +90,8 @@ bool gather_native_group(const GatherGroup&, size_t, size_t, size_t, size_t, voi
                          void*, size_t) { return false; }
 void gather_strata_q2(const uint8_t*, void*, void*, void*) {}
 void swiglu(const float*, float*, int64_t, int64_t, bool, void*) {}
+bool swiglu_quant_ok(int) { return false; }
+void swiglu_quant(const float*, void*, int64_t, bool, void*) {}
 void swiglu_scaled(const float*, float*, int64_t, int64_t, const int32_t*, int, const float*, int64_t, void*) {}
 void down_row_scales(float*, const int32_t*, int, const float*, int64_t, void*) {}
 void iota(int32_t*, int64_t, void*) {}
@@ -116,6 +121,17 @@ void quantize_act_native(const float*, int64_t, int64_t, void*, void*) {}
 void experts_native(const Batch&, const NativeGeom&, int, int64_t, const void*, const void*, const int32_t*, void*,
                     float*, void*) {}
 }  // namespace strata::prefill::fused
+#endif
+#ifndef STRATA_PREFILL_WS
+// the weight-stationary experts (moe_ws.hpp) are in the CUDA STRATA_EXPERIMENTAL_SM60 build only
+namespace strata::prefill::ws {
+int mode() { return 0; }
+bool supported(int, int) { return false; }
+bool faster(int, double) { return false; }
+size_t chunks(const int32_t*, size_t, const int32_t*, const int32_t*, Chunk*) { return 0; }
+bool gate_up(const Layer&, void*) { return false; }
+void down(const Layer&, void*) {}
+}  // namespace strata::prefill::ws
 #endif
 
 #if defined(STRATA_GPU_METAL)
@@ -923,6 +939,13 @@ struct Prefill::Impl {
     float *Xscale = nullptr, *Hscale = nullptr, *grp_tail = nullptr;   // NVFP4: activation scales, expert tails
     float* row_sd = nullptr;          // NVFP4 in MMQ: each Dm row's s_down, applied by the combine as it reads the row
     std::vector<int32_t> bounds_host;
+    // STRATA_MMQ_WS=1 (moe_ws.hpp): a layer whose experts are all resident - their byte offsets from the expert cache's
+    // base in MMQ order and the CTAs' chunks, built on the host per layer and uploaded with the bounds (the device
+    // buffers exist only where ws::mode() != 0; the host copies are the unmapped path's)
+    int64_t* xoff_dev = nullptr;
+    std::vector<int64_t> xoff_host;
+    ws::Chunk* ws_chunks = nullptr;
+    std::vector<ws::Chunk> ws_chunks_host;
     std::unique_ptr<mmq::Context> mmq_ctx;
     std::vector<int32_t> ids_host, slot_host, src_host, cnt, off;
     // set_cpu_pool: a small chunk's CPU experts. The layer's MoE input (T x N, from `mixed`), the rows the pool writes
@@ -1491,7 +1514,10 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     m.steps_up.init(T * strata::kernels::kStepCount);
     m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);
     {
-        const size_t need = 3 * T * K + (size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2));
+        // the routing tables, the MMQ group bounds; STRATA_MMQ_WS: the in-place offsets (n_expert int64) and the
+        // weight-stationary layers' chunks (4 int32 each, 16-byte aligned)
+        const size_t need = 3 * T * K + (size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)) +
+                            (ws::mode() != 0 ? 2 * (size_t) m.g->n_expert + 4 * ws::max_chunks((int64_t) T * K, m.g->n_expert) + 3 : 0);
         const char* gc = std::getenv("STRATA_GROUP_COPY");
         if (m.grp_n < need && !(gc && gc[0] == '1')) {
             if (m.grp_host) cudaFreeHost(m.grp_host);
@@ -1646,6 +1672,10 @@ bool Prefill::carve(size_t T, void* alloc) {
         m.bounds_dev = o.take<int32_t>((size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2)), ok);
         m.grp_gu = o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
         m.grp_d = o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
+        if (ws::mode() != 0) {   // STRATA_MMQ_WS: the offsets and chunks (bytes_needed_impl takes the same)
+            m.xoff_dev = o.take<int64_t>((size_t) m.g->n_expert, ok);
+            m.ws_chunks = (ws::Chunk*) o.take<int32_t>(4 * ws::max_chunks((int64_t) T * K, m.g->n_expert), ok);
+        }
         // (written at every run's start, not here: when serving, these are live expert-cache slots until a request
         // lends them - a write now would corrupt a resident expert)
         if (!m.mmq_ctx) m.mmq_ctx = std::make_unique<mmq::Context>();
@@ -2379,6 +2409,10 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
         o.take<int32_t>((size_t) (2 * (g.n_expert + g.n_expert / MMQ_GROUP + 2)), ok);
         o.take<uint8_t>(MMQ_GROUP * mp.gu_max + MMQ_TAIL, ok);
         o.take<uint8_t>(MMQ_GROUP * mp.d_max + MMQ_TAIL, ok);
+        if (ws::mode() != 0) {   // carve's STRATA_MMQ_WS offsets and chunks
+            o.take<int64_t>((size_t) g.n_expert, ok);
+            o.take<int32_t>(4 * ws::max_chunks((int64_t) T * K, g.n_expert), ok);
+        }
     }
     if (owned_pages) {
         if (stage_slots(T) > 0) o.take<uint8_t>((size_t) stage_slots(T) * (size_t) MAXBLOB(), ok);   // one allocation
@@ -2434,6 +2468,31 @@ void Prefill::arm_cpu_share(bool applies, bool by_default) {
 
 bool Prefill::ring_bytes_enabled() { return ring_bytes_on(); }
 size_t Prefill::slot_guard_bytes() { return mmq::direct_slot_guard(); }
+
+bool Prefill::nibble_prompt_check(std::string& why) {
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (mmq::direct_mode() != 0) {
+        why = "STRATA_MMQ_DIRECT (the prompt MMQ would read the 4-bit slots in place)";
+        return false;
+    }
+    for (int64_t l = 0; lay.native && l < (int64_t) lay.fmt.size(); ++l) {
+        if (!core::nibble::layer(l).on) continue;
+        const auto& f = lay.fmt[(size_t) l];
+        const char* w = !mmq_plan().any || (size_t) l >= mmq_plan().layer.size() || !mmq_plan().layer[(size_t) l]
+                            ? "no prompt MMQ for it (the FP16 path dequantizes GGUF blocks)"
+                        : mmq_plan().wmma_only[(size_t) l] ? "the WMMA tiles read GGUF blocks"
+                        : fused::native_supported(f.gu_type, f.d_type) ? "the fused prompt kernels read GGUF blocks"
+                        : mmq::matrix_bytes(f.gu_type, 1280, N) != (size_t) core::nibble::kRows * f.gu_row ||
+                                  mmq::matrix_bytes(f.d_type, N, 640) != f.bytes - f.down_off
+                            ? "MMQ's matrices are not the blob's [gate | up] and down"
+                            : nullptr;
+        if (w != nullptr) {
+            why = "layer " + std::to_string(l) + ": " + w;
+            return false;
+        }
+    }
+    return true;
+}
 
 namespace {
 
@@ -3799,8 +3858,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // decode kernel, 32 queries at a time (K8V4 runs the tensor kernel's mode 3: INT8 K,
                     // V dequantized from its q4_0 blocks to fp16 at gather)
                     static const bool old_attn = std::getenv("STRATA_PROMPT_ATTN_OLD") != nullptr;
+                    // STRATA_PATTN_SM60=1 (qsa_pattn.hpp, sm_6x, int8 K/V): the decode kernels' output bit for bit from a
+                    // score kernel and a value kernel that merges as it folds (no partials, no merge kernel), ~100
+                    // queries a batch in the same scratch; any refusal or launch failure runs the loop below
                     if (old_attn || !strata::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
                                                                             m.attn, T, m.cs))
+#if !defined(STRATA_GPU_METAL)   // qsa_pattn.cu is in the CUDA / HIP kernel library only
+                        if (!(strata::kernels::pattn_mode() != 0 &&
+                              strata::kernels::qsa_pattn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s, m.attn_scratch,
+                                                               (uint64_t) m.attn_batch *
+                                                                   strata::kernels::qsa_decode_attn_scratch_floats(m.cap, s),
+                                                               m.attn, T, m.cs)))
+#endif
                         for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {
                             const int64_t nb = std::min(m.attn_batch, T - t0);
                             strata::kernels::qsa_decode_attn_batch(m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,
@@ -3914,6 +3983,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     const bool had_gu = lay.native && lay.fmt[(size_t) l].had_gu;
                     const bool had_d = lay.native && lay.fmt[(size_t) l].had_d;
                     const bool use_mmq = mmq_plan().any && mmq_plan().layer[(size_t) l];
+                    // STRATA_EXPERT_NIBBLE=1: a layer whose gate/up experts are 4-bit codes in their slots is gathered
+                    // for MMQ as the GGUF blocks rebuilt from them (core::nibble::gather_gguf); every other expert path
+                    // reads GGUF blocks in the slot, so it stops there instead (never a wrong answer)
+#if STRATA_EXPERT_NIBBLE_BUILT   // every guard of this switch is compiled out of the other builds
+                    const core::nibble::LayerVram& nib_l = core::nibble::layer(l);
+#endif
                     const int had_block = lay.native ? lay.fmt[(size_t) l].had_block : 0;
                     const float* had_sx = had_gu ? m.had_sx[(size_t) l] : nullptr;   // resolved in init
                     const float* had_sh = had_d ? m.had_sh[(size_t) l] : nullptr;
@@ -3951,6 +4026,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     bool cpu_arm = true;                  // auto: this layer may share (false: the arm without)
                     int cpu_set = -1;                     // auto: the wall events' set, -1 when not measured
                     bool cpu_cold = false;                // auto: one-time costs in the window (no reading)
+#if STRATA_EXPERT_NIBBLE_BUILT
+                    if (fused_l && nib_l.on) core::nibble::fatal(l, "the prompt path's fused experts", "they read GGUF blocks");
+#endif
                     if (fused_l) {
                         if (static bool said = false; !said) {
                             said = true;
@@ -4356,6 +4434,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                         const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, 1280, N) : 0;
                         const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
+                        bool ws_layer = false;   // STRATA_MMQ_WS: this layer's products weight-stationary (below)
+                        ws::Layer wl;
                         pt.mark(kPfGather, cs);
                         // the routed experts' input: `mixed`, or (APR) its rotated copy, which the peer / the layer
                         // split's helper also take (one rotation for both cards; `mixed` itself feeds the shared expert)
@@ -4396,6 +4476,67 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (m.up_ring.h2d(m.bounds_dev, m.bounds_host.data(), m.bounds_host.size() * 4, m.cs) != cudaSuccess) {   // #1996
                                     err = "prefill: the group bounds' upload failed";
                                     return false;
+                                }
+                            }
+                            // STRATA_MMQ_WS=1 (moe_ws.hpp, GP100): a layer whose routed experts are ALL resident, on this
+                            // GPU alone (no peer, CPU or streamed share), runs gate/up and down as one weight-stationary
+                            // launch each, with ONE swiglu_quant over all its rows in between, instead of a gate/up,
+                            // swiglu and down MMQ launch per 16-expert group - the same GU, H and Dm bits.  The experts
+                            // are read where they lie in the expert cache (offsets from its base).  Only where both
+                            // products beat the per-group MMQ at this layer's rows per expert, H can be q8_1 in one pass
+                            // (no Hadamard, NVFP4 or FP4 rows; not STRATA_DBG_NAN, which reads H in floats), and not the
+                            // fused layout (its Hq holds stream_all_min() - 1 tokens' rows).
+                            static const bool ws_dbg = std::getenv("STRATA_DBG_NAN") != nullptr;
+                            const double ws_u = n > 0 ? (double) rows_local / (double) n : 0.0;
+                            if (ws::mode() != 0 && m.xoff_dev != nullptr && m.ws_chunks != nullptr && n > 0 && !ws_dbg &&
+                                lay.native && m.cache != nullptr && m.host_res != nullptr && !wmma_l &&
+                                !mmq_plan().direct[(size_t) l] && lay.fmt[(size_t) l].up_off == mmq_gub / 2 &&
+                                order_peer.empty() && rows_cpu == 0 && rows_local == T * K && !m.fused_bufs &&
+                                (!stream_all || seq_start[(size_t) l] == seq_start[(size_t) l + 1]) && !had_gu && !had_d &&
+                                !lay.fmt[(size_t) l].tail_off && !mmq::fp4_activations(mmq_gt) &&
+                                !mmq::fp4_activations(mmq_dt) && mmq::swiglu_quant_ok(mmq_dt) &&
+                                ws::supported(mmq_gt, mmq_dt) && ws::faster(mmq_gt, ws_u) && ws::faster(mmq_dt, ws_u)) {
+                                const uint8_t* ip_base = m.cache->device_slot(0);
+                                m.xoff_host.assign(n, -1);
+                                bool all = true;   // every expert resident
+                                uint64_t at = 0;   // their offsets' low bits
+                                for (size_t j = 0; j < n && all; ++j) {
+                                    const int32_t s = m.host_res[(size_t) l * m.g->n_expert + order[j]];
+                                    if (s < 0) { all = false; break; }
+                                    m.xoff_host[j] = (int64_t) (m.cache->device_slot(s) - ip_base);
+                                    at |= (uint64_t) m.xoff_host[j];
+                                }
+                                ws_layer = all && ((uint64_t) (uintptr_t) ip_base | at | lay.fmt[(size_t) l].down_off) % ws::kAlign == 0;
+                                if (ws_layer) {
+                                    if (static bool said_ws = false; !said_ws) {
+                                        said_ws = true;
+                                        std::fprintf(stderr, "strata prefill: a resident layer's experts weight-stationary, one "
+                                                             "launch per product (STRATA_MMQ_WS=1)\n");
+                                    }
+                                    // the offsets after the bounds in the mapped table, the chunks after them (16-byte
+                                    // aligned); or the host copies through pinned slots
+                                    const size_t xo = 3 * m.grp_tk + 2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2);
+                                    ws::Chunk* ch = nullptr;
+                                    if (grp_mapped) {
+                                        int32_t* xh = m.grp_host + xo;
+                                        std::memcpy(xh, m.xoff_host.data(), n * sizeof(int64_t));
+                                        copy_i32((int32_t*) m.xoff_dev, m.grp_dev + xo, (int64_t) (2 * n), m.cs);
+                                        ch = (ws::Chunk*) (m.grp_host + (xo + 2 * m.g->n_expert + 3) / 4 * 4);
+                                    } else {
+                                        m.ws_chunks_host.resize(ws::max_chunks(T * K, m.g->n_expert));
+                                        ch = m.ws_chunks_host.data();
+                                    }
+                                    wl.nchunks = (int64_t) ws::chunks(order.data(), n, m.cnt.data(), m.bounds_host.data(), ch);
+                                    if (grp_mapped) {
+                                        copy_i32((int32_t*) m.ws_chunks, m.grp_dev + ((int32_t*) ch - m.grp_host), 4 * wl.nchunks, m.cs);
+                                    } else if (m.up_ring.h2d(m.xoff_dev, m.xoff_host.data(), n * sizeof(int64_t), m.cs) != cudaSuccess ||
+                                               m.up_ring.h2d(m.ws_chunks, ch, (size_t) wl.nchunks * sizeof(ws::Chunk), m.cs) != cudaSuccess) {
+                                        err = "prefill: the weight-stationary tables' upload failed";
+                                        return false;
+                                    }
+                                    wl.gu_type = mmq_gt; wl.d_type = mmq_dt; wl.w = ip_base; wl.xoff = m.xoff_dev;
+                                    wl.down_off = (int64_t) lay.fmt[(size_t) l].down_off; wl.chunks = m.ws_chunks;
+                                    wl.rows = T * K; wl.n = (int) n; wl.xq = m.Xq; wl.gu = m.GU; wl.hq = m.Hq; wl.dm = m.Dm;
                                 }
                             }
                         } else {
@@ -4795,6 +4936,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 wait_copied(gg_ents[gg_nslots - 1], (size_t) gg_slots[gg_nslots - 1]);
                                 pt.mark(kPfDequant, cs);
                             }
+#if STRATA_EXPERT_NIBBLE_BUILT
+                            if (nib_l.on) {   // the GGUF blocks rebuilt from the 4-bit slots: the bytes the copy gives
+                                if (const int rc = core::nibble::gather_gguf(nib_l, gg.blob, gg.first, gg.n, m.grp_gu, mmq_gub,
+                                                                             m.grp_d, mmq_db, zero, m.cs); rc != 0)
+                                    core::nibble::fatal(l, "the prompt path's group gather", cudaGetErrorString((cudaError_t) rc));
+                            } else
+#endif
                             // NVFP4: each expert's scales go next to its group slot in the same launch
                             if (!mmq::gather_native_group(gg, f.up_off, mmq_gub / 2, f.down_off, mmq_db, m.grp_gu, mmq_gub,
                                                           m.grp_d, mmq_db, m.cs, f.tail_off,
@@ -4820,6 +4968,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // a ring slot or the peer's), which STRATA_MMQ_DIRECT reads in place
                         auto compute = [&](size_t j, const uint8_t* blob_dev, int slot, int32_t cslot) -> bool {
                             const int32_t e = order[j];
+#if STRATA_EXPERT_NIBBLE_BUILT
+                            if (nib_l.on && (!use_mmq || direct || wmma_l || cslot < 0 || !lay.native ||
+                                             mmq_gub != (size_t) core::nibble::kRows * nib_l.raw_gu_row ||
+                                             mmq_db != nib_l.down_bytes))
+                                core::nibble::fatal(l, "the prompt path",
+                                                    !use_mmq ? "no MMQ for the layer (the FP16 path dequantizes GGUF blocks)"
+                                                    : direct ? "STRATA_MMQ_DIRECT reads the slots in place"
+                                                    : wmma_l ? "the WMMA tiles read GGUF blocks"
+                                                    : cslot < 0 ? "an expert not in this GPU's slots (streamed or the peer's)"
+                                                                : "the MMQ group buffers are not the blob's [gate | up] and down");
+#endif
                             pt.mark(kPfDequant, cs);
                             if (use_mmq) {
                                 // gather the expert into its group slot (GGUF blocks, unchanged or converted)
@@ -4866,6 +5025,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     gg = mmq::GatherGroup{};
                                 } else if (lay.native) {
                                     const auto& f = lay.fmt[(size_t) l];
+#if STRATA_EXPERT_NIBBLE_BUILT
+                                    if (nib_l.on) {   // as the group gather (flush), one expert at its group position q
+                                        const uint8_t* one[mmq::kGatherGroupMax] = {};
+                                        one[q] = blob_dev;
+                                        if (const int rc = core::nibble::gather_gguf(nib_l, one, (int) q, (int) q + 1, m.grp_gu,
+                                                                                     mmq_gub, m.grp_d, mmq_db,
+                                                                                     last_of_group ? MMQ_TAIL : 0, m.cs); rc != 0)
+                                            core::nibble::fatal(l, "the prompt path's gather", cudaGetErrorString((cudaError_t) rc));
+                                    } else
+#endif
                                     // NVFP4: this expert's scales go next to its group slot in the same launch
                                     mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2, blob_dev + f.down_off,
                                                        mmq_db, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, m.cs,
@@ -4974,7 +5143,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             m.gemm.f16(m.Hh + o0 * 640, m.dq_d[q], m.Dm + o0 * N, ne, N, 640);
                             return true;
                         };
-                        if (!stream_all) {
+                        if (ws_layer) {
+                            // STRATA_MMQ_WS: the layer's gate/up in one launch, H of all its rows in one pass, its down
+                            // in one launch (no expert of the layer is staged or streamed: nothing to wait for or give
+                            // back beyond what the walk would)
+                            stats_.experts_resident += (int64_t) order.size();
+                            pt.mark(kPfGemmGU, cs);
+                            if (!ws::gate_up(wl, m.cs)) {   // the layer was taken because ws::faster said so
+                                err = "prefill: the weight-stationary gate/up declined a layer it was picked for";
+                                return false;
+                            }
+                            mmq::swiglu_quant(m.GU, m.Hq, T * K, !lay.native, m.cs);
+                            pt.mark(kPfGemmD, cs);
+                            ws::down(wl, m.cs);
+                            if (stream_all && group_gather) give_back(consumed);
+                        } else if (!stream_all) {
                             size_t staged = 0;
                             size_t pending = 0;
                             const bool stream_ahead = stream_ahead_enabled();
