@@ -2061,7 +2061,17 @@ bool PlainModel::after_rows(int rows, int64_t pos0, std::string& err) {
         }
         const bool from_files = !in_ram_ && (complement_ == nullptr || !complement_->complement_ready() ||
                                              complement_->resident_count() < pairs - on_gpu);
-        set_adapt_period(auto_adapt_period(win > 0.0 ? pool / win : 0.0, adapt_period_, from_files, "strata plain"));
+        // llm-jp-4.1 (qwen3moe) keeps every 16 tokens: after its 16K prompt on the B70 (8 GiB, the profile, 3 runs
+        // each, 2026-10-26) every 4 tokens decoded 31.7 / 31.9 / 40.7 tok/s against 42.5 / 42.7 / 42.5 at 16 (the
+        // engine before these rounds: 43.3 / 43.2 / 42.9); the counts the prompt seeded decay away 4 times as fast
+        // a token, and scaling the decay to the period gave 36.3-37.9
+        const double share = win > 0.0 ? pool / win : 0.0;
+        if (spec_.arch == ModelArch::Qwen3Moe)
+            std::fprintf(stderr, "strata plain: adaptive tier every %lld tokens: the CPU pool took %.0f%% of the verify "
+                                 "windows, and this model keeps the period (--adapt-every sets it)\n",
+                         (long long) adapt_period_, 100.0 * share);
+        else
+            set_adapt_period(auto_adapt_period(share, adapt_period_, from_files, "strata plain"));
     }
     // a round at fixed positions of the text (window-invariant swaps, #152), a layer split's stages in turn
     // (adapt_phase_), so that one's copies land before the next's
