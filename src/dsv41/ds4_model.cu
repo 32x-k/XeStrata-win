@@ -2946,11 +2946,17 @@ struct Model::Impl {
             split128(g.ff, nm, 0, ff0_, FF);   // (the widest member's share: member 0 takes the odd blocks)
             const size_t C = (size_t) chunk;
             c.C = chunk;
-            c.A = std::max(64, (int) (((size_t) 8 << 20) / (size_t) HQ) / 64 * 64);
             // DS4_ATTN_SLAB=N: the attention slab's rows.  The dense projections (q_b, wo_a/b) are dequantized and GEMM'd
             // once a slab, so a slab of 256 rows dequantizes the same weights 32 times for an 8K prompt (measured: the
             // dense dequant 916 ms of the 8K prompt, rocBLAS 867 ms); a larger slab costs VRAM for c.q/c.o and the oa
             // buffers (A * HQ x 4 bytes each).
+            const int a_rule = std::max(64, (int) (((size_t) 8 << 20) / (size_t) HQ) / 64 * 64);   // 256 rows here
+            c.A = a_rule;
+            // Where the cards hold most of the experts, the whole chunk's slab is worth its VRAM: measured on 4x R9700
+            // (2.25 bpw, share 0.77, chunk 1024) the 256-row rule gives 8K warm 1204 / 1236 / 1250 ppts and a slab of
+            // the chunk's 1024 rows 1324 / 1353 / 1363 (+9%) with the decode unchanged (77.7 against 78.1 tok/s); the
+            // 1024 rows cost 268 MB a device, 1% of the card.  Elsewhere the rule stays as it was.
+            if (gpu_expert_share() >= 0.5) c.A = std::max(a_rule, std::min(chunk, 1024) / 64 * 64);
             if (const char* v = std::getenv("DS4_ATTN_SLAB")) {
                 const int a = std::atoi(v);
                 if (a > 0) c.A = std::max(64, std::min(chunk, a) / 64 * 64);
