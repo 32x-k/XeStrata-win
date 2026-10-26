@@ -258,11 +258,10 @@ def detect_hardware(environ=None) -> dict:
     selection treats as "cannot tell", never as a refusal."""
     environ = os.environ if environ is None else environ
     prefer = ""
-    forced = str(environ.get(ec.ENV_BACKEND, "")).strip().lower()
-    if forced.startswith("hip-") and forced not in ec.BACKEND_MATRIX:
+    family, prefer = ec.split_backend(environ.get(ec.ENV_BACKEND, ""))
+    if prefer:
         # "hip-rx9070" is how the feed labels a package; accept it as "the hip family, this variant"
-        prefer = forced[4:]
-        environ = {**environ, ec.ENV_BACKEND: "hip"}
+        environ = {**environ, ec.ENV_BACKEND: family}
     backend, how = ec.detect_backend(environ)
     hw = {"platform": host_platform(), "backend": backend, "backend_source": how, "runtime": ec.runtime_version(),
           "nvidia_driver": None, "cuda_archs": [], "gfx": [], "gpu_names": [], "variant_wanted": prefer,

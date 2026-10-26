@@ -436,11 +436,20 @@ def runtime_version() -> str | None:
 
 # ----------------------------------------------------------------------------------------------- the GPU
 
+def split_backend(value) -> tuple[str, str]:
+    """(backend, variant) for a name the person typed: "hip-rdna2" is the hip family and its rdna2 package (the way the feed labels an AMD
+    package, #4013), "hip" is the family alone, any other name is returned as it is with no variant."""
+    name = str(value or "").strip().lower()
+    if name not in BACKEND_MATRIX and name.startswith("hip-") and len(name) > 4:
+        return "hip", name[4:]
+    return name, ""
+
+
 def detect_backend(environ=None) -> tuple[str | None, str]:
     """(backend, how) for this machine: the engine family its GPU needs. Bounded, read-only probes of tools that are
     already installed; ``STRATA_ENGINE_BACKEND`` overrides (the tests and the support desk use it)."""
     environ = os.environ if environ is None else environ
-    forced = environ.get(ENV_BACKEND, "").strip().lower()
+    forced = split_backend(environ.get(ENV_BACKEND, ""))[0]      # "hip-rdna2" starts the hip family (the package choice reads the variant)
     if forced:
         if forced not in BACKEND_MATRIX:
             raise ComponentProblem(f"{ENV_BACKEND}={forced!r} is not one of {', '.join(sorted(BACKEND_MATRIX))}")
