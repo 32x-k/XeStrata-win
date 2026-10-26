@@ -1268,6 +1268,9 @@ class Strata:
                               # RAM + VRAM the weights need together, WITHOUT the n-gram table (that stays on the SSD): Gyro states it
                               # (mem_total), for the rest the experts plus ~1 GB for the dense part (Swift IQ2_XS: 35.5 + 1 = 36.5)
                               "mem_total": bool(d.get("mem_total")), "multi_file": bool(own and own.get("multi_file")),
+                              # DeepSeek only: the free disk the set needs, from the set itself (the download: model files, n-gram table, drafter and
+                              # metadata, plus the pack folder and room to work, strata_control/dsv41_fit.DISK_HEADROOM_GB): 2.00 and 2.25 differ
+                              "disk_gb": self.dsv41_disk_gb(d) if own and own.get("multi_file") else None,
                               # the first engine that reads this size's files (setup.py "engine"); the app says "needs a newer engine"
                               # with the update step when the installed one is older. None: any engine that setup accepts.
                               "engine_min": ".".join(map(str, d["engine"])) if d.get("engine") else None,
@@ -1282,6 +1285,12 @@ class Strata:
                         "images": any(x["images"] for x in sizes) if sizes else fd.get("vision", True) is not False,
                         "sizes": sizes})
         return out
+
+    @staticmethod
+    def dsv41_disk_gb(d: dict) -> float:
+        """The free disk a DeepSeek set needs: its whole download plus the pack and room to work (the card text says "about")."""
+        from strata_control import dsv41_fit
+        return round(float(d["download_gb"]) + dsv41_fit.DISK_HEADROOM_GB, 1)
 
     def dsv41_plan(self, hw, disk_free=None, only=None, model=None) -> dict:
         """strata_control/dsv41_fit.plan for this computer; `only`: the card numbers a launch names (else every card that counts)."""
