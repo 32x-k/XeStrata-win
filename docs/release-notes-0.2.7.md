@@ -21,8 +21,8 @@
 These need no engine change; they are settings. Each was measured on the same boxes.
 
 - **`--ple-io ram`** - the 28.8 GB n-gram table in RAM instead of read from the SSD row by row. On the 72 GB card
-  (251 GB RAM): prompt **+16.5% at 1K, +30.6% at 4K, +16.8% at 8K**, -2.6% at 16K. Setup already chooses it on
-  Linux PCs with RAM to spare.
+  (251 GB RAM): prompt **+16.5% at 1K, +30.6% at 4K, +16.8% at 8K**, -2.6% at 16K. Setup chooses it on a Linux PC
+  with RAM to spare - check `setup --plan` on yours before trusting that.
 - **`--mtp-draft-vocab draft_vocab_en.bin`** - the helper that guesses the next words considers 162 KB of the
   vocabulary instead of 425 KB, so it reads less per guess: **+2.7..3.1% story and +2.2..3.0% code** decode on both
   big boxes. The big model checks every guess, so the answers are unchanged (identical tokens in every run where
