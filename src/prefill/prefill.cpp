@@ -1099,6 +1099,7 @@ struct Prefill::Impl {
         bool r_dev = false;                  // its residual rows in VRAM (else R_host, copied per sub-chunk)
         void* dev = nullptr;                 // the one device allocation the pointers below are carved from
         float *mixed = nullptr, *acc = nullptr, *inj = nullptr, *R = nullptr, *w = nullptr;
+        uint16_t* mixed_h = nullptr;         // the FFN half's FP16 rows (the FP16 path's inputs, port 2026-10-24)
         int32_t *ids = nullptr, *tab = nullptr;
         size_t tab_n = 0;
         float* R_host = nullptr;
@@ -5623,6 +5624,7 @@ void Prefill::lm_release() {
     }
     m.lm.dev = nullptr;
     m.lm.mixed = m.lm.acc = m.lm.inj = m.lm.R = m.lm.w = m.lm.R2 = nullptr;
+    m.lm.mixed_h = nullptr;
     m.lm.ids = m.lm.tab = nullptr;
     m.lm.S = 0;
 }
@@ -5640,9 +5642,16 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why) {
         return 0;
     }
     const MmqPlan& mp = mmq_plan();
-    if (!mp.any || (int64_t) mp.layer.size() < g.n_layers) { why = "the experts are not on MMQ"; return 0; }
-    for (int64_t l = 0; l < g.n_layers; ++l)
-        if (!mp.layer[(size_t) l]) { why = "a layer's experts are not on MMQ"; return 0; }
+    if ((int64_t) mp.layer.size() < g.n_layers) { why = "the expert plan has fewer layers than the model"; return 0; }
+    // each layer's experts on MMQ, or (port, 2026-10-24) on run_impl's FP16 path; the buffers each one needs
+    int64_t n_mmq = 0;
+    for (int64_t l = 0; l < g.n_layers; ++l) n_mmq += mp.layer[(size_t) l] ? 1 : 0;
+    if (n_mmq > 0 && (!m.grp_gu || !m.grp_d || !m.Xq || !m.H || !m.Hq)) { why = "the MMQ buffers are missing"; return 0; }
+    if (n_mmq < g.n_layers) {
+        bool dq_ok = true;
+        for (int i = 0; i < DQ; ++i) dq_ok = dq_ok && m.dq_gu[i] && m.dq_d[i];
+        if (!m.Xs || !m.Hh || !dq_ok) { why = "the FP16 expert path's buffers are missing"; return 0; }
+    }
     // 0.2.2's expert formats this path's MMQ pass does not carry (port, 2026-10-24): APR's Hadamard-folded layers,
     // NVFP4's tails and w4a4 activations, and IQ1_M layers that only the WMMA tiles run
     {
@@ -5656,9 +5665,7 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why) {
         }
     }
     if (m.fused_bufs) { why = "the fused expert layout"; return 0; }
-    if (!m.grp_gu || !m.grp_d || !m.Xq || !m.GU || !m.H || !m.Hq || !m.Dm || !m.ids_identity || !m.tok_dev) {
-        why = "the MoE buffers are missing"; return 0;
-    }
+    if (!m.GU || !m.Dm || !m.ids_identity || !m.tok_dev) { why = "the MoE buffers are missing"; return 0; }
     // (an explicit STRATA_PREFILL_LM_TOKENS may be one chunk: the A/B against the default path, experts aside)
     const int64_t min_s = lm_tokens_env() > 0 ? m.T : 2 * m.T;
     if (n < min_s) { why = "a short prompt"; return 0; }
@@ -5667,7 +5674,7 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why) {
     S = std::min<int64_t>(S, (n + m.T - 1) / m.T * m.T);
     const int64_t G = m.T * K;
     const auto dev_bytes = [&](int64_t s, bool r_dev) {
-        const uint64_t per = (uint64_t) (2 * N + HC + 2 * K) * 4 + (r_dev ? (uint64_t) D * 4 : 0);
+        const uint64_t per = (uint64_t) (2 * N + HC + 2 * K) * 4 + (uint64_t) N * 2 + (r_dev ? (uint64_t) D * 4 : 0);
         return (uint64_t) s * per + (uint64_t) lm_table_ints(s * K, G) * 4 + 4096 +
                (r_dev ? 0 : (uint64_t) m.T * D * 4 + 256);
     };
@@ -5725,6 +5732,7 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why) {
     auto carve_b = [&](size_t b) { uint8_t* p = q; q += (b + 255) & ~(size_t) 255; return p; };
     lb.mixed = (float*) carve_b((size_t) s_use * N * 4);
     lb.acc = (float*) carve_b((size_t) s_use * N * 4);
+    lb.mixed_h = (uint16_t*) carve_b((size_t) s_use * N * 2);
     lb.inj = (float*) carve_b((size_t) s_use * HC * 4);
     lb.ids = (int32_t*) carve_b((size_t) s_use * K * 4);
     lb.w = (float*) carve_b((size_t) s_use * K * 4);
@@ -5820,8 +5828,9 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
     struct Restore {
         Impl& m;
         float *R, *mixed, *inj;
-        ~Restore() { m.R = R; m.mixed = mixed; m.inj = inj; }
-    } restore{m, m.R, m.mixed, m.inj};
+        uint16_t* mixed_h;
+        ~Restore() { m.R = R; m.mixed = mixed; m.inj = inj; m.mixed_h = mixed_h; }
+    } restore{m, m.R, m.mixed, m.inj, m.mixed_h};
     float* const R_chunk = m.R;
     const strata::kernels::cpu::ExpertLayout& lay = strata::kernels::cpu::expert_layout();
     double ms_attn = 0, ms_experts = 0, ms_host_tables = 0, ms_wait_a = 0;
@@ -5852,7 +5861,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
         Stager* st;
         ~StagerStop() { if (st) st->finish(); }   // an early return in a layer's attention halves
     } stager_stop{m.stager.get()};
-    int64_t lm_streamed = 0, lm_resident = 0, lm_groups = 0, lm_supers = 0;
+    int64_t lm_streamed = 0, lm_resident = 0, lm_groups = 0, lm_supers = 0, lm_groups_f16 = 0;
     uint64_t lm_bytes = 0;
     const int64_t G = m.T * K;   // the MoE buffers' rows (Xq, GU, H, Hq, Dm): a group's most
 
@@ -6042,10 +6051,15 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
         };
         const int mmq_gt = lay.native ? lay.fmt[(size_t) l].gu_type : 42;
         const int mmq_dt = lay.native ? lay.fmt[(size_t) l].d_type : 42;
-        const size_t mmq_gub = mmq::matrix_bytes(mmq_gt, 1280, N), mmq_db = mmq::matrix_bytes(mmq_dt, N, 640);
+        // a layer MMQ does not take runs run_impl's FP16 path (port, 2026-10-24): each expert dequantized to FP16 once
+        // per super-chunk, then per entry its rows' FP16 inputs (lb.mixed_h, the bits run_impl's gather reads) through
+        // two FP16 GEMMs into the group's Dm rows; the group's rows are added per token as on the MMQ path
+        const bool fp16_l = !mmq_plan().layer[(size_t) l];
+        const size_t mmq_gub = fp16_l ? 0 : mmq::matrix_bytes(mmq_gt, 1280, N), mmq_db = fp16_l ? 0 : mmq::matrix_bytes(mmq_dt, N, 640);
         size_t staged = 0, u = 0;
         const uint8_t* blob_dev = nullptr;
         size_t gi = 0;
+        int dq = -1;   // FP16 path: the dequant slot of the current expert
         for (size_t j = 0; j < ents.size(); ++j) {
             const int32_t e = ents[j].e;
             if (j == 0 || ents[j - 1].e != e) {   // the next expert: staged ahead, waited for, its blob located
@@ -6067,6 +6081,41 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
             const Grp& gp = grps[gi];
             const size_t q = j - gp.j0;
             pt.mark(kPfDequant, cs);
+            if (fp16_l) {
+                if (j == 0 || ents[j - 1].e != e) {   // the expert's FP16 matrices, once (run_impl's dequant)
+                    dq = (dq + 1) % DQ;
+                    if (lay.native) {
+                        const auto& f = lay.fmt[(size_t) l];
+                        strata::kernels::iq_dequant_gu_f16(f.gu_type, blob_dev, blob_dev + f.up_off, f.n_ff, f.n_embd,
+                                                           m.dq_gu[dq], cs, nullptr);
+                        strata::kernels::iq_dequant_f16(f.d_type, blob_dev + f.down_off, f.n_embd * f.n_ff, m.dq_d[dq], cs,
+                                                        nullptr);
+                    } else {
+                        blob_dequant_f16(blob_dev, m.dq_gu[dq], m.dq_d[dq], cs);
+                    }
+                    if (stage_of[u] >= 0) {   // the blob is read by the dequant: its ring slot is free
+                        cudaEventRecord(m.used[stage_of[u]], cs);
+                        m.used_of[stage_of[u]] = stage_of[u];
+                    }
+                }
+                // this entry's rows (group-relative offset o): FP16 inputs, gate/up, SwiGLU, down
+                const int64_t o = ents[j].r0 - gp.r0, nr = ents[j].nr;
+                gather_rows16(lb.mixed_h, d_row_tok + ents[j].r0, m.Xs + o * N, nr, N, cs);
+                pt.mark(kPfGemmGU, cs);
+                m.gemm.f16(m.Xs + o * N, m.dq_gu[dq], m.GU + o * 1280, nr, 1280, N);
+                swiglu_interleaved(m.GU + o * 1280, m.Hh + o * 640, nr, cs);
+                pt.mark(kPfGemmD, cs);
+                m.gemm.f16(m.Hh + o * 640, m.dq_d[dq], m.Dm + o * N, nr, N, 640);
+                if (j + 1 < gp.j1) continue;
+                pt.mark(kPfCombine, cs);
+                moe_scatter_add(m.Dm, d_u_tok + gp.u_at, d_u_off + gp.uo_at, d_u_rows + gp.r0,
+                                d_u_w + gp.r0, gp.nu, lb.acc, cs);
+                ++lm_groups;
+                ++lm_groups_f16;
+                ++gi;
+                core::progress_beat();
+                continue;
+            }
             if (lay.native) {
                 const auto& f = lay.fmt[(size_t) l];
                 mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2, blob_dev + f.down_off, mmq_db,
@@ -6148,6 +6197,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                     }
                 }
                 m.mixed = lb.mixed + t0 * N;
+                m.mixed_h = lb.mixed_h + t0 * N;   // the FFN half's FP16 rows stay for the layer's FP16 expert pass
                 m.inj = lb.inj + t0 * HC;
                 float* const acc = lb.acc + t0 * N;
                 if (l == 0) {
@@ -6531,12 +6581,12 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
     }
     stats_.ms_total += ms_since(t_start);
     std::fprintf(stderr, "strata prefill: layer-major: %lld tokens in %lld super-chunk(s) of up to %lld (R in %s, %lld MiB VRAM free before), "
-                         "%lld expert blobs streamed (%.1f MB), %lld resident, %lld MMQ groups; %.0f ms (host: "
+                         "%lld expert blobs streamed (%.1f MB), %lld resident, %lld expert groups (%lld on the FP16 path); %.0f ms (host: "
                          "enqueueing the attention halves %.0f, the experts %.0f: waiting for the attention halves "
                          "%.0f, the routing tables %.0f)\n",
                  (long long) n, (long long) lm_supers, (long long) S, lb.r_dev ? "VRAM" : "pinned RAM", (long long) lb.free_mib,
                  (long long) lm_streamed, (double) lm_bytes / 1e6, (long long) lm_resident, (long long) lm_groups,
-                 ms_since(t_start), ms_attn, ms_experts, ms_wait_a, ms_host_tables);
+                 (long long) lm_groups_f16, ms_since(t_start), ms_attn, ms_experts, ms_wait_a, ms_host_tables);
     if (pt.on) {
         pt.fold();
         double total = 0.0;
