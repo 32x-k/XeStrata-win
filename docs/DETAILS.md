@@ -707,6 +707,9 @@ endpoints are refused with an error that says so.
 | `text.format` | `json_schema` and `json_object` use the JSON formats above (checked, not constrained) |
 | `client_metadata["x-codex-turn-metadata"]` thread-title request | Opt-in `"codex_thread_titles": true`: answered without the engine as `{"title": "<the user's line, cut to 36 characters>"}` so the conversation keeps the prompt cache |
 
+The final event (`response.completed` or `response.incomplete`) and a non-streaming reply carry the same top-level `timings` object as
+`/v1/chat/completions`.
+
 The thinking comes back as a `reasoning` output item with `reasoning_text` content. The model writes no summaries, so `summary` is
 empty. With `"include": ["reasoning.encrypted_content"]` the item also carries an opaque string (base64, not encrypted).
 Send reasoning items back with the conversation, as Codex does, so the prompt matches and the cache is reused. Streaming
