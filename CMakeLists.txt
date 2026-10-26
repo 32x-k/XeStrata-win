@@ -1492,6 +1492,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(ple_residency_test PRIVATE include)
   add_test(NAME ple_residency_test COMMAND ple_residency_test)
 
+  # 0.2.7 (#3911): the qwen35 host sampler's penalties on a short (draft-vocab) logit row; header-only, CPU
+  add_executable(qwen35_sampling_test src/qwen35/sampling_test.cpp)
+  target_include_directories(qwen35_sampling_test PRIVATE include)
+  add_test(NAME qwen35_sampling_test COMMAND qwen35_sampling_test)
+
   # The GPU test runs ON THE TARGET PC. `--selftest` allocates
   # and writes real VRAM, so a machine without a device fails this test rather than skipping it silently -
   # which is correct: an engine that targets one GPU should not report a pass for having no GPU.
