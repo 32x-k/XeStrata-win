@@ -152,21 +152,14 @@ static int g_round_nd = 0;
 // The drafts' cut on the product of their confidences (DeepInfer's cumulative rule): a draft is verified while the chance
 // that it and every draft before it are kept stays at least this - a long window whose later drafts are likely lost is
 // not verified whole.  STRATA_DS4_DSPARK_CUM=F, a request's dspark_cum key; 0: off, only the floor on each draft's own
-// confidence (dspark_conf).  On AMD 0.5 is the default: measured on 4x R9700, DeepSeek 2.25 bpw, six 128-token
-// decodes an arm in one load - 71.7 -> 76.9 tok/s (medians), the same ids; Project Maya runs 0.5 on a Radeon 8065S
-// too (+6.5% decode, the same tokens), while the CUDA measurements in 0.2.7 had it flat, so CUDA keeps 0.
-// STRATA_DS4_DSPARK_CUM overrides either way.
-float dspark_cum_default() {
-    static const float v = [] {
-        const char* e = std::getenv("STRATA_DS4_DSPARK_CUM");
-        if (e != nullptr) return (float) std::atof(e);
-#if defined(STRATA_USE_HIP)
-        return 0.5f;
-#else
-        return 0.0f;
-#endif
-    }();
-    return v;
+// confidence (dspark_conf).  0.5 is the default on gfx1200 / gfx1201 (RDNA4: R9700, RX 9000) only: measured on 4x R9700, DeepSeek 2.25 bpw,
+// six 128-token decodes an arm in one load - 71.7 -> 76.9 tok/s (medians), the same ids.  Project Maya ran 0.5 on a Radeon 8065S (Strix Halo,
+// gfx1151: +6.5% decode, the same tokens), but that is a single datapoint on a box the 0.2.7 defaults have not been tested on, so
+// Strix keeps 0 until it is; the CUDA measurements in 0.2.7 had it flat, so CUDA keeps 0.  STRATA_DS4_DSPARK_CUM overrides everywhere.
+float dspark_cum_default(const strata::ds4::Model& m) {
+    static const char* const e = std::getenv("STRATA_DS4_DSPARK_CUM");
+    if (e != nullptr) return (float) std::atof(e);
+    return m.gpus_are_gfx12() ? 0.5f : 0.0f;
 }
 
 // One round of decoding after `tok` (the token at pos(), not fed yet): with the drafter, its drafts while their
@@ -184,7 +177,7 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
         g_round_conf = conf;
         g_round_nd = (int) drafts.size();
         int keep = 0;
-        if (cum_min < 0) cum_min = dspark_cum_default();
+        if (cum_min < 0) cum_min = dspark_cum_default(m);
         float cum = 1.0f;
         while (keep < (int) drafts.size() && keep < room - 1 && conf[(size_t) keep] >= conf_min &&
                (cum *= conf[(size_t) keep]) >= cum_min)

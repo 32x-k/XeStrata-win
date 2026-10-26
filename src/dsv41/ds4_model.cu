@@ -811,6 +811,7 @@ struct Model::Impl {
     std::vector<Group> groups;
     std::vector<std::unique_ptr<Worker>> workers;   // threads mode: one per device
     bool par = false;                 // threads mode (the windows: decode)
+    mutable int all_gfx12 = -1;       // gpus_are_gfx12(): -1 not asked yet
     bool prompt_par = false;          // the prompt path's chunks (a thread a GPU), as --tp / --threads asked
     unsigned win_seq = 0;             // the windows the threads ran (the hand-offs' seq)
     // the chunked prompt path (threads mode): chunk tokens a pass, runs shorter than chunk_min in windows
@@ -9663,6 +9664,21 @@ void Model::set_images(std::vector<Image> images) {
     p_->imgs = std::move(images);
 }
 int Model::draft_block() const { return p_->g.n_mtp > 0 ? p_->g.d_block : 0; }
+bool Model::gpus_are_gfx12() const {
+    if (p_->all_gfx12 < 0) {
+        bool yes = false;
+#if defined(STRATA_USE_HIP)
+        yes = !p_->devs.empty();
+        for (const auto& d : p_->devs) {
+            cudaDeviceProp prop{};
+            yes = yes && cudaGetDeviceProperties(&prop, d.id) == cudaSuccess &&
+                  (std::strncmp(prop.gcnArchName, "gfx1200", 7) == 0 || std::strncmp(prop.gcnArchName, "gfx1201", 7) == 0);
+        }
+#endif
+        p_->all_gfx12 = yes ? 1 : 0;
+    }
+    return p_->all_gfx12 == 1;
+}
 bool Model::draft(int y, std::vector<int>& d, std::vector<float>& c, std::string& err, float t, float tp, int tk,
                   float mp, uint64_t seed, uint64_t counter) {
     return p_->draft(y, d, c, err, t, tp, tk, mp, seed, counter);
