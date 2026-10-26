@@ -34,6 +34,13 @@ In PowerShell, prefix the wrapper with `.\`, for example `.\START-HERE.bat`.
 `SETUP.bat` opens setup again to add a model or change settings. The wrapper can reuse an existing install;
 first-start and later load times depend on the pack, disk, RAM and backend. A model can take several minutes to load.
 
+When no ready-made engine fits the PC, setup compiles one. That needs the Visual Studio 2022 Build Tools with the C++ workload;
+Visual Studio 2019 is too old (the sources are C++20). With a CUDA toolkit, CUDA 13.0 to 13.2 accept Visual Studio 2022 only, and
+Visual Studio 2026 works from CUDA 13.3. The CPU image encoder alone (no CUDA toolkit on the PC) builds with MSVC and takes any
+Visual Studio that has the C++ tools. If setup cannot find an install it could use, name the file before running it, for example
+`set STRATA_VCVARS=C:\Program Files\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat`. Setup uses that file
+only if it exists; a wrong path is answered as no build tools at all.
+
 ## From source: Linux
 
 Clone or extract the source, enter its folder, then run:
