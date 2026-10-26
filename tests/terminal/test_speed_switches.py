@@ -30,7 +30,9 @@ R9700 = {"name": "AMD Radeon AI PRO R9700", "vendor": "amd", "arch": "gfx1201"}
 RX7900 = {"name": "AMD Radeon RX 7900 XTX", "vendor": "amd", "arch": "gfx1100"}
 STRIX = {"name": "AMD Radeon 8060S", "vendor": "amd", "arch": "gfx1151", "uma": True}
 RTX = {"name": "NVIDIA GeForce RTX 4090", "vendor": "nvidia", "arch": "89"}
-QWEN = {"arch": "qwen35moe", "backend": "cuda", "args": ["--native", "m.gguf"], "env": {"PATH": "/bin"}}
+# A Qwen3.8-Flash-Next run config (the original, Swift, Coder, Unsloth, Gyro, NVFP4): setup writes no "arch" for it.  Qwen3.6-35B-A3B has an engine path of its own: "arch".
+QWEN = {"model_name": "qwen3.8-flash-next-iq3_s", "backend": "cuda", "args": ["--native", "m.gguf"], "env": {"PATH": "/bin"}}
+QWEN36 = {"arch": "qwen35moe", "model_name": "qwen3.6-35b-a3b-ud-q4_k_xl", "backend": "cuda", "args": ["--native", "m.gguf"], "env": {"PATH": "/bin"}}
 DEEPSEEK = {"arch": "deepseek41", "exe": "C:/s/engine-dsv41/0.1.52-win/strata-dsv41.exe", "args": ["--pack", "p"], "env": {"DS4_ASYNC_T": "4"}}
 
 
@@ -56,7 +58,7 @@ class Contract(unittest.TestCase):
         self.assertEqual(ids({**QWEN, "backend": "hip"}, [RX7900]), ["faster_long_prompts"])
         self.assertEqual(ids({**QWEN, "backend": "hip"}, [STRIX]), ["faster_long_prompts"], "Strix Halo is gfx1151, not gfx12")
         self.assertEqual(ids({**QWEN, "backend": "hip"}, [R9700]), ["faster_long_prompts", "faster_radeon_9000"])
-        self.assertEqual(ids({"arch": "qwen35moe"}, [R9700], "hip"), ["faster_long_prompts", "faster_radeon_9000"], "the installed engine's backend when the config has none")
+        self.assertEqual(ids({"model_name": "qwen3.8-flash-next-iq3_s"}, [R9700], "hip"), ["faster_long_prompts", "faster_radeon_9000"], "the installed engine's backend when the config has none")
         self.assertEqual(ids({**QWEN, "backend": "hip"}, [{"name": "AMD Radeon RX 9070 XT", "vendor": "amd"}]), ["faster_long_prompts", "faster_radeon_9000"])
         self.assertEqual(ids({**QWEN, "backend": "cuda"}, [RTX, R9700]), ["faster_long_prompts"], "the Radeon switch needs the HIP engine")
         for backend in ("sycl", "metal", "cpu", None):
@@ -64,6 +66,16 @@ class Contract(unittest.TestCase):
         self.assertEqual(ids(DEEPSEEK, [R9700]), ["deepseek_speedups"])
         self.assertEqual(ids({**DEEPSEEK, "backend": "cuda"}, [RTX]), ["deepseek_speedups"])
         self.assertEqual(ids({"exe": "C:/x/strata-dsv41.exe"}, [RTX]), ["deepseek_speedups"], "found by the engine's name too")
+
+    def test_faster_long_prompts_is_for_qwen38_flash_next_only(self):
+        """KVA was measured on the 48-layer / 512-expert Flash-Next shape and the engine declines other shapes: no row for Qwen3.6-35B-A3B (arch qwen35moe) or DeepSeek."""
+        self.assertEqual(ids(QWEN36, [RTX]), [], "Qwen3.6-35B-A3B on CUDA: no KVA row")
+        self.assertEqual(ids({**QWEN36, "backend": "hip"}, [RX7900]), [], "on HIP too")
+        self.assertEqual(ids({**QWEN36, "backend": "hip"}, [R9700]), ["faster_radeon_9000"], "the Radeon switch is not tied to the model's shape")
+        for family in ("qwen3.8-flash-next-iq3_s", "swift-1.5-iq3_s", "qwen3.8-flash-next-coder-iq3_s", "qwen3.8-flash-next-unsloth-ud-q4_k_xl",
+                       "qwen3.8-flash-next-gyro-gyro-s", "qwen3.8-flash-next-nvfp4-nvfp4"):
+            self.assertEqual(ids({**QWEN, "model_name": family}, [RTX]), ["faster_long_prompts"], family)
+        self.assertEqual(ids(DEEPSEEK, [RTX]), ["deepseek_speedups"])
 
     def test_outside_the_default_and_back_is_the_identical_environment(self):
         env = {"PATH": "/bin", "STRATA_PREFILL": "2", "DS4_ASYNC_T": "4"}

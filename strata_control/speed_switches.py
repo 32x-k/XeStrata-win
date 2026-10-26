@@ -67,7 +67,8 @@ def _radeon_9000(gpus: Iterable[Mapping[str, Any]] | None) -> bool:
 
 
 def applies(switch: Switch | str, cfg: Mapping[str, Any] | None, gpus: Iterable[Mapping[str, Any]] | None, backend: str | None = None) -> bool:
-    """Does the switch make sense for this model on this PC? ``backend`` is the engine's (cuda, hip, sycl, metal, cpu); the run config's own wins."""
+    """Does the switch make sense for this model on this PC? ``backend`` is the engine's (cuda, hip, sycl, metal, cpu); the run config's own wins.
+    "Faster long prompts" is for Qwen3.8-Flash-Next models only (a config without an "arch")."""
     sw = BY_ID[switch] if isinstance(switch, str) else switch
     if sw.only == "deepseek":
         return is_deepseek(cfg)
@@ -75,7 +76,9 @@ def applies(switch: Switch | str, cfg: Mapping[str, Any] | None, gpus: Iterable[
         return False
     backend = (cfg or {}).get("backend") or backend
     if sw.only == "qwen-gpu":
-        return backend in ("cuda", "hip")
+        # KVA was measured on the Qwen3.8-Flash-Next shape (48 layers, 512 experts); the engine declines any other.  Setup writes "arch" only for the
+        # families with an engine path of their own (Qwen3.6-35B-A3B: qwen35moe), so a Flash-Next config (the original, Swift, Coder, Unsloth, Gyro, NVFP4) has none.
+        return not (cfg or {}).get("arch") and backend in ("cuda", "hip")
     if sw.only == "qwen-radeon-9000":
         return backend == "hip" and _radeon_9000(gpus)
     return False

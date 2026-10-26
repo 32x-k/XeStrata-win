@@ -88,6 +88,15 @@ test('a switch shows only where it applies: Qwen on CUDA or HIP, Qwen on a Radeo
   assert.deepEqual(ids({}), [], 'nothing is known: nothing is offered');
 });
 
+test('Faster long prompts is for Qwen3.8-Flash-Next only: no row for Qwen3.6-35B-A3B (a run config with an arch) or DeepSeek', () => {
+  const ids = context => speedSwitchRows({}, context).map(r => r.id);
+  assert.deepEqual(ids({ backend: 'cuda', gpus: [RTX], arch: null }), ['faster_long_prompts'], 'Flash-Next files have no arch');
+  assert.deepEqual(ids({ backend: 'cuda', gpus: [RTX], arch: 'qwen35moe' }), [], 'Qwen3.6-35B-A3B on CUDA');
+  assert.deepEqual(ids({ backend: 'hip', gpus: [RX7900], arch: 'qwen35moe' }), [], 'and on HIP');
+  assert.deepEqual(ids({ backend: 'hip', gpus: [R9700], arch: 'qwen35moe' }), ['faster_radeon_9000'], 'the Radeon switch is not tied to the model\'s shape');
+  assert.equal(speedSwitchApplies('faster_long_prompts', { backend: 'cuda', gpus: [RTX], arch: 'qwen35moe' }), false);
+});
+
 test('the environment names round-trip through the validator, the public view and the restore, and other names stay untouched', () => {
   const all = Object.assign({}, ...Object.values(ENV));
   assert.deepEqual(validateNativeSettings({ env: all }), { env: all });
@@ -152,6 +161,18 @@ test('through the host: a DeepSeek model gets its own switch only, and the Strix
     const env = Object.fromEntries(Object.entries(off.values.env).filter(([name]) => !(name in ENV.deepseek_speedups)));
     f.control.save('iq2_xs', { values: { env } });
     assert.deepEqual(JSON.parse(readFileSync(path, 'utf8')).env, { DS4_ASYNC_T: '4' });
+  } finally { await f.cleanup(); }
+});
+
+test('through the host: Qwen3.6-35B-A3B (its run config has an arch) gets no Faster long prompts row, a Flash-Next model does', async () => {
+  const f = nativeFixture();
+  try {
+    f.setHardware({ ram_gb: 64, gpus: [RTX] });
+    setConfig(f, 'iq2_xs', { backend: 'cuda' });
+    setConfig(f, 'iq3_s', { backend: 'cuda', arch: 'qwen35moe', model_name: 'qwen3.6-35b-a3b-ud-q4_k_xl' });
+    await f.control.refresh();
+    assert.deepEqual(f.control.settings('iq2_xs').speedSwitches.map(s => s.id), ['faster_long_prompts']);
+    assert.deepEqual(f.control.settings('iq3_s').speedSwitches, []);
   } finally { await f.cleanup(); }
 });
 

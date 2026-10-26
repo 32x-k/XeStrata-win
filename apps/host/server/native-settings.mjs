@@ -47,11 +47,16 @@ export const SPEED_SWITCHES=[
   default:'on',env:{DS4_FAST_ATTN:'0',DS4_ATTN_SLAB:'0',DS4_COPY_PIN:'0',DS4_COPY_HUGETLB:'0',DS4_STORE_SPARE:'0',DS4_STORE_PUT:'0'}},
 ];
 const GFX12=/^gfx120[01]$/i, RADEON_9000=/\b(?:RX\s*9\d{3}|AI\s*PRO\s*R97\d{2}|R97\d{2})\b/i;
-/** Which switches make sense for this model on this PC: only those are shown. `backend` is the engine's (cuda, hip, sycl, metal, cpu). */
-export function speedSwitchApplies(id,{deepseek=false,backend=null,gpus=[]}={}){
+/**
+ * Which switches make sense for this model on this PC: only those are shown. `backend` is the engine's (cuda, hip, sycl, metal, cpu). `arch` is the "arch"
+ * of the model's run config: setup writes it only for the families with an engine path of their own (Qwen3.6-35B-A3B "qwen35moe", DeepSeek "deepseek41");
+ * the Qwen3.8-Flash-Next files (the original, Swift, Coder, Unsloth, Gyro, NVFP4) have none. KVA was measured on the Flash-Next shape (48 layers, 512
+ * experts) and the engine declines it on any other, so "Faster long prompts" is shown for a model without an "arch" only.
+ */
+export function speedSwitchApplies(id,{deepseek=false,backend=null,gpus=[],arch=null}={}){
  if(id==='deepseek_speedups')return !!deepseek;
  if(deepseek)return false;                                              // the Qwen engine's switches
- if(id==='faster_long_prompts')return backend==='cuda'||backend==='hip';
+ if(id==='faster_long_prompts')return !arch&&(backend==='cuda'||backend==='hip');
  if(id==='faster_radeon_9000')return backend==='hip'&&(gpus??[]).some(g=>(!g.vendor||g.vendor==='amd')&&(GFX12.test(String(g.arch??''))||(!g.arch&&RADEON_9000.test(String(g.name??'')))));
  return false;
 }
