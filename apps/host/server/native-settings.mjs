@@ -29,21 +29,22 @@ export const NATIVE_FIELDS=[
 /** Engine environment names the app shows and edits: STRATA_* and the DeepSeek engine's DS4_*. Any other name in a model's file is kept untouched and not shown. */
 export const ENV_FLAG=/^(?:STRATA|DS4)_[A-Z0-9_]+$/;
 /**
- * The three speed features that are on by default in 0.2.7 and have an off switch in Expert settings. Each switch, when off, writes exactly the
- * environment entries below into the model's settings file ("env"); turning it on again removes them, so a default launch carries none of them.
- * The names are the engine switch contract (phaseA-tests/notes-027-plan.md); strata_control/speed_switches.py says the same for the Terminal
- * (tests/terminal/test_speed_switches.py compares the two).
+ * The speed features of 0.2.7 that have a switch in Expert settings. A switch has a default ('on' or 'off'); outside it, it writes exactly the
+ * environment entries `env` into the model's settings file ("env"); back in its default it removes them, so a default launch carries none of them.
+ * "Faster long prompts" (Qwen KVA) is OFF by default (owner decision, 26 October): STRATA_KVA=1 turns it on, and an earlier test build's STRATA_KVA=0 reads as off.
+ * The other two are on by default. The names are the engine switch contract (phaseA-tests/notes-027-plan.md); strata_control/speed_switches.py says the
+ * same for the Terminal (tests/terminal/test_speed_switches.py compares the two).
  */
 export const SPEED_SWITCHES=[
  {id:'faster_long_prompts',label:'Faster long prompts',group:'Speed',
-  hint:'Reads long prompts faster by approximating part of the work. Turn off if answers about long documents look wrong.',
-  off:{STRATA_KVA:'0'}},
+  hint:'Reads very long prompts faster by approximating part of the work. Off by default: answers about long documents can miss or mix up details.',
+  default:'off',env:{STRATA_KVA:'1'}},
  {id:'faster_radeon_9000',label:'Faster answers on Radeon RX 9000 / AI PRO R9700',group:'Speed',
   hint:'Shares the work between the graphics card and the processor in a way that makes answers faster on these cards. Turn off to go back to the previous setting, which is slower.',
-  off:{STRATA_PCIE_FRAC_DEFAULT:'old'}},
+  default:'on',env:{STRATA_PCIE_FRAC_DEFAULT:'old'}},
  {id:'deepseek_speedups',label:'DeepSeek speed-ups',group:'Speed',
   hint:'Reads long prompts faster and loads the parts of the model it needs faster. Turn off if DeepSeek stops working or its answers look wrong; it then runs as in version 0.2.6.',
-  off:{DS4_FAST_ATTN:'0',DS4_ATTN_SLAB:'0',DS4_COPY_PIN:'0',DS4_COPY_HUGETLB:'0',DS4_STORE_SPARE:'0',DS4_STORE_PUT:'0'}},
+  default:'on',env:{DS4_FAST_ATTN:'0',DS4_ATTN_SLAB:'0',DS4_COPY_PIN:'0',DS4_COPY_HUGETLB:'0',DS4_STORE_SPARE:'0',DS4_STORE_PUT:'0'}},
 ];
 const GFX12=/^gfx120[01]$/i, RADEON_9000=/\b(?:RX\s*9\d{3}|AI\s*PRO\s*R97\d{2}|R97\d{2})\b/i;
 /** Which switches make sense for this model on this PC: only those are shown. `backend` is the engine's (cuda, hip, sycl, metal, cpu). */
@@ -54,15 +55,17 @@ export function speedSwitchApplies(id,{deepseek=false,backend=null,gpus=[]}={}){
  if(id==='faster_radeon_9000')return backend==='hip'&&(gpus??[]).some(g=>(!g.vendor||g.vendor==='amd')&&(GFX12.test(String(g.arch??''))||(!g.arch&&RADEON_9000.test(String(g.name??'')))));
  return false;
 }
-/** A switch is off when every entry it writes is in the environment with its value; anything less (a hand-edited file) reads as on and is left alone. */
-export function speedSwitchIsOff(env,id){const sw=SPEED_SWITCHES.find(s=>s.id===id);return !!sw&&Object.entries(sw.off).every(([name,value])=>env?.[name]===value);}
-/** The environment with the switch turned off (its entries written) or on (its entries removed). Nothing else in it changes. */
+/** The switch is outside its default when every entry it writes is in the environment with its value; anything less or other (a hand-edited file, STRATA_KVA=0) is the default state and is left alone. */
+export function speedSwitchIsSet(env,id){const sw=SPEED_SWITCHES.find(s=>s.id===id);return !!sw&&Object.entries(sw.env).every(([name,value])=>env?.[name]===value);}
+/** Is the feature on for a launch with this environment? */
+export function speedSwitchIsOn(env,id){const sw=SPEED_SWITCHES.find(s=>s.id===id);return !!sw&&speedSwitchIsSet(env,id)!==(sw.default==='on');}
+/** The environment with the feature on or off: its default removes the switch's entries, the other state writes them. Nothing else in it changes. */
 export function setSpeedSwitch(env,id,on){
  const sw=SPEED_SWITCHES.find(s=>s.id===id);if(!sw)throw new Error(`Unknown speed switch: ${id}`);
- const next={...(env??{})};for(const [name,value] of Object.entries(sw.off)){if(on)delete next[name];else next[name]=value;}return next;
+ const write=on!==(sw.default==='on'),next={...(env??{})};for(const [name,value] of Object.entries(sw.env)){if(write)next[name]=value;else delete next[name];}return next;
 }
-/** What the settings answer carries: each switch that applies, with its words, the entries it writes when off, and whether it is on. */
-export function speedSwitchRows(env,context){return SPEED_SWITCHES.filter(s=>speedSwitchApplies(s.id,context)).map(s=>({...s,on:!speedSwitchIsOff(env,s.id)}));}
+/** What the settings answer carries: each switch that applies, with its words, its default, the entries it writes outside the default, and whether the feature is on. */
+export function speedSwitchRows(env,context){return SPEED_SWITCHES.filter(s=>speedSwitchApplies(s.id,context)).map(s=>({...s,on:speedSwitchIsOn(env,s.id)}));}
 /** Settings the app itself applies when it starts a model (they are not read from the engine's source, so the engine's text never says it supports them). */
 export const APP_OWNED_FIELDS=['mtp','batchMtp','drafting','ds_experts'];
 /** The engine arguments without the draft layer: --mtp <folder or count>, --spec-min-p <p> (its confidence threshold) and --batch-mtp. --spec stays: prompt lookup still uses its windows. Same rule as strata_control/draft_layer.py. */
