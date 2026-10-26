@@ -74,7 +74,12 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
 /// bits as 0 on an Arc A770; gdn_recurrence takes it by default on Alchemist (STRATA_GDN_XE=0 off, =1 any Intel GPU).
 void gdn_recurrence_variant(int variant, float* state, const float* h, const float* gate, const float* beta,
                             const float* z, const float* gamma, float eps, float* y, uint16_t* y16, int64_t T,
-                            void* stream, int64_t ld16 = 0);
+                            void* stream, int64_t ld16 = 0, bool with_out = true);
+/// KVA: the same recurrence kernels as gdn_recurrence, bit for bit, without the output normalization: state, h,
+/// gate, beta and the scratch `y` only.  The output projection and the gated residual write have no consumer when
+/// only the state advances, and their input (z, the gate projection) is not needed either.
+void gdn_recurrence_state_only(float* state, const float* h, const float* gate, const float* beta, float* y,
+                               int64_t T, void* stream);
 
 // ---- MoE
 /// softmax over 512, top-10 (ties to the lower id), weights renormalised over the ten (the native router).
