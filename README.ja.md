@@ -30,7 +30,7 @@ GPU の計算を CUDA から SYCL と Level Zero に書き直し、同じコー�
 
 - **チャットとコーディングエージェント**: ブラウザのチャット、端末の会話、OpenAI 互換と Anthropic 互換の API で使えます。
 - **画像**: 画像を読ませることも、画像を作ることもできます（任意。[画像の生成](docs/IMAGE.ja.md)）。
-- **ほかのモデル**: Qwen3.8-Flash-Next の調整版や圧縮の違う版のほか、Ornith-1.5、llm-jp-4.1、Qwen3.6-35B-A3B、GLM-5.3-Flash も動かせます（BETA）。
+- **ほかのモデル**: Qwen3.8-Flash-Next の調整版や圧縮の違う版のほか、Ornith-1.5、llm-jp-4.1、Qwen3.6-35B-A3B、Qwen3.5-9B、GLM-5.3-Flash も動かせます（BETA）。
 - **GPU は 1 枚が基本**です。同じ PC の 2 枚以上の GPU に層を分けて載せることもでき、メーカーの違う GPU も組み合わせられます（NVIDIA を含むときは contrib-llvm のビルド）。
   2 枚のときは、2 枚目を層の分担にするか、1 枚目のキャッシュの助けにするかを、速い方に自動で選びます（[MULTIGPU](docs/MULTIGPU.ja.md)）。
 - **自由ソフトウェアだけでも動きます**（free のビルド、Debian main に入れられる程度に自由な構成。[ソースから作ります](docs/BUILD.ja.md#deb-と-rpm-のパッケージ)）。
@@ -92,9 +92,10 @@ RAM がそれより少ない PC では、Coder（32 GB）、Gyro（36 GB、RAM �
 | **Ornith-1.5**（BETA） | 350 億（1 トークンで 30 億） | 21〜80 GB | RAM の少ない PC 向け |
 | **llm-jp-4.1**（BETA） | 320 億（1 トークンで 30 億） | 30〜73 GB | 日本語と英語の思考するモデル |
 | **Qwen3.6-35B-A3B**（BETA） | 350 億（1 トークンで 30 億） | 31〜46 GB | 思考するモデル。RAM の少ない PC 向け |
+| **Qwen3.5-9B**（BETA） | 90 億（密） | 8 GB（VRAM は 8〜20 GB） | 画像も読む思考するモデル。重みを GPU に全部載せる。拒否を外した版もあります |
 | **GLM-5.3-Flash**（BETA） | 3,200 億（1 トークンで 180 億） | RAM と VRAM で 101〜165 GB | 思考する大きなモデル。RAM の多い PC 向け |
 
-BETA の 4 つは、画像（読ませることも作ることも）にまだ対応していません。大きさの表とオプションは [DETAILS](docs/DETAILS.ja.md#qwen38-flash-next-以外のモデルornith-15llm-jp-41qwen36-35b-a3bglm-53-flash) にあります。
+BETA のモデルは、画像の生成にまだ対応していません。画像を読ませられるのは Qwen3.5-9B だけです。大きさの表とオプションは [DETAILS](docs/DETAILS.ja.md#qwen38-flash-next-以外のモデルornith-15llm-jp-41qwen36-35b-a3bqwen35-9bglm-53-flash) にあります。
 
 ### Qwen3.8-Flash-Next の版と大きさ
 
@@ -363,6 +364,7 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
    - huihui-ai による [abliterated 版](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF)。
    - Ornith AI の [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)（GSQ-RCO は pfeifferj）、LLM-jp の [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)、
      Qwen の [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)、Z.ai の [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)（どちらも GGUF は Unsloth）。
+   - Qwen の [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)（GGUF は Unsloth）と、HauhauCS による拒否を外した版の [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive)。
    - 画像の生成: Qwen の Qwen-Image-2.1、Microsoft の Mage-Flow、RicemanT の MageTrail と Black Forest Labs の Flux2 VAE、Tencent の HunyuanImage 3.0、文の読み手の Qwen3-VL（[IMAGE](docs/IMAGE.ja.md#ライセンス)）。
 
   モデルのファイルには、それぞれのライセンスが適用されます。

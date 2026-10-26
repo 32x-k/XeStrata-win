@@ -304,16 +304,21 @@ RAM だけで動かすなら、Gyro-Coder-L は 35 GB、Gyro-Coder は 26 GB 要
 ./setup.sh --setup --family huihui-swift --model IQ2_XS
 ```
 
-### Qwen3.8-Flash-Next 以外のモデル（Ornith-1.5、llm-jp-4.1、Qwen3.6-35B-A3B、GLM-5.3-Flash）
+### Qwen3.8-Flash-Next 以外のモデル（Ornith-1.5、llm-jp-4.1、Qwen3.6-35B-A3B、Qwen3.5-9B、GLM-5.3-Flash）
 
-setup の最初の質問では、Qwen3.8-Flash-Next とは作りの違う 4 つの MoE モデルも選べます。
-どれも GGUF のファイル（GLM-5.3-Flash は 3〜4 つに分かれたもの）をそのまま読み、よく使うエキスパートを GPU の VRAM に、残りを RAM に置きます（VRAM にないものの扱いは Qwen3.8-Flash-Next と同じです）。
+setup の最初の質問では、Qwen3.8-Flash-Next とは作りの違う 4 つの MoE モデルと、密な Qwen3.5-9B も選べます。
+どれも GGUF のファイル（GLM-5.3-Flash は 3〜4 つに分かれたもの）をそのまま読みます。
+MoE のモデルは、よく使うエキスパートを GPU の VRAM に、残りを RAM に置きます（VRAM にないものの扱いは Qwen3.8-Flash-Next と同じです）。
+Qwen3.5-9B は、重みをすべて GPU の VRAM に置きます。
 
 - **[Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)**（Ornith AI、MIT）: 35B、1 トークンで使うのは 3B の Qwen3.5 系の MoE です。文脈は 256K まで。
   公式の Q4_K_M〜BF16 と、pfeifferj による GSQ-RCO の 3 ビットと 3.5 ビット（[コミュニティの再現](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF)で、ISTA-DASLab のものではありません）があります。
 - **[llm-jp-4.1-32b-a3b-thinking](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)**（LLM-jp、Apache-2.0）: 32B、1 トークンで使うのは 3B の、日本語と英語の思考するモデルです。文脈は 256K まで。
 - **[Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)**（Qwen、Apache-2.0）: 35B、1 トークンで使うのは 3B の Qwen3.5 系の思考する MoE です。文脈は 256K まで。
   GGUF は Unsloth が MTP の層付きで作った UD-Q4_K_XL・UD-Q6_K_XL・Q8_0 です。
+- **[Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)**（Qwen、Apache-2.0）: 9B の密な思考するモデルで、画像も読めます。文脈は 256K まで。
+  GGUF は Unsloth の Q4_K_M・Q6_K・Q8_0・BF16 です。
+  HauhauCS による拒否を外した版の [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive)（Apache-2.0、同じ 4 つの大きさ）も選べます（`--family qwen35-uncensored`）。拒否がずっと少なく、安全のための絞り込みも弱いので、書いたものを確かめてください。
 - **[GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)**（Z.ai、MIT）: 320B、1 トークンで使うのは 18B の思考する MoE です。setup で選べる文脈は 256K まで。
   注意は KDA（線形の注意）と DSA（選んだトークンだけを見る注意）で、4 本の流れ（mHC）を持ちます。GGUF は Unsloth の UD-IQ1_S・UD-IQ3_XXS・UD-IQ4_XS です。
 
@@ -331,12 +336,18 @@ setup の最初の質問では、Qwen3.8-Flash-Next とは作りの違う 4 つ�
 | Qwen3.6-35B-A3B | **UD-Q4_K_XL** | 22.9 GB | 31 GB | 4 GB から |
 | | **UD-Q6_K_XL** | 32.6 GB | 41 GB | 6 GB から |
 | | Q8_0 | 37.8 GB | 46 GB | 6 GB から |
+| Qwen3.5-9B | Q4_K_M | 5.7 GB | 8 GB | 8 GB から |
+| | Q6_K | 7.5 GB | 8 GB | 10 GB から |
+| | Q8_0 | 9.5 GB | 8 GB | 12 GB から |
+| | BF16 | 17.9 GB | 8 GB | 20 GB から |
 | GLM-5.3-Flash | **UD-IQ1_S** | 93.1 GB | 101 GB | 12 GB から |
 | | **UD-IQ3_XXS** | 120.4 GB | 128 GB | 12 GB から |
 | | UD-IQ4_XS | 156.8 GB | 165 GB | 12 GB から |
 
 RAM の目安は、ダウンロードの大きさに約 8 GB を足したものです（GLM-5.3-Flash は RAM と VRAM の合計）。
 それより少ないと、RAM と VRAM に入らないエキスパートをモデルのファイルから読むので、遅くなります。
+Qwen3.5-9B の VRAM の目安は、32K の文脈で重みと KV キャッシュ（1 トークン 32 KB）に約 1 GB を足したものです（拒否を外した版も同じ）。
+setup は GPU の VRAM に入る最も大きな版を勧め、入らない組み合わせは警告します。VRAM に入らない重みを RAM から流す仕組みはまだありません。
 太字は、このリリースで llama.cpp と答えを比べた版です。
 ほかの版も同じ型のテンソルでできていて、その型は太字の版とカーネルの試験で確かめています（setup は「untested」と表示します）。
 
@@ -344,13 +355,16 @@ RAM の目安は、ダウンロードの大きさに約 8 GB を足したもの�
 ./setup.sh --setup --family ornith --model Q4_K_M
 ./setup.sh --setup --family llmjp
 ./setup.sh --setup --family qwen36 --model UD-Q4_K_XL
+./setup.sh --setup --family qwen35 --model Q4_K_M
+./setup.sh --setup --family qwen35-uncensored --model Q8_0
 ./setup.sh --setup --family glm53 --model UD-IQ3_XXS
 ```
 
 API は、思考と答えの分離、ストリーミング、ツールの呼び出しを含めて使えます。
 Ornith の公式の版（Q4_K_M〜BF16）、Qwen3.6、GLM-5.3-Flash は、モデルの MTP の層で 2 つ先までの下書きを作り、窓でまとめて確かめます（推測デコード、greedy の要求だけ。GSQ-RCO の版と llm-jp には MTP の層がありません）。
 `setup --gpus` で 2 枚以上の GPU を選ぶと、層を GPU に分けて動かします（最初の GPU が前の層、次の GPU がその後の層と head と MTP の層。分割点は各 GPU の空いたメモリの割合から決めます）。VRAM に置けるエキスパートは GPU を合わせた分になります。
-まだ使えないのは、画像、省 RAM モードなど Qwen3.8-Flash-Next のためのオプションです（KV キャッシュの精度は `--kv int8` だけ。GLM-5.3-Flash ではまだ使えません）。
+Qwen3.5-9B は画像を読めます（setup が Qwen3.8-Flash-Next と同じく聞き、24 GB 以上の GPU では GPU の、それ未満では CPU の読み手を使います）。
+まだ使えないのは、ほかのモデルの画像、画像の生成、省 RAM モードなど Qwen3.8-Flash-Next のためのオプションです（KV キャッシュの精度は `--kv int8` だけ。GLM-5.3-Flash ではまだ使えません）。
 RAM がエキスパートの全体に足りないとき、エンジンは VRAM に置かないエキスパートを RAM の空きの許す限り RAM に置き、残りをモデルのファイルから OS のファイルキャッシュ越しに読みます（遅くなります。setup は RAM と VRAM を合わせても足りないとき警告します）。
 そのとき、上の `STRATA_RAM_ADAPT=<n>` で RAM のコピーを会話に従わせられます（1 GPU のとき）。
 `STRATA_DISK_SKIP_FROM=R`（opt-in、答えが変わる、Project Maya の #109 から）にすると、VRAM にも RAM のコピーにもなくファイルから読むエキスパートを、順位 R 以下で選んだトークンでは寄与を 0 にし、窓のどのトークンもその順位でしか選ばないものは読みません（SSD を待ちません）。GLM-5.3-Flash UD-IQ3_XXS を RAM 56 GB に絞った B70 の decode は、R=6 で 4.33 → 5.11 トークン/秒（128 トークンが同じ）、R=4 で 5.93（13 トークン目から分かれる）でした。
@@ -380,6 +394,7 @@ RAM がエキスパートの全体に足りないとき、エンジンは VRAM �
 | `--draft-vocab PATH` | MTP の層の下書きを、このトークンの部分集合（`data/draft_vocab*.bin`）の中だけで作る。ヘッドを読む量が減ります（setup が Qwen3.6 の設定に、`--draft-vocab` の選択に従って書きます） |
 | `--layer-split K[,K2..]` / `auto` | 層を GPU に分ける。最初の GPU が層 K の前まで、次の GPU が K から、…（`auto`: 各 GPU の空いたメモリの割合で。setup の `--gpus` で書かれます） |
 | `--split-device D[,D2..]` | 2 枚目以降の GPU（エンジンの番号か PCI アドレス。既定はほかの単体の GPU） |
+| `--vision` | `--serve` で画像つきの要求を受ける（Qwen3.5-9B と qwen35moe のモデル。setup が画像を選んだとき書きます） |
 | `--rope-scaling none\|linear\|yarn`、`--rope-scale F`、`--yarn-orig-ctx N` | 文脈の延長 |
 
 ### RAM がモデルより少ないとき（省 RAM モード）
@@ -1112,7 +1127,7 @@ B70 の IQ2_XS で、4,996 トークンの会話（INT8 の KV）のファイル
 - 実行の設定の `sampling` のブロックは、項目を省いた要求の既定を決めます（`"sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}`）。
   要求自身の項目がいつも優先します。
   ブロックがなければ、サンプリングの項目のない要求はモデルカードの勧める値で生成します（upstream #2685）。
-  思考の有無で選び、Qwen3.8-Flash-Next（Swift・Gyro も）は思考ありで temperature 1.0・top_p 0.95・top_k 20、思考なしで temperature 0.7・top_p 0.8・top_k 20・presence_penalty 1.5、Qwen3.6-35B-A3B は思考ありで 1.0・0.95・20・presence_penalty 1.5、思考なしで 0.7・0.8・20・1.5 です。
+  思考の有無で選び、Qwen3.8-Flash-Next（Swift・Gyro も）は思考ありで temperature 1.0・top_p 0.95・top_k 20、思考なしで temperature 0.7・top_p 0.8・top_k 20・presence_penalty 1.5、Qwen3.6-35B-A3B と Qwen3.5-9B は思考ありで 1.0・0.95・20・presence_penalty 1.5、思考なしで 0.7・0.8・20・1.5、HauhauCS の Qwen3.5-9B は思考ありで 0.6・0.95・20、思考なしで 0.7・0.8・20 です。
   Ornith-1.5 は model card の一般用途の 0.6・0.95・20（思考の有無によらず）、GLM-5.3-Flash は generation_config の temperature 1.0・top_p 0.95 です。
   llm-jp は model card に推奨がないので表になく、これまでどおり貪欲に生成します。
   優先は要求、web の画面の共有のチャットの設定、設定の `sampling` のブロック、モデルカードの順です。
@@ -1584,7 +1599,7 @@ Strata と ggml / llama.cpp（どちらも MIT）から来たコードも XeStra
   Gyro は agentionai の [agentionai/Qwen3.8-Flash-Next-Gyro-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)、
   Gyro-Coder は同じく [agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF)。
   abliterated 版は huihui-ai の [huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF)。
-  ほかのモデルは、Ornith AI の [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)（GSQ-RCO は pfeifferj の[再現](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF)）、LLM-jp の [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)、Qwen の [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) と Z.ai の [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)（どちらも GGUF は Unsloth）。
+  ほかのモデルは、Ornith AI の [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)（GSQ-RCO は pfeifferj の[再現](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF)）、LLM-jp の [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)、Qwen の [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) と Z.ai の [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)（どちらも GGUF は Unsloth）、Qwen の [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)（GGUF は Unsloth）と HauhauCS の [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive)。
   画像のモデルは、Qwen の Qwen-Image-2.1 と Qwen-Image-2.1-Turbo（GGUF は Unsloth）、Microsoft の Mage-Flow（Comfy-Org の safetensors）、RicemanT の MageTrail と Black Forest Labs の Flux2 VAE（FLUX.2-klein-4B のもの）、Tencent の HunyuanImage 3.0（量子化は PedroMarinhoDev の ComfyUI 向けの単一ファイル）、文の読み手の Qwen3-VL（Unsloth、AtomicChat、huihui-ai と noctrex の版）（[IMAGE](IMAGE.ja.md#ライセンス)）。
   重みにはそれぞれのライセンスが適用されます。
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)**（MIT）: i-quant の形式、`src/kernels/xe/` に書き写した GPU の内積と展開、

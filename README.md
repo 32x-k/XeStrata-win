@@ -30,7 +30,7 @@ The models, the install, the app and the API are much the same as Strata's.
 
 - **Chat and coding agents:** a chat in the browser, a chat in the terminal, and OpenAI- and Anthropic-compatible APIs.
 - **Images:** it reads pictures, and it can make them too (optional; [Image generation](docs/IMAGE.md)).
-- **Other models:** besides tuned and differently compressed versions of Qwen3.8-Flash-Next, it runs Ornith-1.5, llm-jp-4.1, Qwen3.6-35B-A3B and GLM-5.3-Flash (BETA).
+- **Other models:** besides tuned and differently compressed versions of Qwen3.8-Flash-Next, it runs Ornith-1.5, llm-jp-4.1, Qwen3.6-35B-A3B, Qwen3.5-9B and GLM-5.3-Flash (BETA).
 - **One GPU, as a rule.** The layers can also be spread over two or more GPUs in the same PC, of different makers too (with NVIDIA, in the contrib-llvm build).
   With two, it chooses by itself whichever is faster: the second GPU taking a share of the layers, or helping the first one's cache ([MULTIGPU](docs/MULTIGPU.md)).
 - **Runs with free software only, too** (the free build, free enough for Debian main; [made from the source](docs/BUILD.md#the-deb-and-rpm-packages)).
@@ -95,10 +95,11 @@ To add another model later, run `xestrata --setup` too.
 | **Ornith-1.5** (BETA) | 35B (3B a token) | 21-80 GB | a PC with less RAM |
 | **llm-jp-4.1** (BETA) | 32B (3B a token) | 30-73 GB | a thinking model for Japanese and English |
 | **Qwen3.6-35B-A3B** (BETA) | 35B (3B a token) | 31-46 GB | a thinking model; a PC with less RAM |
+| **Qwen3.5-9B** (BETA) | 9B (dense) | 8 GB (VRAM 8-20 GB) | a thinking model that reads images too, every weight on the GPU; also with its refusals removed |
 | **GLM-5.3-Flash** (BETA) | 320B (18B a token) | 101-165 GB of RAM and VRAM | a large thinking model; a PC with a lot of RAM |
 
-The four BETA models do not take images yet (neither reading nor making them). Their sizes and options are in
-[DETAILS](docs/DETAILS.md#or-models-other-than-qwen38-flash-next-ornith-15-llm-jp-41-qwen36-35b-a3b-glm-53-flash).
+The BETA models do not make images yet; of them only Qwen3.5-9B reads images. Their sizes and options are in
+[DETAILS](docs/DETAILS.md#or-models-other-than-qwen38-flash-next-ornith-15-llm-jp-41-qwen36-35b-a3b-qwen35-9b-glm-53-flash).
 
 ### Qwen3.8-Flash-Next's versions and sizes
 
@@ -379,6 +380,7 @@ permission under GPL section 7, what goes in, and how to report).
    - the [abliterated versions](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF), by huihui-ai;
    - [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) by Ornith AI (the GSQ-RCO ones by pfeifferj), [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf) by LLM-jp,
      [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) by Qwen and [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) by Z.ai (both GGUFs by Unsloth);
+   - [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) by Qwen (GGUFs by Unsloth), and the version with its refusals removed, [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive), by HauhauCS;
    - image generation: Qwen's Qwen-Image-2.1, Microsoft's Mage-Flow, RicemanT's MageTrail with Black Forest Labs' Flux2 VAE, Tencent's HunyuanImage 3.0, and Qwen3-VL as the text encoder ([IMAGE](docs/IMAGE.md#licenses)).
 
   Each model's own license applies to its files.

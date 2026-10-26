@@ -314,11 +314,14 @@ The experimental speed projection does not work with them.
 ./setup.sh --setup --family huihui-swift --model IQ2_XS
 ```
 
-### Or: models other than Qwen3.8-Flash-Next (Ornith-1.5, llm-jp-4.1, Qwen3.6-35B-A3B, GLM-5.3-Flash)
+### Or: models other than Qwen3.8-Flash-Next (Ornith-1.5, llm-jp-4.1, Qwen3.6-35B-A3B, Qwen3.5-9B, GLM-5.3-Flash)
 
-setup's first question also offers four MoE models built differently from Qwen3.8-Flash-Next.
-Each is read from its GGUF file as it is (GLM-5.3-Flash's in three or four parts); the most used experts are kept in the
-GPU's VRAM and the rest in RAM (the ones VRAM does not hold are handled as for Qwen3.8-Flash-Next).
+setup's first question also offers four MoE models built differently from Qwen3.8-Flash-Next, and the dense
+Qwen3.5-9B.
+Each is read from its GGUF file as it is (GLM-5.3-Flash's in three or four parts).
+The MoE models keep the most used experts in the GPU's VRAM and the rest in RAM (the ones VRAM does not hold are
+handled as for Qwen3.8-Flash-Next).
+Qwen3.5-9B keeps every weight in the GPU's VRAM.
 
 - **[Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)** (Ornith AI, MIT): a Qwen3.5-family
   MoE of 35B with 3B active per token, context up to 256K. The official Q4_K_M to BF16, and pfeifferj's GSQ-RCO 3 and
@@ -329,6 +332,12 @@ GPU's VRAM and the rest in RAM (the ones VRAM does not hold are handled as for Q
 - **[Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)** (Qwen, Apache-2.0): a thinking
   Qwen3.5-family MoE of 35B with 3B active per token, context up to 256K. The GGUFs are Unsloth's UD-Q4_K_XL,
   UD-Q6_K_XL and Q8_0 with the MTP layer.
+- **[Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)** (Qwen, Apache-2.0): a dense thinking model of 9B
+  that reads images too, context up to 256K. The GGUFs are Unsloth's Q4_K_M, Q6_K, Q8_0 and BF16.
+  HauhauCS's version with its refusals removed,
+  [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive)
+  (Apache-2.0, the same four sizes), can be chosen too (`--family qwen35-uncensored`). It refuses far less, and its
+  safety filtering is reduced, so check what it writes.
 - **[GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)** (Z.ai, MIT): a thinking MoE of 320B with 18B
   active per token; setup offers contexts up to 256K. Its attention is KDA (linear attention) and DSA (attention over
   the tokens it selects), with four residual streams (mHC). The GGUFs are Unsloth's UD-IQ1_S, UD-IQ3_XXS and UD-IQ4_XS.
@@ -347,12 +356,20 @@ GPU's VRAM and the rest in RAM (the ones VRAM does not hold are handled as for Q
 | Qwen3.6-35B-A3B | **UD-Q4_K_XL** | 22.9 GB | 31 GB | 4 GB and up |
 | | **UD-Q6_K_XL** | 32.6 GB | 41 GB | 6 GB and up |
 | | Q8_0 | 37.8 GB | 46 GB | 6 GB and up |
+| Qwen3.5-9B | Q4_K_M | 5.7 GB | 8 GB | 8 GB and up |
+| | Q6_K | 7.5 GB | 8 GB | 10 GB and up |
+| | Q8_0 | 9.5 GB | 8 GB | 12 GB and up |
+| | BF16 | 17.9 GB | 8 GB | 20 GB and up |
 | GLM-5.3-Flash | **UD-IQ1_S** | 93.1 GB | 101 GB | 12 GB and up |
 | | **UD-IQ3_XXS** | 120.4 GB | 128 GB | 12 GB and up |
 | | UD-IQ4_XS | 156.8 GB | 165 GB | 12 GB and up |
 
 The RAM is about the download's size plus 8 GB (for GLM-5.3-Flash, RAM and VRAM together).
 With less, the experts that RAM and VRAM do not hold are read from the model's files, which is slower.
+Qwen3.5-9B's VRAM is its weights and, at a 32K context, its KV cache (32 KB a token) and about 1 GB more (the same
+for the version without refusals).
+setup recommends the largest version the GPU's VRAM holds and warns of a choice it does not; weights that do not fit
+the VRAM are not streamed from RAM yet.
 The sizes in bold are the files whose answers this release compared with llama.cpp's.
 The others are made of the same tensor types, checked on those files and in the kernels' tests (setup marks them
 "untested").
@@ -361,6 +378,8 @@ The others are made of the same tensor types, checked on those files and in the 
 ./setup.sh --setup --family ornith --model Q4_K_M
 ./setup.sh --setup --family llmjp
 ./setup.sh --setup --family qwen36 --model UD-Q4_K_XL
+./setup.sh --setup --family qwen35 --model Q4_K_M
+./setup.sh --setup --family qwen35-uncensored --model Q8_0
 ./setup.sh --setup --family glm53 --model UD-IQ3_XXS
 ```
 
@@ -369,7 +388,9 @@ Ornith's official versions (Q4_K_M to BF16), Qwen3.6 and GLM-5.3-Flash draft up 
 With two or more GPUs chosen by `setup --gpus`, the layers are split across them (the first GPU runs the first layers,
 the next the later ones, the head and the MTP layer; the points follow each GPU's share of the free memory), and the
 experts in VRAM are all the GPUs' together.
-Not yet: images, and the options made for Qwen3.8-Flash-Next such as the low-RAM modes (of the KV cache's precisions only `--kv int8`, and not for GLM-5.3-Flash yet).
+Qwen3.5-9B reads images (setup asks as for Qwen3.8-Flash-Next, and takes the GPU reader on a GPU of 24 GB and more,
+the CPU reader below that).
+Not yet: the other models' images, image generation, and the options made for Qwen3.8-Flash-Next such as the low-RAM modes (of the KV cache's precisions only `--kv int8`, and not for GLM-5.3-Flash yet).
 When RAM is short of all the experts, the engine keeps the ones VRAM does not hold in RAM as far as it has room and
 reads the rest from the model file through the OS file cache (slower; setup warns of it when the RAM and the VRAM
 together are short).
@@ -401,6 +422,7 @@ The engine's options (added to the settings' `args`):
 | `--draft-vocab PATH` | the MTP layer drafts only tokens of this subset (`data/draft_vocab*.bin`), reading less of the head (setup writes it into Qwen3.6's settings, after its `--draft-vocab` choice) |
 | `--layer-split K[,K2..]` / `auto` | split the layers across the GPUs: the first runs the layers before K, the next those from K on, ... (`auto`: by each GPU's share of the free memory; setup's `--gpus` writes it) |
 | `--split-device D[,D2..]` | the later GPUs (engine numbers or PCI addresses; by default the other discrete GPUs) |
+| `--vision` | with `--serve`, take requests with images (Qwen3.5-9B and the qwen35moe models; setup writes it when images are chosen) |
 | `--rope-scaling none\|linear\|yarn`, `--rope-scale F`, `--yarn-orig-ctx N` | context extension |
 
 ### Less RAM than the model: the low-RAM mode
@@ -1137,7 +1159,7 @@ The same held on the small configuration (8 GB, no XMX) and with the icpx build.
   (`"sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}`).
   A request's own fields always win.
   With no block at all, a request without sampling keys gets the sampling the model card recommends (upstream #2685).
-  It is picked by the thinking state: Qwen3.8-Flash-Next (Swift and Gyro too) thinking temperature 1.0, top_p 0.95, top_k 20; not thinking temperature 0.7, top_p 0.8, top_k 20, presence_penalty 1.5; Qwen3.6-35B-A3B thinking 1.0 / 0.95 / 20 with presence_penalty 1.5, not thinking 0.7 / 0.8 / 20 with 1.5.
+  It is picked by the thinking state: Qwen3.8-Flash-Next (Swift and Gyro too) thinking temperature 1.0, top_p 0.95, top_k 20; not thinking temperature 0.7, top_p 0.8, top_k 20, presence_penalty 1.5; Qwen3.6-35B-A3B and Qwen3.5-9B thinking 1.0 / 0.95 / 20 with presence_penalty 1.5, not thinking 0.7 / 0.8 / 20 with 1.5; HauhauCS's Qwen3.5-9B thinking 0.6 / 0.95 / 20, not thinking 0.7 / 0.8 / 20.
   Ornith-1.5 takes its card's set for general tasks, 0.6, 0.95 and 20 (with or without thinking), GLM-5.3-Flash its
   generation_config's temperature 1.0 and top_p 0.95.
   llm-jp's card names no sampling, so it is not in the table and decodes greedy as before.
@@ -1618,7 +1640,7 @@ The model files are not part of it; their licenses apply to them (below).
   Gyro: [agentionai/Qwen3.8-Flash-Next-Gyro-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF) by agentionai;
   Gyro-Coder: [agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF), also by agentionai.
   The abliterated versions: [huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF) by huihui-ai.
-  The other models: [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) by Ornith AI (the GSQ-RCO ones pfeifferj's [reproduction](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF)), [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf) by LLM-jp, [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) by Qwen and [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) by Z.ai (both GGUFs by Unsloth).
+  The other models: [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF) by Ornith AI (the GSQ-RCO ones pfeifferj's [reproduction](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF)), [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf) by LLM-jp, [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) by Qwen and [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) by Z.ai (both GGUFs by Unsloth), [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) by Qwen (GGUFs by Unsloth) and [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive) by HauhauCS.
   The image models: Qwen's Qwen-Image-2.1 and Qwen-Image-2.1-Turbo (GGUFs by Unsloth), Microsoft's Mage-Flow (Comfy-Org's safetensors), RicemanT's MageTrail with Black Forest Labs' Flux2 VAE (FLUX.2-klein-4B's), Tencent's HunyuanImage 3.0 (quantized as single files for ComfyUI by PedroMarinhoDev), and the text encoders, Qwen3-VL (Unsloth's, AtomicChat's, and huihui-ai's by noctrex) ([IMAGE](IMAGE.md#licenses)).
   Their licenses apply to the weights.
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)** (MIT): the i-quant formats, the GPU dot products and dequantizers transcribed in `src/kernels/xe/`,
