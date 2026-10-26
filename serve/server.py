@@ -3531,6 +3531,9 @@ def child_env(cfg: dict, *, offline: bool = False) -> dict:
         env[var] = os.pathsep.join(dirs + ([env[var]] if env.get(var) else []))
     if cfg.get("backend") == "hip":
         hip_env_guard(env, cfg)
+        note = sh_stream_warning(env, cfg)
+        if note:
+            print(note, flush=True)
         auto = hip_auto_devices(cfg, env)
         if auto:
             env["HIP_VISIBLE_DEVICES"] = ",".join(str(i) for i in auto)
@@ -3543,6 +3546,20 @@ def _dir_writable(p: str) -> bool:
             return True
     except OSError:
         return False
+
+
+def sh_stream_warning(env: dict, cfg: dict) -> str | None:
+    """#3895: the shared-expert fork (STRATA_SH_STREAM=1) together with KV streaming (--kv-resident) made one Windows RX 6900 XT fail on the first
+    request ("verify: unspecified launch failure"); each alone, or Linux, did not. A warning, not a refusal: the person set the variable, the
+    engine runs as asked, and the line says what to take out."""
+    if os.name != "nt" or str(env.get("STRATA_SH_STREAM", "")).strip() in ("", "0"):
+        return None
+    args = [str(a) for a in cfg.get("args") or []]
+    if "--kv-resident" not in args:
+        return None
+    return ("[strata] WARNING: STRATA_SH_STREAM=1 with --kv-resident (KV streaming) failed on the first request on one Windows RX 6000 PC "
+            "(\"verify: unspecified launch failure\", #3895). If the engine stops that way, take STRATA_SH_STREAM out of the config's env "
+            "(AMD runs without it by default) or run without --kv-resident, and tell us the card and the driver.")
 
 
 def hip_env_guard(env: dict, cfg: dict) -> list[str]:
