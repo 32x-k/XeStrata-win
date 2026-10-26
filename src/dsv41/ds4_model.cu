@@ -885,6 +885,7 @@ struct Model::Impl {
     x3::Mat d_main_proj;
     float *d_main_norm = nullptr, *d_norm = nullptr, *d_conf = nullptr;
     uint16_t *d_mk_embed = nullptr, *d_mk_head = nullptr;   // BF16 [vocab][rank], F16 [vocab][rank]
+    uint8_t* d_mk_head_q8 = nullptr;   // the markov head as Q8_0 blocks (the same bias, half the bytes a step)
     // a head group of two or more: the markov steps over its members (each its rows of the bias and an argmax of its
     // share, the global one through host-mapped slots [step][member] {value, index, seq}) in place of the lead's whole
     // rows - E host-mapped (each member reads the picked token's row), a draft's seq in mk_seq
@@ -1619,14 +1620,59 @@ struct Model::Impl {
         return upload(d, *t, p, err);
     }
 
+    // The markov bias's head as Q8_0 blocks of 32 (34 B: F16 d + 32 int8) instead of F16 values: the same bias sums with the
+    // quantisation's error, half the bytes the drafter's five markov steps read (66 MB -> 33 MB) and half the memory.  The
+    // pack is untouched: the F32 / F16 / BF16 tensor is quantised as it is loaded.
+    bool mk_head_q8(Dev& d, const std::string& name, uint8_t*& p, std::string& err, size_t* acct) {
+        const Tensor* t = pk.get(name);
+        if (t == nullptr || (t->dtype != "F32" && t->dtype != "F16" && t->dtype != "BF16")) {
+            err = name + ": not an F32 / F16 / BF16 tensor";
+            return false;
+        }
+        const size_t n = t->bytes / (t->dtype == "F32" ? 4 : 2);
+        if (n == 0 || n % 32 != 0) {
+            err = name + ": not a whole number of 32-value blocks";
+            return false;
+        }
+        std::vector<uint8_t> raw(t->bytes);
+        if (!pk.read(*t, raw.data())) {
+            err = name + ": read failed";
+            return false;
+        }
+        std::vector<float> v(n);
+        for (size_t i = 0; i < n; ++i) {
+            if (t->dtype == "F32") std::memcpy(&v[i], raw.data() + i * 4, 4);
+            else v[i] = t->dtype == "F16" ? f16_to_f32(((const uint16_t*) raw.data())[i])
+                                          : bf16_to_f32(((const uint16_t*) raw.data())[i]);
+        }
+        const size_t nb = n / 32;
+        std::vector<uint8_t> q(nb * 34);
+        for (size_t b = 0; b < nb; ++b) {
+            const float* s = v.data() + b * 32;
+            float amax = 0.0f;
+            for (int i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(s[i]));
+            const float dd = amax > 0.0f ? amax / 127.0f : 0.0f;
+            const uint16_t dh = strata::kernels::f16_from_f32(dd);
+            std::memcpy(q.data() + b * 34, &dh, 2);
+            int8_t* o = (int8_t*) (q.data() + b * 34 + 2);
+            for (int i = 0; i < 32; ++i) {
+                const float x = dd > 0.0f ? s[i] / dd : 0.0f;
+                o[i] = (int8_t) std::max(-127.0f, std::min(127.0f, std::round(x)));
+            }
+        }
+        if (!dalloc(d, p, nb * 34, err, acct)) return false;
+        cudaSetDevice(d.id);
+        CK(cudaMemcpy(p, q.data(), nb * 34, cudaMemcpyHostToDevice));
+        return true;
+    }
+
     size_t mat_bytes(const std::string& pre) const {
         if (const Tensor* t = pk.get(pre + ".weight")) return align256(t->bytes);
         size_t b = 0;
         for (const char* s : {".trellis", ".suh", ".svh"})
             if (const Tensor* t = pk.get(pre + s)) b += align256(t->bytes);
         return b;
-    }
-    size_t tensor_bytes(const std::string& name) const {
+    }    size_t tensor_bytes(const std::string& name) const {
         const Tensor* t = pk.get(name);
         return t ? align256(t->bytes * (t->dtype == "F32" ? 1 : 2)) : 0;
     }
@@ -3790,7 +3836,7 @@ struct Model::Impl {
                     return false;
                 }
                 if (!dalloc(d, d_mk_embed, te->bytes / 2, err, acct) || !upload(d, *te, d_mk_embed, err) ||
-                    !f16raw(d, Z + "markov_head.head.weight", d_mk_head, err, acct))
+                    !mk_head_q8(d, Z + "markov_head.head.weight", d_mk_head_q8, err, acct))
                     return false;
             }
         }
@@ -6845,7 +6891,7 @@ struct Model::Impl {
                 sp.seed = dq_seed;
             }
             for (int i = 0; i < T; ++i) {   // the markov bias of the token before, then that position's draft
-                markov_add(hd.logits + (size_t) i * V, d_mk_embed, d_mk_head, d_ints + i, V, R, hd.st);
+                markov_add_q8(hd.logits + (size_t) i * V, d_mk_embed, d_mk_head_q8, d_ints + i, V, R, hd.st);
                 if (drafts_q) {
                     sp.counter = dq_counter + (uint64_t) i;
                     strata::dsv41k::sample_draft(hd.logits + (size_t) i * V, 1, V, sp, d_specq + i, d_ints + i + 1, hd.st);
