@@ -503,6 +503,64 @@ int main() {
         check(conversation_checkpoints_merge(std::move(none), back) && back.empty(), "no checkpoints: nothing to do");
     }
     {
+        // #1503, the cross-conversation leak: the retained K/V of a restored conversation must never be reused to
+        // park ANOTHER conversation the main session later holds (a batch slot gave its conversation back)
+        auto kv = [](size_t n) {
+            std::vector<ConversationKv> v(2);
+            for (auto& l : v) l.k.resize(n, 1);
+            return v;
+        };
+        ConversationCache cache(1 << 20, 4);
+        const std::vector<int32_t> a = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+        std::vector<std::vector<ConversationKv>> st;
+        st.push_back(kv(100));
+        cache.retain(kv(500), 16, std::move(st), a);
+        std::vector<int32_t> b(16, 99);
+        auto other = cache.take_reuse_for(b);
+        check(other.kv.empty() && other.stages.empty() && other.unchanged_tokens == 0,
+              "another conversation never gets the retained K/V");
+        check(cache.retained_bytes() == 0, "the retained K/V is dropped once refused");
+        cache.retain(kv(500), 16, {}, a);
+        check(cache.retained_tokens() == 16, "the retained extent is reported");
+        std::vector<int32_t> cont(a.begin(), a.begin() + 10);
+        cont.push_back(42);
+        cont.push_back(43);
+        auto partly = cache.take_reuse_for(cont);
+        check(partly.unchanged_tokens == 10 && !partly.kv.empty(), "a conversation that diverges reuses only the shared prefix");
+        std::vector<std::vector<ConversationKv>> st2;
+        st2.push_back(kv(100));
+        cache.retain(kv(500), 16, std::move(st2), a);
+        cache.limit_reuse(9);
+        auto same = cache.take_reuse_for(a);
+        check(same.unchanged_tokens == 9 && same.stages.size() == 1 && same.stages[0].unchanged_tokens == 9,
+              "the same conversation keeps the first rewrite's limit, on every stage");
+        cache.retain(kv(500), 16);
+        check(cache.take_reuse_for(a).kv.empty(), "retained K/V of unknown identity is never reused");
+
+        // the sequence of the report: P restored (retained), a slot hands Q to the main session, Q is parked.  Q shares
+        // only the system prompt with P (4 tokens): with the slot's drop, nothing is reused; without it (the ids check
+        // alone), at most the shared system prompt
+        const std::vector<int32_t> p = {7, 7, 7, 7, 100, 101, 102, 103, 104, 105};
+        const std::vector<int32_t> q = {7, 7, 7, 7, 200, 201, 202, 203, 204, 205, 206, 207};
+        std::vector<std::vector<ConversationKv>> stp;
+        stp.push_back(kv(100));
+        cache.retain(kv(500), 10, std::move(stp), p);
+        (void) cache.take_reuse();   // copy_from_slot
+        check(cache.take_reuse_for(q).kv.empty(), "a slot that gave its conversation back drops the retained K/V");
+        std::vector<std::vector<ConversationKv>> stp2;
+        stp2.push_back(kv(100));
+        cache.retain(kv(500), 10, std::move(stp2), p);
+        auto sys_only = cache.take_reuse_for(q);
+        check(sys_only.unchanged_tokens == 4 && sys_only.stages.size() == 1 && sys_only.stages[0].unchanged_tokens == 4,
+              "without the drop, only the shared system prompt is reused, on every stage");
+        check(cache.retained_bytes() == 0, "taken once");
+        // a conversation that is a strict extension of the retained one keeps the whole extent
+        cache.retain(kv(500), 10, {}, p);
+        std::vector<int32_t> p_more = p;
+        p_more.push_back(300);
+        check(cache.take_reuse_for(p_more).unchanged_tokens == 10, "the conversation's own continuation reuses all of it");
+    }
+    {
         // the later stages' retained K/V, kept with the first stage's and limited together
         auto kv = [](size_t n) {
             std::vector<ConversationKv> v(2);
