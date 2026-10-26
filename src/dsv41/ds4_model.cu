@@ -8518,8 +8518,11 @@ struct Model::Impl {
         const size_t ld = mi == 0 ? (size_t) V : (size_t) vn;
         cudaSetDevice(d.id);
         // (an EXL3 head: as many activations at a time as its split-K partials fit the scratch - 8 for a shared head, 4
-        // for a whole one, each pass reading the whole share; a GGUF's: 4 at a time, as before)
-        const int per = d.head.fmt != 0 ? 4 : std::max(1, x3::mv_cols(d.head));
+        // for a whole one, each pass reading the whole share; a GGUF's: 8, so that every window the engine can build (rows
+        // <= kWin = 8) walks the head once instead of twice - measured on the drafter's fixed T=5: 4.55 -> 2.83 ms, its
+        // round 14.49 -> 13.46; the verify window's head 3.48 -> 2.68 ms, the same logits.  DS4_HEAD_PER overrides.)
+        const int per = d.head.fmt != 0 ? (std::getenv("DS4_HEAD_PER") ? std::atoi(std::getenv("DS4_HEAD_PER")) : 8)
+                                        : std::max(1, x3::mv_cols(d.head));
         for (int c = 0; c < rows; c += per)
             if (!mv(d, {job(d.head, xn + (size_t) c * D, out + (size_t) c * ld, std::min(per, rows - c), D, ld)}, err))
                 return false;
