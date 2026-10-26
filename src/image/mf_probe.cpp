@@ -9,7 +9,8 @@
 //       the Flux2 VAE: golden_f2vae.py's f2_img of the run's latent, whole and in tiles, the tiled image as FP32
 //       [3][H][W] to OUT.f32)
 //   strata-image-mf-probe vae-enc VAE.safetensors GOLDEN_DIR   (golden_edit.py's ref0_pix: its posterior's mean,
-//       log-variance and, with the run's own noise, the sample)
+//       log-variance and, with the run's own noise, the sample; the Flux2 VAE: golden_f2enc.py's ref0_z, the latent
+//       of ref0_pix as FLUX.2's pipelines take it)
 //   strata-image-mf-probe dit DIT.safetensors GOLDEN_DIR [q8|bf16 [VAE.safetensors OUT.f32]]
 //       (block 0, the first velocity, the final latent; with the VAE the image as FP32 [3][H][W] to OUT.f32)
 //
@@ -390,10 +391,27 @@ int vae_enc(const std::string& path, const std::string& dir) {
     std::vector<int64_t> ps, ms;
     const auto pix = npy<float>(dir + "/ref0_pix.npy", &ps);    // [3][H][W]
     const auto mean = npy<float>(dir + "/ref0_mean.npy", &ms);  // [1][128][h][w]
-    const auto lv = npy<float>(dir + "/ref0_logvar.npy");
     const auto zg = npy<float>(dir + "/ref0_z.npy");
     const int64_t Z = ms[1], h = ms[2], w = ms[3], HW = h * w;
     float* rgb = put(pix);
+    float* z = nullptr;
+    if (!strata::gpu::alloc_device(&z, (size_t) (HW * Z) * 4)) throw std::runtime_error("GPU memory");
+    if (v.flux2()) {   // golden_f2enc.py's latent: the posterior's mode, patchified and normalized as FLUX.2 takes it
+        v.encode(rgb, h, w, nullptr, z);   // warm
+        strata::gpu::stream_sync(s);
+        const auto t0 = std::chrono::steady_clock::now();
+        v.encode(rgb, h, w, nullptr, z);
+        strata::gpu::stream_sync(s);
+        std::printf("encode %lld x %lld: %.1f ms (Flux2 VAE, scratch %.0f MiB)\n", (long long) ps[2],
+                    (long long) ps[1], 1e3 * seconds_since(t0), (double) v.encode_scratch_bytes(h, w) / 1048576.0);
+        const auto zt = fetch(z, (size_t) (HW * Z));
+        std::vector<float> zc((size_t) (HW * Z));
+        for (int64_t p = 0; p < HW; ++p)
+            for (int64_t c = 0; c < Z; ++c) zc[(size_t) (c * HW + p)] = zt[(size_t) (p * Z + c)];
+        compare("latent", zc.data(), zg.data(), zg.size());
+        return 0;
+    }
+    const auto lv = npy<float>(dir + "/ref0_logvar.npy");
     float* mom = nullptr;
     if (!strata::gpu::alloc_device(&mom, (size_t) (HW * 2 * Z) * 4)) throw std::runtime_error("GPU memory");
     v.encode_moments(rgb, h, w, mom);   // warm
@@ -421,8 +439,6 @@ int vae_enc(const std::string& path, const std::string& dir) {
             eps[(size_t) (p * Z + c)] = (zg[g] - mean[g]) / std::exp(0.5f * lv[g]);
         }
     float* e = put(eps);
-    float* z = nullptr;
-    if (!strata::gpu::alloc_device(&z, (size_t) (HW * Z) * 4)) throw std::runtime_error("GPU memory");
     v.encode(rgb, h, w, e, z);
     const auto zt = fetch(z, (size_t) (HW * Z));
     std::vector<float> zc((size_t) (HW * Z));
