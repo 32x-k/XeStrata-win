@@ -115,6 +115,7 @@ screens; leave out what you do not care about.
 | `MODEL` | model size: `IQ2_XS`, `IQ3_XXS`, `IQ3_S`, `Q2_0`, `UD-Q4_K_XL`, ... ([MODELS.md](MODELS.md)) | Strata picks what suits the card, and says so in the log |
 | `FAMILY` | `qwen`, `unsloth`, `gyro`, `coder`, `swift`, ...; use `qwen` for the original ISTA-DASLab packs | installer recommendation; may differ by hardware |
 | `MODEL_PATH` | GGUF files you already have: a folder or one `.gguf`, **inside the container** (mount it with `-v`, `:ro` is fine) | download |
+| `ALLOW_DOWNLOAD` | `1`: go on and download the model although model files of the older layout were left unread in `/data/models` (see [From the older image](#from-the-older-image)) | stop |
 | `CONTEXT` | how much text it remembers at once: `32k`, `64k`, `128k`, `256k` or a number | the largest that fits |
 | `PARALLEL` | requests answered at the same time, 1 to 8 | fitted to the card |
 | `VISION` | `off`, `on` (the model reads pictures), `gpu`, `cpu`; the picture-reader file (about 0.9 GB) is downloaded with the model | `off` |
@@ -276,7 +277,10 @@ package and start through `strata launch`. Mapping:
 A volume from the older image is picked up: the first start moves `/data/models`, `/data/packs` and `/data/mtp` into
 `/data/Strata-data` (a rename inside the volume: nothing is copied or downloaded again, and the prepared pack is kept). The old
 `/data/config` is not read; the run settings are made again from the files. A folder you mounted yourself at one of those places
-is left alone: point `MODEL_PATH` at it. The container name, the volume and the port can stay as they were.
+is left alone: point `MODEL_PATH` at it. If model files are still in `/data/models` when the container starts (a folder you mounted there, or
+a move that failed) and `MODEL_PATH` is not set, the start **stops at once and says where the files are**: it would otherwise download the model
+again, tens of GB, because this image does not read that place. Name the folder in `MODEL_PATH`, or set `ALLOW_DOWNLOAD=1` to download anyway.
+The container name, the volume and the port can stay as they were.
 
 ## Build it yourself
 
