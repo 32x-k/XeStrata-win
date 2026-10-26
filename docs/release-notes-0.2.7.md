@@ -54,7 +54,8 @@ on the RTX 3060 12 GB (IQ3_XXS), five interleaved pairs of fresh engines:
 | prompt 4K, in a 4K context | 248.5 | **291.0 (+17.1%)** |
 | decode behind a 4K document | 45.1 | **62.2 (+37.9%)** |
 
-It holds where it matters most: on content the tuning was never fitted to it measures **+29.0%** (43.5 -> 55.0 tok/s on a
+It holds where it matters most: with **two conversations in flight** it measures **+67% aggregate** (59.7 against 35.6 tok/s),
+and on content the tuning was never fitted to it **+29.0%** (43.5 -> 55.0 tok/s on a
 document prompt), and the whole recipe - routing, a workload-fitted expert profile, `--adapt-every 0`, `--vram-reserve-mib
 896` and the English draft vocabulary - gives **+26.5%** there and **+80%** on code in a sustained 80-request session.
 
