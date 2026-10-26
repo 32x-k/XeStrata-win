@@ -5477,39 +5477,46 @@ int main(int argc, char** argv) {
     // the policy rather than a hint.
     int64_t prefilled = 0;
     if (!profile.empty() && srcp != nullptr) {
-        const int64_t want = std::min<int64_t>((int64_t) profile.size(), xcache.slots());
+        // the pairs in the profile's order over all the layers while the slots last (core/expert_tier's
+        // plan_profile_fill, the other models' engine's as well: its slots are a slot each here)
+        const std::vector<std::pair<int32_t, int32_t>> fill_pairs =
+            strata::core::plan_profile_fill(profile, g.n_layers, g.n_expert, (uint64_t) xcache.slots(),
+                                            [](int64_t) { return (uint64_t) 1; }, [](int64_t) { return true; }, false)
+                .fill;
+        const auto& profile_order = fill_pairs;
+        const int64_t want = (int64_t) profile_order.size();
         // mapped reads: advise the next `fill_ahead` pairs so their reads overlap; STRATA_FILL_AHEAD=0 turns it off
         int64_t fill_ahead = 0;
         if (srcp == &src && !src.unbuffered()) {
             const char* v = std::getenv("STRATA_FILL_AHEAD");
             fill_ahead = v == nullptr ? 256 : std::max<int64_t>(0, std::strtol(v, nullptr, 10));
-            if (fill_ahead > 0 && !src.advise_pairs(profile.data(), std::min<int64_t>(fill_ahead, want))) fill_ahead = 0;
+            if (fill_ahead > 0 && !src.advise_pairs(profile_order.data(), std::min<int64_t>(fill_ahead, want))) fill_ahead = 0;
             std::fprintf(stderr, "strata generate: the profile fill asks for %lld pairs ahead (STRATA_FILL_AHEAD)\n",
                          (long long) fill_ahead);
         }
         const auto fill_t0 = std::chrono::steady_clock::now();
         uint64_t fill_bytes = 0;
         for (int64_t i = 0; i < want; ++i) {
-            if (fill_ahead > 0 && i + fill_ahead < want) (void) src.advise_pairs(profile.data() + i + fill_ahead, 1);
-            const int32_t slot = xcache.admit(profile[(size_t) i].first, profile[(size_t) i].second);
+            if (fill_ahead > 0 && i + fill_ahead < want) (void) src.advise_pairs(profile_order.data() + i + fill_ahead, 1);
+            const int32_t slot = xcache.admit(profile_order[(size_t) i].first, profile_order[(size_t) i].second);
             if (slot == strata::core::kNotResident) break;
-            const uint8_t* b = blob_to_copy(srcp, profile[(size_t) i].first, profile[(size_t) i].second, fill_tmp);
+            const uint8_t* b = blob_to_copy(srcp, profile_order[(size_t) i].first, profile_order[(size_t) i].second, fill_tmp);
             if (b == nullptr || !xcache.fill_slot_blocking(slot, b, err,
-                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first))) {
+                    (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile_order[(size_t) i].first))) {
                 std::fprintf(stderr, "strata generate: the profile fill failed at pair %lld: %s\n",
                              (long long) i, err.c_str());
                 return 1;
             }
-            fill_bytes += strata::kernels::cpu::expert_layout().blob_bytes(profile[(size_t) i].first);
+            fill_bytes += strata::kernels::cpu::expert_layout().blob_bytes(profile_order[(size_t) i].first);
             ++prefilled;
         }
         const double fill_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - fill_t0).count();
         // **AND ONE SLOT IS READ BACK AND COMPARED.**  A residency table that is right about indices and wrong
         // about bytes produces a plausible token, which is this project's most expensive failure mode; the
         // cache's own `verify_slot` is the check and it costs one 1.38 MB D2H at startup.
-        if (prefilled > 0 && !xcache.verify_slot(xcache.slot_of(profile[0].first, profile[0].second),
-                                blob_to_copy(srcp, profile[0].first, profile[0].second, fill_tmp), err,
-                                (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile[0].first))) {
+        if (prefilled > 0 && !xcache.verify_slot(xcache.slot_of(profile_order[0].first, profile_order[0].second),
+                                blob_to_copy(srcp, profile_order[0].first, profile_order[0].second, fill_tmp), err,
+                                (int64_t) strata::kernels::cpu::expert_layout().blob_bytes(profile_order[0].first))) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }

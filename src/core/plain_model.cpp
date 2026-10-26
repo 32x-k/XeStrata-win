@@ -1014,13 +1014,43 @@ bool PlainModel::open_experts(std::string& err) {
     // (78 GiB of pinned experts, a model file in the cache: the tier's 24 GiB refused with 17 GiB free, B70,
     // 2026-10-19): the OS is made to give the cache back first
     if (level_zero_) strata::platform::make_free_ram(per_layer_b * (uint64_t) q + (2ull << 30));
+    // the slots each layer gets: with a profile, as Qwen3.8-Flash-Next's tier fills from one (generate.cpp), the
+    // profile's pairs in its order over all the layers while the tier's bytes last; without one, the layers alike
+    // (a profile of the trunk's layers serves a load with the MTP layer as well, and one with the MTP layer a load
+    // without it: its pairs dropped)
+    std::vector<int64_t> quota((size_t) L, 0);
+    if (!opt_.profile.empty()) {
+        int64_t ranked_slots = 0;
+        std::string err2;
+        if (!read_expert_profile(opt_.profile, L, E, prior_, ranked_slots, err)) {
+            const int64_t other = model_mtp_ ? L - 1 : L + 1;
+            if (!read_expert_profile(opt_.profile, other, E, prior_, ranked_slots, err2)) return false;
+            prior_.erase(std::remove_if(prior_.begin(), prior_.end(), [&](const auto& p) { return p.first >= L; }),
+                         prior_.end());
+            err.clear();
+        }
+        std::vector<char> local((size_t) L, 0);
+        for (int64_t l : moe_local_) local[(size_t) l] = 1;
+        // Ornith-1.5 (qwen35moe) the layers alike: the order over all the layers lost hits there (RTX 4070, Q6_K,
+        // 256 tokens: 72.8-73.1% -> 70.8%, 91.1 / 90.8 -> 87.5 / 87.6 tok/s, 2026-10-26)
+        const bool alike = s.arch == ModelArch::Qwen35Moe;
+        quota = plan_profile_fill(prior_, L, E, per_layer_b * (uint64_t) q, [&](int64_t l) { return lay.bytes[(size_t) l]; },
+                                  [&](int64_t l) { return local[(size_t) l] != 0; }, alike)
+                    .quota;
+    } else {
+        for (int64_t l : moe_local_) quota[(size_t) l] = q;
+    }
     std::vector<int64_t> slot_bytes;
     free_.assign((size_t) L, {});
-    for (int64_t i = 0; i < q; ++i)   // the layers in turn: slot s is moe_local_[s % LS]'s (prompt_borrow takes the last)
-        for (int64_t l : moe_local_) {
-            free_[(size_t) l].push_back((int32_t) slot_bytes.size());
-            slot_bytes.push_back((int64_t) lay.bytes[(size_t) l]);
-        }
+    slot_layer_.clear();
+    const int64_t most = *std::max_element(quota.begin(), quota.end());
+    for (int64_t i = 0; i < most; ++i)   // the layers in turn while each has slots (prompt_borrow takes the last)
+        for (int64_t l : moe_local_)
+            if (i < quota[(size_t) l]) {
+                free_[(size_t) l].push_back((int32_t) slot_bytes.size());
+                slot_layer_.push_back(l);
+                slot_bytes.push_back((int64_t) lay.bytes[(size_t) l]);
+            }
     for (auto& f : free_) std::reverse(f.begin(), f.end());   // taken from the back: the lowest slot first
     cache_.set_max_piece(max_alloc_bytes());   // in pieces where the tier passes the device's largest allocation
     if (opt_.vram_elastic) {   // #533: in segments, as generate.cpp's cache; one GPU only (a split has a tier per GPU)
@@ -1090,18 +1120,7 @@ bool PlainModel::open_experts(std::string& err) {
     }
     // the tier from a profile, after the split's timing (which needs experts in RAM outside the VRAM): its ranking,
     // each of this stage's layers up to its slots
-    if (!opt_.profile.empty()) {
-        // a profile of the trunk's layers serves a load with the MTP layer as well (its experts left to the
-        // adaptive rule), and one with the MTP layer a load without it (its pairs dropped)
-        int64_t ranked_slots = 0;
-        std::string err2;
-        if (!read_expert_profile(opt_.profile, L, E, prior_, ranked_slots, err)) {
-            const int64_t other = model_mtp_ ? L - 1 : L + 1;
-            if (!read_expert_profile(opt_.profile, other, E, prior_, ranked_slots, err2)) return false;
-            prior_.erase(std::remove_if(prior_.begin(), prior_.end(), [&](const auto& p) { return p.first >= L; }),
-                         prior_.end());
-            err.clear();
-        }
+    if (!opt_.profile.empty()) {   // prior_ read above, where it sized the layers' slots
         // each layer up to its slots, the experts read on several threads, each through pinned memory of its own: one
         // at a time, GLM-5.3-Flash's 2,646 (22.9 GB) took 19.5 s from the drive, 1.2 GB/s (B70, 990 Pro, 2026-10-19)
         struct Fill { int64_t l; int32_t e, slot; };
@@ -1402,9 +1421,9 @@ bool PlainModel::vram(int64_t reserve_mib, std::string& answer, std::string& err
             taken[(size_t) slot] = 1;
         }
         vram_evicted_.swap(keep_out);
-        // the slots mapped again that held no expert: back to their layers' free lists (slot s is moe_local_[s % LS]'s)
+        // the slots mapped again that held no expert: back to their layers' free lists
         for (int64_t s = had; s < live; ++s)
-            if (!taken[(size_t) s]) free_[(size_t) moe_local_[(size_t) (s % LS)]].push_back((int32_t) s);
+            if (!taken[(size_t) s]) free_[(size_t) slot_layer_[(size_t) s]].push_back((int32_t) s);
     }
     strata::gpu::mem_info(&free_b, &total_b);
     std::fprintf(stderr, "strata plain: VRAM %lld MiB kept free: the expert tier %lld -> %lld of %lld slots (%.2f of "

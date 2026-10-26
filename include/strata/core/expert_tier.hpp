@@ -101,6 +101,43 @@ inline std::vector<TierSwap> choose_ram_swaps(const float* usage, const int32_t*
     return swaps;
 }
 
+/// How many slots of a tier of `budget` bytes each layer takes, from its profile (`prior`, (layer, expert) pairs in
+/// rank order): Qwen3.8-Flash-Next's fill (generate.cpp), the pairs in their order over all the layers while the bytes
+/// last (`bytes(l)` a layer's expert, `local(l)` the layers this tier holds), then the rest of the bytes the layers in
+/// turn; `alike`: every layer the same count instead (PlainModel's for Ornith-1.5, below).  `fill` the pairs that get
+/// a slot, in rank order.
+template <class Pairs>
+struct ProfileFill {
+    std::vector<int64_t> quota;   ///< per layer
+    Pairs fill;                   ///< the profile's pairs within the quotas
+};
+template <class Pairs, class Bytes, class Local>
+ProfileFill<Pairs> plan_profile_fill(const Pairs& prior, int64_t layers, int64_t n_expert, uint64_t budget, Bytes bytes,
+                                     Local local, bool alike) {
+    ProfileFill<Pairs> f;
+    f.quota.assign((size_t) layers, 0);
+    uint64_t left = budget;
+    auto take = [&](int64_t l) {
+        if (l < 0 || l >= layers || !local(l) || f.quota[(size_t) l] >= n_expert || bytes(l) > left) return false;
+        ++f.quota[(size_t) l];
+        left -= bytes(l);
+        return true;
+    };
+    if (!alike)
+        for (const auto& p : prior) take((int64_t) p.first);
+    for (bool more = true; more;) {   // the rest (or, alike, all of it) the layers in turn
+        more = false;
+        for (int64_t l = 0; l < layers; ++l) more |= take(l);
+    }
+    std::vector<int64_t> used((size_t) layers, 0);
+    for (const auto& p : prior)
+        if ((int64_t) p.first >= 0 && (int64_t) p.first < layers && used[(size_t) p.first] < f.quota[(size_t) p.first]) {
+            ++used[(size_t) p.first];
+            f.fill.push_back(p);
+        }
+    return f;
+}
+
 /// A prompt chunk's layer, for the CPU's share of the experts the GPU does not hold: `missed` the routed experts not in
 /// VRAM, `cand` (rows, expert) those the CPU may take, fewest rows first - at most MAXT rows (one multi-token job) and a
 /// blob the CPU reads where it lies, page-locked or not assembled into a short-lived buffer (the CPU's jobs keep their

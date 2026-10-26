@@ -536,6 +536,7 @@ private:
     MoeWindow win_;
     std::vector<int32_t> res_;                    ///< [moe layer][expert] slot or -1
     std::vector<std::vector<int32_t>> free_;      ///< per moe layer, its free slots
+    std::vector<int64_t> slot_layer_;             ///< per slot, the moe layer it holds experts of
     std::vector<double> heat_;                    ///< [moe layer][expert] routed entries since the load
     std::FILE* route_dump_ = nullptr;             ///< --dump-routing's file, or null
     /// `n` tokens' `k` routed experts of MoE layer `layer` into --dump-routing's file

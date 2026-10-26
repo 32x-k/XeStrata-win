@@ -146,7 +146,7 @@ bool PlainModel::prompt_return(std::string& err) {
     if (borrow_first_ < 0 || LS <= 0) return true;   // a borrow needs slots, and slots need MoE layers
     const auto& lay = k::cpu::expert_layout();
     if (!strata::gpu::stream_sync(cs_)) { err = std::string("plain prompt: ") + strata::gpu::last_error(); return false; }
-    for (int64_t s = borrow_first_; s < n; ++s) free_[(size_t) moe_local_[(size_t) (s % LS)]].push_back((int32_t) s);
+    for (int64_t s = borrow_first_; s < n; ++s) free_[(size_t) slot_layer_[(size_t) s]].push_back((int32_t) s);
     borrow_first_ = -1;
     // the experts the prompt displaced, back into the slots: straight from pinned RAM, else through fill_slot
     for (const auto& [l, e] : borrowed_res_) {
