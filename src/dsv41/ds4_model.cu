@@ -594,6 +594,8 @@ struct Chunk {
     int *bc_pin = nullptr, *bc_dev = nullptr;
     uint64_t n_batch = 0;
     double wait_ms = 0;                      // the compute waiting for a read
+    // (DS4_PROF: where copy_ahead's time goes - the host staging copy, the DMA issues, the waits for a slot)
+    double dbg_stage_ms = 0, dbg_dma_ms = 0, dbg_evt_ms = 0;
     uint64_t it_file = 0, it_ram = 0, it_spec = 0, it_spec_unused = 0;
     uint64_t io_d0 = 0, io_b0 = 0;           // io's unbuffered / buffered bytes when the run started
     // layer-major (a run of several chunks, every layer on this device): the layers one after another, each through
@@ -3226,9 +3228,12 @@ struct Model::Impl {
             if (S.cp >= (size_t) P) CK(cudaStreamWaitEvent(c.cs, c.freed[half], 0));
             uint8_t* sb = nullptr;   // in place: the batch's regions in the part's staging slots
             if (c.stage != nullptr) {
+                const double t_evt = now_ms();
                 if (S.cp >= (size_t) P) CK(cudaEventSynchronize(c.filled[half]));   // (its last batch's copies out)
+                c.dbg_evt_ms += now_ms() - t_evt;
                 sb = c.stage + (size_t) half * (c.ring_n / P) * c.stage_stride;
                 std::atomic<bool> bad{false};
+                const double t_st = now_ms();
                 c.readers->run(bt.n, [&](int i) {
                     const int e = l0.host_list[(size_t) (bt.j0 + i)];
                     if (l0.lay.fmt == gg::kFmtMXFP4 ? !read_mx(l0, e, sb + (size_t) i * c.stage_stride)
@@ -3237,11 +3242,13 @@ struct Model::Impl {
                                                                   sb + (size_t) i * c.stage_stride))
                         bad.store(true);
                 });
+                c.dbg_stage_ms += now_ms() - t_st;
                 if (bad.load()) {
                     err = "reading layer " + std::to_string(l0.il) + "'s experts from the model's files failed";
                     return false;
                 }
             }
+            const double t_dma = now_ms();
             for (int i = 0; i < bt.n; ++i) {
                 uint8_t* dst = c.ring + ((size_t) half * (c.ring_n / P) + i) * c.ring_stride;
                 if (!stream_expert(l0, mi, l0.host_list[(size_t) (bt.j0 + i)], dst, c.cs, err,
@@ -3249,6 +3256,7 @@ struct Model::Impl {
                     return false;
                 c.stream_bytes += (double) unit(member(l0, mi));
             }
+            c.dbg_dma_ms += now_ms() - t_dma;
             CK(cudaEventRecord(c.filled[half], c.cs));
             ++S.cp;
             S.done.store(S.cp, std::memory_order_relaxed);
@@ -8494,15 +8502,19 @@ struct Model::Impl {
                 if (c.lm)
                     std::snprintf(lcs, sizeof lcs, ", %llu again from the layer cache (layer-major, %d chunks, %.1f GB "
                                   "of RAM)", (unsigned long long) c.it_lc, (int) run.T.size(), (double) c.lc_bytes / 1e9);
+                char dbgs[160] = "";
+                if (pm.on)
+                    std::snprintf(dbgs, sizeof dbgs, "; copy_ahead: staging %.0f ms, DMA issues %.0f ms, slot waits %.0f ms",
+                                  c.dbg_stage_ms, c.dbg_dma_ms, c.dbg_evt_ms);
                 std::fprintf(stderr,
                              "ds4 prompt stream, CUDA%d: %d tokens in %.0f ms; %llu experts streamed: %llu from the files "
                              "(%.1f GB, %.2f GB/s: %.1f GB from the disk unbuffered, %.1f GB through the page cache), %llu "
                              "from RAM (%.1f GB)%s; %llu likely ones queued early, %llu of them unpicked; the compute waited "
-                             "%.0f ms for reads\n",
+                             "%.0f ms for reads%s\n",
                              devs[di].id, n, ms, (unsigned long long) (c.it_file + c.it_ram + c.it_lc),
                              (unsigned long long) c.it_file, fb, fb / std::max(1e-3, ms / 1000.0), db, bb,
                              (unsigned long long) c.it_ram, rb, lcs, (unsigned long long) c.it_spec,
-                             (unsigned long long) c.it_spec_unused, c.wait_ms);
+                             (unsigned long long) c.it_spec_unused, c.wait_ms, dbgs);
             }
         }
         if (pm.on && run.T.size() == 1) {   // (the picks' spread for pick_path: the CPU-lane experts this run picked)
