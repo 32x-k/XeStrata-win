@@ -3097,11 +3097,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 m.pp->p_issued = m.pp->pk = 0;
             }
             double ps_acc = 0.0;
-            // STRATA_KVA: an approximated chunk queues no transfer for a layer whose MoE half will not run
-            const int64_t LE_stream = kva_approx ? std::min<int64_t>(LE, kva_split) : LE;
-            for (int64_t l = LB; l < LE_stream; ++l) {
+            // STRATA_KVA: a layer that will not run its MoE half must not queue expert transfers either - the
+            // transfer plan is where the avoidable cost lives (the research handoff's "expert transfers must be
+            // skipped too").  `kva_skips_layer` is the one place the two conditions meet.
+            auto kva_skips_layer = [&](int64_t l) {
+                return kva_approx && l >= kva_split &&
+                       (kva.only == KvaConfig::Only::All ||
+                        (kva.only == KvaConfig::Only::Gdn) == !core::is_qsa_layer(g, l));
+            };
+            for (int64_t l = LB; l < LE; ++l) {
                 seq_start[(size_t) l] = seq.size();
                 if (ps_on) m.pp->pseq_start[(size_t) l] = m.pp->pseq.size();
+                if (kva_skips_layer(l)) continue;   // no transfer for a layer whose MoE half is skipped
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
                     if (m.pp && m.pp->peer && m.pp->peer->has(l, e)) continue;   // multi-GPU: computed on (or read from) the peer
@@ -3130,7 +3137,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     seq.push_back({(int32_t) l, e, b, job});
                 }
             }
-            for (int64_t l = LE_stream; l <= g.n_layers; ++l) {
+            for (int64_t l = LE; l <= g.n_layers; ++l) {
                 seq_start[(size_t) l] = seq.size();
                 if (ps_on) m.pp->pseq_start[(size_t) l] = m.pp->pseq.size();
             }
@@ -3254,7 +3261,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             const core::LayerView v(*m.wt, l);
             // STRATA_KVA: `kva_layer` means this layer's output has no consumer left for this chunk, so only its
             // state advances; `kva_subst` means the block input itself is replayed from a capture (oracle mode).
-            const bool kva_layer = kva_approx && l >= kva_split;
+            const bool kva_layer = kva_approx && l >= kva_split &&
+                                   (kva.only == KvaConfig::Only::All ||
+                                    (kva.only == KvaConfig::Only::Gdn) == !core::is_qsa_layer(g, l));
             const bool kva_subst = kva_layer && kva.mode == KvaConfig::Mode::Oracle;
             const bool kva_cap_layer = kva.capture && LB == 0 && (LE < 0 || LE == g.n_layers) && l >= kva_split;
             if (l == std::max<int64_t>(LB, 1)) {   // the PLE rows, read from layer 1 on (a wait for the SSD read of the first chunk lands on "ple")
@@ -3432,7 +3441,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (!kva_layer)   // KVA: the out projection feeds only the residual write and the MoE half
                         if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err, 0, ld_y)) return false;
                     ++gdn_index;
-                    if (kva_layer) break;   // state advanced: no gated residual write, no MoE half of this layer
+                    if (kva_layer) {
+                        // the layer consumed no expert: its stream entries must still be released, or the issuer
+                        // thread fills the ring and the next fully computed layer waits for a copy that never comes
+                        consumed = std::max(consumed, seq_start[(size_t) l + 1]);
+                        give_back(consumed);
+                        break;   // state advanced: no gated residual write, no MoE half of this layer
+                    }
                 } else if (half == 0) {
                     // ======================= QSA =======================
                     const core::QsaState& st = ss.qsa_states[qsa_index];
@@ -3545,6 +3560,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (kva_layer) {
                         ++qsa_index;
                         if (!kv_prefetch_after(l + 1, qsa_index)) return false;
+                        // no expert is consumed here: release the stream entries so the issuer cannot stall
+                        consumed = std::max(consumed, seq_start[(size_t) l + 1]);
+                        give_back(consumed);
                         break;
                     }
                     pt.mark(kPfQsaSel, cs);
@@ -5240,11 +5258,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     if (kva_run || kva.capture) {
         const char* mode = kva.mode == KvaConfig::Mode::Oracle ? "oracle"
                          : kva.mode == KvaConfig::Mode::Linear ? "linear" : "identity";
+        const char* only = kva.only == KvaConfig::Only::Gdn ? ", gdn layers only"
+                         : kva.only == KvaConfig::Only::Qsa ? ", qsa layers only" : "";
         std::fprintf(stderr, "strata prefill: KVA %s: split %lld, suffix %lld, approximated %lld of %lld positions "
-                             "in %lld of %lld chunks, mode %s%s\n",
+                             "in %lld of %lld chunks, mode %s%s%s\n",
                      kva_run ? "on" : "off (capture)", (long long) kva_split, (long long) kva.suffix,
                      (long long) kva_positions, (long long) n, (long long) kva_chunks,
-                     (long long) (n > 0 && m.T > 0 ? (n + m.T - 1) / m.T : 0), mode,
+                     (long long) (n > 0 && m.T > 0 ? (n + m.T - 1) / m.T : 0), mode, only,
                      kva.capture ? ", capturing the late layers' inputs" : "");
         if (kva_positions > 0)
             std::fprintf(stderr, "strata prefill: KVA: the session state holds approximated cells; it is not an exact "

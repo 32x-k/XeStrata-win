@@ -26,6 +26,7 @@ namespace strata::prefill {
 
 struct KvaConfig {
     enum class Mode { Identity, Oracle, Linear };
+    enum class Only { All, Gdn, Qsa };
 
     bool on = false;             ///< STRATA_KVA=1
     bool capture = false;        ///< STRATA_KVA_CAPTURE=<dir>: dump every late layer's real input rows
@@ -36,6 +37,7 @@ struct KvaConfig {
     int64_t suffix = 2048;       ///< STRATA_KVA_SUFFIX: fully computed tail positions (rounded up to a chunk)
     int64_t min_prompt = 4096;   ///< STRATA_KVA_MIN_PROMPT: shorter prompts stay on the full path
     Mode mode = Mode::Identity;  ///< STRATA_KVA_MODE=identity|oracle|linear
+    Only only = Only::All;       ///< STRATA_KVA_ONLY=all|gdn|qsa: which late layers take the approximate path
     std::string oracle_dir;      ///< STRATA_KVA_ORACLE
     std::string capture_dir;     ///< STRATA_KVA_CAPTURE
     std::string projector;       ///< STRATA_KVA_PROJECTOR
@@ -88,6 +90,11 @@ inline const KvaConfig& kva_config() {
             if (std::string(m) == "oracle") k.mode = KvaConfig::Mode::Oracle;
             else if (std::string(m) == "linear") k.mode = KvaConfig::Mode::Linear;
             else k.mode = KvaConfig::Mode::Identity;
+        }
+        if (const char* o = std::getenv("STRATA_KVA_ONLY"); o != nullptr && *o != '\0') {
+            if (std::string(o) == "gdn") k.only = KvaConfig::Only::Gdn;
+            else if (std::string(o) == "qsa") k.only = KvaConfig::Only::Qsa;
+            else k.only = KvaConfig::Only::All;
         }
         return k;
     }();
