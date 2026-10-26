@@ -676,6 +676,56 @@ curl -X POST "http://127.0.0.1:8080/slots/0?action=restore" -H "Content-Type: ap
   only for this feature. Exact token replay across restarts is not guaranteed: expert residency and CPU/GPU rounding can
   change later output.
 
+### The web page (Chat, Images, Monitor, About)
+
+Open the server's address in a browser. Everything in it runs from the server's own files: no CDN, no outside address. Chats,
+settings and the API key stay in the browser.
+
+**Chat settings** (the button next to the message box) holds the sampling and thinking settings and the switches below. Every
+switch below is **off by default**; with all of them off the page behaves as it did before.
+
+- **Render math.** Equations written as `\( ... \)`, `\[ ... \]`, `$x$` or `$$ ... $$` are drawn as formulas by KaTeX 0.19.0, which
+  ships in `serve/web/vendor/katex` (MIT; `PROVENANCE.json` there lists the package and a hash of every file). The text of a
+  message is never changed: copying, the Markdown export and the next request all carry what the model wrote. Code, prices
+  (`$5 and $10`) and a formula still being written stay text. A formula KaTeX cannot read stays as its source. A formula can only
+  draw: it cannot make a link, load a picture or run anything (`\href`, `\url`, `\includegraphics` and `\htmlClass` are shown as
+  their own names).
+- **Saved chats list.** Keeps every chat in a list on the left, with search over titles and text, rename, delete (with Undo) and
+  days as headings. The chats live in this browser's IndexedDB; a picture or file is kept by name only. Nothing goes to the server.
+  In a private window, or when the browser's storage is full, the list stays in memory and the page says so once. Turning it on
+  keeps the chat on the screen as the first one in the list; turning it off keeps that chat as the single chat.
+- **Edit and rewind messages.** Under each message: **Regenerate** (a new answer to the same question), **Edit answer** (correct its
+  text; the old thinking and tool calls go and no request is sent) and **Rewind to here**. Rewind asks what you want. On your
+  message, **Edit and send again here** hides it and the messages after it and puts it in the box; on an answer, **Continue from
+  here** hides the messages after it. **Branch from here** (needs the saved chats list) starts a new chat from the messages up to
+  that point and leaves this chat as it is; the branch keeps a name such as "Branch of ..." and links back to the original. An
+  **Undo** bar above the box brings back what was hidden, until your next question, another chat or a reload. A picture or file
+  that was only kept by name is not sent again: the page asks you to attach it again.
+- **When you send while it is answering.** *Wait* (the default): Send is off until the answer is done. *Send after*: your message
+  waits and goes when the answer is done. *Interrupt*: the answer stops where it is, what was written stays and is marked
+  interrupted, and your message goes at once; a tool that is running finishes first. Only one message waits, and **Take back**
+  returns it to the box. Stop keeps a waiting message for you to send yourself.
+
+An answer's ` ```svg ` or ` ```html ` block gets a **Preview** button. The code is drawn in a frame that is cut off from the page:
+an empty sandbox (no scripts, forms, popups or downloads, and no access to the page, its storage or the server), a policy inside
+the frame that allows no address at all, and a page header (`Content-Security-Policy: frame-src 'none'`) that keeps a link or a
+redirect in the model's HTML from loading a web page into it. An svg is shown as a picture. For an HTML page there is also a
+warning button, **Run scripts**: after you confirm, that one block runs with scripts, still with no way to the page and no network,
+until you close the preview. It can still use your CPU, and it is code the model wrote.
+
+**Load / Unload** in the header loads the model or frees the GPU (`POST /load`, `POST /unload`). It asks before unloading and is off
+while an answer is being written or an image is made.
+
+**Language.** About > Settings lists the page's languages: English (the default), German, Spanish, Japanese, Korean, Portuguese,
+Russian and Chinese. The Chat view, its settings and the header are translated; Monitor, Images and About are still English. A
+language is a file `serve/web/locales/<lang>.json`; the English text lives in the code next to its key, and
+`python tools/web_i18n.py` checks every file for the same keys and placeholders (`--write` rewrites `en.json`). `/?lang=de` shows a
+language for one visit.
+
+Tests: `serve/test_web_*.py` and `serve/test_web_*.js` (Node), and a browser run against a stand-in server with no model:
+`WEBTEST_MODULES=<folder with puppeteer-core> node tools/webtest/browser_test.mjs`. `tools/webtest/shots.mjs` takes the page's
+screenshots.
+
 ### API request monitor
 
 Off by default, because it keeps prompts and answers in memory. Turn it on with `"api_monitor": true` or
@@ -765,7 +815,7 @@ after a change.
   needed for `npx` servers. An **address** (`url`, optional `headers`) uses MCP's Streamable HTTP transport (the older SSE-only
   transport is not supported). `"disabled": true` leaves an entry out.
 - Servers start with Strata. The server window says what each offers or why it did not start. The Monitor tab lists them, and
-  the Sampling drawer has **Use tools from MCP servers** (on by default). A server that stops later is started again at its next call.
+  Chat settings has **Use tools from MCP servers** (on by default). A server that stops later is started again at its next call.
 - In the chat each call shows as a small block. The model reads the result and goes on, up to `max_rounds` calls in a row. A tool
   that fails or takes longer than `timeout_s` gives the model an `error: ...` result. Results longer than `max_result_chars` are
   cut with a note. Stop stops a running tool too.
@@ -1042,7 +1092,7 @@ your own prompts. The Monitor marks every request ESP or stock.
 ```
 
 The engine log then says `control vector mode = project, dir = per-layer, layers 4..44 (41 steered)`. A loaded vector is on for
-every request unless it says otherwise: the Sampling drawer has a switch, and the API takes `"experimental_speed_projection": false`
+every request unless it says otherwise: Chat settings has a switch, and the API takes `"experimental_speed_projection": false`
 (config default: `"sampling": {"experimental_speed_projection": false}`). Switching drops the conversation cache once. Switched
 off, the output is token for token the stock model's.
 
@@ -1154,6 +1204,9 @@ Strata itself: [MIT](../LICENSE). The model files are not part of it; their lice
   [HyperQwen](https://github.com/syv-ai/HyperQwen); references in the paper.
 - The web app's font: [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1, see `serve/web/fonts/OFL.txt`). Its
   Monitor tab started from @code-martin's dashboard idea (PR #22).
+  Math is drawn by [KaTeX](https://katex.org) (MIT, vendored in `serve/web/vendor/katex`). The chat page's wide-window layout, svg/html preview, math, Load/Unload, saved
+  chats, edit and rewind came from PRs #3176 (@mnott), #1628 (@thoives), #2972 and #2974 (@CC-David-CC), #3550 (@sakuumomo), #1787 (@Scotty-Hudson) and
+  #2615 (@uppet), and the rewind choice and sending while answering from issues #3823 and #4004 (@xvcezrqpbxtpzblrt).
 - The experimental speed projection's vector (`data/experimental-speed-projection/`): Qwen Community License 1.0, made from the model's
   activations (see its README).
 

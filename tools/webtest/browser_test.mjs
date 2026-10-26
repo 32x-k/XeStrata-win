@@ -601,6 +601,51 @@ htest("history: another chat or New chat does not lose a waiting message", async
   await page.close();
 });
 
+// ------------------------------------------------------------------------------------------------ language
+htest("language: English until the user picks one; a pick translates the chat and is kept", async ({ browser, mock }) => {
+  const page = await openPage(browser, mock, { seed: on() });
+  assert.equal(await page.evaluate(() => StrataI18n.lang), "en");
+  assert.equal(await page.$eval("html", (e) => e.lang), "en");
+  assert.equal(await page.$eval("#tab-btn-chat", (e) => e.textContent.trim()), "Chat");
+  await page.evaluate(() => { document.getElementById("tab-btn-about").click(); });
+  await page.select("#lang", "de");
+  await page.waitForFunction(() => StrataI18n.lang === "de");
+  assert.equal(await page.$eval("html", (e) => e.lang), "de");
+  assert.equal(await page.$eval("#tab-btn-chat", (e) => e.textContent.trim()), "Chat");
+  assert.equal(await page.$eval("#tab-btn-about", (e) => e.textContent.trim()), "Info");
+  await page.evaluate(() => { document.getElementById("tab-btn-chat").click(); });
+  assert.equal(await page.$eval("#input", (e) => e.placeholder), "Fragen Sie, was Sie möchten…");
+  await ask(page, "hallo");
+  assert.equal(await page.$eval(".st-msg--user .st-msg__meta", (e) => e.textContent.startsWith("Sie · ")), true);
+  assert.equal(await page.$eval(".history-actions button:last-child", (e) => e.textContent), "Bis hier zurückgehen");
+  assert.equal(await page.$eval("#sidebar-foot", (e) => e.textContent), "1 Chat · in diesem Browser gespeichert");
+  await page.reload({ waitUntil: "networkidle0" });
+  assert.equal(await page.evaluate(() => StrataI18n.lang), "de", "kept in this browser");
+  await page.select("#lang", "en");
+  await page.waitForFunction(() => StrataI18n.lang === "en");
+  assert.equal(await page.$eval("#input", (e) => e.placeholder), "Ask anything…");
+  assert.deepEqual(page.errors.filter((e) => !e.includes("404")), [], "(About asks for /config, which the mock does not have)");
+  await page.close();
+});
+
+htest("language: /?lang= is for one visit, an unknown code stays English, every language loads", async ({ browser, mock }) => {
+  let page = await openPage(browser, mock, { query: "?lang=ru" });
+  assert.equal(await page.$eval("#send-btn", (e) => e.getAttribute("aria-label")), "Отправить");
+  assert.equal(await page.evaluate(() => localStorage.getItem("strata.lang")), null, "not remembered");
+  await page.close();
+  page = await openPage(browser, mock, { query: "?lang=xx" });
+  assert.equal(await page.evaluate(() => StrataI18n.lang), "en");
+  await page.close();
+  for (const lang of ["de", "es", "ja", "ko", "pt", "ru", "zh"]) {
+    page = await openPage(browser, mock, { query: "?lang=" + lang, seed: on() });
+    assert.equal(await page.evaluate(() => StrataI18n.lang), lang);
+    assert.notEqual(await page.$eval("#send-btn", (e) => e.getAttribute("aria-label")), "Send", lang);
+    await ask(page, "hello " + lang);
+    assert.deepEqual(page.errors, [], lang);
+    await page.close();
+  }
+});
+
 const mock = await startMock();
 const browser = await launch();
 await run(async () => ({ browser, mock, close: async () => { await browser.close(); await mock.stop(); } }));
