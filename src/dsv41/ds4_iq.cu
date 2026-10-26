@@ -1393,7 +1393,7 @@ __global__ void __launch_bounds__(kThreads) dq_rows_kernel(const uint8_t* __rest
 // prompt 79.5 -> 88.5 tok/s with it, so a gfx11 device defaults to it.  DS4_DQ_OLD=1 forces it anywhere, DS4_DQ_OLD=0 forces kernel2
 // anywhere.  The detection is the device's gcnArchName (HIP only; a CUDA build has no gfx11).  Decided once per device.
 static bool dq_use_old_kernel() {
-    if (const char* e = std::getenv("DS4_DQ_OLD"); e != nullptr && *e != ' ') return std::atoi(e) != 0;
+    if (const char* e = std::getenv("DS4_DQ_OLD"); e != nullptr && *e != '\0') return std::atoi(e) != 0;
 #if defined(STRATA_USE_HIP)
     static std::atomic<int> cache[64];   // 0 unknown, 1 no, 2 yes
     int dev = 0;
