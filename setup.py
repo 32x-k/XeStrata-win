@@ -2586,6 +2586,29 @@ def _piece_worker(src: _Source, st: _Pieces, todo: list, part: Path):
         st.stop.set()
 
 
+class StallNote:
+    """A download that gets no byte for a while says so (upstream ed0c8939a, #3567): "stalled at 69%" instead of a
+    silent line that never moves.  `check` is called often with the bytes so far; it answers a sentence at most once a
+    minute while nothing arrives, and None otherwise."""
+
+    AFTER = 120.0
+
+    def __init__(self, now: float = 0.0):
+        self.have, self.since, self.said = -1, now, 0.0
+
+    def check(self, have: int, total: int, now: float) -> str | None:
+        if have != self.have:
+            self.have, self.since, self.said = have, now, 0.0
+            return None
+        idle = now - self.since
+        if idle < self.AFTER or now - self.said < 60:
+            return None
+        self.said = now
+        return (f"no data for {int(idle // 60)} min at {100 * have // max(1, total)}%: the connection is stuck. "
+                "It keeps trying; to stop, press Ctrl+C, and run the same command again: the download continues "
+                "where it stopped")
+
+
 def parallel_download(url: str, part: Path, total: int, label: str, conns: int, name: str) -> bool:
     """Fill `part` (total bytes) over `conns` ranged connections.  True when every byte is there; False when the server
     does not do ranges (the caller reads the file in one stream)."""
@@ -2605,13 +2628,19 @@ def parallel_download(url: str, part: Path, total: int, label: str, conns: int, 
     if not part.with_name(part.name + ".chunks").is_file() and not _save_pieces(part, total, done):
         return False                                    # no piece list can be kept: pieces would not be told from holes
     last_print = last_save = 0.0
+    stall = StallNote(time.time())
 
     def report(force=False):
         nonlocal last_print, last_save
         now = time.time()
         if now - last_print > 2 or force:
             last_print = now
-            progress(label, st.have(), total)
+            have = st.have()
+            progress(label, have, total)
+            note = stall.check(have, total, now)
+            if note:
+                progress_end()
+                warn(note)
         if now - last_save > DL_SAVE_EVERY:
             last_save = now
             _save_pieces(part, total, st.snapshot())
