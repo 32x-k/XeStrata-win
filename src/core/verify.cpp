@@ -286,7 +286,9 @@ bool batch_self_commits(const int* rows, int S) { return g_batch_self_commit && 
 // profiler turns the fork off to time the stages, so a profiled run never showed that.  #816 reports the same fall on a
 // gfx1030 (RX 6800, Windows, 42.5 -> 56.4 t/s).  STRATA_SH_STREAM overrides either default: `=1` forks, `=0` does not.
 // Strix Halo (gfx1151, unified memory) is the exception: the fork pays there (+1.8% UD-IQ4_XS, +6.7% UD-Q4_K_XL decode
-// at 8K, ids identical), so the gfx1151 arch table sets STRATA_SH_STREAM=1.  Read on first use, after that table ran.
+// at 8K, ids identical), so the gfx1151 arch table sets STRATA_SH_STREAM=1 on Linux.  On Windows gfx1151 the fork is slower (0.2.7,
+// Qwen IQ3_S: decode -6.4% with it, ids identical), so there the table leaves it out and this default (off on HIP) applies.
+// Read on first use, after that table ran.
 bool sh_stream_on() {
     static const bool on = [] {
         if (const char* v = std::getenv("STRATA_SH_STREAM")) return v[0] != '0';
