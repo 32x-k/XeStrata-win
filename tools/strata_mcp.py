@@ -128,8 +128,9 @@ FALLBACK_FAMILIES = {
               "tag": "llmjp-"},
     "qwen36": {"title": "Qwen3.6-35B-A3B", "about": "35B, 3B active; a Qwen3.5 MoE with the Qwen tokenizer: Unsloth's "
                                                     "4-, 6- and 8-bit files", "tag": "qwen36-"},
-    "qwen35": {"title": "Qwen3.5-9B", "about": "9B, dense, reads images: for a GPU of 8 GB or more, every weight in its "
-                                               "VRAM", "tag": "qwen35-"},
+    "qwen35": {"title": "Qwen3.5-9B",
+               "about": "9B, dense, reads images: for a GPU of 8 GB or more, every weight in its VRAM",
+               "tag": "qwen35-"},
     "qwen35-uncensored": {"title": "Qwen3.5-9B (uncensored)",
                           "about": "Qwen3.5-9B with its refusals removed (HauhauCS's Aggressive): far fewer refusals, "
                                    "and its safety filtering is reduced, so check what it writes",

@@ -5862,7 +5862,8 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     else:
         say()
         say("  Images: the model can also read pictures (screenshots, photos, scanned pages). This adds a 0.9 GB")
-        say("  download; the image encoder runs on the GPU from 24 GB of VRAM, else on the CPU (a few seconds a picture).")
+        say("  download; the image encoder runs on the GPU from 24 GB of VRAM, else on the CPU (a few seconds a"
+            " picture).")
         vision = images_encoder("yes", gpu) if ask("Do you want images?", ["y", "n"], "y", a.yes) == "y" else "none"
     if fam.get("mmproj"):
         ok("images: " + {"none": "off", "gpu": "on (encoder on the GPU, the CPU encoder as fallback)",
@@ -5904,7 +5905,7 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     left = 0 if have else d["size"] / 1e9
     mm = fam.get("mmproj") if vision != "none" else None
     mmproj = models_dir / Path(mm["path"]).name if mm else None   # the picture reader, beside the model
-    if mmproj is not None and not (mmproj.exists() and (done(mmproj) or a.gguf_dir)):
+    if mm is not None and mmproj is not None and not (mmproj.exists() and (done(mmproj) or a.gguf_dir)):
         left += mm["size"] / 1e9
     if left and free_gb(models_dir) < left:
         fail(f"not enough free disk space in {models_dir}: need ~{left:.0f} GB, {free_gb(models_dir):.0f} GB free",
