@@ -183,6 +183,10 @@ void DraftHeadInt2::logits(const float* x, const uint8_t* head_rows, const Exact
     k::topk(out, n_rows_, k_, cand_, scratch_, stream);
     k::gather_rows(head_rows, (int64_t) exact_row_bytes_, cand_, k_, cand_rows_, stream);
     exact(cand_rows_, k_, cand_y_, stream);
+    // the coarse products only pick the candidates: left in the softmax, their error raised its sum and lowered every
+    // draft probability, so the drafts stopped early (RTX 4070, 64K serve: 0.45 drafts a token against 0.76 with the
+    // head as it is).  The others are set to -1.7e38 (0xFE bytes), a probability of 0.
+    gpu::memset_async(out, 0xFE, (size_t) n_rows_ * sizeof(float), stream);
     k::scatter_values(cand_y_, cand_, k_, out, stream);
 }
 

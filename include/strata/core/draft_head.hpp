@@ -3,8 +3,9 @@
 // include/strata/core/draft_head.hpp - the MTP drafts' head at 2 bits, for Qwen3.8-Flash-Next's drafter (mtp.cpp) and
 // the other models' (PlainModel): the coarse products of every row of the draft head (its token subset, or the whole
 // vocabulary), the k best of them taken again with the head's own rows and written back.  The logits it leaves are
-// the coarse ones but for those k, so the picks and the draft probabilities after it are taken as before.  A draft
-// only proposes (the verify window decides with the model's head): a worse pick costs acceptance, not the answer.
+// those k alone (the rest at a probability of 0), so the picks and the draft probabilities after it come from the
+// head's own values.  A draft only proposes (the verify window decides with the model's head): a worse pick costs
+// acceptance, not the answer.
 //
 // Which form a device takes is measured at load (`choose`), not told by its name: on the 2560 x 106,299 subset of
 // Qwen3.8's Q5_K head, a draft step's head took 556 -> 288 us on the B70 and 400 -> 325 us on the RTX 4070 (k = 16,
