@@ -41,6 +41,9 @@ Requirements and limits for this first version:
 - **The session state after a KVA read is approximate.** It must not be reused as an exact prefix: no
   checkpoint of it, no follow-up prompt that reuses it. The engine prints a warning when this happens.
 - The approximation is a quality tradeoff, not a lossless transformation. Measure before using it.
+- Every run says what it did:
+  - applied: `strata prefill: KVA on: split 24, suffix 2112, approximated 5120 of 7533 positions in 5 of 8 chunks, mode identity`
+  - configured but not applied: `strata prefill: KVA configured but NOT applied: <reason> (prompt … positions, min_prompt …, suffix …, split …)`
 
 ## Measured (Tesla P100 16 GB, Qwen3.8-Flash-Next IQ3_XXS, chunk 1024, expert cache 1500, MTP window 2048)
 

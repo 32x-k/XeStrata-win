@@ -5279,6 +5279,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         if (kva_positions > 0)
             std::fprintf(stderr, "strata prefill: KVA: the session state holds approximated cells; it is not an exact "
                                  "prefix and must not be reused as one (no checkpoint, no follow-up reuse)\n");
+    } else if (kva.on) {
+        // KVA-8 (observability): a run that was configured for KVA but fell back completely must say so and why,
+        // or an operator cannot tell it apart from a run where the feature was never asked for.
+        const char* why = pos0 != 0                                   ? "a continuation read (pos0 != 0)"
+                        : (LB != 0 || (LE >= 0 && LE != g.n_layers))  ? "a layer split (not the whole trunk)"
+                        : kva.capture                                 ? "capture mode"
+                        : n < kva.min_prompt                          ? "the prompt is shorter than STRATA_KVA_MIN_PROMPT"
+                        : n <= kva.suffix + 64                        ? "the suffix leaves too few positions to approximate"
+                                                                      : "not applicable";
+        std::fprintf(stderr, "strata prefill: KVA configured but NOT applied: %s (prompt %lld positions, "
+                             "min_prompt %lld, suffix %lld, split %lld)\n",
+                     why, (long long) n, (long long) kva.min_prompt, (long long) kva.suffix, (long long) kva_split);
     }
     if (std::getenv("STRATA_STATE_HASH_GDN") != nullptr) {   // debug: the GDN states as the prompt path leaves them
         cudaStreamSynchronize(m.cs);
