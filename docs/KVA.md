@@ -28,6 +28,14 @@ against off) show where it costs answers when more layers are approximated:
 - **Split 36.** On the same 22 tasks on the RTX 5070: agents 6 of 10 (exact: 4 and 7), extraction 585 of 606 facts
   (exact: 585), with prompt speed +11 % at 14K and +18 % at 30K. This is the cleanest configuration measured and the
   one `STRATA_KVA=1` selects.
+- **Speed of the shipped opt-in (split 36, 2048-token tail).**
+  - Tesla P100, IQ3_XXS: prompt speed +12 % at 14K (323.8 to 363.5 tok/s) and +20 % at 30K (336.1 to 401.9).
+  - Radeon AI PRO R9700 (gfx12), IQ3_S, final build d1a57dc9d, 27K needle prompt: prompt 2411 to 3086 tok/s (+28 %), decode
+    94.7 to 84.3 tok/s (−11 %, tokens per round 4.08 to 3.33). The needle was found with and without KVA. Nothing is
+    approximated below 16K there, because the chunks are 16384 tokens.
+  - The trade, plainly: a long prompt is read faster, and the answers after it decode somewhat slower on fast GPUs,
+    because the draft layer's guesses are accepted less often once most of the context was approximated. On a slow GPU
+    the decode difference is within the noise.
 - Needle retrieval, unanswerable questions, short summaries, code and JSON were unchanged in every variant.
 - Split 24 is faster (about 1.3x at 14K and 1.5x at 30K on the P100); the extra layers that stay exact are what buy
   the quality.
