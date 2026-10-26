@@ -875,11 +875,11 @@ struct Gdn {
             const char* v = std::getenv("STRATA_GDN_KEYHEAD");
             return v == nullptr || std::strtol(v, nullptr, 10) != 0;
         }();
-        auto launch_kh = [&](float* st, float* yy) {
+        auto launch_kh = [&](float* st, float* yy, const int64_t n) {
             q.submit([&](sycl::handler& hd) {
             using L = sycl::local_accessor<float, 1>;
             hd.parallel_for(sycl::nd_range<1>((size_t) HK * NCB * GdnRecKh::NT, GdnRecKh::NT),
-                            GdnRecKh{st, h, gate, beta, yy, T, L(sycl::range<1>((size_t) 2 * GDN_TB * S), hd),
+                            GdnRecKh{st, h, gate, beta, yy, n, L(sycl::range<1>((size_t) 2 * GDN_TB * S), hd),
                                      L(sycl::range<1>((size_t) 2 * GDN_TB * S), hd),
                                      L(sycl::range<1>((size_t) 2 * GDN_TB * VPK * CB), hd),
                                      L(sycl::range<1>((size_t) 2 * GdnRecKh::GB), hd),
@@ -887,7 +887,7 @@ struct Gdn {
                                      L(sycl::range<1>((size_t) VPK * RG * CB), hd)});
         });
         };
-        auto launch_d2 = [&](float* st, float* yy) {
+        auto launch_d2 = [&](float* st, float* yy, const int64_t n) {
             q.submit([&](sycl::handler& hd) {
             sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), sq(sycl::range<1>(S), hd),
                 red(sycl::range<1>((size_t) RG * CB), hd);
@@ -900,7 +900,7 @@ struct Gdn {
                 const size_t rs = (size_t) HV * S;
                 for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
                 if (!pipe) {
-                    for (int64_t t = 0; t < T; ++t) {
+                    for (int64_t t = 0; t < n; ++t) {
                         const float oc = rec_step<CB>(it, s, h + t * C, gate, beta, t, head, qh, rg, c, col, tid, &sk[0],
                                                       &sq[0], &red[0]);
                         if (rg == 0) yy[t * HV * S + (int64_t) head * S + col] = oc;
@@ -917,14 +917,14 @@ struct Gdn {
                     ng = gate[t * HV + head];
                     nb = beta[t * HV + head];
                 };
-                if (T > 0) fetch(0);
-                for (int64_t t = 0; t < T; ++t) {
+                if (n > 0) fetch(0);
+                for (int64_t t = 0; t < n; ++t) {
                     const float cq = nq, ck = nk, cv = nv, cg = ng, cbt = nb;
                     sycl::group_barrier(it.get_group());
                     sq[tid] = cq;
                     sk[tid] = ck;
                     sycl::group_barrier(it.get_group());
-                    if (t + 1 < T) fetch(t + 1);
+                    if (t + 1 < n) fetch(t + 1);
                     const float g = sycl::exp(cg);
                     float kv = 0.0f;
                     for (int r = 0; r < RPG; ++r) kv = sycl::fma(s[r], sk[rg * RPG + r], kv);
@@ -951,12 +951,16 @@ struct Gdn {
         // D-2 or the key-head form, whichever ran a chunk faster on this device: timed once, on copies of the state, at
         // the first call of at least 64 tokens.  RTX 4070: 2175 -> 459 us for 512 tokens (+2.4% prompt speed); the B70
         // without GdnRecLane: 56 -> 92 ms a prompt (the key-head form keeps 3 x 32 state rows a work-item in registers).
+        // Timed on the chunk's first 1024 tokens at most: the ratio does not move with the length (RTX 4070: 5.2x at
+        // 1016 tokens, 5.3x at 16384), and the output copy of a 16384-token chunk (256 MiB) did not fit beside a full
+        // expert cache, which left the 5x slower D-2 on unmeasured (32K serve prompt 1,943 -> 1,687 tok/s).
         static int pick = -1;   // 1: the key-head form
         if (gdn_lane_ok(q))
             q.parallel_for(sycl::nd_range<1>((size_t) HV * S, 16), GdnRecLane<16>{state, h, gate, beta, y, T});
         else {
             if (pick < 0 && kh_on && T >= 64) {
-                const size_t ns = (size_t) S * HV * S, ny = (size_t) T * HV * S;
+                const int64_t tn = std::min<int64_t>(T, 1024);
+                const size_t ns = (size_t) S * HV * S, ny = (size_t) tn * HV * S;
                 float* st = sycl::malloc_device<float>(ns, q);
                 float* yy = sycl::malloc_device<float>(ny, q);
                 if (st != nullptr && yy != nullptr) {
@@ -965,7 +969,7 @@ struct Gdn {
                         for (int r = 0; r < 2; ++r) {
                             q.copy(state, st, ns).wait();
                             const auto t0 = std::chrono::steady_clock::now();
-                            launch(st, yy);
+                            launch(st, yy, tn);
                             q.wait();
                             us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
                         }
@@ -974,15 +978,19 @@ struct Gdn {
                     const double d2 = time(launch_d2), kh = time(launch_kh);
                     pick = kh < d2 ? 1 : 0;
                     std::fprintf(stderr, "strata: the DeltaNet recurrence, %lld tokens: D-2 %.0f us, the key-head form %.0f "
-                                 "us: %s\n", (long long) T, d2, kh, pick ? "the key-head form" : "D-2");
+                                 "us: %s\n", (long long) tn, d2, kh, pick ? "the key-head form" : "D-2");
                 } else {
-                    pick = 0;
+                    static bool said = false;   // D-2 meanwhile; the next call tries again
+                    if (!said)
+                        std::fprintf(stderr, "strata: the DeltaNet recurrence: no VRAM to time the two forms on %lld "
+                                             "tokens, D-2 until it can be timed\n", (long long) tn);
+                    said = true;
                 }
                 if (st != nullptr) sycl::free(st, q);
                 if (yy != nullptr) sycl::free(yy, q);
             }
-            if (kh_on && pick == 1) launch_kh(state, y);
-            else launch_d2(state, y);
+            if (kh_on && pick == 1) launch_kh(state, y, T);
+            else launch_d2(state, y, T);
         }
         q.submit([&](sycl::handler& hd) {
             sycl::local_accessor<float, 1> wsum(sycl::range<1>(4), hd);
