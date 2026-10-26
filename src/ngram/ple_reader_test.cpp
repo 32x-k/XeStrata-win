@@ -168,6 +168,10 @@ void format_round_trip(const std::string& dir, const k::PleFormatInfo& f, uint32
         if (g_fail) break;
         CHECK(std::strcmp(t.format(), f.name) == 0, "%s: format() says \"%s\"", f.name, t.format());
         CHECK(t.rows() == rows, "%s: rows %llu, not %u", f.name, (unsigned long long) t.rows(), rows);
+        // The residency policy in generate.cpp sizes the table with table_bytes(); it must be the file's own
+        // row count x row bytes in both modes, and 0 once the table is closed.
+        CHECK(t.table_bytes() == (uint64_t) rows * f.row_bytes, "%s: %s: table_bytes %llu, not %u x %u", f.name, name,
+              (unsigned long long) t.table_bytes(), rows, f.row_bytes);
         std::vector<uint8_t> raw(f.row_bytes);
         float got[k::PLE_HEAD_DIM], ref[k::PLE_HEAD_DIM];
         for (uint32_t r : want) {

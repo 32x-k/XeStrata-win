@@ -4,6 +4,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 
 static int fails = 0;
@@ -45,11 +46,19 @@ int main() {
                 CHECK(kv.first != bits);
         }
     }
-    // gfx12: the five prompt switches only, no decode switch, no bit-changing one
+    // gfx12: the five prompt switches and four bit-identical decode switches, no bit-changing one
     unset("STRATA_GFX12_DEFAULTS");
     for (const char* a : {"gfx1200", "gfx1201", "gfx1201:sramecc-:xnack-"}) {
         const auto t = arch_default_env(a);
-        CHECK(t.size() == 5);
+        CHECK(t.size() == 9);
+        bool attn_lane = false, attn_merge = false, tsum = false, expdec = false;
+        for (const auto& kv : t) {
+            if (kv.first == "STRATA_ATTN_LANECELL") attn_lane = kv.second == "1";
+            if (kv.first == "STRATA_ATTN_MERGE_V2") attn_merge = kv.second == "1";
+            if (kv.first == "STRATA_TSUM") tsum = kv.second == "1";
+            if (kv.first == "STRATA_EXPDEC") expdec = kv.second == "1";
+        }
+        CHECK(attn_lane && attn_merge && tsum && expdec);   // the 0.2.7 R9700 decode measurement, bit-identical
         for (const auto& kv : t) CHECK(kv.first != "STRATA_HCD_EXACT");
         for (const auto& kv : t) {
             CHECK(kv.first != "STRATA_Q8_PACKED" && kv.first != "STRATA_SH_STREAM" && kv.first != "STRATA_PF_GEMM" &&
@@ -168,6 +177,16 @@ int main() {
     const char* five[] = {"STRATA_HIP_WMMA", "STRATA_PF_GEMM", "STRATA_PA_FAST", "STRATA_SELECT_WMMA", "STRATA_HC_UPMIX"};
     for (const char* k : five) unset(k);
     CHECK(apply_arch_defaults("gfx1100", false).empty());
+    // gfx12: a discrete RDNA4 card gets its own nine switches (five prompt, four decode); a second call has nothing to do
+    const char* g12[] = {"STRATA_GDN_HEAD", "STRATA_GDN_PP",  "STRATA_GDN_CONVL2",    "STRATA_GDN_NOY", "STRATA_CVEC_FUSE",
+                         "STRATA_ATTN_LANECELL", "STRATA_ATTN_MERGE_V2", "STRATA_TSUM", "STRATA_EXPDEC"};
+    for (const char* k : g12) unset(k);
+    const auto g12set = apply_arch_defaults("gfx1201", false);
+    CHECK(g12set.size() == 9);
+    for (const char* k : g12) {
+        CHECK(std::getenv(k) != nullptr);
+        CHECK(std::string(std::getenv(k)) == (std::strcmp(k, "STRATA_GDN_PP") == 0 ? "2" : "1"));
+    }
     CHECK(apply_arch_defaults("gfx1201", false).empty());
     CHECK(apply_arch_defaults("gfx1103", false).empty());   // integrated == false: a mixed box (iGPU + dGPU) keeps the old defaults
     for (const char* k : five) CHECK(std::getenv(k) == nullptr);

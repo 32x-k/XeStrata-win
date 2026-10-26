@@ -274,6 +274,7 @@ them in the server config's `env`, or in the shell.
 | `STRATA_HIP_ROUTER_OLD=1` | all HIP | Off | Run the portable MoE router kernel instead of the fast one |
 | `STRATA_PREFILL_WARM=0` | all | On | Turn off the warm-up BF16 and FP16 products run while the expert arena loads |
 | `STRATA_HIP_QUEUE_PRIME=0` | gfx1200, gfx1201, Linux | On | Turn off the ordered opening of two GPU queues at start (it avoids slow starts) |
+| `STRATA_PLE_AUTO_RAM=0` | all | On where the RAM fits | Keep the n-gram table in RAM when `--ple-io` was not given (RDNA4: 8K prompt +22.5%, see [RDNA4](#rdna4-gfx1201)); `=0` keeps the direct reads |
 | `STRATA_TOPK_OLD=1`, `STRATA_TOPK_STREAM=0` | HIP | Off | Run the original top-k kernel, or the register kernel in the 90K-135K band |
 
 ### Opt-in chunked prompt GDN on gfx11
@@ -372,6 +373,26 @@ signed dot4 instruction and a 100 MHz wall clock. Switch defaults for gfx12 are 
   arena loads so the first request does not carry them (`STRATA_COLD_TRACE=1` times them).
 - **Pictures:** the card's reader (`strata-vision-hip`) keeps about 1.4 GiB of VRAM. It has not run on an RDNA3 card
   (gfx1100-gfx1102) or on Windows with an AMD card.
+- **PLE table residency (0.2.7):** when `--ple-io` is not given and the machine has room for the n-gram table plus
+  8 GiB, the engine keeps the table in RAM (`--ple-io ram`: map, pre-touch, mlock attempt; `STRATA_PLE_AUTO_RAM=0`
+  turns the policy off, an explicit `--ple-io` always wins). The rows are random reads in a 26.8 GiB table, so this
+  is the one prompt lever that paid on this card. Measured on p620 (R9700 32 GB, IQ3_S, engine 0.1.51, 24576 expert
+  pairs of which 13207 resident): 8K prompt 2045 tok/s with direct reads, 2276 with `mmap`, **2506 with the table in
+  RAM (+22.5%)**; 32K prompt 2522 against 2754 (+9.2%). Decode unchanged, answer md5 identical; the project's
+  `ple_reader_selftest` proves the mapped rows are the same bytes as the direct ones. The table is 26.8 GiB
+  (320,001,536 rows of 90 B), so a start reads it once: about 3 s when it is in the file cache, up to a minute
+  from a cold disk, and it needs the RAM for it while the engine runs.
+- **Decode: the miss split is the opt-in lever on this card (0.2.7, owner decision pending).** `--pcie-frac`
+  decides how many of the missing expert rows are fetched over PCIe and how many are computed by the CPU pool.
+  The x16 share (0.55) was measured where the link was the cheap side; on an R9700 with idle CPU cores it is
+  the pool: IQ3_S, 3 rotated pairs, PLE direct, **8K decode 86.1 -> 94.6 tok/s at `--pcie-frac 0.15` (+9.9%),
+  32K 67.2 -> 84.4 (+25.6%)**, 64K 69.1 -> 72.3 (+4.7%), prompt speed unchanged. Under `serve/server.py` a short
+  chat decodes 84.4 -> 93.2 (+10.4%). The CPU lane rounds a missing expert's FP32 rows differently from the GPU
+  lane, so this changes bits: the first-token KL of 0.0 against 0.55 is **0.0013 mean** (median 0.0011, max
+  0.0047, same top-1 in 12 of 12 prompts), but **the generated text is not identical** - on six fixed 2K/4K
+  prompts and 64 greedy tokens, 4 of 6 answers differ somewhere from the default. It therefore stays **opt-in**
+  (`--pcie-frac 0.15` in the config's args) until the owner accepts a text-changing default; the same class of
+  finding is in the CUDA plan for the 3060 and P100 ("the pcie-frac default is wrong").
 - **Not validated:** answer-quality benchmarks and contexts beyond 16K on the 9070 XT.
 
 > **Measured on:** Radeon AI PRO R9700 32 GB and RX 9070 XT 16 GB (gfx1201), Ryzen 9 3900X, 47 GB RAM, Ubuntu 24.04
