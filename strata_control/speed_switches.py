@@ -1,12 +1,16 @@
-"""The three speed features that are on by default in 0.2.7, and the off switch each one has.
+"""The speed features of 0.2.7 that have a switch in the app's Expert settings and in the Terminal's Advanced table.
 
-Each switch, when off, writes exactly the engine environment below into the model's run config ("env"); turning it on again removes those entries,
-so a default launch carries none of them and is byte for byte what 0.2.6 started. The names are the engine switch contract
-(phaseA-tests/notes-027-plan.md). The app does the same in apps/host/server/native-settings.mjs (SPEED_SWITCHES); tests/terminal/test_speed_switches.py
+A switch has a default (``on`` or ``off``).  In its other state it writes exactly the engine environment below into the model's run config ("env"); back in
+its default it removes those entries, so a default launch carries none of them and is byte for byte what 0.2.6 started.  The names are the engine switch
+contract (phaseA-tests/notes-027-plan.md).  The app does the same in apps/host/server/native-settings.mjs (SPEED_SWITCHES); tests/terminal/test_speed_switches.py
 reads that file and fails when the two disagree, so the Terminal and the app cannot drift apart.
 
-The Terminal shows the switches as rows of its Advanced table (strata_cli/launch/params.py), only where they apply: ``strata launch --set STRATA_KVA=0``
-turns "Faster long prompts" off, ``--set STRATA_KVA=off`` puts the default back (the same as removing the row).
+- "Faster long prompts" (Qwen KVA) is OFF by default (owner decision, 26 October): ``STRATA_KVA=1`` turns it on.  A file that holds ``STRATA_KVA=0`` (the
+  off switch of an earlier 0.2.7 test build) reads as off, which is what it is now.
+- "Faster answers on Radeon RX 9000 / AI PRO R9700" and "DeepSeek speed-ups" are ON by default; turning them off writes their entries.
+
+The Terminal shows the switches as rows of its Advanced table (strata_cli/launch/params.py), only where they apply: ``strata launch --set STRATA_KVA=1``
+turns "Faster long prompts" on, ``--set STRATA_KVA=off`` puts the default back (the same as removing the row).
 """
 
 from __future__ import annotations
@@ -20,15 +24,16 @@ from typing import Any, Iterable, Mapping
 class Switch:
     id: str
     label: str                    # the words the app shows
-    effect: str                   # one plain sentence: what it does and what turning it off does
-    off: tuple[tuple[str, str], ...]   # the environment entries written when it is off
+    effect: str                   # one plain sentence: what it does and what the other choice does
+    env: tuple[tuple[str, str], ...]   # the environment entries written when the switch is NOT in its default state
     only: str                     # "qwen-gpu" | "qwen-radeon-9000" | "deepseek": where it applies
+    default: str = "on"           # "on" | "off": what a launch without the entries does
 
 
 SWITCHES: tuple[Switch, ...] = (
     Switch("faster_long_prompts", "Faster long prompts",
-           "Reads long prompts faster by approximating part of the work. Turn off if answers about long documents look wrong.",
-           (("STRATA_KVA", "0"),), "qwen-gpu"),
+           "Reads very long prompts faster by approximating part of the work. Off by default: answers about long documents can miss or mix up details.",
+           (("STRATA_KVA", "1"),), "qwen-gpu", default="off"),
     Switch("faster_radeon_9000", "Faster answers on Radeon RX 9000 / AI PRO R9700",
            "Shares the work between the graphics card and the processor in a way that makes answers faster on these cards. "
            "Turn off to go back to the previous setting, which is slower.",
@@ -62,7 +67,8 @@ def _radeon_9000(gpus: Iterable[Mapping[str, Any]] | None) -> bool:
 
 
 def applies(switch: Switch | str, cfg: Mapping[str, Any] | None, gpus: Iterable[Mapping[str, Any]] | None, backend: str | None = None) -> bool:
-    """Does the switch make sense for this model on this PC? ``backend`` is the engine's (cuda, hip, sycl, metal, cpu); the run config's own wins."""
+    """Does the switch make sense for this model on this PC? ``backend`` is the engine's (cuda, hip, sycl, metal, cpu); the run config's own wins.
+    "Faster long prompts" is for Qwen3.8-Flash-Next models only (a config without an "arch")."""
     sw = BY_ID[switch] if isinstance(switch, str) else switch
     if sw.only == "deepseek":
         return is_deepseek(cfg)
@@ -70,7 +76,9 @@ def applies(switch: Switch | str, cfg: Mapping[str, Any] | None, gpus: Iterable[
         return False
     backend = (cfg or {}).get("backend") or backend
     if sw.only == "qwen-gpu":
-        return backend in ("cuda", "hip")
+        # KVA was measured on the Qwen3.8-Flash-Next shape (48 layers, 512 experts); the engine declines any other.  Setup writes "arch" only for the
+        # families with an engine path of their own (Qwen3.6-35B-A3B: qwen35moe), so a Flash-Next config (the original, Swift, Coder, Unsloth, Gyro, NVFP4) has none.
+        return not (cfg or {}).get("arch") and backend in ("cuda", "hip")
     if sw.only == "qwen-radeon-9000":
         return backend == "hip" and _radeon_9000(gpus)
     return False
@@ -81,32 +89,42 @@ def applicable(cfg: Mapping[str, Any] | None, gpus: Iterable[Mapping[str, Any]] 
     return [s for s in SWITCHES if applies(s, cfg, gpus, backend)]
 
 
-def is_off(env: Mapping[str, Any] | None, switch: Switch | str) -> bool:
-    """Off only when every entry the switch writes is there with its value; a file with only some of them reads as on and is left alone."""
+def is_set(env: Mapping[str, Any] | None, switch: Switch | str) -> bool:
+    """Every entry the switch writes is there with its value (the switch is out of its default).  A file with only some of them, or other values
+    (``STRATA_KVA=0``), is in the default state and is left alone."""
     sw = BY_ID[switch] if isinstance(switch, str) else switch
-    return all((env or {}).get(name) == value for name, value in sw.off)
+    return all((env or {}).get(name) == value for name, value in sw.env)
+
+
+def is_on(env: Mapping[str, Any] | None, switch: Switch | str) -> bool:
+    """Is the feature on for a launch with this environment?"""
+    sw = BY_ID[switch] if isinstance(switch, str) else switch
+    return is_set(env, sw) != (sw.default == "on")
 
 
 def set_switch(env: Mapping[str, Any] | None, switch: Switch | str, on: bool) -> dict[str, Any]:
-    """The environment with the switch on (its entries removed) or off (its entries written). Nothing else in it changes."""
+    """The environment with the feature on or off: the default state removes the switch's entries, the other one writes them. Nothing else changes."""
     sw = BY_ID[switch] if isinstance(switch, str) else switch
     out = dict(env or {})
-    for name, value in sw.off:
-        if on:
-            out.pop(name, None)
-        else:
+    write = on != (sw.default == "on")
+    for name, value in sw.env:
+        if write:
             out[name] = value
+        else:
+            out.pop(name, None)
     return out
 
 
 def env_names() -> dict[str, Switch]:
     """Every environment name a switch writes -> its switch."""
-    return {name: sw for sw in SWITCHES for name, _ in sw.off}
+    return {name: sw for sw in SWITCHES for name, _ in sw.env}
 
 
 def env_words(name: str) -> str:
     """The plain sentence of one environment row of the Terminal's Advanced table."""
     sw = env_names()[name]
-    value = dict(sw.off)[name]
-    together = f"; all {len(sw.off)} speed-up rows go together" if len(sw.off) > 1 else ""
+    value = dict(sw.env)[name]
+    together = f"; all {len(sw.env)} speed-up rows go together" if len(sw.env) > 1 else ""
+    if sw.default == "off":
+        return f"{sw.label} (off by default; set {value} to turn on{together}). {sw.effect}"
     return f"{sw.label} (on by default; set {value} to turn off{together}). {sw.effect}"
