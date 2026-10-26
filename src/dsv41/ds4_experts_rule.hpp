@@ -47,7 +47,7 @@ inline int prefill_chunk_default(bool own_default, double gpu_share, bool gguf_c
     // `strata launch` writes for 4 or more AMD cards), share 0.86: 1024 370 against 214 tok/s at 8192; and with the engine's own default tp
     // (2, pairs of cards, nothing written), where the rule used to fall through to 2048/8192: 2.25 bpw, --dspark auto, ids 5705e1164a, 8K
     // warm prompts 1024 -> 1247 ppts against 690 at 8192, decode unchanged.  So a multi-card tp run takes it too.  One card with the default
-    // tp, `--threads on` (it stalled at the first 8K prompt in the 4-card runs) and a build that is not HIP keep their old defaults: not measured with 1024.
+    // tp, `--threads on` (it stalled at the first 8K prompt in the 4-card runs) and a system that is not RDNA4 keep their old defaults: not measured with 1024.
     // An explicit --prefill-chunk N wins over all of this (the call site takes the rule only when none was given).
     if ((own_default || multi_tp) && gpu_share >= 0.5) return 1024;
     if (gguf_copy && !hip && min_vram_bytes >= kChunk4096MinVram) return 4096;
@@ -108,7 +108,7 @@ inline int attn_slab_rows(int env, int chunk, int base, double spare_bytes, doub
 //     summed room, 64 MB a GB, 400..1200 MB.  Measured on Strix Halo only (400 -> 1200: the queue 3,200 -> 8,087 experts, 4K prompt 27.3
 //     -> 21.3 s, decode unchanged); a discrete card in this band is not measured and takes the same, VRAM-bounded, rule.
 // A unified-memory GPU never takes the small ring (its datapoint is the 1200 MB one): it keeps the 16 MB "fit" rule at 1/1.3.
-// `hip`: the 0.5..0.82 band and the 0.82 threshold are the 4 x R9700 measurements, so only a HIP build takes them; any other build keeps main's
+// `hip`: the 0.5..0.82 band and the 0.82 threshold are the 4 x R9700 measurements, so only an RDNA4 system (every device a gfx1200 or gfx1201; the parameter is named hip) takes them; any other build keeps main's
 // rule there (16 MB from 1/1.3, the streamed ring below it) until a CUDA multi-card rig is measured.
 inline int staging_ring_mb(double share, double room_bytes, int n_dev, bool integrated, bool hip) {
     const double GB = 1e9;

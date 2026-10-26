@@ -134,7 +134,7 @@ int main() {
         CHECK_EQ(staging_ring_mb(0.76, 40 * GB, 1, true, true), 1200);
         // nothing known: no devices
         CHECK_EQ(staging_ring_mb(0.0, 0.0, 0, false, true), 400);
-        // a build that is not HIP keeps main's rule everywhere: 16 MB from 1/1.3, the streamed ring below it (no small band, no 0.82)
+        // a system that is not RDNA4 keeps main's rule everywhere: 16 MB from 1/1.3, the streamed ring below it (no small band, no 0.82)
         CHECK_EQ(staging_ring_mb(0.77, 4 * 31 * GB, 4, false, false), 16);
         CHECK_EQ(staging_ring_mb(0.60, 4 * 31 * GB, 4, false, false), 1200);
         CHECK_EQ(staging_ring_mb(0.80, 4 * 31 * GB, 4, false, false), 16);
@@ -174,7 +174,7 @@ int main() {
     CHECK_EQ(prefill_chunk_default(true, 0.86, false, true, true, 32 * GiB), 1024);
     CHECK_EQ(prefill_chunk_default(true, 0.50, false, true, true, 32 * GiB), 1024);
     CHECK_EQ(prefill_chunk_default(true, 0.49, false, true, true, 32 * GiB), 8192);
-    // a multi-card tp run (own_default false, multi_tp: 2+ cards, no --threads on; the engine's default tp 2, or --tp 2 from the launcher) takes
+    // a multi-card tp run (own_default false, multi_tp: RDNA4, 2+ cards, no --threads on; the engine's default tp 2, or --tp 2 from the launcher) takes
     // the small chunk too: the 4 x R9700 default-tp datapoint (8K warm 1247 ppts at 1024 against 690)
     CHECK_EQ(prefill_chunk_default(false, 0.86, false, true, true, 32 * GiB, 8192, true), 1024);
     CHECK_EQ(prefill_chunk_default(false, 0.50, false, true, true, 32 * GiB, 8192, true), 1024);
