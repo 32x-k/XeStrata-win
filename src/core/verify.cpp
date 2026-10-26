@@ -204,6 +204,32 @@ inline int g_side_mixer() {
     return per_dev[dev] - 1;
 #endif
 }
+// STRATA_ROUTE_PRIOR=lambda: residency-biased routing (the top-10 picked again with a logit bonus for the resident
+// experts; route_prior.cu).  Unset: 2.0 on a DISCRETE NVIDIA card of 13 GiB or less (CUDA builds only), 0 elsewhere.
+// Measured on an RTX 3060 12 GB only (IQ3_XXS, 5 interleaved pairs: +37.6% / +35.2% decode); the owner approved the
+// quality trade for 12 GB cards (it changes which experts run).  Not a default in a HIP build (a 12 GB Radeon, or a
+// Strix Halo whose reported VRAM is a small carve-out of unified memory: unmeasured there) and not on an integrated GPU.
+// STRATA_ROUTE_PRIOR=0 turns it off, any other value wins everywhere.  The default is read from the device properties
+// (no allocation, no stream work), and Verifier::init asks once per card, so the first ask is never inside a graph capture.
+inline float g_route_prior() {
+    static const char* const env_s = std::getenv("STRATA_ROUTE_PRIOR");
+    static const float env = env_s ? (float) std::atof(env_s) : 0.0f;
+    if (env_s != nullptr) return env;
+#if defined(STRATA_USE_HIP) || defined(STRATA_GPU_METAL)
+    return 0.0f;
+#else
+    static float per_dev[64];   // 0 unknown, else prior + 1
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return 0.0f; }
+    if (per_dev[dev] == 0.0f) {
+        cudaDeviceProp p;
+        const bool ok = cudaGetDeviceProperties(&p, dev) == cudaSuccess;
+        if (!ok) cudaGetLastError();
+        per_dev[dev] = 1.0f + (ok && !p.integrated && (double) p.totalGlobalMem / 1073741824.0 <= 13.0 ? 2.0f : 0.0f);
+    }
+    return per_dev[dev] - 1.0f;
+#endif
+}
 inline bool g_qfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_QFUSE"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
 #define VDBG(...) do { if (g_dbg) { std::fprintf(stderr, "verify dbg: " __VA_ARGS__); std::fflush(stderr); } } while (0)
 
@@ -703,6 +729,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     release_gpu_fn().store(&release_live_verifiers);
     cudaGetDevice(&device_);   // a layer split's stage on another GPU: its streams, graphs and buffers live there
     rr_stats_ = route_resident_cfg().stats_on(device_);   // STRATA_ROUTE_RESIDENT: this GPU's counters, outside graph capture
+    {   // once per card, here: record_window (graph capture) only reads the cached value
+        const float rp = g_route_prior();
+        if (rp > 0.0f && std::getenv("STRATA_ROUTE_PRIOR") == nullptr)
+            std::fprintf(stderr, "strata verify: residency-biased routing is on by default on this card (STRATA_ROUTE_PRIOR=%.1f: a card of 13 GiB "
+                                 "or less; it changes which experts run; STRATA_ROUTE_PRIOR=0 turns it off)\n", (double) rp);
+    }
     strata::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
     strata::kernels::fused_gr_persist_init();   // opt-in STRATA_HC_PERSIST=1 (HIP)
     wt_ = &wt;
@@ -1966,23 +1998,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
-        // STRATA_ROUTE_PRIOR=lambda: the top-10 picked again with a logit bonus for the resident experts; the weights
-        // stay the router's (route_prior.cu).  **On by default at 2.0 on a card of 13 GiB or less**, where the expert
-        // cache cannot hold the model: measured on an RTX 3060 12 GB (IQ3_XXS), 5 interleaved pairs, story 44.2 ->
-        // 60.9 tok/s (+37.6%) and code 47.3 -> 64.0 (+35.2%); at 1.0 it is +22.6% / +24.6%.  The owner approved the
-        // quality trade for 12 GB cards (it changes which experts run).  It is NOT a default where the cache holds
-        // the model: on an RTX PRO 5000 72 GB it measured -1.9% / -0.5% and on 2x RTX A4000 -4.2% / +11.0%, so
-        // STRATA_ROUTE_PRIOR=0 turns it off and any explicit value wins.
-        static const float route_prior = [] {
-            const char* v = std::getenv("STRATA_ROUTE_PRIOR");
-            if (v != nullptr) return (float) std::atof(v);
-            int dev = 0;
-            if (cudaGetDevice(&dev) != cudaSuccess) return 0.0f;
-            size_t free_b = 0, total_b = 0;
-            if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return 0.0f;
-            cudaGetLastError();   // drop what a query on a device without a context leaves behind
-            return (double) total_b / 1073741824.0 <= 13.0 ? 2.0f : 0.0f;
-        }();
+        // STRATA_ROUTE_PRIOR=lambda (changes the output): the top-10 picked again with a logit bonus for the resident
+        // experts; the weights stay the router's (route_prior.cu).  The default is g_route_prior() above: 2.0 on a
+        // discrete CUDA card of 13 GiB or less, off elsewhere (measured on an RTX 3060 12 GB: story +37.6%, code +35.2%;
+        // on an RTX PRO 5000 72 GB -1.9% / -0.5%, on 2x RTX A4000 -4.2% / +11.0%, hence not a default on bigger cards).
+        const float route_prior = g_route_prior();
         if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr)
             route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
         if (route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {

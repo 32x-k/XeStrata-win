@@ -42,7 +42,8 @@ These need no engine change; they are settings. Each was measured on the same bo
 
 ## The 12 GB default: residency-biased routing
 
-**On by default at 2.0 on a card with 13 GiB of memory or less** (`STRATA_ROUTE_PRIOR=0` turns it off). The router prefers
+**On by default at 2.0 on a discrete NVIDIA card with 13 GiB of memory or less** (`STRATA_ROUTE_PRIOR=0` turns it off;
+not a default on a Radeon, a Strix Halo or any integrated GPU, where it was not measured). The router prefers
 experts that are already resident, so a window stops waiting on a page-in that the next window would need again. Measured
 on the RTX 3060 12 GB (IQ3_XXS), five interleaved pairs of fresh engines:
 

@@ -444,6 +444,11 @@ constexpr int UPW_BLOCKS = N / UPW_COLS;
 /// resident, 5 interleaved pairs of fresh engines): story 197.6 -> 201.3 tok/s (+1.9%), code 243.5 -> 245.1 (+0.7%),
 /// the produced token ids identical in 6/6 runs; the isolated read (fused_gr_bench) is bitwise the old kernel's.
 bool gr_up_wide_on() {
+#if defined(__HIPCC__)
+    // A HIP build never takes it: gfx1200 / gfx1201 report compute capability 12.0 too, and sm120_default() would turn the
+    // CUDA-measured kernel on there (unmeasured on AMD).  The persistent HC read is the HIP card's own opt-in.
+    return false;
+#else
     static const int env = [] {
         const char* v = std::getenv("STRATA_GR_UP_WIDE");
         return v != nullptr ? (std::atoi(v) != 0 ? 1 : 0) : -1;
@@ -460,6 +465,7 @@ bool gr_up_wide_on() {
         cudaGetLastError();   // drop what an attribute query on a CPU-only box leaves behind
     }
     return per_dev[dev] == 2;
+#endif
 }
 
 template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false>
