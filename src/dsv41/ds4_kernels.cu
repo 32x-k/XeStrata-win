@@ -14,6 +14,7 @@
 #include <atomic>
 #include <cfloat>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <cstdio>
@@ -2025,15 +2026,40 @@ bool split_enabled() {
     }();
     return on;
 }
-// DS4_FAST_ATTN=1: the chunked prompt's packed-KV attention on the matrix cores (sparse_attn_wmma_kernel).  Opt-in: the
+// DS4_FAST_ATTN: the chunked prompt's packed-KV attention on the matrix cores (sparse_attn_wmma_kernel).  The
 // QK/PV sums are the matrix cores' order, so the outputs differ from the scalar kernel's in the last places (the owner
 // approved the trade for the prefill; the decode path stays on the scalar kernels).
+// 0.2.7: ON by default on gfx1200 / gfx1201 (RDNA4: the R9700, RX 9000), where it was measured and gated (KL 0.0003 against the
+// 0.006 gate, ids identical); gfx11 and gfx1151 (Strix Halo) are untested and keep the scalar kernels.  DS4_FAST_ATTN=0 is the
+// off switch (exactly the 0.2.6 arithmetic), DS4_FAST_ATTN=1 turns it on elsewhere.  Decided per device (the first call there).
+#if defined(STRATA_USE_HIP)
+bool device_is_gfx12() {
+    static std::atomic<int> cache[64];   // 0 unknown, 1 no, 2 yes
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (dev < 0 || dev >= 64) return false;
+    int c = cache[dev].load();
+    if (c == 0) {
+        cudaDeviceProp prop{};
+        const bool yes = cudaGetDeviceProperties(&prop, dev) == cudaSuccess &&
+                         (std::strncmp(prop.gcnArchName, "gfx1200", 7) == 0 || std::strncmp(prop.gcnArchName, "gfx1201", 7) == 0);
+        c = yes ? 2 : 1;
+        cache[dev].store(c);
+    }
+    return c == 2;
+}
+#endif
 bool fast_attn_enabled() {
-    static const bool on = [] {
+    static const int env = [] {
         const char* e = std::getenv("DS4_FAST_ATTN");
-        return e != nullptr && std::atoi(e) != 0;
+        return e == nullptr ? -1 : (std::atoi(e) != 0 ? 1 : 0);
     }();
-    return on;
+    if (env >= 0) return env == 1;
+#if defined(STRATA_USE_HIP)
+    return device_is_gfx12();
+#else
+    return false;
+#endif
 }
 attnsplit::AttnSplitScratch split_scratch(cudaStream_t s, int heads) {
     static std::mutex mu;
