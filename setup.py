@@ -7878,14 +7878,15 @@ def dsv41_engine_pending(eng: Path) -> bool:
 
 
 def dsv41_manual_steps(eng: Path) -> str:
-    return (f"If you downloaded the DeepSeek engine package from the release page (the file strata-dsv41-...-{'windows' if WIN else 'linux'}-....{'zip' if WIN else 'tar.gz'}), "
+    return (f"If you downloaded the DeepSeek engine package from the release page (the file strata-dsv41-...-{'windows' if WIN else 'linux'}-....tar.gz), "
             f"run the same command again with --dsv41-package PATH-OF-THE-FILE (strata launch accepts it too), or put the file in {dsv41_engine_dir(eng)} "
             "and run it again. Strata checks it before it is used.")
 
 
-def get_dsv41_engine(eng: Path, hip: bool, package: str | None = None) -> Path | None:
+def get_dsv41_engine(eng: Path, hip: bool, package: str | None = None, feed: str | None = None) -> Path | None:
     """The DeepSeek engine package next to the engine `eng`: one the person gave (--dsv41-package) or put in engine-dsv41/ by hand, else downloaded from
-    the signed feed.  Checked first either way; its strata-dsv41, or None when it cannot be had."""
+    the signed feed `feed` (--feed; else STRATA_UPDATE_FEED, a remembered https feed, or the release's).  Checked first either way; its
+    strata-dsv41, or None when it cannot be had."""
     from strata_control import dsv41_engine
     root = dsv41_engine_dir(eng)
     if package:
@@ -7900,7 +7901,7 @@ def get_dsv41_engine(eng: Path, hip: bool, package: str | None = None) -> Path |
             return exe
     acquisition.require("the DeepSeek engine")
     from strata_cli import update_cmd
-    source = update_cmd._feed_source(argparse.Namespace(feed=None), root.parent)
+    source = update_cmd._feed_source(argparse.Namespace(feed=feed), root.parent)
     say("  Downloading the DeepSeek engine (its own package, separate from the Strata engine) ...")
     hw = None
     if hip:
@@ -7912,14 +7913,15 @@ def get_dsv41_engine(eng: Path, hip: bool, package: str | None = None) -> Path |
     return exe
 
 
-def upgrade_dsv41_engine(eng: Path, exe: Path) -> Path:
-    """The installed DeepSeek engine package is older than the signed feed's: updated next to it, switched after its test start, the old one removed
-    (strata_control.dsv41_engine.upgrade).  Silent when the feed cannot be reached; a failure is one plain line and `exe` keeps running."""
+def upgrade_dsv41_engine(eng: Path, exe: Path, feed: str | None = None) -> Path:
+    """The installed DeepSeek engine package is older than the signed feed's (--feed, else STRATA_UPDATE_FEED, a remembered https feed,
+    or the release's): updated next to it, switched after its test start, the old one removed (strata_control.dsv41_engine.upgrade).
+    Silent when the feed cannot be reached; a failure is one plain line and `exe` keeps running."""
     from strata_control import dsv41_engine
     try:
         from strata_cli import update_cmd
         root = dsv41_engine_dir(eng)
-        source = update_cmd._feed_source(argparse.Namespace(feed=None), root.parent)
+        source = update_cmd._feed_source(argparse.Namespace(feed=feed), root.parent)
         if not dsv41_engine.source_reachable(source):
             return exe
         new = dsv41_engine.upgrade(root, source, installed=exe, emit=lambda m: say("  " + m))
@@ -8015,6 +8017,38 @@ def dsv41_pack_cmd(folder: Path, shards: list, engram: Path, meta: Path, dspark:
     return [sys.executable, str(ROOT / "tools" / "dsv41" / "pack_gguf.py"), "--model", str(folder), "--shards", *[Path(n).name for n in shards],
             "--engram", str(engram), "--engram-meta", str(meta), "--dspark-gguf", str(dspark),
             "--dspark-noise-token", "128799", "--dspark-markov-rank", "256", "--out", str(pack)]
+
+
+def dsv41_prefill_chunk_args(cards, ram_gb) -> list:
+    """A bigger prompt chunk on a unified-memory APU (Ryzen AI Max, gfx1151), where the engine's 1,024-token rule was calibrated on
+    cards that hold most of the experts.  Measured on the 128 GB Strix Halo with the 2.00 bpw set (2026-10-25, engine 0.1.51):
+    4K prompt 78.7 -> 87.2 tok/s, 8K 108.9 -> 125.1, 32K 155.2 -> 176.9; decode unchanged (16.53 -> 16.59 tok/s), because the
+    chunk buffers take ~5 GB from the GPU expert tier and the RAM store's hit rate rises to compensate.  The prompt chunk's
+    summation order changes, not the model: the repo's chunk-size KL check (1024 0.1705 / 2048 0.1692 / 4096 0.1688 / 8192 0.1695)
+    shows no quality move.  Only where the shared pool has room; STRATA_DSV41_NO_BIG_CHUNK=1 leaves the engine's own choice."""
+    if not cards or not any(c.get("uma") for c in cards):
+        return []
+    pool = float(ram_gb or 0) + max([float(c.get('dedicated_gb') or 0.0) for c in cards] or [0.0])
+    if pool < 64.0:                       # the RAM Windows sees plus the GPU's BIOS carve-out
+        return []
+    if os.environ.get("STRATA_DSV41_NO_BIG_CHUNK") == "1":
+        return []
+    return ["--prefill-chunk", "8192"]
+
+
+def dsv41_config_env(cards) -> dict:
+    """Engine env settings for the DeepSeek engine on a unified-memory APU (Ryzen AI Max, gfx1151).
+
+    DS4_ASYNC_T=4: the engine's windowed decode uses the mailbox ("async") path for windows up to this size, 8 by default.  On the
+    128 GB Strix Halo the async path is slower than the synchronous one for the 6-row verify window: measured 2026-10-25 (2.00
+    bpw, engine 0.1.51, 256-token code set, greedy): 15.87-16.33 tok/s with the default against 20.14-21.28 with 4 (+31%); the
+    agent set with the same accepted tokens a round: 15.93 against 18.48 (+16%).  The same bits come out - only the scheduling
+    changes - and the drafter's own single-token windows (T=1) stay on the async path.  A discrete card keeps the engine's
+    default; STRATA_DSV41_ASYNC_T=n overrides the value, STRATA_DSV41_ASYNC_T=8 restores the default."""
+    if not cards or not any(c.get("uma") for c in cards):
+        return {}
+    value = os.environ.get("STRATA_DSV41_ASYNC_T") or "4"
+    return {} if value == "8" else {"DS4_ASYNC_T": value}
 
 
 def dsv41_engine_env(lib_dirs) -> dict:
@@ -8160,18 +8194,20 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
         fail("Strata can't reach GitHub to download the DeepSeek engine.",
              "Check the internet connection and run the same command again. " + dsv41_manual_steps(eng))
     if exe is None and not getattr(a, "build", False):
-        get_dsv41_engine(eng, hip, getattr(a, "dsv41_package", None))
+        get_dsv41_engine(eng, hip, getattr(a, "dsv41_package", None), getattr(a, "feed", None))
         exe = dsv41_exe(eng)
     if (exe is not None and not getattr(a, "dsv41_package", None) and not getattr(a, "build", False)
             and not (os.environ.get("STRATA_DSV41_EXE") or "").strip() and exe.parent.parent == dsv41_engine_dir(eng)):
-        exe = upgrade_dsv41_engine(eng, exe)               # an installed package older than the signed feed's: updated next to it, switched after it starts
+        exe = upgrade_dsv41_engine(eng, exe, getattr(a, "feed", None))   # an installed package older than the signed feed's: updated next to it, switched after it starts
     if exe is not None and exe.parent != Path(eng):
-        lib_dirs = [*lib_dirs, str(exe.parent)]            # its own package carries the libraries it needs
+        from strata_control import dsv41_engine
+        lib_dirs = [*lib_dirs, *dsv41_engine.lib_dirs(exe)]   # its own package, and the rocm/bin an AMD package keeps the ROCm DLLs in
     if exe is None:
         if os.environ.get("STRATA_VERBOSE") == "1" or "--verbose" in sys.argv:
             say("  Details for developers: build it with cmake -DSTRATA_BUILD_DSV41=ON and point STRATA_DSV41_EXE at it.")
         fail("DeepSeek's engine is not available for this computer yet",
-             "Supported graphics cards: NVIDIA RTX 30, 40 and 50 series, and the Radeon AI PRO R9700. " + dsv41_manual_steps(eng)
+             "Supported graphics cards: NVIDIA RTX 30, 40 and 50 series, the Radeon AI PRO R9700, and a Ryzen AI Max (Strix Halo) on "
+             "Windows with the AMD DeepSeek engine package. " + dsv41_manual_steps(eng)
              + " Or update Strata later (a newer version may add your card), or pick another model. Nothing has been downloaded.")
     ok(f"engine: {exe}")
 
@@ -8237,15 +8273,20 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
     step(7, "writing the start script")
     # --dspark auto, never off: "off" still LOADS the drafter, and its 7 GB of experts take the graphics memory (found 2026-10-23);
     # auto keeps it unloaded when the experts are far larger than the card.  The RAM store sizes itself (--ssd-cache auto is the
-    # engine's default), and <pack>/expert-profile.bin is read from the pack folder without a flag.  The layer-major chunked prompt is the engine's own default now (f-dsv41-rel d6f18babe: 1024 on a single card,
-    # its own choice for several), so no --prefill-chunk is written.  --dspark-conf 0.65: the
-    # drafts' confidence floor (H100 replay, DSPARK-DEFAULTS.md: within 0.01-0.02 of the per-class best, never below 0.3).  The engine has
-    # no flag for the draft block (3 in the same table): it reads the block size from the pack, so only the floor is written.
+    # engine's default), and <pack>/expert-profile.bin is read from the pack folder without a flag.  The layer-major chunked prompt
+    # is the engine's own default (1024 on a single card whose cards hold most of the experts; its own choice for several); on a
+    # unified-memory APU the chunk is written out instead (dsv41_prefill_chunk_args: 8,192 reads 11-15% faster there).
+    # --dspark-conf 0.65: the drafts' confidence floor (H100 replay, DSPARK-DEFAULTS.md: within 0.01-0.02 of the per-class best,
+    # never below 0.3).  The engine has no flag for the draft block (3 in the same table): it reads the block size from the pack,
+    # so only the floor is written.
     args = ["--pack", str(pack), "--max-context", str(ctx), "--eos", "1", "--dspark", "auto",
-            *(["--dspark-conf", "0.65"] if md.get("recipe") == "ista" else []), *plan["args"]]
+            *(["--dspark-conf", "0.65"] if md.get("recipe") == "ista" else []), *dsv41_prefill_chunk_args(cards, ram),
+            *plan["args"]]
+    env = dsv41_config_env(cards)
     cfg = {"exe": str(exe), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": fam["name"], "arch": fam["arch"], "log": str(home() / f"strata-{tag.lower()}.log"),
-           "lib_dirs": lib_dirs, "port": port, "engine_ready_s": 3600}      # 300+ GB read from the files: a slow disk needs its time
+           "lib_dirs": lib_dirs, "port": port, "engine_ready_s": 3600,      # 300+ GB read from the files: a slow disk needs its time
+           **({"env": env} if env else {})}
     if cuda_tk == 12:
         cfg["cuda"] = 12
     if hip:
@@ -8608,6 +8649,9 @@ def main() -> int:
     ap.add_argument("--models-dir", help="where the GGUF files go (default: <data folder>/models)")
     ap.add_argument("--dsv41-package", metavar="FILE", help="DeepSeek: the engine package you downloaded from the release page (a .tar.gz or .zip, "
                                                            "or its unpacked folder); it is checked and installed instead of being fetched")
+    ap.add_argument("--feed", metavar="URL|DIR",
+                    help="where the signed update feed (the DeepSeek engine package) is: default STRATA_UPDATE_FEED, a remembered https feed, "
+                         "or the release's (as `strata update --feed`; a folder is a local test feed)")
     ap.add_argument("--gguf-dir", help="use GGUF files you already have (a folder with every shard: "
                                        "<name>-00001-of-0000N.gguf ... -0000N-of-0000N.gguf)")
     ap.add_argument("--yes", action="store_true", help="accept the recommended answers")
@@ -9898,3 +9942,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         say("\nstopped.")
         sys.exit(1)
+

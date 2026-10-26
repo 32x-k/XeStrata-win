@@ -20,7 +20,7 @@
   <a href="https://buymeacoffee.com/strataengine"><img src="https://img.shields.io/badge/Buy_me_a_coffee-FFDD00?logo=buymeacoffee&logoColor=000" alt="Support Strata on Buy Me a Coffee"></a>
 </p>
 
-<p align="center"><sub><b>English</b> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.de.md">Deutsch</a> · <a href="README.fr.md">Français</a> · <a href="README.es.md">Español</a> · <a href="README.pt-BR.md">Português</a></sub></p>
+<p align="center"><sub><b>English</b> · <a href="README.zh-CN.md">ç®€ä˝“ä¸­ć–‡</a> · <a href="README.ja.md">ć—Ąćś¬čŞž</a> · <a href="README.de.md">Deutsch</a> · <a href="README.fr.md">FranĂ§ais</a> · <a href="README.es.md">EspaĂ±ol</a> · <a href="README.pt-BR.md">PortuguĂŞs</a></sub></p>
 
 **Free, open source, and yours to run.** Use Strata on your desktop or with your favorite coding tools. No account needed.
 
@@ -63,14 +63,14 @@ disk space.
 | 2.00 bpw | 257 GB | about 265 GB |
 | 2.25 bpw | 274 GB | about 280 GB |
 
-Runs on NVIDIA RTX 30, 40 and 50 series (Windows and Linux) and AMD Radeon AI PRO R9700 (Linux). Setup downloads the
-files and the DeepSeek engine, then starts the model.
+Runs on NVIDIA RTX 30, 40 and 50 series (Windows and Linux), AMD Radeon AI PRO R9700 (Linux), and AMD Ryzen AI Max — Strix Halo
+(Windows). Setup downloads the files and the DeepSeek engine, then starts the model.
 
 ```sh
 strata launch --family deepseek41 --model ist-das-2.00bpw --plan
 ```
 
-Measured with the 2.00 bpw set on Strata 0.2.5. Output is the speed of the answer, prompt is how fast Strata reads your input.
+Measured with the 2.00 bpw set on Strata 0.2.5 (Strix Halo: 0.2.7). Output is the speed of the answer, prompt is how fast Strata reads your input.
 
 | Hardware | Output | Prompt |
 | --- | ---: | ---: |
@@ -78,6 +78,7 @@ Measured with the 2.00 bpw set on Strata 0.2.5. Output is the speed of the answe
 | RTX 3060 12 GB, 46 GB RAM | 9 to 11 tokens/s | about 155 tokens/s (4K) |
 | 1x Radeon AI PRO R9700, 251 GB RAM | 21 to 25 tokens/s | 320 to 360 tokens/s (8K) |
 | 4x Radeon AI PRO R9700 | 74 to 77 tokens/s | 400 to 450 tokens/s (8K) |
+| Ryzen AI Max+ 395 (Strix Halo), 128 GB unified | 19 to 21 tokens/s (code), 11 (chat) | 87 tokens/s (4K), 125 tokens/s (8K) |
 
 [Memory, disk and details](docs/DEEPSEEK41.md) · [Release notes](https://github.com/Niko1221/Strata/releases)
 
@@ -189,3 +190,4 @@ Run **`strata connect`** to see setup instructions for your tool. [Connection gu
 <sub>For AI tools and automated readers: <a href="AGENTS.md">technical reference</a> · <a href="docs/AI_SETUP.md">setup instructions</a>.</sub>
 
 **Sponsorships, hardware partnerships or collaborations:** [niko.veit@outlook.com](mailto:niko.veit@outlook.com).
+

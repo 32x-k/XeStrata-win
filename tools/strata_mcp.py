@@ -1334,6 +1334,10 @@ class Strata:
         v = pl["verdict"]
         if v == "no_card":
             return "does not fit: it needs one or more graphics cards"
+        if pl.get("uma"):                       # Ryzen AI Max (Strix Halo, Windows): the graphics memory is the RAM, counted once
+            return (f"runs on this PC's shared memory: about {pl['vram_experts_gb']:.0f} GB of the {pl['experts_gb']:.0f} GB of experts stay "
+                    f"in memory and the other {pl['streamed_gb']:.0f} GB are read from the SSD; measured 14-16 tokens a second on code and "
+                    "10-11 on chat")
         if pl.get("variant"):                   # an official IST-DAS set (strata_control/dsv41_fit.py): measured on 46-64 GB, never a refusal
             if v == "spills":
                 return (f"slow here: this computer has {pl['ram_gb']:.0f} GB of RAM and the set was measured with 46-64 GB, so most of its "

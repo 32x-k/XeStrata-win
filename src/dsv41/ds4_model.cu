@@ -4578,6 +4578,12 @@ struct Model::Impl {
     bool cpu_lane_fits_ram() const {
         if (!pk.gguf || o.mmap_experts >= 0 || o.ssd_cache_gb >= 0.0 || std::getenv("DS4_STORE_GB") || std::getenv("DS4_COPY_GB")) return false;
         if (const char* v = std::getenv("DS4_COPY_ALL")) return std::atoi(v) != 0 && ram_avail() != ~uint64_t{0};
+        // An integrated GPU's experts are already in this same RAM (and, above the RAM, in the page file it commits): copying
+        // the CPU lane's in beside them takes the pages the GPU's experts live on.  Measured on Strix Halo (64 GB, 2.00 set):
+        // 82 GB of experts on the GPU, then 53 GB copied in, and an 8K prompt did not finish in 11 minutes (the in-place path is
+        // what the 8-hour soak ran).  DS4_COPY_ALL=1 still forces it; DS4_COPY_ALL=0 leaves it off everywhere.
+        for (const Dev& d : devs)
+            if (commit_charged(d)) return false;
         const uint64_t avail = ram_avail();
         if (avail == ~uint64_t{0}) return false;
         double exp_b = 0, room = 0, other_b = 0;

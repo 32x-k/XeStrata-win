@@ -4,10 +4,13 @@ This page is for people with a Ryzen AI Max "Strix Halo" PC (Radeon 8060S / 8050
 shared by the CPU and the GPU). Strata runs there through the same HIP backend as the Radeon cards in [AMD_HIP.md](AMD_HIP.md).
 **Status: experimental.**
 
-DeepSeek V4.1-Flash does not run on Strix Halo yet. It runs in the app and the Terminal on NVIDIA RTX 30, 40 and 50 cards and on the Radeon AI
-PRO R9700 ([MODELS.md](MODELS.md#deepseek-v41-flash)).
+**DeepSeek V4.1-Flash runs here on Windows** (since 0.2.7): its own engine package is built for gfx1151 and the official IST-DAS
+1.75 / 2.00 / 2.25 bpw sets run through it. Measured on the 128 GB box (64 GB BIOS carve-out plus 64 GB seen by Windows) with 2.00 bpw and the default Faster mode: answers 15-17
+tokens/s on code, 10-11 on chat; a 4K prompt 87 tokens/s, an 8K prompt 125 and a 32K prompt 177. The graphics chip and the CPU share the RAM, so the
+engine counts it once and reads the rest of the experts from the SSD. [DeepSeek on Strix Halo](#deepseek-v41-flash) has the details,
+the driver it needs and the limits.
 
-> **On this page:** [Quick start](#quick-start) · [What the engine does differently](#what-the-engine-does-differently) ·
+> **On this page:** [Quick start](#quick-start) · [DeepSeek](#deepseek-v41-flash) · [What the engine does differently](#what-the-engine-does-differently) ·
 > [1. Toolchain](#1-the-toolchain-no-root-needed) · [2. Engine](#2-the-engine) · [3. Tuning table](#3-the-prompt-table-and-running) ·
 > [4. Defaults](#4-what-is-on-by-default-on-gfx1151) · [5. Opt-in](#5-what-is-not-on-by-default-it-changes-bits) ·
 > [5b. Desktop and RAM](#5b-the-desktop-the-ram-and-a-discrete-card-beside-the-strix-halo-linux) · [6. Measured](#6-measured) ·
@@ -25,6 +28,54 @@ Use the [current release](https://github.com/Niko1221/Strata/releases/latest). Y
 Packaged engines carry the matching hipBLASLt tuning table for gfx1151 and select it on their own. Setup recognizes `gfx1151` and
 PCI ID `1002:1586`; other integrated Radeon chips have separate support limits. Unified memory is counted once. Setup does not
 change BIOS or kernel settings. The manual Linux toolchain below is for reproduction and builds, not a prerequisite for the app.
+
+DeepSeek V4.1-Flash comes with its own engine package on Windows and needs nothing extra: pick the model and the app or `strata launch`
+downloads it ([DeepSeek on Strix Halo](#deepseek-v41-flash)).
+
+## DeepSeek V4.1-Flash
+
+The model runs through its own engine, `strata-dsv41`, as on the other platforms ([DEEPSEEK41.md](DEEPSEEK41.md)); on Windows the
+package is the AMD one built for gfx1151 (`strata-dsv41-...-windows-x86_64-hip-rdna3`), downloaded when you choose the model.
+
+| | |
+| --- | --- |
+| Sets | IST-DAS 1.75 bpw (239 GB download), 2.00 bpw (257 GB), 2.25 bpw (274 GB); the n-gram table is shared |
+| Memory | one pool of 128 GB (the BIOS carve-out plus the RAM): about 109 GB of the 2.00 set's 132 GB of experts stay in it beside the dense weights and 12 GB kept for Windows; the other 23 GB are read from the SSD |
+| Driver | AMD Adrenalin 26.10.1 (driver 32.0.32015.7029) is the tested version, and the minimum to use: the 2025-03 driver failed at 32K context |
+| Context | 8K default; 32K and 64K work (an 8-hour 32K soak passed) |
+| Disk | the sets above; keep the files on the NVMe drive, they are read while it answers |
+
+Measured on the maintainers' box (Ryzen AI Max+ 395, 128 GB unified, Windows 11, 2.00 bpw, Faster mode, DSpark auto, engine 0.1.51):
+
+| Workload | Result |
+| --- | --- |
+| Code answer | 19-21 tokens/s |
+| Agent answer | about 18 tokens/s |
+| Chat answer | 11 tokens/s |
+| 4K prompt | about 87 tokens/s |
+| 8K prompt | about 125 tokens/s |
+| 32K prompt | about 177 tokens/s |
+| Stability | 100-request, 1-hour (243 requests) and 8-hour 32K (646 requests) soaks passed on the engine line this package is built from |
+
+The verify window runs synchronously on this PC: setup writes `DS4_ASYNC_T=4` in the config's env (`STRATA_DSV41_ASYNC_T=8`
+restores the engine's default, any other value overrides). The engine's mailbox ("async") path is sized for cards that hold most
+of the experts and is slower here: measured 2026-10-25 (2.00 bpw, greedy, 256 tokens): code 15.87-16.33 → 20.14-21.28 tok/s
+(+31%), agent with the same accepted tokens a round 15.93 → 18.48 (+16%), chat 10.33 → 11.30 (+9%). The same bits come out; only
+the scheduling changes, and the drafter's own single-token windows stay async. The 2.25 set runs without the drafter on this box
+(its experts leave no room for it) and does not change.
+
+Prompts are read in 8,192-token chunks: setup writes `--prefill-chunk 8192` on this PC (STRATA_DSV41_NO_BIG_CHUNK=1 leaves the
+engine's 1,024-token default). Measured 2026-10-25: 4K 78.7 → 87.2, 8K 108.9 → 125.1, 32K 155.2 → 176.9 tok/s; decode unchanged
+(16.53 → 16.59), because the chunk buffers take ~5 GB from the GPU expert tier and the RAM store's hit rate rises to compensate. The
+chunk's summation order changes, not the model (the repo's chunk-size KL check: 1024 0.1705, 2048 0.1692, 4096 0.1688, 8192 0.1695).
+
+How it uses the memory: the GPU's expert tier and the RAM store are the same memory, so the engine keeps a store of about 22-23 GB,
+sized after the weights are on the GPU, and reads the other experts from the model files when a word needs them. It does not copy the
+CPU lane's experts into RAM on an integrated GPU: on this box that copy overcommits the shared memory and an 8K prompt stalls (found
+on Strix on 2026-10-25, fixed for 0.2.7; `DS4_COPY_ALL=1` forces the old behaviour for a test). `--ssd-cache N` sets the store size.
+
+Known limits: the 128 GB machine was tested. A 64 GB or 32 GB Strix Halo gets a smaller store and is slower, and setup says so (it never
+refuses). Linux on Strix Halo has no DeepSeek engine package yet. WSL is not supported: the AMD engines hang there.
 
 ## What the engine does differently
 
@@ -235,3 +286,4 @@ UD-Q4_K_XL 49.5 -> 52.8 (+6.7%), prompt unchanged.
 | `--mtp-window 8192` | 64K output +3.5%, 32K -0.4% |
 | 12-turn agent replay, `STRATA_PREFILL_STREAM_MIN=128`, C2T8, `--no-prefill-borrow` | 3.4 -> 2.1 s per turn |
 | Defaults off, IQ3_XXS 8K | prompt 8% lower (1,137) |
+
