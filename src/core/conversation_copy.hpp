@@ -14,6 +14,7 @@
 #include <thread>
 #include <vector>
 
+namespace strata::core { void conversation_checkpoint_join(const void* only); }
 namespace strata::core::conversation_detail {
 
 /// The private copy streams and ordering events (below) belong to a thread, but a thread can be short-lived: the layer
@@ -152,6 +153,7 @@ inline ConversationCheckpoint copy_checkpoint_beating(const ConversationCheckpoi
     o.ids = copy_beating(c.ids);
     o.imgs = copy_beating(c.imgs);
     o.gdn = copy_beating(c.gdn);
+    o.dev_tag = c.dev_tag;   // the same bytes
     o.ple = copy_beating(c.ple);
     o.tails = copy_beating(c.tails);
     o.dead = copy_beating(c.dead);
@@ -164,6 +166,7 @@ inline ConversationCheckpoint copy_checkpoint_beating(const ConversationCheckpoi
 }
 
 inline std::vector<ConversationCheckpoint> copy_checkpoints_beating(const std::vector<ConversationCheckpoint>& cs) {
+    for (const auto& c : cs) core::conversation_checkpoint_join(c.gdn.data());
     std::vector<ConversationCheckpoint> out;
     out.reserve(cs.size());
     for (const auto& c : cs) out.push_back(copy_checkpoint_beating(c));
