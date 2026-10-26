@@ -120,9 +120,10 @@ MIN_SIDE = 256
 MAX_N = 16                         # "max_n": the most images one request makes
 BUDGET_S = 600                     # "budget_s": the longest one request's images may take (ImageGen.check_n)
 UNMEASURED_N = 4                   # the most images a request makes before the server has measured its speed
-# img2img's strength when a request gives none (a model without edits, an image and no mask): diffusers' default for
-# the flow models' img2img pipelines (QwenImageImg2ImgPipeline, FluxImg2ImgPipeline)
-STRENGTH_IMG2IMG = 0.6
+# img2img's strength when a request gives none (a model without edits, an image and no mask): the denoise of ComfyUI's
+# own img2img example (comfyanonymous.github.io/ComfyUI_examples/img2img).  An edit's, and a mask's alone, is 1.0, the
+# default denoise of ComfyUI's KSampler (nodes.py)
+STRENGTH_IMG2IMG = 0.87
 # a step's time against the image's pixels, above the largest size measured (estimate_s): the attention's share grows
 # with them (the B70, Qwen-Image Turbo: 6.5 times the time at 4 times the pixels, 1.35); taken higher, to err long
 SIZE_EXP = 1.5
@@ -1616,7 +1617,7 @@ TOOLS: list[dict[str, Any]] = [
          "size": {"type": "string", "description": "WIDTHxHEIGHT; default the image's shape at about 1024x1024"},
          "strength": {"type": "number",
                       "description": "how much of the image may change, above 0 to 1 (lower keeps more of it); "
-                                     "default 1 for an edit, 0.6 for img2img"},
+                                     "default 1 for an edit, 0.87 for img2img"},
          "seed": {"type": "integer"}},
          "required": ["prompt"]}},
 ]
