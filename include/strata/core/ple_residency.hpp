@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
 
 #include "strata/core/conversation_memory.hpp"
@@ -24,6 +25,13 @@ inline bool ple_resident_admit(std::optional<uint64_t> available, uint64_t table
     if (!available || table_bytes == 0 || experts_ram_bytes == 0) return false;
     if (table_bytes > UINT64_MAX - experts_ram_bytes) return false;
     return conversation_memory_admit(available, table_bytes + experts_ram_bytes, headroom_bytes);
+}
+
+/// May the residency policy run at all?  STRATA_PLE_AUTO_RAM when it is set (0 off, anything else on: an explicit value wins), otherwise on
+/// except under STRATA_DEFAULTS=026 (`v026`: v0.2.6 had no such policy, the direct reads stayed).
+inline bool ple_auto_ram_allowed(const char* env_value, bool v026) {
+    if (env_value != nullptr) return std::atoi(env_value) != 0;
+    return !v026;
 }
 
 } // namespace strata::core

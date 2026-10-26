@@ -18,7 +18,9 @@
 namespace strata::core {
 
 /// The environment settings that are the defaults of `gcn_arch` (hipDeviceProp_t::gcnArchName; "gfx1151" or
-/// "gfx1151:sramecc-:xnack-"): empty for every other architecture.
+/// "gfx1151:sramecc-:xnack-"): empty for every other architecture.  `defaults026` (STRATA_DEFAULTS=026, defaults_026.hpp): the gfx12 table of
+/// v0.2.6 (the five prompt switches only, without the four 0.2.7 decode switches); the one-argument form asks the environment.
+std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gcn_arch, bool defaults026);
 std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gcn_arch);
 
 /// The integrated Radeons (Phoenix / Hawk Point 780M gfx1103, Strix Point 890M / 880M gfx1150, Strix Halo gfx1151) whose

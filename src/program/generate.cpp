@@ -31,6 +31,7 @@
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/ple_residency.hpp"
+#include "strata/core/defaults_026.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/foresight_swap.hpp"
@@ -3977,8 +3978,7 @@ int main(int argc, char** argv) {
         const bool pf_old = pfd != nullptr && std::strcmp(pfd, "old") == 0;
         // 0.2.7: gfx12 native packs start at 0.15 (see pcie_share_gfx12_default above); other cards and
         // STRATA_PCIE_FRAC_DEFAULT=old keep the x16 share measured for them.
-        const double base = nvfp4_pack ? 0.25
-                                       : native_pack ? (pcie_share_gfx12_default() && !pf_old ? 0.15 : 0.55) : 0.2;
+        const double base = strata::pcie_start_frac(nvfp4_pack, native_pack, pcie_share_gfx12_default(), pf_old, strata::qwen_defaults_026());
         std::string bursts;
 #if !defined(STRATA_USE_HIP) && defined(_WIN32)
         // Windows: opt-in (STRATA_PCIE_AUTO_CANON=1); an RTX 5070 decoded a short Q2_0 answer 3% slower with it, code 2.5% faster
@@ -4487,7 +4487,7 @@ int main(int argc, char** argv) {
         if (pio.mode == strata::kernels::PleIo::Direct && !o.ple_io_explicit) {
             const strata::kernels::PleIoOptions direct_pio = pio;
             const char* auto_ram = std::getenv("STRATA_PLE_AUTO_RAM");
-            const bool allowed = auto_ram == nullptr || std::atoi(auto_ram) != 0;
+            const bool allowed = strata::core::ple_auto_ram_allowed(auto_ram, strata::qwen_defaults_026());
             const uint64_t need = ple_table.table_bytes();
             const auto available = strata::core::available_host_bytes();
             uint64_t experts_ram = 0;   // every routed expert's blob, the arena the engine copies into RAM at start
@@ -11716,7 +11716,11 @@ int main(int argc, char** argv) {
         const bool trace = std::getenv("STRATA_TRACE") != nullptr;
         auto tr = [&](const char* what, long long a = -1, long long b = -1) {
             if (!trace) return;
-            std::fprintf(stderr, "strata trace: %s %lld %lld\n", what, a, b);
+            static Clock::time_point t0;   // process-wide: the stages run on different threads
+            static bool t0_set = false;
+            if (!t0_set) { t0 = Clock::now(); t0_set = true; }
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            std::fprintf(stderr, "strata trace: %s %lld %lld %.1f ms\n", what, a, b, ms);
             std::fflush(stderr);
         };
         {
@@ -18009,3 +18013,4 @@ int main(int argc, char** argv) {
     cudaFree(arena);
     return 0;
 }
+

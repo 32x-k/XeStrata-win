@@ -2923,7 +2923,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             stopped_at_ = c0;
             break;
         }
-        if (std::getenv("STRATA_TRACE")) { std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld\n", (long long) c0, (long long) n); std::fflush(stderr); }
+        if (std::getenv("STRATA_TRACE")) {
+            static Clock::time_point t0;   // process-wide: the stages run on different threads
+            static bool set = false;
+            if (!set) { t0 = Clock::now(); set = true; }
+            const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+            std::fprintf(stderr, "strata trace: prompt chunk %lld of %lld stage [%lld,%lld) %.1f ms\n", (long long) c0,
+                         (long long) n, (long long) stage_lb_, (long long) stage_le_, ms);
+            std::fflush(stderr);
+        }
         const int64_t T = std::min(C, n - c0), p0 = pos0 + c0;
         // STRATA_KVA: this chunk is approximated in the layers at and after the split when its last position is
         // before the request's full-computation suffix; a chunk in the suffix runs the ordinary path everywhere.
@@ -5686,3 +5694,4 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
 }
 
 }  // namespace strata::prefill
+
