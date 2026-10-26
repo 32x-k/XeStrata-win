@@ -9,6 +9,7 @@ using strata::ds4::experts_per_word;
 using strata::ds4::experts_test_override;
 using strata::ds4::copy_all_fits;
 using strata::ds4::attn_slab_rows;
+using strata::ds4::staging_ring_mb;
 
 static int fails = 0;
 #define CHECK_EQ(a, b)                                                                              \
@@ -89,8 +90,52 @@ int main() {
         CHECK_EQ(attn_slab_rows(100, 8192, 256, 1e18, bpr), 64);          // rounded down to 64, at least 64
         CHECK_EQ(attn_slab_rows(99999, 8192, 256, 1e18, bpr), 8192);      // at most the chunk
         CHECK_EQ(attn_slab_rows(300, 8192, 256, 1e18, bpr), 256);
+        // the cards hold half the experts or more (expert_share, the 6th argument): the whole small chunk's slab, min(chunk, 1024) rows, whatever
+        // the spare (the 4 x R9700 cell: chunk 1024, share 0.77, spare negative: 256 -> 1024 rows)
+        CHECK_EQ(attn_slab_rows(-1, 1024, 256, -5.0e9, bpr, 0.77), 1024);
+        CHECK_EQ(attn_slab_rows(-1, 1024, 256, -5.0e9, bpr, 0.50), 1024);
+        CHECK_EQ(attn_slab_rows(-1, 1024, 256, -5.0e9, bpr, 0.49), 256);   // under half: the base, as before
+        CHECK_EQ(attn_slab_rows(-1, 512, 256, -5.0e9, bpr, 0.77), 512);   // a chunk under 1024 caps it
+        CHECK_EQ(attn_slab_rows(-1, 8192, 256, -5.0e9, bpr, 0.77), 1024);   // a big chunk: still 1024 rows without the room for more
+        CHECK_EQ(attn_slab_rows(-1, 8192, 256, 4.0e9, bpr, 0.77), 2048);   // the room is there too: the automatic growth wins
+        CHECK_EQ(attn_slab_rows(-1, 8192, 256, 1e18, bpr, 1.0), 2048);     // everything fits (a big card): 2048 as without the share
+        CHECK_EQ(attn_slab_rows(-1, 8192, 2560, -5.0e9, bpr, 0.77), 2560);   // never below the base
+        CHECK_EQ(attn_slab_rows(0, 1024, 256, 1e18, bpr, 0.77), 256);      // DS4_ATTN_SLAB=0: the 0.2.6 rule whatever the share
+        CHECK_EQ(attn_slab_rows(512, 1024, 256, 1e18, bpr, 0.77), 512);    // DS4_ATTN_SLAB=N: that many rows whatever the share
+        CHECK_EQ(attn_slab_rows(-1, 1024, 1024, -5.0e9, bpr, 0.77), 1024);   // a unified-memory base (32 MB of q = 1024 rows) is kept
     }
-    // prompt chunk: prefill_chunk_default(own_default, gpu_share, gguf_copy, file_experts, hip, min_vram, big=8192).  What `strata launch` runs on one card
+    // the staging ring (MB): staging_ring_mb(share, room_bytes, n_dev, integrated)
+    {
+        const double GB = 1e9;
+        // the cards hold the experts: 16 MB, discrete (4 x R9700 at 0.86 and a card that holds everything)
+        CHECK_EQ(staging_ring_mb(0.86, 4 * 30 * GB, 4, false), 16);
+        CHECK_EQ(staging_ring_mb(1.00, 70 * GB, 1, false), 16);
+        CHECK_EQ(staging_ring_mb(0.82, 4 * 30 * GB, 4, false), 16);
+        // they hold most of them (4 x R9700, share 0.72-0.77, 31 GB of room a device): 8 MB a GB of one device's room = 248 MB
+        CHECK_EQ(staging_ring_mb(0.77, 4 * 31 * GB, 4, false), 248);
+        CHECK_EQ(staging_ring_mb(0.72, 4 * 31 * GB, 4, false), 248);
+        CHECK_EQ(staging_ring_mb(0.81, 4 * 31 * GB, 4, false), 248);
+        CHECK_EQ(staging_ring_mb(0.77, 4 * 10 * GB, 4, false), 128);       // small devices: at least 128
+        CHECK_EQ(staging_ring_mb(0.60, 3 * 90 * GB, 3, false), 512);       // big devices: at most 512
+        CHECK_EQ(staging_ring_mb(0.50, 2 * 31 * GB, 2, false), 248);       // the per-device room, not the summed one (1 card: 31 GB -> 248 too)
+        CHECK_EQ(staging_ring_mb(0.60, 31 * GB, 1, false), 248);
+        // they hold under half (discrete): 64 MB a GB of the summed room, 400..1200 (streamed; not measured on a discrete card)
+        CHECK_EQ(staging_ring_mb(0.19, 31 * GB, 1, false), 1200);
+        CHECK_EQ(staging_ring_mb(0.06, 10 * GB, 1, false), 640);           // a 12 GB card
+        CHECK_EQ(staging_ring_mb(0.06, 4 * GB, 1, false), 400);            // a small pool still gets 400
+        CHECK_EQ(staging_ring_mb(0.40, 2 * 31 * GB, 2, false), 1200);      // capped
+        CHECK_EQ(staging_ring_mb(0.49, 4 * 31 * GB, 4, false), 1200);
+        // a unified-memory GPU (Strix Halo): never the small ring; the streamed 400..1200 MB under 1/1.3, 16 above
+        CHECK_EQ(staging_ring_mb(0.60, 40 * GB, 1, true), 1200);           // share 0.6 would be the small ring on a discrete card
+        CHECK_EQ(staging_ring_mb(0.30, 18.75 * GB, 1, true), 1200);
+        CHECK_EQ(staging_ring_mb(0.30, 12 * GB, 1, true), 768);
+        CHECK_EQ(staging_ring_mb(0.30, 5 * GB, 1, true), 400);
+        CHECK_EQ(staging_ring_mb(0.77, 40 * GB, 1, true), 16);             // main's "fit" threshold, 1/1.3 = 0.769
+        CHECK_EQ(staging_ring_mb(0.76, 40 * GB, 1, true), 1200);
+        // nothing known: no devices
+        CHECK_EQ(staging_ring_mb(0.0, 0.0, 0, false), 400);
+    }
+    // prompt chunk: prefill_chunk_default(own_default, gpu_share, gguf_copy, file_experts, hip, min_vram, big=8192, multi_tp=false).  What `strata launch` runs on one card
     // passes neither --tp nor --threads, but the engine's default tp is 2, so own_default is false there; a launch with several cards passes --tp 1.
     using strata::ds4::prefill_chunk_default;
     // RTX 5070 / RTX 3060 (12 GB), launch default: experts in place on a card under 16 GiB -> 4096 (their logs said 8192 before this rule)
@@ -123,8 +168,17 @@ int main() {
     CHECK_EQ(prefill_chunk_default(true, 0.86, false, true, true, 32 * GiB), 1024);
     CHECK_EQ(prefill_chunk_default(true, 0.50, false, true, true, 32 * GiB), 1024);
     CHECK_EQ(prefill_chunk_default(true, 0.49, false, true, true, 32 * GiB), 8192);
-    // threads / tp runs (own_default false) keep their defaults whatever the share: 8192 streamed, 2048 for a pack that is not a GGUF
+    // a multi-card tp run (own_default false, multi_tp: 2+ cards, no --threads on; the engine's default tp 2, or --tp 2 from the launcher) takes
+    // the small chunk too: the 4 x R9700 default-tp datapoint (8K warm 1247 ppts at 1024 against 690)
+    CHECK_EQ(prefill_chunk_default(false, 0.86, false, true, true, 32 * GiB, 8192, true), 1024);
+    CHECK_EQ(prefill_chunk_default(false, 0.50, false, true, true, 32 * GiB, 8192, true), 1024);
+    CHECK_EQ(prefill_chunk_default(false, 0.49, false, true, true, 32 * GiB, 8192, true), 8192);
+    // one card with the default tp, and `--threads on` (neither own_default nor multi_tp) keep their defaults whatever the share: 8192
+    // streamed, 2048 for a pack that is not a GGUF, 4096 copied into RAM on a CUDA card
     CHECK_EQ(prefill_chunk_default(false, 0.86, false, true, true, 32 * GiB), 8192);
+    CHECK_EQ(prefill_chunk_default(false, 1.00, false, true, true, 80 * GiB), 8192);
+    CHECK_EQ(prefill_chunk_default(false, 1.00, true, true, false, 80 * GiB), 4096);
+    CHECK_EQ(prefill_chunk_default(false, 0.86, false, false, true, 32 * GiB), 2048);
     CHECK_EQ(prefill_chunk_default(false, 0.30, false, false, false, 24 * GiB), 2048);
     // the rule takes no --max-context: a 128K session on a 12 GB card gets the same chunk, because the chunk's buffers and the KV are
     // allocated whole at load for that context and a chunk that does not fit there is halved before the first prompt (4096 -> 2048 -> 1024 ...)

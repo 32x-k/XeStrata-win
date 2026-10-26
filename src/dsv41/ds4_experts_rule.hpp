@@ -36,12 +36,20 @@ inline int experts_per_word(int requested, uint64_t vram_bytes, int model_k, boo
 // Alloc failure halves the chunk at load (4096 -> 2048 -> 1024 ...), KV and score buffers are allocated whole at the full --max-context.
 constexpr uint64_t kChunk4096MinVram = 10ull << 30;
 constexpr uint64_t kChunkInPlace4096Below = 16ull << 30;
-// own_default: a single-card run (no --threads, tp 1); gpu_share: the share of the routed experts the cards can hold (1 = all);
+// own_default: a run with tp 1 and no --threads (`strata launch` writes --tp 1 for 4 or more AMD cards); multi_tp: two or more cards, tp above 1
+// and no `--threads on` (the engine's own default tp is 2, and `strata launch` writes --tp 2 for 2-3 cards); gpu_share: the share of the
+// routed experts the cards can hold (1 = all);
 // gguf_copy: a GGUF pack with --mmap-experts off; file_experts: the experts stay in the files; hip: a HIP build; min_vram_bytes: the
 // smallest card; big: the chunk of the streamed case (the engine's kVlRows, 8192)
 inline int prefill_chunk_default(bool own_default, double gpu_share, bool gguf_copy, bool file_experts, bool hip, uint64_t min_vram_bytes,
-                                 int big = 8192) {
-    if (own_default && gpu_share >= 0.5) return 1024;
+                                 int big = 8192, bool multi_tp = false) {
+    // The cards hold most of the experts: the small chunk is the measured one.  Two datapoints, both on 4 x R9700: with `--tp 1` (what
+    // `strata launch` writes for 4 or more AMD cards), share 0.86: 1024 370 against 214 tok/s at 8192; and with the engine's own default tp
+    // (2, pairs of cards, nothing written), where the rule used to fall through to 2048/8192: 2.25 bpw, --dspark auto, ids 5705e1164a, 8K
+    // warm prompts 1024 -> 1247 ppts against 690 at 8192, decode unchanged.  So a multi-card tp run takes it too.  One card with the default
+    // tp, and `--threads on` (it stalled at the first 8K prompt in the 4-card runs), keep their old defaults: not measured with 1024.
+    // An explicit --prefill-chunk N wins over all of this (the call site takes the rule only when none was given).
+    if ((own_default || multi_tp) && gpu_share >= 0.5) return 1024;
     if (gguf_copy && !hip && min_vram_bytes >= kChunk4096MinVram) return 4096;
     // the experts read in place on a card under 16 GiB (the 12 GB PCs; not measured on HIP): 4096 keeps ~120 more experts resident than 8192 (RTX 5070
     // 287 against 165, RTX 3060 386 against 277) - 5 interleaved pairs, 4096 against 8192, decode: 5070 agent x1.020 (5/5) code x1.004 (3/5), 3060
@@ -68,14 +76,45 @@ inline bool copy_all_fits(double lane_bytes, uint64_t ram_avail, double ram_marg
 // The answers do not change with the slab (a row's arithmetic is its own), but the experts a card holds do: measured 2026-10-26 on the RTX
 // 5070 (12 GB, 2.25 bpw, 8K prompt): 1024 rows +2.0% prompt, 2048 rows +2.2%, at 29 / 83 fewer experts in VRAM, a -3% decode and different
 // greedy ids (placement); so a card whose room is all experts keeps the 0.2.6 slab, and the automatic size is for cards with VRAM to spare.
-inline int attn_slab_rows(int env, int chunk, int base, double spare_bytes, double bytes_per_row) {
+// `expert_share` (the share of the routed experts the cards hold, 0 when unknown): the second measured case.  Where the cards hold at least
+// half the experts the whole small chunk's slab is worth its VRAM: 4 x R9700 (2.25 bpw, share 0.77, chunk 1024), 8K warm 1204 / 1236 / 1250
+// ppts with the 256-row rule against 1324 / 1353 / 1363 with a 1024-row slab (+9%), decode 77.7 against 78.1 tok/s, 268 MB a device (1% of
+// the card).  That branch asks for min(chunk, 1024) rows whatever the spare room (the spare of such a box is negative: its room is all
+// experts), and never less than the base; the automatic growth on top of it still applies where the room is there.  A unified-memory GPU
+// (the caller passes env 0 there) and DS4_ATTN_SLAB=0 never take either branch.
+inline int attn_slab_rows(int env, int chunk, int base, double spare_bytes, double bytes_per_row, double expert_share = 0.0) {
     auto clampn = [&](int a) { return std::max(64, std::min(chunk, a) / 64 * 64); };
     if (env == 0) return base;
     if (env > 0) return clampn(env);
+    int rows = base;
+    if (expert_share >= 0.5) rows = std::max(rows, clampn(1024));
     const int target = clampn(2048);
-    if (target <= base) return base;
-    const double extra = (double) (target - base) * bytes_per_row;
-    return spare_bytes >= extra * 1.25 + (256.0 * 1048576.0) ? target : base;
+    if (target > rows) {
+        const double extra = (double) (target - base) * bytes_per_row;
+        if (spare_bytes >= extra * 1.25 + (256.0 * 1048576.0)) rows = target;
+    }
+    return rows;
+}
+
+// The prompt path's expert staging ring (MB).  The prompt streams the experts the cards do not hold through it.  Three measured cases and
+// the rest left as it was:
+//   - the cards hold the experts (share >= 0.82): 16 MB.  4 x R9700, share 0.86 (the 2.00 pack): a bigger ring costs decode after a prompt
+//     (-1.8% at 16 MB against none, -4.4% at 64, -4.6% at 400); everything fitting needs no ring at all;
+//   - they hold most of them (0.5 <= share < 0.82, discrete cards): a small ring from each DEVICE's room, 8 MB a GB of it, 128..512 MB
+//     (4 x R9700, 2.25 bpw, share 0.72-0.77, chunk 1024, 8K prompt + six 128-token decodes a load: 2000 MB 1243 ppts / 73.2 tok/s, 1000 MB
+//     1287 / 77.5, 500 MB 1314 / 78.5, 256 MB 1324 / 78.4, 128 MB 1338 / 78.3; the room per device there is 31 GB -> 248 MB);
+//   - a unified-memory GPU (Strix Halo) that holds under 1/1.3 of them, and every discrete card that holds under half: a share of the
+//     summed room, 64 MB a GB, 400..1200 MB.  Measured on Strix Halo only (400 -> 1200: the queue 3,200 -> 8,087 experts, 4K prompt 27.3
+//     -> 21.3 s, decode unchanged); a discrete card in this band is not measured and takes the same, VRAM-bounded, rule.
+// A unified-memory GPU never takes the small ring (its datapoint is the 1200 MB one): it keeps the 16 MB "fit" rule at 1/1.3.
+inline int staging_ring_mb(double share, double room_bytes, int n_dev, bool integrated) {
+    const double GB = 1e9;
+    const double per_dev = n_dev > 0 ? room_bytes / (double) n_dev : 0.0;
+    const double streamed = std::min(1200.0, std::max(400.0, room_bytes / GB * 64.0));
+    if (integrated) return share >= 1.0 / 1.3 ? 16 : (int) streamed;
+    if (share >= 0.82) return 16;
+    if (share >= 0.5) return (int) std::min(512.0, std::max(128.0, per_dev / GB * 8.0));
+    return (int) streamed;
 }
 
 // DS4_TOPK=N (a test, not for users): over the flag and the rule; returns the count to use
