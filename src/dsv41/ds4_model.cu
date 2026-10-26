@@ -2919,7 +2919,13 @@ struct Model::Impl {
         // fifth more CPU-lane experts).  So: a share of each device's room, bounded, rather than the fixed 400 MB.
         const double per_dev = devs.empty() ? 0.0 : room / (double) devs.size();
         const size_t deep = (size_t) std::min(2000.0, std::max(400.0, per_dev / 1e9 * 0.08 * 1000.0));   // (MB)
-        const size_t mb = share >= 0.98 ? 16 : deep;
+        // ... but with the 1024-token prompt chunk (the default now when the cards hold most of the experts) the
+        // ring's balance moved: every MB it takes is a tenth of an expert the decode keeps.  Measured on the same
+        // box, 8K prompt and six 128-token decodes a load, chunk 1024: 2000 MB 1243 ppts / 73.2 tok/s, 1000 MB
+        // 1287 / 77.5, 500 MB 1314 / 78.5, 256 MB 1324 / 78.4.  So a small bounded ring where the cards hold the
+        // most of the experts, and the old depth where they do not (the streaming cases it was measured for).
+        const size_t small = (size_t) std::min(512.0, std::max(128.0, per_dev / 1e9 * 0.008 * 1000.0));   // (MB)
+        const size_t mb = share >= 0.98 ? 16 : (share >= 0.5 ? small : deep);
         if (o.verbose)
             std::fprintf(stderr, "ds4: staging ring: experts %.1f GB, VRAM room %.1f GB, dense %.1f GB -> %d MB\n", exp_b / 1e9,
                          room / 1e9, other_b / 1e9, (int) mb);
