@@ -897,6 +897,59 @@ struct PinnedUpload {
     }
 };
 
+// STRATA_PREFILL_WARM=1: chunks below stream_all_min() take the per-layer walk, where each layer's file-tier
+// experts are page faults of the stager's few threads (128 KiB of read-ahead each).  This thread hands the source a
+// layer's whole list at once (madvise(WILLNEED) - the drive sees one deep queue), and the next layer's list from
+// the previous chunk while this layer computes.  Only warms pages: what the stager copies is unchanged.
+struct PrefillWarmer {
+    core::ExpertSource* src = nullptr;
+    struct Job { int64_t layer; std::vector<int64_t> experts; };
+    std::vector<Job> queue;
+    bool quit = false;
+    std::mutex mu;
+    std::condition_variable cv;
+    std::thread thread;
+    std::atomic<int64_t> warmed{0}, dropped{0};
+
+    explicit PrefillWarmer(core::ExpertSource* s) : src(s) {
+        thread = std::thread([this] {
+            strata::aux_cpus::pin_current_thread();
+            for (;;) {
+                Job j;
+                {
+                    std::unique_lock<std::mutex> lk(mu);
+                    cv.wait(lk, [&] { return quit || !queue.empty(); });
+                    if (quit) return;
+                    j = std::move(queue.front());
+                    queue.erase(queue.begin());
+                }
+                src->warm(j.layer, j.experts.data(), (int64_t) j.experts.size());
+                warmed.fetch_add((int64_t) j.experts.size(), std::memory_order_relaxed);
+            }
+        });
+    }
+    ~PrefillWarmer() {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            quit = true;
+        }
+        cv.notify_all();
+        if (thread.joinable()) thread.join();
+    }
+    void submit(int64_t layer, std::vector<int64_t> experts) {
+        if (experts.empty()) return;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            while (queue.size() >= 4) {   // behind: the oldest layer is done or nearly so
+                dropped.fetch_add((int64_t) queue.front().experts.size(), std::memory_order_relaxed);
+                queue.erase(queue.begin());
+            }
+            queue.push_back({layer, std::move(experts)});
+        }
+        cv.notify_one();
+    }
+};
+
 struct Prefill::Impl {
     const core::WeightTable* wt = nullptr;
     const core::ModelGeometry* g = nullptr;
@@ -997,6 +1050,8 @@ struct Prefill::Impl {
     // only write stream_all_min() - 1 of its rows into them; fused_layout() keeps the two in step (#583, #954)
     bool fused_bufs = false;
     std::unique_ptr<Stager> stager;          // the unpinned experts' host copies (step 4)
+    std::unique_ptr<PrefillWarmer> warmer;   // STRATA_PREFILL_WARM=1: the per-layer walk's page warming
+    std::vector<std::vector<int64_t>> warm_prev;   // per layer: the file-tier experts of the previous chunk
     cudaEvent_t copied[RING_MAX] = {}, used[RING_MAX] = {};
     bool stage_live[RING_MAX] = {};
     // the event that releases each ring slot: its own `used`, or - when an MMQ group is gathered in one launch - the
@@ -1511,6 +1566,15 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         }
         if (!m.stager->init((size_t) MAXBLOB(), threads)) ok = false;
         m.stager->batch = std::min(m.stager->batch, m.stager->kRing);
+    }
+    if (!m.warmer && src != nullptr && src->warms()) {
+        const char* wv = std::getenv("STRATA_PREFILL_WARM");
+        if (wv != nullptr && std::atoi(wv) != 0) {
+            m.warmer = std::make_unique<PrefillWarmer>(src);
+            m.warm_prev.assign((size_t) g.n_layers, {});
+            std::fprintf(stderr, "prefill: STRATA_PREFILL_WARM=1: the per-layer walk warms this layer's and the next "
+                                 "layer's file-tier experts\n");
+        }
     }
     m.steps_host.resize(T * strata::kernels::kStepCount);
     m.steps_up.init(T * strata::kernels::kStepCount);
@@ -4758,6 +4822,23 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 const uint8_t* b = m.src->blob_stable(l, e);
                                 if (!b) { err = "prefill: expert source has no blob"; return false; }
                                 js.push_back({b, (size_t) lay.blob_bytes(l)});
+                            }
+                            if (m.warmer) {
+                                std::vector<int64_t> cur;
+                                for (size_t j = 0; j < order.size(); ++j)
+                                    if (job_of[j] >= 0) cur.push_back(order[j]);
+                                m.warm_prev[(size_t) l] = cur;
+                                m.warmer->submit(l, std::move(cur));
+                                if (l + 1 < m.g->n_layers) {
+                                    std::vector<int64_t> nxt;
+                                    for (int64_t e : m.warm_prev[(size_t) (l + 1)]) {
+                                        if (m.host_res && m.cache && m.host_res[(size_t) (l + 1) * m.g->n_expert + e] >= 0)
+                                            continue;
+                                        if (m.src->pinned(l + 1, (int32_t) e)) continue;
+                                        nxt.push_back(e);
+                                    }
+                                    m.warmer->submit(l + 1, std::move(nxt));
+                                }
                             }
                             m.stager->start(std::move(js));
                         }
