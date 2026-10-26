@@ -5618,6 +5618,7 @@ int64_t lm_table_ints(int64_t rows, int64_t G) { return 5 * rows + 3 * lm_entrie
 
 void Prefill::lm_release() {
     Impl& m = *impl_;
+    const core::OnDevice on_device(m.device);
     if (m.lm.dev) {
         cudaStreamSynchronize(m.cs);
         cudaFree(m.lm.dev);
@@ -5629,12 +5630,18 @@ void Prefill::lm_release() {
     m.lm.S = 0;
 }
 
-int64_t Prefill::lm_prepare(int64_t n, std::string& why) {
+int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
     Impl& m = *impl_;
     if (m.g == nullptr) { why = "not initialized"; return 0; }
     const core::ModelGeometry& g = *m.g;
-    if (stage_lb_ != 0 || stage_le_ != g.n_layers || next_ != nullptr || hand_in_ != nullptr) { why = "a layer split"; return 0; }
+    const core::OnDevice on_device(m.device);   // a layer split's later stage is sized on its own GPU
+    // layer split (2026-10-24): each stage runs its own layers layer-major over the same super-chunk and hands the
+    // super-chunk's rows to the next one (lm_prepare_chain); the peer GPU's expert share and the stage helper have
+    // no layer-major form
+    const bool split = stage_lb_ != 0 || stage_le_ != g.n_layers || next_ != nullptr;
+    if (hand_in_ != nullptr) { why = "a layer split's chunk hand-off is in use"; return 0; }
     if (m.pp || helper_ != nullptr || core::peer_portable()) { why = "a peer GPU"; return 0; }
+    if (split && m.ss->ple.ready()) { why = "a layer split with PLE layers"; return 0; }
     if (embd_rows != nullptr) { why = "an image prompt"; return 0; }
     // run_impl's debug hooks on the routing and the rows have no layer-major form
     if (std::getenv("STRATA_DBG_FEAT") || std::getenv("STRATA_DBG_ROUTE_OVERRIDE") || std::getenv("STRATA_PREFILL_DUMP_R_ALL")) {
@@ -5672,6 +5679,10 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why) {
     const int64_t want = lm_tokens_env() > 0 ? lm_tokens_env() : kLmDefaultTokens;
     int64_t S = std::max<int64_t>(min_s, want / m.T * m.T);
     S = std::min<int64_t>(S, (n + m.T - 1) / m.T * m.T);
+    if (cap > 0) {
+        if (cap % m.T != 0 || cap < min_s) { why = "the layer split's stages read different chunks"; return 0; }
+        S = std::min(S, cap);
+    }
     const int64_t G = m.T * K;
     const auto dev_bytes = [&](int64_t s, bool r_dev) {
         const uint64_t per = (uint64_t) (2 * N + HC + 2 * K) * 4 + (uint64_t) N * 2 + (r_dev ? (uint64_t) D * 4 : 0);
@@ -5687,7 +5698,8 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why) {
         while (s >= min_s && (int64_t) dev_bytes(s, r_dev) > room) s -= m.T;
         return s >= min_s ? s : (int64_t) 0;
     };
-    const int mode = lm_r_env();
+    // a stage after the first: its rows arrive in R_host (the previous stage writes them there), so they stay there
+    const int mode = stage_lb_ > 0 ? 2 : lm_r_env();
     bool r_dev = false;
     int64_t s_use = 0;
     if (mode == 1) { s_use = fit(true); r_dev = true; }
@@ -5754,6 +5766,37 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why) {
     return s_use;
 }
 
+// A layer split: every stage gets the same super-chunk (the smallest any of them fits), re-sized until they agree.
+int64_t Prefill::lm_prepare_chain(int64_t n, std::string& why) {
+    int64_t cap = 0;
+    for (int round = 0; round < 4; ++round) {
+        bool same = true;
+        for (Prefill* p = this; p != nullptr; p = p->next_) {
+            Impl::LmBufs& lb = p->impl_->lm;
+            if (lb.S > 0 && lb.S == cap) continue;
+            if (lb.S > 0) p->lm_release();
+            const int64_t s = p->lm_prepare(n, why, cap);
+            if (s <= 0) {
+                if (p != this)
+                    why = "layers " + std::to_string(p->stage_lb_) + ".." + std::to_string(p->stage_le_) + ": " + why;
+                lm_release_chain();
+                return 0;
+            }
+            if (cap > 0 && s != cap) same = false;
+            cap = s;
+        }
+        if (same) return cap;
+    }
+    why = "the layer split's stages found no common super-chunk";
+    lm_release_chain();
+    return 0;
+}
+
+void Prefill::lm_release_chain() {
+    for (Prefill* p = this; p != nullptr; p = p->next_)
+        if (p->impl_) p->lm_release();
+}
+
 bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
     err.clear();
     Impl& m = *impl_;
@@ -5764,6 +5807,11 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
     const cudaStream_t cs = (cudaStream_t) m.cs;
     Impl::LmBufs& lb = m.lm;
     const int64_t S = lb.S, L = g.n_layers;
+    // a layer split's stage (2026-10-24): its layers [LB, LE); a later stage's rows arrive in R_host, written by the
+    // stage before it, and a stage before the last writes its final rows into the next stage's R_host, then runs
+    // the next stage on that super-chunk on a thread while it reads its own next super-chunk (one hand-off buffer:
+    // its final pass waits until the next stage has finished the previous one)
+    const int64_t LB = stage_lb_, LE = stage_le_;
     strata::kernels::QsaShapes s = core::qsa_shapes(g);   // as 0.2.2's run_impl
     const uint64_t gdn_floats = (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
                                 (uint64_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
@@ -6162,9 +6210,9 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
         const int64_t nc = (Sn + m.T - 1) / m.T;
         ++lm_supers;
         lm_mid_ = true;
-        for (int64_t l = 0; l <= L; ++l) {
+        for (int64_t l = LB; l <= LE; ++l) {
             const auto ta = Clock::now();
-            if (l < L && !lm_prefetch(l)) return false;
+            if (l < LE && !lm_prefetch(l)) return false;
             // host mode: sub-chunk c's rows go up on the copy stream into buffer c % 2 (issued one sub-chunk ahead)
             auto r_buf = [&](int64_t c) { return (c & 1) ? lb.R2 : R_chunk; };
             auto issue_up = [&](int64_t c) {
@@ -6241,13 +6289,29 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                             return ple_gather(c0, b, ple_next_err);
                         });
                     for (int64_t t = 0; t < T; ++t) { prev[0] = prev[1]; prev[1] = (int32_t) tokens[c0 + t]; }
-                } else {
+                } else if (l > LB) {   // (a later stage's first layer: the stage before wrote layer LB - 1)
                     // the previous layer's experts: the hyper-connection write of its FFN half
                     gr_write(m.R, acc, m.inj, HC, T, cs);
                     if (strata::kernels::cvec().covers(l - 1))
                         strata::kernels::cvec_apply(m.R, l - 1, T, D, nullptr, 0, nullptr, 0, false, cs);
                 }
-                if (l == L) {
+                if (l == LE && next_ != nullptr) {
+                    // ---- a layer split: this sub-chunk's rows into the next stage's R_host (on the copy stream, as
+                    // the per-layer download) once the next stage has finished the previous super-chunk
+                    stats_.tokens += T;
+                    ++stats_.chunks;
+                    if (c == 0 && next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
+                    cudaEventRecord(lb.ev_done[c & 1], cs);
+                    cudaStreamWaitEvent(m.copy, lb.ev_done[c & 1], 0);
+                    if (cudaMemcpyAsync(next_->impl_->lm.R_host + (size_t) t0 * D, m.R, (size_t) T * D * 4,
+                                        cudaMemcpyDeviceToHost, m.copy) != cudaSuccess) {
+                        err = "prefill (layer-major): the layer split's hand-off failed";
+                        return false;
+                    }
+                    cudaEventRecord(lb.ev_out[c & 1], m.copy);
+                    continue;
+                }
+                if (l == LE) {
                     // ---- the final rows of this sub-chunk: reported in order, as run_impl's chunks are
                     stats_.tokens += T;
                     ++stats_.chunks;
@@ -6270,7 +6334,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                             return false;
                         }
                         lm_mid_ = c + 1 < nc;
-                        if (on_stage_chunk && !on_stage_chunk(p0 + T, err)) return false;
+                        if (on_stage_chunk && !lm_mid_ && !on_stage_chunk(p0 + T, err)) return false;
                         if (on_chunk && !on_chunk(m.R, T, p0, err)) return false;
                     }
                     continue;
@@ -6562,8 +6626,21 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                 }
             }
             ms_attn += ms_since(ta);
-            if (l == L) break;
+            if (l == LE) break;
             if (!lm_experts(l, Sn)) return false;
+        }
+        if (next_ != nullptr) {   // the super-chunk's rows are in the next stage's R_host: it reads them on a thread
+            if (cudaStreamSynchronize(cs) != cudaSuccess || cudaStreamSynchronize(m.copy) != cudaSuccess) {
+                err = std::string("prefill (layer-major): the layer split's hand-off: ") +
+                      cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            if (on_stage_chunk && !on_stage_chunk(pos0 + sc0 + Sn, err)) return false;
+            next_err_.clear();
+            next_run_ = std::async(std::launch::async, [this, tokens, sc0, Sn, pos0] {
+                strata::aux_cpus::pin_current_thread();
+                return next_->run_layer_major(tokens + sc0, Sn, pos0 + sc0, next_err_);
+            });
         }
     }
     lm_mid_ = false;
@@ -6579,11 +6656,12 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
         return false;
     }
     stats_.ms_total += ms_since(t_start);
-    std::fprintf(stderr, "strata prefill: layer-major: %lld tokens in %lld super-chunk(s) of up to %lld (R in %s, %lld MiB VRAM free before), "
+    std::fprintf(stderr, "strata prefill: layer-major (layers %lld..%lld): %lld tokens in %lld super-chunk(s) of up to %lld (R in %s, %lld MiB VRAM free before), "
                          "%lld expert blobs streamed (%.1f MB), %lld resident, %lld expert groups (%lld on the FP16 path); %.0f ms (host: "
                          "enqueueing the attention halves %.0f, the experts %.0f: waiting for the attention halves "
                          "%.0f, the routing tables %.0f)\n",
-                 (long long) n, (long long) lm_supers, (long long) S, lb.r_dev ? "VRAM" : "pinned RAM", (long long) lb.free_mib,
+                 (long long) LB, (long long) LE, (long long) n, (long long) lm_supers, (long long) S,
+                 lb.r_dev ? "VRAM" : "pinned RAM", (long long) lb.free_mib,
                  (long long) lm_streamed, (double) lm_bytes / 1e6, (long long) lm_resident, (long long) lm_groups,
                  (long long) lm_groups_f16, ms_since(t_start), ms_attn, ms_experts, ms_wait_a, ms_host_tables);
     if (pt.on) {
@@ -6653,10 +6731,15 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
 #endif
     if (lm_env() && hand_in_ == nullptr && impl_) {
         std::string why;
-        if (lm_prepare(n, why) > 0) {
-            const bool ok = run_layer_major(tokens, n, pos0, err);
-            lm_mid_ = false;
-            lm_release();
+        if (lm_prepare_chain(n, why) > 0) {
+            bool ok = run_layer_major(tokens, n, pos0, err);
+            std::string drain_err;   // a layer split: the later stages' last super-chunk
+            if (!drain_pipeline(drain_err) && ok) {
+                ok = false;
+                err = drain_err;
+            }
+            for (Prefill* p = this; p != nullptr; p = p->next_) p->lm_mid_ = false;
+            lm_release_chain();
             return ok;
         }
         static std::string said;   // once per reason (a short prompt is the common one)

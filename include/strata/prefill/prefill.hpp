@@ -259,15 +259,23 @@ public:
 
     /// Layer-major prefill (STRATA_PREFILL_LAYER_MAJOR=1): true while `on_chunk` reports a sub-chunk before the end of
     /// its super-chunk.  The session state is already at the super-chunk's end then, so no checkpoint may be taken.
-    bool layer_major_mid() const { return lm_mid_; }
+    /// On a layer split it is the last stage's (the one that reports the rows), asked through the first.
+    bool layer_major_mid() const {
+        const Prefill* p = this;
+        while (p->next_ != nullptr) p = p->next_;
+        return p->lm_mid_;
+    }
 
 private:
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
                                       bool owned_pages, bool src);
     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;   ///< set_cpu_pool
     // Layer-major prefill: the super-chunk's buffers for an n-token prompt (its size, 0 = not this prompt: `why`),
-    // the run, and the buffers given back after it.
-    int64_t lm_prepare(int64_t n, std::string& why);
+    // the run, and the buffers given back after it.  `cap` (> 0): at most that many tokens (a layer split's stages
+    // share one size); lm_prepare_chain sizes every stage of a split.
+    int64_t lm_prepare(int64_t n, std::string& why, int64_t cap = 0);
+    int64_t lm_prepare_chain(int64_t n, std::string& why);
+    void lm_release_chain();
     bool run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
     void lm_release();
     bool lm_mid_ = false;
