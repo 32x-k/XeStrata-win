@@ -1486,6 +1486,13 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(pin_budget_test PRIVATE strata_core ${_strata_gpu_runtime_target})
   add_test(NAME pin_budget_test COMMAND pin_budget_test)
 
+  # #3350 / #3470: the conversation copy streams and events are pooled across short-lived threads (needs a device, else skips)
+  add_executable(conversation_copy_streams_test src/core/conversation_copy_streams_test.cpp)
+  target_include_directories(conversation_copy_streams_test PRIVATE include)
+  target_link_libraries(conversation_copy_streams_test PRIVATE strata_core ${_strata_gpu_runtime_target})
+  add_test(NAME conversation_copy_streams_test COMMAND conversation_copy_streams_test)
+  set_tests_properties(conversation_copy_streams_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(pinned_shared_test src/core/pinned_shared_test.cpp)
     target_link_libraries(pinned_shared_test PRIVATE strata_core ${_strata_gpu_runtime_target})

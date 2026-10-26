@@ -10,27 +10,88 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
+#include <mutex>
 #include <thread>
 #include <vector>
 
 namespace strata::core::conversation_detail {
+
+/// The private copy streams and ordering events (below) belong to a thread, but a thread can be short-lived: the layer
+/// split's later stages run each prompt chunk on a fresh std::async thread, and a checkpoint part is saved on it.  The
+/// handles used to be created per thread and never destroyed, so every such thread left one stream and one event per
+/// device behind - a few MiB of VRAM per long cold prompt on the later cards, until a stream could not be created any
+/// more and the copy failed with "out of memory" (#3350, #3470).  Now a thread hands its handles back to a process-wide
+/// pool when it ends and the next thread takes them: the number of handles is the number of threads copying at once.
+/// The pool is leaked on purpose (a thread may end after the statics are gone).
+struct CopyHandlePool {
+    std::mutex mu;
+    std::vector<std::vector<cudaStream_t>> streams;   // free ones, by device
+    std::vector<std::vector<cudaEvent_t>> events;
+    long streams_created = 0, events_created = 0;
+};
+inline CopyHandlePool& copy_handle_pool() {
+    static CopyHandlePool* p = new CopyHandlePool;
+    return *p;
+}
+/// How many streams / events the process has created for these copies (tests: it stays at the peak number of threads
+/// copying at once, not at the number of threads that ever copied).
+inline long copy_streams_created() {
+    CopyHandlePool& p = copy_handle_pool();
+    std::lock_guard<std::mutex> lk(p.mu);
+    return p.streams_created;
+}
+inline long copy_events_created() {
+    CopyHandlePool& p = copy_handle_pool();
+    std::lock_guard<std::mutex> lk(p.mu);
+    return p.events_created;
+}
+struct ThreadCopyHandles {
+    std::vector<cudaStream_t> streams;   // by device, nullptr = none yet
+    std::vector<cudaEvent_t> events;
+    ThreadCopyHandles() = default;
+    ThreadCopyHandles(const ThreadCopyHandles&) = delete;
+    ThreadCopyHandles& operator=(const ThreadCopyHandles&) = delete;
+    ~ThreadCopyHandles() {
+        CopyHandlePool& p = copy_handle_pool();
+        std::lock_guard<std::mutex> lk(p.mu);
+        if (p.streams.size() < streams.size()) p.streams.resize(streams.size());
+        if (p.events.size() < events.size()) p.events.resize(events.size());
+        for (size_t d = 0; d < streams.size(); ++d)
+            if (streams[d]) p.streams[d].push_back(streams[d]);
+        for (size_t d = 0; d < events.size(); ++d)
+            if (events[d]) p.events[d].push_back(events[d]);
+    }
+};
+inline ThreadCopyHandles& thread_copy_handles() {
+    thread_local ThreadCopyHandles t;
+    return t;
+}
 
 /// Conversation snapshot / checkpoint copies go through a private non-blocking stream of the current device
 /// instead of the legacy (null) stream.  A plain cudaMemcpy is ordered against every blocking stream of the
 /// device, and while another thread captures a graph on one (a drafter or a stage worker), HIP refuses it with
 /// "operation would make the legacy stream depend on a capturing blocking stream".  The caller's contract is
 /// unchanged: the device was synchronized before the copy (the copy itself is complete on return).
-/// private_stream: this thread's stream on the current device, created on first use.
+/// private_stream: this thread's stream on the current device: one a finished thread handed back, else a new one on
+/// first use.
 inline cudaError_t private_stream(cudaStream_t& s) {
     int dev = 0;
     cudaError_t e = cudaGetDevice(&dev);
     if (e != cudaSuccess) return e;
-    thread_local std::vector<cudaStream_t> streams;
+    std::vector<cudaStream_t>& streams = thread_copy_handles().streams;
     if (dev < 0) dev = 0;
-    if ((size_t) dev >= streams.size()) streams.resize((size_t) dev + 1, nullptr);   // never destroyed: process lifetime
+    if ((size_t) dev >= streams.size()) streams.resize((size_t) dev + 1, nullptr);
     if (!streams[(size_t) dev]) {
-        e = cudaStreamCreateWithFlags(&streams[(size_t) dev], cudaStreamNonBlocking);
-        if (e != cudaSuccess) { streams[(size_t) dev] = nullptr; return e; }
+        CopyHandlePool& p = copy_handle_pool();
+        std::lock_guard<std::mutex> lk(p.mu);
+        if ((size_t) dev < p.streams.size() && !p.streams[(size_t) dev].empty()) {
+            streams[(size_t) dev] = p.streams[(size_t) dev].back();
+            p.streams[(size_t) dev].pop_back();
+        } else {
+            e = cudaStreamCreateWithFlags(&streams[(size_t) dev], cudaStreamNonBlocking);
+            if (e != cudaSuccess) { streams[(size_t) dev] = nullptr; return e; }
+            ++p.streams_created;
+        }
     }
     s = streams[(size_t) dev];
     return cudaSuccess;
@@ -118,12 +179,20 @@ inline cudaError_t order_after_queued() {
     int dev = 0;
     e = cudaGetDevice(&dev);
     if (e != cudaSuccess) return e;
-    thread_local std::vector<cudaEvent_t> events;
+    std::vector<cudaEvent_t>& events = thread_copy_handles().events;
     if (dev < 0) dev = 0;
-    if ((size_t) dev >= events.size()) events.resize((size_t) dev + 1, nullptr);    // never destroyed: process lifetime
+    if ((size_t) dev >= events.size()) events.resize((size_t) dev + 1, nullptr);
     if (!events[(size_t) dev]) {
-        e = cudaEventCreateWithFlags(&events[(size_t) dev], cudaEventDisableTiming);
-        if (e != cudaSuccess) { events[(size_t) dev] = nullptr; return e; }
+        CopyHandlePool& p = copy_handle_pool();
+        std::lock_guard<std::mutex> lk(p.mu);
+        if ((size_t) dev < p.events.size() && !p.events[(size_t) dev].empty()) {
+            events[(size_t) dev] = p.events[(size_t) dev].back();
+            p.events[(size_t) dev].pop_back();
+        } else {
+            e = cudaEventCreateWithFlags(&events[(size_t) dev], cudaEventDisableTiming);
+            if (e != cudaSuccess) { events[(size_t) dev] = nullptr; return e; }
+            ++p.events_created;
+        }
     }
     e = cudaEventRecord(events[(size_t) dev], s);
     if (e != cudaSuccess) return e;
