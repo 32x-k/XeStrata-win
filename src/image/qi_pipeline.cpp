@@ -6,6 +6,7 @@
 
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/image/img_start.hpp"
 #include "strata/image/qi_kernels.hpp"
 
 #include <algorithm>
@@ -27,16 +28,6 @@ constexpr uint64_t kMargin = 512 * kMiB;      // the driver's own and the copies
 constexpr uint64_t kScratch = 384 * kMiB;     // the products' dequantization scratch (the DiT's and the encoder's)
 
 uint64_t clampu(uint64_t v, uint64_t lo, uint64_t hi) { return std::max(lo, std::min(v, hi)); }
-
-// RGBA8 [H][W][4] of `f` at W x H, nearest (as the references are resized)
-std::vector<uint8_t> resized(const QiRef& f, int64_t W, int64_t H) {
-    std::vector<uint8_t> out((size_t) (W * H * 4));
-    for (int64_t y = 0; y < H; ++y)
-        for (int64_t x = 0; x < W; ++x)
-            std::copy_n(f.rgba.data() + ((y * f.height / H) * f.width + x * f.width / W) * 4, 4,
-                        out.data() + (y * W + x) * 4);
-    return out;
-}
 
 }  // namespace
 
@@ -131,9 +122,10 @@ QiNeed QiPipeline::need(int64_t n_text, int64_t width, int64_t height,
         const uint64_t v = vision_size_ ? vision_size_->weight_bytes() + vision_size_->scratch_bytes((rh / 16) * (rw / 16)) : 0;
         edit = std::max(edit, v + vae.encode_scratch_bytes(rh, rw) + (uint64_t) (4 * rh * rw) * 4);
     }
-    // a mask: the first reference encoded again at the image's size; the base latent, the noise and the mask kept
+    // a base image (img2img's or a mask's): encoded at the image's size; its latent, and a mask's noise and positions,
+    // kept through the sampling
     if (mask) edit = std::max(edit, vae.encode_scratch_bytes(height, width) + (uint64_t) (4 * height * width) * 4);
-    const uint64_t inpaint = mask ? (uint64_t) ((2 * dit.channels() + 1) * h * w) * 4 : 0;
+    const uint64_t inpaint = mask ? LatentStart::bytes(dit.channels() * h * w, h * w, true) : 0;
     // guidance: the negative prompt's prefix beside the first (the same references), and its sequence
     // its activations: both sequences side by side after the first step (forward_pair)
     const int64_t neg_pre = n_neg > 0 ? n_neg + (T - h * w - n_text) : 0,
@@ -246,7 +238,7 @@ QiPlan QiPipeline::plan(int64_t T, int64_t h, int64_t w, int64_t n_ids, int64_t 
 
 void QiPipeline::edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::vector<QiVisionOut>& vouts,
                            std::vector<QiText::Image>& te_images, std::vector<QiDit::Ref>& dit_refs,
-                           std::vector<float*>& ref_z, float** base_z, std::vector<int32_t>& neg_ids,
+                           std::vector<float*>& ref_z, std::vector<int32_t>& neg_ids,
                            std::vector<QiText::Image>& neg_te, std::vector<QiDit::Ref>& neg_refs) {
     if (vision_path_.empty()) throw std::invalid_argument("image engine: an edit needs the vision encoder (--vision)");
     if (std::count(r.ids.begin(), r.ids.end(), kImagePad) != (int64_t) r.refs.size())
@@ -255,8 +247,8 @@ void QiPipeline::edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::v
     std::vector<std::pair<int64_t, int64_t>> sizes;
     sizes.reserve(r.refs.size());
     for (const QiRef& f : r.refs) sizes.emplace_back(f.width, f.height);
-    const bool mask = !r.mask.rgba.empty();
-    const QiNeed nd = need(0, r.width, r.height, sizes, mask);
+    const bool base = base_image(r) != nullptr;
+    const QiNeed nd = need(0, r.width, r.height, sizes, base);
     const uint64_t edit = nd.least - need(0, r.width, r.height).least;
     if (held() + edit > budget()) release(false);
     ensure_open();
@@ -291,20 +283,6 @@ void QiPipeline::edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::v
         vae_->encode(d, rh, rw, z);
         gpu::free(d);
         grids.emplace_back(rw, rh);
-    }
-    if (mask) {   // the first reference at the image's size: the latent the part the mask keeps follows
-        const std::vector<uint8_t> px = resized(r.refs[0], r.width, r.height);
-        const int64_t HW = r.width * r.height;
-        std::vector<float> rgba((size_t) (4 * HW));
-        for (int64_t q = 0; q < HW; ++q)
-            for (int c = 0; c < 4; ++c) rgba[(size_t) (c * HW + q)] = (float) px[(size_t) (q * 4 + c)] / 255.f;
-        float* d = nullptr;
-        if (!gpu::alloc_device(&d, rgba.size() * 4) ||
-            !gpu::alloc_device(base_z, (size_t) (64 * (r.height / 16) * (r.width / 16)) * 4))
-            throw std::runtime_error(std::string("image engine: GPU memory: ") + gpu::last_error());
-        gpu::copy(d, rgba.data(), rgba.size() * 4);
-        vae_->encode(d, r.height, r.width, *base_z);
-        gpu::free(d);
     }
     vision_.reset();   // its weights go: an edit opens it again
     vae_->drop_scratch();
@@ -366,17 +344,25 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
         }
     } free_z{ref_z};
     const bool mask = !r.mask.rgba.empty();
-    if (mask && (r.refs.empty() || r.mask.rgba.size() != (size_t) (r.mask.width * r.mask.height * 4)))
-        throw std::invalid_argument("image engine: a mask needs its reference image, and it must not be empty");
-    float* base_z = nullptr;
+    const QiRef* base = base_image(r);
+    if ((mask || r.strength < 1.0f) && base == nullptr)
+        throw std::invalid_argument("image engine: a mask or a strength below 1 needs a base image (an init image or "
+                                    "a reference)");
+    if (mask && r.mask.rgba.size() != (size_t) (r.mask.width * r.mask.height * 4))
+        throw std::invalid_argument("image engine: the mask is empty");
+    const std::vector<float> sigmas = strength_sigmas(r.sigmas.empty() ? turbo_sigmas() : r.sigmas, r.strength);
+    LatentStart ls;
     const bool guided = r.cfg > 1.0f && !r.neg_ids.empty();
     std::vector<int32_t> neg_ids;   // an edit's negative prompt, its pads widened
     std::vector<QiText::Image> neg_te;
     std::vector<QiDit::Ref> neg_refs;
     if (!r.refs.empty()) {
         if (stage) stage("refs");
-        edit_refs(r, ids, vouts, te_images, dit_refs, ref_z, &base_z, neg_ids, neg_te, neg_refs);
-        if (base_z != nullptr) ref_z.push_back(base_z);
+        edit_refs(r, ids, vouts, te_images, dit_refs, ref_z, neg_ids, neg_te, neg_refs);
+    }
+    if (base != nullptr) {
+        if (stage && r.refs.empty()) stage("refs");
+        encode_base(r, *base, ls);
     }
     if (stage) stage("text");
     const std::vector<int32_t>& all_ids = r.refs.empty() ? r.ids : ids;
@@ -423,33 +409,18 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     if (!gpu::alloc_device(&x, (size_t) n * 4) || !gpu::alloc_device(&rgba, (size_t) (4 * HW) * 4))
         throw std::runtime_error(std::string("image engine: GPU memory: ") + gpu::last_error());
     std::vector<float> out((size_t) (4 * HW));
-    // a mask: 1 for each latent token with a pixel of the mask less than opaque (the part that changes), the noise
-    // the kept part's latent follows
-    std::function<void(float*, float)> keep;
+    // a mask: the latent tokens with a pixel of the mask less than opaque change, the rest follow the base image's
+    // latent from the seed's noise (img_start.hpp)
     std::vector<uint8_t> mask_px;
     if (mask) {
-        mask_px = resized(r.mask, r.width, r.height);
-        std::vector<float> m((size_t) (h * w), 0.f);
-        for (int64_t y = 0; y < r.height; ++y)
-            for (int64_t xx = 0; xx < r.width; ++xx)
-                if (mask_px[(size_t) ((y * r.width + xx) * 4 + 3)] < 255) m[(size_t) ((y / 16) * w + xx / 16)] = 1.f;
-        float *nz = nullptr, *mk = nullptr;
-        for (auto [p, bytes] : {std::pair<float**, size_t>{&nz, (size_t) n * 4}, {&mk, m.size() * 4}}) {
-            if (!gpu::alloc_device(p, bytes))
-                throw std::runtime_error(std::string("image engine: GPU memory: ") + gpu::last_error());
-            ref_z.push_back(*p);   // freed with the references' latents
-        }
-        gpu::copy(nz, noise.data(), (size_t) n * 4);
-        gpu::copy(mk, m.data(), m.size() * 4);
-        const int64_t C = dit_->channels();
-        keep = [this, base_z, nz, mk, C, h, w](float* xs, float sigma) {
-            qi_inpaint_blend(xs, base_z, nz, mk, sigma, C, h * w, s_);
-        };
+        mask_px = resize_nearest(r.mask, r.width, r.height);
+        ls.set_mask(latent_mask(mask_px, r.width, r.height, 16), noise, dit_->channels(), h * w, false);
     }
     try {
         gpu::copy(x, noise.data(), (size_t) n * 4);
+        if (r.strength < 1.0f) ls.start(x, sigmas[0], s_);   // img2img: from the base image's latent at that time
         if (stage) stage("sampling");
-        dit_->sample(x, h, w, r.sigmas.empty() ? turbo_sigmas() : r.sigmas, step, keep, guided ? r.cfg : 1.0f);
+        dit_->sample(x, h, w, sigmas, step, ls.after(s_), guided ? r.cfg : 1.0f);
         dit_->drop_host_prefix();
         const auto t2 = clock::now();
         if (stage) stage("decode");
@@ -500,17 +471,32 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     for (int64_t q = 0; q < HW; ++q)
         for (int c = 0; c < 4; ++c)
             img[(size_t) (q * 4 + c)] = (uint8_t) std::lround(std::clamp(out[(size_t) (c * HW + q)], 0.0f, 1.0f) * 255.0f);
-    if (mask) {   // the kept part is the reference's own pixels (not through the VAE), blended by the mask's alpha
-        const std::vector<uint8_t> base = resized(r.refs[0], r.width, r.height);
-        for (int64_t q = 0; q < HW; ++q) {
-            const int a = mask_px[(size_t) (q * 4 + 3)];
-            for (int c = 0; c < 4; ++c) {
-                const size_t i = (size_t) (q * 4 + c);
-                img[i] = (uint8_t) ((a * base[i] + (255 - a) * img[i] + 127) / 255);
-            }
-        }
-    }
+    // a mask's kept part is the base image's own pixels (not through the VAE), blended by the mask's alpha
+    if (mask) keep_pixels(img, resize_nearest(*base, r.width, r.height), mask_px);
     return img;
+}
+
+void QiPipeline::encode_base(const QiRequest& r, const QiRef& base, LatentStart& ls) {
+    if (r.refs.empty()) {   // the VAE encoder's room: the cache gives way when the budget is short of it (an edit's
+        const uint64_t more = need(0, r.width, r.height, {}, true).least - need(0, r.width, r.height).least;
+        if (held() + more > budget()) release(false);   // references made it in edit_refs already)
+    }
+    ensure_open();
+    if (!vae_->has_encoder()) throw std::invalid_argument("image engine: the VAE file has no encoder for a base image");
+    const std::vector<uint8_t> px = resize_nearest(base, r.width, r.height);
+    const int64_t HW = r.width * r.height;
+    std::vector<float> rgba((size_t) (4 * HW));
+    for (int64_t q = 0; q < HW; ++q)
+        for (int c = 0; c < 4; ++c) rgba[(size_t) (c * HW + q)] = (float) px[(size_t) (q * 4 + c)] / 255.f;
+    float* d = nullptr;
+    if (!gpu::alloc_device(&d, rgba.size() * 4))
+        throw std::runtime_error(std::string("image engine: GPU memory: ") + gpu::last_error());
+    float* z0 = ls.base(dit_->channels() * (r.height / 16) * (r.width / 16));
+    gpu::copy(d, rgba.data(), rgba.size() * 4);
+    const bool ok = vae_->encode(d, r.height, r.width, z0);
+    gpu::free(d);
+    vae_->drop_scratch();
+    if (!ok) throw std::runtime_error("image engine: the VAE's encoder failed on the base image");
 }
 
 }  // namespace strata::image

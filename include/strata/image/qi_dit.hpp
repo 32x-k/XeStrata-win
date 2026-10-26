@@ -70,8 +70,8 @@ public:
 
     /// The flow sampler: x (device FP32 [64][H][W], the starting noise) through `sigmas` by Euler's steps.
     /// `step` (if set) is called after each step with (steps done, steps); it returns false to stop (the sampler then
-    /// throws QiStopped).  `after` (if set) is given x and the step's new sigma first, on the sampler's stream (an
-    /// edit's mask: qi_inpaint_blend).  `cfg` above 1 (with a second context set): classifier-free guidance, the
+    /// throws QiStopped).  `after` (if set) is given x and the step's new sigma first, on the sampler's stream (a mask:
+    /// img_start.hpp's blend).  `cfg` above 1 (with a second context set): classifier-free guidance, the
     /// velocity neg + cfg * (cond - neg) of the two contexts' (diffusers' true_cfg_scale).
     void sample(float* x, int64_t H, int64_t W, const std::vector<float>& sigmas,
                 const std::function<bool(int, int)>& step = {},

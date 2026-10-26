@@ -13,6 +13,7 @@
 // kept too.
 #pragma once
 
+#include "strata/image/img_start.hpp"
 #include "strata/image/pipeline.hpp"
 #include "strata/image/qi_dit.hpp"
 #include "strata/image/qi_text.hpp"
@@ -54,8 +55,9 @@ public:
     uint64_t held() const override;
 
     /// What an image of n_text prompt ids (after the system turn) at width x height needs (from the parts' sizes:
-    /// nothing put on the GPU); refs: an edit's reference images' sizes (width, height as read); mask: the edit has a
-    /// mask (the first reference encoded again at the image's size, and the sampler's base latent, noise and mask);
+    /// nothing put on the GPU); refs: an edit's reference images' sizes (width, height as read); mask: the request has
+    /// a base image (img_start.hpp: img2img's or a mask's), encoded at the image's size, its latent and a mask's noise
+    /// and positions kept through the sampling;
     /// n_neg: guidance's negative prompt's ids after the system turn (0: no guidance), its own prefix beside the first.
     QiNeed need(int64_t n_text, int64_t width, int64_t height,
                 const std::vector<std::pair<int64_t, int64_t>>& refs = {}, bool mask = false,
@@ -74,8 +76,10 @@ private:
     void ensure_open();
     void edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::vector<QiVisionOut>& vouts,
                    std::vector<QiText::Image>& te_images, std::vector<QiDit::Ref>& dit_refs, std::vector<float*>& ref_z,
-                   float** base_z, std::vector<int32_t>& neg_ids, std::vector<QiText::Image>& neg_te,
+                   std::vector<int32_t>& neg_ids, std::vector<QiText::Image>& neg_te,
                    std::vector<QiDit::Ref>& neg_refs);
+    /// The base image (img_start.hpp) at the image's size through the VAE's encoder into `ls`'s base latent.
+    void encode_base(const QiRequest& r, const QiRef& base, LatentStart& ls);
 
     void* s_ = nullptr;
     std::string dit_path_, vae_path_, text_path_, vision_path_;
