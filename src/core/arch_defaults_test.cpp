@@ -48,6 +48,66 @@ int main() {
                 CHECK(kv.first != bits);
         }
     }
+    // 0.2.7: STRATA_SH_STREAM.  Windows gfx1151 leaves the shared-expert fork off (it measured slower there, same ids); Linux gfx1151,
+    // the 026 master switch and every other architecture are unchanged.  Pure rule: the platform is an argument.
+    {
+        auto find = [](const std::vector<std::pair<std::string, std::string>>& t, const char* k) -> const std::string* {
+            for (const auto& kv : t) if (kv.first == k) return &kv.second;
+            return static_cast<const std::string*>(nullptr);
+        };
+        for (const char* a : {"gfx1151", "gfx1151:sramecc-:xnack-"}) {
+            const auto lin = arch_default_env(a, false, false);
+            const auto win = arch_default_env(a, false, true);
+            const auto lin26 = arch_default_env(a, true, false);
+            const auto win26 = arch_default_env(a, true, true);
+            const std::string* l = find(lin, "STRATA_SH_STREAM");
+            CHECK(l != nullptr && *l == "1");                      // Linux gfx1151: unchanged, the fork is on
+            CHECK(find(win, "STRATA_SH_STREAM") == nullptr);       // Windows gfx1151: not in the table, so the HIP default (off) applies
+            CHECK(find(win26, "STRATA_SH_STREAM") != nullptr);     // STRATA_DEFAULTS=026: v0.2.6's table on Windows too
+            CHECK(find(lin26, "STRATA_SH_STREAM") != nullptr);
+            CHECK(win26 == lin26 && win26 == lin);                 // under 026 and on Linux the whole table is the same
+            CHECK(win.size() + 1 == lin.size());                   // Windows loses that one entry and nothing else
+            for (const auto& kv : win) CHECK(find(lin, kv.first.c_str()) != nullptr && *find(lin, kv.first.c_str()) == kv.second);
+        }
+        // other architectures: the platform changes nothing
+        for (const char* a : {"gfx1100", "gfx1030", "gfx1103", "gfx1150", "gfx1152", "gfx1201", "gfx1200", ""}) {
+            CHECK(arch_default_env(a, false, true) == arch_default_env(a, false, false));
+            CHECK(arch_default_env(a, true, true) == arch_default_env(a, true, false));
+        }
+        CHECK(arch_default_env(nullptr, false, true).empty());
+        // the build's own platform answers like the explicit form (the one-argument form reads STRATA_DEFAULTS, unset here)
+        unset("STRATA_DEFAULTS");
+#if defined(_WIN32)
+        CHECK(arch_default_env("gfx1151") == arch_default_env("gfx1151", false, true));
+        CHECK(find(arch_default_env("gfx1151"), "STRATA_SH_STREAM") == nullptr);
+#else
+        CHECK(arch_default_env("gfx1151") == arch_default_env("gfx1151", false, false));
+        CHECK(find(arch_default_env("gfx1151"), "STRATA_SH_STREAM") != nullptr);
+#endif
+        // applying the table: an explicit STRATA_SH_STREAM=1 stays 1, an explicit 0 stays 0, and the Windows table does not set it
+        unset("STRATA_QFUSE");
+        put("STRATA_SH_STREAM", "1");
+        apply_arch_defaults("gfx1151");
+        CHECK(std::getenv("STRATA_SH_STREAM") != nullptr && std::string(std::getenv("STRATA_SH_STREAM")) == "1");
+        put("STRATA_SH_STREAM", "0");
+        apply_arch_defaults("gfx1151");
+        CHECK(std::string(std::getenv("STRATA_SH_STREAM")) == "0");
+        unset("STRATA_SH_STREAM");
+        unset("STRATA_QFUSE");
+        const auto applied = apply_arch_defaults("gfx1151");
+        bool sh_set = false;
+        for (const auto& n : applied) sh_set = sh_set || n == "STRATA_SH_STREAM";
+#if defined(_WIN32)
+        CHECK(!sh_set);
+        CHECK(std::getenv("STRATA_SH_STREAM") == nullptr || std::string(std::getenv("STRATA_SH_STREAM")).empty());
+#else
+        CHECK(sh_set);
+        CHECK(std::getenv("STRATA_SH_STREAM") != nullptr && std::string(std::getenv("STRATA_SH_STREAM")) == "1");
+#endif
+        unset("STRATA_SH_STREAM");
+        unset("STRATA_QFUSE");
+        unset("STRATA_TSUM");
+    }
     // gfx12: the five prompt switches and four bit-identical decode switches, no bit-changing one
     unset("STRATA_GFX12_DEFAULTS");
     for (const char* a : {"gfx1200", "gfx1201", "gfx1201:sramecc-:xnack-"}) {
