@@ -22,11 +22,12 @@
 // whole process (batch slots, a layer split, a peer device).
 //
 // The draft layer (MTP) builds its K/V from the final rows of the prompt, which an approximated chunk does not have.
-// Its window is NOT changed: the draft layer's attention starts at the "cell floor" (MtpDrafter::set_cell_floor), the
-// first cell built from a real row, and the cells below it are neither built nor read.  A session KVA did not
-// approximate has a floor of 0 and is bit for bit what STRATA_KVA=0 runs (kva_floor.hpp keeps the floor with the
-// tokens of the session, window_start.hpp is the one rule the kernel and the tests share).  The target model verifies
-// every token whatever the draft read.
+// Its window is NOT changed, and by default neither is anything else: the draft cells of an approximated chunk are
+// built from the rows that chunk has and the draft layer attends to them (measured: draft acceptance after a KVA
+// read stays within noise on the P100).  The research option STRATA_KVA_DRAFT_FLOOR=1 gives the draft layer a "cell
+// floor" per session (MtpDrafter::set_cell_floor; kva_floor.hpp keeps it with the tokens of the session,
+// window_start.hpp is the one rule the kernel and the tests share): the first cell built from a real row, below
+// which no draft cell is built or read.  The target model verifies every token whatever the draft read.
 #pragma once
 
 #include <algorithm>
@@ -68,6 +69,7 @@ struct KvaConfig {
     bool capture_fp32 = false;   ///< STRATA_KVA_CAPTURE_FP32=1: fp32 records (else bf16; fp32 is for parity runs)
     bool oracle_fp32 = false;    ///< STRATA_KVA_ORACLE_FP32=1: the oracle files are fp32 (else bf16)
     bool parity = false;         ///< STRATA_KVA_PARITY=1: report the state-only path against the full path
+    bool draft_floor = false;    ///< STRATA_KVA_DRAFT_FLOOR=1: the draft layer skips the cells of approximated chunks (research; default: it reads them)
     int64_t split = 24;          ///< STRATA_KVA_SPLIT: first approximated layer (zero-based)
     int64_t suffix_env = 0;      ///< STRATA_KVA_SUFFIX: fully computed tail positions (0 = not set: kKvaSuffixDefault)
     int64_t min_prompt = 4096;   ///< STRATA_KVA_MIN_PROMPT: shorter prompts stay on the full path
@@ -83,7 +85,7 @@ struct KvaConfig {
     /// Does the draft layer need the cell floor at all?  Only when a read can approximate something: KVA on, not ruled
     /// out for the process, and a draft layer loaded.  Otherwise the draft layer's attention is 0.2.6's own code.
     bool wants_cell_floor(const KvaEngine& e, bool has_drafter) const {
-        return kKvaBackend && on && e.blocked.empty() && has_drafter;
+        return kKvaBackend && on && draft_floor && e.blocked.empty() && has_drafter;
     }
 
     /// Why this read cannot take the approximate path, or nullptr when it can: a cold read of one prompt (not a
@@ -143,6 +145,7 @@ inline KvaConfig kva_config_from_env() {
     k.suffix_env = std::max<int64_t>(0, kva_env_i64("STRATA_KVA_SUFFIX", 0));
     k.min_prompt = kva_env_i64("STRATA_KVA_MIN_PROMPT", 4096);
     k.parity = kva_env_flag("STRATA_KVA_PARITY", false);
+    k.draft_floor = kva_env_flag("STRATA_KVA_DRAFT_FLOOR", false);
     if (const char* d = std::getenv("STRATA_KVA_CAPTURE"); d != nullptr && *d != '\0') {
         k.capture = true;
         k.capture_dir = d;
