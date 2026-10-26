@@ -68,6 +68,9 @@ struct PlainOptions {
     /// of RAM; the RTX 4070 started at all (it had 161 MiB left for the tier), and at 64K went 86 -> 172 slots, its
     /// prompt 3.3 -> 7.1 tok/s and decode 2.32 -> 2.30 (UD-IQ3_XXS, 1K + 256, 2026-10-26).  The other models: off.
     bool kv_ram = true;
+    /// --vision (qwen35, qwen35moe): pictures among the prompt's tokens (plain_generate's GENI): their rows in place
+    /// of the token embeddings (set_embeddings) and every cell's M-RoPE position from a table (set_positions)
+    bool vision = false;
     /// --vram-elastic (#533; --serve, one GPU with virtual memory): the expert slots in physical segments of
     /// vram_segment_mib that `vram` gives back to the driver and maps again between requests
     bool vram_elastic = false;
@@ -154,6 +157,12 @@ public:
     int64_t max_cells() const { return opt_.max_cells; }
     /// The prompt's chunk (0: the prompt runs in windows; GLM-5.3-Flash's for now, whatever the options asked).
     int64_t prompt_chunk() const { return opt_.prompt_chunk; }
+    /// --vision: the M-RoPE positions (t, h, w) of cells 0 .. n - 1, `thw` 3 n of them on the host (kernels/mrope.hpp's
+    /// table, every stage's; the cells after n keep theirs).  Between requests.
+    bool set_positions(const int32_t* thw, int64_t n, std::string& err);
+    /// --vision: (*rows)[p], n_embd floats, in place of the embedding of the token at position p where it is not null
+    /// (a picture's rows; null `rows`: none).  The vector outlives the prompt it is set for.
+    void set_embeddings(const std::vector<const float*>* rows);
 
     /// Zeroes the recurrent states and the K/V cache: the next window starts a sequence at position 0.
     bool reset(std::string& err);
@@ -527,6 +536,11 @@ private:
     bool dense_ = false;             ///< a dense FFN in every block and no experts (qwen35)
     int emb_type_ = -1;
     const uint8_t* emb_ = nullptr;   ///< token_embd in the GGUF mapping (rows dequantized on the host)
+    const std::vector<const float*>* emb_rows_ = nullptr;   ///< set_embeddings'
+    /// The embedding of token `tok` at position `pos` into `dst` (n_embd floats): a picture's row there, else the
+    /// token's; false for a token outside the vocabulary or a row the host cannot dequantize
+    bool embed(int32_t tok, int64_t pos, float* dst) const;
+    int32_t* mrope_ = nullptr;       ///< --vision: the cells' (t, h, w), device [max_cells][3]
     size_t emb_row_ = 0;
     W head_;
     const float* out_norm_ = nullptr;

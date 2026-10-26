@@ -41,6 +41,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_select.hpp"
 #include "strata/kernels/kv_q8.hpp"
+#include "strata/kernels/mrope.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/rope_scaling.hpp"
 #include "strata/kernels/router_top10.hpp"
@@ -694,6 +695,19 @@ bool PlainModel::load_qwen(std::string& err) {
             return false;
         }
         allocs_.push_back(page_table_);
+    }
+    // --vision: every cell's rotary position from the table (kernels/mrope.hpp), the identity until a request with
+    // pictures writes it; set before any graph is recorded, which reads the pointer
+    if (opt_.vision) {
+        std::vector<int32_t> thw((size_t) opt_.max_cells * 3);
+        for (int64_t c = 0; c < opt_.max_cells; ++c)
+            for (int i = 0; i < 3; ++i) thw[(size_t) (c * 3 + i)] = (int32_t) c;
+        if (!strata::gpu::alloc_device(&mrope_, thw.size() * 4) || !strata::gpu::copy(mrope_, thw.data(), thw.size() * 4)) {
+            err = "plain model: the rotary positions' table";
+            return false;
+        }
+        allocs_.push_back(mrope_);
+        k::mrope_table_set(mrope_);
     }
 
     // the window's buffers
@@ -1603,6 +1617,32 @@ std::vector<int64_t> PlainModel::split_points() const {
     return at;
 }
 
+bool PlainModel::set_positions(const int32_t* thw, int64_t n, std::string& err) {
+    if (n < 0 || n > opt_.max_cells) { err = "plain model: positions past the context"; return false; }
+    for (PlainModel* st : chain()) {
+        const OnDevice on(st->dev_);
+        if (st->mrope_ == nullptr) { err = "plain model: the engine was started without --vision"; return false; }
+        if (n > 0 && !strata::gpu::copy(st->mrope_, thw, (size_t) n * 3 * 4)) {
+            err = std::string("plain model: the rotary positions: ") + strata::gpu::last_error();
+            return false;
+        }
+    }
+    return true;
+}
+
+void PlainModel::set_embeddings(const std::vector<const float*>* rows) {
+    for (PlainModel* st : chain()) st->emb_rows_ = rows;
+}
+
+bool PlainModel::embed(int32_t tok, int64_t pos, float* dst) const {
+    if (tok < 0 || tok >= n_vocab_) return false;
+    if (emb_rows_ != nullptr && pos >= 0 && pos < (int64_t) emb_rows_->size() && (*emb_rows_)[(size_t) pos] != nullptr) {
+        std::memcpy(dst, (*emb_rows_)[(size_t) pos], (size_t) spec_.n_embd * 4);
+        return true;
+    }
+    return k::cpu::native_row_to_float(emb_type_, emb_ + (size_t) tok * emb_row_, dst, spec_.n_embd);
+}
+
 void PlainModel::set_sampler(const strata::kernels::SamplerParams& sp) {
     sampler_ = sp;
     for (auto& st : next_) st->sampler_ = sp;
@@ -2066,8 +2106,7 @@ bool PlainModel::stage(const int32_t* tokens, int T, int64_t pos, std::string& e
     const k::QsaShapes qs = attn_shapes(s, nkv_);
     for (int t = 0; t < T; ++t) {
         if (tokens[t] < 0 || tokens[t] >= n_vocab_) { err = "plain model: a token is out of the vocabulary"; return false; }
-        if (emb &&
-            !k::cpu::native_row_to_float(emb_type_, emb_ + (size_t) tokens[t] * emb_row_, h_emb_ + (size_t) t * N, N)) {
+        if (emb && !embed(tokens[t], pos + t, h_emb_ + (size_t) t * N)) {
             err = "plain model: the embedding row could not be dequantized";
             return false;
         }
