@@ -4453,12 +4453,18 @@ struct Model::Impl {
         std::fprintf(stderr, "ds4: %zu of the CPU lane's %zu experts copied into RAM (%.1f GB, %d NUMA part%s) in %.1f s%s\n",
                      jobs.size(), hot.size(), cb / 1e9, NH, NH > 1 ? "s" : "", (now_ms() - t0) / 1000.0,
                      jobs.size() < hot.size() ? "; the others read in place" : "");
-        // DS4_COPY_PIN=1: pin the copies, so the prompt path DMAs each expert from where it lies instead of copying it
-        // to the pinned staging first (measured on the R9700 box: the 8K pass streams 122 GB at 6.8 GB/s through the
-        // staging, where the RAM-to-staging and DMA probes are 24 and 28 GB/s).  The CPU lane reads the same memory, and
-        // pinned 4 KB pages can cost its TLB (an earlier registration measured -15% decode), so this stays opt-in.
+        // DS4_COPY_PIN: pin the copies, so the prompt path DMAs each expert from where it lies instead of copying it to
+        // the pinned staging first (the pass streams 122 GB at 6.8 GB/s through the staging, where the RAM-to-staging
+        // and DMA probes are 24 and 28 GB/s).  The CPU lane reads the same memory, and pinned 4 KB pages can cost its
+        // TLB (an earlier registration measured -15% decode on a 12 GB card, where the CPU lane does nearly all of the
+        // decode) - so AUTO (unset) pins when the cards hold at least half the routed experts: the CPU lane is then a
+        // minority of the decode and the prompt stream is what hurts.  Measured on 4x R9700, 2.25 bpw (share 0.72),
+        // three interleaved pairs: the second 8K prompt of a process 12.0/11.9/11.9 s against 28.8/13.8/12.3 s unpinned,
+        // decode 35.42/35.50/34.9-36.0 against 35.43/35.45/34.9-36.0 tok/s (no cost).  DS4_COPY_PIN=0/1 forces it.
         // DS4_COPY_PIN_RO=1: cudaHostRegisterReadOnly (the GPU only reads it).
-        if (const char* cp = std::getenv("DS4_COPY_PIN"); cp != nullptr && std::atoi(cp) != 0) {
+        const char* cp = std::getenv("DS4_COPY_PIN");
+        const bool pin_on = cp != nullptr ? std::atoi(cp) != 0 : gpu_expert_share() >= 0.5;
+        if (pin_on) {
             const bool ro = std::getenv("DS4_COPY_PIN_RO") != nullptr && std::atoi(std::getenv("DS4_COPY_PIN_RO")) != 0;
             const double tr = now_ms();
             bool ok = true;
