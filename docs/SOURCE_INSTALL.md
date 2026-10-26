@@ -33,6 +33,8 @@ Choose a pack that fits your machine; Q2_0 is an example, not a universal minimu
 In PowerShell, prefix the wrapper with `.\`, for example `.\START-HERE.bat`.
 `SETUP.bat` opens setup again to add a model or change settings. The wrapper can reuse an existing install;
 first-start and later load times depend on the pack, disk, RAM and backend. A model can take several minutes to load.
+Run again over an installed model, setup pre-selects the size that is installed and marks it "(installed)", and `--yes` takes it: a repeat run
+does not move the model to the recommended size.
 
 When no ready-made engine fits the PC, setup compiles one. That needs the Visual Studio 2022 Build Tools with the C++ workload;
 Visual Studio 2019 is too old (the sources are C++20). With a CUDA toolkit, CUDA 13.0 to 13.2 accept Visual Studio 2022 only, and

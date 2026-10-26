@@ -63,6 +63,12 @@ Retry it in the app, or rerun the same `strata launch` command. Completed model-
 free space and the error message. For an interrupted Terminal installer, rerun the install command. Only a source
 checkout uses `START-HERE.bat` / `./setup.sh` to resume source setup.
 
+**The engine stops at the start with no line in its log, and the error says `the engine process ended: ...`.**
+The error names how the system ended the engine process, because the engine log is silent then: for example `killed by signal 4 (SIGILL, Illegal
+instruction)` on Linux and Mac, or `exit code 0xC000001D: illegal instruction` on Windows. An illegal instruction means the engine ran an instruction
+the CPU cannot execute; the error lists the AVX, AVX2, FMA and F16C flags the CPU lacks, or says the CPU has them all, which is a bug in the engine.
+Report it with the CPU model.
+
 **Startup takes a long time or the computer becomes slow.**
 Large models need time to check files, prepare packs and fill memory. A first launch can take many minutes; there is
 no fixed startup time. Watch progress and the engine log. If memory pressure is high, close memory-heavy programs and try a
