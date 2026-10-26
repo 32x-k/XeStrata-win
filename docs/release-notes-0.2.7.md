@@ -41,6 +41,13 @@ A variable or flag you set yourself (`DS4_ATTN_SLAB=N`, `STRATA_ROUTE_PRIOR=2`, 
 `--ple-io`) still wins over the switch. The older single switches (`DS4_FAST_ATTN=0`, `DS4_ATTN_SLAB=0`, `DS4_COPY_PIN=0`,
 `DS4_COPY_HUGETLB=0`, `DS4_STORE_SPARE=0`, `DS4_STORE_PUT=0`, `STRATA_ROUTE_PRIOR=0`, ...) work as before.
 
+- **Strix Halo (`gfx1151`) on Windows: the shared expert no longer runs on its own stream.** `STRATA_SH_STREAM` was on by default on
+  `gfx1151`; on a Windows PC it is slower. Qwen3.8-Flash-Next IQ3_S, three interleaved pairs: chat decode **43.6 -> 46.6 tokens/s (+6.9%)**
+  with it off, prompts unchanged. The answers are the same: five fixed greedy prompts (up to 16,383 tokens) gave identical token ids with
+  the switch on and off, in four runs. Linux `gfx1151` keeps it on, other cards are untouched. Turn it back on with
+  `STRATA_SH_STREAM=1`; `STRATA_DEFAULTS=026` restores the 0.2.6 behaviour. Details and the other numbers of that PC:
+  [docs/STRIX_HALO_WINDOWS.md](STRIX_HALO_WINDOWS.md).
+
 ## What is faster if your PC is set up for it
 
 These need no engine change; they are settings. Each was measured on the same boxes.

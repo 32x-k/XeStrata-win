@@ -42,6 +42,10 @@ the default 8K context, the others 64K context with `--context 64k`):
 These are speed measurements. They say nothing about answer quality, and the short-chat range depends on the text. The DeepSeek 2.25 bpw set
 and the other Qwen sizes were not measured for this page.
 
+The DeepSeek 4K prompt here (214 to 226 tok/s) is higher than the 87 tok/s on [STRIX_HALO.md](STRIX_HALO.md), which was measured on 2026-10-25 with an
+earlier build. The 0.2.7 DeepSeek defaults explain most of the gap (the same build with `DS4_DEFAULTS=026` reads 133 to 139 tok/s); the table there
+changes one thing at a time.
+
 ## 2. Memory and the BIOS
 
 - Allocate a **fixed carve-out** to the graphics chip in the BIOS (64 GB on the measured PC). The engine counts the carve-out and the
@@ -76,7 +80,7 @@ environment and the package's `rocm/bin` folder on the library path.
 
 ## 4. What is on by default
 
-- On `gfx1151` the engine turns on 19 exact speed switches by itself (the start line lists them; `STRATA_GFX1151_DEFAULTS=0` turns them all
+- On `gfx1151` the engine turns on exact speed switches by itself (19 on Linux, 18 on Windows, which leaves `STRATA_SH_STREAM` out, see below; the start line lists them; `STRATA_GFX1151_DEFAULTS=0` turns them all
   off, and a switch you set is kept). They are the ones that give the same answers as without. `STRATA_HC_Q8=1` is also on here (decode
   about 9% faster, near-tie tokens can differ); `STRATA_HC_Q8=0` keeps the old read.
 - The hipBLASLt table for `gfx1151` ships in the package and is chosen without a setting (`prefill gemm: hipBLASLt tuning enabled (32 rows,
@@ -85,13 +89,14 @@ environment and the package's `rocm/bin` folder on the library path.
   budget and decode fell to 28 tok/s on engine 0.1.41; the engine on this page sizes the cache from the shared pool and reaches every slot.
 - DeepSeek runs in "Faster" mode here: 5 of 6 experts per word. The app and `strata launch` say so; the quality change is small.
 
-**`STRATA_SH_STREAM` (the shared expert on its own stream) is on by default on `gfx1151`, and on this Windows PC it is slower.** The first
-Windows guide found the same on engine 0.1.41 (+13% decode with it off). Measured again on 0.2.7 with Qwen IQ3_S, three starts each, run
-in turn (on, off, on, off, on, off), the same quick suite after every start:
+**`STRATA_SH_STREAM` (the shared expert on its own stream) is off by default on Windows `gfx1151` in 0.2.7, because it is slower there.** It stays
+on by default on Linux `gfx1151`, where it was measured to help ([STRIX_HALO.md](STRIX_HALO.md)). The first Windows guide found the Windows
+result on engine 0.1.41 (+13% decode with it off). Measured again on the 0.2.7 build as it was before this default changed (the switch was
+on), with Qwen IQ3_S, three starts each, run in turn (on, off, on, off, on, off), the same quick suite after every start:
 
 | Start | `STRATA_SH_STREAM` | Chat decode, median of 9 answers (tok/s) | 4K prompt (tok/s) |
 | --- | --- | ---: | ---: |
-| 1 | 1 (default) | 43.9 | 742.9 |
+| 1 | 1 (the default then) | 43.9 | 742.9 |
 | 2 | 0 | 48.3 | 742.9 |
 | 3 | 1 | 43.6 | 746.8 |
 | 4 | 0 | 46.0 | 740.8 |
@@ -99,9 +104,16 @@ in turn (on, off, on, off, on, off), the same quick suite after every start:
 | 6 | 0 | 46.6 | 739.4 |
 
 With the switch off, decode was 6.9% faster (46.6 against 43.6, the median of the three starts) and the code-like question 14% faster
-(67 against 59 tok/s); all three pairs went the same way. The prompt speed did not change. Setting it takes `strata launch ... --set
-STRATA_SH_STREAM=0`; it changes only the order the work runs in, so the answers stay the same. Whether Windows `gfx1151` gets this by
-default is a separate decision. This is one model, one PC and short answers; DeepSeek was not tested with it.
+(67 against 59 tok/s); all three pairs went the same way. The prompt speed did not change.
+
+The answers stay the same: on the same PC and build I ran five fixed greedy prompts (a short question, a code request, an explanation, a
+4,091-token prompt and a 16,383-token prompt; 895 generated token ids) through the engine four times, with the switch on, off, on, off. The
+token ids were identical in all four runs for every prompt.
+
+What 0.2.7 does: on Windows `gfx1151` the engine no longer turns the switch on by itself. To turn it back on, use `strata launch ...
+--set STRATA_SH_STREAM=1` (or put `STRATA_SH_STREAM=1` in the environment of an engine you start by hand); a value you set is always kept.
+`STRATA_DEFAULTS=026` brings back everything 0.2.6 did, including the switch on. This is one model, one PC and short answers; DeepSeek was
+not tested with it, and Linux `gfx1151` has not been measured against it.
 
 ## 5. Traps
 
