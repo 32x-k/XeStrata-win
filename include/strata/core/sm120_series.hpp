@@ -49,10 +49,16 @@ inline bool sm120_default(int major, int minor) { return is_sm120(major, minor) 
 // `total_bytes`: the card's memory (cudaDeviceProp::totalGlobalMem); `integrated`: a GPU that shares the PC's memory.
 constexpr double kSmallCardGiB = 13.0;   // "a 12 GB card": 12 GB cards report 11.6 - 12.0 GiB, 16 GB ones 15.6 - 16.0
 
-/// STRATA_ROUTE_PRIOR when the user set nothing: 2.0 (residency-biased routing, changes which experts run; owner-approved for 12 GB cards) on a
-/// discrete CUDA card of 13 GiB or less, 0 everywhere else.  Measured on an RTX 3060 12 GB only.
+/// The residency-bias bonus a discrete CUDA card of 13 GiB or less gets when the user set nothing: THE one place the value lives.  1.5 since the
+/// owner decision of 2026-10-26 (it was 2.0 in the first 0.2.7 candidates): on the RTX 3060 12 GB with IQ3_XXS the copy and code check found real
+/// defects at 2.0 and none in 19 tasks at 1.5 or 1.0, and 1.5 keeps the speed (story +15%, code +37% against off).  A longer 61-task check of
+/// 0 / 1.5 / 2.0 is still running; if it shows defects at 1.5 this falls back to 1.0.
+constexpr float kRoutePriorSmallCard = 1.5f;
+
+/// STRATA_ROUTE_PRIOR when the user set nothing: kRoutePriorSmallCard (residency-biased routing, changes which experts run; owner-approved for 12 GB
+/// cards) on a discrete CUDA card of 13 GiB or less, 0 everywhere else.  Measured on an RTX 3060 12 GB only.
 inline float route_prior_default(bool hip, bool integrated, double total_bytes, bool v026 = false) {
-    return !v026 && !hip && !integrated && total_bytes > 0.0 && total_bytes / 1073741824.0 <= kSmallCardGiB ? 2.0f : 0.0f;
+    return !v026 && !hip && !integrated && total_bytes > 0.0 && total_bytes / 1073741824.0 <= kSmallCardGiB ? kRoutePriorSmallCard : 0.0f;
 }
 
 /// STRATA_GR_V3 (the stream-split hyper-connection read, another summation order) when the user set nothing: ON for a discrete compute capability

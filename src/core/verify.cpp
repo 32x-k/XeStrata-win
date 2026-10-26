@@ -206,8 +206,10 @@ inline int g_side_mixer() {
 #endif
 }
 // STRATA_ROUTE_PRIOR=lambda: residency-biased routing (the top-10 picked again with a logit bonus for the resident
-// experts; route_prior.cu).  Unset: 2.0 on a DISCRETE NVIDIA card of 13 GiB or less (CUDA builds only), 0 elsewhere.
-// Measured on an RTX 3060 12 GB only (IQ3_XXS, 5 interleaved pairs: +37.6% / +35.2% decode); the owner approved the
+// experts; route_prior.cu).  Unset: 1.5 (strata::kRoutePriorSmallCard, sm120_series.hpp; it was 2.0 until the owner decision of
+// 2026-10-26: defects in the copy and code check at 2.0, none in 19 tasks at 1.5) on a DISCRETE NVIDIA card of 13 GiB or less
+// (CUDA builds only), 0 elsewhere.
+// Measured on an RTX 3060 12 GB only (IQ3_XXS, 5 interleaved pairs at 2.0: +37.6% / +35.2% decode; at 1.5 story +15%, code +37%); the owner approved the
 // quality trade for 12 GB cards (it changes which experts run).  Not a default in a HIP build (a 12 GB Radeon, or a
 // Strix Halo whose reported VRAM is a small carve-out of unified memory: unmeasured there) and not on an integrated GPU.
 // STRATA_ROUTE_PRIOR=0 turns it off, any other value wins everywhere.  The default is read from the device properties
@@ -2002,8 +2004,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
         // STRATA_ROUTE_PRIOR=lambda (changes the output): the top-10 picked again with a logit bonus for the resident
-        // experts; the weights stay the router's (route_prior.cu).  The default is g_route_prior() above: 2.0 on a
-        // discrete CUDA card of 13 GiB or less, off elsewhere (measured on an RTX 3060 12 GB: story +37.6%, code +35.2%;
+        // experts; the weights stay the router's (route_prior.cu).  The default is g_route_prior() above: 1.5 on a
+        // discrete CUDA card of 13 GiB or less, off elsewhere (measured on an RTX 3060 12 GB at 2.0: story +37.6%, code +35.2%;
         // on an RTX PRO 5000 72 GB -1.9% / -0.5%, on 2x RTX A4000 -4.2% / +11.0%, hence not a default on bigger cards).
         const float route_prior = g_route_prior();
         if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr)
