@@ -114,6 +114,9 @@ def add_parsers(sp: argparse._SubParsersAction) -> list[argparse.ArgumentParser]
                    "Main does the last steps of every answer; a helper holds part of the model")
     g.add_argument("--tune", type=_choice("a tuning mode", S.TUNE_MODES), metavar="quick|thorough|skip", help="find the fastest settings first (default: skip here; the guided screens suggest quick the first time)")
     g.add_argument("--tune-allow-small", action="store_true", help="let the tuner also try settings that can change answers very slightly")
+    g.add_argument("--dspark", type=_choice("a DSpark mode", ("on", "off", "auto", "none")), metavar="on|off|auto|none",
+                   help="DeepSeek: the DSpark drafter that guesses ahead (auto loads it only where it helps; off still loads it on some cards). "
+                        "The same as --set dspark=<word>")
     g.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                    help="an advanced engine setting or STRATA_* variable, e.g. prefill=65536 (repeat); unknown names get a warning, not a refusal")
     g.add_argument("--pool-cores", metavar="LIST",
@@ -279,6 +282,8 @@ def settings_from_args(a: argparse.Namespace, catalog=None) -> tuple[S.LaunchSet
         s.no_key = False
     if a.set:
         s.extra = {**s.extra, **S.settings_from_pairs(a.set)}
+    if a.dspark:
+        s.extra = {**s.extra, "--dspark": a.dspark}
     if a.pool_cores:
         text = a.pool_cores.replace(" ", "")
         if not re.fullmatch(r"\d+(-\d+(:\d+)?)?(,\d+(-\d+(:\d+)?)?)*", text):

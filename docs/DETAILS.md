@@ -552,7 +552,10 @@ tables per token). The scaling is fixed for the whole run, because the KV cache 
 - **Browser pages (CORS):** off by default. `"cors_origins": ["https://chat.example.com"]` lets those origins call `/v1/*`;
   `["*"]` lets any page and is only sensible with an API key. It never opens `/settings`, `/unload` or the MCP tools. It
   belongs to the engine's own server; the desktop app answers browser pages on its own API address and already allows
-  pages of any site there.
+  pages of any site there. When you share with other devices or run a tunnel, the shared address answers them too, with an
+  API key: the key decides, not the site. The browser's preflight (`OPTIONS`) is answered without a key, since a browser never
+  sends one with it; the request that follows still needs the key. Without an API key the shared address sends no CORS
+  headers, so a page of another site cannot read your model through it - only devices on your network can.
 - **Host names (DNS rebinding):** without an API key the server answers only requests whose `Host` is `localhost`, an IP
   address, the address it listens on, or (when it listens beyond this PC) this PC's name and `host.docker.internal`. Others
   get **403** naming the setting. Add a name with `"allowed_hosts": ["strata.example.com"]` or
@@ -816,7 +819,8 @@ after a change.
   transport is not supported). `"disabled": true` leaves an entry out.
 - Servers start with Strata. The server window says what each offers or why it did not start. The Monitor tab lists them, and
   Chat settings has **Use tools from MCP servers** (on by default). A server that stops later is started again at its next call.
-- In the chat each call shows as a small block. The model reads the result and goes on, up to `max_rounds` calls in a row. A tool
+- In the chat each call shows as a small block. The model reads the result and goes on, up to `max_rounds` rounds of calls (one round can hold several calls). At the limit
+  the model gets one final reply with no tools, using the results already found, so the answer is not cut off. A tool
   that fails or takes longer than `timeout_s` gives the model an `error: ...` result. Results longer than `max_result_chars` are
   cut with a note. Stop stops a running tool too.
 - Only the chat page uses them. API clients see the API exactly as before and keep their own tools. A request to

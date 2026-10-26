@@ -93,6 +93,13 @@ What the person chose is saved by `tools-settings.mjs` (inside the host's settin
 
 ## Thinking and the output budget
 
+The Harness staging script (`apps/desktop/scripts/stage-harness.mjs`) applies Strata's guarded pi-ai 1.1.0 patch to its staged copy
+(`harness-budget.mjs`, #3684): below 64K the context safety room is at most `min(4096, floor(contextWindow / 16))` and never more
+than half the estimated remaining room, so an 8K window keeps output room after a tool result instead of ending with a one-token
+cap. The caller's output cap and the one-token floor remain; windows of 64K or more keep the previous calculation. `BUNDLE.json.patches`
+records the patch identity, the dependency version and the before/after SHA-256. Unknown dependency bytes stop staging for review.
+Source and already-installed Harness copies are not changed.
+
 - A local route is reasoning-capable (`reasoning: true`) with `compat.thinkingFormat: 'chat-template'`: the request carries `chat_template_kwargs {enable_thinking, reasoning_effort}`, which the Strata server reads (a top-level `enable_thinking` is ignored by it, which is why pi-ai's `qwen` format left the model thinking). The chat's Reasoning menu travels as `thinking` in the stream body; the bridge sends it with `session/selectModel` (`reasoningEffort`) whenever the model or the level changed; a level a route does not have is dropped (never an error). API routes keep the provider default (the menu is disabled for them in the UI).
 - `localOutputBudget(context)` is 30 percent of the window, at least 4096 and at most 32768 (9,830 tokens at 32K, 19,660 at 64K). The Harness's automatic compaction reads it as the room a reply reserves. pi-ai sends the window minus the prompt. App-loaded models get `fit_max_tokens: true` so the engine clamps instead of answering 400. Sampling is not set here: the Harness sends none, so the server's own defaults apply.
 

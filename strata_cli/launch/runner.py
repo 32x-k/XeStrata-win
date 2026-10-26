@@ -489,6 +489,18 @@ def apply_experts(cfg: dict, experts: int | None) -> None:
     cfg["args"] = out + ["--experts", str(int(experts))]
 
 
+_SETUP_LOG_NAME = re.compile(r"^strata-[A-Za-z0-9_.-]+\.log$")
+
+
+def own_log_path(base: dict) -> str | None:
+    """The log path a person wrote into the model's config themselves (#3656): setup names its own `strata-<model>.log`, so any other
+    name is theirs and a launch keeps it instead of writing its per-profile log file."""
+    value = base.get("log")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return None if _SETUP_LOG_NAME.match(Path(value.replace("\\", "/")).name) else value
+
+
 def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str], log: str | None = None, gpus: "list[int] | dict | None" = None,
                   experts: int | None = None) -> dict:
     """The private run config of this launch: the installed one plus the choices that are not setup's (host, port, key, cards, advanced)."""
@@ -508,7 +520,7 @@ def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str]
     cfg["open_browser"] = False                              # strata launch never opens a browser by itself (only `--open` does, after the start)
     if isinstance(cfg.get("args"), list):
         cfg["args"] = [a for a in cfg["args"] if a != "--open"]
-    if log:
+    if log and not own_log_path(base):
         cfg["log"] = log
     apply_cards(cfg, gpus)
     from strata_control import drafting as _drafting
@@ -1060,7 +1072,7 @@ class Runner:
         s, cat = self.s, self.catalog
         data = Path(s.data_dir) if s.data_dir else (self.existing_data_dir() or cat.data_dir())
         models_dir = data / "models"
-        job = {"folder": str(models_dir / cat.tag_of(s.family, s.model)),
+        job = {"folder": str(cat.model_folder(data, s.family, s.model)),
                "total_gb": float(next((r.download_gb for r in cat.rows() if r.family == s.family and r.model == s.model), 0) or 0)}
         try:
             setup_module = cat.strata.setup_module()
