@@ -621,7 +621,7 @@ std::vector<uint8_t> HunyuanImage3Pipeline::generate(const QiRequest& r, QiTimes
     using clock = std::chrono::steady_clock;
     const bool mask = !r.mask.rgba.empty();
     const QiRef* base = base_image(r);
-    if ((mask || r.strength < 1.0f) && base == nullptr)
+    if ((mask || r.strength < 1.0) && base == nullptr)
         throw std::invalid_argument("image engine: a mask or a strength below 1 needs a base image (an init image or "
                                     "a reference)");
     if (mask && r.mask.rgba.size() != (size_t) (r.mask.width * r.mask.height * 4))
@@ -693,7 +693,7 @@ std::vector<uint8_t> HunyuanImage3Pipeline::generate(const QiRequest& r, QiTimes
     // img2img: from the base image's latent on the flow's path at the first sigma; a mask: the positions it keeps
     // follow that path after each step (img_start.hpp, here on the host latent [32][th][tw])
     const std::vector<float> noise = base != nullptr ? lat : std::vector<float>();
-    if (base != nullptr && r.strength < 1.0f)
+    if (base != nullptr && r.strength < 1.0)
         for (size_t i = 0; i < (size_t) n_lat; ++i) lat[i] = (1.f - sigmas[0]) * z0[i] + sigmas[0] * noise[i];
     std::vector<uint8_t> mask_px;
     std::vector<float> m;

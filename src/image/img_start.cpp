@@ -17,14 +17,14 @@ namespace gpu = strata::gpu;
 
 const QiRef* base_image(const QiRequest& r) {
     if (!r.init.rgba.empty()) return &r.init;
-    if ((r.strength < 1.0f || !r.mask.rgba.empty()) && !r.refs.empty()) return &r.refs[0];
+    if ((r.strength < 1.0 || !r.mask.rgba.empty()) && !r.refs.empty()) return &r.refs[0];
     return nullptr;
 }
 
-int64_t strength_skip(int64_t steps, float strength) {
-    if (!(strength > 0.0f && strength <= 1.0f))
+int64_t strength_skip(int64_t steps, double strength) {
+    if (!(strength > 0.0 && strength <= 1.0))
         throw std::invalid_argument("image engine: the strength must be above 0 and at most 1");
-    const double run = std::min((double) steps * (double) strength, (double) steps);
+    const double run = std::min((double) steps * strength, (double) steps);
     const auto skip = (int64_t) std::max((double) steps - run, 0.0);
     if (skip >= steps)
         throw std::invalid_argument("image engine: a strength of " + std::to_string(strength) + " runs none of the " +
@@ -32,8 +32,8 @@ int64_t strength_skip(int64_t steps, float strength) {
     return skip;
 }
 
-std::vector<float> strength_sigmas(const std::vector<float>& sigmas, float strength) {
-    if (strength >= 1.0f || sigmas.size() < 2) return sigmas;
+std::vector<float> strength_sigmas(const std::vector<float>& sigmas, double strength) {
+    if (strength >= 1.0 || sigmas.size() < 2) return sigmas;
     const int64_t skip = strength_skip((int64_t) sigmas.size() - 1, strength);
     return std::vector<float>(sigmas.begin() + skip, sigmas.end());
 }

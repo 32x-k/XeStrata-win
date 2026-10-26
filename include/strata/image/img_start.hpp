@@ -27,10 +27,10 @@ const QiRef* base_image(const QiRequest& r);
 
 /// The steps of an n-step schedule that a strength skips (diffusers' get_timesteps: n less n strength, floored).
 /// Throws std::invalid_argument when the strength is outside (0, 1] or would leave no step to run.
-int64_t strength_skip(int64_t steps, float strength);
+int64_t strength_skip(int64_t steps, double strength);
 
 /// The schedule `sigmas` (n steps and the terminal 0) as the strength runs it: the sigmas from the first step it runs.
-std::vector<float> strength_sigmas(const std::vector<float>& sigmas, float strength);
+std::vector<float> strength_sigmas(const std::vector<float>& sigmas, double strength);
 
 /// RGBA8 [H][W][4] of `f` at W x H, nearest (the base image and the mask as the pipelines take them).
 std::vector<uint8_t> resize_nearest(const QiRef& f, int64_t W, int64_t H);

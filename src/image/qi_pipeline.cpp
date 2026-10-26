@@ -345,7 +345,7 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     } free_z{ref_z};
     const bool mask = !r.mask.rgba.empty();
     const QiRef* base = base_image(r);
-    if ((mask || r.strength < 1.0f) && base == nullptr)
+    if ((mask || r.strength < 1.0) && base == nullptr)
         throw std::invalid_argument("image engine: a mask or a strength below 1 needs a base image (an init image or "
                                     "a reference)");
     if (mask && r.mask.rgba.size() != (size_t) (r.mask.width * r.mask.height * 4))
@@ -418,7 +418,7 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     }
     try {
         gpu::copy(x, noise.data(), (size_t) n * 4);
-        if (r.strength < 1.0f) ls.start(x, sigmas[0], s_);   // img2img: from the base image's latent at that time
+        if (r.strength < 1.0) ls.start(x, sigmas[0], s_);   // img2img: from the base image's latent at that time
         if (stage) stage("sampling");
         dit_->sample(x, h, w, sigmas, step, ls.after(s_), guided ? r.cfg : 1.0f);
         dit_->drop_host_prefix();

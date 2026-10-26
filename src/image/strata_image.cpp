@@ -121,7 +121,7 @@ std::vector<si::QiRef> read_refs(std::istringstream& ls, si::QiRequest& r) {
         if (word.rfind("SIGMAS:", 0) == 0) r.sigmas = parse_sigmas(word.substr(7));
         else if (word.rfind("MASK:", 0) == 0) r.mask = read_image(word.substr(5));
         else if (word.rfind("INIT:", 0) == 0) r.init = read_image(word.substr(5));
-        else if (word.rfind("STRENGTH:", 0) == 0) r.strength = std::stof(word.substr(9));
+        else if (word.rfind("STRENGTH:", 0) == 0) r.strength = std::stod(word.substr(9));
         else if (word.rfind("NEG:", 0) == 0) r.neg_ids = parse_ids(word.substr(4));
         else if (word.rfind("CFG:", 0) == 0) r.cfg = std::stof(word.substr(4));
         else if (word.rfind("GUID:", 0) == 0) r.guidance = std::stof(word.substr(5));
@@ -357,7 +357,7 @@ int main(int argc, char** argv) {
             else if (a == "--ref") ref_paths.push_back(val());
             else if (a == "--mask") r.mask = read_image(val());
             else if (a == "--init") r.init = read_image(val());
-            else if (a == "--strength") r.strength = std::stof(val());
+            else if (a == "--strength") r.strength = std::stod(val());
             else if (a == "--neg-ids") r.neg_ids = parse_ids(val());
             else if (a == "--cfg") r.cfg = std::stof(val());
             else if (a == "--out") out = val();
