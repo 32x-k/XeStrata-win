@@ -2673,8 +2673,7 @@ struct Model::Impl {
                 if (slab_auto_grew_) {   // the automatic slab did not fit: the 0.2.6 slab first, the chunk only if that does not fit either
                     slab_auto_grew_ = false;
                     slab_force_base_ = true;
-                    std::fprintf(stderr, "ds4: the automatic attention slab did not fit (%s): trying the 256-row slab
-", aerr.c_str());
+                    std::fprintf(stderr, "ds4: the automatic attention slab did not fit (%s): trying the 256-row slab\n", aerr.c_str());
                     aerr.clear();
                     continue;
                 }
@@ -3008,8 +3007,7 @@ struct Model::Impl {
                 if (env < 0 && c.A > base) {
                     slab_auto_grew_ = true;
                     if (di == 0 && o.verbose)
-                        std::fprintf(stderr, "ds4: attention slab %d rows (automatic: %.1f GB of VRAM to spare beyond the experts; DS4_ATTN_SLAB=0 keeps %d)
-",
+                        std::fprintf(stderr, "ds4: attention slab %d rows (automatic: %.1f GB of VRAM to spare beyond the experts; DS4_ATTN_SLAB=0 keeps %d)\n",
                                      c.A, spare / 1e9, base);
                 }
             }
