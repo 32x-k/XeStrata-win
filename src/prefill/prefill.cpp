@@ -5316,7 +5316,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                      "the first %lld positions of this prompt; a follow-up turn that continues from "
                                      "this state reads its new tokens exactly on top of them (nothing is approximated "
                                      "twice); STRATA_KVA=0 reads every prompt exactly\n",
-                             (long long) kva_split, (long long) kva_frontier);
+                             (long long) kva_split, (long long) kva_positions);
         }
     } else if (kva.on && (kva.explicit_on || (n >= kva.min_prompt && !kva_routine && kva_eng.blocked.empty()))) {
         // KVA-8 (observability): a run that was configured for KVA but fell back completely must say so and why,
