@@ -19,8 +19,12 @@ R9700 = [{"name": "Radeon AI PRO R9700", "vram_gb": 32.0}]
 
 
 class StrixChunkArgs(unittest.TestCase):
-    def test_a_128_gb_unified_pc_gets_the_big_chunk(self):
-        self.assertEqual(setup.dsv41_prefill_chunk_args(HALO, 63.6), ["--prefill-chunk", "8192"])
+    def test_a_128_gb_unified_pc_gets_the_16k_chunk(self):
+        # (2026-10-26, the same box: 16K prompt 152.2 -> 158.6 tok/s, 32K 174.0 -> 179.7, 8K flat, decode unchanged)
+        self.assertEqual(setup.dsv41_prefill_chunk_args(HALO, 63.6), ["--prefill-chunk", "16384"])
+
+    def test_a_96_gb_pool_is_the_line(self):
+        self.assertEqual(setup.dsv41_prefill_chunk_args(HALO, 31.0), ["--prefill-chunk", "8192"])
 
     def test_a_64_gb_unified_pc_keeps_the_engines_choice(self):
         self.assertEqual(setup.dsv41_prefill_chunk_args(SMALL_HALO, 31.6), [])

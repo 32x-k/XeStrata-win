@@ -8025,7 +8025,12 @@ def dsv41_prefill_chunk_args(cards, ram_gb) -> list:
     4K prompt 78.7 -> 87.2 tok/s, 8K 108.9 -> 125.1, 32K 155.2 -> 176.9; decode unchanged (16.53 -> 16.59 tok/s), because the
     chunk buffers take ~5 GB from the GPU expert tier and the RAM store's hit rate rises to compensate.  The prompt chunk's
     summation order changes, not the model: the repo's chunk-size KL check (1024 0.1705 / 2048 0.1692 / 4096 0.1688 / 8192 0.1695)
-    shows no quality move.  Only where the shared pool has room; STRATA_DSV41_NO_BIG_CHUNK=1 leaves the engine's own choice."""
+    shows no quality move.  Only where the shared pool has room; STRATA_DSV41_NO_BIG_CHUNK=1 leaves the engine's own choice.
+
+    A 16,384-token chunk on the 128 GB box (2026-10-26, engine 0.1.51, the same set, 1-2 runs a point): 8K 119.8 -> 119.4 (nothing,
+    the set is read once a chunk either way), 16K 152.2 -> 158.6 (+4.2%), 32K 174.0 -> 179.7 (+3.3%), decode 17.21 -> 17.27
+    (2+2 interleaved, unchanged) although the bigger chunk moves ~30% more experts to the CPU lane.  So a pool that holds this
+    box's 128 GB takes 16,384; a smaller unified PC keeps 8,192 (not measured below this box)."""
     if not cards or not any(c.get("uma") for c in cards):
         return []
     pool = float(ram_gb or 0) + max([float(c.get('dedicated_gb') or 0.0) for c in cards] or [0.0])
@@ -8033,7 +8038,7 @@ def dsv41_prefill_chunk_args(cards, ram_gb) -> list:
         return []
     if os.environ.get("STRATA_DSV41_NO_BIG_CHUNK") == "1":
         return []
-    return ["--prefill-chunk", "8192"]
+    return ["--prefill-chunk", "16384" if pool >= 96.0 else "8192"]
 
 
 def dsv41_config_env(cards) -> dict:
