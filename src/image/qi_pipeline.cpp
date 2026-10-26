@@ -374,27 +374,24 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     if (guided && n_neg_ctx <= 0) throw std::invalid_argument("image engine: no negative prompt after the system turn");
     const int64_t n_neg_pre = guided ? n_neg_ctx + (n_pre - n_ctx) : 0;
     QiPlan p = plan(n_pre + h * w, h, w, (int64_t) std::max(all_ids.size(), neg_all.size()), n_neg_pre);
-    if (!r.refs.empty()) {   // the references' states are not kept: another edit has other images
-        last_states_ = te_->encode(all_ids, te_images);
+    // the text states, kept for the same prompt and the same references (an edit again with another seed)
+    const std::string refs = refs_key(r.refs);
+    if (all_ids != last_ids_ || refs != last_refs_) {
+        last_states_ = r.refs.empty() ? te_->encode(r.ids) : te_->encode(all_ids, te_images);
         te_->drop_activations();
-        last_ids_.clear();
-    } else if (r.ids != last_ids_) {
-        last_states_ = te_->encode(r.ids);
-        te_->drop_activations();
-        last_ids_ = r.ids;
+        last_ids_ = all_ids;
+        last_refs_ = refs;
     } else {
         p.text_cached = true;
     }
     const int64_t C = te_->hidden();
     for (QiDit::Ref& f : dit_refs) f.slot -= r.drop;
     dit_->set_context(last_states_.data() + r.drop * C, n_ctx, dit_refs);
-    if (guided) {   // the negative prompt's states (kept for the same ids again when there are no references)
-        if (!r.refs.empty()) {
-            last_neg_states_ = te_->encode(neg_all, neg_te);
-            last_neg_ids_.clear();
-        } else if (r.neg_ids != last_neg_ids_) {
-            last_neg_states_ = te_->encode(r.neg_ids);
-            last_neg_ids_ = r.neg_ids;
+    if (guided) {   // the negative prompt's states (kept as the prompt's are; its references are the prompt's)
+        if (neg_all != last_neg_ids_ || refs != last_neg_refs_) {
+            last_neg_states_ = r.refs.empty() ? te_->encode(r.neg_ids) : te_->encode(neg_all, neg_te);
+            last_neg_ids_ = neg_all;
+            last_neg_refs_ = refs;
         }
         te_->drop_activations();
         for (QiDit::Ref& f : neg_refs) f.slot -= r.drop;

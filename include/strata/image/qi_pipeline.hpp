@@ -99,6 +99,9 @@ private:
     std::vector<float> last_neg_states_;   // the last negative prompt's states (guidance), for the same ids again
     std::vector<int32_t> last_neg_ids_;   // the last prompt, and its text states (host)
     std::vector<float> last_states_;
+    /// The references the last states read (img_start.hpp's refs_key; empty, none): an edit's states are kept for the
+    /// same prompt and the same references, as a generation's for the same prompt
+    std::string last_refs_, last_neg_refs_;
 };
 
 }  // namespace strata::image
