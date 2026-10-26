@@ -4331,8 +4331,19 @@ struct Model::Impl {
         // (Windows: the copies are committed memory, within what its commit still has beside the other programs' margin)
         // DS4_COPY_HUGETLB: the arena comes from the kernel's huge-page pool, which MemAvailable does not count: add
         // its free bytes so the full copy is taken when the pool holds it.
-        static const bool huge_arena = std::getenv("DS4_COPY_HUGETLB") != nullptr && std::atoi(std::getenv("DS4_COPY_HUGETLB")) != 0;
-        const double pool = huge_arena ? (double) os::huge_free_bytes() : 0.0;
+        // 0.2.7: DS4_COPY_HUGETLB unset = ON when the reserved pool already holds the whole copy (HugePages_Free), else the
+        // ordinary arena exactly as before; =0 is the off switch, =1 asks for it anyway (a smaller pool is used, the rest warns).
+        const uint64_t pool_free = os::huge_free_bytes();
+        const bool huge_arena = [&] {
+            const char* e = std::getenv("DS4_COPY_HUGETLB");
+            if (e != nullptr) return std::atoi(e) != 0;
+            return pool_free > 0 && (double) pool_free >= all;
+        }();
+        if (huge_arena && std::getenv("DS4_COPY_HUGETLB") == nullptr)
+            std::fprintf(stderr, "ds4: the reserved huge-page pool (%.1f GB free) holds the whole copy (%.1f GB): the arena on 2 MB pages "
+                                 "(DS4_COPY_HUGETLB=0 keeps the ordinary arena)\n", (double) pool_free / 1e9, all / 1e9);
+        bool arena_all_huge = huge_arena;   // (every chunk really from the pool: the pin below needs that)
+        const double pool = huge_arena ? (double) pool_free : 0.0;
         const double can = std::min(avail == ~uint64_t{0} ? 1e300 : std::max(0.0, (double) avail - (double) kRamMargin) + pool,
                                     commit_room());
         // (auto: none - copies that all fit were measured no faster than the page cache: the CPU lane's rows are
@@ -4395,7 +4406,7 @@ struct Model::Impl {
             // DS4_COPY_HUGETLB=1: the arena on explicit 2 MB pages (the pool must be reserved), so a pin of it keeps
             // 2 MB pages and the prompt's DMA reads stay stable (a THP arena pinned by cudaHostRegister runs in 4 KB
             // pages: measured 11.9 s one prompt, 30.4 s the next for the same 140 GB)
-            static const bool huge = std::getenv("DS4_COPY_HUGETLB") != nullptr && std::atoi(std::getenv("DS4_COPY_HUGETLB")) != 0;
+            const bool huge = huge_arena;
             bool ok = true;
             for (int X = 0; X < NH && ok; ++X) {
                 size_t got = bytes;
@@ -4403,10 +4414,11 @@ struct Model::Impl {
                 if (huge && base[(size_t) X] == nullptr) {   // no pool on this machine: the ordinary arena instead
                     static bool warned = false;
                     if (!warned) {
-                        std::fprintf(stderr, "ds4: DS4_COPY_HUGETLB=1 but no 2 MB huge pages are free (reserve them: sysctl "
+                        std::fprintf(stderr, "ds4: the 2 MB huge-page arena was asked for but the pool ran out (reserve more: sysctl "
                                              "vm.nr_hugepages=N); using the ordinary arena\n");
                         warned = true;
                     }
+                    arena_all_huge = false;
                     got = bytes;
                     base[(size_t) X] = (uint8_t*) node_map(bytes, X, NH);
                 }
@@ -4484,7 +4496,11 @@ struct Model::Impl {
         // staging, where the RAM-to-staging and DMA probes are 24 and 28 GB/s).  The CPU lane reads the same memory, and
         // pinned 4 KB pages can cost its TLB (an earlier registration measured -15% decode), so this stays opt-in.
         // DS4_COPY_PIN_RO=1: cudaHostRegisterReadOnly (the GPU only reads it).
-        if (const char* cp = std::getenv("DS4_COPY_PIN"); cp != nullptr && std::atoi(cp) != 0) {
+        // 0.2.7: DS4_COPY_PIN unset = ON only when the whole arena is on explicit 2 MB pages (a pin of a THP arena registers 4 KB
+        // pages and the DMA rate was erratic: 11.9 s one prompt, 30.4 s the next); =0 is the off switch, =1 pins any arena.
+        const char* cp = std::getenv("DS4_COPY_PIN");
+        const bool pin_copies = cp != nullptr ? std::atoi(cp) != 0 : (arena_all_huge && !ram_chunks.empty());
+        if (pin_copies) {
             const bool ro = std::getenv("DS4_COPY_PIN_RO") != nullptr && std::atoi(std::getenv("DS4_COPY_PIN_RO")) != 0;
             const double tr = now_ms();
             bool ok = true;
