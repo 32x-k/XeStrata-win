@@ -2720,8 +2720,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     const int64_t kva_suffix = kva.effective_suffix();
     bool kva_routine = false;
     const char* kva_why_not = kva.decline(kva_eng, pos0, n, LB, LE < 0 ? -1 : LE, (int64_t) g.n_layers,
-                                          embd_rows != nullptr, !tap_layers_.empty(), &kva_routine,
-                                          g.n_layers != 48 || g.n_expert != 512);
+                                          embd_rows != nullptr, !tap_layers_.empty(), &kva_routine);
+    if (kva_why_not == nullptr && (g.n_layers != 48 || g.n_expert != 512)) {
+        // the split layer and the tail were measured on one geometry; STRATA_KVA=1 is the user's call, but say so once
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            std::fprintf(stderr, "strata prefill: WARNING: KVA was only validated on Qwen3.8-Flash-Next (48 layers, 512 "
+                                 "experts); this model has %lld layers and %lld experts\n", (long long) g.n_layers,
+                         (long long) g.n_expert);
+    }
     const bool kva_run = kva_why_not == nullptr;
     const int64_t kva_split = std::min<int64_t>(std::max<int64_t>(kva.split, 1), g.n_layers);
     const int64_t kva_frontier = std::max<int64_t>(0, n - kva_suffix);
@@ -5312,9 +5319,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
     } else if (kva.on && (kva.explicit_on || (n >= kva.min_prompt && !kva_routine && kva_eng.blocked.empty()))) {
         // KVA-8 (observability): a run that was configured for KVA but fell back completely must say so and why,
-        // or an operator cannot tell it apart from a run where the feature was never asked for.  With KVA on by
-        // default only a long prompt that was turned away for an unusual reason is worth a line (STRATA_KVA=1 asks
-        // for every reason).
+        // or an operator cannot tell it apart from a run where the feature was never asked for.  (KVA only runs
+        // when STRATA_KVA=1 asked for it, so every reason is worth a line.)
         std::fprintf(stderr, "strata prefill: KVA configured but NOT applied: %s (prompt %lld positions, "
                              "min_prompt %lld, suffix %lld, split %lld)\n",
                      kva_why_not != nullptr ? kva_why_not : "not applicable", (long long) n, (long long) kva.min_prompt,

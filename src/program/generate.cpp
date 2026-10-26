@@ -5509,7 +5509,7 @@ int main(int argc, char** argv) {
     // slots' draft-KV copies use this one too
     static const strata::core::ModelGeometry draft_geometry{};
     std::vector<std::unique_ptr<strata::core::MtpDrafter>> slot_mtp;
-    // KVA (0.2.7: on by default, STRATA_KVA=0 is the exact 0.2.6 path): what only the engine knows.  A layer split and
+    // KVA (0.2.7: opt-in with STRATA_KVA=1; unset is the exact 0.2.6 path): what only the engine knows.  A layer split and
     // the batch slots read their prompts in pieces and in stages, which the one-device, one-cold-read rule of the
     // approximate prompt read cannot follow, so they stay on the exact path (and say so here, once).  The draft layer
     // (MTP) keeps its window, whatever it is: a session KVA approximated tells it the first cell built from a real row

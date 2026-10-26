@@ -37,30 +37,34 @@ static void clear_all() {
 static bool is(const char* got, const char* want) { return got != nullptr && std::strcmp(got, want) == 0; }
 
 int main() {
-    // ---- the switch: on by default, STRATA_KVA=0 off, anything else on and chatty
+    // ---- the switch: off unless STRATA_KVA=1 (0.2.7 ships KVA opt-in; unset is the exact 0.2.6 engine)
     clear_all();
     {
         const KvaConfig c = kva_config_from_env();
-        CHECK(c.on && !c.explicit_on);
+        CHECK(!c.on && !c.explicit_on);                                      // unset: off
         CHECK(c.split == 24 && c.min_prompt == 4096 && c.suffix_env == 0);
         CHECK(c.mode == KvaConfig::Mode::Identity && c.only == KvaConfig::Only::All && !c.capture);
+        KvaEngine eng;
+        CHECK(!c.wants_cell_floor(eng, true));
+        CHECK(is(c.decline(eng, 0, 30000, 0, -1, 48), "off (STRATA_KVA is not 1)"));   // a 30K cold prompt is read exactly
     }
     put("STRATA_KVA", "0");
     { const KvaConfig c = kva_config_from_env(); CHECK(!c.on && !c.explicit_on); }
     put("STRATA_KVA", "1");
     { const KvaConfig c = kva_config_from_env(); CHECK(c.on && c.explicit_on); }
     put("STRATA_KVA", "");   // an empty value is "not set"
-    { const KvaConfig c = kva_config_from_env(); CHECK(c.on && !c.explicit_on); }
+    { const KvaConfig c = kva_config_from_env(); CHECK(!c.on && !c.explicit_on); }
     clear_all();
+    put("STRATA_KVA", "1");   // everything below runs with KVA switched on
 
-    // ---- the tail: 2048, or STRATA_KVA_SUFFIX; the draft window plays no part (the cell floor protects the draft layer)
+    // ---- the tail: 8192 when switched on (the safest configuration measured), or STRATA_KVA_SUFFIX
     {
         const KvaConfig c = kva_config_from_env();
-        CHECK(c.effective_suffix() == kKvaSuffixDefault && kKvaSuffixDefault == 2048);
+        CHECK(c.on && c.effective_suffix() == kKvaSuffixDefault && kKvaSuffixDefault == 8192);
         put("STRATA_KVA_SUFFIX", "3000");
         const KvaConfig e = kva_config_from_env();
         CHECK(e.effective_suffix() == 3000);
-        clear_all();
+        unset("STRATA_KVA_SUFFIX");
     }
 
     // ---- who is turned away, and why (the first reason that holds is the one named)
@@ -68,42 +72,33 @@ int main() {
         const KvaConfig c = kva_config_from_env();
         KvaEngine eng;
         bool routine = false;
-        // a cold 14.6K prompt on one device: applies
+        // a cold 14.6K prompt on one device: applies (14600 > 8192 + 64)
         CHECK(c.decline(eng, 0, 14600, 0, -1, 48) == nullptr);
         CHECK(c.decline(eng, 0, 14600, 0, 48, 48) == nullptr);   // le == n_layers is the whole trunk too
         // a continuation (turn 2 of a chat, a resumed prompt): routine
         CHECK(is(c.decline(eng, 9000, 14600, 0, -1, 48, false, false, &routine), "a continuation read (pos0 != 0)") && routine);
-        // short prompts and a prompt the tail would swallow: routine
+        // short prompts and a prompt the 8192-token tail would swallow: routine
         CHECK(is(c.decline(eng, 0, 3000, 0, -1, 48, false, false, &routine), "the prompt is shorter than STRATA_KVA_MIN_PROMPT") && routine);
-        CHECK(c.decline(eng, 0, 4096, 0, -1, 48) == nullptr);   // 4096 > 2112 + 64: it applies
-        put("STRATA_KVA_SUFFIX", "5000");
-        { const KvaConfig s = kva_config_from_env();
-          CHECK(is(s.decline(eng, 0, 5000, 0, -1, 48, false, false, &routine), "the suffix leaves too few positions to approximate") && routine); }
-        clear_all();
+        CHECK(is(c.decline(eng, 0, 8256, 0, -1, 48, false, false, &routine), "the suffix leaves too few positions to approximate") && routine);
+        CHECK(c.decline(eng, 0, 8257, 0, -1, 48) == nullptr);
+        put("STRATA_KVA_SUFFIX", "2048");
+        { const KvaConfig s = kva_config_from_env(); CHECK(s.decline(eng, 0, 4096, 0, -1, 48) == nullptr); }
+        unset("STRATA_KVA_SUFFIX");
         // not routine: the user may want to know
         CHECK(is(c.decline(eng, 0, 14600, 24, -1, 48, false, false, &routine), "a layer split (not the whole trunk)") && !routine);
         CHECK(is(c.decline(eng, 0, 14600, 0, 24, 48), "a layer split (not the whole trunk)"));
         CHECK(is(c.decline(eng, 0, 14600, 0, -1, 48, true), "a prompt with pictures"));
         CHECK(is(c.decline(eng, 0, 14600, 0, -1, 48, false, true), "the DFlash2 drafter reads the late layers' hidden states"));
-        // a model the split and the tail were not measured on reads exactly unless STRATA_KVA=1 asks
-        CHECK(is(c.decline(eng, 0, 14600, 0, -1, 40, false, false, &routine, true),
-                 "KVA was not validated for this model (STRATA_KVA=1 forces it)") && !routine);
-        put("STRATA_KVA", "1");
-        { const KvaConfig f = kva_config_from_env(); CHECK(f.decline(eng, 0, 14600, 0, -1, 40, false, false, nullptr, true) == nullptr); }
-        clear_all();
-        // no draft layer at all: nothing to cover
         // the engine rules the whole process out (batch slots, a layer split, a peer device)
         KvaEngine blocked = eng;
         blocked.blocked = "batch slots (--batch)";
         CHECK(is(c.decline(blocked, 0, 14600, 0, -1, 48, false, false, &routine), "batch slots (--batch)") && !routine);
-        // off wins over everything, capture over the rest
-        put("STRATA_KVA", "0");
-        { const KvaConfig o = kva_config_from_env(); CHECK(is(o.decline(eng, 0, 14600, 0, -1, 48), "off (STRATA_KVA=0)")); }
-        put("STRATA_KVA", "1");
+        // capture wins over the rest
         put("STRATA_KVA_CAPTURE", "/tmp/kva-cap");
         { const KvaConfig o = kva_config_from_env(); CHECK(o.capture && is(o.decline(eng, 0, 14600, 0, -1, 48), "capture mode")); }
-        clear_all();
+        unset("STRATA_KVA_CAPTURE");
     }
+    clear_all();
 
     // ---- the research modes still parse
     put("STRATA_KVA_ORACLE", "/tmp/o");
@@ -133,8 +128,9 @@ int main() {
     // (1) by default the draft layer is 0.2.6's own code; the cell floor is a research option, wired only when asked
     {
         KvaEngine eng;
+        put("STRATA_KVA", "1");
         const KvaConfig on = kva_config_from_env();
-        CHECK(!on.draft_floor && !on.wants_cell_floor(eng, true));
+        CHECK(on.on && !on.draft_floor && !on.wants_cell_floor(eng, true));
         put("STRATA_KVA_DRAFT_FLOOR", "1");
         const KvaConfig fl = kva_config_from_env();
         CHECK(fl.draft_floor && fl.wants_cell_floor(eng, true));

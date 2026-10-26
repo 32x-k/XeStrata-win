@@ -1,4 +1,4 @@
-// include/strata/prefill/kva.hpp - STRATA_KVA: the approximate late-layer prompt read (on by default since 0.2.7).
+// include/strata/prefill/kva.hpp - STRATA_KVA: the approximate late-layer prompt read (opt-in since 0.2.7).
 //
 // After layer `split` the prompt's late layers need only their recurrent state (GDN recurrence + conv history)
 // and their KV/indexer caches; the attention output, the output projection, the MoE half and its expert
@@ -14,8 +14,10 @@
 //   oracle    a captured real input per late layer (STRATA_KVA_ORACLE=<dir>; the plumbing/parity mode),
 //   linear    a fitted low-rank projector (STRATA_KVA_PROJECTOR=<file>; not implemented in this step).
 //
-// 0.2.7: the read is ON by default for a cold prompt of STRATA_KVA_MIN_PROMPT tokens or more on one CUDA/HIP
-// device.  STRATA_KVA=0 brings back the exact 0.2.6 prompt path and the 0.2.6 draft window.  Everything is read from
+// 0.2.7: the read is OFF unless STRATA_KVA=1 is set (the quality runs found lost records and invented rows in long
+// extraction and agent tasks, docs/KVA.md).  Unset, nothing here runs and the engine is 0.2.6's.  Switched on, it applies
+// to a cold prompt of STRATA_KVA_MIN_PROMPT tokens or more on one CUDA/HIP device, with an 8192-token exact tail
+// (the safest configuration measured).  Everything is read from
 // the environment once per process.
 //
 // What the engine tells this header at start-up (kva_engine()): whether its configuration rules the read out for the
@@ -47,7 +49,7 @@ inline constexpr bool kKvaBackend = true;
 #endif
 
 /// The fully computed tail of every approximated read.
-inline constexpr int64_t kKvaSuffixDefault = 2048;
+inline constexpr int64_t kKvaSuffixDefault = 8192;
 
 /// What the running engine knows and the environment cannot say.
 struct KvaEngine {
@@ -67,7 +69,7 @@ struct KvaConfig {
     /// the MoE half and its expert transfers.
     enum class Skip { StateOnly, Moe };
 
-    bool on = true;              ///< on unless STRATA_KVA=0 (or this build has no path)
+    bool on = false;             ///< STRATA_KVA=1 (and this build has a path); unset or 0: off
     bool explicit_on = false;    ///< STRATA_KVA was set to something other than 0: every declined read says why
     bool capture = false;        ///< STRATA_KVA_CAPTURE=<dir>: dump every late layer's real input rows
     bool capture_fp32 = false;   ///< STRATA_KVA_CAPTURE_FP32=1: fp32 records (else bf16; fp32 is for parity runs)
@@ -84,7 +86,7 @@ struct KvaConfig {
     std::string capture_dir;     ///< STRATA_KVA_CAPTURE
     std::string projector;       ///< STRATA_KVA_PROJECTOR
 
-    /// The fully computed tail of a read: STRATA_KVA_SUFFIX when set, otherwise 2048.
+    /// The fully computed tail of a read: STRATA_KVA_SUFFIX when set, otherwise 8192.
     int64_t effective_suffix() const { return suffix_env > 0 ? suffix_env : kKvaSuffixDefault; }
 
     /// Does the draft layer need the cell floor at all?  Only when a read can approximate something: KVA on, not ruled
@@ -96,17 +98,13 @@ struct KvaConfig {
     /// Why this read cannot take the approximate path, or nullptr when it can: a cold read of one prompt (not a
     /// continuation, no layer split, no pictures, no DFlash2 taps), on an engine that allows it, long enough for a
     /// suffix to leave approximated positions behind it.  `routine` (optional) is set when the reason is an
-    /// everyday one (a continuation, a short prompt) that an engine running KVA by default does not log.
+    /// everyday one (a continuation, a short prompt) that is not worth a log line.
     const char* decline(const KvaEngine& e, int64_t pos0, int64_t n, int64_t lb, int64_t le, int64_t n_layers,
-                        bool pictures = false, bool taps = false, bool* routine = nullptr,
-                        bool unvalidated_model = false) const {
+                        bool pictures = false, bool taps = false, bool* routine = nullptr) const {
         if (routine) *routine = false;
-        if (!on) return "off (STRATA_KVA=0)";
+        if (!on) return "off (STRATA_KVA is not 1)";
         if (capture) return "capture mode";
         if (!e.blocked.empty()) return e.blocked.c_str();
-        // The split layer, the state-only layers and the suffix rule were measured on one geometry (Qwen3.8-Flash-Next,
-        // 48 layers, 512 experts).  Another model reads exactly unless STRATA_KVA=1 asks for it.
-        if (unvalidated_model && !explicit_on) return "KVA was not validated for this model (STRATA_KVA=1 forces it)";
         if (pos0 != 0) {
             if (routine) *routine = true;
             return "a continuation read (pos0 != 0)";
@@ -143,8 +141,8 @@ inline KvaConfig kva_config_from_env() {
     KvaConfig k;
     const char* sw = std::getenv("STRATA_KVA");
     const bool set = sw != nullptr && *sw != '\0';
-    k.on = !set || sw[0] != '0';
-    k.explicit_on = set && sw[0] != '0';
+    k.on = set && sw[0] != '0';
+    k.explicit_on = k.on;
     if (!kKvaBackend) k.on = false;
     k.split = kva_env_i64("STRATA_KVA_SPLIT", 24);
     k.suffix_env = std::max<int64_t>(0, kva_env_i64("STRATA_KVA_SUFFIX", 0));
