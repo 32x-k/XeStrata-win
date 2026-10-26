@@ -552,7 +552,10 @@ tables per token). The scaling is fixed for the whole run, because the KV cache 
 - **Browser pages (CORS):** off by default. `"cors_origins": ["https://chat.example.com"]` lets those origins call `/v1/*`;
   `["*"]` lets any page and is only sensible with an API key. It never opens `/settings`, `/unload` or the MCP tools. It
   belongs to the engine's own server; the desktop app answers browser pages on its own API address and already allows
-  pages of any site there.
+  pages of any site there. When you share with other devices or run a tunnel, the shared address answers them too, with an
+  API key: the key decides, not the site. The browser's preflight (`OPTIONS`) is answered without a key, since a browser never
+  sends one with it; the request that follows still needs the key. Without an API key the shared address sends no CORS
+  headers, so a page of another site cannot read your model through it - only devices on your network can.
 - **Host names (DNS rebinding):** without an API key the server answers only requests whose `Host` is `localhost`, an IP
   address, the address it listens on, or (when it listens beyond this PC) this PC's name and `host.docker.internal`. Others
   get **403** naming the setting. Add a name with `"allowed_hosts": ["strata.example.com"]` or
