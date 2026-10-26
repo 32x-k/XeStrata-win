@@ -19,8 +19,13 @@
 // vae/, the same weights in bf16): each latent token's 128 values un-normalized by the VAE's batch norm
 // statistics and spread over 2 x 2 positions of 32 channels, then the LDM decoder (a 1 x 1 convolution, ResNet blocks
 // with group norms, one self-attention over every position in the middle, three nearest 2x upsamplings: 8 x 8 pixels
-// a position).  It has no encoder here (no edit model takes it).  Its activations are channels-last FP32 at each
-// level's size: the largest, 256 channels at the full size after the last upsampling, holds 1 GiB at 1024 x 1024.
+// a position).  Its activations are channels-last FP32 at each level's size: the largest, 256 channels at the full
+// size after the last upsampling, holds 1 GiB at 1024 x 1024.  Its encoder (img2img's and a mask's base image, by
+// open_encoder) is the LDM encoder: conv_in, four levels of ResNet blocks with a 3 x 3 convolution of stride 2 after
+// each but the last (the image padded by one on the bottom and the right), the middle as the decoder's, norm_out and
+// conv_out to the posterior's mean and log-variance, and the 1 x 1 quant_conv; the latent is the mean (diffusers'
+// Flux2 pipelines take its argmax), each 2 x 2 positions' 32 channels gathered into a token's 128 and normalized by
+// the batch norm's statistics, the decoder's input undone.  It runs on the whole image (not in tiles).
 // Where the whole does not fit the room decode is given, it runs the stages up to the deepest level that fits on the
 // whole latent (the middle's attention and the group norms there over all of it) and the rest in overlapping tiles (4
 // tokens, 64 pixels, on each side shared), blended linearly across the overlap as ComfyUI's tiled decode does; the
@@ -56,14 +61,15 @@ public:
 
     /// Puts the encoder's weights (the file open read) on the GPU.  `dry`: their sizes only.
     bool open_encoder(std::string& err, bool dry = false);
-    bool has_encoder() const { return !enc_blocks_.empty(); }
-    /// The file is the Flux2 VAE (no encoder).
+    bool has_encoder() const { return f2_ ? !f2_down_.empty() : !enc_blocks_.empty(); }
+    /// The file is the Flux2 VAE.
     bool flux2() const { return f2_; }
     uint64_t encoder_bytes() const { return enc_bytes_; }
     /// The posterior's mean and log-variance [h w][256] (device FP32) of rgb [3][16 h][16 w] (device FP32, -1 .. 1).
     void encode_moments(const float* rgb, int64_t h, int64_t w, float* moments);
     /// The latent tokens z [h w][128] (device FP32) of rgb: the posterior's mean, plus exp(logvar / 2) eps when `eps`
-    /// (device [h w][128] standard normal) is given (the reference samples the posterior).
+    /// (device [h w][128] standard normal) is given (the reference samples the posterior).  The Flux2 VAE's is the
+    /// mean (eps is not read).
     void encode(const float* rgb, int64_t h, int64_t w, const float* eps, float* z);
     /// The GPU memory an encode of an h x w latent works in.
     uint64_t encode_scratch_bytes(int64_t h, int64_t w) const;
@@ -119,6 +125,8 @@ private:
     Attn attn_w(class SafeTensors& st, const std::string& norm, const std::string (&qkv)[3], const std::string& proj,
                 int64_t C);
     void conv(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, float* out);
+    /// A 3 x 3 convolution of stride 2 (the input padded by one on the bottom and the right): out [H / 2][W / 2].
+    void conv_s2(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, float* out);
     void gn_silu16(const float* x, const float* w, const float* b, int64_t HW, int64_t C, bool silu, uint16_t* y16);
     void resblock(const Res& r, float*& x, int64_t H, int64_t W);
     void attention(const Attn& a, float* x, int64_t H, int64_t W);
@@ -134,10 +142,18 @@ private:
         std::vector<F2Res> blocks;
         Conv up;            // the convolution after the 2x upsampling (out 0: the last level, none)
     };
+    // the Flux2 VAE's encoder: a level's blocks, then its downsampling (out 0: the last level, none)
+    struct F2Down {
+        std::vector<F2Res> blocks;
+        Conv down;
+    };
     void open_flux2(class SafeTensors& st);
+    void open_flux2_encoder(class SafeTensors& st);
     void f2_others(const float* x, float*& a, float*& b) const;
     void f2_resblock(const F2Res& r, float*& x, int64_t H, int64_t W);
-    void f2_attention(float* x, int64_t H, int64_t W);
+    void f2_attention(const Attn& a, float* x, int64_t H, int64_t W);
+    F2Sizes f2_enc_walk(int64_t h, int64_t w) const;
+    void f2_encode(const float* rgb, int64_t h, int64_t w, float* z);
     void f2_front(const float* z, int64_t h, int64_t w, int k, float*& x, int64_t& H, int64_t& W, int64_t& c);
     void f2_levels(int k0, int k1, float*& x, int64_t& H, int64_t& W, int64_t& c);
     void f2_tail(const float* x, int64_t H, int64_t W, int64_t c, float* rgb);
@@ -189,6 +205,13 @@ private:
     F2Res f2_mid_[2];
     Attn f2_attn_;
     std::vector<F2Level> f2_levels_;
+    // its encoder: conv_in (its input widened to 8 channels), the levels from the largest, the middle, norm_out,
+    // conv_out and quant_conv (out 0: none)
+    Conv f2_ein_, f2_eout_, f2_qc_;
+    std::vector<F2Down> f2_down_;
+    F2Res f2_emid_[2];
+    Attn f2_eattn_;
+    const float *f2_enw_ = nullptr, *f2_enb_ = nullptr;
     F2Sizes f2_cap_;           // what the scratch holds (rows: the attention's query band)
     uint64_t f2_held_ = 0;
     float *f2_x_ = nullptr, *f2_y_ = nullptr, *f2_t_ = nullptr, *f2_q_ = nullptr;
