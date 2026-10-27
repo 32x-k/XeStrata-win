@@ -1771,7 +1771,18 @@ def own_nvidia_gpus() -> list:
     for line in s.strip().splitlines():
         try:
             idx, name, mem, cc, drv = [x.strip() for x in line.split(",")]
-            found.append({"index": int(idx), "name": name, "vram_gb": float(mem) / 1024.0,
+            try:
+                mem_gb = float(mem) / 1024.0
+            except ValueError:
+                if platform.machine().lower() not in ("aarch64", "arm64"):
+                    raise            # as before on x86: a card whose memory nvidia-smi does not report is not listed
+                # a DGX Spark (GB10): one memory for the CPU and the GPU, memory.total is [N/A]; counted as setup.py's gpus() counts it
+                # (the RAM less the OS's 6 GB, none of it room beside the RAM)
+                shared = max(0.0, own_ram_gb() - 6)
+                found.append({"index": int(idx), "name": name, "vram_gb": shared, "arch": cc.replace(".", ""), "driver": drv,
+                              "uma": True, "dedicated_gb": 0.0, "shared_gb": shared})
+                continue
+            found.append({"index": int(idx), "name": name, "vram_gb": mem_gb,
                           "arch": cc.replace(".", ""), "driver": drv})
         except ValueError:
             continue

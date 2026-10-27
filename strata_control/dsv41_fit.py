@@ -83,6 +83,9 @@ UMA_RESERVE_GB = 12.0                 # kept for Windows, the desktop and the en
 UMA_MEASURED = ("a Ryzen AI Max+ 395 (Radeon 8060S, 128 GB unified: a 64 GB BIOS carve-out plus 64 GB seen by Windows) on Windows: answers "
                 "14-16 tokens a second on code in the default Faster mode (5 experts) and 10-11 on chat; a 4,000-token prompt 77-81 tokens a "
                 "second, 8,000 tokens 108-111")
+# A DGX Spark (GB10, Linux, 128 GB unified, no BIOS carve-out): the same one-pool plan.  Measured with the 2.00 bpw set, six experts per word.
+UMA_MEASURED_GB10 = ("an NVIDIA DGX Spark (GB10, 128 GB unified) on Linux with six experts per word: about 17 tokens a second on a first short "
+                     "chat and 20-23 once warm; a 1,700-token prompt read at 213-237 tokens a second, a 500-token one at 76")
 
 
 def variant(model: str | None) -> dict | None:
@@ -305,10 +308,17 @@ def _plan_uma(key: str, model: str, card: dict, ram_gb: float | None, disk_free_
     lines.append("The n-gram table stays on the SSD and is read a few rows for each word: use an NVMe drive for the model files (a slow "
                  "disk makes every word slower). The same table serves every IST-DAS set, so installing another one downloads it once.")
     name = card.get("name") or "the built-in Radeon"
-    lines.append(f"{name} shares this PC's memory: the RAM and the GPU's BIOS carve-out are one pool of {total:.0f} GB. About "
-                 f"{resident:.0f} GB of the {float(v['experts_gb']):.0f} GB of experts stay in it beside {ISTA_DENSE_GB:.1f} GB of "
-                 f"dense weights and {UMA_RESERVE_GB:.0f} GB kept for Windows; the other {streamed:.0f} GB are read from the SSD while it answers.")
-    lines.append(f"Measured on this kind of PC: {UMA_MEASURED}.")
+    if float(card.get("dedicated_gb") or 0.0) > 0 or "GB10" not in str(card.get("name") or ""):
+        lines.append(f"{name} shares this PC's memory: the RAM and the GPU's BIOS carve-out are one pool of {total:.0f} GB. About "
+                     f"{resident:.0f} GB of the {float(v['experts_gb']):.0f} GB of experts stay in it beside {ISTA_DENSE_GB:.1f} GB of "
+                     f"dense weights and {UMA_RESERVE_GB:.0f} GB kept for Windows; the other {streamed:.0f} GB are read from the SSD while it answers.")
+        lines.append(f"Measured on this kind of PC: {UMA_MEASURED}.")
+    else:       # a DGX Spark's GB10: one memory for the CPU and the GPU, nothing set aside in a BIOS, Linux
+        lines.append(f"{name} shares this computer's memory: the CPU and the GPU are one pool of {total:.0f} GB. About "
+                     f"{resident:.0f} GB of the {float(v['experts_gb']):.0f} GB of experts stay in it beside {ISTA_DENSE_GB:.1f} GB of "
+                     f"dense weights and {UMA_RESERVE_GB:.0f} GB kept for the system; the other {streamed:.0f} GB are read from the SSD while it answers.")
+        lines.append(f"Measured on this kind of computer: {UMA_MEASURED_GB10}.")
+        out["measured"] = UMA_MEASURED_GB10
     if streamed > 0.5:
         lines.append("Keep the model files on the NVMe drive and the machine otherwise idle while it answers: every word reads experts from it.")
     if streamed <= 0.5:
