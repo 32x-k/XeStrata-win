@@ -1641,8 +1641,10 @@ B70 では、`cvec_parity` が制御ベクトルのカーネルを確かめて�
 | 起動に何分もかかり、その間カーネルがメモリーの圧縮（`kcompactd`）で忙しい | 透過的なヒュージページ（THP）が `madvise` のとき、エンジンはアリーナに `MADV_HUGEPAGE` を頼み、断片化した RAM では fault のたびに圧縮が走ることがあります（upstream #771）。`STRATA_NO_ARENA_THP=1` で頼まなくなります（THP が `always` のときは、エンジンは初めから頼みません）。 |
 | 起動のエラーに `the engine process ended: ...` とある | システムがエンジンのプロセスを終わらせました。エラーがその終わり方を示します（Linux では `killed by signal 4 (SIGILL, Illegal instruction)`、Windows では `exit code 0xC000001D: illegal instruction` など）。不正な命令（illegal instruction）は、CPU が実行できない命令をエンジンが使ったということで、Linux ではエラーが CPU に欠けている AVX・AVX2・FMA・F16C を挙げるか、すべてあるならエンジンのバグだと示します。CPU の型番を添えて issue を立ててください。 |
 | `the engine stopped unexpectedly (exit code ...)` | 答えの途中でエンジンのプロセスが終わりました。たいていは RAM 不足で、Linux がいちばん大きなプログラムを終わらせます（`journalctl -k \| grep -i -E 'killed process\|out of memory'`）。次の要求で、エンジンは自分で起動し直します。繰り返すなら、ほかのプログラムを閉じるか、小さい大きさを選びます。server は、モデルのエキスパートがほかのために約 6 GB の RAM を残さないとき、起動時に警告します。 |
+| Linux でエンジンが signal 9 で終わったのに、RAM は足りていた | デスクトップのセッションに実時間の CPU の制限（RLIMIT_RTTIME）があると、カーネルが signal 9 でプログラムを何も言わずに終わらせることがあります。rtkit がないとき、音声のシステム（PipeWire）がこの制限を 0 にし、デスクトップから始めたプログラムがそれを受け継ぎます。server は起動時と、エンジンが signal 9 で終わったときに、この制限を見つけると知らせます。`ulimit -R` で確かめ、rtkit を入れるか、セッションの制限の外で起動します（`systemd-run --user --collect -p LimitRTTIME=infinity -- xestrata`）。 |
 | decode が遅く、ディスクのランプが点きっぱなし | 空いている RAM が足りません。ほかのプログラムを閉じるか、Q2_0 か IQ2_XS を選びます。 |
 | `prompt ... exceeds the context` | 要求が、選んだ文脈より長くなっています。もっと大きな `--context` で setup をやり直します。 |
+| 前に空で返った答えが、会話の履歴から抜けている | server は、文章のない終わったアシスタントの発言を、次の答えの手本にしないよう履歴から外します（画像やツールの呼び出しのある発言と最後の発言は残します）。server の環境の `STRATA_KEEP_EMPTY_TURNS=1` で、外さずに読みます。 |
 | 思ったより遅い | GPU に挿したモニターやほかの GPU のプログラムが、エキスパートのキャッシュから VRAM を取っています。定格より遅い RAM（BIOS の XMP を確かめる）は、CPU の分を遅くします。XMX なしでビルドしていないかは、setup の `SYCL compiler: ...` の行で確かめます。 |
 | `this server was started without the vision encoder` | 文章だけで setup したモデルです。`--vision gpu` で setup をやり直します。 |
 | 画像が断られる、`cannot read the image` | Pillow で開けない画像のファイルです（JPEG、PNG、WebP、GIF、BMP、TIFF、AVIF は使えます）。 |
