@@ -88,6 +88,12 @@ inline bool force_pageable() {
     static const bool v = [] { const char* e = std::getenv("STRATA_TEST_PAGEABLE"); return e != nullptr && e[0] == '1'; }();
     return v;
 }
+// STRATA_PLE_COMPACT=1 (opt-in, upstream 17b08c963): the prompt chunk's PLE rows go up raw and are dequantized on the
+// device (IQ4_NL tables held in memory); the same floats as the host dequant, 7x fewer bytes over the host link
+inline bool ple_compact_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PLE_COMPACT"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
 // A host table the GPU reads or writes every layer (the routing ids, the row maps, the group bounds): USM host
 // memory that a kernel reads and writes in place (to_device / from_device: copy_i32_from_mapped), so these small copies
 // never queue behind the streamed experts on the copy engine (upstream 1b3bb8f8).  A copy from or to pageable memory
@@ -564,6 +570,8 @@ struct Prefill::Impl {
     float* ple_emb_host[2] = {};             // pinned, double-buffered: the next chunk's rows are read while this
     strata::gpu::Event* ple_copied[2] = {};          // one runs; the event marks that buffer's upload done
     std::vector<uint32_t> ple_rows[2];
+    bool ple_compact[2] = {false, false};    // STRATA_PLE_COMPACT: the pinned buffer holds raw IQ4_NL rows
+    uint8_t* ple_raw_dev = nullptr;          // their device copy (the chunk's 16 rows a token)
     float* ple_norm = nullptr;
     uint8_t* region = nullptr;               // the attention/MoE scratch region (idle while the PLE block runs)
     uint64_t region_bytes = 0;
@@ -811,6 +819,7 @@ void Prefill::release() {
         if (impl_->ple_copied[b]) strata::gpu::event_destroy(impl_->ple_copied[b]);
         if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty()) strata::gpu::free(impl_->ple_emb_host[b]);
     }
+    if (impl_->ple_raw_dev) strata::gpu::free(impl_->ple_raw_dev);
     if (impl_->copy) strata::gpu::stream_destroy(impl_->copy);
     for (void* p : impl_->owned) strata::gpu::free(p);
 }
@@ -1207,6 +1216,11 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
             ok = false;
         m.ple_rows[b].resize(T * strata::kernels::PLE_N_HEADS);
     }
+    // STRATA_PLE_COMPACT: without the buffer (no VRAM for it) the rows take the host dequant as before
+    if (ple_compact_on() && m.ple_raw_dev == nullptr &&
+        !strata::gpu::alloc_device((void**) &m.ple_raw_dev,
+                                   T * strata::kernels::PLE_N_HEADS * strata::kernels::PLE_ROW_BYTES))
+        m.ple_raw_dev = nullptr;
     if (ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {   // KV streaming: the staging pool's identity page table
         const int64_t pages = ss.qsa_states[ss.qsa_primary()].n_pages;
         std::vector<int32_t> ident((size_t) pages);
@@ -1749,6 +1763,14 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             pv[0] = pv[1];
             pv[1] = tok;
         }
+        // STRATA_PLE_COMPACT: the raw rows (1,440 bytes a token instead of 10,240 floats' bytes) into the same pinned
+        // buffer; ple_land uploads them and dequantizes on the device
+        if (ple_compact_on() && m.ple_pageable[buf].empty() && m.ple_raw_dev != nullptr &&
+            ss.ple.table->gather_raw_iq4nl(m.ple_rows[buf].data(), (size_t) T, (uint8_t*) m.ple_emb_host[buf])) {
+            m.ple_compact[buf] = true;
+            return true;
+        }
+        m.ple_compact[buf] = false;
         return ss.ple.table->gather_batch(m.ple_rows[buf].data(), (size_t) T, m.ple_emb_host[buf], e);
     };
     std::string ple_next_err;
@@ -1883,8 +1905,15 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 err = ple_next_err;
                 return false;
             }
-            strata::gpu::copy_async(m.ple_emb, m.ple_emb_host[ple_buf], (size_t) T * N * 4, m.cs);
-            strata::gpu::event_record(m.ple_copied[ple_buf], m.cs);
+            if (m.ple_compact[ple_buf]) {
+                strata::gpu::copy_async(m.ple_raw_dev, m.ple_emb_host[ple_buf],
+                                        (size_t) T * strata::kernels::PLE_N_HEADS * strata::kernels::PLE_ROW_BYTES, m.cs);
+                strata::gpu::event_record(m.ple_copied[ple_buf], m.cs);
+                strata::kernels::ple_iq4nl_dequant(m.ple_raw_dev, T * strata::kernels::PLE_N_HEADS, m.ple_emb, m.cs);
+            } else {
+                strata::gpu::copy_async(m.ple_emb, m.ple_emb_host[ple_buf], (size_t) T * N * 4, m.cs);
+                strata::gpu::event_record(m.ple_copied[ple_buf], m.cs);
+            }
             // the pageable fallback (no pinned RAM): waited for, as a pageable source can be read out of order
             // (upstream #1996)
             if (!m.ple_pageable[ple_buf].empty()) strata::gpu::stream_sync(m.cs);

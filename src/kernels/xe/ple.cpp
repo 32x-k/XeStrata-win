@@ -155,6 +155,30 @@ bool ple_block_available() {
     catch (const std::exception&) { return false; }
 }
 
+namespace {
+constexpr int8_t kPleIq4Nl[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+}
+
+void ple_iq4nl_dequant(const uint8_t* raw, int64_t rows, float* out, void* stream) {
+    const int64_t n = rows * PLE_HEAD_DIM;
+    if (n <= 0) return;
+    auto& q = core::Runtime::get().stream(stream);
+    // one work-item a value: row r, block b (18 bytes: fp16 d, 16 bytes of codes), element j of 32 (j < 16: the low
+    // nibble of qs[j], else the high nibble of qs[j - 16] - the split halves of iq4nl_dequant_row)
+    const int64_t groups = (n + THREADS - 1) / THREADS;
+    const auto e = q.parallel_for(sycl::nd_range<1>((size_t) groups * THREADS, THREADS), [=](sycl::nd_item<1> it) {
+        const int64_t i = (int64_t) it.get_global_id(0);
+        if (i >= n) return;
+        const int64_t r = i / PLE_HEAD_DIM;
+        const int el = (int) (i - r * PLE_HEAD_DIM), b = el >> 5, j = el & 31;
+        const uint8_t* blk = raw + r * PLE_ROW_BYTES + (int64_t) (b * 18);
+        const float d = f32_from_f16((uint16_t) (blk[0] | (blk[1] << 8)));
+        const uint8_t c = blk[2 + (j & 15)];
+        out[i] = d * (float) kPleIq4Nl[j < 16 ? (c & 15) : (c >> 4)];
+    });
+    if (!stream) core::Runtime::get().wait(e, "ple_iq4nl_dequant");
+}
+
 uint64_t ple_block_scratch_bytes() {
     // five hc_dim floats + n_embd + hc, then the Q8 activation image, then the BF16 embedding copy, each 16-byte
     // aligned because the scratch is cast to float* and uint8_t* at those offsets

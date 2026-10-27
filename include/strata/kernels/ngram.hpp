@@ -186,6 +186,10 @@ public:
     /// as ONE reader request - page dedupe and sort across the whole batch, the reader's full queue depth.  Not
     /// while a single-token `issue` is pending.  The mapped mode gathers row by row.
     bool gather_batch(const uint32_t* rows, size_t n_tokens, float* out, std::string& err);
+    /// STRATA_PLE_COMPACT: the same rows as their raw IQ4_NL bytes (n_tokens x 16 rows of PLE_ROW_BYTES; a row past
+    /// the table: scale 0 and code 8 everywhere, which decode to the +0.0f gather_batch writes) for ple_iq4nl_dequant
+    /// on the device.  False (nothing written) unless the table is in memory (--ple-io ram / mmap) and IQ4_NL.
+    bool gather_raw_iq4nl(const uint32_t* rows, size_t n_tokens, uint8_t* out) const;
     /// Direct mode: one token's 16 rows read ahead while the GPU is busy (the MTP drafts the next window's tokens);
     /// `gather_batch` takes them when its rows are the ones read ahead, in order.  Elsewhere a no-op.
     void prefetch_rows(const uint32_t* rows16);
