@@ -10,6 +10,7 @@
 #include "strata/prefill/prefill.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -70,7 +71,16 @@ int parse_shared_option(const std::string& a, Next&& next, const SharedOptionFie
     }
     if (a == "--adapt-swaps" && f.adapt_swaps) { *f.adapt_swaps = (int) std::strtol(next(a.c_str()), nullptr, 10); return 1; }
     if (a == "--adapt-min-gain" && f.adapt_min_gain) { *f.adapt_min_gain = std::strtof(next(a.c_str()), nullptr); return 1; }
-    if (a == "--adapt-decay" && f.adapt_decay) { *f.adapt_decay = std::strtof(next(a.c_str()), nullptr); return 1; }
+    if (a == "--adapt-decay" && f.adapt_decay) {
+        // inside 0..1 it forgets old routing; above 1 the counts grow without end and the swap gains turn NaN, which
+        // breaks the sort that orders the swaps: an unusable value runs with the default, said (upstream 4a7e373da)
+        const double v = std::strtod(next(a.c_str()), nullptr);
+        *f.adapt_decay = std::isfinite(v) && v >= 0.0 && v <= 1.0 ? (float) v : 0.7f;
+        if (*f.adapt_decay != (float) v)
+            std::fprintf(stderr, "strata: --adapt-decay %g is not between 0 and 1; using 0.7 (counts above 1 grow without "
+                                 "end and the swap gains turn NaN)\n", v);
+        return 1;
+    }
     if (a == "--expert-profile" && f.expert_profile) { *f.expert_profile = next(a.c_str()); return 1; }
     if (a == "--expert-profile-save" && f.expert_profile_save) { *f.expert_profile_save = next(a.c_str()); return 1; }
     if (a == "--expert-profile-save-every" && f.expert_profile_save_min) return f64(f.expert_profile_save_min);
