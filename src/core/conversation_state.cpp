@@ -8,6 +8,7 @@
 #include "strata/core/progress.hpp"
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/qsa.hpp"
+#include "strata/platform/aux_cpus.hpp"
 
 #include <algorithm>
 #include <array>
@@ -30,6 +31,19 @@ bool conversation_vram_room(size_t want) {
     size_t free_bytes = 0, total = 0;
     if (!strata::gpu::mem_info(&free_bytes, &total)) return false;
     return free_bytes > want && free_bytes - want > total / 16;
+}
+// First thing a background copy thread does (STRATA_CKPT_ASYNC, STRATA_PARK_ASYNC; upstream ca378670b): a thread the
+// host creates inherits the host's one CPU (strata/platform/aux_cpus.hpp), where its memcpys would take turns with the
+// decode.  Wide first: the mask the aux placement keeps as this thread's own is the one restore() puts back, and the
+// host's one CPU must not be it.  No output depends on where a thread runs.
+void conversation_background_thread() {
+#if defined(__linux__)
+    cpu_set_t all;
+    CPU_ZERO(&all);
+    for (int c = 0; c < CPU_SETSIZE; ++c) CPU_SET(c, &all);
+    (void) sched_setaffinity(0, sizeof all, &all);   // the kernel keeps the CPUs the process may use
+#endif
+    strata::aux_cpus::pin_current_thread();          // (a no-op while the feature is off)
 }
 }  // namespace conversation_detail
 namespace {
@@ -252,6 +266,7 @@ void ckpt_async_launch(CkptAsync& a, uint8_t* dst, void* bounce, const void* src
     std::lock_guard<std::mutex> lk(a.mu);
     a.dst = dst;
     a.pending = std::async(std::launch::async, [dst, bounce, src, n, st, dev]() -> std::string {
+        conversation_detail::conversation_background_thread();
         const OnDevice on(dev);
         constexpr size_t PIECE = (size_t) 4 << 20;
         auto* land = bounce != nullptr ? static_cast<uint8_t*>(bounce) : dst;
@@ -318,6 +333,68 @@ int ckpt_async_save_gdn(uint8_t* dst, const SessionState& ss, size_t n, bool pin
     }
     if (park_trace_env()) std::fprintf(stderr, "strata parktrace: async ckpt d2d %.2f ms\n", ms_since(q0));
     ckpt_async_launch(a, dst, pinned_dst ? nullptr : a.host, dsrc, n);
+    return 1;
+}
+
+// STRATA_CKPT_GATHER=1 (opt-in, upstream ca378670b): the small running-state vectors (the PLE history, then each
+// layer's indexer tail, dead row and block position: 1 + 3 x layers pieces) are gathered device to device into one
+// buffer, allocated once, and fetched with ONE copy into a pinned buffer, then copied into the vectors.  A small
+// device-to-host copy issued while the checkpoint copy (STRATA_CKPT_ASYNC) is in flight waits behind its 4 MiB piece
+// on the copy engine: one such wait instead of 37.  The same bytes in the same places.
+struct CkptGather { std::mutex mu; void* stage = nullptr; void* host = nullptr; size_t cap = 0; int dev = -1; };
+CkptGather& ckpt_gather() { static CkptGather a; return a; }
+bool ckpt_gather_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_CKPT_GATHER"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+// 1: the vectors are filled; 0: no buffers (the caller copies them one by one); -1: a copy failed (`error` set)
+int ckpt_gather_small(ConversationCheckpoint& c, const SessionState& ss, const ConversationStateSizes& z,
+                      size_t layers, std::string& error) {
+    const size_t ple = c.ple.size(), tails = c.tails.size(), dead = c.dead.size(), block_pos = c.block_pos.size();
+    const size_t total = ple + tails + dead + block_pos;
+    if (total == 0) return 1;
+    CkptGather& a = ckpt_gather();
+    std::lock_guard<std::mutex> lk(a.mu);   // (a layer split's stages save from their own threads)
+    const int dev = current_device();
+    if (a.stage != nullptr && (a.cap < total || a.dev != dev)) {
+        strata::gpu::free(a.stage);
+        strata::gpu::free(a.host);
+        a.stage = a.host = nullptr; a.cap = 0;
+    }
+    if (a.stage == nullptr) {
+        a.stage = strata::gpu::alloc_device(total);
+        a.host = a.stage != nullptr ? strata::gpu::alloc_host(total) : nullptr;
+        if (a.host == nullptr) {
+            if (a.stage) strata::gpu::free(a.stage);
+            a.stage = nullptr;
+            return 0;
+        }
+        a.cap = total; a.dev = dev;
+    }
+    // the pieces in the vectors' order, queued on the compute queue (in order, after the work already on it), then
+    // the one copy to the host behind them
+    auto* s = static_cast<uint8_t*>(a.stage);
+    bool ok = true;
+    auto put = [&](uint8_t* d, const void* src, size_t n) {
+        if (ok && n) ok = src != nullptr && strata::gpu::copy_async(d, src, n, nullptr);
+    };
+    put(s, ss.ple_hist, ple);
+    for (size_t j = 0; j < layers; ++j) {
+        const auto& st = owned(ss, j);
+        put(s + ple + j * z.tail, st.idx_tail, z.tail);
+        put(s + ple + tails + j * z.dead, st.idx_dead, z.dead);
+        put(s + ple + tails + dead + j * z.block_pos, st.idx_block_pos, z.block_pos);
+    }
+    if (!ok) {
+        error = std::string("conversation snapshot gather: ") + strata::gpu::last_error();
+        return -1;
+    }
+    if (!copy(a.host, a.stage, total, error)) return -1;
+    const auto* h = static_cast<const uint8_t*>(a.host);
+    if (ple) std::memcpy(c.ple.data(), h, ple);
+    if (tails) std::memcpy(c.tails.data(), h + ple, tails);
+    if (dead) std::memcpy(c.dead.data(), h + ple + tails, dead);
+    if (block_pos) std::memcpy(c.block_pos.data(), h + ple + tails + dead, block_pos);
     return 1;
 }
 } // namespace
@@ -388,8 +465,12 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
     ConversationStateSizes z;
     if (!checkpoint_targets(ss, g, c.ids.size(), z, error)) return false;
     const size_t layers = owned_qsa(ss, g);
+    const bool ready = c.gdn.size() == z.gdn;   // (a vector of the right size has its pages in; a fresh one faults)
+    const auto r0 = std::chrono::steady_clock::now();
     c.gdn.resize(z.gdn); c.ple.resize(ss.ple_hist ? z.ple : 0);
     c.tails.resize(layers * z.tail); c.dead.resize(layers * z.dead); c.block_pos.resize(layers * z.block_pos);
+    if (park_trace_env()) std::fprintf(stderr, "strata parktrace: save vectors %s, resize %.2f ms\n",
+                                       ready ? "ready" : "fresh", ms_since(r0));
     c.dev_tag = 0;
     int staged = 0;   // STRATA_CKPT_ASYNC: the GDN bytes land in c.gdn on the background thread
     if (ckpt_async_for(ss, g, c.gdn.size())) {
@@ -397,7 +478,13 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
         if (staged < 0) return false;
     }
     if (staged == 0 && !copy(c.gdn.data(), ss.gdn_state, c.gdn.size(), error)) return false;
+    const auto s0 = std::chrono::steady_clock::now();
     const bool ok = [&] {
+        // STRATA_CKPT_GATHER=1: the small vectors through one device gather and one copy (else one copy each)
+        if (ckpt_gather_on()) {
+            const int r = ckpt_gather_small(c, ss, z, layers, error);
+            if (r != 0) return r > 0;
+        }
         if (!copy(c.ple.data(), ss.ple_hist, c.ple.size(), error)) return false;
         for (size_t j = 0; j < layers; ++j) {
             const auto& st = owned(ss, j);
@@ -407,6 +494,7 @@ bool conversation_checkpoint_save(ConversationCheckpoint& c, const SessionState&
         }
         return true;
     }();
+    if (park_trace_env()) std::fprintf(stderr, "strata parktrace: save small copies %.2f ms\n", ms_since(s0));
     if (!ok && staged > 0) conversation_checkpoint_join(c.gdn.data());   // a failed save's caller drops `c` at once
     return ok;
 }
@@ -563,15 +651,19 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
     return true;
 }
 
+// (conversation_snapshot.cpp) STRATA_PARK_TRACE: conversation_kv_save's time since the park's begin, by part (ms)
+void conversation_kv_save_trace(double& attrs_ms, double& resize_ms, double& copy_ms);
+
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
                                 const SessionState& ss, const ModelGeometry& g,
                                 const QsaState& draft, std::string& error,
                                 ConversationKvReuse reuse, size_t* reused_bytes,
                                 std::vector<ConversationCheckpoint>* moved) {
-    conversation_checkpoint_join(nullptr);   // the last turn checkpoint's copy (STRATA_CKPT_ASYNC)
-    conversation_park_join();                // the previous park's K/V copy (STRATA_PARK_ASYNC)
     using Steady = std::chrono::steady_clock;
     auto ms = [](Steady::time_point a, Steady::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    const auto pj = Steady::now();
+    conversation_checkpoint_join(nullptr);   // the last turn checkpoint's copy (STRATA_CKPT_ASYNC)
+    conversation_park_join();                // the previous park's K/V copy (STRATA_PARK_ASYNC)
     const auto p0 = Steady::now();
     size_t estimate = 0;
     if (!conversation_snapshot_capture_bytes(reuse, view, ss, g, draft, estimate, error) || !sync(error)) return false;
@@ -607,16 +699,26 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     for (size_t j = 0; j < layers; ++j) kv_need += conversation_kv_bytes(owned(ss, j), g, upto, true);
     kv_need += conversation_kv_bytes(draft, g, upto, false);
     const bool staged = conversation_park_async_begin(kv_need);
+    const auto p4 = Steady::now();
     struct Abandon { bool on; ~Abandon() { if (on) conversation_park_async_abandon(); } } abandon{staged};
-    for (size_t j = 0; j < layers; ++j)
+    double kv_max = 0, kv_sum = 0;   // (STRATA_PARK_TRACE: the per-layer save time)
+    for (size_t j = 0; j < layers; ++j) {
+        const auto k0 = Steady::now();
         if (!conversation_kv_save(captured.kv[j], owned(ss, j), g, upto, true, error,
                                   unchanged, reused_bytes)) return false;
+        const double kt = ms(k0, Steady::now());
+        kv_sum += kt; kv_max = std::max(kv_max, kt);
+    }
     if (park_trace_env()) {
         size_t kvb = 0;
         for (const auto& k : captured.kv) kvb += k.bytes();
-        std::fprintf(stderr, "strata parktrace: sync %.1f ms, %zu checkpoints copied %.1f ms, live state %.1f ms, "
-                             "K/V %zu MB %.1f ms\n", ms(p0, p1), captured.checkpoints.size(), ms(p1, p2), ms(p2, p3),
-                     kvb >> 20, ms(p3, Steady::now()));
+        double attrs_ms = 0, resize_ms = 0, copy_ms = 0;
+        conversation_kv_save_trace(attrs_ms, resize_ms, copy_ms);   // (the main layers' saves above)
+        std::fprintf(stderr, "strata parktrace: joins %.1f ms, sync %.1f ms, %zu checkpoints copied %.1f ms, live state "
+                             "%.1f ms, begin %.1f ms, K/V %zu MB %.1f ms (layer max %.2f, sum %.2f; attrs %.2f, resize "
+                             "%.2f, copy %.2f)\n", ms(pj, p0), ms(p0, p1), captured.checkpoints.size(), ms(p1, p2),
+                     ms(p2, p3), ms(p3, p4), kvb >> 20, ms(p4, Steady::now()), kv_max, kv_sum, attrs_ms, resize_ms,
+                     copy_ms);
     }
     // The draft's final cell may not have been computed when the output cap was
     // reached. Refresh that page even when the main prefix continued unchanged.
