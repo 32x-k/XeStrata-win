@@ -1252,7 +1252,7 @@ HTML のページには警告のボタン **Run scripts** もあり、確かめ�
 ヘッダーの **Load / Unload** は、モデルを読み込むか、GPU を空けます（`POST /load`、`POST /unload`）。
 解放の前に確かめ、答えを書いている間と画像を作っている間は押せません。
 
-**Language.** About > Settings に画面の言語が並びます。英語（既定）、ドイツ語、スペイン語、日本語、韓国語、ポルトガル語、ロシア語、中国語です。
+**Language.** About > Settings に画面の言語が並びます。英語（既定）、ドイツ語、フランス語、スペイン語、日本語、韓国語、ポルトガル語、ロシア語、中国語です。
 Chat の画面とその設定、ヘッダーを訳し、Monitor・Images・About はまだ英語です。
 言語は `serve/web/locales/<lang>.json` のファイルで、英語の文はコードの中の鍵の横にあります。
 `python tools/web_i18n.py` がどのファイルも同じ鍵と {placeholder} を持つかを確かめます（`--write` で `en.json` を書き直します）。

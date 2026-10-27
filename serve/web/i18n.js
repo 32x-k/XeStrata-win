@@ -16,7 +16,7 @@
 "use strict";
 (function (root) {
   // [code, the language's own name].  A new language is a locales/<code>.json file plus one line here.
-  const LANGUAGES = [["en", "English"], ["de", "Deutsch"], ["es", "Español"], ["ja", "日本語"], ["ko", "한국어"],
+  const LANGUAGES = [["en", "English"], ["de", "Deutsch"], ["fr", "Français"], ["es", "Español"], ["ja", "日本語"], ["ko", "한국어"],
                      ["pt", "Português"], ["ru", "Русский"], ["zh", "中文"]];
   let lang = "en", catalog = null, rules = null;
 

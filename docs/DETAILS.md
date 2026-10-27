@@ -1282,7 +1282,7 @@ It can still use your CPU, and it is code the model wrote.
 **Load / Unload** in the header loads the model or frees the GPU (`POST /load`, `POST /unload`).
 It asks before unloading and is off while an answer is being written or an image is made.
 
-**Language.** About > Settings lists the page's languages: English (the default), German, Spanish, Japanese, Korean, Portuguese, Russian and Chinese.
+**Language.** About > Settings lists the page's languages: English (the default), German, French, Spanish, Japanese, Korean, Portuguese, Russian and Chinese.
 The Chat view, its settings and the header are translated; Monitor, Images and About are still English.
 A language is a file `serve/web/locales/<lang>.json`; the English text lives in the code next to its key.
 `python tools/web_i18n.py` checks every file for the same keys and placeholders (`--write` rewrites `en.json`).
