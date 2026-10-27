@@ -1695,6 +1695,9 @@ if(STRATA_BUILD_TESTS)
   add_executable(arch_defaults_test src/core/arch_defaults_test.cpp src/core/arch_defaults.cpp)
   target_include_directories(arch_defaults_test PRIVATE include)
   add_test(NAME arch_defaults_test COMMAND arch_defaults_test)
+  add_executable(nv_defaults_test src/core/nv_defaults_test.cpp src/core/nv_defaults.cpp)   # the sm_121 (GB10) table and its two off switches
+  target_include_directories(nv_defaults_test PRIVATE include)
+  add_test(NAME nv_defaults_test COMMAND nv_defaults_test)
   add_executable(kva_test src/prefill/kva_test.cpp)   # KVA: the switch, the automatic tail, the reasons a read is turned away
   target_include_directories(kva_test PRIVATE include)
   add_test(NAME kva_test COMMAND kva_test)
