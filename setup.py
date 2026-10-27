@@ -691,14 +691,16 @@ PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
 }
 # Qwen3.5-9B (qwen35): dense, 32 blocks (a full attention every 4th, 4 K/V heads of 256: 8 x 2 x 4 x 256 x 2 bytes of
 # K/V a token), every weight in VRAM; Qwen's model as Unsloth's GGUFs, or HauhauCS's with its refusals removed.  Both
-# read pictures through their own mmproj
+# read pictures through Unsloth's mmproj: HauhauCS's has the same 334 tensors byte for byte (only its metadata
+# differs, 2026-10-27), so one file serves both
 _QWEN35_HAU_FILE = "Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-{}.gguf"
+_QWEN35_MMPROJ = {"repo": _QWEN35, "path": "mmproj-BF16.gguf", "size": 921705024,
+                  "sha256": "853698ce7aa6c7ba732478bad280240969ddf7b0fcbf93900046f63903a83383"}
 PLAIN_FAMILIES["qwen35"] = {
     "title": "Qwen3.5-9B", "by": "Qwen (Apache-2.0), GGUFs by Unsloth",
     "about": "9B, dense, reads images: for a GPU of 8 GB or more, every weight in its VRAM",
     "tag": "qwen35-", "name": "qwen3.5-9b", "max_context": 262144, "plain": True, "dense": True, "kv_bytes": 32768,
-    "mmproj": {"repo": _QWEN35, "path": "mmproj-BF16.gguf", "size": 921705024,
-               "sha256": "853698ce7aa6c7ba732478bad280240969ddf7b0fcbf93900046f63903a83383"},
+    "mmproj": _QWEN35_MMPROJ,
     "models": {
         "Q4_K_M": {"repo": _QWEN35, "file": "Qwen3.5-9B-Q4_K_M.gguf", "size": 5680522464,
                    "sha256": "03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8", "about": "4-bit"},
@@ -717,8 +719,7 @@ PLAIN_FAMILIES["qwen35-uncensored"] = {
              "filtering is reduced, so check what it writes",
     "tag": "qwen35-uncensored-", "name": "qwen3.5-9b-uncensored", "max_context": 262144, "plain": True, "dense": True,
     "kv_bytes": 32768,
-    "mmproj": {"repo": _QWEN35_HAU, "path": "mmproj-" + _QWEN35_HAU_FILE.format("BF16"), "size": 921704448,
-               "sha256": "05f662501f8bd45607b079723a3e238a4e888fd085a10a53f4057a0e250f6934"},
+    "mmproj": _QWEN35_MMPROJ,
     "models": {
         "Q4_K_M": {"repo": _QWEN35_HAU, "file": _QWEN35_HAU_FILE.format("Q4_K_M"), "size": 5627044224,
                    "sha256": "2ca636d9e81d3d23ca9b60c234fe185d30ec082eeba69ce770fdb0c76559a4f5", "about": "4-bit"},
@@ -5928,6 +5929,18 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     more = f" and {len(parts) - 1} more beside it" if len(parts) > 1 else ""
     ok(f"model file present: {gguf}{more}")
     if mm is not None and mmproj is not None:
+        # the same file beside another size or the other family (Qwen3.5-9B's two share one): linked, not fetched
+        # (only a copy whose finish mark holds the pinned SHA-256: GLM-5.3-Flash's is named mmproj-BF16.gguf too)
+        other = [p for p in Path(a.models_dir).glob("*/" + mmproj.name) if p != mmproj and done(p)
+                 and f"sha256 {mm['sha256']}" in p.with_name(p.name + ".done").read_text(encoding="utf-8",
+                                                                                         errors="replace")]
+        if other and not mmproj.exists() and not a.gguf_dir:
+            try:
+                os.link(other[0], mmproj)
+                mark(mmproj, f"sha256 {mm['sha256']}")
+                ok(f"{mmproj.name} shared with {other[0].parent.name} (identical file)")
+            except OSError:
+                pass
         if not (mmproj.exists() and (done(mmproj) or a.gguf_dir)):
             download(hf(mm["repo"]) + mm["path"], mmproj, "vision encoder")
         verify_sha256(mmproj, mm["size"], mm["sha256"], own=bool(a.gguf_dir))
