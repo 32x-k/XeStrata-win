@@ -169,7 +169,7 @@ static int amd_family() {
         if (!__get_cpuid(1, &a, &b, &c, &d)) return 0;
         const unsigned eax = a;
 #else
-        const unsigned eax = 0;   // not x86 (arm64, a DGX Spark): no AMD family, the base family below reads 0
+        const unsigned eax = 0;   // (not an x86 host: no family)
 #endif
         const unsigned base = (eax >> 8) & 0xF;
         return (int) (base == 0xF ? base + ((eax >> 20) & 0xFF) : base);
