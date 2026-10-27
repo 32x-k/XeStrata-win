@@ -5735,10 +5735,13 @@ def derived_factor(ctx: int, trained: int = 262144) -> float:
 def resolve_rope(ctx: int, scaling, scale, trained: int = 262144):
     """The rope configuration for the context actually served: (scaling, scale); scaling None = no flags.
 
-    An explicit --rope-scaling / --rope-scale wins, a given factor verbatim.  Past the trained range an omitted method
-    is yarn and an omitted factor final / trained; inside it nothing turns on by itself and a chosen method without a
-    factor gets 1 (the trained angles).  An explicit none past the trained range is refused, not overridden.
+    An explicit --rope-scaling / --rope-scale wins, a valid given factor (finite, at least 1) verbatim.  Past the
+    trained range an omitted method is yarn and an omitted factor final / trained; inside it nothing turns on by
+    itself and a chosen method without a factor gets 1 (the trained angles).  An explicit none past the trained range
+    is refused, not overridden.
     """
+    if scale is not None and (not math.isfinite(scale) or scale < 1.0):     # upstream a332cc95d, #3393
+        raise ValueError("--rope-scale must be a finite value >= 1, e.g. --rope-scale 4")
     if ctx <= trained:
         if scale is not None and scaling in (None, "none"):
             raise ValueError("--rope-scale needs --rope-scaling linear or yarn (the chosen context fits the "
@@ -6172,8 +6175,8 @@ def main() -> int:
                          "interpolation) or yarn, llama.cpp's types. Omitted with such a context, setup takes yarn; "
                          "none is refused there")
     ap.add_argument("--rope-scale", type=float,
-                    help="the extension factor (default: the final context over the trained 262144, at least 1: "
-                         "1.5 for 384K, 2 for 512K, 1 inside the trained range)")
+                    help="the extension factor, finite and >= 1 (default: the final context over the trained "
+                         "262144, at least 1: 1.5 for 384K, 2 for 512K, 1 inside the trained range)")
     ap.add_argument("--kv", choices=["int8", "q4_0", "k8v4", "fp16"],
                     help="KV cache precision above 8K context: int8 (default), q4_0 (half the memory, a little less "
                          "precise), k8v4 (8-bit keys and 4-bit values: about three quarters of the memory) or fp16 "
