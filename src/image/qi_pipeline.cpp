@@ -239,7 +239,7 @@ QiPlan QiPipeline::plan(int64_t T, int64_t h, int64_t w, int64_t n_ids, int64_t 
 void QiPipeline::edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::vector<QiVisionOut>& vouts,
                            std::vector<QiText::Image>& te_images, std::vector<QiDit::Ref>& dit_refs,
                            std::vector<float*>& ref_z, std::vector<int32_t>& neg_ids,
-                           std::vector<QiText::Image>& neg_te, std::vector<QiDit::Ref>& neg_refs) {
+                           std::vector<QiText::Image>& neg_te, std::vector<QiDit::Ref>& neg_refs, bool vision) {
     if (vision_path_.empty()) throw std::invalid_argument("image engine: an edit needs the vision encoder (--vision)");
     if (std::count(r.ids.begin(), r.ids.end(), kImagePad) != (int64_t) r.refs.size())
         throw std::invalid_argument("image engine: the prompt's image pads and the reference images differ in number");
@@ -252,11 +252,13 @@ void QiPipeline::edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::v
     const uint64_t edit = nd.least - need(0, r.width, r.height).least;
     if (held() + edit > budget()) release(false);
     ensure_open();
-    vision_ = std::make_unique<QiVision>();
     std::string err;
-    if (!vision_->open(vision_path_, s_, err)) {
-        vision_.reset();
-        throw std::runtime_error(err);
+    if (vision) {
+        vision_ = std::make_unique<QiVision>();
+        if (!vision_->open(vision_path_, s_, err)) {
+            vision_.reset();
+            throw std::runtime_error(err);
+        }
     }
     std::vector<std::pair<int64_t, int64_t>> grids;   // each reference's worked size
     for (const QiRef& f : r.refs) {
@@ -274,7 +276,17 @@ void QiPipeline::edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::v
                 for (int c = 0; c < 3; ++c)
                     rgb[(size_t) ((c * rh + y) * rw + x)] = 2.f * ((float) px[c] / 255.f * a + 1.f - a) - 1.f;
             }
-        vouts.push_back(vision_->encode(rgb.data(), rw, rh));
+        if (vision) {
+            vouts.push_back(vision_->encode(rgb.data(), rw, rh));
+        } else {   // the kept states' references: their vision outputs' shapes only (no rows: the text is not encoded)
+            QiVisionOut v;
+            const QiVisionOut& was = last_vision_[vouts.size()];
+            v.rows = was.rows;
+            v.dim = was.dim;
+            v.grid_h = was.grid_h;
+            v.grid_w = was.grid_w;
+            vouts.push_back(std::move(v));
+        }
         float *d = nullptr, *z = nullptr;
         if (!gpu::alloc_device(&d, rgba.size() * 4) || !gpu::alloc_device(&z, (size_t) (64 * (rh / 16) * (rw / 16)) * 4))
             throw std::runtime_error(std::string("image engine: GPU memory: ") + gpu::last_error());
@@ -286,6 +298,17 @@ void QiPipeline::edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::v
     }
     vision_.reset();   // its weights go: an edit opens it again
     vae_->drop_scratch();
+    if (vision) {   // their shapes, for the next edit of the same request and references
+        last_vision_.clear();
+        for (const QiVisionOut& v : vouts) {
+            QiVisionOut s;
+            s.rows = v.rows;
+            s.dim = v.dim;
+            s.grid_h = v.grid_h;
+            s.grid_w = v.grid_w;
+            last_vision_.push_back(std::move(s));
+        }
+    }
     // the ids with each pad widened to its reference's tokens: the prompt's, and guidance's negative prompt's
     auto widen = [&](const std::vector<int32_t>& src, std::vector<int32_t>& out, std::vector<QiText::Image>& te,
                      std::vector<QiDit::Ref>& refs) {
@@ -356,9 +379,15 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     std::vector<int32_t> neg_ids;   // an edit's negative prompt, its pads widened
     std::vector<QiText::Image> neg_te;
     std::vector<QiDit::Ref> neg_refs;
+    // an edit whose text states are kept (the same request and references, the guidance's negative prompt too): the
+    // vision encoder, which only the text encoder reads, is not run
+    const std::string refs = refs_key(r.refs);
+    const bool kept = !r.refs.empty() && refs == last_refs_ && r.ids == last_req_ids_ &&
+                      last_vision_.size() == r.refs.size() &&
+                      (!guided || (refs == last_neg_refs_ && r.neg_ids == last_req_neg_));
     if (!r.refs.empty()) {
         if (stage) stage("refs");
-        edit_refs(r, ids, vouts, te_images, dit_refs, ref_z, neg_ids, neg_te, neg_refs);
+        edit_refs(r, ids, vouts, te_images, dit_refs, ref_z, neg_ids, neg_te, neg_refs, !kept);
     }
     if (base != nullptr) {
         if (stage && r.refs.empty()) stage("refs");
@@ -375,12 +404,13 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     const int64_t n_neg_pre = guided ? n_neg_ctx + (n_pre - n_ctx) : 0;
     QiPlan p = plan(n_pre + h * w, h, w, (int64_t) std::max(all_ids.size(), neg_all.size()), n_neg_pre);
     // the text states, kept for the same prompt and the same references (an edit again with another seed)
-    const std::string refs = refs_key(r.refs);
     if (all_ids != last_ids_ || refs != last_refs_) {
+        if (kept) throw std::logic_error("image engine: an edit's kept states do not match its request");
         last_states_ = r.refs.empty() ? te_->encode(r.ids) : te_->encode(all_ids, te_images);
         te_->drop_activations();
         last_ids_ = all_ids;
         last_refs_ = refs;
+        last_req_ids_ = r.ids;
     } else {
         p.text_cached = true;
     }
@@ -390,8 +420,10 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     if (guided) {   // the negative prompt's states (kept as the prompt's are; its references are the prompt's)
         if (neg_all != last_neg_ids_ || refs != last_neg_refs_) {
             last_neg_states_ = r.refs.empty() ? te_->encode(r.neg_ids) : te_->encode(neg_all, neg_te);
+            if (kept) throw std::logic_error("image engine: an edit's kept states do not match its request");
             last_neg_ids_ = neg_all;
             last_neg_refs_ = refs;
+            last_req_neg_ = r.neg_ids;
         }
         te_->drop_activations();
         for (QiDit::Ref& f : neg_refs) f.slot -= r.drop;

@@ -77,7 +77,7 @@ private:
     void edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::vector<QiVisionOut>& vouts,
                    std::vector<QiText::Image>& te_images, std::vector<QiDit::Ref>& dit_refs, std::vector<float*>& ref_z,
                    std::vector<int32_t>& neg_ids, std::vector<QiText::Image>& neg_te,
-                   std::vector<QiDit::Ref>& neg_refs);
+                   std::vector<QiDit::Ref>& neg_refs, bool vision = true);
     /// The base image (img_start.hpp) at the image's size through the VAE's encoder into `ls`'s base latent.
     void encode_base(const QiRequest& r, const QiRef& base, LatentStart& ls);
 
@@ -102,6 +102,11 @@ private:
     /// The references the last states read (img_start.hpp's refs_key; empty, none): an edit's states are kept for the
     /// same prompt and the same references, as a generation's for the same prompt
     std::string last_refs_, last_neg_refs_;
+    /// The last edit's request (its ids and negative ids as asked, before the pads are widened) and each reference's
+    /// vision output's shape: an edit whose states are kept (the same request and references) widens its pads from
+    /// these, without the vision encoder, whose output only the text encoder reads
+    std::vector<int32_t> last_req_ids_, last_req_neg_;
+    std::vector<QiVisionOut> last_vision_;
 };
 
 }  // namespace strata::image
