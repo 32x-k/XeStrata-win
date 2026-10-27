@@ -698,6 +698,20 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
     return next_.empty() ? prompt_one(tokens, n, pos, out, logits, err) : prompt_split(tokens, n, pos, out, logits, err);
 }
 
+bool PlainModel::encode(const int32_t* tokens, int64_t n, float* hidden, std::string& err) {
+    if (!opt_.encoder || hidden == nullptr || n <= 0 || n > opt_.max_cells) {
+        err = "plain model: encode takes an encoder's 1 .. max_cells tokens";
+        return false;
+    }
+    if (!reset(err)) return false;
+    enc_out_ = hidden;
+    int32_t next = 0;
+    const bool ok = prompt_one(tokens, n, 0, &next, nullptr, err);
+    enc_out_ = nullptr;
+    if (!ok && err.empty()) err = "plain model: the device cannot lend the prompt's buffers";
+    return ok;
+}
+
 // A layer split's prompt: every stage's buffers for chunks as long as its GPU's tier lends them, then each chunk of the
 // longest through the stages in turn, the rows handed on through pinned memory, a stage of shorter chunks reading them
 // in its own.  Chunks of the shortest everywhere made the RTX 4070's 1K the B70's too, which then read every missed
@@ -907,9 +921,9 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
             auto proj_hn = [&](const W& w, float* y, int64_t ldy = 0) {
                 if (!dense(w, P.hn, N, y, T, ldy)) proj(w, y, T, ldy, dense_half_sums_);
             };
-            // the last token's logits, by the decode's head
+            // the last token's logits, by the decode's head (an encoder's chunks write their rows instead, below)
             auto last_logits = [&] {
-                if (c0 + T < n) return;
+                if (c0 + T < n || enc_out_ != nullptr) return;
                 k::native_qsa_rms_norm_weighted(P.x + (T - 1) * N, out_norm_, P.hn, (int) N, 1, eps, cs);
                 if (head_.type == 30) {   // a BF16 head, as the decode reads it
                     k::bf16_gemv_fp32_mmvf_multi(P.hn, head_.n_in, static_cast<const uint16_t*>(head_.data), logits_,
@@ -1094,7 +1108,14 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                 k::add_inplace(P.x, P.moe_out, T * N, cs);
                 mark(3, t_mark);
             }
-            if (!last()) {   // the rows to the next stage
+            if (enc_out_ != nullptr) {   // encode: every row through the final norm, to the host
+                k::native_qsa_rms_norm_weighted(P.x, out_norm_, P.hn, (int) N, (int) T, eps, cs);
+                if (!strata::gpu::stream_sync(cs) ||
+                    !strata::gpu::copy(enc_out_ + (c0 - c_begin) * N, P.hn, (size_t) (T * N) * 4)) {
+                    err = std::string("plain prompt: the encoder's rows: ") + strata::gpu::last_error();
+                    return false;
+                }
+            } else if (!last()) {   // the rows to the next stage
                 if (!strata::gpu::copy_async(hand, P.x, (size_t) (T * N) * 4, cs)) {
                     err = std::string("plain prompt: the rows to the next GPU: ") + strata::gpu::last_error();
                     return false;

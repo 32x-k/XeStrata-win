@@ -489,6 +489,11 @@ bool PlainModel::load_qwen(std::string& err) {
         const char* e = std::getenv("STRATA_PLAIN_EAGER");
         eager_ = e != nullptr && (e[0] == '0' || e[0] == '1') ? e[0] - '0' : -1;
     }
+    if (opt_.encoder && (!dense_ || !opt_.split_at.empty() || opt_.split_auto)) {
+        err = "plain model: an encoder is a dense model (qwen35) on one GPU";
+        return false;
+    }
+    if (opt_.encoder) opt_.spec = 0;   // no decode: no MTP layer, no drafts
     has_gate_ = q35;
     has_shared_ = q35 && !dense_;
     bool shape_ok = s.key_length == s.value_length && (s.key_length == 128 || s.key_length == 256) &&
@@ -544,11 +549,14 @@ bool PlainModel::load_qwen(std::string& err) {
         if (emb_row_ == 0) { err = "plain model: token_embd.weight's type has no host dequantizer"; return false; }
         emb_ = m.shard(at).tensor_data(*t);
     }
-    if (last()) {   // the head: the last stage's
-        if (!upload(m, "output.weight", head_, err) ||
+    if (last()) {   // the head: the last stage's (an encoder's states end at the final norm: no head)
+        if ((!opt_.encoder && !upload(m, "output.weight", head_, err)) ||
             !upload_f32(m, "output_norm.weight", (uint64_t) s.n_embd, out_norm_, err))
             return false;
-        if (head_.n_in != s.n_embd || head_.n_out != n_vocab_) { err = "plain model: output.weight's shape"; return false; }
+        if (!opt_.encoder && (head_.n_in != s.n_embd || head_.n_out != n_vocab_)) {
+            err = "plain model: output.weight's shape";
+            return false;
+        }
     }
 
     const uint64_t N = (uint64_t) s.n_embd, E = (uint64_t) s.n_expert;
@@ -669,8 +677,8 @@ bool PlainModel::load_qwen(std::string& err) {
     n_pages_ = (opt_.max_cells + qs.page_size - 1) / qs.page_size;
     opt_.max_cells = n_pages_ * qs.page_size;
     // the decode attention's form for this GPU (an fp16 cache), timed before any graph is recorded and before the cache
-    // takes its VRAM
-    if (!opt_.kv_int8) {
+    // takes its VRAM (an encoder does not decode)
+    if (!opt_.kv_int8 && !opt_.encoder) {
         try {
             k::qsa_dense_attn_tune(qs, opt_.max_cells, cs_);
         } catch (const std::exception& e) {

@@ -71,6 +71,9 @@ struct PlainOptions {
     /// --vision (qwen35, qwen35moe): pictures among the prompt's tokens (plain_generate's GENI): their rows in place
     /// of the token embeddings (set_embeddings) and every cell's M-RoPE position from a table (set_positions)
     bool vision = false;
+    /// An image model's text encoder (encode: MOSS-Image reads Qwen3.5-9B's states): no head, no decode attention
+    /// timed; the prompt runs in chunks only.  A dense model (qwen35) on one GPU.
+    bool encoder = false;
     /// --vram-elastic (#533; --serve, one GPU with virtual memory): the expert slots in physical segments of
     /// vram_segment_mib that `vram` gives back to the driver and maps again between requests
     bool vram_elastic = false;
@@ -197,6 +200,10 @@ public:
     /// Runs each dense product the prompt takes once, so the products' library has loaded its kernels before the
     /// first prompt (plain_prompt.cpp); nothing when the prompt runs in windows.
     bool prompt_warm(std::string& err);
+    /// An encoder's (PlainOptions::encoder) states of the prompt tokens [0, n) from position 0: `hidden` takes n rows of
+    /// n_embd floats, every token's last block output through the final norm (host).  The state is reset first and left
+    /// as the prompt leaves it.  False with the reason, also when the device cannot lend the prompt's buffers.
+    bool encode(const int32_t* tokens, int64_t n, float* hidden, std::string& err);
     /// Whether every MoE layer's experts take the int8 products on this GPU (iq_mmq; STRATA_PLAIN_MMQ=0: no).
     bool prompt_int8() const;
 
@@ -289,6 +296,7 @@ private:
     /// pinned: a layer split's prompt rows in and out, up to prompt_chunk of them (each stage reads them in chunks of
     /// its own, as long as its tier lends the buffers for)
     float* hand_host_ = nullptr;
+    float* enc_out_ = nullptr;   ///< encode's rows (host): prompt_chunks writes every row there, normed, no logits
     bool in_ram_ = false;              ///< the experts in pinned RAM (an arena), else read in place
     bool level_zero_ = false;
     uint64_t total_b_ = 0;             ///< the GPU's memory
