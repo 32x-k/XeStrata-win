@@ -549,6 +549,23 @@ applies at the next start. Network, key, MCP and program keys are not editable t
   `--parallel`, only a `max_tokens` 1 request gets them: it is the one a batch slot decodes through the single-token
   path, which writes an LP line. A longer reply there is a 400, since the slot's `BT` lines carry none -- entries for
   a prefix only, which a client cannot tell from the model's own answer.
+- `STRATA_SPEC_PROB=1` with the default `--spec-min-p` gate: the gate tests the token the draft head drew from its distribution
+  q. A draft that fails the gate still counts as a proposal. The verifier keeps q's mass on the tokens that pass the gate
+  (not renormalised; call it mu), accepts an offered token D with probability min(1, p(D)/mu(D)), and draws the replacement
+  for a rejection or a failed gate from the positive part of p - mu. The older rule checked against the unfiltered q and
+  treated a failed gate as a plain sample, which shifts the output: with p = (0.5, 0.5), q = (0.875, 0.125) and a threshold
+  of 0.5 it gave (0.5625, 0.4375). `STRATA_SPEC_PROB_GATE=top` gates on q's largest probability before the draw instead and
+  keeps the normalised-q rule. The gated rule needs serial decode on one device with `--lookup-chain 0 --adapt-swaps 0
+  --pcie-frac 0` and without `STRATA_SPEC_COST`; otherwise the engine says so once and keeps the older rule. This is a
+  correctness change, not a speed change. `spec_admission_test` enumerates the rule exactly for a two-token vocabulary,
+  `gated_proposal_test` checks the proposal packet and `spec_proposal_parity` checks the GPU verifier against a CPU
+  reference. A model-level distribution run is not published yet.
+- With `STRATA_SPEC_PROB=1` the CPU experts of a native (IQ) pack compute a token's rows the same way whatever the window
+  width: the grouped kernels that round differently from the one-token result are replaced by the one-token arithmetic,
+  and the grouped kernels that already match it stay. Prefill and every other decode keep their arithmetic.
+  `native_arithmetic_parity` checks every group width from 1 to 8 for the supported formats, bit for bit. Comparing other
+  decode modes against each other still needs one target evaluator; `STRATA_IQ_MT_MIN=1` selects the grouped IQ arithmetic
+  at every width and also changes prefill, so keep it the same in both arms.
 - **Non-finite logits end the request and drop the cached state (on by default).** If a verify window's logits are NaN, the
   window emits no tokens, the request ends, and the next request drops the live session, checkpoints and parked
   conversations and reads its prompt from token 0. The server retries a request that had sent nothing once, transparently.
