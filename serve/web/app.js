@@ -1449,7 +1449,7 @@ async function generateReply() {
   for (const t of m.tools || []) if (t.state === "writing" || t.state === "running") { t.state = "skipped"; t.ms = null; }
   const ran = (m.tools || []).filter((t) => t.state === "done" || t.state === "error").length;
   if (ran) m.meta = `${m.meta ? `${m.meta} · ` : ""}${tr("chat.toolCalls", {one: "{n} tool call", other: "{n} tool calls"}, {n: ran})}`;
-  if (m.limit) m.meta = `${m.meta || ""} · ${tr("chat.toolLimit", "stopped at the limit of {n} tool rounds (mcp.max_rounds)", {n: m.limit})}`;
+  if (m.limit) m.meta = `${m.meta || ""} · ${tr("chat.toolLimit", "tool limit reached ({n} rounds, mcp.max_rounds)", {n: m.limit})}`;
   busy = null;
   setBusy(false);
   paintLive();

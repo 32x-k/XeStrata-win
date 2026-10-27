@@ -26,7 +26,7 @@
   "chat.stoppedLower": "остановлено",
   "chat.tokens": "{n} токенов",
   "chat.toolCalls": {"one": "{n} вызов инструмента", "few": "{n} вызова инструмента", "many": "{n} вызовов инструмента", "other": "{n} вызова инструмента"},
-  "chat.toolLimit": "остановлено на пределе в {n} раундов инструментов (mcp.max_rounds)",
+  "chat.toolLimit": "достигнут предел инструментов ({n} раундов, mcp.max_rounds)",
   "chat.untitled": "Новый чат",
   "chat.you": "Вы",
   "close": "Закрыть",

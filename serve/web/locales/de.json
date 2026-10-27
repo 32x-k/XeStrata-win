@@ -26,7 +26,7 @@
   "chat.stoppedLower": "gestoppt",
   "chat.tokens": "{n} Tokens",
   "chat.toolCalls": {"one": "{n} Werkzeugaufruf", "other": "{n} Werkzeugaufrufe"},
-  "chat.toolLimit": "bei der Grenze von {n} Werkzeugrunden gestoppt (mcp.max_rounds)",
+  "chat.toolLimit": "Werkzeuggrenze erreicht ({n} Runden, mcp.max_rounds)",
   "chat.untitled": "Neuer Chat",
   "chat.you": "Sie",
   "close": "Schließen",

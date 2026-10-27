@@ -26,7 +26,7 @@
   "chat.stoppedLower": "已停止",
   "chat.tokens": "{n} 个 token",
   "chat.toolCalls": {"other": "{n} 次工具调用"},
-  "chat.toolLimit": "已在 {n} 轮工具调用的上限处停止 (mcp.max_rounds)",
+  "chat.toolLimit": "已达到 {n} 轮工具调用的上限 (mcp.max_rounds)",
   "chat.untitled": "新聊天",
   "chat.you": "你",
   "close": "关闭",

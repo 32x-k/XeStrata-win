@@ -26,7 +26,7 @@
   "chat.stoppedLower": "停止",
   "chat.tokens": "{n} トークン",
   "chat.toolCalls": {"other": "ツール呼び出し {n} 回"},
-  "chat.toolLimit": "ツールのラウンド上限 {n} 回で停止 (mcp.max_rounds)",
+  "chat.toolLimit": "ツールのラウンド上限 {n} 回に到達 (mcp.max_rounds)",
   "chat.untitled": "新しいチャット",
   "chat.you": "あなた",
   "close": "閉じる",

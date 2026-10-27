@@ -29,7 +29,7 @@
     "one": "{n} appel d’outil",
     "other": "{n} appels d’outils"
   },
-  "chat.toolLimit": "arrêtée à la limite de {n} tours d’outils (mcp.max_rounds)",
+  "chat.toolLimit": "limite d’outils atteinte ({n} tours, mcp.max_rounds)",
   "chat.untitled": "Nouvelle conversation",
   "chat.you": "Vous",
   "close": "Fermer",

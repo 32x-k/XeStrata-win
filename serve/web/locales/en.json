@@ -29,7 +29,7 @@
     "one": "{n} tool call",
     "other": "{n} tool calls"
   },
-  "chat.toolLimit": "stopped at the limit of {n} tool rounds (mcp.max_rounds)",
+  "chat.toolLimit": "tool limit reached ({n} rounds, mcp.max_rounds)",
   "chat.untitled": "New chat",
   "chat.you": "You",
   "close": "Close",
