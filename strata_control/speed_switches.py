@@ -26,14 +26,19 @@ class Switch:
     label: str                    # the words the app shows
     effect: str                   # one plain sentence: what it does and what the other choice does
     env: tuple[tuple[str, str], ...]   # the environment entries written when the switch is NOT in its default state
-    only: str                     # "qwen-gpu" | "qwen-radeon-9000" | "deepseek": where it applies
+    only: str                     # "qwen-gpu" | "qwen-cuda-12gb" | "qwen-radeon-9000" | "deepseek" | "qwen-any": where it applies
     default: str = "on"           # "on" | "off": what a launch without the entries does
+    legacy: tuple[tuple[str, str], ...] = ()    # entries an earlier 0.2.7 test build wrote for the same state: they read as the switch being set, and are removed with it
+    terminal_only: bool = False   # shown in the Terminal's Advanced table only, never in the app
 
 
 SWITCHES: tuple[Switch, ...] = (
     Switch("faster_long_prompts", "Faster long prompts",
            "Reads very long prompts faster by approximating part of the work. Off by default: answers about long documents can miss or mix up details.",
            (("STRATA_KVA", "1"),), "qwen-gpu", default="off"),
+    Switch("faster_12gb_nvidia", "Faster answers on 12 GB NVIDIA cards",
+           "Prefers the parts of the model already on the graphics card, which makes answers much faster on 12 GB cards. Turn off if answers look worse than before.",
+           (("STRATA_ROUTE_PRIOR", "0"),), "qwen-cuda-12gb"),
     Switch("faster_radeon_9000", "Faster answers on Radeon RX 9000 / AI PRO R9700",
            "Shares the work between the graphics card and the processor in a way that makes answers faster on these cards. "
            "Turn off to go back to the previous setting, which is slower.",
@@ -41,14 +46,35 @@ SWITCHES: tuple[Switch, ...] = (
     Switch("deepseek_speedups", "DeepSeek speed-ups",
            "Reads long prompts faster and loads the parts of the model it needs faster. "
            "Turn off if DeepSeek stops working or its answers look wrong; it then runs as in version 0.2.6.",
-           (("DS4_FAST_ATTN", "0"), ("DS4_ATTN_SLAB", "0"), ("DS4_COPY_PIN", "0"), ("DS4_COPY_HUGETLB", "0"),
-            ("DS4_STORE_SPARE", "0"), ("DS4_STORE_PUT", "0")), "deepseek"),
+           # DS4_DEFAULTS=026: the engine's master switch back to the 0.2.6 defaults; the six are what older engines (and the test builds) read
+           (("DS4_DEFAULTS", "026"), ("DS4_FAST_ATTN", "0"), ("DS4_ATTN_SLAB", "0"), ("DS4_COPY_PIN", "0"), ("DS4_COPY_HUGETLB", "0"),
+            ("DS4_STORE_SPARE", "0"), ("DS4_STORE_PUT", "0")), "deepseek",
+           legacy=(("DS4_FAST_ATTN", "0"), ("DS4_ATTN_SLAB", "0"), ("DS4_COPY_PIN", "0"), ("DS4_COPY_HUGETLB", "0"),
+                   ("DS4_STORE_SPARE", "0"), ("DS4_STORE_PUT", "0"))),
+    # Troubleshooting only, in the Terminal's Advanced table and nowhere else: every Qwen 0.2.7 default back to its 0.2.6 behaviour.
+    Switch("qwen_defaults_026", "Qwen: 0.2.6 behaviour",
+           "Starts every Qwen speed setting new in 0.2.7 the way 0.2.6 did, for troubleshooting. Use it if something that worked before no longer does.",
+           (("STRATA_DEFAULTS", "026"),), "qwen-any", default="off", terminal_only=True),
 )
 
 BY_ID = {s.id: s for s in SWITCHES}
 
 _GFX12 = re.compile(r"^gfx120[01]$", re.IGNORECASE)
 _RADEON_9000 = re.compile(r"\b(?:RX\s*9\d{3}|AI\s*PRO\s*R97\d{2}|R97\d{2})\b", re.IGNORECASE)
+
+
+def _small_nvidia(gpus: Iterable[Mapping[str, Any]] | None) -> bool:
+    """A discrete NVIDIA card of 13 GiB or less (the engine's rule for residency-biased routing: not an integrated chip, not a card that shares system memory)."""
+    for g in gpus or []:
+        if g.get("usable") is False or g.get("uma") or g.get("integrated") or (g.get("unified_gb") or 0) > 0:
+            continue
+        vendor = str(g.get("vendor") or "").lower()
+        if vendor not in ("nvidia", "") or (vendor == "" and not re.search(r"nvidia|geforce|\brtx\b|\bgtx\b|quadro|tesla", str(g.get("name") or ""), re.IGNORECASE)):
+            continue
+        vram = float(g.get("vram_gb") or 0)
+        if 0 < vram <= 13.0:
+            return True
+    return False
 
 
 def is_deepseek(cfg: Mapping[str, Any] | None) -> bool:
@@ -74,11 +100,16 @@ def applies(switch: Switch | str, cfg: Mapping[str, Any] | None, gpus: Iterable[
         return is_deepseek(cfg)
     if is_deepseek(cfg):
         return False
+    if sw.only == "qwen-any":
+        return True
     backend = (cfg or {}).get("backend") or backend
     if sw.only == "qwen-gpu":
         # KVA was measured on the Qwen3.8-Flash-Next shape (48 layers, 512 experts); the engine declines any other.  Setup writes "arch" only for the
         # families with an engine path of their own (Qwen3.6-35B-A3B: qwen35moe), so a Flash-Next config (the original, Swift, Coder, Unsloth, Gyro, NVFP4) has none.
         return not (cfg or {}).get("arch") and backend in ("cuda", "hip")
+    if sw.only == "qwen-cuda-12gb":
+        # the engine's residency-biased routing needs the Flash-Next shape (512 experts, top-10) and a CUDA build; a Qwen3.6 config has an "arch"
+        return not (cfg or {}).get("arch") and backend == "cuda" and _small_nvidia(gpus)
     if sw.only == "qwen-radeon-9000":
         return backend == "hip" and _radeon_9000(gpus)
     return False
@@ -89,11 +120,17 @@ def applicable(cfg: Mapping[str, Any] | None, gpus: Iterable[Mapping[str, Any]] 
     return [s for s in SWITCHES if applies(s, cfg, gpus, backend)]
 
 
+def app_switches() -> list[Switch]:
+    """The switches the app shows (apps/host/server/native-settings.mjs SPEED_SWITCHES): all but the Terminal-only ones."""
+    return [s for s in SWITCHES if not s.terminal_only]
+
+
 def is_set(env: Mapping[str, Any] | None, switch: Switch | str) -> bool:
     """Every entry the switch writes is there with its value (the switch is out of its default).  A file with only some of them, or other values
     (``STRATA_KVA=0``), is in the default state and is left alone."""
     sw = BY_ID[switch] if isinstance(switch, str) else switch
-    return all((env or {}).get(name) == value for name, value in sw.env)
+    have = lambda entries: bool(entries) and all((env or {}).get(name) == value for name, value in entries)   # noqa: E731
+    return have(sw.env) or have(sw.legacy)
 
 
 def is_on(env: Mapping[str, Any] | None, switch: Switch | str) -> bool:
@@ -111,6 +148,9 @@ def set_switch(env: Mapping[str, Any] | None, switch: Switch | str, on: bool) ->
         if write:
             out[name] = value
         else:
+            out.pop(name, None)
+    if not write:
+        for name, _ in sw.legacy:
             out.pop(name, None)
     return out
 

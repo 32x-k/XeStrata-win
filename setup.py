@@ -25,7 +25,7 @@ Options: --family qwen|swift, --model Q2_0|IQ2_XS|IQ3_XXS|IQ3_S, --context 32768
 at least 1 - an explicit --rope-scaling none is refused for such a context), --vision yes|no|gpu|cpu, --port
 8080, --yes (recommended
 answers, no questions), --setup (install another model / change settings instead of starting), --no-start,
---host 0.0.0.0 --api-key KEY (reach it from other devices on your network), --experimental-speed-projection on|off
+--host 0.0.0.0 --api-key KEY (reach it over IPv4; use --host :: for IPv6), --experimental-speed-projection on|off
 (EXPERIMENTAL, off by default),
 --models-dir DIR, --gguf-dir DIR (use GGUF files you already have), --build (compile instead of the ready-made
 engine), --check (only check this PC), --resident-budget-gib N (UD-Q4_K_XL's or UD-IQ4_XS's experts in RAM),
@@ -69,6 +69,7 @@ tls.install()      # #3722: HTTPS checks the server against the operating system
 from strata_control import atomic
 from strata_control import draft_layer
 from strata_control import dsv41_context
+from strata_control import engine_component
 from strata_control.discovery import in_trash
 from strata_control import user_args
 
@@ -1551,6 +1552,26 @@ def sm60_card(arch) -> bool:
     return 60 <= int(arch) <= 70
 
 
+def maxwell_card(arch) -> bool:
+    """#3218: Maxwell (5.x).  No ready-made engine holds code for it; it is a source build (docs/OLDER_GPUS.md)."""
+    return 50 <= int(arch) < 60
+
+
+def maxwell_note(found) -> str:
+    """#3218: what to tell a PC whose only NVIDIA cards are Maxwell: setup cannot install an engine for it, and a
+    source build exists.  Empty when there is no Maxwell card.  A warning with the way forward, never a switch: setup
+    does not route a Maxwell card to an engine that holds no code for it."""
+    cards = [g for g in found if maxwell_card(g["arch"])]
+    if not cards:
+        return ""
+    names = ", ".join(f"GPU {g['index']} ({g['name']})" for g in cards)
+    return (f"{names}: Maxwell (compute capability {cc(cards[0])}). No ready-made Strata engine holds code for it, so "
+            "setup cannot install one. One reporter built the engine from source for two Quadro M6000 with a CUDA 12.x "
+            "toolkit (cmake -B build -G Ninja -DSTRATA_EXPERIMENTAL_SM60=ON -DCMAKE_CUDA_ARCHITECTURES=52) and saw about "
+            "22 tokens a second with a 1-bit Qwen3.8-Flash-Next; nobody has checked the answer text yet. Steps and "
+            "caveats: docs/OLDER_GPUS.md. A card of the RTX 20 series or newer runs the ready-made engine")
+
+
 def old_gpus_opt_in(found, named=(), cuda=None, other=False):
     """Why this run may use Pascal / Volta cards (the experimental CUDA 12 engine), or None.  The cards are an opt-in:
     the user named one (`named`: --gpu / --gpus), asked for --cuda 12, set STRATA_EXPERIMENTAL_SM60=1, or the PC has
@@ -1617,7 +1638,8 @@ def gpu_problem(g, together=False):
     if int(g["arch"]) < 75 and not (sm60_card(g["arch"]) and experimental_sm60()):
         return (f"not supported - older than the RTX 20 series (compute capability {cc(g)}; Strata needs 7.5 or "
                 "newer" + ("; experimental: choose it with --gpu " + str(g["index"]) + " (the CUDA 12 engine, "
-                          "docs/OLDER_GPUS.md)" if sm60_card(g["arch"]) else "") + ")")
+                          "docs/OLDER_GPUS.md)" if sm60_card(g["arch"]) else
+                          "; Maxwell only runs from a source build, docs/OLDER_GPUS.md" if maxwell_card(g["arch"]) else "") + ")")
     if together and g["vram_gb"] < SPLIT_MIN_VRAM_GB - 0.5:
         return (f"not supported together with other GPUs - {g['vram_gb']:.0f} GB of VRAM (a card sharing the model "
                 f"needs {SPLIT_MIN_VRAM_GB} GB or more)")
@@ -2884,12 +2906,14 @@ def download(url, dst: Path, what=None):
             time.sleep(5)
     if not total:
         total = range_total(url)
+    meta = ms_meta(*ms) if ms is not None else None
+    if not total:                                  # published size also governs partial-file completion
+        total = pin[0] if pin else (meta[0] if meta else 0)
     if pin and total and total != pin[0]:              # not the pinned file: stop before the download, not after
         fail(f"{what or dst.name} is {total:,} bytes on {url.split('/')[2]}, not the pinned {pin[0]:,}",
              "update Strata (the file there has changed since this version pinned it)")
     label = what or dst.name
     conns = dl_connections()
-    meta = ms_meta(*ms) if ms is not None else None
     fixed = pin if pin else (meta if meta is not None and meta[1] else None)
     again = (lambda: repair_download(url, dst, total, label, conns)) if total >= DL_MIN_PARALLEL and conns > 1 else None
     if dst.exists() and total and dst.stat().st_size == total:    # finished by an older setup (no mark yet), or stopped before the check
@@ -4196,12 +4220,16 @@ def amd_gpus_windows(adapters=None, registry=None) -> list[dict]:
 
 def engine_env(eng: Path) -> dict:
     """The environment for running an installed engine's own programs (`strata --families`, `strata-device
-    --list-devices`): the ready-made Windows HIP engine keeps hipblas.dll / libhipblaslt.dll in its rocm/bin, which the
-    loader finds through PATH only (#2372: a launch without it shows a "not found" dialog per DLL and prints nothing)."""
+    --list-devices`): the engine's ROCm library folders (its BUILD.json "lib_dirs") first on the dynamic-library path -
+    on Windows that is PATH, where the ready-made HIP engine keeps hipblas.dll / libhipblaslt.dll in its rocm/bin and the
+    loader finds them only through PATH (#2372: a launch without it shows a "not found" dialog per DLL and prints
+    nothing); on Linux and elsewhere it is LD_LIBRARY_PATH, where a probe without it exits 127 on libhipblas.so.3 and
+    prints nothing."""
     env = dict(os.environ)
     dirs = [str(d) for d in hip_lib_dirs(eng)]
     if dirs:
-        env["PATH"] = os.pathsep.join(dirs + [env.get("PATH", "")])
+        var = "PATH" if os.name == "nt" else "LD_LIBRARY_PATH"
+        env[var] = os.pathsep.join(dirs + ([env[var]] if env.get(var) else []))
     return env
 
 
@@ -5572,9 +5600,35 @@ def ensure_build_tools():
     return cmake, ninja
 
 
+def configured_generator(bdir: Path) -> str | None:
+    """The generator a build folder was configured with (CMakeCache.txt), None when it was never configured."""
+    try:
+        for line in (Path(bdir) / "CMakeCache.txt").read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("CMAKE_GENERATOR:"):
+                return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
+def fresh_if_other_generator(bdir: Path, generator: str = "Ninja") -> bool:
+    """CMake refuses to configure a folder with another generator than the one it was made with ("Does not match the generator used
+    previously"). The manual build in docs/INSTALL.md uses CMake's default, Unix Makefiles on Linux, in the same build/ folder (#4038).
+    Such a folder is configured afresh: its cache is removed (the compiled objects of the other generator are not reused anyway), with one
+    plain line. True when it did."""
+    had = configured_generator(bdir)
+    if had is None or had == generator:
+        return False
+    say(f"  {Path(bdir).name}/ was configured with {had}; setup builds with {generator}, so it is configured again (the other build is not used)")
+    (Path(bdir) / "CMakeCache.txt").unlink(missing_ok=True)
+    shutil.rmtree(Path(bdir) / "CMakeFiles", ignore_errors=True)
+    return True
+
+
 def cmake_build(src, bdir, target, defs, vcvars, bat_name):
     acquisition.require("a compile (cmake)")
     cmake, ninja = ensure_build_tools()
+    fresh_if_other_generator(bdir)
     conf = [cmake, "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={ninja}", "-S", str(src), "-B", str(bdir),
             "-DCMAKE_BUILD_TYPE=Release", *defs]
     build = [cmake, "--build", str(bdir), "--target", target, "-j", str(max(2, (os.cpu_count() or 4) // 2))]
@@ -6851,7 +6905,10 @@ def _start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open
     """keep: settings given on this start that the model keeps from now on (--host, --api-key, --draft-vocab,
     --vram-reserve-mib)."""
     cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
-    missing = [p for p in [cfg["exe"], *[a for a in cfg["args"] if a.endswith(".gguf")]] if not Path(p).exists()]
+    component = engine_component.is_reference(cfg["exe"])
+    # The server resolves and verifies component engines; the reference itself is not a file.
+    files = ([] if component else [cfg["exe"]]) + [a for a in cfg["args"] if a.endswith(".gguf")]
+    missing = [p for p in files if not Path(p).exists()]
     if missing:
         fail(f"{cfg_path.name} refers to missing files: {missing[0]}", "run it again with --setup to repair")
     keep = {k: v for k, v in (keep or {}).items() if v is not None}
@@ -6879,12 +6936,12 @@ def _start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open
     cmd = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
            "--port", str(port or cfg.get("port", 8080))]
     if cfg.get("backend") == "hip":                    # AMD, numbered as HIP numbers them (setup's KFD order)
-        if WIN:
+        if WIN and not component:
             hip_runtime_beside_exe(Path(cfg["exe"]).parent)   # #468 #461: also fixes a 0.1.34 install
         amd = amd_gpus()
         if isinstance(gpu, list):                      # --gpus: saved, this model runs on these cards from now on
             cards = amd_parse_gpus(",".join(str(i) for i in gpu), amd)
-            built = (engine_archs_hip() or [])
+            built = [] if component else (engine_archs_hip() or [])
             miss = [x for x in cards if built and x["arch"] not in built]
             if miss:
                 fail("the installed engine has no code for " + ", ".join(f"{x['name']} ({x['arch']})" for x in miss),
@@ -7297,6 +7354,8 @@ def ensure_engine_for(cards, cfg_path: Path, cfg: dict, yes: bool) -> dict:
     older or newer generation, #128) or a new GPU in the PC otherwise stops the start with 'no kernel image'.  Such a
     card gets the engine compiled for all of them, before the start.  A Pascal / Volta card added to a model on the
     CUDA 13 engine moves the model to the experimental CUDA 12 engine (CUDA 13 has no code for it)."""
+    if engine_component.is_reference(cfg.get("exe")):
+        return cfg                                    # the server checks the installed component, not ROOT/engine
     tk = config_toolkit(cfg)
     if tk == 13 and any(int(g["arch"]) < CUDA13_MIN_ARCH for g in cards):
         return use_cuda12(cards, cfg_path, cfg, yes)
@@ -7391,7 +7450,7 @@ def derived_factor(ctx: int, trained: int = 262144) -> float:
 def resolve_rope(ctx: int, scaling, scale, trained: int = 262144):
     """The rope config for the context ACTUALLY SERVED: (scaling, scale); scaling None = no scaling flags.
 
-    An explicit --rope-scaling/--rope-scale always wins - a user-supplied factor is kept verbatim even
+    An explicit --rope-scaling/--rope-scale always wins - a valid user-supplied factor is kept verbatim even
     when a reduction changed the context.  Past the trained range an omitted method defaults to yarn -
     llama.cpp's extension method: the trained angles survive on the high-frequency pairs and the
     magnitude correction keeps the attention temperature - and an omitted factor is derived from the
@@ -7400,6 +7459,8 @@ def resolve_rope(ctx: int, scaling, scale, trained: int = 262144):
     past the trained range (the setup will not configure a run it knows is out of spec) rather than
     silently overridden.
     """
+    if scale is not None and (not math.isfinite(scale) or scale < 1.0):
+        raise ValueError("--rope-scale must be a finite value >= 1, e.g. --rope-scale 4")
     if ctx <= trained:
         if scale is not None and scaling in (None, "none"):
             raise ValueError("--rope-scale needs --rope-scaling linear or yarn (the chosen context fits the "
@@ -7719,7 +7780,9 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     gguf = folder / fam["file"].format(q=model)
     size = fam["sha256"][gguf.name][0]
     part = gguf.with_name(gguf.name + ".part")
-    left = 0 if gguf.exists() and done(gguf) else (size - (part.stat().st_size if part.is_file() else 0)) / 1e9
+    def have(p: Path) -> bool:                         # --gguf-dir: the person's own file has no finish mark; verify_sha256 checks and writes it
+        return p.exists() and (done(p) or bool(a.gguf_dir))
+    left = 0 if have(gguf) else (size - (part.stat().st_size if part.is_file() else 0)) / 1e9
     if left and free_gb(folder) < left:
         fail(f"not enough free disk space in {folder}: need ~{left:.0f} GB, {free_gb(folder):.0f} GB free", ("use --data-dir on a bigger drive (strata launch --data-dir)" if CONTROL else "use --models-dir on a bigger drive"))
     if left and free_gb(folder) < left + 1:
@@ -7743,7 +7806,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     ok("engine: the engine component (looked up when the model loads)" if CONTROL else f"engine: {eng / EXE}")
 
     step(5, f"downloading {fam['title']} {model}")
-    if gguf.exists() and done(gguf):
+    if have(gguf):
         ok(f"{gguf.name} already downloaded")
     else:
         if a.gguf_dir:
@@ -7753,7 +7816,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     ok(f"model file: {gguf}")
     mmproj = folder / fam["mmproj"]
     if vision != "none":                               # the image encoder: Unsloth's mmproj, pinned, size + SHA-256 checked
-        if mmproj.exists() and done(mmproj):
+        if have(mmproj):
             ok(f"{mmproj.name} already downloaded")
         else:
             if a.gguf_dir:
@@ -8214,11 +8277,13 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
         lib_dirs = [*lib_dirs, *dsv41_engine.lib_dirs(exe)]   # its own package, and the rocm/bin an AMD package keeps the ROCm DLLs in
     if exe is None:
         if os.environ.get("STRATA_VERBOSE") == "1" or "--verbose" in sys.argv:
-            say("  Details for developers: build it with cmake -DSTRATA_BUILD_DSV41=ON and point STRATA_DSV41_EXE at it.")
+            say("  Details for developers: build it with cmake -DSTRATA_BUILD_DSV41=ON -DCMAKE_CUDA_ARCHITECTURES=<your card: 86 RTX 30, 89 RTX 40, 120 RTX 50> "
+                "and point STRATA_DSV41_EXE at it (docs/DEEPSEEK41.md, \"Building the engine for your card\").")
         fail("DeepSeek's engine is not available for this computer yet",
              "Supported graphics cards: NVIDIA RTX 30, 40 and 50 series, the Radeon AI PRO R9700, and a Ryzen AI Max (Strix Halo) on "
              "Windows with the AMD DeepSeek engine package. " + dsv41_manual_steps(eng)
-             + " Or update Strata later (a newer version may add your card), or pick another model. Nothing has been downloaded.")
+             + " Or update Strata later (a newer version may add your card), pick another model, or build the engine for your card yourself "
+             "(docs/DEEPSEEK41.md, \"Building the engine for your card\"). Nothing has been downloaded.")
     ok(f"engine: {exe}")
 
     step(5, f"downloading {fam['title']} {model}")
@@ -8604,8 +8669,8 @@ def main() -> int:
                          "interpolation) or yarn - llama.cpp's types. Omitted with a scaled context, the setup "
                          "picks yarn; 'none' is refused for such a context")
     ap.add_argument("--rope-scale", type=float,
-                    help="the extension factor (default: the final context over the trained 262144, at least 1 - "
-                         "1.5 for 384K, 2 for 512K, 1 inside the trained range)")
+                    help="the extension factor, finite and >= 1 (default: the final context over the trained "
+                         "262144, at least 1 - 1.5 for 384K, 2 for 512K, 1 inside the trained range)")
     ap.add_argument("--kv", choices=["int8", "q4_0", "k8v4", "fp16"],
                     help="KV cache precision above 8K context: int8 (default), q4_0 (half the memory, a little less "
                          "precise) k8v4 (hybrid: INT8 K + 4-bit V, 816 B/cell) or fp16 (16-bit, twice the memory of int8)")
@@ -8643,9 +8708,10 @@ def main() -> int:
                                           "auto, placed from each GPU's free VRAM")
     ap.add_argument("--no-remote-expert-opt", action="store_true",
                     help="with two or more GPUs: leave out --remote-expert-opt, which setup adds there (#578)")
-    ap.add_argument("--host", help="where the server listens: 127.0.0.1 = this PC only (default), 0.0.0.0 = also other "
-                                   "devices on your network (issue #26; an --api-key is recommended)")
-    ap.add_argument("--api-key", help="require this key from clients (recommended with --host 0.0.0.0); several keys: key1,key2")
+    ap.add_argument("--host", help="where the server listens: 127.0.0.1 = this PC only (default), 0.0.0.0 = all IPv4 "
+                                   "interfaces, :: = all IPv6 interfaces (issue #26; an --api-key is recommended)")
+    ap.add_argument("--api-key", help="require this key from clients (recommended with --host 0.0.0.0 or --host ::); "
+                                      "several keys: key1,key2")
     ap.add_argument("--no-browser", dest="browser", action="store_false", default=None,
                     help="do not open the chat page in the browser when the model is ready (for a harness or an app "
                          "that uses the API; remembered for this model, also in run-<model>.bat/.sh)")
@@ -8882,6 +8948,8 @@ def main() -> int:
         warn(f"older NVIDIA GPUs (Pascal / Volta) can be used ({OLD_GPUS}): experimental, through a second engine "
              "built with CUDA 12 (docs/OLDER_GPUS.md)")
     nv_ok = any(gpu_problem(g) is None for g in found)
+    if not nv_ok and not amd_ok and a.backend != "hip" and maxwell_note(found):    # #3218: a warning with the way forward
+        warn(maxwell_note(found))
     hip = a.backend == "hip" or (a.backend is None and not nv_ok and bool(amd_ok))
     if a.backend is None and nv_ok and amd_ok:
         # both kinds of card: asked (a first run on such a PC used to take NVIDIA without mentioning the Radeon)

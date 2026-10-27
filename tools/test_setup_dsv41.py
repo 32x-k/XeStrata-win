@@ -315,6 +315,22 @@ class Catalog(unittest.TestCase):
         small = next(f for f in s.model_table({"ram_gb": 32.0, "gpus": []}) if f["family"] == "deepseek41")
         self.assertTrue(all(x["on_this_pc"].startswith("does not fit") for x in small["sizes"]))      # no card
 
+    def test_each_set_states_the_free_disk_it_needs_from_the_set_itself(self):
+        """The app's DeepSeek card says "Needs about N GB of free disk space": N is the set's whole download plus the pack and room to work, per set."""
+        import strata_mcp as M
+        s = M.Strata(ROOT)
+        table = s.model_table({"ram_gb": 251.0, "gpus": [{**c, "usable": True} for c in FOUR], "engine_vendor": "amd"})
+        fam = next(f for f in table if f["family"] == "deepseek41")
+        for size in fam["sizes"]:
+            self.assertEqual(size["disk_gb"], round(size["download_gb"] + dsv41_fit.DISK_HEADROOM_GB, 1), size["model"])
+        by = {x["model"]: x["disk_gb"] for x in fam["sizes"]}
+        self.assertNotEqual(by["IST-DAS-2.00bpw"], by["IST-DAS-2.25bpw"], "2.00 and 2.25 do not need the same disk")
+        self.assertGreater(by["IST-DAS-2.25bpw"], by["IST-DAS-2.00bpw"])
+        self.assertGreater(by["IST-DAS-2.00bpw"], by["IST-DAS-1.75bpw"])
+        for f in table:
+            if f["family"] != "deepseek41":
+                self.assertTrue(all(x["disk_gb"] is None for x in f["sizes"]), f["family"])
+
     def test_the_install_plan(self):
         import strata_mcp as M
         s = M.Strata(ROOT)
