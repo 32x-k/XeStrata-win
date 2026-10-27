@@ -250,22 +250,38 @@ function setMetric(key, value, unit, sub) {
 
 let lastMetrics = null, metricsFailures = 0, keyWarned = false, mcpTick = 0;
 let failureSeen = null;   // issue #10: the engine failure already shown as a toast (its time)
+let metricsEpoch = 0;
+// After Load or Unload returns, a poll that started earlier can still say the opposite. Hold the POST's state until a later
+// poll agrees, or until the first poll that started after the POST arrives. (PR #3550 by sakuumomo)
+let metricsHold = null;
 let reqShowAll = false;   // the Monitor's request table: the last 12, or every one the server keeps (issue #35)
+function metricsAgree(live, state) {
+  const s = (live && live.state) || "";
+  if (state === "unloaded") return s === "unloaded";
+  return s !== "" && s !== "unloaded";
+}
 async function poll() {
+  const epoch = ++metricsEpoch;
   try {
     const r = await fetch(reqShowAll ? "metrics?requests=all" : "metrics", {headers: headers()});
     if (r.status === 401) {
-      setPill("error", "API key needed");
-      if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it under About > Settings.", 6000); }
+      setPill("error", tr("pill.keyNeeded", "API key needed"));
+      if (!keyWarned) { keyWarned = true; toast("warn", tr("pill.keyNeeded", "API key needed"), tr("toast.keyAbout", "This server needs a key: add it under About > Settings."), 6000); }
     } else if (r.ok) {
-      lastMetrics = await r.json();
+      const m = await r.json();
+      if (metricsHold && epoch <= metricsHold.after && !metricsAgree(m.live, metricsHold.state)) {
+        setTimeout(poll, 1000);
+        return;
+      }
+      if (metricsHold && (metricsAgree(m.live, metricsHold.state) || epoch > metricsHold.after)) metricsHold = null;
+      lastMetrics = m;
       metricsFailures = 0;
       render(lastMetrics);
     } else {
       throw new Error(`HTTP ${r.status}`);
     }
   } catch (e) {
-    if (++metricsFailures === 3) setPill("error", "Server not reachable");
+    if (++metricsFailures === 3) setPill("error", tr("pill.unreachable", "Server not reachable"));
   }
   if (tab === "monitor" && ++mcpTick % 10 === 0) loadMcp();       // server states change rarely: every 10 s
   setTimeout(poll, 1000);
@@ -275,23 +291,168 @@ function setPill(state, text, force = false) {
   if (switching && !force) return;   // while the models swap, the menu owns the pill
   $("pill").dataset.state = state === "error" ? "queued" : state;
   $("pill-text").textContent = text;
+  // a poll re-sets the sentence every second; refit only when its text changed
+  if (text !== lastPillText) { lastPillText = text; fitHeader(); }
 }
+let lastPillText = null;
+// The pill's sentence is the first thing the header row can spare when it runs out of room.
+function fitHeader() {
+  const header = document.querySelector(".st-header");
+  if (!header) return;
+  header.classList.remove("st-header--clip");
+  if (header.scrollWidth > header.clientWidth) header.classList.add("st-header--clip");
+}
+window.addEventListener("resize", fitHeader);
+
+// ------------------------------------------------------------------ Load / Unload (POST /load, /unload: the header button)
+// Metrics stay "unloaded" until the engine is READY, so a turn or an image job on this page has to paint Loading itself.
+// modelOp covers the button's own POST, which returns before the next poll can agree.
+let modelOp = null;
+let imageBusy = false;
+function pageBusy() { return busy != null || imageBusy; }
+// live.image (the image engine's job, on the metrics) is the job a refresh can see. imageBusy is this page's POST before
+// that job is published. A chat phase already on the metrics wins, because Stop still stops that reply.
+function imageLive(live) {
+  if (live && live.image) return true;
+  const state = live && live.state;
+  if (state === "reading" || state === "generating") return false;
+  return imageBusy;
+}
+function paintLive() { if (lastMetrics) render(lastMetrics); }
+function turnBlocksUnload(live) {
+  const state = (live && live.state) || "";
+  return pageBusy() || imageLive(live) || state === "reading" || state === "generating" || (live && live.queued > 0);
+}
+function setModelButton(text, title, disabled) {
+  const btn = $("unload-btn");
+  btn.textContent = text; btn.title = title; btn.disabled = disabled;
+  fitHeader();
+}
+function modelButton(live) {
+  if (modelOp === "load") return setModelButton(tr("model.loading", "Loading…"), tr("model.loadingTitle", "The model is loading"), true);
+  if (modelOp === "unload") return setModelButton(tr("model.unloading", "Unloading…"), tr("model.unloadingTitle", "The model is unloading"), true);
+  const state = (live && live.state) || "";
+  const metricsBusy = state === "reading" || state === "generating" || (live && live.queued > 0);
+  const imageNow = imageLive(live);
+  const unload = tr("model.unload", "Unload");
+  if (state === "unloaded") {
+    // an image job runs on its own engine beside the unloaded text model: Load waits until it has finished
+    if (imageNow) return setModelButton(tr("model.load", "Load"), tr("model.imageBusy", "An image is generating. It finishes on its own."), true);
+    if (pageBusy()) return setModelButton(tr("model.loading", "Loading…"), tr("model.replyLoading", "A reply is already loading the model"), true);
+    return setModelButton(tr("model.load", "Load"), tr("model.loadTitle", "Load the model now. A message also loads it."), false);
+  }
+  if (imageNow) return setModelButton(unload, tr("model.imageBusy", "An image is generating. It finishes on its own."), true);
+  if (!state) return setModelButton("…", tr("model.waiting", "Waiting for the server"), true);
+  if (metricsBusy || pageBusy()) return setModelButton(unload, tr("model.stopFirst", "Stop the reply, then unload"), true);
+  return setModelButton(unload, tr("model.unloadTitle", "Unload the model and free the GPU"), false);
+}
+$("unload-btn").onclick = async () => {
+  if (modelOp) return;
+  const live = (lastMetrics && lastMetrics.live) || {};
+  const loading = live.state === "unloaded";
+  const busyCopy = (sample, stillLoading) => stillLoading
+    ? (imageLive(sample) ? tr("model.imageBusy", "An image is generating. It finishes on its own.") : tr("model.replyLoadingDot", "A reply is already loading the model."))
+    : (imageLive(sample) ? tr("model.imageBusy", "An image is generating. It finishes on its own.") : tr("model.stopFirstDot", "Stop the reply, then unload."));
+  if (loading ? pageBusy() || imageLive(live) : turnBlocksUnload(live)) {
+    toast("warn", tr("model.busy", "Model is busy"), busyCopy(live, loading));
+    return;
+  }
+  if (!loading && !confirm(tr("model.confirmUnload", "Unload the model and free the GPU? Load, or the next message, brings it back."))) return;
+  // confirm() blocks the poll. Yield so a sample that arrived during the dialog is applied. A confirmed Unload stays an unload.
+  if (!loading) {
+    modelOp = "unload";
+    modelButton(live);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  const now = (lastMetrics && lastMetrics.live) || {};
+  const loadingNow = loading;
+  if (loadingNow ? pageBusy() || imageLive(now) : turnBlocksUnload(now)) {
+    modelOp = null;
+    if (lastMetrics) render(lastMetrics); else modelButton(now);
+    toast("warn", tr("model.busy", "Model is busy"), busyCopy(now, loadingNow));
+    return;
+  }
+  modelOp = loadingNow ? "load" : "unload";
+  modelButton(now);
+  if (loadingNow) toast("info", tr("model.loadingToast", "Loading the model"), tr("model.fewMinutes", "This can take a few minutes."));
+  const remember = (state) => {
+    if (!lastMetrics) lastMetrics = {};
+    lastMetrics.live = Object.assign({}, lastMetrics.live, {state, queued: 0});
+    metricsHold = {state, after: metricsEpoch};
+  };
+  try {
+    const r = await fetch(loadingNow ? "load" : "unload", {method: "POST", headers: headers(true), body: "{}"});
+    let body = {};
+    try { body = await r.json(); } catch (e) { /* the connection dropped */ }
+    const status = body.status || "";
+    const msg = (body.error && body.error.message) ||
+                (r.status === 401 ? tr("toast.keyAbout2", "API key needed: add it under About > Settings.") : tr("toast.httpAnswer", "The server answered HTTP {code}.", {code: r.status}));
+    const failTitle = loadingNow ? tr("model.loadFailed", "Load failed") : tr("model.unloadFailed", "Unload failed");
+    if (loadingNow) {
+      if (r.ok && status === "loaded") {
+        remember("idle");
+        toast("success", tr("model.loaded", "Model loaded"), tr("model.gpuInUse", "The GPU is in use."));
+      } else {
+        toast("error", failTitle, msg);
+      }
+    } else if (status === "unloaded" || status === "not loaded") {
+      remember("unloaded");
+      toast(status === "unloaded" ? "success" : "info",
+            status === "unloaded" ? tr("model.unloaded", "Model unloaded") : tr("model.alreadyUnloaded", "Already unloaded"),
+            tr("model.gpuFree", "The GPU is free. Load, or the next message, brings it back."));
+    } else if (r.status === 409 || status === "busy") {
+      let sample = (lastMetrics && lastMetrics.live) || {};
+      try {
+        const mr = await fetch("metrics", {headers: headers()});
+        if (mr.ok) {
+          const m = await mr.json();
+          if (m && m.live) { sample = m.live; lastMetrics = m; }
+        }
+      } catch (e) { /* the 409 body has no phase */ }
+      toast("warn", tr("model.busy", "Model is busy"), imageLive(sample)
+        ? tr("model.imageBusy", "An image is generating. It finishes on its own.") : tr("model.stopFirstDot", "Stop the reply, then unload."));
+    } else if (status === "unsupported") {
+      toast("error", tr("model.unsupported", "Unload is not available"), "");
+    } else {
+      toast("error", failTitle, msg);
+    }
+  } catch (e) {
+    toast("error", loadingNow ? tr("model.loadFailed", "Load failed") : tr("model.unloadFailed", "Unload failed"), tr("model.noAnswer", "The server did not answer."));
+  } finally {
+    modelOp = null;
+    if (lastMetrics) render(lastMetrics); else modelButton({});
+  }
+};
 
 function render(m) {
   const live = m.live || {}, hw = m.hardware || {}, st = m.hardware_static || {}, eng = m.engine || {}, h = m.history || {};
   const last = (m.requests || []).find((r) => r.kind !== "image");   // the chat's last request (image jobs aside)
-  // the header pill
-  if (live.image) {
+  // the header pill. modelOp and a local load win over "N queued": with parallel requests, queued stays up through
+  // ensure_loaded(), and metrics stay "unloaded" until the engine is READY. An image job runs beside an unloaded text
+  // model (it has its own engine), so only a chat turn here counts as a load.
+  const localLoad = live.state === "unloaded" && busy != null;
+  if (modelOp === "load") {
+    setPill("idle", tr("model.loading", "Loading…"));
+  } else if (modelOp === "unload") {
+    setPill("idle", tr("model.unloading", "Unloading…"));
+  } else if (live.image) {
     setPill("generating", `Image · ${imageStep(live.image)}`);
+  } else if (localLoad) {
+    setPill("idle", tr("model.loading", "Loading…"));
+  } else if (imageLive(live)) {
+    setPill("reading", tr("pill.image", "Generating image…"));
   } else if (live.state === "reading") {
     const pct = live.prompt_total ? Math.round((100 * live.prompt_read) / live.prompt_total) : null;
-    setPill("reading", pct != null ? `Reading prompt · ${pct}%` : "Reading prompt");
+    setPill("reading", pct != null ? tr("pill.readingPct", "Reading prompt · {pct}%", {pct}) : tr("pill.reading", "Reading prompt"));
   } else if (live.state === "generating") {
-    setPill("generating", `Generating · ${fmt(live.tok_s, 1)} tok/s`);
+    setPill("generating", tr("pill.generating", "Generating · {rate} tok/s", {rate: fmt(live.tok_s, 1)}));
+  } else if (live.state === "unloaded") {
+    setPill("idle", tr("pill.unloaded", "Unloaded"));
   } else {
-    setPill("idle", "Idle");
+    setPill("idle", tr("pill.idle", "Idle"));
   }
-  if (live.queued > 0) setPill("queued", `${live.queued} queued`);
+  modelButton(live);
+  if (!modelOp && !localLoad && live.queued > 0) setPill("queued", tr("pill.queued", "{n} queued", {n: live.queued}));
   // issue #10: an engine that stopped in a request says why once (the server starts it again for the next one)
   const fail = m.engine_failure;
   if (fail && fail.at !== failureSeen) {
@@ -353,8 +514,14 @@ function renderTotals(t) {
 }
 function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail) {
   // model state
-  const on = live.queued > 0 ? "queued" : live.image ? "generating" : live.state;
-  for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", b.dataset.s === on || (!live.image && b.dataset.s === live.state));
+  // A local turn keeps metrics on "unloaded" for the whole engine start.
+  const imageNow = imageLive(live);
+  const starting = modelOp === "load" || (busy != null && live.state === "unloaded");
+  const on = !modelOp && live.queued > 0 ? "queued" : live.image ? "generating" : live.state;
+  for (const b of document.querySelectorAll("#state-badges .st-badge")) {
+    const lit = (b.dataset.s === on || (!live.image && b.dataset.s === live.state)) && !(starting && b.dataset.s === "unloaded");
+    b.classList.toggle("on", lit);
+  }
   const prog = $("state-progress");
   let label = "Waiting for a request", detail = "", pct = 0;
   if (live.image) {
@@ -365,6 +532,18 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
     detail = [`step ${img.step}/${img.steps}`, img.step_s != null ? `${fmt(img.step_s, 2)} s/step` : null,
               `${fmt(img.elapsed_s, 0)} s`, img.size, img.refs ? `${img.refs} reference${img.refs > 1 ? "s" : ""}` : null]
       .filter(Boolean).join(" · ");
+  } else if (modelOp === "load" || (busy != null && live.state === "unloaded")) {
+    label = "Loading";
+    delete prog.dataset.tone;
+    detail = "The model is loading.";
+  } else if (imageNow) {
+    label = "Generating image";
+    delete prog.dataset.tone;
+    detail = "An image is generating. It finishes on its own.";
+  } else if (modelOp === "unload") {
+    label = "Unloading";
+    delete prog.dataset.tone;
+    detail = "Freeing the GPU.";
   } else if (live.state === "reading") {
     label = "Reading prompt";
     prog.dataset.tone = "info";
@@ -379,6 +558,10 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
     delete prog.dataset.tone;
     pct = live.max_tokens ? Math.min(100, (100 * live.generated) / live.max_tokens) : 0;
     detail = `${fmt(live.generated)} tokens · ${fmt(live.tok_s, 1)} tok/s`;
+  } else if (live.state === "unloaded") {
+    label = "Unloaded";
+    delete prog.dataset.tone;
+    detail = "Load brings it back. A message does too.";
   } else if (last) {
     delete prog.dataset.tone;
     detail = `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`;
@@ -1045,6 +1228,7 @@ async function send() {
   const controller = new AbortController();
   busy = {controller, msg: m};
   setBusy(true);
+  paintLive();
 
   const body = {model: health.model, messages: apiMessages(), stream: true};
   const effort = thinkingEffort(settings);
@@ -1128,6 +1312,7 @@ async function send() {
   if (m.limit) m.meta = `${m.meta || ""} · stopped at the limit of ${m.limit} tool rounds (mcp.max_rounds)`;
   busy = null;
   setBusy(false);
+  paintLive();
   if (frame) cancelAnimationFrame(frame);
   updateAssistant(el, m, false);
   saveChat();
@@ -1411,6 +1596,7 @@ async function start() {
   showTab(location.hash.slice(1) || "chat");
   poll();
   setInterval(() => { if (!switching) loadSwitcher(); }, 15000);   // a switch started elsewhere shows here too
+  requestAnimationFrame(fitHeader);
 }
 start();
 
@@ -1654,7 +1840,9 @@ $("img-form").onsubmit = async (ev) => {
   if (+$("img-n").value > 1) body.n = +$("img-n").value;
   body.output_format = $("img-fmt").value;
   if (body.output_format !== "png") body.output_compression = Math.max(0, Math.min(100, +$("img-q").value || 0));
+  imageBusy = true;
   $("img-go").disabled = true;
+  paintLive();
   const t0 = performance.now();
   $("img-hint").textContent = "Generating\u2026 (a minute or more on a small GPU)";
   try {
@@ -1689,8 +1877,10 @@ $("img-form").onsubmit = async (ev) => {
     $("img-hint").textContent = "";
     toast("error", "No image", String(e.message || e), 8000);
   } finally {
+    imageBusy = false;
     $("img-go").disabled = false;
     $("img-ref").value = "";   // the reference images go with this job only: the next Generate is a new image
+    paintLive();
     await loadHealth();        // the speed the job measured (the count's limit and estimate)
     imgMaskSetup();
   }
