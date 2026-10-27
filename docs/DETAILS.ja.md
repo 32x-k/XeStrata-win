@@ -54,6 +54,8 @@ prefill には、エンジンの環境で入れる opt-in の切り替えが 4 �
 
 `STRATA_GDN_TC=1`（opt-in、答えが変わる、upstream 8c2a84694）にすると、128 トークン以上のチャンクの DeltaNet の再帰を、32 トークンの塊ごとの走査にして、行列ユニット（Intel の XMX、NVIDIA の tensor core、RDNA3・RDNA4 の WMMA）で計算します。積は FP16 の 2 つに分けた値で取り、FP32 で足すので、既定の FP32 の再帰とは丸めが変わります。行列ユニットのない GPU と `STRATA_NO_XMX=1` では既定の再帰のままです。作業用に約 60 MiB の VRAM を使います。
 
+長いプロンプトの後ろの層を近似で読んで prefill を速くする opt-in（`STRATA_KVA=1`、答えが変わる）は [KVA](KVA.ja.md) にあります。
+
 ### decode（トークン/秒）
 
 | モデル | 1K | 4K | 32K | 64K | 128K | 262K |
