@@ -854,6 +854,7 @@ print(r.choices[0].message.content)
   接続を閉じるか、アプリで止めると、モデルも本当に止まるので、次の要求はすぐに始まります。
 - **呼び出しとして返すツールの呼び出し**: 呼び出しになるのは、要求が宣言したツールの名前のものだけです。
   別の名前の呼び出しや、ツールを宣言していない Chat Completions・Anthropic の要求の呼び出しは、書かれたままの文として返すので、クライアントが差し出していないツールを動かすことはありません（Responses は Codex のまとめの要求のために前のままです）。
+  名前空間のツール（`mcp__filesystem.write_file`）は、モデルが `mcp__filesystem__write_file`、`mcp__filesystem=write_file`、`mcp__filesystem_write_file` と書いたときと、そのメンバーを持つツールが宣言の中に 1 つだけのときにメンバーだけ（`write_file`）を書いたときも、その呼び出しになります。
   囲みが 1 トークンずれた呼び出し（`<function=NAME>` でなく `<=NAME>`、`<function:NAME>`、`<NAME>`）は、NAME が宣言したツールなら呼び出しとして読みます。
   それでも呼び出しとして読めない `<tool_call>` の塊は、server のウィンドウで数を出します。
 - **チャットのアプリ**: 「OpenAI 互換」の接続先を持つアプリなら使えます。

@@ -889,6 +889,7 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   Closing the connection or pressing stop in your app really stops the model, so the next request starts at once.
 - **Which tool calls come back as calls.** A call counts only when it names a tool the request declared.
   A call for another name, or any call in a Chat Completions or Anthropic request that declared no tools, is returned as the text it was written as, so a client never runs a tool it did not offer (the Responses route keeps its own rule for Codex's compaction requests).
+  A namespaced tool (`mcp__filesystem.write_file`) is that call when the model writes `mcp__filesystem__write_file`, `mcp__filesystem=write_file`, `mcp__filesystem_write_file`, or the bare member (`write_file`) and exactly one declared tool has that member.
   A call whose envelope drifted by a token, `<=NAME>`, `<function:NAME>` or `<NAME>` instead of `<function=NAME>`, is read as the call when NAME is a declared tool.
   A `<tool_call>` block that still does not read as a call is counted in the server window.
 - **Chat apps.** Any app with an "OpenAI-compatible" provider works: base URL `http://127.0.0.1:8095/v1`, any API key.
