@@ -330,7 +330,6 @@ class ThinkingLevels(unittest.TestCase):
         t = self.template(HARMONY_TPL)
         for given, level in (("high", "high"), ("xhigh", "high"), ("max", "high"), ("low", "low"), (None, "medium")):
             self.assertIn(f"Reasoning: {level}", self.render(t, **effort_kwargs(given)), given)
-        self.assertTrue(self.render(t, **effort_kwargs("none")).endswith(HARMONY_TURN + HARMONY_NO_THINKING +
-                                                                          HARMONY_TURN))
+        no_thinking = HARMONY_TURN + HARMONY_NO_THINKING + HARMONY_TURN
+        self.assertTrue(self.render(t, **effort_kwargs("none")).endswith(no_thinking))
         self.assertTrue(self.render(t).endswith("hi" + HARMONY_TURN))
-
