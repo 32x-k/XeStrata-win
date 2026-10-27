@@ -425,7 +425,7 @@ if(STRATA_ENABLE_XE)
                                    src/core/conversation_file.cpp src/core/vmm.cpp src/core/draft_head.cpp
                                    src/core/grammar.cpp)
   target_include_directories(strata_engine PUBLIC include)
-  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu)
+  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu strata_spec)
   # grammar-constrained decoding (src/core/grammar.cpp, --serve's grammar=): xgrammar (Apache-2.0) at a pinned release
   # and dlpack (Apache-2.0), the one header it reads, both checked by SHA-256.  Built here from xgrammar's C++ sources
   # alone: its own CMakeLists builds Python bindings and compiles with -flto.  OFF: the engine builds without it and
