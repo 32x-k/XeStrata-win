@@ -396,7 +396,7 @@ struct Bufs {
             !strata::gpu::alloc_device(&vt, (size_t) (Tp * C)) || !strata::gpu::alloc_device(&sq, (size_t) (Tp * heads) * 4) ||
             !strata::gpu::alloc_device(&sk, (size_t) (Tp * heads) * 4) || !strata::gpu::alloc_device(&sv, (size_t) C * 4) ||
             !strata::gpu::alloc_device(&mean, (size_t) C * 4) ||
-            !strata::gpu::alloc_device(&part, (size_t) (2 * SLICES * C) * 4))
+            !strata::gpu::alloc_device(&part, (size_t) 2 * SLICES * C * 4))
             return false;
         cap_t = Tp;
         cap_c = C;
@@ -453,11 +453,11 @@ void prep_i8(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uin
             float isv[4], mn[4];
 #pragma unroll
             for (int u = 0; u < 4; ++u) {
-                isv[u] = 1.f / sv[hd * D + lane * 4 + u];
-                mn[u] = mean[hd * D + lane * 4 + u];
+                isv[u] = 1.f / sv[(int64_t) hd * D + (int64_t) lane * 4 + u];
+                mn[u] = mean[(int64_t) hd * D + (int64_t) lane * 4 + u];
             }
             for (int tt = wave; tt < sycl::min<int64_t>(RB, Tp - t0); tt += WG / 32) {
-                const int64_t t = t0 + tt, base = t * C + hd * D + lane * 4;
+                const int64_t t = t0 + tt, base = t * C + (int64_t) hd * D + (int64_t) lane * 4;
                 const bool in = t < T;
                 const sycl::vec<uint16_t, 4> z(0);
                 const sycl::vec<uint16_t, 4> xq = in ? *reinterpret_cast<const sycl::vec<uint16_t, 4>*>(q16 + base) : z,
@@ -743,7 +743,7 @@ bool run(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint16_
     key_stats(q, k16, v16, T, C, b.part, b.mean, b.sv);
     prep_i8(q, q16, k16, v16, b.mean, b.sv, T, Tp, heads, 1.4426950408889634f / std::sqrt((float) D),   // log2 e / sqrt D
             b.q, b.k, b.vt, b.sq, b.sk);
-    const size_t groups = (size_t) ((row_end - r0 + NW * 16 * QT - 1) / (NW * 16 * QT));
+    const size_t groups = (size_t) ((row_end - r0 + (int64_t) NW * 16 * QT - 1) / ((int64_t) NW * 16 * QT));
     q.submit([&](sycl::handler& h) {
         Kernel k{b.q, b.k, b.vt, b.sq, b.sk, b.sv, out16, T, Tp, heads, r0, first, row_end,
                  sycl::local_accessor<int8_t, 1>(sycl::range<1>((size_t) (2 * CH * KLD)), h),
@@ -847,14 +847,9 @@ void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
         }
         if (use == 1 && !g_no_i8) i8_done = run_i8();
     }
-    if (i8_done) {
-        if (first >= n_text) {
-            if (!stream) core::Runtime::get().stream(stream).wait();
-            return;
-        }
-        row_end = n_text;
-    } else if (T - r0 >= 256 && qi_sdpa(q16, k16, v16, r0, T, T, heads, head_dim, out16 + (r0 - first) * heads * head_dim,
-                                        stream)) {
+    // the image rows went through the int8 kernel or else the maker's 16-bit one; the text rows are left
+    if (i8_done || (T - r0 >= 256 && qi_sdpa(q16, k16, v16, r0, T, T, heads, head_dim,
+                                             out16 + (r0 - first) * heads * head_dim, stream))) {
         if (first >= n_text) {
             if (!stream) core::Runtime::get().stream(stream).wait();
             return;

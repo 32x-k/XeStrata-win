@@ -44,7 +44,7 @@ template <typename T> T* up(par::Device& dev, const std::vector<T>& h) {
 }
 
 void inputs(int64_t T, std::vector<uint16_t>& q, std::vector<uint16_t>& kk, std::vector<uint16_t>& v) {
-    std::mt19937 rng(1201);
+    std::mt19937 rng(1201);  // NOLINT(bugprone-random-generator-seed): reproducible inputs.
     std::normal_distribution<float> nd(0.f, 1.f);
     q.resize((size_t) (T * C));
     kk.resize(q.size());
@@ -66,7 +66,7 @@ void long_inputs(int64_t T, std::vector<uint16_t>& q, std::vector<uint16_t>& kk,
     constexpr int64_t TAIL = 32;
     constexpr double QS = 1.75, G = 2.0, LAM = 4.0;   // Q's scale, Q on the tail dims, the offset's mean in score units
     const double b = LAM * std::sqrt((double) D) / ((double) TAIL * G);
-    std::mt19937 rng(1202);
+    std::mt19937 rng(1202);  // NOLINT(bugprone-random-generator-seed): reproducible inputs.
     std::normal_distribution<float> nd(0.f, 1.f);
     std::exponential_distribution<float> ex(1.f);
     q.resize((size_t) (T * C));
@@ -206,6 +206,7 @@ int check_long(par::Device& dev) {
     std::vector<double> got(g.size());
     for (size_t i = 0; i < g.size(); ++i) got[i] = k::f32_from_f16(g[i]);
     std::vector<int64_t> rows;
+    rows.reserve(64);
     for (int64_t i = 0; i < 64; ++i) rows.push_back(r0 + i * (T - r0) / 64 + i % 7);
     return row_bound("long rows (64 of 4096):", qh, kh, vh, T, rows, got, int8_unit(qh, kh, vh, T));
 }
@@ -339,7 +340,7 @@ int main(int argc, char** argv) {
     setenv("STRATA_IMAGE_ATTN_I8", "0", 1);
 #endif
     if (argc >= 3 && std::strcmp(argv[1], "--bench") == 0)
-        return bench(std::atoll(argv[2]), argc >= 4 ? std::atoll(argv[3]) : 0);
+        return bench(std::strtoll(argv[2], nullptr, 10), argc >= 4 ? std::strtoll(argv[3], nullptr, 10) : 0);
     std::printf("qi_attn: Qwen-Image's 32 heads of 128, 64 text rows and 512 image rows (and long rows, 8192 keys), against FP64\n");
     return check();
 }
