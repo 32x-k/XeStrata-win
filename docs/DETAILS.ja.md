@@ -1223,6 +1223,8 @@ server の起動からの合計（`totals`）も示します。
 | `text.format` | `json_schema` と `json_object` は [JSON の応答の形式](#json-の応答の形式) を使います（確かめるだけで、出力を縛りません） |
 | `temperature`、`top_p`、`reasoning_budget_tokens` など | チャットの経路と同じ |
 
+最後のイベント（`response.completed` か `response.incomplete`）とストリームでない返事は、`/v1/chat/completions` と同じ `timings` を一番上に持ちます。
+
 モデルの思考は、`reasoning_text` を中身に持つ `reasoning` の出力項目で返ります（`response.reasoning_text.delta` で流れます）。
 このモデルは別の要約を書かないので、`summary` は空です。
 `"include": ["reasoning.encrypted_content"]` を付けると、項目に `encrypted_content` も付きます。不透明な文字列（base64 で、暗号化はしていません。クライアントは文字をすでに持っています）です。

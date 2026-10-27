@@ -1257,6 +1257,8 @@ are refused with an error that says so.
 | `text.format` | `json_schema` and `json_object` use the [JSON response formats](#json-response-formats) (checked, not constrained) |
 | `temperature`, `top_p`, `reasoning_budget_tokens`, ... | As on the chat path |
 
+The final event (`response.completed` or `response.incomplete`) and a non-streaming reply carry the same top-level `timings` object as `/v1/chat/completions`.
+
 The model's thinking comes back as a `reasoning` output item with `reasoning_text` content (streamed as
 `response.reasoning_text.delta`). This model writes no separate summaries, so `summary` is empty. With
 `"include": ["reasoning.encrypted_content"]` the item also carries `encrypted_content`: an opaque string (base64, not
