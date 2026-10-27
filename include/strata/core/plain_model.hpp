@@ -203,9 +203,11 @@ public:
     /// Runs each dense product the prompt takes once, so the products' library has loaded its kernels before the
     /// first prompt (plain_prompt.cpp); nothing when the prompt runs in windows.
     bool prompt_warm(std::string& err);
-    /// An encoder's (PlainOptions::encoder) states of the prompt tokens [0, n) from position 0: `hidden` takes n rows of
-    /// n_embd floats, every token's last block output through the final norm (host).  The state is reset first and left
-    /// as the prompt leaves it.  False with the reason, also when the device cannot lend the prompt's buffers.
+    /// The states of the prompt tokens [0, n) from position 0: `hidden` takes n rows of n_embd floats, every token's
+    /// last block output through the final norm (host), as the prompt computes them before its logits.  A dense model
+    /// on one GPU: an encoder (PlainOptions::encoder), or the chat's engine, whose conversation the caller saves and
+    /// restores around it.  The state is reset first and left as the prompt leaves it.  False with the reason, also
+    /// when the device cannot lend the prompt's buffers.
     bool encode(const int32_t* tokens, int64_t n, float* hidden, std::string& err);
 
     /// A streamed encoder's (PlainOptions::stream_blocks) block matrices on the device, block by block: begin(l) gives

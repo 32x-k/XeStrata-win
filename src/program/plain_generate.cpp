@@ -388,10 +388,75 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             std::fflush(stdout);
             continue;
         }
+        // ENCODE <ids file> <states file> (serve/images.py: MOSS-Image's text encoder, when this engine reads the GGUF
+        // it names): every prompt token's state after the final norm, from position 0, into the file - int32 'STE1',
+        // the rows and their width, then the rows (MossText::read_states).  The live conversation is set aside first
+        // and put back after, so the next request takes it up as it would have.  ENCODED <rows> <ms>, or ERR.
+        if (line.rfind("ENCODE ", 0) == 0) {
+            const size_t gap = line.find(' ', 7);
+            const std::string ids_path = line.substr(7, gap == std::string::npos ? 0 : gap - 7);
+            const std::string out_path = gap == std::string::npos ? std::string() : line.substr(gap + 1);
+            auto refuse = [&](const std::string& why) {
+                std::printf("ERR %s\n", why.c_str());
+                std::fflush(stdout);
+            };
+            std::vector<int32_t> ids;
+            {
+                std::ifstream f(ids_path);
+                const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                if (ids_path.empty() || out_path.empty() || !f || !parse_ids(text, ids)) {
+                    refuse("expected: ENCODE <ids file> <states file>, the ids comma- or space-separated");
+                    continue;
+                }
+            }
+            const int64_t n = (int64_t) ids.size();
+            if (n > ctx || std::any_of(ids.begin(), ids.end(), [&](int32_t t) { return t >= V; })) {
+                refuse("the prompt is longer than the context or has a token outside the vocabulary");
+                continue;
+            }
+            const auto t0 = Clock::now();
+            strata::core::PlainModel::Snapshot snap;
+            const bool kept = !live.empty();
+            if (kept && !model.save_state((int64_t) live.size(), snap, err)) {
+                refuse("the conversation could not be set aside: " + err);
+                continue;
+            }
+            std::vector<int32_t> flat;
+            if (!pos3_identity) {   // a picture's M-RoPE positions in the table: the prompt's own, then them again
+                flat.resize((size_t) ctx * 3);
+                for (int64_t c = 0; c < ctx; ++c) flat[(size_t) c * 3] = flat[(size_t) c * 3 + 1] = flat[(size_t) c * 3 + 2] = (int32_t) c;
+            }
+            std::vector<float> rows((size_t) (n * N));
+            bool ok = (flat.empty() || model.set_positions(flat.data(), ctx, err)) &&
+                      model.encode(ids.data(), n, rows.data(), err);
+            std::string why = ok ? std::string() : err;
+            if (!flat.empty() && !model.set_positions(pos3.data(), ctx, err) && why.empty()) why = err;
+            // the conversation back (the state as it was), or a clean one for the next request to start from
+            if (kept ? !model.restore_state(snap, err) : !model.reset(err)) {
+                live.clear();
+                if (why.empty()) why = "the conversation could not be put back: " + err;
+            }
+            if (why.empty()) {
+                std::FILE* f = std::fopen(out_path.c_str(), "wb");
+                const int32_t hdr[3] = {0x31455453, (int32_t) n, (int32_t) N};
+                const bool wrote = f != nullptr && std::fwrite(hdr, sizeof(int32_t), 3, f) == 3 &&
+                                   std::fwrite(rows.data(), sizeof(float), rows.size(), f) == rows.size();
+                if (f == nullptr || std::fclose(f) != 0 || !wrote) why = "cannot write " + out_path;
+            }
+            err.clear();
+            if (!why.empty()) {
+                refuse(why);
+                continue;
+            }
+            std::printf("ENCODED %lld %.1f\n", (long long) n,
+                        std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+            std::fflush(stdout);
+            continue;
+        }
         const bool geni = line.rfind("GENI ", 0) == 0;
         if (!geni && line.rfind("GEN ", 0) != 0) {
             const std::string head = line.substr(0, line.find(' '));
-            std::printf("ERR %s is not available for %s (this engine takes GEN, GENI, STOP and QUIT)\n", head.c_str(),
+            std::printf("ERR %s is not available for %s (this engine takes GEN, GENI, ENCODE, STOP and QUIT)\n", head.c_str(),
                         arch.c_str());
             std::fflush(stdout);
             continue;

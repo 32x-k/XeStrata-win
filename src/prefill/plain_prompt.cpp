@@ -707,8 +707,8 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
 }
 
 bool PlainModel::encode(const int32_t* tokens, int64_t n, float* hidden, std::string& err) {
-    if (!opt_.encoder || hidden == nullptr || n <= 0 || n > opt_.max_cells) {
-        err = "plain model: encode takes an encoder's 1 .. max_cells tokens";
+    if (!dense_ || !next_.empty() || hidden == nullptr || n <= 0 || n > opt_.max_cells) {
+        err = "plain model: encode takes 1 .. max_cells tokens of a dense model on one GPU";
         return false;
     }
     if (!reset(err)) return false;
