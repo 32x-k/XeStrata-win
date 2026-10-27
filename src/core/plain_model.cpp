@@ -480,9 +480,15 @@ bool PlainModel::load_qwen(std::string& err) {
     }
     const bool q35 = s.arch == ModelArch::Qwen35Moe || s.arch == ModelArch::Qwen35;
     dense_ = s.arch == ModelArch::Qwen35;
-    // a dense model's windows straight onto the stream, not recorded in graphs: a profiler that cannot take the graphs
-    // (rocprofv3 stops at the first, 2026-10-27) sees the decode's kernels; slower, for measuring only
-    if (const char* e = std::getenv("STRATA_PLAIN_EAGER")) eager_ = dense_ && e[0] == '1';
+    // a dense model's decode windows with a graph or straight onto the stream, whichever is faster on this GPU: timed
+    // on the first decode windows (stage_forward).  The graph is not always faster (Qwen3.5-9B's decode, 2026-10-27:
+    // the B70 46.9 tok/s with it, 52.7 without; the RTX 4070 79.9 and 77.1, the RX 9060 XT 47.5 and 41.4).
+    // STRATA_PLAIN_EAGER=1 runs without (a profiler that cannot take the graphs, rocprofv3, sees the decode's kernels),
+    // 0 with.  The other models keep their graphs: their windows answer the CPU's rings between graph segments
+    if (dense_) {
+        const char* e = std::getenv("STRATA_PLAIN_EAGER");
+        eager_ = e != nullptr && (e[0] == '0' || e[0] == '1') ? e[0] - '0' : -1;
+    }
     has_gate_ = q35;
     has_shared_ = q35 && !dense_;
     bool shape_ok = s.key_length == s.value_length && (s.key_length == 128 || s.key_length == 256) &&
@@ -2118,7 +2124,7 @@ void PlainModel::setup_int2() {
 
 // The graph of a window of T rows, the trunk's or (`mtp`) the MTP layer's, recorded once.
 bool PlainModel::record(int T, bool mtp, std::string& err) {
-    if (eager_) return true;   // run by run_window each time
+    if (eager_ == 1) return true;   // run by run_window each time
     strata::gpu::Graph*& exec = (mtp ? mexec_ : exec_)[(size_t) T];
     std::vector<strata::gpu::Graph*>& segs = (mtp ? msegs_ : segs_)[(size_t) T];
     if (exec != nullptr || !segs.empty()) return true;
@@ -2226,9 +2232,12 @@ bool PlainModel::stage_forward(const int32_t* tokens, int T, int64_t pos, const 
     if (hand_in != nullptr) std::memcpy(h_in_, hand_in, (size_t) T * (size_t) hand_w_ * 4);
     pcie_probe_before();
     const double pool0 = disp_.ms_plan + disp_.ms_actq + disp_.ms_jobs + disp_.ms_run;
+    // while the form is timed, the one-row windows take the two in turns (the same tokens either way)
+    const bool timing = eager_ == -1 && T == 1;
+    const bool eager = eager_ == 1 || (timing && (eager_trial_ & 1) != 0);
     const auto t0 = std::chrono::steady_clock::now();
-    if (!(eager_ ? run_window(T, false, err)
-                 : launch_serve(exec_[(size_t) T], segs_[(size_t) T], moe_trunk_, moe_local_.data(), T, err)))
+    if (!(eager ? run_window(T, false, err)
+                : launch_serve(exec_[(size_t) T], segs_[(size_t) T], moe_trunk_, moe_local_.data(), T, err)))
         return false;
     if (last()) {
         k::SamplerParams sp = sampler_;
@@ -2240,6 +2249,16 @@ bool PlainModel::stage_forward(const int32_t* tokens, int T, int64_t pos, const 
         return false;
     }
     const double win_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    // one window of each to warm up, then 4 of each counted: the two differ by a tenth (above), and every window
+    // timed in the slower form costs the decode (RX 9060 XT: 3 ms each, 20 windows were 1% of 128 tokens)
+    if (timing) {
+        if (eager_trial_ >= 2) eager_ms_[eager_trial_ & 1] += win_ms;
+        if (++eager_trial_ == 10) {
+            eager_ = eager_ms_[1] < eager_ms_[0] ? 1 : 0;
+            std::fprintf(stderr, "strata plain: the decode windows %s (timed: %.2f ms with a graph, %.2f ms without)\n",
+                         eager_ == 1 ? "without a graph" : "with a graph", eager_ms_[0] / 4, eager_ms_[1] / 4);
+        }
+    }
     pcie_probe_after(win_ms, T);
     if (disp_.failed) {
         err = std::string("plain model: the CPU experts: ") + (disp_.fail ? disp_.fail : "failed");
@@ -2347,7 +2366,8 @@ void PlainModel::pcie_probe_after(double ms, int T) {
 bool PlainModel::mtp_run(int T, const int32_t* tokens, int64_t pos, int32_t* draft, std::string& err) {
     if (!record(T, true, err) || !stage(tokens, T, pos, err)) return false;   // the swaps: settle_window
     const int64_t ml = n_moe_ - 1;
-    if (!(eager_ ? run_window(T, true, err) : launch_serve(mexec_[(size_t) T], msegs_[(size_t) T], 1, &ml, T, err)))
+    if (!(eager_ == 1 ? run_window(T, true, err)
+                      : launch_serve(mexec_[(size_t) T], msegs_[(size_t) T], 1, &ml, T, err)))
         return false;
     k::SamplerParams sp;   // the drafts are greedy
     sp.greedy = true;

@@ -562,7 +562,11 @@ private:
     bool has_gate_ = false;          ///< the attention's output gate: [q | gate] per head (qwen35moe)
     bool has_shared_ = false;        ///< the gated shared expert (qwen35moe)
     bool dense_ = false;             ///< a dense FFN in every block and no experts (qwen35)
-    bool eager_ = false;             ///< STRATA_PLAIN_EAGER=1, a dense model's windows run without a graph (profiling)
+    /// a dense model's one-row windows with a graph (0) or straight onto the stream (1), or being timed (-1): the
+    /// first decode windows in turns, then the faster (STRATA_PLAIN_EAGER=0 / 1 fixes it).  Other models: 0
+    int eager_ = 0;
+    int eager_trial_ = 0;            ///< one-row windows timed so far
+    double eager_ms_[2] = {};        ///< their milliseconds, with a graph and without
     int emb_type_ = -1;
     const uint8_t* emb_ = nullptr;   ///< token_embd in the GGUF mapping (rows dequantized on the host)
     const std::vector<const float*>* emb_rows_ = nullptr;   ///< set_embeddings'
