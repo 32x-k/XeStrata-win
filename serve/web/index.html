@@ -30,21 +30,21 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
     <span class="model-switch__k">Model</span>
     <select id="model-select" aria-label="Model on the GPU"></select>
   </label>
-  <nav class="st-tabs" role="tablist" aria-label="Views">
+  <nav class="st-tabs" role="tablist" aria-label="Views" data-i18n-label="tab.views">
     <button class="st-tab" role="tab" id="tab-btn-chat" aria-controls="view-chat" aria-selected="true" data-tab="chat">
-      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-chat"/></svg>Chat</button>
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-chat"/></svg><span data-i18n="tab.chat">Chat</span></button>
     <button class="st-tab" role="tab" id="tab-btn-images" aria-controls="view-images" aria-selected="false" data-tab="images" hidden>
-      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-image"/></svg>Images</button>
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-image"/></svg><span data-i18n="tab.images">Images</span></button>
     <button class="st-tab" role="tab" id="tab-btn-monitor" aria-controls="view-monitor" aria-selected="false" data-tab="monitor">
-      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg>Monitor</button>
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg><span data-i18n="tab.monitor">Monitor</span></button>
     <button class="st-tab" role="tab" id="tab-btn-about" aria-controls="view-about" aria-selected="false" data-tab="about">
-      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-info"/></svg>About<span class="tab-dot" id="update-dot" hidden></span></button>
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-info"/></svg><span data-i18n="tab.about">About</span><span class="tab-dot" id="update-dot" hidden></span></button>
   </nav>
   <span class="st-header__spacer"></span>
   <span class="st-pill" id="pill" data-state="idle" role="status" aria-live="polite">
-    <span class="st-pill__dot"></span><span id="pill-text">Connecting&hellip;</span></span>
+    <span class="st-pill__dot"></span><span id="pill-text" data-i18n="pill.connecting">Connecting&hellip;</span></span>
   <button class="st-btn st-btn--secondary" id="unload-btn" type="button" title="Waiting for the server" disabled>&hellip;</button>
-  <button class="st-btn st-btn--icon" id="theme-btn" title="Light / dark" aria-label="Switch between light and dark">
+  <button class="st-btn st-btn--icon" id="theme-btn" title="Light / dark" aria-label="Switch between light and dark" data-i18n-title="theme.title" data-i18n-label="theme.label">
     <svg class="st-icon"><use id="theme-icon" href="web/sprite.svg#i-moon"/></svg></button>
 </header>
 
@@ -71,7 +71,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
         <div class="chat" id="chat">
           <div class="chat-empty" id="chat-empty">
             <div class="chat-empty__title" data-i18n="chat.empty">Ask anything</div>
-            <div class="chat-empty__sub" id="chat-empty-sub" data-i18n="chat.emptySub">The model runs on this PC. Nothing leaves it.</div>
+            <div class="chat-empty__sub" id="chat-empty-sub">The model runs on this PC. Nothing leaves it.</div>
           </div>
         </div>
       </div>
@@ -80,7 +80,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
           <div class="attachments" id="attachments" hidden></div>
           <textarea id="input" rows="2" placeholder="Ask anything&hellip;" aria-label="Message" data-i18n-placeholder="composer.placeholder" data-i18n-label="composer.message"></textarea>
           <div class="st-composer__bar">
-            <button type="button" class="st-btn st-btn--icon" id="attach-btn" title="Attach a text file (or drop it here)" aria-label="Attach a file" data-i18n-label="composer.attach">
+            <button type="button" class="st-btn st-btn--icon" id="attach-btn" title="Attach a text file (or drop it here)" aria-label="Attach a file" data-i18n-label="composer.attachLabel">
               <svg class="st-icon"><use href="web/sprite.svg#i-attach"/></svg></button>
             <input type="file" id="file" multiple hidden>
             <button type="button" class="st-btn st-btn--icon" id="new-btn" title="New chat" aria-label="New chat" data-i18n-title="chat.new" data-i18n-label="chat.new">

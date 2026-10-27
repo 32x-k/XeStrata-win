@@ -124,7 +124,8 @@ def html_strings(src: str) -> dict:
 def english() -> dict:
     """Every key in serve/web with its English text; the same key twice must have the same text."""
     out: dict = {}
-    sources = {p.name: js_strings(p.read_text(encoding="utf-8"), p.name) for p in sorted(WEB.glob("*.js"))}
+    sources = {p.name: js_strings(p.read_text(encoding="utf-8"), p.name)
+               for p in sorted(WEB.glob("*.js")) if p.name != "i18n.js"}
     sources["index.html"] = html_strings((WEB / "index.html").read_text(encoding="utf-8"))
     for name, found in sources.items():
         for key, value in found.items():

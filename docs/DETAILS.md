@@ -1191,8 +1191,8 @@ The same held on the small configuration (8 GB, no XMX) and with the icpx build.
   llm-jp's card names no sampling, so it is not in the table and decodes greedy as before.
   The order of precedence: the request, the web page's shared Chat settings, the config's `sampling` block, the card.
   Greedy is only for who asks for it: `temperature: 0` in the request, or `"sampling": {"temperature": 0}` in the config.
-  The web page sends no sampling of its own until you change its Sampling settings (it showed and sent 0.6 before); an old stored 0.6 with the default top_p and top_k counts as not set.
-  The Sampling drawer takes a min_p too; empty, it is the server's default (the config's `sampling.min_p`).
+  The web page sends no sampling of its own until you change its Chat settings (it showed and sent 0.6 before); an old stored 0.6 with the default top_p and top_k counts as not set.
+  Chat settings takes a min_p too; empty, it is the server's default (the config's `sampling.min_p`).
 - The penalties (`presence_penalty`, `frequency_penalty`, `repetition_penalty`) ride the same path.
   `penalty_last_n` caps how many recent tokens they count over, 64 by default when any penalty is set.
   llama.cpp's names `repeat_penalty` and `repeat_last_n` work too, in the config's `sampling` block and in a request (upstream #1819).
@@ -1243,6 +1243,50 @@ Valid output is never touched.
 `\b`, `\f`, `\n`, `\r`, `\t` and `\uXXXX` are valid JSON, so they stay: a `\beta` beside a `\alpha` comes back with a backspace.
 Off by default.
 `/v1/status.structured_output` advertises the formats, the validation method and the buffered streaming.
+
+### The web page (Chat, Images, Monitor, About)
+
+Open the server's address in a browser.
+Everything in it runs from the server's own files: no CDN, no outside address.
+Chats, settings and the API key stay in the browser.
+
+**Chat settings** (the button next to the message box) holds the sampling and thinking settings and the switches below.
+Every switch below is **off by default**; with all of them off the page behaves as it did before.
+
+- **Render math.** Equations written as `\( ... \)`, `\[ ... \]`, `$x$` or `$$ ... $$` are drawn as formulas by KaTeX 0.19.0.
+  KaTeX is in `third_party/main/katex` (MIT; `PROVENANCE.json` there lists the package and a hash of every file), and the server hands it out at `/web/vendor/katex/`.
+  The text of a message is never changed: copying, the Markdown export and the next request all carry what the model wrote.
+  Code, prices (`$5 and $10`) and a formula still being written stay text. A formula KaTeX cannot read stays as its source.
+  A formula can only draw: it cannot make a link, load a picture or run anything (`\href`, `\url`, `\includegraphics` and `\htmlClass` are shown as their own names).
+- **Saved chats list.** Keeps every chat in a list on the left, with search over titles and text, rename, delete (with Undo) and days as headings.
+  The chats live in this browser's IndexedDB; a picture or file is kept by name only. Nothing goes to the server.
+  In a private window, or when the browser's storage is full, the list stays in memory and the page says so once.
+  Turning it on keeps the chat on the screen as the first one in the list; turning it off keeps that chat as the single chat.
+- **Edit and rewind messages.** Under each message: **Regenerate** (a new answer to the same question), **Edit answer** (correct its text; the old thinking and tool calls go and no request is sent) and **Rewind to here**.
+  Rewind asks what you want.
+  On your message, **Edit and send again here** hides it and the messages after it and puts it in the box; on an answer, **Continue from here** hides the messages after it.
+  **Branch from here** (needs the saved chats list) starts a new chat from the messages up to that point and leaves this chat as it is; the branch keeps a name such as "Branch of ..." and links back to the original.
+  An **Undo** bar above the box brings back what was hidden, until your next question, another chat or a reload.
+  A picture or file that was only kept by name is not sent again: the page asks you to attach it again.
+- **When you send while it is answering.** *Wait* (the default): Send is off until the answer is done.
+  *Send after*: your message waits and goes when the answer is done.
+  *Interrupt*: the answer stops where it is, what was written stays and is marked interrupted, and your message goes at once; a tool that is running finishes first.
+  Only one message waits, and **Take back** returns it to the box. Stop keeps a waiting message for you to send yourself.
+
+An answer's ` ```svg ` or ` ```html ` block gets a **Preview** button.
+The code is drawn in a frame that is cut off from the page: an empty sandbox (no scripts, forms, popups or downloads, and no access to the page, its storage or the server), a policy inside the frame that allows no address at all, and a page header (`Content-Security-Policy: frame-src 'none'`) that keeps a link or a redirect in the model's HTML from loading a web page into it.
+An svg is shown as a picture.
+For an HTML page there is also a warning button, **Run scripts**: after you confirm, that one block runs with scripts, still with no way to the page and no network, until you close the preview.
+It can still use your CPU, and it is code the model wrote.
+
+**Load / Unload** in the header loads the model or frees the GPU (`POST /load`, `POST /unload`).
+It asks before unloading and is off while an answer is being written or an image is made.
+
+**Language.** About > Settings lists the page's languages: English (the default), German, Spanish, Japanese, Korean, Portuguese, Russian and Chinese.
+The Chat view, its settings and the header are translated; Monitor, Images and About are still English.
+A language is a file `serve/web/locales/<lang>.json`; the English text lives in the code next to its key.
+`python tools/web_i18n.py` checks every file for the same keys and placeholders (`--write` rewrites `en.json`).
+`/?lang=de` shows a language for one visit.
 
 ### API request monitor
 
@@ -1349,7 +1393,7 @@ Restart XeStrata after a change.
 - The servers start with XeStrata, in the background.
   The server window says what each one offers (`MCP server 'files': 14 tools (...)`), or why it did not start.
   Its tools are then left out and the chat works without them.
-  The Monitor tab lists them, and the Sampling drawer has **Use tools from MCP servers** (on by default).
+  The Monitor tab lists them, and Chat settings has **Use tools from MCP servers** (on by default).
   A server that stops later is started again at its next call.
 - In the chat each call shows as a small block (tool, arguments, result).
   The model reads the result and goes on, up to `max_rounds` calls in a row per answer.
@@ -1585,7 +1629,7 @@ The engine log then says `control vector mode = project, dir = per-layer, layers
 (`--cvec-mode add` is llama.cpp's stock additive mode, for additive vectors.)
 
 **Per request.** A loaded vector is on for every request unless it says otherwise.
-The web app's Sampling drawer has a switch, and the API takes `"experimental_speed_projection": false` in the request body (OpenAI and Anthropic);
+The web app's Chat settings has a switch, and the API takes `"experimental_speed_projection": false` in the request body (OpenAI and Anthropic);
 a config default goes in `"sampling": {"experimental_speed_projection": false}`.
 Switching drops the conversation cache once, since the model state was computed the other way.
 Switched off, the output is token-for-token the stock model's.
@@ -1715,5 +1759,6 @@ The model files are not part of it; their licenses apply to them (below).
 - **The web app's font**: [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1, see `third_party/main/outfit/OFL.txt`;
   without it the app uses the system font). The chat draws math with [KaTeX](https://katex.org/) 0.19.0 (MIT, see
   `third_party/main/katex/LICENSE`). Its Monitor tab started from @code-martin's dashboard idea (PR #22).
+  The chat page's wide-window layout, svg/html preview, math, Load/Unload, saved chats, edit and rewind came from upstream's PRs #3176 (@mnott), #1628 (@thoives), #2972 and #2974 (@CC-David-CC), #3550 (@sakuumomo), #1787 (@Scotty-Hudson) and #2615 (@uppet), and the rewind choice and sending while answering from issues #3823 and #4004 (@xvcezrqpbxtpzblrt).
 - **`third_party/nonfree/`**: Qwen Community License 1.0, not free; XeStrata runs without it.
   It holds the experimental speed projection's vector, made from the model's activations, and the original model's chat template (see its README).

@@ -4,7 +4,7 @@
 // serve/web/app.js - the Strata web app: Chat, Monitor, About. No framework, no network beyond this server.
 // The Monitor tab rebuilds PR #22's dashboard idea (code-martin) on the server's own /metrics.
 /* global tr, StrataI18n, StrataMath, StrataPreview, node, panel, msgActions, saveChat, stillWriting, initChats, setChatList,
-          clearUndo, syncActions, closePanel, renderSidebar, renderParent, renderUndoBar */
+          clearUndo, syncActions, closePanel, renderSidebar, renderParent, renderUndoBar, setSidebar, sidebarOpen */
 // serve/web/i18n.js, math.js, preview.js and chats-ui.js, loaded before this file
 "use strict";
 
@@ -56,7 +56,7 @@ async function copyText(text, btn) {
     use.setAttribute("href", `${SPRITE}#i-check`);
     setTimeout(() => use.setAttribute("href", `${SPRITE}#i-copy`), 1500);
   }
-  toast("success", "Copied to clipboard", "", 1800);
+  toast("success", tr("toast.copied", "Copied to clipboard"), "", 1800);
 }
 
 // ------------------------------------------------------------------ theme and tabs
@@ -121,12 +121,16 @@ $("api-key").oninput = () => saveApiKey();
 $("api-key").onchange = () => saveApiKey(true);
 
 let health = {model: "strata", images: false, max_context: 0};
+// the texts that depend on what this server offers: the empty chat's line and the attach button's hint
+function renderEmptyChat() {
+  $("attach-btn").title = health.images ? tr("composer.attachPictures", "Attach a text file or a picture (or drop it here)")
+                                        : tr("composer.attach", "Attach a text file (or drop it here)");
+  $("chat-empty-sub").textContent = tr("chat.emptyModel", "{model} runs on this PC. Nothing leaves it.", {model: health.model});
+}
 async function loadHealth() {
   try {
     health = await (await fetch("health")).json();
-    $("attach-btn").title = health.images ? "Attach a text file or a picture (or drop it here)"
-                                          : "Attach a text file (or drop it here)";
-    $("chat-empty-sub").textContent = `${health.model} runs on this PC. Nothing leaves it.`;
+    renderEmptyChat();
     $("tab-btn-images").hidden = !health.image_generation;
     $("img-note").hidden = !health.image_note;
     $("img-note").textContent = health.image_note || "";
@@ -1003,8 +1007,8 @@ function msgEl(m, i) {
       const wrap = document.createElement("div");
       wrap.className = "msg-images";
       for (const im of m.images) {
-        if (im.url) { const img = document.createElement("img"); img.src = im.url; img.alt = im.name || "image"; wrap.appendChild(img); }
-        else { const c = document.createElement("span"); c.className = "chip"; c.innerHTML = icon("image", "st-icon st-icon--sm"); c.append(im.name || "image"); wrap.appendChild(c); }
+        if (im.url) { const img = document.createElement("img"); img.src = im.url; img.alt = im.name || tr("chat.image", "image"); wrap.appendChild(img); }
+        else { const c = document.createElement("span"); c.className = "chip"; c.innerHTML = icon("image", "st-icon st-icon--sm"); c.append(im.name || tr("chat.image", "image")); wrap.appendChild(c); }
       }
       el.appendChild(wrap);
     }
@@ -1014,13 +1018,13 @@ function msgEl(m, i) {
     el.appendChild(b);
     const meta = document.createElement("div");
     meta.className = "st-msg__meta";
-    meta.textContent = `You · ${timeStr(m.time)}`;
+    meta.textContent = `${tr("chat.you", "You")} · ${timeStr(m.time)}`;
     el.appendChild(meta);
   } else {
     el.innerHTML = `<details class="st-collapse think" hidden><summary>${icon("thinking", "st-icon st-icon--sm")}<span class="think-title"></span>` +
       `${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body thinking"></div></details>` +
       `<div class="st-bubble"></div><div class="st-msg__meta"><span class="meta-text"></span>` +
-      `<button class="st-btn st-btn--icon" data-msg-copy aria-label="Copy the answer" title="Copy">${icon("copy")}</button></div>`;
+      `<button class="st-btn st-btn--icon" data-msg-copy aria-label="${esc(tr("chat.copyAnswer", "Copy the answer"))}" title="${esc(tr("chat.copy", "Copy"))}">${icon("copy")}</button></div>`;
     updateAssistant(el, m, false);
   }
   const actions = msgActions(m, i);                 // edit / regenerate / rewind (chats-ui.js), when switched on
@@ -1029,18 +1033,20 @@ function msgEl(m, i) {
 }
 // One MCP tool call in the answer: a compact block (name, state, a one-line preview) that opens to the arguments and
 // the result as the model read it.  Its body is built only while open: a result can be 20,000 characters.
-const TOOL_STATE = {writing: ["st-badge--reading", "Writing"], running: ["st-badge--generating", "Running"], done: ["", "Done"],
-                    error: ["st-badge--error", "Error"], skipped: ["st-badge--queued", "Not run"]};
+const TOOL_STATE = {writing: ["st-badge--reading", () => tr("tool.writing", "Writing")], running: ["st-badge--generating", () => tr("tool.running", "Running")],
+                    done: ["", () => tr("tool.done", "Done")], error: ["st-badge--error", () => tr("tool.error", "Error")],
+                    skipped: ["st-badge--queued", () => tr("tool.skipped", "Not run")]};
 function toolHtml(t, k) {
-  const [cls, label] = TOOL_STATE[t.state] || ["", t.state];
+  const [cls, labelOf] = TOOL_STATE[t.state] || ["", () => t.state];
+  const label = labelOf();
   const args = t.arguments == null ? "" : JSON.stringify(t.arguments, null, 2);
   const preview = t.result != null ? t.result : args.replace(/\s+/g, " ");
   let body = "";
   if (t.open) {
-    body = `<div class="tool-call__label">Arguments</div><pre class="tool-call__pre">${esc(args || "(being written)")}</pre>`;
+    body = `<div class="tool-call__label">${esc(tr("tool.arguments", "Arguments"))}</div><pre class="tool-call__pre">${esc(args || tr("tool.beingWritten", "(being written)"))}</pre>`;
     if (t.result != null) {
-      body += `<div class="tool-call__label">${t.ok ? "Result" : "Error"}${t.chars ? ` · ${fmt(t.chars)} characters` : ""}` +
-              `${t.truncated ? ", cut for the model" : ""}</div><pre class="tool-call__pre">${esc(t.result)}</pre>`;
+      body += `<div class="tool-call__label">${esc(t.ok ? tr("tool.result", "Result") : tr("tool.error", "Error"))}${t.chars ? ` · ${esc(tr("tool.chars", "{n} characters", {n: fmt(t.chars)}))}` : ""}` +
+              `${t.truncated ? esc(tr("tool.cut", ", cut for the model")) : ""}</div><pre class="tool-call__pre">${esc(t.result)}</pre>`;
     }
   }
   return `<details class="st-collapse tool-call" data-tool="${k}" data-state="${esc(t.state)}"${t.open ? " open" : ""}>` +
@@ -1087,8 +1093,8 @@ function updateAssistant(el, m, streaming) {
   if (m.reasoning) {
     det.hidden = false;
     const thinkingNow = streaming && !m.text;
-    el.querySelector(".think-title").textContent = thinkingNow ? "Thinking…" :
-      m.thinkSecs != null ? `Thought for ${fmt(m.thinkSecs, 1)} s` : "Thoughts";
+    el.querySelector(".think-title").textContent = thinkingNow ? tr("think.now", "Thinking…") :
+      m.thinkSecs != null ? tr("think.for", "Thought for {s} s", {s: fmt(m.thinkSecs, 1)}) : tr("think.done", "Thoughts");
     const body = el.querySelector(".thinking");
     if (det.open || thinkingNow) body.textContent = m.reasoning;
     else body.dataset.pending = "1";
@@ -1107,7 +1113,7 @@ function updateAssistant(el, m, streaming) {
     if (settings.math) StrataMath.hydrate(bubble);
     if (streaming) bubble.classList.add("cursor"); else bubble.classList.remove("cursor");
   }
-  el.querySelector(".meta-text").textContent = m.meta || (streaming ? "" : m.stopped ? "Stopped" : "");
+  el.querySelector(".meta-text").textContent = m.meta || (streaming ? "" : m.stopped ? tr("chat.stopped", "Stopped") : "");
   el.querySelector("[data-msg-copy]").hidden = streaming || !m.text;
 }
 function renderChat() {
@@ -1450,7 +1456,7 @@ $("new-btn").onclick = () => {
   }});
 };
 $("export-btn").onclick = () => {
-  if (!messages.length) { toast("info", "Nothing to save yet"); return; }
+  if (!messages.length) { toast("info", tr("export.nothing", "Nothing to save yet")); return; }
   const tools = (m) => (m.tools || []).filter((t) => t.result != null).map((t) =>
     `<details><summary>Tool ${t.server ? `${t.server} / ` : ""}${t.tool || t.name}${t.ok ? "" : " (error)"}</summary>\n\n` +
     `\`\`\`json\n${JSON.stringify(t.arguments || {}, null, 2)}\n\`\`\`\n\n\`\`\`\n${t.result}\n\`\`\`\n\n</details>\n\n`).join("");
@@ -1473,19 +1479,20 @@ function isTextFile(f) {
 function addFiles(files) {
   for (const f of files) {
     if (f.type.startsWith("image/")) {
-      if (!health.images) { toast("warn", "Pictures are off", "This model was set up for text only."); continue; }
-      if (f.size > 20e6) { toast("warn", "Picture too large", `${f.name} is over 20 MB.`); continue; }
+      if (!health.images) { toast("warn", tr("file.picturesOff", "Pictures are off"), tr("file.picturesOffText", "This model was set up for text only.")); continue; }
+      if (f.size > 20e6) { toast("warn", tr("file.pictureBig", "Picture too large"), tr("file.pictureBigText", "{name} is over 20 MB.", {name: f.name})); continue; }
       const r = new FileReader();
-      r.onload = () => { attachments.push({kind: "image", name: f.name || "pasted image", url: r.result}); renderAttachments(); };
+      r.onload = () => { attachments.push({kind: "image", name: f.name || tr("file.pasted", "pasted image"), url: r.result}); renderAttachments(); };
       r.readAsDataURL(f);
       continue;
     }
-    if (!isTextFile(f)) { toast("warn", "Not a text file", `${f.name}: attach text files (code, notes, logs, data)${health.images ? " or pictures" : ""}.`); continue; }
-    if (f.size > MAX_TEXT_FILE) { toast("warn", "File too large", `${f.name} is over 512 KB.`); continue; }
+    if (!isTextFile(f)) { toast("warn", tr("file.notText", "Not a text file"), health.images ? tr("file.notTextPictures", "{name}: attach text files (code, notes, logs, data) or pictures.", {name: f.name})
+                                                              : tr("file.notTextOnly", "{name}: attach text files (code, notes, logs, data).", {name: f.name})); continue; }
+    if (f.size > MAX_TEXT_FILE) { toast("warn", tr("file.big", "File too large"), tr("file.bigText", "{name} is over 512 KB.", {name: f.name})); continue; }
     const r = new FileReader();
     r.onload = () => {
       const text = String(r.result);
-      if (text.includes("\u0000")) { toast("warn", "Not a text file", `${f.name} looks like a binary file.`); return; }
+      if (text.includes("\u0000")) { toast("warn", tr("file.notText", "Not a text file"), tr("file.binaryText", "{name} looks like a binary file.", {name: f.name})); return; }
       attachments.push({kind: "file", name: f.name, text});
       renderAttachments();
     };
@@ -1512,7 +1519,7 @@ function renderAttachments() {
     c.innerHTML = icon(a.kind === "file" ? "attach" : "image", "st-icon st-icon--sm");
     c.append(a.name);
     const x = document.createElement("button");
-    x.type = "button"; x.className = "st-btn st-btn--icon"; x.setAttribute("aria-label", "Remove");
+    x.type = "button"; x.className = "st-btn st-btn--icon"; x.setAttribute("aria-label", tr("file.remove", "Remove"));
     x.innerHTML = icon("trash");
     x.onclick = () => { attachments.splice(i, 1); renderAttachments(); };
     c.appendChild(x);
@@ -1620,7 +1627,9 @@ function thinkingEffort(s) {
   return v && v !== thinkingInfo().default && v !== "on" ? v : undefined;
 }
 function thinkingButtons() {
-  const t = thinkingInfo(), names = {none: "Off", low: "Low", medium: "Medium", high: "High", max: "Max", on: "On"};
+  const t = thinkingInfo();
+  const names = {none: tr("drawer.off", "Off"), low: tr("drawer.low", "Low"), medium: tr("drawer.medium", "Medium"),
+                 high: tr("drawer.high", "High"), max: "Max", on: "On"};
   $("s-thinking").replaceChildren(...t.levels.map((v) => {
     const b = document.createElement("button");
     Object.assign(b, {type: "button", textContent: names[v] || v});
@@ -1638,7 +1647,8 @@ function outputs() {
   $("o-topp").textContent = (+$("s-topp").value).toFixed(2);
   $("o-topk").textContent = $("s-topk").value;
   const sel = segValue("s-thinking");
-  const what = {none: "answers right away", low: "short", medium: "medium", high: "thorough", max: "the most thorough",
+  const what = {none: tr("drawer.thinkNone", "answers right away"), low: tr("drawer.thinkLow", "short"),
+                medium: tr("drawer.thinkMedium", "medium"), high: tr("drawer.thinkHigh", "thorough"), max: "the most thorough",
                 on: "thinks first"};
   $("o-thinking").textContent = sel ? what[sel] + (sel === thinkingInfo().default ? " (default)" : "") : "";
   const busyMode = segValue("s-busy");
@@ -1699,6 +1709,9 @@ const urlLang = new URLSearchParams(location.search).get("lang");
 $("lang").innerHTML = StrataI18n.LANGUAGES.map(([code, name]) => `<option value="${esc(code)}">${esc(name)}</option>`).join("");
 function showLanguage() {
   $("lang").value = StrataI18n.lang;
+  renderEmptyChat();
+  setSidebar(sidebarOpen, false);
+  thinkingButtons();   // the level buttons are built in the code, in the language of the moment
   renderChat();
   setBusy(!!busy);
   if (lastMetrics) render(lastMetrics);
@@ -1713,6 +1726,7 @@ $("lang").onchange = async () => {
 async function start() {
   await StrataI18n.setLanguage(urlLang || store.get("lang", "en"));
   $("lang").value = StrataI18n.lang;
+  renderEmptyChat();
   initChats();
   if (settings.chatList) await setChatList(true, false);       // the saved-chats list is read before the first draw
   setBusy(false);

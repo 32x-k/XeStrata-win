@@ -1159,7 +1159,7 @@ B70 の IQ2_XS で、4,996 トークンの会話（INT8 の KV）のファイル
   優先は要求、web の画面の共有のチャットの設定、設定の `sampling` のブロック、モデルカードの順です。
   貪欲に生成するのは、要求の `temperature: 0` か、設定の `"sampling": {"temperature": 0}` で頼んだときだけです。
   web の画面は、サンプリングの設定を変えるまで自分の値を送りません（前は 0.6 を出して送っていました）。前に保存した 0.6 と既定の top_p・top_k は、設定していないものとして扱います。
-  min_p も Sampling の引き出しで指定でき、空欄ならサーバーの既定（設定の `sampling.min_p`）です。
+  min_p も Chat settings の引き出しで指定でき、空欄ならサーバーの既定（設定の `sampling.min_p`）です。
 - ペナルティ（`presence_penalty`、`frequency_penalty`、`repetition_penalty`）も同じ経路で効きます。
   `penalty_last_n` は数える直近のトークン数の上限で、どれかのペナルティがあれば既定は 64 です。
   llama.cpp の名前の `repeat_penalty` と `repeat_last_n` も、設定の `sampling` と要求で使えます（upstream #1819）。
@@ -1213,6 +1213,50 @@ JSON の形式とツールや MCP の組み合わせは、はっきり断りま�
 `\alpha` の横の `\beta` はバックスペースになって返ります。
 既定はオフです。
 `/v1/status.structured_output` は、形式、確かめ方、ためてから送るストリーミングを示します。
+
+### ウェブの画面（Chat、Images、Monitor、About）
+
+ブラウザーでサーバーのアドレスを開きます。
+画面はサーバー自身のファイルだけで動き、CDN や外のアドレスは使いません。
+会話・設定・API キーはブラウザーに残ります。
+
+**Chat settings**（入力欄の横のボタン）に、サンプリングと思考の設定と、下のスイッチがあります。
+下のスイッチは**どれも既定でオフ**で、全部オフなら画面は前と同じに動きます。
+
+- **Render math.** `\( ... \)`・`\[ ... \]`・`$x$`・`$$ ... $$` で書いた式を、KaTeX 0.19.0 で数式として描きます。
+  KaTeX は `third_party/main/katex` にあり（MIT。そこの `PROVENANCE.json` がパッケージとファイルごとのハッシュを示します）、サーバーが `/web/vendor/katex/` で配ります。
+  メッセージの文は変えません。コピー・Markdown の書き出し・次の要求は、どれもモデルが書いたとおりの文を使います。
+  コード、金額（`$5 and $10`）、書いている途中の式は文のままです。KaTeX が読めない式は元の文のままです。
+  式は描くだけで、リンクを作ることも、画像を読み込むことも、何かを動かすこともできません（`\href`・`\url`・`\includegraphics`・`\htmlClass` はその名前のまま出ます）。
+- **Saved chats list.** すべての会話を左の一覧に残します。題と本文の検索、名前の変更、削除（Undo 付き）ができ、日ごとに見出しが付きます。
+  会話はこのブラウザーの IndexedDB に置き、画像やファイルは名前だけを残します。サーバーには何も送りません。
+  プライベートウィンドウやブラウザーの保存先がいっぱいのときは、一覧はメモリにだけ置き、画面が一度そう伝えます。
+  オンにすると、画面の会話が一覧の最初の会話になります。オフにすると、その会話が 1 つだけの会話として残ります。
+- **Edit and rewind messages.** 各メッセージの下に **Regenerate**（同じ質問への新しい答え）、**Edit answer**（答えの文を直す。前の思考とツールの呼び出しは消え、要求は送りません）、**Rewind to here** が出ます。
+  Rewind はどうしたいかを聞きます。
+  自分のメッセージでは **Edit and send again here** が、そのメッセージとその後を隠して入力欄に戻します。答えでは **Continue from here** がその後を隠します。
+  **Branch from here**（Saved chats list が要ります）は、そこまでのメッセージから新しい会話を始め、元の会話はそのまま残します。枝の会話は「Branch of ...」のような名前を持ち、元の会話へのリンクが付きます。
+  入力欄の上の **Undo** のバーは、次の質問・別の会話・再読み込みまで、隠したものを戻せます。
+  名前だけを残した画像やファイルはもう一度は送らず、画面が付け直すよう求めます。
+- **When you send while it is answering.** *Wait*（既定）: 答えが終わるまで送信できません。
+  *Send after*: メッセージは待ち、答えが終わったら送ります。
+  *Interrupt*: 答えはそこで止まり、書いたところまでは中断の印を付けて残り、メッセージはすぐ送ります。動いているツールは終わるのを待ちます。
+  待てるメッセージは 1 つで、**Take back** で入力欄に戻せます。Stop は待っているメッセージを、自分で送れるよう残します。
+
+答えの中の ` ```svg ` や ` ```html ` のブロックには **Preview** のボタンが付きます。
+コードは画面から切り離した枠に描きます。空の sandbox（スクリプト・フォーム・ポップアップ・ダウンロードなし、画面・その保存先・サーバーに触れない）、どのアドレスも許さない枠の中のポリシー、それにモデルの HTML の中のリンクやリダイレクトが枠に Web のページを読み込まないようにするページのヘッダー（`Content-Security-Policy: frame-src 'none'`）です。
+svg は画像として出します。
+HTML のページには警告のボタン **Run scripts** もあり、確かめた後、そのブロックだけをスクリプト付きで、画面にも網にも触れないまま、プレビューを閉じるまで動かします。
+それでも CPU は使えますし、モデルが書いたコードです。
+
+ヘッダーの **Load / Unload** は、モデルを読み込むか、GPU を空けます（`POST /load`、`POST /unload`）。
+解放の前に確かめ、答えを書いている間と画像を作っている間は押せません。
+
+**Language.** About > Settings に画面の言語が並びます。英語（既定）、ドイツ語、スペイン語、日本語、韓国語、ポルトガル語、ロシア語、中国語です。
+Chat の画面とその設定、ヘッダーを訳し、Monitor・Images・About はまだ英語です。
+言語は `serve/web/locales/<lang>.json` のファイルで、英語の文はコードの中の鍵の横にあります。
+`python tools/web_i18n.py` がどのファイルも同じ鍵と {placeholder} を持つかを確かめます（`--write` で `en.json` を書き直します）。
+`/?lang=de` は、その回だけ言語を変えます。
 
 ### API の要求のモニター
 
@@ -1311,7 +1355,7 @@ stream_idle_timeout_ms = 600000         # 最初の長いプロンプトは読�
 - サーバーは XeStrata と一緒に裏で起動します。
   server のウィンドウに、それぞれが何を提供するか（`MCP server 'files': 14 tools (...)`）、または起動しなかった理由が出ます。
   起動しなかったサーバーのツールは外し、チャットはそれなしで動きます。
-  Monitor のタブがサーバーを並べ、Sampling の引き出しに **Use tools from MCP servers**（既定でオン）があります。
+  Monitor のタブがサーバーを並べ、Chat settings の引き出しに **Use tools from MCP servers**（既定でオン）があります。
   あとで止まったサーバーは、次に呼ぶときに起動し直します。
 - チャットでは、呼び出しごとに小さなブロック（ツール、引数、結果）が出ます。
   モデルは結果を読んで続け、1 つの答えで最大 `max_rounds` 回まで続けて呼びます。
@@ -1550,7 +1594,7 @@ setup は、次のエンジンの設定（llama.cpp のもの）を `xestrata-<m
 （`--cvec-mode add` は llama.cpp の普通の加算の方式で、加算用のベクトルのためのものです。）
 
 **要求ごとに切り替える**: 読み込んだベクトルは、要求が指定しない限りどの要求にも効きます。
-ウェブの画面の Sampling の引き出しに切り替えがあり、API では要求の本文に `"experimental_speed_projection": false` を書きます（OpenAI でも Anthropic でも）。
+ウェブの画面の Chat settings の引き出しに切り替えがあり、API では要求の本文に `"experimental_speed_projection": false` を書きます（OpenAI でも Anthropic でも）。
 設定の既定にするなら `"sampling": {"experimental_speed_projection": false}` です。
 切り替えると、モデルの状態が別のやり方で計算されたものになるので、会話のキャッシュを一度捨てます。
 オフにすると、出力は普通のモデルとトークン単位で同じです。
@@ -1674,6 +1718,7 @@ Strata と ggml / llama.cpp（どちらも MIT）から来たコードも XeStra
    - maxfridbe による [nextsycl](https://github.com/maxfridbe/nextsycl)（Qwen3.5 系のモデルの decode でカーネルをまとめるやり方。コードは書き起こし）。
 - **ウェブの画面のフォント**: [Outfit](https://github.com/Outfitio/Outfit-Fonts)（SIL Open Font License 1.1、`third_party/main/outfit/OFL.txt`。なければシステムのフォントを使う）。
   チャットの数式は [KaTeX](https://katex.org/) 0.19.0（MIT、`third_party/main/katex/LICENSE`）で描きます。
+  チャットの画面の広い窓の使い方・svg と html のプレビュー・数式・Load と Unload・保存した会話・編集と巻き戻しは upstream の PR #3176（@mnott）・#1628（@thoives）・#2972 と #2974（@CC-David-CC）・#3550（@sakuumomo）・#1787（@Scotty-Hudson）・#2615（@uppet）から、巻き戻しの選び方と答えている間の送信は issue #3823 と #4004（@xvcezrqpbxtpzblrt）から来ました。
   Monitor のタブは @code-martin のダッシュボードの案（PR #22）から始まりました。
 - **`third_party/nonfree/`**: Qwen Community License 1.0 で、自由ソフトウェアではありません。XeStrata はこれなしでも動きます。
   実験的な速度向上用の射影のベクトル（モデルの活性化から作ったもの）と、元のモデルのチャットテンプレートが入っています（その README を参照）。

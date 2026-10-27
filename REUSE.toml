@@ -19,7 +19,7 @@ SPDX-License-Identifier = "MIT"
 
 # upstream Strata's files without a comment of their own, changed by XeStrata
 [[annotations]]
-path = ["data/gguf_fingerprints.json"]
+path = ["data/gguf_fingerprints.json", "serve/web/locales/*.json"]
 SPDX-FileCopyrightText = ["2026 Niko1221 and the Strata contributors", "2026 MistVVK and the XeStrata contributors"]
 SPDX-License-Identifier = "LGPL-3.0-or-later AND MIT"
 
