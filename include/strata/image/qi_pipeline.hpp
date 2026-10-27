@@ -75,6 +75,7 @@ private:
     QiPlan plan(int64_t T, int64_t h, int64_t w, int64_t n_ids = 0, int64_t n_neg_pre = 0);
 
     void ensure_open();
+    void te_layers();
     void edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::vector<QiVisionOut>& vouts,
                    std::vector<QiText::Image>& te_images, std::vector<QiDit::Ref>& dit_refs, std::vector<float*>& ref_z,
                    std::vector<int32_t>& neg_ids, std::vector<QiText::Image>& neg_te,
@@ -95,6 +96,7 @@ private:
     std::unique_ptr<QiVae> vae_size_;
     uint64_t budget_ = 0, auto_budget_ = 0;
     uint64_t dit_set_ = 0, te_set_ = 0;
+    uint64_t te_want_ = 0;   // the encoder's layers the plan gives them: taken when it encodes (te_layers)
     int64_t mlp_set_ = -1;
     std::vector<int32_t> last_ids_;
     std::vector<float> last_neg_states_;   // the last negative prompt's states (guidance), for the same ids again

@@ -177,6 +177,12 @@ void QiPipeline::release(bool all) {
     mlp_set_ = -1;
 }
 
+void QiPipeline::te_layers() {
+    if (te_set_ == te_want_) return;
+    te_->set_layer_budget(te_want_);
+    te_set_ = te_want_;
+}
+
 QiPlan QiPipeline::plan(int64_t T, int64_t h, int64_t w, int64_t n_ids, int64_t n_neg_pre) {
     QiPlan p;
     p.budget = budget_ > 0 ? budget_ : auto_budget_;
@@ -217,7 +223,11 @@ QiPlan QiPipeline::plan(int64_t T, int64_t h, int64_t w, int64_t n_ids, int64_t 
         dit_->set_block_budget(p.blocks);
         dit_set_ = p.blocks;
     }
-    if (p.layers != te_set_) {
+    // the encoder's layers: fewer at once (their room is the DiT's now), more only when it encodes (te_layers): the
+    // decode gives them to the VAE, and a prompt whose states are kept does not run it (RX 9060 XT: 163 ms an image
+    // to take 6300 MiB back for nothing)
+    te_want_ = p.layers;
+    if (p.layers < te_set_) {
         te_->set_layer_budget(p.layers);
         te_set_ = p.layers;
     }
@@ -420,6 +430,7 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     // the text states, kept for the same prompt and the same references (an edit again with another seed)
     if (all_ids != last_ids_ || refs != last_refs_) {
         if (kept) throw std::logic_error("image engine: an edit's kept states do not match its request");
+        te_layers();
         last_states_ = r.refs.empty() ? te_->encode(r.ids) : te_->encode(all_ids, te_images);
         te_->drop_activations();
         last_ids_ = all_ids;
@@ -433,6 +444,7 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     dit_->set_context(last_states_.data() + r.drop * C, n_ctx, dit_refs);
     if (guided) {   // the negative prompt's states (kept as the prompt's are; its references are the prompt's)
         if (neg_all != last_neg_ids_ || refs != last_neg_refs_) {
+            te_layers();
             last_neg_states_ = r.refs.empty() ? te_->encode(r.neg_ids) : te_->encode(neg_all, neg_te);
             if (kept) throw std::logic_error("image engine: an edit's kept states do not match its request");
             last_neg_ids_ = neg_all;
@@ -473,8 +485,9 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
             dit_->drop_activations();
             vae_room = p.vae;
         }
-        if (vae_->scratch_bytes(h, w) > vae_room && te_->layers_vram() > 0) {
-            // the encoder's layers too (the next prompt streams them back; the same prompt's states are kept)
+        if (vae_->scratch_bytes(h, w) > vae_room && p.layers > 0) {
+            // the encoder's layers too, or their room if they have not taken it (the next prompt that encodes takes it
+            // back; the same prompt's states are kept)
             te_->drop_layers();
             te_set_ = 0;
             vae_room += p.layers;
