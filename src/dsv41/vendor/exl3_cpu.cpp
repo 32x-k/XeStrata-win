@@ -1,4 +1,4 @@
-#if !defined(__AVX512F__)
+#if !(defined(__x86_64__) || defined(_M_X64))   // (x86 defines it below, inside its guard)
 // the band GEMM's chunk width, defined here because the uses are outside the AVX-512 guard
 constexpr int kGemmK = 256;
 #endif

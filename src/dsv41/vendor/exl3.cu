@@ -19,8 +19,8 @@
 // NVIDIA GPUs before sm_80 (V100, T4, RTX 20) decode with v1.1.8's kernels instead (exl3_legacy.cu, use_legacy
 // below): this file's CUDA-core fallback was slower there (a V100 with EXL3-3.05bpw: decode 4.9 -> 4.4 tok/s).  The
 // prompt path below is this file's on every GPU.
-#if defined(STRATA_METAL)
 #include "../ds4_launch.h"   // strata_ds4_launch: <<<>>> on CUDA and HIP, a dispatch on Metal
+#if defined(STRATA_METAL)
 #include <ds4_metal_host.h>
 #endif
 #include "strata/dsv41/exl3.hpp"
