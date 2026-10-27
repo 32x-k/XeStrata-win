@@ -161,6 +161,67 @@ An entry may add `"env"` and `"args"`.
 - A replica that stopped is started again in the background; the others keep serving.
 - Every replica keeps its own copy of the model's experts in RAM: check that the RAM holds them.
 
+## Read the prompt on one card, make the answer on another (split serving, opt-in)
+
+When two GPUs can each hold the whole model, one can read the prompt (prefill) and the other make the answer (decode) (upstream 690172c46; the idea and the hand-made setup are @MarcoTool's, in upstream's issue #4000).
+The layers are not split: the server starts two engines, one card each, and the prefill engine hands the session it read to the decode engine through a file in RAM.
+The client still sees one endpoint.
+Nothing changes unless it is set.
+
+In the config (`xestrata-<model>.json`) the cards are PCI addresses, as in `"gpu_pci"`:
+
+```json
+{
+  "split_serve": {"prefill_gpu": "0000:03:00.0", "decode_gpu": "0000:09:00.0"}
+}
+```
+
+`serve/server.py --split-serve 0000:03:00.0,0000:09:00.0` (the prefill card first) does the same.
+The two cards take the place of the config's `"gpu_pci"` and `"split_pci"`, and each engine gets its card through `STRATA_GPU_PCI`.
+It cannot be used with `"replicas"`, `--layer-split`, `--split-device`, `--batch`/`--slots`/`"parallel"` or `--prompt-cache 0`, and it needs `--mtp` (the server stops at start and says why).
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `prefill_gpu`, `decode_gpu` | required | The two cards' PCI addresses. Different cards. |
+| `min_prompt_tokens` | 2048 | A request is handed over only when the decode engine would otherwise read at least this many new tokens itself; below it the decode engine reads them in place. |
+| `dir` | `/dev/shm` if it has room, else the temp folder | Where the session file lives during a hand-over. |
+| `shared_arena` | `true` | One copy of the experts in RAM for both engines (Linux, a file in `/dev/shm` when the experts fit there). `false`: each engine keeps its own. A file name: that file backs it (a file on disk works). |
+| `prefill_args`, `decode_args` | none | Extra engine arguments for one role (a bigger expert cache for the decode engine, say). They must not change the session settings below. |
+
+The start line says what was chosen, and `/metrics` has a `split_serve` block: requests, hand-overs, fallbacks to reading in place, bytes moved and the time spent saving and restoring.
+
+How it works:
+
+1. The server tracks the tokens the decode engine's session holds, and sends a request whose new part is `min_prompt_tokens` or more to the prefill engine as `GEN 0 prefill=1 <ids>`.
+   The engine reads the prompt in the same chunks and with the same checkpoints as a request, up to where the first verify window starts, and stops without making a token.
+   Its session holds the prompt but its last token: the state a continuing request resumes from.
+1. The prefill engine `SAVE`s, the decode engine `RESTORE`s (the session file of [Saving a conversation to a file](DETAILS.md#saving-a-conversation-to-a-file-and-restoring-it-opt-in)).
+1. The request goes to the decode engine as usual; it finds the restored session as the start of the prompt, reads the last token and answers.
+   The request's prompt time and tokens read include the prefill engine's work and the two file steps.
+
+When anything on the way fails (the prefill engine stopped, the file was refused, memory ran short), the decode engine reads the prompt itself and the log says why.
+A prefill engine that stopped is started again in the background.
+
+The session file is bound to the model files, the engine version, the K/V format, the context length, `--kv-resident`, `--mtp-window`, the RoPE, the control vector and the arithmetic switches.
+Both engines start from one config, so these match unless `prefill_args`/`decode_args` change them.
+The expert cache size, the `--prefill` chunk, sampling and the drafting depth may differ between the engines.
+Two cards of different makers (an Intel Arc and an NVIDIA card, say) can be paired when one build drives both.
+Their arithmetic then differs in its bits, so the answer is not token for token that of one engine on either card.
+
+It helps when one card is better at reading prompts and another at making answers.
+On two alike cards a layer split reads the prompt and decodes faster than one card, and this gives both up (upstream's measurements on two alike cards were slower than the layer split on every workload).
+A request whose new part is short (a chat follow-up, an agent step) is not handed over, so such use does not change.
+
+Limits:
+
+- One request at a time: reading the next request's prompt does not overlap making the current answer.
+- The decode engine holds one conversation; a hand-over replaces it.
+- No parallel requests, no layer split inside an engine, no pictures (a request with pictures goes to the decode engine alone).
+- RAM for one copy of the experts (the shared arena, Linux) or two, and the session file during a hand-over.
+- `"conversation_save"` is the decode engine's alone.
+
+`tools/split_serve_check.py` compares the answer of one engine with the split's, by tokens and by the state fingerprint (`STRATA_STATE_HASH`) (`exact`), and measures the layer split, one card and the split (`bench`).
+
 ## One conversation with both cards busy (`--pipeline-windows`, opt-in)
 
 With a split the GPUs take turns on a verify window.
