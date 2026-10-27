@@ -1245,6 +1245,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(gdn_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(gdn_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME gdn_parity COMMAND gdn_parity --selftest)
+  # #3948: the same checks through the 4-blocks-a-head GDN step (the default on gfx1151), whose output-norm kernel writes the
+  # STRATA_QFUSE q8_1 image on its own
+  add_test(NAME gdn_parity_split COMMAND gdn_parity --selftest)
+  set_tests_properties(gdn_parity_split PROPERTIES ENVIRONMENT "STRATA_GDN_SPLIT=1")
 
   # v100/gdn-chunk: the chunked GDN prompt recurrence vs the token recurrence and a host reference (GPU,
   # synthetic, no model).  The chunked path changes the summation order - FP32-level, not bit-exact - so the
