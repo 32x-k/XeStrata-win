@@ -601,6 +601,7 @@ Buffer Context::wrap(void* p, size_t bytes, size_t max_span) {
 // buffer per call.  (Each fresh wrapper is a second GPU mapping of the same pages: the quantiser read the activations through
 // one mapping while the norm that produced them had written through another, and saw the previous layer's.)
 extern "C" void* ds4_gpu_buffer_for_cpu(const void* cpu, size_t bytes, size_t* off) __attribute__((weak_import));
+extern "C" size_t ds4_gpu_alloc_remaining(const void* cpu) __attribute__((weak_import));
 #endif
 Buffer Context::wrap(void* p, size_t bytes) {
 #if defined(STRATA_DS4_RUNTIME)
@@ -615,6 +616,10 @@ Buffer Context::wrap(void* p, size_t bytes) {
             return r;
         }
     }
+#endif
+#if defined(STRATA_DS4_RUNTIME)
+    if (std::getenv("DS4_WRAP_LOG"))   // debugging: a wrap that is not inside one runtime allocation gets a second GPU mapping of the pages
+        std::fprintf(stderr, "mtl: wrap FALLBACK p=%p bytes=%zu alloc_remaining=%zu\n", p, bytes, ds4_gpu_alloc_remaining ? ds4_gpu_alloc_remaining(p) : (size_t) 0);
 #endif
     id<MTLBuffer> b = [impl_->dev newBufferWithBytesNoCopy:p length:bytes options:MTLResourceStorageModeShared deallocator:nil];
     if (!b) {

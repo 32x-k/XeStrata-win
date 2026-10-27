@@ -43,8 +43,8 @@ if [ ! -x "$EXE" ]; then
   "$CMAKE" -S "$ROOT/metal" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_MAKE_PROGRAM="$NINJA" \
     -DMETAL_CPP_DIR="$METAL_CPP_DIR" -DSTRATA_GGML_DIR="$STRATA_GGML_DIR" -DSTRATA_BUILD_ID="$BUILD_ID" \
     -DSTRATA_DS4_VERSION="$VERSION-metal" || exit 1
-  "$NINJA" -C "$BUILD" strata_ds4 || exit 1
 fi
+"$NINJA" -C "$BUILD" strata_ds4 || exit 1      # (always: a no-op when current; an existing build folder must not package a stale binary)
 
 STAGE="$ROOT/pkg/dsv41-stage"
 rm -rf "$STAGE"

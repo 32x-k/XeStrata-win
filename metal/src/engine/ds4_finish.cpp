@@ -26,6 +26,17 @@ extern "C" void ds4_gpu_sync_all_streams();
 extern "C" unsigned long long ds4_dispatch_seq();
 static unsigned long long g_q8_deduped = 0;
 
+// The bytes a kernel's wrap() binds from the page-aligned `base`, `need` of them used: whole pages, but never past the end of
+// the allocation that holds them.  A range that leaves its allocation cannot be bound as the runtime's own buffer and gets a fresh
+// no-copy buffer instead: a second GPU mapping of the same pages, through which a kernel read the previous values of what an
+// earlier kernel had written through the first (ext_to_ring read the window rows of the layer before; a prompt of a few tokens
+// answered differently on every run, with the same result only when the GPU was synchronised after the kernel).
+static size_t wrap_len(size_t base, size_t need) {
+    const size_t pg = 16384, up = (need + pg - 1) / pg * pg;
+    const size_t rem = ds4_gpu_alloc_remaining((const void*) base);
+    return rem > 0 && rem < up ? rem : up;   // (sparse_attn asks for one row more than the window buffer holds, which it never reads)
+}
+
 #define DSV41_PROBE(fmt, ...) do { static bool once_ = false; if (!once_) { once_ = true; std::fprintf(stderr, "[probe] " fmt, __VA_ARGS__); } } while (0)
 
 namespace strata::dsv41::metal_host {
@@ -134,7 +145,7 @@ bool finish(float* x, int n_vec, int len, long long stride, const FinishIn& f) {
     const size_t bytes = (size_t) (n_vec - 1) * (size_t) stride * sizeof(float) + (size_t) len * sizeof(float);
     const size_t base = ((uintptr_t) hx) & ~(uintptr_t) (page - 1);
     const size_t off = ((uintptr_t) hx) - base;
-    mtl::Buffer bx = g_cx->wrap((void*) base, ((bytes + off + page - 1) / page) * page);
+    mtl::Buffer bx = g_cx->wrap((void*) base, wrap_len(base, bytes + off));
     if (!bx.handle) { std::fprintf(stderr, "dsv41 metal: finish wrap failed\n"); return false; }
 
     GpuFinish gf{};
@@ -190,7 +201,7 @@ bool hc_post(const float* y, float* h, const float* post, const float* comb, int
     auto wrap = [&](void* host, size_t bytes) {   // the pages the buffer itself spans (see q8_quant_rows' note)
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     mtl::Buffer by = wrap(hy, (size_t) T * dim * 4 );
@@ -241,7 +252,7 @@ bool hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float*
     auto wrap = [&](void* host, size_t bytes) {   // the pages the buffer itself spans (see q8_quant_rows' note)
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     mtl::Buffer bh = wrap(hh, (size_t) T * hcdim * 4 );
@@ -277,7 +288,7 @@ bool hc_mix(const float* h, const float* fn, int hcdim, int n_mix, int T, float 
     auto wrap = [&](void* host, size_t bytes) {   // the pages the buffer itself spans (see q8_quant_rows' note)
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     mtl::Buffer bh = wrap(hh, (size_t) T * hcdim * 4 );
@@ -314,7 +325,7 @@ bool hc_split(const float* mixes, const float* scale, const float* base, int hc,
     auto wrap = [&](void* host, size_t bytes) {   // the pages the buffer itself spans (see q8_quant_rows' note)
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     mtl::Buffer bm = wrap(hm, (size_t) T * 32 * 4 );
@@ -377,7 +388,7 @@ bool hc_mix_split(const float* h, const float* fn, int hcdim, int n_mix, int T, 
     auto wrap = [&](void* host, size_t bytes) {   // the pages the buffer itself spans (see q8_quant_rows' note)
         const size_t base_ = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base_, ((end - base_ + page - 1) / page) * page);
+        return g_cx->wrap((void*) base_, wrap_len(base_, end - base_));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(size_t) (page - 1))); };
     mtl::Buffer bh = wrap(hh, (size_t) T * hcdim * 4);
@@ -421,7 +432,7 @@ bool moe_sort(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds
     auto wrap = [&](void* host, size_t bytes) {   // the pages the buffer itself spans (see q8_quant_rows' note)
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     const size_t t_bytes = (size_t) T * (size_t) k * 4;
@@ -478,7 +489,7 @@ bool engram_dequant_tok(const uint8_t* src, size_t per, int cols, int T, int hd,
     auto wrap = [&](void* host, size_t bytes) {   // the pages the buffer itself spans (see q8_quant_rows' note)
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     const size_t rows = (size_t) T * (size_t) cols;
@@ -510,7 +521,7 @@ bool hc_pre_norm(const float* h, const float* mix, const float* w, int dim, int 
     auto wrap = [&](void* host, size_t bytes) {   // the pages the buffer itself spans (see q8_quant_rows' note)
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     mtl::Buffer bh = wrap(hh, (size_t) T * hc * dim * 4 );
@@ -558,7 +569,7 @@ bool q8_quant_rows(const float* x, size_t ldx, int rows, int k, int8_t* q, float
     auto wrap = [&](void* host, size_t bytes) {
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     mtl::Buffer bx = wrap(hx, (size_t) rows * ldx * 4);
@@ -1065,7 +1076,7 @@ bool ring_to_ext(const void* ring, void* ext, long long p0, int n, int d, size_t
     auto wrap = [&](void* host, size_t bytes) {   // the pages the buffer itself spans (see q8_quant_rows' note)
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     mtl::Buffer br = wrap(hr, (size_t) n * row_bytes );
@@ -1097,7 +1108,7 @@ bool ext_to_ring(const void* ext, void* ring, long long p0, int n, int T, int d,
     auto wrap = [&](void* host, size_t bytes) {   // the pages the buffer itself spans (see q8_quant_rows' note)
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     mtl::Buffer be = wrap(he, (size_t) (n + T) * d * 2 );
@@ -1160,7 +1171,7 @@ bool sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
     auto wrap = [&](void* host, size_t bytes) {   // the pages the buffer itself spans (see q8_quant_rows' note)
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
 
@@ -1306,7 +1317,7 @@ bool route(const float* logits, const float* bias, int n, int k, int T, float ro
     auto wrap = [&](void* host, size_t bytes) {
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     mtl::Buffer bl = wrap(hl, (size_t) T * 1024 * 4);
@@ -1368,7 +1379,7 @@ bool gather_rows(const float* x, const void* g, int n, int cols, float* out) {
     auto wrap = [&](void* host, size_t bytes) {
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     int max_src = 0;
@@ -1405,7 +1416,7 @@ bool combine(const float* ed, const float* cpu, const float* sh, const void* c, 
     auto wrap = [&](void* host, size_t bytes) {
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     int max_row = 0;
@@ -1453,7 +1464,7 @@ bool engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, f
     auto wrap = [&](void* host, size_t bytes) {   // the pages the buffer spans (see q8_quant_rows' note)
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     // (the kernel strides rows by hd bytes, as the CUDA kernel does, though an IQ4_NL row only fills hd/32*18 of them:
@@ -1486,7 +1497,7 @@ bool engram_gate(float* h, const float* kv, const float* w, int hc, int dim, int
     auto wrap = [&](void* host, size_t bytes) {
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     mtl::Buffer bh = wrap(hh, (size_t) T * (size_t) hc * (size_t) dim * 4);
@@ -1545,7 +1556,7 @@ bool compress_win(const float* kv, const float* score, float* kv_state, float* s
     auto wrap = [&](void* host, size_t bytes) {   // the pages the buffer spans (see q8_quant_rows' note)
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     mtl::Buffer bkv = wrap(hkv, (size_t) T * (size_t) d * 4);
@@ -1589,7 +1600,7 @@ bool index_score(const float* q, const float* wq, const void* kc, int heads, int
     auto wrap = [&](void* host, size_t bytes) {
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     const size_t kb = kfmt == 3 ? (size_t) ((hd / 2 + hd / 32 + 15) / 16 * 16) : (size_t) hd * 2;
@@ -1666,7 +1677,7 @@ bool gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, 
     auto wrap = [&](void* host, size_t bytes) {   // the pages the buffer spans (see q8_quant_rows' note)
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     mtl::Buffer bw = wrap(hw, (size_t) n * (size_t) k * 2);
@@ -1705,7 +1716,7 @@ bool topk(const float* vals, long long stride, int T, const void* rows, const in
     auto wrap = [&](void* host, size_t bytes) {   // the pages the buffer spans (see q8_quant_rows' note)
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     mtl::Buffer bv = wrap(hv, ((size_t) (T - 1) * (size_t) stride + 1) * 4);
@@ -1750,7 +1761,7 @@ bool block_max(const float* score, long long stride, int T, const void* rows, in
     auto wrap = [&](void* host, size_t bytes) {   // the pages the buffer spans (see q8_quant_rows' note)
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     mtl::Buffer bs = wrap(hs, ((size_t) (T - 1) * (size_t) stride + (size_t) nb_max * (size_t) blk) * 4);
@@ -1789,7 +1800,7 @@ bool hc_mean(const float* h, int T, int hc, int dim, float* out, long long out_s
     auto wrap = [&](void* host, size_t bytes) {   // the pages the buffer spans (see q8_quant_rows' note)
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     mtl::Buffer bh = wrap(hh, (size_t) T * (size_t) hc * (size_t) dim * 4);
@@ -1909,7 +1920,7 @@ bool iota_rows(int* out, int T, int n, int stride) {
     auto wrap = [&](void* host, size_t bytes) {
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     mtl::Buffer bo = wrap(ho, ((size_t) (T - 1) * (size_t) stride + (size_t) n) * 4);
@@ -1944,7 +1955,7 @@ bool sample_greedy(const float* logits, int n_tokens, int n_vocab, const int* hi
     auto wrap = [&](void* host, size_t bytes) {   // the pages the buffer spans (see q8_quant_rows' note)
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     mtl::Buffer bl = wrap(hl, (size_t) n_tokens * (size_t) n_vocab * 4);
@@ -1988,7 +1999,7 @@ bool unpack_sel(const void* ckv, const int* sel, int sel_stride, int gen, long l
     auto wrap = [&](void* host, size_t bytes) {   // the pages the buffer itself spans (see q8_quant_rows' note)
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     int maxrow = -1;
@@ -2039,7 +2050,7 @@ bool moe_combine(void* acc, const void* y, const int* pos, const float* w_, int 
     auto wrap = [&](void* host, size_t bytes) {   // the pages the buffer itself spans (see q8_quant_rows' note)
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     mtl::Buffer ba = wrap(ha, (size_t) T * dim * 4 );
@@ -2076,7 +2087,7 @@ bool hc_post_v(const float* y, const float* res, const float* post, const float*
     auto wrap = [&](void* host, size_t bytes) {   // the pages the buffer itself spans (see q8_quant_rows' note)
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     mtl::Buffer by = wrap(hy, (size_t) T * dim * 4 );
@@ -2113,7 +2124,7 @@ bool gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int
     auto wrap = [&](void* host, size_t bytes) {   // the pages the buffer itself spans (see q8_quant_rows' note)
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     mtl::Buffer bw = wrap(hw, (size_t) n * k * 4 );
@@ -2151,7 +2162,7 @@ bool route_publish(const float* logits, const float* bias, int n, int k, int T, 
     auto wrap = [&](void* host, size_t bytes) {   // the pages the buffer itself spans (see q8_quant_rows' note)
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     mtl::Buffer bl = wrap(hl, (size_t) T * 1024 * 4 );
@@ -2197,7 +2208,7 @@ bool swiglu(const float* g, const float* u, int n, float lim, float* h) {
     auto wrap = [&](void* host) {
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + (size_t) n * 4;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     mtl::Buffer bg = wrap(hg), bu = wrap(hu), bh = wrap(hh);
@@ -2288,7 +2299,7 @@ bool rows_f16(const float* x, int ldx, const int* idx, int nrows, int ncols, uin
     auto wrap = [&](void* host, size_t bytes) {
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     mtl::Buffer bx = wrap(hx, ((size_t) (nrows - 1) * (size_t) ldx + (size_t) ncols) * 4);
@@ -2323,7 +2334,7 @@ bool dequant_rows(int kind, const void* raw, size_t ld, int k, int n, uint16_t* 
     auto wrap = [&](void* host, size_t bytes) {
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     const size_t wbytes = (size_t) (n - 1) * ld * (kind == 0 ? 2 : 1) + (kind == 0 ? (size_t) k * 2 : (kind == 13 ? (size_t) (k / 256) * 176 : (size_t) (k / 32) * 34));
@@ -2364,7 +2375,7 @@ bool gemm_f16_nt(const uint16_t* W16, const uint16_t* X16, int ldx, float* Y, in
     auto wrap = [&](void* host, size_t bytes) {
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     void* hw = strata::gpu::host_view((void*) W16);
@@ -2599,7 +2610,7 @@ static bool mm_set(bool gate_up, const uint8_t* wbase, size_t stride, const size
         void* hyr = strata::gpu::host_view(yout);
         const size_t n4 = (size_t) total_rows * (size_t) n_embd;
         const size_t base = (size_t) ((uintptr_t) hyr) & ~(size_t) (page - 1);
-        mtl::Buffer bd = g_cx->wrap((void*) base, ((((size_t) (uintptr_t) hyr + n4 * 4 - base) + page - 1) / page) * page);
+        mtl::Buffer bd = g_cx->wrap((void*) base, wrap_len(base, (size_t) (uintptr_t) hyr + n4 * 4 - base));
         mtl::Pipeline pc;
         try { pc = g_cx->pipeline(g_lib, "ds4_copy4"); } catch (...) { return false; }
         mtl::Dispatch c;
@@ -2647,7 +2658,7 @@ extern "C" bool ds4_ctx_copy(void* dst, const void* src, size_t n) {
     auto wrap = [&](void* host, size_t bytes) {
         const size_t base = (size_t) ((uintptr_t) host) & ~(size_t) (page - 1);
         const size_t end = (size_t) ((uintptr_t) host) + bytes;
-        return g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+        return g_cx->wrap((void*) base, wrap_len(base, end - base));
     };
     auto off = [&](void* host) { return (size_t) ((uintptr_t) host - (((uintptr_t) host) & ~(uintptr_t) (page - 1))); };
     mtl::Buffer bs = wrap(hs, n);
@@ -2674,7 +2685,7 @@ extern "C" bool ds4_ctx_fill(void* dst, int value, size_t n) {
     const size_t page = 16384;
     const size_t base = (size_t) ((uintptr_t) hd) & ~(size_t) (page - 1);
     const size_t end = (size_t) ((uintptr_t) hd) + n;
-    mtl::Buffer bd = g_cx->wrap((void*) base, ((end - base + page - 1) / page) * page);
+    mtl::Buffer bd = g_cx->wrap((void*) base, wrap_len(base, end - base));
     if (!bd.handle) return false;
     mtl::Pipeline pl;
     try { pl = g_cx->pipeline(g_lib, "ds4_fill1"); } catch (...) { return false; }
