@@ -346,13 +346,12 @@ def apply_defaults(s: S.LaunchSettings, catalog) -> tuple[S.LaunchSettings, list
                 if s.vision == "off" and r.images and catalog.reader_state() == "missing":
                     notices.append(S.Notice("warn", "The engine installed here has no picture reader, so pictures are off.",
                                             "Update the engine to read pictures, or add --vision off to silence this."))
-        if catalog.strata.multi_family(s.family):           # DeepSeek-V4.1-Flash: one request at a time, no tuning, no pictures yet
+        if catalog.strata.multi_family(s.family):           # DeepSeek-V4.1-Flash: one request at a time, no tuning
             if s.parallel and s.parallel > 1:
                 notices.append(S.Notice("warn", f"{s.model} answers one request at a time in this Strata version, so --parallel {s.parallel} is not used.", ""))
                 s.parallel = None
-            if s.vision not in (None, "off"):
-                notices.append(S.Notice("warn", "DeepSeek-V4.1-Flash cannot read pictures in this Strata version, so pictures are off.", ""))
-            s.vision = "off"                                 # (tuning is DeepSeek's own short tune: tools/dsv41/tune.py, run by the launch)
+            # pictures: on unless the person chose off - the engine reads them with its own vision tower, no separate reader
+            s.vision = "off" if s.vision == "off" else "on"   # (tuning is DeepSeek's own short tune: tools/dsv41/tune.py, run by the launch)
         elif s.speed:
             notices.append(S.Notice("warn", "--speed and --full-quality are for DeepSeek; this model uses all its experts, so they are not used.", ""))
             s.speed = None

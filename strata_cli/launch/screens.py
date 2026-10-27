@@ -1017,10 +1017,15 @@ class PicturesScreen(Base):
         s = self.ctx.settings
         return next((x for x in self.ctx.rows if (x.family, x.model) == (s.family, s.model)), None)
 
+    def own_tower(self) -> bool:
+        """DeepSeek reads pictures with a tower inside its own engine: no separate picture reader to look for."""
+        s = self.ctx.settings
+        return bool(s.family) and bool(self.ctx.catalog.strata.multi_family(s.family))
+
     def reader(self) -> str:
         """"present" when the installed engine carries the picture reader (strata-vision), "missing" when an engine is installed without it,
         "unknown" before any engine is installed (the first launch fetches it)."""
-        return self.ctx.catalog.reader_state()
+        return "present" if self.own_tower() else self.ctx.catalog.reader_state()
 
     def on_mount(self) -> None:
         s = self.ctx.settings
@@ -1036,6 +1041,9 @@ class PicturesScreen(Base):
         self.paint()
 
     def explain(self) -> Text:
+        if self.own_tower() and self.supported:
+            return Text("Pictures are on by default. DeepSeek reads them with a picture tower of its own inside the engine: a 1 GB file that comes with "
+                        "the model's files and about 0.3 GB of graphics memory. Say No if you only chat in text.", style=MUTE)
         amd = any(str(g.get("vendor")) == "amd" for g in self.ctx.computer.usable_gpus)
         on_card = self.ctx.catalog.picture_default(True) == "gpu"
         extra = ("a 0.9 GB download (if it is not on this computer yet). On your AMD card the picture reader runs on the graphics card "
@@ -1056,7 +1064,7 @@ class PicturesScreen(Base):
 
     def commit(self) -> None:
         key = self.menu().current.key
-        if key == "on":                                      # yes: the reader on the card (NVIDIA, AMD) or the CPU, as the default says
+        if key == "on" and not self.own_tower():             # yes: the reader on the card (NVIDIA, AMD) or the CPU, as the default says
             device = self.ctx.catalog.picture_default(True)
             key = device if device != "off" else "on"
         self.ctx.settings.vision = key

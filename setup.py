@@ -704,6 +704,14 @@ DSV41_ISTA_FILES = {
     "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00004-of-00004.gguf": (20527837312, "9b790a2297ed3cdede379fc984f4a52bb95f3b23724c797af11d1fa6a69db059"),
     "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf": (110595290816, "eb19f30d368d393784e1fc54fdfaffc427ebb2110bf3762fdf5a8fbb9a2d740a"),
 }
+# ISTA re-published the first shard of each set on 2026-10-26 with a larger chat template (images in tool results; their PATCHING.md, and what their
+# patch_chat_template.py makes of a shard 1 already downloaded).  setup downloads the pinned revision (HF_REVISIONS), so DSV41_ISTA_FILES stays the older
+# file; a newer shard 1 "already here" (--gguf-dir) is the same weights with the newer template and is accepted by its own size and SHA-256, never fetched.
+DSV41_NEW_SHARD1 = {
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00004.gguf": (39358841536, "a7be0d5a48e4d1c13c5535f9123d9131ab8964e5acf8a0c01d14970e4b7f4df9"),
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00004.gguf": (39535788064, "d9b949d55e27242b8afc7c2928749b888372d4c39682f9a131670d1c2555155e"),
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf": (39075725728, "2dfe9711eac1f7814aa59154d11e8f27739f8b96875dc1e667eac9f8c756e1fe"),
+}
 # The files the first release of these sets was downloaded as (helcig/tmp-oct26-2, 2026-10-23: model-2.00bpw-0000N-of-00004.gguf, model-2.25bpw-...,
 # engram-IQ4_NL.gguf, usually in a 2.00bpw/ or 2.25bpw/ folder): testers and our boxes have them.  They are the same weights: shards 2-4 are the
 # same bytes as today's, and shard 1 and the Engram differ only in their GGUF header (metadata).  setup accepts them from "files already here"
@@ -726,7 +734,9 @@ DSV41_LEGACY_NAMES = {
     DSV41_ISTA_ENGRAM: "engram-IQ4_NL.gguf",
 }
 # the files every official set shares (name -> where it comes from); they live in models/deepseek-v4.1-flash-shared, once
+DSV41_MMPROJ = "mmproj-BF16.gguf"     # the vision tower's weights (972 MB, pinned): packed into the model's pack when pictures are on (0.2.7)
 DSV41_SHARED = {
+    DSV41_MMPROJ: hf(DSV41_REPO),
     DSV41_ISTA_ENGRAM: hf(DSV41_ISTA_REPO),
     DSV41_SHARD.format(i=1): hf(DSV41_REPO) + "UD-Q8_K_XL/",      # only its metadata is read (pack_gguf --engram-meta)
     DSV41_DSPARK: hf(DSV41_REPO),
@@ -743,7 +753,7 @@ MULTI_FILE_FAMILIES = {
                    "models": {"UD-Q8_K_XL": {"about": "Unsloth Dynamic 8-bit: the experts in MXFP4 as DeepSeek made them, the rest "
                                                        "in BF16 (the checkpoint's own precision)",
                               "ram_gb": 306, "shards": [DSV41_SHARD.format(i=i) for i in range(1, 10)]}},
-                   "sha256": DSV41_ALL_FILES, "vision": False}
+                   "sha256": DSV41_ALL_FILES, "vision": True}     # the engine's own tower (strata-dsv41 --vision on, the default), 0.2.7
 }
 # The official sets first (a normal PC), Unsloth's 508 GB set last.  Each model: its shards, the sub-folder they are in at the repository
 # (and in a --gguf-dir folder), the files shared with the other set ("shared"), the pack recipe and the shipped expert profile.
@@ -8098,14 +8108,23 @@ def dsv41_find_shared(a, name: str, folder: Path, shared: Path) -> Path:
     return shared / name
 
 
-def dsv41_pack_cmd(folder: Path, shards: list, engram: Path, meta: Path, dspark: Path, pack: Path) -> list:
+def dsv41_pack_has_tower(pack: Path) -> bool:
+    """Does the pack carry the vision tower (pack_gguf.py writes vision.* and image_token_id into ds4.txt when it found the mmproj)?"""
+    try:
+        txt = (Path(pack) / "ds4.txt").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return "\nimage_token_id " in "\n" + txt and "vision.num_hidden_layers" in txt
+
+
+def dsv41_pack_cmd(folder: Path, shards: list, engram: Path, meta: Path, dspark: Path, pack: Path, mmproj: Path | None = None) -> list:
     """The pack recipe for an official IST-DAS set - this and nothing else: another one (--skip-tensors / --dense-override + engram_fold)
     packs without an error and gives garbage text (P2003, 2026-10-23).  The drafter's noise token (128799) and markov rank (256) are stated:
     the IST-DAS GGUFs do not carry them, and a pack with noise id 0 drafts deep less often (decode ~10% slower with DSpark).  --shards names the four files, so an Engram or another
     set in the same folder is not read as part of the model."""
     return [sys.executable, str(ROOT / "tools" / "dsv41" / "pack_gguf.py"), "--model", str(folder), "--shards", *[Path(n).name for n in shards],
             "--engram", str(engram), "--engram-meta", str(meta), "--dspark-gguf", str(dspark),
-            "--dspark-noise-token", "128799", "--dspark-markov-rank", "256", "--out", str(pack)]
+            "--dspark-noise-token", "128799", "--dspark-markov-rank", "256", *(["--mmproj", str(mmproj)] if mmproj else []), "--out", str(pack)]
 
 
 def dsv41_prefill_chunk_args(cards, ram_gb) -> list:
@@ -8229,7 +8248,12 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
     folder = dsv41_folder(a, fam, tag, model)
     shards = [dsv41_pick(folder, n) for n in md["shards"]]
     shared_dir = dsv41_shared_dir(a, fam)
-    shared = [dsv41_find_shared(a, n, folder, shared_dir) for n in md.get("shared", [])]
+    # Pictures are on by default (owner rule): the engine reads them with its own vision tower, which the pack carries when the tower's weights
+    # (mmproj-BF16.gguf, a shared file) were there when it was made.  --vision no leaves the file out and the pack text-only.
+    ds_vision = "off" if a.vision in ("no", "off") else "on"
+    shared_names = list(md.get("shared", [])) + ([DSV41_MMPROJ] if ds_vision == "on" else [])
+    shared = [dsv41_find_shared(a, n, folder, shared_dir) for n in shared_names]
+    mmproj_file = shared[len(md.get("shared", []))] if ds_vision == "on" else None
     own_files = {f: bool(a.gguf_dir) or f.parent != shared_dir for f in shared}         # a file found outside setup's own folder is the person's
 
     def partial(f: Path) -> int:
@@ -8273,8 +8297,10 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
         warn(f"little free disk space in {folder}: {free:.1f} GB free for about {left:.1f} GB. Setup goes on and should fit")
     if ctx > 65536:
         warn(f"{ctx // 1024}K tokens of context: the engine was checked at 4K and 8K; longer is kept as you chose, but untested")
-    if a.vision in ("yes", "gpu", "cpu"):
-        warn(f"{fam['title']} cannot read pictures in this Strata version (its picture reader is in development): images off")
+    # Pictures are on by default (owner rule): the engine reads them with its own vision tower (319 MiB, loaded with the model, no separate
+    # reader process).  --vision no turns them off (--vision off for the engine); gpu / cpu name a Flash-Next reader and mean "on" here.
+    if a.vision in ("gpu", "cpu"):
+        warn(f"{fam['title']} reads pictures with the engine's own tower, so --vision {a.vision} is taken as yes: pictures on")
     if a.rope_scaling or a.rope_scale or a.kv or a.resident_budget_gib is not None or a.low_ram not in (None, "auto"):
         warn(f"--rope-scaling / --kv / --resident-budget-gib / --low-ram are Flash-Next settings: {fam['title']} does not use them")
 
@@ -8322,7 +8348,12 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
                 download((md.get("hf") or fam["hf"]) + f.name, f)
         if f.name in DSV41_LEGACY_FILES:
             ok(f"{f.name}: a file of the first release of this set (the same weights); it is used as it is")
-        verify_sha256(f, *fam["sha256"][f.name], own=bool(a.gguf_dir) or f.name in DSV41_LEGACY_FILES)
+        pin = fam["sha256"][f.name]
+        new = DSV41_NEW_SHARD1.get(f.name)
+        if new and a.gguf_dir and f.is_file() and f.stat().st_size == new[0] and f.stat().st_size != pin[0]:      # shard 1 with the 2026-10-26 chat template
+            pin = new
+            ok(f"{f.name}: the version with ISTA's newer chat template (the same weights); it is used as it is")
+        verify_sha256(f, *pin, own=bool(a.gguf_dir) or f.name in DSV41_LEGACY_FILES)
     for f in shared:                                  # the Engram, the drafter, the metadata shard: once for every official set
         if f.exists() and (done(f) or own_files[f]):
             ok(f"{f.name} already here ({f.parent})")
@@ -8335,6 +8366,10 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
     data, _ = data_folder_for(a)
     pack = data / "packs" / tag.lower()            # the engine's map of the shards, the hash tables, the tokenizer: a few MB
     have_pack = (pack / "tokenizer" / "vocab.json").exists() and (pack / "tensors.txt").exists()
+    if have_pack and ds_vision == "on" and mmproj_file is not None and not dsv41_pack_has_tower(pack):
+        warn("the pack from an earlier run was made without the picture reader: building it again with it (a few minutes)")
+        shutil.rmtree(pack, ignore_errors=True)
+        have_pack = False
     if have_pack and ista:                         # a pack from an earlier run is kept only when the engine finds all of its files
         good, why = dsv41_pack_info(exe, pack, lib_dirs)
         if not good:
@@ -8343,9 +8378,10 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
             have_pack = False
     if not have_pack:
         if ista:
-            run(dsv41_pack_cmd(folder, [f.name for f in shards], shared[0], shared[1], shared[2], pack))
+            run(dsv41_pack_cmd(folder, [f.name for f in shards], shared[0], shared[1], shared[2], pack, mmproj_file))
         else:
-            run([sys.executable, str(ROOT / "tools" / "dsv41" / "pack_gguf.py"), "--model", str(folder), "--out", str(pack)])
+            run([sys.executable, str(ROOT / "tools" / "dsv41" / "pack_gguf.py"), "--model", str(folder), "--out", str(pack),
+                 *(["--mmproj", str(mmproj_file)] if mmproj_file else [])])
     if ista:
         prof = DSV41_PROFILES / md["profile"]          # which experts are used most: the RAM store starts with them (the engine reads <pack>/expert-profile.bin)
         if prof.is_file() and not (pack / "expert-profile.bin").exists():
@@ -8381,7 +8417,7 @@ def install_dsv41(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopted, 
     # --dspark-conf 0.65: the drafts' confidence floor (H100 replay, DSPARK-DEFAULTS.md: within 0.01-0.02 of the per-class best,
     # never below 0.3).  The engine has no flag for the draft block (3 in the same table): it reads the block size from the pack,
     # so only the floor is written.
-    args = ["--pack", str(pack), "--max-context", str(ctx), "--eos", "1", "--dspark", "auto",
+    args = ["--pack", str(pack), "--max-context", str(ctx), "--eos", "1", "--vision", ds_vision, "--dspark", "auto",
             *(["--dspark-conf", "0.65"] if md.get("recipe") == "ista" else []), *dsv41_prefill_chunk_args(cards, ram),
             *plan["args"]]
     env = dsv41_config_env(cards)

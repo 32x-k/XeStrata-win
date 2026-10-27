@@ -72,6 +72,7 @@ from strata_control import tls  # noqa: E402
 tls.install()       # #3722: image URLs and tool servers over HTTPS are checked against the operating system's certificates
 from strata_control import hipblaslt_tuning  # noqa: E402
 from strata_control import vision_reader  # noqa: E402
+from serve.ds_pictures import DsPictures  # noqa: E402
 from strata_control import draft_layer  # noqa: E402
 from strata_control import drafting  # noqa: E402
 from strata_control import user_args  # noqa: E402
@@ -4981,14 +4982,16 @@ class Service:
         self.embeddings.path = None
         self.embeddings.keys = None
         images = images_of(messages)
+        ds_pics = False                                  # DeepSeek pictures (the engine's own tower): the file is already written
         if images:
             if self.offline and any(src.startswith(("http://", "https://")) for src in images):
                 raise ValueError("offline mode cannot download an image URL; send a data: image instead")
             if self.vision is None:
+                if self.family == "deepseek41":
+                    raise ValueError("this server was started without pictures for DeepSeek (--vision off, or a pack made without the "
+                                     "picture reader): run strata launch again without --vision off to read images")
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
-            pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
-            start = self.tok.encode(VISION_START, parse_special=True)[0]
             # An image URL is downloaded first, outside the FIFO: under it, a slow server held every other request
             # for as long as urlopen waited.
             def fetch(src):
@@ -4997,6 +5000,16 @@ class Service:
                 return fetched[src] if src in fetched else Vision.download(src) \
                     if src.startswith(("http://", "https://")) else src
             images = [fetch(src) for src in images]
+            if isinstance(self.vision, DsPictures):
+                # DeepSeek-V4.1: the engine has its own vision tower.  The pictures go to it as raw RGB in the file of a GENI line
+                # (serve/ds_pictures.py); each template placeholder becomes the run of image tokens its picture takes.
+                ids, ds_file = self.vision.build(ids, [Vision.load(src) if isinstance(src, str) else src for src in images])
+                self.embeddings.path = ds_file
+                self.embeddings.keys = None
+                images, ds_pics = [], True
+        if images:
+            pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
+            start = self.tok.encode(VISION_START, parse_special=True)[0]
             # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
@@ -5068,12 +5081,12 @@ class Service:
             # (an encoder restart, the cache's eviction) with other bits still matches its checkpoints
             self.embeddings.keys = [Path(p).stem[:16] for p, _ in encoded]
             write_temporary(combined, [p for p, _ in encoded])
-        if self.family == "deepseek41" and req is not None and req.get("strata_prefix") is None and not images:
+        if self.family == "deepseek41" and req is not None and req.get("strata_prefix") is None and not images and not ds_pics:
             lead = self.deepseek_shared_start(messages)
             if lead:
                 req["strata_prefix"] = {"messages": lead}
         if req is not None and req.get("strata_prefix") is not None:
-            req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
+            req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images) or ds_pics)
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
     @staticmethod
@@ -8968,6 +8981,13 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or (not a.no_fit_max_tokens and cfg.get("fit_max_tokens") is not False))
     svc.launch_attestation = launch_attestation
+    if (cfg.get("arch") or "") == "deepseek41" and vision is None and a.engine == "strata":
+        # DeepSeek-V4.1 reads pictures with the engine's own tower (--vision on, the default): no separate reader process.
+        # `--vision off` in the config's args, or a pack without a tower, leaves svc.vision None: pictures are refused with the 400 as before.
+        _dsp = DsPictures.from_config(cfg, tmp_dir=Path(cfg["log"]).parent / "ds-pictures" if cfg.get("log") else None)
+        if _dsp is not None:
+            svc.vision = _dsp
+            print("[strata] pictures: on (DeepSeek-V4.1 reads them with the engine's own vision tower; --vision off turns them off)", flush=True)
     svc.offline = a.offline
     svc.max_queue = max_queue
     svc.queue_timeout_s = float(queue_timeout) if queue_timeout is not None else None

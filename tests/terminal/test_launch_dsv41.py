@@ -40,7 +40,7 @@ class LaunchDeepSeek(unittest.TestCase):
         self.assertEqual([r.download_gb for r in rows[:3]], [256.8, 273.8, 239.3])
         self.assertEqual(catalog(self.hw).resolve("ist-das-2.25bpw"), ("deepseek41", "IST-DAS-2.25bpw"))
         r = rows[3]
-        self.assertEqual((r.id, r.download_gb, r.verdict, r.images), ("deepseek-v4.1-flash-ud-q8_k_xl", 508.4, "fits", False))
+        self.assertEqual((r.id, r.download_gb, r.verdict, r.images), ("deepseek-v4.1-flash-ud-q8_k_xl", 508.4, "fits", True))   # 0.2.7: pictures through the engine's own tower
         self.assertEqual(catalog(self.hw).resolve("ud-q8_k_xl"), ("deepseek41", "UD-Q8_K_XL"))
         self.assertEqual(catalog(self.hw).max_context("deepseek41", "UD-Q8_K_XL"), 8192)
 
@@ -50,7 +50,7 @@ class LaunchDeepSeek(unittest.TestCase):
         self.assertEqual(p["settings"]["family"], "deepseek41")
         self.assertEqual(p["settings"]["context"], 8192)
         self.assertEqual(p["settings"]["tune"], "skip")
-        self.assertEqual(p["settings"]["vision"], "off")
+        self.assertEqual(p["settings"]["vision"], "on")              # pictures are on by default (the engine's own tower)
         self.assertEqual(pl["verdict"], "fits")
         self.assertEqual([c["layers"] for c in pl["cards"]], [[0, 9], [10, 19], [20, 29], [30, 39]])
         self.assertEqual(pl["args"], ["--tp", "2"])
@@ -107,10 +107,12 @@ class LaunchDeepSeek(unittest.TestCase):
         p = self.plan("--model", "ud-q8_k_xl", "--parallel", "4", "--vision", "on", "--tune", "quick")
         s = p["settings"]
         self.assertFalse(s.get("parallel"))
-        self.assertEqual((s["vision"], s["tune"]), ("off", "quick"))          # the DeepSeek tune is real now: the choice stays
+        self.assertEqual((s["vision"], s["tune"]), ("on", "quick"))           # the DeepSeek tune is real now: the choice stays; pictures stay on
         text = " ".join(p["warnings"])
         self.assertIn("one request at a time", text)
-        self.assertIn("cannot read pictures", text)
+        self.assertNotIn("cannot read pictures", text)
+        off = self.plan("--model", "ud-q8_k_xl", "--vision", "off")["settings"]
+        self.assertEqual(off["vision"], "off")                                 # --vision off still turns them off
         self.assertNotIn("Tuning is not offered", text)
 
     def test_setup_is_asked_for_the_family_and_the_files(self):
