@@ -7,7 +7,8 @@
 //
 //   strata-image-moss-dit-probe TRANSFORMER_DIR REF_DIR [q8|bf16]
 //
-// Prints each velocity's cosine to the reference's, its relative error (L1: sum |got - want| / sum |want|; L2), and
+// First the pipeline's schedule (moss_sigmas: 50 steps, shift 5) and seed 7's noise (torch_cpu_randn) against the
+// reference's sigmas.npy, timesteps.npy and noise-short.npy.  Then prints each velocity's cosine to the reference's, its relative error (L1: sum |got - want| / sum |want|; L2), and
 // the time of a step (both contexts, then the prompt's alone).  MOSS_BLOCK_BUDGET_MIB: the blocks' VRAM (the rest
 // streamed); without it, what the GPU has free beside the working buffers and 512 MiB.  MOSS_PROBE_RUNS: the timed
 // steps (3).
@@ -15,6 +16,7 @@
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/image/moss_dit.hpp"
+#include "strata/image/moss_pipeline.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -101,7 +103,29 @@ float* put(const std::vector<float>& h) {
     return d;
 }
 
+// the schedule and the noise the pipeline makes against the reference's
+void schedule(const std::string& dir) {
+    const auto sig = npy(dir + "/sigmas.npy"), ts = npy(dir + "/timesteps.npy");
+    const auto mine = strata::image::moss_sigmas(50, 5.0f);
+    size_t same = 0, tsame = 0;
+    for (size_t i = 0; i < std::min(sig.size(), mine.size()); ++i) same += sig[i] == mine[i];
+    for (size_t i = 0; i < std::min(ts.size(), mine.size()); ++i) tsame += ts[i] == mine[i] * 1000.f;
+    std::printf("sigmas: %zu of %zu equal (%zu made); timesteps: %zu of %zu equal\n", same, sig.size(), mine.size(),
+                tsame, ts.size());
+    std::vector<int64_t> ns;
+    const auto noise = npy(dir + "/noise-short.npy", &ns);
+    const auto n = strata::image::torch_cpu_randn(7, noise.size());
+    size_t eq = 0;
+    double mx = 0;
+    for (size_t i = 0; i < n.size(); ++i) {
+        eq += n[i] == noise[i];
+        mx = std::max(mx, (double) std::fabs(n[i] - noise[i]));
+    }
+    std::printf("noise (seed 7): %zu of %zu equal, max |diff| %.3g\n", eq, n.size(), mx);
+}
+
 int run(const std::string& path, const std::string& dir, bool q8) {
+    schedule(dir);
     void* s = strata::core::Runtime::get().create_stream();
     strata::image::MossDit d;
     std::string err;
