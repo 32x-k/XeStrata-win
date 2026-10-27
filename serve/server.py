@@ -391,6 +391,12 @@ class GpuBusy(RuntimeError):
         self.retry_after = retry_after
 
 
+# The page's only CSP directive: its preview frames (srcdoc) may not load any address. Other directives are left out
+# on purpose: a frame made from srcdoc inherits the page's policy, and the opt-in "run scripts" preview needs its own
+# inline script.
+PAGE_CSP = "frame-src 'none'"
+
+
 def unload_wait(value, default: float) -> float:
     """#1997: the `wait` of POST /unload?wait=...: absent / 0 / false: 0 (answer "busy" at once, as before); 1 / true /
     yes: `default` seconds; a number of seconds above 1: that long (at most an hour)."""
@@ -6159,6 +6165,11 @@ def make_handler(svc: Service):
                 body = (ROOT / "serve" / "web" / ("monitor.html" if path else "index.html")).read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
+                if not path:
+                    # the chat's svg/html preview is a sandboxed frame; this keeps it from navigating away to a web
+                    # page (a link or <meta refresh> inside a model's html), which no sandbox flag does
+                    # (serve/web/preview.js)
+                    self.send_header("Content-Security-Policy", PAGE_CSP)
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)

@@ -258,3 +258,16 @@ main { flex: 1; min-height: 0; display: flex; }
 .chat-math--display > * { margin: 0 !important; }
 .chat-math[data-math-error] { white-space: pre-wrap; }
 .chat-math .katex { font-size: 1.08em; }
+
+/* svg/html preview (serve/web/preview.js): the frame is sandboxed and carries the page's colours, so it is transparent on the
+   theme's surface; the code and the preview swap places inside the same box. */
+.st-code__btns { display: flex; gap: 4px; }
+.st-code .st-btn--icon[aria-pressed="true"] { background: rgba(255, 255, 255, .12); color: #fff; }
+.st-code__preview { display: none; }
+.st-code[data-preview="true"] > pre { display: none; }
+.st-code--run .st-code__preview { outline: 2px solid var(--st-warn-text); outline-offset: -2px; }
+.st-code[data-preview="true"] .st-code__preview { display: block; height: min(340px, 60vh); background: var(--st-surface-2); }
+.st-code [data-preview-scripts] { display: none; }
+.st-code[data-preview="true"] [data-preview-scripts] { display: inline-flex; }
+.st-code .st-btn--icon[data-preview-scripts][aria-pressed="true"] { background: var(--st-warn-tint); color: var(--st-warn-text); }
+.st-code__preview iframe { display: block; width: 100%; height: 100%; border: 0; background: transparent; }

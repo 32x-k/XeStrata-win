@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // serve/web/app.js - the Strata web app: Chat, Monitor, About. No framework, no network beyond this server.
 // The Monitor tab rebuilds PR #22's dashboard idea (code-martin) on the server's own /metrics.
-/* global StrataI18n, StrataMath */   // serve/web/i18n.js, math.js, preview.js, loaded before this file
+/* global tr, StrataI18n, StrataMath, StrataPreview */   // serve/web/i18n.js, math.js, preview.js, loaded before this file
 "use strict";
 
 const $ = (id) => document.getElementById(id);
@@ -64,6 +64,7 @@ function setTheme(t, save) {
   if (save) try { localStorage.setItem("xestrata.theme", t); } catch (e) { /* ignore */ }
   $("theme-icon").setAttribute("href", `${SPRITE}#i-${t === "dark" ? "sun" : "moon"}`);
   $("dark-toggle").setAttribute("aria-checked", String(t === "dark"));
+  refreshPreviews();                                  // the preview frames carry the page's colours
 }
 const flipTheme = () => setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark", true);
 $("theme-btn").onclick = flipTheme;
@@ -692,10 +693,36 @@ function inline(s) {
     .replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
   return s.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code class="inline">${esc(codes[+i])}</code>`);
 }
-function codeBlock(lang, code) {
-  return `<div class="st-code"><div class="st-code__head"><span>${esc(lang || "code")}</span>` +
-    `<button class="st-btn st-btn--icon" data-code-copy aria-label="Copy code">${icon("copy")}</button></div>` +
-    `<pre><code>${esc(code)}</code></pre></div>`;
+// An ```svg or ```html block that is complete gets a Preview button (serve/web/preview.js): the block's own code in a sandboxed
+// frame, built when it is first opened and again when the theme changes. The state lives on the box (data-preview), so it
+// resets if the answer is rebuilt. A page (html) can also be run WITH scripts, after a warning, one block at a time.
+function pageTheme() {
+  const root = document.documentElement;
+  return {dark: root.dataset.theme === "dark", ink: getComputedStyle(root).getPropertyValue("--st-ink").trim()};
+}
+function fillPreview(fr, scripts, blank) {
+  const box = fr.closest(".st-code");
+  const doc = blank ? null : StrataPreview.previewDoc(fr.dataset.lang, box.querySelector("pre").textContent, scripts, pageTheme(), window);
+  const nf = StrataPreview.makeFrame(doc, {scripts, title: fr.title, lang: fr.dataset.lang});
+  fr.replaceWith(nf);
+  box.classList.toggle("st-code--run", !!(doc && scripts));
+  const rb = box.querySelector("[data-preview-scripts]");
+  if (rb) {
+    rb.setAttribute("aria-pressed", String(!!(doc && scripts)));
+    rb.setAttribute("aria-label", doc && scripts ? tr("preview.stopScripts", "Stop scripts") : tr("preview.runScripts", "Run scripts"));
+  }
+}
+function refreshPreviews() { for (const fr of document.querySelectorAll("iframe[data-opened]")) fillPreview(fr, fr.dataset.scripts === "1"); }
+function codeBlock(lang, code, complete) {
+  const ok = complete && StrataPreview.canPreview(lang || "", code);
+  const kind = ok ? StrataPreview.kindOf(lang) : null;
+  const label = kind === "svg" ? tr("preview.showSvg", "Preview the picture") : tr("preview.showPage", "Preview the page");
+  const head = `<div class="st-code__head"><span>${esc(lang || tr("code.label", "code"))}</span><span class="st-code__btns">` +
+    (kind === "page" ? `<button class="st-btn st-btn--icon" data-preview-scripts aria-label="${esc(tr("preview.runScripts", "Run scripts"))}" aria-pressed="false" title="${esc(tr("preview.runScripts", "Run scripts"))}">${icon("warning")}</button>` : "") +
+    (ok ? `<button class="st-btn st-btn--icon" data-preview-toggle data-preview-label="${esc(label)}" aria-label="${esc(label)}" title="${esc(label)}" aria-pressed="false">${icon("image")}</button>` : "") +
+    `<button class="st-btn st-btn--icon" data-code-copy aria-label="${esc(tr("code.copy", "Copy code"))}">${icon("copy")}</button></span></div>`;
+  const prev = ok ? `<div class="st-code__preview"><iframe sandbox="" title="${esc(kind === "svg" ? tr("preview.titleSvg", "Picture preview") : tr("preview.titlePage", "Page preview"))}" data-lang="${esc(lang)}"></iframe></div>` : "";
+  return `<div class="st-code">${head}<pre><code>${esc(code)}</code></pre>${prev}</div>`;
 }
 function blocks(text) {
   const out = [], lines = text.split("\n");
@@ -741,8 +768,8 @@ function markdown(text) {
     html += blocks(rest.slice(0, m.index));
     rest = rest.slice(m.index + m[0].length);
     const end = rest.match(/(^|\n)```[ \t]*(\n|$)/);
-    if (!end) { html += codeBlock(m[2].trim(), rest); break; }         // still streaming
-    html += codeBlock(m[2].trim(), rest.slice(0, end.index));
+    if (!end) { html += codeBlock(m[2].trim(), rest, false); break; }  // still streaming: no preview of a half-written block
+    html += codeBlock(m[2].trim(), rest.slice(0, end.index), true);
     rest = rest.slice(end.index + end[0].length);
   }
   return html;
@@ -913,6 +940,27 @@ function scrollDown(force) { const s = $("chat-scroll"); if (force || nearBottom
 $("chat").addEventListener("click", (e) => {
   const cc = e.target.closest("[data-code-copy]");
   if (cc) { copyText(cc.closest(".st-code").querySelector("pre").textContent, cc); return; }
+  // an svg/html block: flip between its code and its sandboxed preview. Closing the preview also turns scripts off.
+  const pv = e.target.closest("[data-preview-toggle]");
+  if (pv) {
+    const box = pv.closest(".st-code");
+    const on = box.dataset.preview === "true";
+    if (on) delete box.dataset.preview; else box.dataset.preview = "true";
+    pv.setAttribute("aria-pressed", String(!on));
+    pv.setAttribute("aria-label", on ? pv.dataset.previewLabel : tr("preview.showCode", "Show the code"));
+    const fr = box.querySelector("iframe");
+    if (on) fillPreview(fr, false, true);
+    else if (!fr.dataset.opened) fillPreview(fr, false);
+    return;
+  }
+  const rs = e.target.closest("[data-preview-scripts]");
+  if (rs) {
+    const fr = rs.closest(".st-code").querySelector("iframe");
+    const run = fr.dataset.scripts !== "1";
+    if (run && !confirm(tr("preview.confirm", "Run this code with scripts?\n\nIt runs in your browser, cut off from this chat and from the network, but it can still freeze the tab, and it is code the model wrote.\n\nOnly this block, and only until you close the preview."))) return;
+    fillPreview(fr, run);
+    return;
+  }
   const mc = e.target.closest("[data-msg-copy]");
   if (mc) { const i = +mc.closest(".st-msg").dataset.i; copyText(messages[i].text, mc); return; }
   // a tool block: its open state lives in the message (the answer is rebuilt while it streams), so the click sets it
