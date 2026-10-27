@@ -342,6 +342,9 @@ def plan(cards: list[dict] | None, ram_gb: float | None, disk_free_gb: float | N
     On a unified-memory APU (Ryzen AI Max, gfx1151) the plan counts one pool: also `uma: True` and `streamed_gb` (the experts
     read from the SSD), tp 1 and no args (nothing to split between cards)."""
     if variant(model):
+        mac = mac_card(cards)
+        if mac is not None and variant_key(model) in MAC_SET_PACK:
+            return _plan_mac(variant_key(model), model, mac, ram_gb, disk_free_gb, context)
         mine = gpu_fit.for_vendor(list(cards or []), vendor)[0] if vendor else list(cards or [])
         card = uma_card(mine)
         if card is not None:
@@ -510,7 +513,10 @@ def mac_expert_cap_gb(ram_gb: float) -> float:
     if p <= 0:
         return 0.0
     keep = max(7.0, 0.15 * p)
-    leave = max(keep, 0.40 * p, MAC_FILECACHE_FLOOR_GB + MAC_HEADROOM_GB) if p >= 64.0 else keep
+    # the file-cache floor (vm.vm_page_filecache_min) was read on the 128 GiB M5 Max (37.2 GB) and on a 32 GiB M4 mini (11.1 GB, a third
+    # of its RAM): it grows with the memory, so a Mac between the two gets it by that share, an estimate (only the 128 GiB one was run)
+    floor = MAC_FILECACHE_FLOOR_GB * min(1.0, p / (128.0 * gib))
+    leave = max(keep, 0.40 * p, floor + MAC_HEADROOM_GB) if p >= 64.0 else keep
     cap = min(p - leave, MAC_DEVICE_SHARE * p)
     return max(0.0, cap - MAC_ENGINE_FOOTPRINT_GB - 1.0)
 
@@ -552,7 +558,8 @@ def mac_plan(ram_gb: float, quant: str = "IQ2_XS", disk_free_gb: float | None = 
     elif resident < 0.25 * routed:
         out["verdict"] = "small"
         warns.append(f"Only about {resident:.0f} GB of {routed:.0f} GB of experts fit in memory (under a quarter): "
-                     "most of the model is read from the SSD for every word. Expect seconds a word rather than tokens a second.")
+                     "most of the model is read from the SSD for every word, so answers are much slower than on a Mac with 128 GB "
+                     "(nothing this small was measured). It still runs; a 64 GB or bigger Mac is the better fit.")
     else:
         out["verdict"] = "streams"
         lines.append("The model streams: answers are slower than on a machine that holds all the experts, and they still "
@@ -560,5 +567,63 @@ def mac_plan(ram_gb: float, quant: str = "IQ2_XS", disk_free_gb: float | None = 
     if disk_free_gb is not None and disk_free_gb < disk_need:
         warns.append(f"The files need about {disk_need:.0f} GB of free disk space and {disk_free_gb:.0f} GB are free.")
     lines.append("Measured on " + MAC_MEASURED + ".")
+    out["words"] = " ".join(lines)
+    return out
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# The Mac in the launch flow: plan() answers for an Apple Silicon Mac in the shape the catalog, `strata launch` and the app read
+# for any other computer, from mac_plan's numbers.  The official sets that were run on a Mac (2.00 and 2.25 bpw, 2026-10-25);
+# the 1.75 bpw set shares the 2.00 set's IQ1_M kernel but was never run there, so it is not offered on a Mac.
+
+MAC_SET_PACK = {"IST-DAS-2.00bpw": "IQ2_XXS", "IST-DAS-2.25bpw": "IQ2_XS"}
+MAC_SMALL_RAM_GB = 64.0     # below this the measured M5 Max numbers do not apply (nothing smaller than 32 GB was ever started)
+
+
+def mac_card(cards: list[dict] | None) -> dict | None:
+    """The Apple Silicon "graphics card" of the hardware report (vendor apple, its unified memory in `unified_gb`), None on any other computer."""
+    return next((c for c in cards or [] if str(c.get("vendor")) == "apple" or float(c.get("unified_gb") or 0) > 0), None)
+
+
+def _plan_mac(key: str, model: str, card: dict, ram_gb: float | None, disk_free_gb: float | None, context: int) -> dict[str, Any]:
+    """plan() for an official IST-DAS set on an Apple Silicon Mac.  One pool of unified memory: the engine keeps the experts it can
+    beside the dense weights resident (mac_expert_cap_gb) and reads the rest from the SSD in place.  Never a refusal: a smaller Mac
+    gets a plain warning, not a block."""
+    v = ISTA_SETS[key]
+    ram = float(ram_gb or card.get("unified_gb") or 0.0)
+    mp = mac_plan(ram, MAC_SET_PACK[key], disk_free_gb)
+    expert_gb = v["experts_gb"] / EXPERTS
+    resident = float(mp["resident_gb"])
+    streamed = float(mp["streaming_gb"])
+    in_mem = int(resident / expert_gb)
+    download = ista_download_bytes(model) / GB
+    need_disk = download + DISK_HEADROOM_GB
+    verdict = {"fits": "fits", "streams": "tight", "small": "spills"}[mp["verdict"]]
+    out: dict[str, Any] = {
+        "variant": model, "mac": True, "mac_verdict": mp["verdict"],
+        "cards": [{"index": card.get("index", 0), "name": card.get("name") or "Apple Silicon", "vram_gb": _round1(ram),
+                   "layers": [0, LAYERS - 1], "dense_gb": _round1(ISTA_DENSE_GB), "experts_gb": _round1(resident), "experts": in_mem}],
+        "experts_total": EXPERTS, "experts_in_vram": in_mem, "vram_experts_gb": _round1(resident), "cpu_experts_gb": 0.0,
+        "weights_gb": _round1(v["set_bytes"] / GB), "experts_gb": _round1(v["experts_gb"]), "dense_gb": _round1(ISTA_DENSE_GB),
+        "engram_gb": _round1(ISTA_ENGRAM_BYTES / GB), "download_gb": _round1(download), "tp": 1, "args": [],
+        "measured": MAC_MEASURED, "lines": [], "warnings": [], "ram_gb": ram_gb, "context": context,
+        "disk_total_gb": v["disk_total"], "disk_need_gb": _round1(need_disk),
+        "disk_ok": None if disk_free_gb is None else disk_free_gb >= need_disk,
+        "streamed_gb": _round1(streamed), "ram_needed_gb": _round1(resident + ISTA_DENSE_GB + MAC_ENGINE_FOOTPRINT_GB),
+        "spill_gb": _round1(streamed), "spare_ram_gb": _round1(max(0.0, ram - resident - ISTA_DENSE_GB - MAC_ENGINE_FOOTPRINT_GB)),
+        "verdict": verdict,
+    }
+    lines, warns = out["lines"], out["warnings"]
+    lines.append(f"DeepSeek-V4.1-Flash, {v['title']}: a {download:.0f} GB download ({v['set_bytes'] / GB:.0f} GB of model, "
+                 f"{ISTA_ENGRAM_BYTES / GB:.0f} GB n-gram table, {ISTA_DSPARK_BYTES / GB:.0f} GB drafter). Quality: {v['quality']}.")
+    lines.extend(l for l in mp["lines"][1:] if not l.startswith("Measured on "))
+    lines.append("Measured on " + MAC_MEASURED + ".")
+    warns.extend(mp["warnings"])
+    if ram and ram < MAC_SMALL_RAM_GB and mp["verdict"] != "small":
+        warns.append(f"This Mac has {ram:.0f} GB of memory and the set was measured on one with 128 GB: with less, more experts come from "
+                     "the SSD for every word, so answers are slower. It still runs.")
+    if disk_free_gb is not None and disk_free_gb < need_disk:
+        warns.append(f"The download needs about {need_disk:.0f} GB of free disk space and {disk_free_gb:.0f} GB are free where the files go. "
+                     "Use --models-dir on a bigger drive, or --gguf-dir for files you already have.")
     out["words"] = " ".join(lines)
     return out

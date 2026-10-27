@@ -1152,7 +1152,39 @@ class Strata:
             if sizes:
                 out.append({"family": family, "title": fd["title"], "about": fd.get("about"), "experimental": False,
                             "images": any(x["images"] for x in sizes), "sizes": sizes})
+        ds = self._mac_deepseek(hw, have)                # DeepSeek-V4.1-Flash on the Mac (0.2.7.1): after Qwen, never the default
+        if ds is not None:
+            out.append(ds)
         return out
+
+    def _mac_deepseek(self, hw: dict, have: set) -> dict | None:
+        """DeepSeek-V4.1-Flash for a Mac: the official sets that were run on one (strata_control/dsv41_fit.MAC_SET_PACK), with the Mac fit words.
+        None when setup.py has no DeepSeek family (an older Terminal)."""
+        big = self.multi_family("deepseek41")
+        if not big:
+            return None
+        from strata_control import dsv41_fit
+        mf, ram = self.mac(), float(hw.get("ram_gb") or 0)
+        sizes = []
+        for m in big["models"]:
+            if m not in dsv41_fit.MAC_SET_PACK:
+                continue
+            d = self.own_size("deepseek41", m)
+            if d is None:
+                continue
+            tag = (big.get("tag", "") + m).lower()
+            sizes.append({"model": m, "about": d["about"], "download_gb": d["download_gb"], "experimental": False,
+                          "images": False, "images_reader": "none",       # the Mac engine's picture tower: see docs/DEEPSEEK_MAC.md
+                          "ram_needed_gb": d["ram_gb"], "experts_gb": d.get("arena_gb"), "mem_total": True, "multi_file": True,
+                          "disk_gb": self.dsv41_disk_gb(d), "engine_min": None,
+                          "memory_gb": round(float(d["ram_gb"]), 1),
+                          "on_this_pc": ("does not fit: this Mac has too little memory" if ram and ram < mf.MIN_STREAM_RAM_GB
+                                         else self.dsv41_words(hw, m, installed=tag in have)),
+                          "installed": tag in have, "id": tag, "gpu_options": None})
+        if not sizes:
+            return None
+        return {"family": "deepseek41", "title": big["title"], "about": big.get("about"), "experimental": False,
+                "images": False, "sizes": sizes}
 
     def recommend(self, hw: dict) -> dict:
         """setup.py's own rules: the size it preselects (IQ3_XXS from 60 GB of RAM, else the first, Q2_0), the
@@ -1363,6 +1395,16 @@ class Strata:
         v = pl["verdict"]
         if v == "no_card":
             return "does not fit: it needs one or more graphics cards"
+        if pl.get("mac"):                       # an Apple Silicon Mac (0.2.7.1): one pool of unified memory, the rest of the experts streams from the SSD
+            streamed, kept = pl["streamed_gb"], pl["vram_experts_gb"]
+            if pl["mac_verdict"] == "fits":
+                return f"fits: every expert stays in this Mac's memory ({pl['experts_gb']:.0f} GB)"
+            if pl["mac_verdict"] == "small":
+                return (f"slow here: this Mac's memory holds about {kept:.0f} GB of the {pl['experts_gb']:.0f} GB of experts and the other "
+                        f"{streamed:.0f} GB are read from the SSD for every word; it can still be installed (nothing this small was measured, "
+                        "a Mac with 64 GB or more suits it better)")
+            return (f"runs on this Mac's memory: about {kept:.0f} GB of the {pl['experts_gb']:.0f} GB of experts stay in memory and the other "
+                    f"{streamed:.0f} GB are read from the SSD while it answers; measured 12-19 tokens a second on an M5 Max with 128 GB")
         if pl.get("uma"):                       # Ryzen AI Max (Strix Halo, Windows): the graphics memory is the RAM, counted once
             return (f"runs on this PC's shared memory: about {pl['vram_experts_gb']:.0f} GB of the {pl['experts_gb']:.0f} GB of experts stay "
                     f"in memory and the other {pl['streamed_gb']:.0f} GB are read from the SSD; measured 14-16 tokens a second on code and "
