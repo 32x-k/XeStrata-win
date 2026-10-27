@@ -575,6 +575,10 @@ class Smallest(unittest.TestCase):
         self.assertEqual(setup.DSV41_ISTA_FILES[d["shards"][3]][0], 2188841824)
         self.assertEqual(sum(setup.DSV41_ISTA_FILES[n][0] for n in d["shards"]), 120_721_120_256)
         self.assertTrue(all(n not in setup.DSV41_LEGACY_NAMES.values() for n in d["shards"]))     # no first-release names for it
+        for n, (size, sha) in setup.DSV41_NEW_SHARD1.items():                                     # shard 1 after ISTA's 2026-10-26 template update
+            self.assertIn(n, setup.DSV41_ISTA_FILES)
+            self.assertNotEqual(setup.DSV41_ISTA_FILES[n][0], size)
+            self.assertNotEqual(setup.DSV41_ISTA_FILES[n][1], sha)
         cmd = setup.dsv41_pack_cmd(Path("/m"), d["shards"], Path("/s/e.gguf"), Path("/s/m.gguf"), Path("/s/d.gguf"), Path("/p"))
         self.assertIn("--dspark-noise-token", cmd)
         self.assertNotIn("--skip-tensors", cmd)
