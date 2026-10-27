@@ -2000,10 +2000,14 @@ void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
 }
 
 void Verifier::collect_profile() {
-    if (std::getenv("STRATA_VERIFY_EAGER") == nullptr)   // eager (SYCL port): prof_h_ already holds the host clocks
-        dpct::get_in_order_queue()
-            .memcpy(prof_h_.data(), prof_, prof_h_.size() * 8)
-            .wait();
+    if (std::getenv("STRATA_VERIFY_EAGER") == nullptr) {   // eager (SYCL port): prof_h_ already holds the host clocks
+        // SYCL port: the stamps are written by kernels on THIS verifier's stream, so the readback has to ride the
+        // same stream.  The device's default queue is neither ordered after the window nor necessarily this
+        // stage's device (a layer split), so reading there could return the previous window's stamps or another
+        // card's memory - which is why the table was only ever printed in the eager mode before.
+        const strata::core::OnDevice on_device(device_);
+        cs_->memcpy(prof_h_.data(), prof_, prof_h_.size() * 8).wait();
+    }
     accumulate_profile(prof_h_.data());
 }
 
@@ -2458,6 +2462,20 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
         collect_profile();
         if (std::getenv("STRATA_VERIFY_EAGER") != nullptr)   // SYCL port: the stage table per window, host-clocked
             std::fprintf(stderr, "verify stages T=%d (ms/window):%s\n", T, profile_report().c_str());
+        else {
+            // SYCL port: the same table from the GPU's own clock, averaged over N windows, so a decode can be
+            // attributed without the eager mode's drain per stamp (which measures host gaps, not kernel time).
+            // STRATA_VERIFY_PROFILE=1 STRATA_VERIFY_PROFILE_EVERY=32.
+            static const long long every = [] {
+                const char* e = std::getenv("STRATA_VERIFY_PROFILE_EVERY");
+                return e ? std::atoll(e) : 0LL;
+            }();
+            if (every > 0 && prof_windows_ >= every) {
+                std::fprintf(stderr, "verify stages T=%d (ms/window over %lld, GPU clock):%s\n", T,
+                             (long long) prof_windows_, profile_report().c_str());
+                std::fflush(stderr);
+            }
+        }
     }
     // ---- a sampled or penalized request: the head's sampling again, host-side so its parameters are this call's
     // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
