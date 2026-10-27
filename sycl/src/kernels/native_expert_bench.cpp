@@ -49,6 +49,18 @@ int main(int argc, char** argv) {
     int failures = 0;
     dpct::queue_ptr s;
     s = dpct::get_current_device().create_queue(true);
+    // SYCL port: the queue carries an exception handler, which would swallow a failing launch and leave the timing
+    // at "the kernel did nothing" (0.3 us for a group of experts).  Every wait goes through this, so a device-side
+    // error is printed instead of silently producing an empty measurement.
+    auto sync = [&](const char* what) {
+        try {
+            s->wait_and_throw();
+            return true;
+        } catch (std::exception const& e) {
+            std::printf("%s: %s\n", what, e.what());
+            return false;
+        }
+    };
     for (int l : layers) {
         const strata::TensorInfo* t[3] = {};
         const char* roles[3] = {"gate", "up", "down"};
@@ -120,11 +132,13 @@ int main(int argc, char** argv) {
         std::vector<float> ref((size_t) NE * H), got((size_t) NE * H);
         s->memset(dout, 0xff, got.size() * 4).wait();
         run(mref, 0);
+        if (!sync("reference window")) return 1;
+
         s->memcpy(ref.data(), dout, ref.size() * 4).wait();
         s->memset(dout, 0xff, got.size() * 4).wait();
         run(mode, 0);
+        if (!sync("mode window")) return 1;
         s->memcpy(got.data(), dout, got.size() * 4).wait();
-        s->wait();
         size_t ndiff = 0;
         double worst = 0;
         for (size_t i = 0; i < ref.size(); ++i)
@@ -137,7 +151,7 @@ int main(int argc, char** argv) {
             s->wait();
             const auto t0 = std::chrono::steady_clock::now();
             for (int i = 0; i < iters; ++i) run(m, phase);
-            s->wait();
+            sync("timing loop");
             const double ms =
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             return ms / iters;
