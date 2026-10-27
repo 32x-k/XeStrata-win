@@ -2063,7 +2063,7 @@ class StrataEngine:
                          "tok_s": round(r["generated"] / max(1e-6, now - ft), 1) if ft else None})
         return view
 
-    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None, prefill_only=False):
         """Yields token ids, and None as a heartbeat every 10 s while the engine is quiet (reading a long prompt):
         the HTTP layer turns it into an SSE comment, which keeps clients' watchdogs calm and notices a client that
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
@@ -2079,6 +2079,10 @@ class StrataEngine:
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
+        if prefill_only:                                 # split serving (serve/split.py): read the prompt, no token
+            if embeddings or int(max_new) != 0:
+                raise ValueError("prefill_only is a text prompt and max_new 0")
+            head = "GEN 0 prefill=1"
         try:
             self.proc.stdin.write(f"{head} {','.join(str(int(t)) for t in ids)}\n")
             self.proc.stdin.flush()
@@ -3981,6 +3985,8 @@ class Service:
                 live["state"] = "generating"
         if hasattr(self.engine, "replica_view"):        # opt-in replicas: each one's state and requests routed to it
             live["replicas"] = self.engine.replica_view()
+        if hasattr(self.engine, "split_view"):          # opt-in split serving: the hand-overs so far (serve/split.py)
+            live["split_serve"] = self.engine.split_view()
         image = self.images.live() if self.images is not None else None
         if image is not None:                           # an image job in the GPU's turn: its stage and steps
             live["image"] = image
@@ -7613,6 +7619,41 @@ def start_replicas(cfg: dict, groups: list[list[str]], exe: str, effort_end: lis
     return rp.ReplicaEngine(engines, load_tokens=load)
 
 
+def start_split(cfg: dict, spec: dict, exe: str, effort_end: list[str], lazy: bool):
+    """Opt-in split serving (serve/split.py, upstream 690172c46): a prefill engine and a decode engine, one card each,
+    the same model and the same session settings.  Started one after the other, so a shared expert arena is filled
+    once; the SplitEngine in front hands a long prompt from the first to the second."""
+    from serve import split as sp
+    sp.check_cfg(cfg, spec)
+    arena, arena_note = sp.arena_path(cfg, spec)
+    work = sp.session_dir(spec)
+    print(f"[strata] split serving: the prompt is read on card {spec['prefill_gpu']}, the answer is made on card "
+          f"{spec['decode_gpu']} (prompts with {spec['min_prompt_tokens']}+ new tokens are handed over); {arena_note}",
+          flush=True)
+    engines = {}
+    try:
+        for role in ("prefill", "decode"):
+            rc = sp.role_cfg(cfg, spec, role)
+            if arena:
+                rc["args"] = list(rc["args"]) + ["--shared-expert-arena", arena]
+            if role == "prefill":
+                warn_budget_over_ram(engine_args(rc) if "args" in rc else [])
+            env = child_env(rc)
+            env["STRATA_GPU_PCI"] = rc["gpu_pci"]       # its own card, whatever the server's environment names
+            engines[role] = StrataEngine(exe, engine_args(rc) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
+                                         env=env, lazy=lazy)
+    except BaseException:
+        for e in engines.values():
+            try:
+                e.close()
+            except Exception:        # noqa: BLE001
+                pass
+        shutil.rmtree(work, ignore_errors=True)
+        raise
+    return sp.SplitEngine(engines["prefill"], engines["decode"], min_tokens=spec["min_prompt_tokens"], work_dir=work,
+                          arena_file=arena)
+
+
 # The sampling each model card recommends ("Best Practices"), used when neither the request, the Chat settings nor the
 # run config's `sampling` block says otherwise.  Greedy is only for a request or config that asks for temperature 0.
 # min_p 0, repetition_penalty 1 and presence_penalty 0 are the engine's own "off", so they are not listed.
@@ -7716,6 +7757,11 @@ def main() -> int:
                     help="data-parallel replicas (opt-in): cut the cards (\"gpu_pci\" and \"split_pci\") into N equal "
                          "groups and run one engine on each, requests spread over them (also \"replicas\" in the "
                          "config: a number, or [{\"gpus\": [\"0000:03:00.0\"]}, {\"gpus\": [\"0000:09:00.0\"]}])")
+    ap.add_argument("--split-serve", default=None, metavar="PREFILL,DECODE",
+                    help="split serving (opt-in): one engine on the card PREFILL reads the prompt, a second on the "
+                         "card DECODE makes the answer, the session handed over in RAM; the cards by PCI address "
+                         "(0000:03:00.0,0000:09:00.0; also \"split_serve\" in the config: {\"prefill_gpu\": "
+                         "\"0000:03:00.0\", \"decode_gpu\": \"0000:09:00.0\"}; docs/MULTIGPU.md)")
     a = ap.parse_args()
     if a.engine == "strata" and (_rt := rttime_limit_note()):   # upstream #3238: say it before the first unexplained -9
         print("[strata] WARNING: " + _rt, flush=True)
@@ -7723,6 +7769,14 @@ def main() -> int:
     split_joined_args(cfg)
     if a.replicas is not None:
         cfg["replicas"] = a.replicas
+    if a.split_serve is not None:
+        pair = [x.strip() for x in a.split_serve.split(",")]
+        if len(pair) != 2:
+            ap.error("--split-serve takes two cards by PCI address: PREFILL,DECODE (for example "
+                     "0000:03:00.0,0000:09:00.0)")
+        given = cfg.get("split_serve")
+        cfg["split_serve"] = {**(given if isinstance(given, dict) else {}), "prefill_gpu": pair[0],
+                              "decode_gpu": pair[1]}
     lift_reasoning_effort_arg(cfg)
     if a.gpu is not None:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
@@ -7814,15 +7868,25 @@ def main() -> int:
             groups = rp.gpu_groups(cfg)
         except rp.ReplicaConfigError as e:
             raise SystemExit(f"[strata] config {e}")
+        from serve import split as split_mod
+        try:
+            split_serve = split_mod.split_spec(cfg)
+            if split_serve:
+                split_mod.check_cfg(cfg, split_serve)
+        except split_mod.SplitConfigError as e:
+            raise SystemExit(f"[strata] config {e}")
         if groups:
             engine = start_replicas(cfg, groups, exe, effort_end or [], lazy)
+        elif split_serve:
+            engine = start_split(cfg, split_serve, exe, effort_end or [], lazy)
         else:
             engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
                                   env=env, lazy=lazy)
         engine.silence_s = silence                      # an attribute of its own: restart() keeps it
         warn_tight_ram(engine.info.get("arena_mib"), engine.info.get("experts_ram"))
-        note = None if groups else desktop_vram_note(amd_card(cfg.get("gpu_pci")), engine.info.get("vram_free_mib"),
-                                                     engine_args(cfg), linux_desktop())
+        note = None if groups or split_serve else desktop_vram_note(amd_card(cfg.get("gpu_pci")),
+                                                                    engine.info.get("vram_free_mib"),
+                                                                    engine_args(cfg), linux_desktop())
         if note:                                        # upstream #560 #516: before --open starts a browser there
             print(note, flush=True)
     else:
@@ -7991,6 +8055,8 @@ def main() -> int:
     svc.reasoning_loop_recovery = recovery
     svc.gpu_pci = os.environ.get("STRATA_GPU_PCI") or cfg.get("gpu_pci")   # the Monitor reads the engine's card
     svc.split_pci = cfg.get("split_pci") or None       # and a layer split's other cards
+    if a.engine == "strata" and split_serve:            # split serving: the decode card, and the prefill card beside it
+        svc.gpu_pci, svc.split_pci = split_serve["decode_gpu"], [split_serve["prefill_gpu"]]
     if a.config:
         svc.config_path = a.config                      # #564: the web page's Settings view
     # A host that runs one model at a time and swaps them (a GPU shared with other work) can name the RPC that does
