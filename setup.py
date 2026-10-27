@@ -2065,6 +2065,12 @@ def gpu_problem(g, together=False):
     FP16, the matrix engines) is checked by the engine and the compiler's probe, not here."""
     if together:
         return "not supported together with other GPUs - the Xe engine runs on one GPU"
+    cc = g.get("cc") or ""
+    if g.get("vendor") == "nvidia" and re.fullmatch(r"\d+\.\d+", cc) and round(float(cc) * 10) < 60:
+        # Maxwell and older (upstream #3218 builds sm_52 in its experimental build): NVIDIA's SYCL runtime reports FP16,
+        # which the engine's kernels take, only from compute capability 5.3 on, and XeStrata builds code from Pascal on
+        return (f"compute capability {cc} is older than Pascal (6.0), the oldest NVIDIA GPUs the engine has code for "
+                "(below 5.3 the SYCL runtime reports no FP16, which its kernels need)")
     if g.get("vendor") == "nvidia" and PACKAGED:
         meta = packaged_engine()
         archs = [int(x[3:]) for x in meta.get("cuda_archs", []) if x[3:].isdigit()]   # "sm_75" -> 75
@@ -2072,7 +2078,6 @@ def gpu_problem(g, together=False):
             return (f"{meta.get('package', 'this package')} has no NVIDIA code: an NVIDIA GPU needs "
                     "xestrata-contrib-cuda<version> in its place")
         # unknown without nvidia-smi: the engine says so if it has no code for the card
-        cc = g.get("cc") or ""
         if re.fullmatch(r"\d+\.\d+", cc) and round(float(cc) * 10) < min(archs):
             return (f"compute capability {g.get('cc')} is older than the sm_{min(archs)} {meta.get('package')} has "
                     "code for: xestrata-contrib-cuda12.4 in its place has code for it (from Pascal, sm_60)")
