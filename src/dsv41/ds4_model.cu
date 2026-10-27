@@ -2229,6 +2229,14 @@ struct Model::Impl {
         if (o.vision_only) return true;
 
         // layers: roles and the sources they read
+#if defined(STRATA_METAL)
+        // On a Mac the drafter is off unless it is asked for outright: it gave the same answers and no speed-up there, and the head of its
+        // quantised Markov bias has no Metal kernel (the engine stopped with "kernel launch with no Metal dispatch" on the setup test).
+        if (o.dspark_auto && o.dspark && g.n_mtp > 0) {
+            o.dspark = false;
+            std::fprintf(stderr, "ds4: DSpark not loaded on a Mac (--dspark on loads it anyway)\n");
+        }
+#endif
         if (o.dspark_auto && o.dspark && g.n_mtp > 0) {   // (see Options::dspark_auto)
             double exp_b = 0, room_b = 0;
             for (const auto& kt : pk.t)

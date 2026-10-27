@@ -77,8 +77,8 @@ def main() -> int:
     with tempfile.TemporaryDirectory() as d:
         f = Path(d) / "ids.txt"
         f.write_text(",".join(str(i) for i in ids), encoding="ascii")
-        cmd = [a.exe, "--pack", str(pack), "--ids", "@" + str(f), "--n", str(a.tokens), "--max-context", "1024", "--dspark", "auto",
-               "--window", "16"]
+        cmd = [a.exe, "--pack", str(pack), "--ids", "@" + str(f), "--n", str(a.tokens), "--max-context", "1024", "--dspark", "none" if sys.platform == "darwin" else "auto",
+               "--window", "16"]      # (a Mac runs without the drafter: its Metal engine has no kernels for it)
         if a.gpus:
             cmd += ["--gpus", a.gpus]
         try:
