@@ -108,6 +108,8 @@ HF_REVISIONS = {
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": "1ada08422e404aca51ab9df665f089f34c419c6b",          # 2026-10-13
     "agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF": "b32c7399b57f7a627b8aa9403ef06767e9a444e8",    # 2026-10-24
     "huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF": "06a318de4011598a142ee54bcfec47c6921c958e",  # 2026-10-22
+    "unsloth/Qwen3.5-9B-GGUF": "3885219b6810b007914f3a7950a8d1b469d598a5",                          # 2026-10-26
+    "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive": "0a41c68809d375475f954be12ba7c40efa56c2a9",  # 2026-10-26
 }
 
 
@@ -589,13 +591,17 @@ FAMILIES: dict[str, dict[str, Any]] = {
 # The models the engine runs other than Qwen3.8-Flash-Next (src/core/plain_model.cpp: `strata --native` with another
 # architecture): one GGUF file each, its size and SHA-256 at the pinned revision (the Hub's LFS pointers), or its
 # "parts" (a model in several files: each one's path in the repository, size and SHA-256; "file" is the first, which
-# the engine is given), no pack, no PLE table and no images yet.  "tested": the files this release was checked with
-# (the rest use the same tensor types, checked on those files and in the kernels' tests).
+# the engine is given), no pack and no PLE table.  "tested": the files this release was checked with (the rest use the
+# same tensor types, checked on those files and in the kernels' tests).  "mmproj": the picture reader's file (the
+# family reads images); "dense": a model without experts, every weight of which the engine keeps in VRAM, and
+# "kv_bytes": its K/V cache's bytes a token (setup sizes the model and the context by the GPU's memory).
 _ORNITH = "ornith-ai/Ornith-1.5-35B-A3B-GGUF"
 _ORNITH_GSQ = "pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF"
 _LLMJP = "llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf"
 _QWEN36 = "unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
 _GLM53 = "unsloth/GLM-5.3-Flash-GGUF"
+_QWEN35 = "unsloth/Qwen3.5-9B-GGUF"
+_QWEN35_HAU = "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive"
 
 
 def _glm53_parts(quant: str, parts: list[tuple[int, str]]) -> list[dict[str, Any]]:
@@ -683,6 +689,48 @@ PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
                             "about": "8-bit, the closest to the full model"},
                }},
 }
+# Qwen3.5-9B (qwen35): dense, 32 blocks (a full attention every 4th, 4 K/V heads of 256: 8 x 2 x 4 x 256 x 2 bytes of
+# K/V a token), every weight in VRAM; Qwen's model as Unsloth's GGUFs, or HauhauCS's with its refusals removed.  Both
+# read pictures through Unsloth's mmproj: HauhauCS's has the same 334 tensors byte for byte (only its metadata
+# differs, 2026-10-27), so one file serves both
+_QWEN35_HAU_FILE = "Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-{}.gguf"
+_QWEN35_MMPROJ = {"repo": _QWEN35, "path": "mmproj-BF16.gguf", "size": 921705024,
+                  "sha256": "853698ce7aa6c7ba732478bad280240969ddf7b0fcbf93900046f63903a83383"}
+PLAIN_FAMILIES["qwen35"] = {
+    "title": "Qwen3.5-9B", "by": "Qwen (Apache-2.0), GGUFs by Unsloth",
+    "about": "9B, dense, reads images: for a GPU of 8 GB or more, every weight in its VRAM",
+    "tag": "qwen35-", "name": "qwen3.5-9b", "max_context": 262144, "plain": True, "dense": True, "kv_bytes": 32768,
+    "mmproj": _QWEN35_MMPROJ,
+    "models": {
+        "Q4_K_M": {"repo": _QWEN35, "file": "Qwen3.5-9B-Q4_K_M.gguf", "size": 5680522464,
+                   "sha256": "03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8", "about": "4-bit"},
+        "Q6_K": {"repo": _QWEN35, "file": "Qwen3.5-9B-Q6_K.gguf", "size": 7458301152,
+                 "sha256": "91898433cf5ce0a8f45516a4cc3e9343b6e01d052d01f684309098c66a326c59", "about": "6-bit"},
+        "Q8_0": {"repo": _QWEN35, "file": "Qwen3.5-9B-Q8_0.gguf", "size": 9527502048,
+                 "sha256": "809626574d0cb43d4becfa56169980da2bb448f2299270f7be443cb89d0a6ae4",
+                 "about": "8-bit, the closest to the full model"},
+        "BF16": {"repo": _QWEN35, "file": "Qwen3.5-9B-BF16.gguf", "size": 17920697312,
+                 "sha256": "daebe40eeea7057c1cdf35ac56d13f507d8bf12171bbb7a6b6b0d3f05439159a",
+                 "about": "the unquantized weights"},
+    }}
+PLAIN_FAMILIES["qwen35-uncensored"] = {
+    "title": "Qwen3.5-9B (uncensored)", "by": "HauhauCS (Apache-2.0), from Qwen's Qwen3.5-9B",
+    "about": "Qwen3.5-9B with its refusals removed (HauhauCS's Aggressive): far fewer refusals, and its safety "
+             "filtering is reduced, so check what it writes",
+    "tag": "qwen35-uncensored-", "name": "qwen3.5-9b-uncensored", "max_context": 262144, "plain": True, "dense": True,
+    "kv_bytes": 32768,
+    "mmproj": _QWEN35_MMPROJ,
+    "models": {
+        "Q4_K_M": {"repo": _QWEN35_HAU, "file": _QWEN35_HAU_FILE.format("Q4_K_M"), "size": 5627044224,
+                   "sha256": "2ca636d9e81d3d23ca9b60c234fe185d30ec082eeba69ce770fdb0c76559a4f5", "about": "4-bit"},
+        "Q6_K": {"repo": _QWEN35_HAU, "file": _QWEN35_HAU_FILE.format("Q6_K"), "size": 7359259008,
+                 "sha256": "c0ba7beb68fd3fe47891bd549486d38dcf62d00817296ea314ad37017f5a4986", "about": "6-bit"},
+        "Q8_0": {"repo": _QWEN35_HAU, "file": _QWEN35_HAU_FILE.format("Q8_0"), "size": 9527501184,
+                 "sha256": "99e7f2201c0046b05d2825e4d8be6a2efad2b87b071cd55d37bdd9fbe201a58b", "about": "8-bit"},
+        "BF16": {"repo": _QWEN35_HAU, "file": _QWEN35_HAU_FILE.format("BF16"), "size": 17920696704,
+                 "sha256": "40110026c1bd726f85f20487c54fa54b3ffef6ddfdf095e8e5901126d5a2b743",
+                 "about": "the unquantized weights"},
+    }}
 # GLM-5.3-Flash (glm5-next): 320B, 18B active, KDA and DSA attention with four residual streams (mHC), its MTP layer
 # not read yet; Unsloth's files in several parts
 PLAIN_FAMILIES["glm53"] = {
@@ -724,6 +772,9 @@ for _fam in PLAIN_FAMILIES.values():                 # the other models' files, 
     for _d in _fam["models"].values():
         for _x in plain_parts(_d):
             REPO_PINS.setdefault(_d["repo"], {})[_x["path"].rsplit("/", 1)[-1]] = (_x["size"], _x["sha256"])
+    if _fam.get("mmproj"):
+        _m = _fam["mmproj"]
+        REPO_PINS.setdefault(_m["repo"], {})[_m["path"].rsplit("/", 1)[-1]] = (_m["size"], _m["sha256"])
 
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 # EXPERIMENTAL, off by default (setup asks): a control vector shipped with the repository, see its README
@@ -5744,14 +5795,29 @@ def prepare_engine(a, gpu: dict, vision: str) -> tuple[Path, Path, str, list]:
     return llama, eng, enc, lib_dirs
 
 
+# A dense model's VRAM beside its weights and K/V cache: the prompt's buffers (Qwen3.5-9B's for 4096-token chunks are
+# about 1.9 GB, counted from prompt_carve, not measured; the engine halves the chunk until they fit, down to 16 tokens),
+# the products' libraries and the driver's reserve.  The least that lets the engine start.
+DENSE_MARGIN_GB = 1.0
+# ... and its RAM: the model file's pages pass through the OS cache once while the weights go to the GPU, and the
+# token embedding stays mapped (rows read on the host); an estimate, not measured
+DENSE_RAM_GB = 8
+
+
+def dense_vram_gb(fam: dict, d: dict, ctx: int) -> float:
+    """The VRAM (GB) a dense model of PLAIN_FAMILIES needs at a context of `ctx`: its weights, its K/V and the margin"""
+    return d["size"] / 1e9 + fam["kv_bytes"] * ctx / 1e9 + DENSE_MARGIN_GB
+
+
 def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, found: list, gpu_chosen: bool,
                 ram: float, roots: list, elsewhere: list, port: int, adopted: Path | None) -> int:
     """Steps 2-7 for a model of PLAIN_FAMILIES: its size and context, the engine, the GGUF file (size and SHA-256 at
     the pinned revision), its tokenizer and chat template written out, and the config: `strata --native` with no pack,
-    PLE table or MTP layer.  Images, the layer split and the Qwen3.8-Flash-Next options (KV precision, low-RAM modes,
-    the speed projection) do not apply; --low-ram on|mmap reads the experts from the model file instead of RAM
-    (--mmap-experts), the engine's own choice when the RAM is short; --gpus with several cards splits the layers
-    across them (docs/MULTIGPU.md)."""
+    PLE table or MTP layer.  Images where the family has a picture reader ("mmproj"), as for Qwen3.8-Flash-Next.  The
+    Qwen3.8-Flash-Next options (KV precision, low-RAM modes, the speed projection) do not apply; --low-ram on|mmap reads
+    the experts from the model file instead of RAM (--mmap-experts), the engine's own choice when the RAM is short;
+    --gpus with several cards splits the layers across them (docs/MULTIGPU.md).  A dense model's sizes are recommended
+    by the GPU's memory, which holds all of its weights."""
     models = fam["models"]
     names = list(models)
     if a.model and a.model not in names:
@@ -5759,26 +5825,52 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     # the experts the GPUs hold need no copy in RAM (every card of --gpus: the layer split)
     vram = sum(max(0.0, gpu_info(i).get("vram_gb", 0.0) - 5) for i in sel) if len(sel) > 1 \
         else max(0.0, gpu.get("vram_gb", 0.0) - 5)
+    dense = bool(fam.get("dense"))
+    gpu_gb = sum(gpu_expert_vram(gpu_info(i)) for i in sel) if len(sel) > 1 else gpu_expert_vram(gpu)
+    rec_ctx = min(vram_ctx(chosen), fam["max_context"])
     for i, m in enumerate(names, 1):
         d = models[m]
         gb = d["size"] / 1e9
-        fit = "" if ram + vram >= gb + 8 else f"   <- {gb:.0f} GB of weights, this PC has {ram:.0f} GB of RAM"
+        if dense:
+            need = dense_vram_gb(fam, d, rec_ctx)
+            fit = "" if gpu_gb >= need else \
+                f"   <- needs ~{need:.0f} GB of VRAM at {rec_ctx // 1024}K, the GPU has {gpu_gb:.0f} GB"
+        else:
+            fit = "" if ram + vram >= gb + 8 else f"   <- {gb:.0f} GB of weights, this PC has {ram:.0f} GB of RAM"
         say(f"  {i}) {m:15s} {d['about']}; download {gb:.0f} GB" + ("" if d.get("tested") else "   [untested]") + fit)
-    rec = next((str(i) for i, m in enumerate(names, 1) if models[m].get("tested")), "1")
+    if dense:   # the largest that fits the GPU, else the smallest
+        fits = [i for i, m in enumerate(names, 1) if gpu_gb >= dense_vram_gb(fam, models[m], rec_ctx)]
+        rec = str(max(fits, key=lambda i: models[names[i - 1]]["size"])) if fits else \
+            str(min(range(1, len(names) + 1), key=lambda i: models[names[i - 1]]["size"]))
+    else:
+        rec = next((str(i) for i, m in enumerate(names, 1) if models[m].get("tested")), "1")
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
     d = models[model]
     if not d.get("tested"):
         warn(f"{model} has not been run with this release (its tensor types are checked with the tested files)")
-    if ram + vram < d["size"] / 1e9 + 8:
+    if not dense and ram + vram < d["size"] / 1e9 + 8:
         warn(f"{model}'s {d['size'] / 1e9:.0f} GB of weights do not fit this PC's RAM and GPU with room to spare: "
              "the engine reads the experts neither holds from the model file through the OS file cache (slower)")
     ok(f"size: {model}")
     tag = fam["tag"] + model
-    if a.vision not in (None, "no", "none"):
-        warn(f"images are not available with {fam['title']} yet: off")
+    # images: the family's picture reader, asked as for Qwen3.8-Flash-Next (the GPU encoder from 24 GB of VRAM)
+    vision = "none"
+    if not fam.get("mmproj"):
+        if a.vision not in (None, "no", "none"):
+            warn(f"images are not available with {fam['title']} yet: off")
+    elif a.vision:
+        vision = "none" if a.vision in ("no", "none") else images_encoder(a.vision, gpu)
+    else:
+        say()
+        say("  Images: the model can also read pictures (screenshots, photos, scanned pages). This adds a 0.9 GB")
+        say("  download; the image encoder runs on the GPU from 24 GB of VRAM, else on the CPU (a few seconds a"
+            " picture).")
+        vision = images_encoder("yes", gpu) if ask("Do you want images?", ["y", "n"], "y", a.yes) == "y" else "none"
+    if fam.get("mmproj"):
+        ok("images: " + {"none": "off", "gpu": "on (encoder on the GPU, the CPU encoder as fallback)",
+                         "cpu": "on (encoder on the CPU)"}[vision])
     # the context: up to the model's, recommended by the smallest card's memory as for Qwen3.8-Flash-Next
     contexts = [c for c in CONTEXTS if c <= fam["max_context"]]
-    rec_ctx = vram_ctx(chosen)
     if a.context:
         ctx = a.context
         if ctx > fam["max_context"]:
@@ -5793,6 +5885,10 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         ctx = contexts[int(ask("Context?", [str(i) for i in range(1, len(contexts) + 1)],
                                str(contexts.index(rec_ctx) + 1), a.yes)) - 1]
     ok(f"context: {ctx} tokens")
+    if dense and gpu_gb < dense_vram_gb(fam, d, ctx):
+        warn(f"{fam['title']} {model} keeps every weight in VRAM: ~{dense_vram_gb(fam, d, ctx):.0f} GB at a "
+             f"{ctx // 1024}K context, and the GPU has {gpu_gb:.0f} GB, so the engine may not start; a smaller size "
+             "or context fits")
     parts = plain_parts(d)
     names_of = [Path(x["path"]).name for x in parts]   # side by side in one folder: the engine finds them by name
     models_dir = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
@@ -5808,6 +5904,10 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     gguf = models_dir / names_of[0]
     have = all_there(models_dir)
     left = 0 if have else d["size"] / 1e9
+    mm = fam.get("mmproj") if vision != "none" else None
+    mmproj = models_dir / Path(mm["path"]).name if mm else None   # the picture reader, beside the model
+    if mm is not None and mmproj is not None and not (mmproj.exists() and (done(mmproj) or a.gguf_dir)):
+        left += mm["size"] / 1e9
     if left and free_gb(models_dir) < left:
         fail(f"not enough free disk space in {models_dir}: need ~{left:.0f} GB, {free_gb(models_dir):.0f} GB free",
              "use --models-dir on a bigger drive")
@@ -5815,7 +5915,7 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         warn(f"little free disk space in {models_dir}: {free_gb(models_dir):.1f} GB free for about {left:.1f} GB. "
              "Setup goes on and should fit")
 
-    llama, eng, enc, lib_dirs = prepare_engine(a, gpu, "none")
+    llama, eng, enc, lib_dirs = prepare_engine(a, gpu, vision)
 
     # ---- 5. the model file
     step(5, f"downloading {fam['title']} {model}")
@@ -5828,6 +5928,23 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         verify_sha256(models_dir / n, x["size"], x["sha256"], own=bool(a.gguf_dir))
     more = f" and {len(parts) - 1} more beside it" if len(parts) > 1 else ""
     ok(f"model file present: {gguf}{more}")
+    if mm is not None and mmproj is not None:
+        # the same file beside another size or the other family (Qwen3.5-9B's two share one): linked, not fetched
+        # (only a copy whose finish mark holds the pinned SHA-256: GLM-5.3-Flash's is named mmproj-BF16.gguf too)
+        other = [p for p in Path(a.models_dir).glob("*/" + mmproj.name) if p != mmproj and done(p)
+                 and f"sha256 {mm['sha256']}" in p.with_name(p.name + ".done").read_text(encoding="utf-8",
+                                                                                         errors="replace")]
+        if other and not mmproj.exists() and not a.gguf_dir:
+            try:
+                os.link(other[0], mmproj)
+                mark(mmproj, f"sha256 {mm['sha256']}")
+                ok(f"{mmproj.name} shared with {other[0].parent.name} (identical file)")
+            except OSError:
+                pass
+        if not (mmproj.exists() and (done(mmproj) or a.gguf_dir)):
+            download(hf(mm["repo"]) + mm["path"], mmproj, "vision encoder")
+        verify_sha256(mmproj, mm["size"], mm["sha256"], own=bool(a.gguf_dir))
+        ok(f"vision encoder: {mmproj}")
 
     # ---- 6. the tokenizer and the chat template, for the server
     step(6, "preparing the model for Strata")
@@ -5845,8 +5962,12 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         args += ["--expert-profile", str(ROOT / "data" / fam["profile"])]
     if fam.get("draft_vocab"):                         # the MTP layer's drafts over a token subset (--draft-vocab)
         args += ["--draft-vocab", str(ROOT / "data" / DRAFT_VOCABS.get(a.draft_vocab or "cjk", "draft_vocab.bin"))]
+    if vision != "none":   # the GPU encoder warms up before the engine, which then sizes itself around it
+        args += ["--vision"]
     if a.vram_reserve_mib is not None:
         args += ["--vram-reserve-mib", str(a.vram_reserve_mib)]
+    elif vision != "none":
+        args += ["--vram-reserve-mib", str(VISION[vision]["reserve_mib"])]
     # --low-ram: the engine keeps in RAM what the VRAM does not hold as far as the RAM allows and reads the rest from
     # the file by itself (resident and auto); on and mmap read every expert the VRAM misses from the file
     if a.low_ram in ("on", "mmap"):
@@ -5872,7 +5993,18 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         cfg["open_browser"] = a.browser
     if a.parallel is not None and a.parallel >= 2:
         warn("--parallel is not available for this model yet: one request at a time")
-    return finish_setup(a, cfg, tag, port, adopted, False, tune=False)
+    if vision != "none" and mmproj is not None:   # as Qwen3.8-Flash-Next's (setup's main path)
+        vt = vision_tokens(a.vision_tokens, vision, CONF / f"xestrata-{tag.lower()}.json")
+        cpu_enc = {"exe": str(eng / VEXE["cpu"]), "gpu": False,
+                   "max_tokens": vt if vision == "cpu" else VISION["cpu"]["max_tokens"],
+                   "threads": max(1, (os.cpu_count() or 8) // 2)}
+        cfg["vision"] = {"mmproj": str(mmproj), "model": str(gguf), **cpu_enc}
+        if vision == "gpu":
+            cfg["vision"] = {"mmproj": str(mmproj), "model": str(gguf), "exe": str(eng / VEXE[enc]), "gpu": True,
+                             "gpu_pci": gpu["pci"], "max_tokens": vt, "fallback": cpu_enc}
+    elif a.vision_tokens is not None:
+        warn("--vision-tokens: images are off for this model, so it is not used")
+    return finish_setup(a, cfg, tag, port, adopted, vision != "none", tune=False)
 
 
 def finish_setup(a, cfg: dict, tag: str, port: int, adopted: Path | None, images: bool, tune: bool = True,
@@ -5953,13 +6085,19 @@ def describe() -> dict:
         if fam.get("plain"):
             names = list(fam["models"])
             rec = next((m for m in names if fam["models"][m].get("tested")), names[0])
+            ctx_f = min(by_vram, fam["max_context"])
+            if fam.get("dense"):   # every weight in VRAM: the largest size that fits the GPU
+                fit_d = [m for m in names if vram >= dense_vram_gb(fam, fam["models"][m], ctx_f)]
+                rec = max(fit_d, key=lambda m: fam["models"][m]["size"]) if fit_d else names[0]
             for m in names:
                 d = fam["models"][m]
                 gb = d["size"] / 1e9
-                models.append({"id": m, "about": d["about"], "download_gb": round(gb, 1), "ram_gb": round(gb + 8),
-                               "fits": "yes" if ram + vram >= gb + 8 else "slow", "tested": bool(d.get("tested")),
-                               "experimental": False, "recommended": m == rec,
-                               "context": min(by_vram, fam["max_context"])})
+                fits = ("yes" if vram >= dense_vram_gb(fam, d, ctx_f) else "no") if fam.get("dense") \
+                    else "yes" if ram + vram >= gb + 8 else "slow"
+                models.append({"id": m, "about": d["about"], "download_gb": round(gb, 1),
+                               "ram_gb": DENSE_RAM_GB if fam.get("dense") else round(gb + 8),
+                               "fits": fits, "tested": bool(d.get("tested")),
+                               "experimental": False, "recommended": m == rec, "context": ctx_f})
             max_ctx = fam["max_context"]
         else:
             names = sorted((m for m in MODELS if f in MODELS[m].get("families", ("qwen", "swift"))),
@@ -6494,6 +6632,12 @@ def main() -> int:
         for fam in PLAIN_FAMILIES.values():
             for m, d in fam["models"].items():
                 gb = d["size"] / 1e9
+                if fam.get("dense"):   # every weight in VRAM, at the context the card recommends
+                    c = min(vram_ctx([gpu]), fam["max_context"])
+                    need = dense_vram_gb(fam, d, c)
+                    verdict = "fits" if gpu_expert_vram(gpu) >= need else "does not fit the GPU"
+                    say(f"  {fam['title']} {m}: ~{need:.0f} GB of VRAM at {c // 1024}K: {verdict}")
+                    continue
                 verdict = "fits" if ram >= gb + 8 else "fits with the GPU's VRAM" if ram + plain_vram >= gb + 8 \
                     else "slow (the experts that do not fit are read from the SSD)"
                 say(f"  {fam['title']} {m}: ~{gb + 8:.0f} GB of RAM and VRAM: {verdict}")

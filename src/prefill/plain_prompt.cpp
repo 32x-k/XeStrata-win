@@ -59,6 +59,18 @@ namespace strata::core {
 
 namespace k = strata::kernels;
 
+namespace {
+
+bool dense_int8_env() {   // STRATA_PLAIN_DENSE_MMQ=0: every dense product through Gemm::native
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PLAIN_DENSE_MMQ");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    return on;
+}
+
+}  // namespace
+
 
 void PlainModel::prompt_gemm_free(PromptGemm* g) { delete g; }
 
@@ -85,6 +97,22 @@ PlainModel::PromptGemm& PlainModel::prompt_gemm() {
 
 bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
     if (!settle_swaps(true, err)) return false;   // the tier's copies may still be writing the slots lent below
+    if (dense_) {   // no tier: the buffers of its own (open_dense), in even chunks of up to their length
+        if (borrow_first_ >= 0 || prompt_dev_.at.empty() || prompt_dev_T_ < 1) {
+            err = "plain prompt: no buffers for the prompt's chunks";
+            return false;
+        }
+        const int64_t pieces = (T + prompt_dev_T_ - 1) / prompt_dev_T_;
+        uint64_t db = 0, hb = 0;
+        borrow_short_ = false;
+        borrowed_res_.clear();
+        borrow_first_ = 0;
+        prompt_carve((T + pieces - 1) / pieces, pb_, nullptr, (uint8_t*) prompt_host_, db, hb, &prompt_dev_);
+        PromptGemm& g = prompt_gemm();
+        g.gemm.rebind(pb_.gemm_scratch, pb_.gemm_elems);
+        g.identity = false;
+        return true;
+    }
     const int64_t L = n_moe_, E = spec_.n_expert, n = cache_.slots();   // the live slots (--vram-elastic's shrinks)
     const uint64_t* off = cache_.slot_offsets();
     if (borrow_first_ >= 0 || off == nullptr || L <= 0 || n < 2) { err = "plain prompt: no tier to borrow from"; return false; }
@@ -105,12 +133,12 @@ bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
     }
     // the buffers of their own when their chunk is no shorter than the borrowed one: no slot lent, prompt_return
     // gives back none
-    if (prompt_dev_ != nullptr && (T < least || std::min(want, prompt_dev_T_) >= T)) {
+    if (!prompt_dev_.at.empty() && (T < least || std::min(want, prompt_dev_T_) >= T)) {
         const int64_t pieces = (want + prompt_dev_T_ - 1) / prompt_dev_T_;   // even chunks: no short last one
         T = (want + pieces - 1) / pieces;
         borrowed_res_.clear();
         borrow_first_ = n;
-        prompt_carve(T, pb_, (uint8_t*) prompt_dev_, (uint8_t*) prompt_host_, db, hb);
+        prompt_carve(T, pb_, nullptr, (uint8_t*) prompt_host_, db, hb, &prompt_dev_);
         PromptGemm& g = prompt_gemm();
         g.gemm.rebind(pb_.gemm_scratch, pb_.gemm_elems);
         g.identity = false;
@@ -143,6 +171,7 @@ bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
 
 bool PlainModel::prompt_return(std::string& err) {
     const int64_t LS = (int64_t) moe_local_.size(), n = cache_.slots();
+    if (dense_) borrow_first_ = -1;   // its own buffers: nothing to give back
     if (borrow_first_ < 0 || LS <= 0) return true;   // a borrow needs slots, and slots need MoE layers
     const auto& lay = k::cpu::expert_layout();
     if (!strata::gpu::stream_sync(cs_)) { err = std::string("plain prompt: ") + strata::gpu::last_error(); return false; }
@@ -238,6 +267,7 @@ bool PlainModel::prompt_warm(std::string& err) {
     if (opt_.prompt_chunk <= 0 || prompt_host_ == nullptr) return true;
     if (!prompt_borrow(std::min<int64_t>(opt_.prompt_chunk, 512), err)) return false;
     const bool ok = prompt_warm_products(err);
+    if (ok && dense_) prompt_dense_calibrate();
     std::string err2;
     if (!prompt_return(err2) && ok) { err = err2; return false; }
     return ok;
@@ -281,7 +311,7 @@ bool PlainModel::prompt_warm_products(std::string& err) {
                 warm(b.v, P.vcur);
                 warm(b.o, P.mix);
             }
-            if (has_shared_) {
+            if (has_shared_ || dense_) {   // the shared expert, or the dense FFN in its fields
                 warm(b.sh_gate, P.sh_gate);
                 warm(b.sh_up, P.sh_up);
                 warm(b.sh_down, P.shared);
@@ -296,6 +326,87 @@ bool PlainModel::prompt_warm_products(std::string& err) {
         return false;
     }
     return true;
+}
+
+bool PlainModel::dense_int8_ok(const W& w) const {
+    return dense_int8_env() && prefill::mmq::chosen() && w.data != nullptr && prefill::mmq::supported(w.type) &&
+           w.n_out % 128 == 0 && w.n_in % 32 == 0;
+}
+
+bool PlainModel::prompt_dense_int8(const W& w, const float* x, int64_t ldx, float* y, int64_t T, int64_t ldy) {
+    if (!dense_int8_ok(w)) return false;
+    PromptBufs& P = pb_;
+    prefill::mmq::quantize(x, nullptr, P.xq, w.type, w.n_in, ldx, T, cs_);
+    prefill::mmq::Product p;
+    p.w = w.data; p.type = w.type; p.w_rows = w.n_out; p.w_cols = w.n_in; p.n = 1; p.xq = P.xq;
+    p.bounds = P.dense_bounds; p.ids = P.identity; p.total_rows = T; p.max_rows = T;
+    p.dst = y; p.ld_dst = ldy > 0 ? ldy : w.n_out;
+    prompt_gemm().mmq.run(p, cs_);
+    return true;
+}
+
+// The int8 products read the weight in its blocks a row tile at a time; Gemm::native dequantizes it to FP16 once a
+// product (a time of its own, whatever the rows) and multiplies it in the products' library.  Each is timed as
+// a + b rows from 16 rows and the chunk's (the best of three, after one), and dense_native_rows_ is where they cross.
+// The RX 9060 XT, Qwen3.5-9B Q4_K_M (2026-10-27): int8 faster at 16 and 23 tokens, FP16 at 128 and above (2289 tok/s
+// at 1K against 843).  Gemm::native is timed with its sums in FP32 and in FP16 too: the RTX 4070 takes FP16's (1K
+// 2842 -> 3572 tok/s warm, 32K 1524 -> 1681), the B70 FP32's (oneMKL's half GEMM is slower there: 3476 against 3304).
+void PlainModel::prompt_dense_calibrate() {
+    PromptBufs& P = pb_;
+    if (blocks_.empty() || P.T < 32) return;
+    const W& w = blocks_.front().sh_gate;   // the dense FFN's gate: the largest of the products a chunk takes
+    if (!dense_int8_ok(w)) return;
+    prefill::Gemm& gm = prompt_gemm().gemm;
+    PromptGemm& pg = prompt_gemm();
+    const int64_t lo = 16, hi = P.T;
+    using Clock = std::chrono::steady_clock;
+    auto best = [&](const std::function<void()>& run) {
+        double t = 1e30;
+        for (int i = 0; i < 4; ++i) {
+            const auto t0 = Clock::now();
+            run();
+            if (!strata::gpu::stream_sync(cs_)) return -1.0;
+            if (i > 0) t = std::min(t, std::chrono::duration<double>(Clock::now() - t0).count());
+        }
+        return t;
+    };
+    try {
+        if (!strata::gpu::memset_async(P.hn, 0, (size_t) (hi * w.n_in) * 4, cs_) ||
+            !strata::gpu::memset_async(P.x16, 0, (size_t) (hi * w.n_in) * 2, cs_))
+            return;
+        if (!pg.identity) {
+            prefill::mmq::iota(P.identity, P.T, cs_);
+            pg.identity = true;
+        }
+        // Gemm::native with its sums in FP32 and in FP16 (h), the faster at the chunk's rows taken for the products
+        // from the normed rows
+        double n[2], h[2], q[2];
+        for (int i = 0; i < 2; ++i) {
+            const int64_t T = i == 0 ? lo : hi;
+            P.h_dense_bounds[0] = 0;
+            P.h_dense_bounds[1] = (int32_t) T;
+            if (!strata::gpu::copy_async(P.dense_bounds, P.h_dense_bounds, 2 * sizeof(int32_t), cs_)) return;
+            n[i] = best([&] { gm.native(P.x16, w.type, w.data, P.sh_gate, T, w.n_out, w.n_in, 0); });
+            h[i] = best([&] { gm.native(P.x16, w.type, w.data, P.sh_gate, T, w.n_out, w.n_in, 0, true); });
+            q[i] = best([&] { prompt_dense_int8(w, P.hn, w.n_in, P.sh_gate, T, 0); });
+            if (n[i] < 0 || h[i] < 0 || q[i] < 0) return;
+        }
+        dense_half_sums_ = h[1] < n[1];
+        if (dense_half_sums_) { n[0] = h[0]; n[1] = h[1]; }
+        // native - int8 = d0 + d1 (T - lo): FP16 from where it turns negative
+        const double d0 = n[0] - q[0], d1 = ((n[1] - q[1]) - d0) / (double) (hi - lo);
+        if (d0 <= 0) dense_native_rows_ = 0;
+        else if (d1 < 0) dense_native_rows_ = lo + (int64_t) std::ceil(d0 / -d1);
+        std::fprintf(stderr, "strata plain: dense products in FP16 (the products' library, %s sums) from %s rows, in "
+                             "int8 below (%.2f / %.2f ms at %lld rows, %.2f / %.2f at %lld)\n",
+                     dense_half_sums_ ? "FP16" : "FP32",
+                     dense_native_rows_ == INT64_MAX ? "no" : std::to_string(dense_native_rows_).c_str(), 1e3 * n[0],
+                     1e3 * q[0], (long long) lo, 1e3 * n[1], 1e3 * q[1], (long long) hi);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "strata plain: timing the dense products: %s (int8 kept)\n", e.what());
+        dense_native_rows_ = INT64_MAX;
+        dense_half_sums_ = false;
+    }
 }
 
 bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* routes,
@@ -688,7 +799,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
     const ModelSpec& s = spec_;
     const int64_t N = s.n_embd, NH = s.n_head, HD = s.key_length, NKV = nkv_, HV = s.ssm_dt_rank, HK = s.ssm_n_group;
     const int64_t E = s.n_expert, K = s.n_expert_used;
-    const int64_t FS = s.n_ff_shexp, qw = (has_gate_ ? 2 : 1) * NH * HD;
+    const int64_t FS = dense_ ? s.n_ff : s.n_ff_shexp, qw = (has_gate_ ? 2 : 1) * NH * HD;
     const float eps = (float) s.rms_eps;
     const k::QsaShapes qs = [&] {
         k::QsaShapes q = k::qsa_real_shapes();
@@ -699,26 +810,14 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
     strata::gpu::Stream cs = cs_;
     prefill::Gemm& gm = prompt_gemm().gemm;
     auto f16 = [&](const float* x, int64_t rows, int64_t cols) { prefill::to_f16(x, P.x16, rows * cols, cs); };
-    // a dense product from float rows x (ldx a row) in int8 (iq_mmq, as one expert of T rows) where the weight's type
-    // and shape are the int8 products'; false: the caller takes Gemm::native from the FP16 copy
-    static const bool dense_env = [] {   // STRATA_PLAIN_DENSE_MMQ=0: every dense product through Gemm::native
-        const char* v = std::getenv("STRATA_PLAIN_DENSE_MMQ");
-        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
-    }();
-    const bool dense_on = dense_env && prefill::mmq::chosen();   // as for the experts: PlainModel::prompt_int8
+    // a dense product from float rows x (ldx a row) in int8 below dense_native_rows_ rows where the weight is the int8
+    // products'; false: the caller takes Gemm::native from the FP16 copy
+    const bool dense_on = dense_int8_env() && prefill::mmq::chosen();   // as for the experts: PlainModel::prompt_int8
     auto dense = [&](const W& w, const float* x, int64_t ldx, float* y, int64_t T, int64_t ldy = 0) {
-        if (!dense_on || w.data == nullptr || !prefill::mmq::supported(w.type) || w.n_out % 128 != 0 || w.n_in % 32 != 0)
-            return false;
-        prefill::mmq::quantize(x, nullptr, P.xq, w.type, w.n_in, ldx, T, cs);
-        prefill::mmq::Product p;
-        p.w = w.data; p.type = w.type; p.w_rows = w.n_out; p.w_cols = w.n_in; p.n = 1; p.xq = P.xq;
-        p.bounds = P.dense_bounds; p.ids = P.identity; p.total_rows = T; p.max_rows = T;
-        p.dst = y; p.ld_dst = ldy > 0 ? ldy : w.n_out;
-        prompt_gemm().mmq.run(p, cs);
-        return true;
+        return T < dense_native_rows_ && prompt_dense_int8(w, x, ldx, y, T, ldy);
     };
-    auto proj = [&](const W& w, float* y, int64_t T, int64_t ldy = 0) {
-        gm.native(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, ldy);
+    auto proj = [&](const W& w, float* y, int64_t T, int64_t ldy = 0, bool half_sums = false) {
+        gm.native(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, ldy, half_sums);
     };
     // the routed experts in their quantized blocks (int8 products, iq_mmq: on the matrix engines, else by dp4a where the
     // FP16 products have none either) where every layer's types are theirs (prompt_int8, decided with the buffers),
@@ -738,8 +837,9 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     PromptGemm& pg = prompt_gemm();
+    const int64_t rows_id = P.T * std::max<int64_t>(K, 1);   // the identity's rows: the routed ones, or a dense chunk's
     if (use_mmq && !pg.identity) {
-        prefill::mmq::iota(P.identity, P.T * K, cs);
+        prefill::mmq::iota(P.identity, rows_id, cs);
         pg.identity = true;
     }
     // STRATA_PROMPT_PROFILE=1: the time of each stage, the stream synchronized after each (slower; for finding where it
@@ -770,8 +870,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
             // positions
             for (int64_t t = 0; t < T; ++t) {
                 const int32_t tok = tokens[c0 + t];
-                if (tok < 0 || tok >= n_vocab_ ||
-                    (first() && !k::cpu::native_row_to_float(emb_type_, emb_ + (size_t) tok * emb_row_, P.emb + t * N, N))) {
+                if (tok < 0 || tok >= n_vocab_ || (first() && !embed(tok, p0 + t, P.emb + t * N))) {
                     err = "plain prompt: a token is out of the vocabulary";
                     return false;
                 }
@@ -793,12 +892,13 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                 return false;
             }
             if (dense_on && !pg.identity) {   // the dense products' row map (the experts' sets it too)
-                prefill::mmq::iota(P.identity, P.T * K, cs);
+                prefill::mmq::iota(P.identity, rows_id, cs);
                 pg.identity = true;
             }
-            // from the normed rows: int8 where it can, else FP16 (x16, written once a layer if any product needs it)
+            // from the normed rows: int8 where it can, else FP16 (x16, written once a layer if any product needs it),
+            // its sums in FP16 where that was measured faster (a norm's rows keep them in FP16's range)
             auto proj_hn = [&](const W& w, float* y, int64_t ldy = 0) {
-                if (!dense(w, P.hn, N, y, T, ldy)) proj(w, y, T, ldy);
+                if (!dense(w, P.hn, N, y, T, ldy)) proj(w, y, T, ldy, dense_half_sums_);
             };
             // the last token's logits, by the decode's head
             auto last_logits = [&] {
@@ -831,7 +931,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     k::native_qsa_rms_norm_weighted(P.hn, mtp_hnorm_, P.mix, (int) N, (int) T, eps, cs);
                     for (int64_t t = 0; t < T; ++t) {   // the stream has synchronized since the chunk's uploads
                         const int32_t tok = c0 + t + 1 < n ? tokens[c0 + t + 1] : tokens[n - 1];
-                        if (!k::cpu::native_row_to_float(emb_type_, emb_ + (size_t) tok * emb_row_, P.emb + t * N, N)) {
+                        if (!embed(tok, p0 + 1 + t, P.emb + t * N)) {
                             err = "plain prompt: a token is out of the vocabulary";
                             return false;
                         }
@@ -882,8 +982,10 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     prefill::gdn_recurrence(gdn_state_[(size_t) b.gdn], P.h, P.gate, P.beta, P.z, b.ssm_norm, eps, P.y,
                                             P.y16, T, cs, HK, HV, /*silu=*/true);
                     part(8);
-                    // (y16, the normed and gated output, exists only in FP16: no float rows to round to int8)
-                    gm.native(P.y16, b.ssm_out.type, b.ssm_out.data, P.mix, T, b.ssm_out.n_out, b.ssm_out.n_in);
+                    // (y16, the normed and gated output, exists only in FP16: no float rows to round to int8; normed,
+                    // its sums in FP16 as proj_hn's)
+                    gm.native(P.y16, b.ssm_out.type, b.ssm_out.data, P.mix, T, b.ssm_out.n_out, b.ssm_out.n_in, 0,
+                              dense_half_sums_);
                     part(9);
                 } else {
                     const int64_t a = b.attn;
@@ -930,11 +1032,32 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     }
                     if (!dense(b.o, ao, NH * HD, P.mix, T)) {
                         f16(ao, T, NH * HD);
-                        proj(b.o, P.mix, T);
+                        proj(b.o, P.mix, T, 0, dense_half_sums_);   // averages of V's rows: in FP16's range as well
                     }
                 }
                 k::add_inplace(P.x, P.mix, T * N, cs);
                 mark(b.recurrent ? 0 : 4, t_mark);
+
+                if (dense_) {   // qwen35's FFN: gate and up from the normed rows, the SwiGLU, down; int8 where it can
+                    k::native_qsa_rms_norm_weighted(P.x, b.post_norm, P.hn, (int) N, (int) T, eps, cs);
+                    f16(P.hn, T, N);
+                    proj_hn(b.sh_gate, P.sh_gate);
+                    proj_hn(b.sh_up, P.sh_up);
+                    if (T < dense_native_rows_ && dense_int8_ok(b.sh_down)) {
+                        // the SwiGLU in FP32 rows for the int8 product: the chunk as one row (the kernel is
+                        // element-wise, and takes at most 8 rows)
+                        k::native_swiglu_f32(P.sh_gate, P.sh_up, P.sh_gate, (int) (FS * T), 1, cs);
+                        dense(b.sh_down, P.sh_gate, FS, P.moe_out, T);
+                    } else {   // into FP16 (x16 is free again) for Gemm::native
+                        prefill::swiglu_pair(P.sh_gate, P.sh_up, P.x16, T, cs, FS);
+                        // its sums in FP16 too where they were measured faster, as llama.cpp's cuBLAS products of FP16
+                        // weights take every product's (its default precision): the SwiGLU's rows are in FP16 already
+                        proj(b.sh_down, P.moe_out, T, 0, dense_half_sums_);
+                    }
+                    k::add_inplace(P.x, P.moe_out, T * N, cs);
+                    mark(3, t_mark);
+                    continue;
+                }
 
                 // the MoE
                 k::native_qsa_rms_norm_weighted(P.x, b.post_norm, P.hn, (int) N, (int) T, eps, cs);

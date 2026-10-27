@@ -128,6 +128,13 @@ FALLBACK_FAMILIES = {
               "tag": "llmjp-"},
     "qwen36": {"title": "Qwen3.6-35B-A3B", "about": "35B, 3B active; a Qwen3.5 MoE with the Qwen tokenizer: Unsloth's "
                                                     "4-, 6- and 8-bit files", "tag": "qwen36-"},
+    "qwen35": {"title": "Qwen3.5-9B",
+               "about": "9B, dense, reads images: for a GPU of 8 GB or more, every weight in its VRAM",
+               "tag": "qwen35-"},
+    "qwen35-uncensored": {"title": "Qwen3.5-9B (uncensored)",
+                          "about": "Qwen3.5-9B with its refusals removed (HauhauCS's Aggressive): far fewer refusals, "
+                                   "and its safety filtering is reduced, so check what it writes",
+                          "tag": "qwen35-uncensored-"},
     "glm53": {"title": "GLM-5.3-Flash",
               "about": "320B, 18B active; a large MoE for the PCs whose RAM and VRAM hold 95 GB or more",
               "tag": "glm53-"},
@@ -446,8 +453,12 @@ class Strata:
             return models[model]
         d = fam["models"][model]
         gb = round(d["size"] / 1e9, 1)
+        if fam.get("dense"):   # every weight in the GPU's VRAM (setup_plain's dense_vram_gb), little RAM
+            ram = float(getattr(self.setup_module(), "DENSE_RAM_GB", 8))
+            return {"about": d["about"], "download_gb": gb, "ram_gb": ram, "vram_gb": gb,
+                    "vision": bool(fam.get("mmproj")), "experimental": not d.get("tested"), "families": (family,)}
         return {"about": d["about"], "download_gb": gb, "ram_gb": round(gb + 8, 1), "mem_total": True,
-                "vision": False, "experimental": not d.get("tested"), "families": (family,)}
+                "vision": bool(fam.get("mmproj")), "experimental": not d.get("tested"), "families": (family,)}
 
     def sizes_of(self, models, family) -> list:
         fam = self.plain_family(family)
@@ -716,6 +727,8 @@ class Strata:
                             verdict = "fits in the low-RAM mode (slower: the GPU holds part of the experts)"
                     except Exception:                   # noqa: BLE001
                         pass
+                if d.get("vram_gb") is not None and usable:   # a dense model: every weight in the GPU's VRAM, its K/V
+                    verdict = "fits" if vram >= d["vram_gb"] + 2 else "does not fit the GPU"   # and buffers beside
                 sizes.append({"model": m, "about": d["about"], "download_gb": d["download_gb"],
                               "experimental": bool(d.get("experimental")),
                               "images": d.get("vision", fd.get("vision", True)) is not False,

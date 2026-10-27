@@ -11,6 +11,9 @@
 // and whose head is rms_norm, then the output projection.  Qwen3.8 (four residual streams, the QSA indexer, PLE) keeps
 // its own engine.
 //
+// qwen35 (Qwen3.5-9B) is qwen35moe's block with a dense SwiGLU in place of the MoE (`dense_`): every weight in VRAM, a
+// window one graph with nothing for the host to answer, the prompt's buffers of their own; no tiers, no CPU pool.
+//
 // glm5-next (GLM-5.3-Flash, plain_glm5.cpp) runs here too, with its own block: four mHC streams read before and written
 // after every mixer and FFN, KDA (per-channel decay) and DSA (a k-pool indexer, the MLA attention over its selection)
 // mixers, leading dense FFN layers, a sigmoid router and the clamped SwiGLU; the expert tiers and the windows as above.
@@ -65,6 +68,9 @@ struct PlainOptions {
     /// of RAM; the RTX 4070 started at all (it had 161 MiB left for the tier), and at 64K went 86 -> 172 slots, its
     /// prompt 3.3 -> 7.1 tok/s and decode 2.32 -> 2.30 (UD-IQ3_XXS, 1K + 256, 2026-10-26).  The other models: off.
     bool kv_ram = true;
+    /// --vision (qwen35, qwen35moe): pictures among the prompt's tokens (plain_generate's GENI): their rows in place
+    /// of the token embeddings (set_embeddings) and every cell's M-RoPE position from a table (set_positions)
+    bool vision = false;
     /// --vram-elastic (#533; --serve, one GPU with virtual memory): the expert slots in physical segments of
     /// vram_segment_mib that `vram` gives back to the driver and maps again between requests
     bool vram_elastic = false;
@@ -151,6 +157,12 @@ public:
     int64_t max_cells() const { return opt_.max_cells; }
     /// The prompt's chunk (0: the prompt runs in windows; GLM-5.3-Flash's for now, whatever the options asked).
     int64_t prompt_chunk() const { return opt_.prompt_chunk; }
+    /// --vision: the M-RoPE positions (t, h, w) of cells 0 .. n - 1, `pos3` 3 n of them on the host
+    /// (kernels/mrope.hpp's table, every stage's; the cells after n keep theirs).  Between requests.
+    bool set_positions(const int32_t* pos3, int64_t n, std::string& err);
+    /// --vision: (*rows)[p], n_embd floats, in place of the embedding of the token at position p where it is not null
+    /// (a picture's rows; null `rows`: none).  The vector outlives the prompt it is set for.
+    void set_embeddings(const std::vector<const float*>* rows);
 
     /// Zeroes the recurrent states and the K/V cache: the next window starts a sequence at position 0.
     bool reset(std::string& err);
@@ -296,7 +308,7 @@ private:
         const float *q_norm = nullptr, *k_norm = nullptr;
         const float* router = nullptr;                        // F32 [n_embd, n_expert]
         const float* sh_gate_inp = nullptr;                   // F32 [n_embd]
-        W sh_gate, sh_up, sh_down;
+        W sh_gate, sh_up, sh_down;                            // the shared expert, or qwen35's dense FFN
     };
 
     /// A projection's GGUF tensor into VRAM: its first dimension the input, every other the outputs (a 3-D tensor, the
@@ -309,6 +321,8 @@ private:
     /// in BF16).
     bool upload_f32(const GgufModel& m, const std::string& name, uint64_t elements, const float*& out, std::string& err);
     bool open_experts(std::string& err);
+    /// qwen35's in place of open_experts: no tiers, the prompt's buffers beside the weights
+    bool open_dense(std::string& err);
     bool record(int T, bool mtp, std::string& err);
     /// The window's inputs (embeddings, steps, positions) for `tokens` at pos .. pos + T - 1 into the mapped staging;
     /// `emb` false: no embeddings (a later stage's window, which reads the rows handed on).
@@ -404,19 +418,31 @@ private:
         int32_t* g_ids = nullptr;
         float *g_ffg = nullptr, *g_ffu = nullptr;
     };
-    /// Lays the buffers for chunks of `T` tokens out from `dev` / `host` (null: only counts), returning the device and
-    /// host bytes.
+    /// Device buffers in pieces of at most max_alloc_bytes() (a chunk's buffers may take more than a device allots at
+    /// once: the RX 9060 XT's HIP adapter allots 1 GiB): each piece's bytes and, once allocated, where it lies.
+    struct PromptPieces {
+        std::vector<uint64_t> bytes;
+        std::vector<uint8_t*> at;
+    };
     /// The lowest slot of `n` a prompt chunk may borrow from (prefill::lend_pct of them, 128 left).
     int64_t lend_lowest(int64_t n) const;
     /// --prompt-chunk not given: the chunk from the tier, as Qwen3.8-Flash-Next's --prefill auto.
     void auto_prompt_chunk(uint64_t beside);
+    /// Lays the buffers for chunks of `T` tokens out from `dev` / `host` (null: only counts), returning the device and
+    /// host bytes.  With `pieces` the device's go into pieces instead: sized (pieces->bytes, each within
+    /// max_alloc_bytes()) while pieces->at is empty, else laid out within those pieces in turn (a chunk of at most the
+    /// T they were sized for fits: every buffer grows with T).
     void prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* host, uint64_t& dev_bytes,
-                      uint64_t& host_bytes) const;
+                      uint64_t& host_bytes, PromptPieces* pieces = nullptr) const;
+    /// The pieces for chunks of `T` tokens (prompt_dev_, not yet in allocs_) when they take at most `room` bytes;
+    /// false, nothing held, when they do not or an allocation fails.
+    bool alloc_prompt_dev(int64_t T, uint64_t room);
     PromptBufs pb_;
     void* prompt_host_ = nullptr;
     /// The prompt's device buffers of their own, for chunks of up to prompt_dev_T_ tokens, when every expert has a
-    /// slot and the VRAM beside the tier holds them (else null: prompt_borrow lends the tier's last slots).
-    void* prompt_dev_ = nullptr;
+    /// slot and the VRAM beside the tier holds them (else none: prompt_borrow lends the tier's last slots), and a dense
+    /// model's always (open_dense; none there: the prompt runs in windows).
+    PromptPieces prompt_dev_;
     int64_t prompt_dev_T_ = 0;
     /// The prompt's device buffers, carved from the tier's last slots for one prompt (prompt_borrow) and given back
     /// after it (prompt_return), with the experts that were in them put back: the tier keeps that memory between
@@ -432,6 +458,22 @@ private:
     bool prompt_one(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits, std::string& err);
     bool prompt_split(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits, std::string& err);
     bool prompt_warm_products(std::string& err);
+    /// W's dense products can go in int8: the int8 products are this GPU's (prefill::mmq::chosen, not turned off by
+    /// STRATA_PLAIN_DENSE_MMQ=0) and take W's type and shape.
+    bool dense_int8_ok(const W& w) const;
+    /// A dense product y = x W^T of T float rows (ldx a row) in int8 (iq_mmq, as one expert of T rows), into y (ldy a
+    /// row, 0: W's n_out); false where dense_int8_ok is not (the caller takes Gemm::native).
+    bool prompt_dense_int8(const W& w, const float* x, int64_t ldx, float* y, int64_t T, int64_t ldy);
+    /// A dense model's: the rows from which a dense product is faster through Gemm::native (dequantized to FP16, the
+    /// products' library) than in int8, from the two timed on the dense FFN's gate at 16 rows and a whole chunk's
+    /// (dense_native_rows_); after prompt_warm_products, in its buffers.
+    void prompt_dense_calibrate();
+    /// Dense products of at least this many rows go through Gemm::native, fewer in int8 (INT64_MAX: always in int8,
+    /// as the MoE models' dense products)
+    int64_t dense_native_rows_ = INT64_MAX;
+    /// A dense model's: Gemm::native's products from the normed rows with their sums in FP16 (measured faster at a
+    /// chunk's rows by prompt_dense_calibrate: cuBLAS's HGEMM on GeForce cards; not oneMKL's on the B70)
+    bool dense_half_sums_ = false;
     /// The chunk's routed experts of MoE layer `ml`: pb_.hn its T normed rows (and pb_.x16 their FP16 copy for the FP16
     /// path), pb_.ids their routes; writes pb_.parts in routing order, the routes into `routes` (null: not kept).
     /// `mark(stage)` is the profile's (1 the grouping, 2 the experts).
@@ -518,8 +560,14 @@ private:
     int64_t nkv_ = 0;                ///< the attention blocks' K/V heads (the same in every one)
     bool has_gate_ = false;          ///< the attention's output gate: [q | gate] per head (qwen35moe)
     bool has_shared_ = false;        ///< the gated shared expert (qwen35moe)
+    bool dense_ = false;             ///< a dense FFN in every block and no experts (qwen35)
     int emb_type_ = -1;
     const uint8_t* emb_ = nullptr;   ///< token_embd in the GGUF mapping (rows dequantized on the host)
+    const std::vector<const float*>* emb_rows_ = nullptr;   ///< set_embeddings'
+    /// The embedding of token `tok` at position `pos` into `dst` (n_embd floats): a picture's row there, else the
+    /// token's; false for a token outside the vocabulary or a row the host cannot dequantize
+    bool embed(int32_t tok, int64_t pos, float* dst) const;
+    int32_t* mrope_ = nullptr;       ///< --vision: the cells' (t, h, w), device [max_cells][3]
     size_t emb_row_ = 0;
     W head_;
     const float* out_norm_ = nullptr;

@@ -421,6 +421,30 @@ public:
         auto it = meta_.find(key);
         return it == meta_.end() ? nullptr : &it->second;
     }
+    /// The index of `text` in the string array `key` (get() holds an array's first 64 items only: a vocabulary's
+    /// token is looked up here), read from the header again; -1 when the array has no such string or there is none.
+    int64_t string_index(const std::string& key, const std::string& text) const {
+        Cursor c(base_, size_);
+        c.read<uint32_t>();
+        c.read<uint32_t>();
+        c.read<uint64_t>();
+        const uint64_t n_kv = c.read<uint64_t>();
+        for (uint64_t i = 0; i < n_kv; ++i) {
+            const std::string k = c.str();
+            const MetaType t = (MetaType)c.read<uint32_t>();
+            if (k != key || t != MetaType::ARRAY) {
+                read_value(c, t);
+                continue;
+            }
+            const MetaType e = (MetaType)c.read<uint32_t>();
+            const uint64_t n = c.read<uint64_t>();
+            if (e != MetaType::STRING) return -1;
+            for (uint64_t j = 0; j < n; ++j)
+                if (c.str() == text) return (int64_t)j;
+            return -1;
+        }
+        return -1;
+    }
     const uint8_t* tensor_data(const TensorInfo& t) const { return base_ + data_start_ + t.offset; }
 
 private:

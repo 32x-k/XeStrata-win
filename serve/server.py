@@ -4058,6 +4058,9 @@ class Service:
         thinking) is rendered as a default one up to the answer - the same prompt start, so the conversation cache
         keeps it - and its effort follows in a short system turn right before the answer (thinking off: the template's
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
+        # thinking unless asked off, as the server counts it (encode_prompt): said to the template, since Unsloth's
+        # Qwen3.5-9B template thinks only when enable_thinking is given true (the others think unless it is false)
+        kwargs = {"enable_thinking": True, **kwargs}
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
@@ -7310,9 +7313,13 @@ MODEL_CARD_SAMPLING = {
     # Qwen3.8-Flash-Next (and Gyro, the same base model)
     "qwen4exp": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
                  "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
-    # Qwen3.6-35B-A3B: the general-task sets (the card's precise-coding set is temperature 0.6, presence_penalty 0)
+    # Qwen3.6-35B-A3B and Qwen3.5-9B: the general-task sets (the cards' precise-coding set is temperature 0.6,
+    # presence_penalty 0)
     "qwen35moe": {"thinking": {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "presence_penalty": 1.5},
                   "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20, "presence_penalty": 1.5}},
+    # HauhauCS's Qwen3.5-9B Uncensored Aggressive: its card's two sets
+    "hauhaucs": {"thinking": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
+                 "instruct": {"temperature": 0.7, "top_p": 0.8, "top_k": 20}},
     # Ornith-1.5: the card's set for general tasks (its benchmarks ran at temperature 1.0)
     "ornith": {"thinking": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
                "instruct": {"temperature": 0.6, "top_p": 0.95, "top_k": 20}},
@@ -7323,14 +7330,16 @@ MODEL_CARD_SAMPLING = {
 
 def card_family(cfg: dict) -> str | None:
     """Which MODEL_CARD_SAMPLING set a config's model takes: Qwen3.8-Flash-Next and its variants (Swift, Gyro: upstream
-    gives every qwen4exp file the set, "qwen4exp"), Qwen3.6-35B-A3B ("qwen35moe"), Ornith-1.5 ("ornith"),
-    GLM-5.3-Flash ("glm5"); None for llm-jp (its card names no sampling), which stays greedy unless the request or the
-    config's `sampling` block says otherwise.  By the model's name, as the architecture alone does not tell Qwen3.6
-    from Ornith."""
+    gives every qwen4exp file the set, "qwen4exp"), Qwen3.6-35B-A3B and Qwen3.5-9B ("qwen35moe"), HauhauCS's Qwen3.5-9B
+    ("hauhaucs"), Ornith-1.5 ("ornith"), GLM-5.3-Flash ("glm5"); None for llm-jp (its card names no sampling), which
+    stays greedy unless the request or the config's `sampling` block says otherwise.  By the model's name, as the
+    architecture alone does not tell Qwen3.6 from Ornith."""
     name = str(cfg.get("model_name") or "qwen3.8-flash-next").lower()
     if name.startswith(("qwen3.8", "swift")) or "gyro" in name:
         return "qwen4exp"
-    if name.startswith("qwen3.6"):
+    if name.startswith("qwen3.5") and "uncensored" in name:
+        return "hauhaucs"
+    if name.startswith(("qwen3.6", "qwen3.5")):
         return "qwen35moe"
     if name.startswith("ornith"):
         return "ornith"
