@@ -2160,6 +2160,24 @@ __global__ void moe_combine4_kernel(const float* __restrict__ Dm, const int32_t*
     bo[i] = make_float4(s.x + sh.x * g, s.y + sh.y * g, s.z + sh.z * g, s.w + sh.w * g);
 }
 
+__global__ void moe_shared_init_kernel(const float* __restrict__ shared, const float* __restrict__ sg,
+                                       float* __restrict__ acc, int64_t T) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * N) return;
+    acc[i] = shared[i] * sigm(sg[i / N]);
+}
+// grid (n_u, ceil(N / 256)): one token of the group per block row, its rows summed in order
+__global__ void moe_scatter_add_kernel(const float* __restrict__ Dm, const int32_t* __restrict__ u_tok,
+                                       const int32_t* __restrict__ u_off, const int32_t* __restrict__ u_rows,
+                                       const float* __restrict__ u_w, float* __restrict__ acc) {
+    const int64_t u = blockIdx.x;
+    const int64_t d = (int64_t) blockIdx.y * blockDim.x + threadIdx.x;
+    if (d >= N) return;
+    float s = 0.0f;
+    for (int32_t j = u_off[u]; j < u_off[u + 1]; ++j) s = fmaf(u_w[j], Dm[(int64_t) u_rows[j] * N + d], s);
+    acc[(int64_t) u_tok[u] * N + d] += s;
+}
+
 // ---------------------------------------------------------------- QSA helpers
 __global__ void rms_rows_kernel(float* __restrict__ x, const float* __restrict__ w, int64_t cols, int64_t ld, float eps) {
     __shared__ float sh[32];
@@ -2975,6 +2993,18 @@ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const flo
 #endif
     moe_combine_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(Dm, slot, w, shared, sg, bo, T, row_sd);
     check("moe_combine");
+}
+void moe_shared_init(const float* shared, const float* sg, float* acc, int64_t T, void* stream) {
+    if (T <= 0) return;
+    moe_shared_init_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(shared, sg, acc, T);
+    check("moe_shared_init");
+}
+void moe_scatter_add(const float* Dm, const int32_t* u_tok, const int32_t* u_off, const int32_t* u_rows,
+                     const float* u_w, int64_t n_u, float* acc, void* stream) {
+    if (n_u <= 0) return;
+    const dim3 grid((unsigned) n_u, (unsigned) ((N + 255) / 256));
+    moe_scatter_add_kernel<<<grid, 256, 0, (cudaStream_t) stream>>>(Dm, u_tok, u_off, u_rows, u_w, acc);
+    check("moe_scatter_add");
 }
 void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, float eps, void* stream) {
     if (rows <= 0) return;
