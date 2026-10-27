@@ -4934,12 +4934,24 @@ def hybrid_pool_workers(cores) -> int | None:
     return max(1, p - 1 + e // 2)
 
 
+# The most CPU expert workers the engine takes by default (default_worker_cap in src/kernels/cpu/pool.cpp), and the
+# most threads setup gives the CPU image encoder: a 256-thread server does not need 128 of them (upstream 5ece068f7).
+POOL_WORKERS_CAP = 32
+VISION_THREADS_CAP = 16
+
+
+def vision_threads(logical: int | None = None) -> int:
+    """The CPU image encoder's threads: one per physical core (half the logical threads), at most VISION_THREADS_CAP."""
+    return max(1, min((logical if logical is not None else (os.cpu_count() or 8)) // 2, VISION_THREADS_CAP))
+
+
 def recommend_pool_workers(args: list) -> list:
     """`args` with setup's recommended `--pool-workers` for a hybrid CPU, unless they set one already (a calibration's
     measured count, or the user's own).  A recommendation: the config line can be edited or removed."""
     n = hybrid_pool_workers(cpu_cores())
     if n is None or "--pool-workers" in args:
         return args
+    n = min(n, POOL_WORKERS_CAP)   # setup never writes more workers than the engine's own default takes
     p, e = cpu_cores()
     ok(f"hybrid CPU ({p} performance + {e} efficiency cores): {n} CPU expert workers - the performance cores and half "
        f"of the efficiency cores (--pool-workers in the config; {SETUP_CMD} --calibrate measures it on this PC)")
@@ -6002,7 +6014,7 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         vt = vision_tokens(a.vision_tokens, vision, CONF / f"xestrata-{tag.lower()}.json")
         cpu_enc = {"exe": str(eng / VEXE["cpu"]), "gpu": False,
                    "max_tokens": vt if vision == "cpu" else VISION["cpu"]["max_tokens"],
-                   "threads": max(1, (os.cpu_count() or 8) // 2)}
+                   "threads": vision_threads()}
         cfg["vision"] = {"mmproj": str(mmproj), "model": str(gguf), **cpu_enc}
         if vision == "gpu":
             cfg["vision"] = {"mmproj": str(mmproj), "model": str(gguf), "exe": str(eng / VEXE[enc]), "gpu": True,
@@ -7190,7 +7202,7 @@ def main() -> int:
         vt = vision_tokens(a.vision_tokens, vision, CONF / f"xestrata-{tag.lower()}.json")
         cpu_enc = {"exe": str(eng / VEXE["cpu"]), "gpu": False,
                    "max_tokens": vt if vision == "cpu" else VISION["cpu"]["max_tokens"],
-                   "threads": max(1, (os.cpu_count() or 8) // 2)}
+                   "threads": vision_threads()}
         cfg["vision"] = {"mmproj": str(mmproj), "model": str(shards[0]), **cpu_enc}
         if vision == "gpu":
             # the GPU encoder takes the card by PCI address: with Vulkan the first GPU can be another card
