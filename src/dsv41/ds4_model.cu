@@ -10214,7 +10214,7 @@ struct Model::Impl {
 #endif
             static const bool skip_cpu = ds4_dbg("DS4_SKIP_CPU");   // (timing only: the CPU lane's experts left out)
             if (!skip_cpu) cpu_experts(l, h_x, ents);
-            else if (const char* fk = ds4_dbg("DS4_FAKE_CPU_US")) std::this_thread::sleep_for(std::chrono::microseconds(std::atoi(fk)));   // (timing only)
+            else if (ds4_dbg("DS4_FAKE_CPU_US")) std::this_thread::sleep_for(std::chrono::microseconds(std::atoi(std::getenv("DS4_FAKE_CPU_US"))));   // (timing only)
 #if defined(STRATA_METAL)
             ds4_busy_end();
 #endif
