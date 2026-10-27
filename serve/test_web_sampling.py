@@ -43,8 +43,9 @@ class WebSampling(unittest.TestCase):
         cls.shared = slice_between(src, "function sharedDefaults", "async function saveShared")
         cls.body = slice_between(src, "  if (!(settings.temperature > 0)) {", "  if (settings.seed)")
 
-    def run_js(self, settings: dict, pieces: str):
-        js = (self.defaults + "function projectionLoaded() { return false; }\nconst health = {};\n" + self.thinking +
+    def run_js(self, settings: dict, pieces: str, health: dict | None = None):
+        js = (self.defaults + "function projectionLoaded() { return false; }\n"
+              f"const health = {json.dumps(health or {})};\n" + self.thinking +
               self.shared +
               f"\nconst settings = {json.dumps(settings)};\nconst body = {{}};\n{pieces}\n"
               "console.log(JSON.stringify({body, shared: sharedDefaults(settings)}));")
@@ -77,6 +78,17 @@ class WebSampling(unittest.TestCase):
         body, shared = self.sampling(temperature=0)
         self.assertEqual(body, {"temperature": 0})
         self.assertEqual(shared["temperature"], 0)
+
+    def test_thinking_is_sent_by_the_model_own_levels(self):
+        glm = {"thinking": {"levels": ["none", "low", "high", "max"], "default": "max"}}
+        onoff = {"thinking": {"levels": ["none", "on"], "default": "on"}}
+        for health, level, sent in ((glm, "", None), (glm, "max", None), (glm, "high", "high"),
+                                    (glm, "medium", None),      # not GLM's: its default
+                                    (onoff, "on", None), (onoff, "none", "none"), (onoff, "low", None)):
+            s = {"thinking": level, "temperature": 1.0, "top_p": 0.95, "top_k": 20, "max": "", "seed": "",
+                 "esp": True}
+            shared = self.run_js(s, "", health)["shared"]
+            self.assertEqual(shared.get("reasoning_effort"), sent, (health, level))
 
     def test_the_old_default_is_shown_as_the_new_one(self):
         src = APP.read_text(encoding="utf-8")

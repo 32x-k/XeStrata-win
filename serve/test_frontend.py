@@ -4,9 +4,11 @@
 """Chat history normalization before rendering the model's prompt."""
 import copy
 from pathlib import Path
+import tempfile
 import unittest
 
-from serve.frontend import ChatTemplate, anthropic_to_messages, openai_to_messages, require_messages
+from serve.frontend import (HARMONY_NO_THINKING, HARMONY_TURN, ChatTemplate, anthropic_to_messages, effort_kwargs,
+                            openai_to_messages, require_messages)
 from serve.server import ByteTokenizer, MockEngine, Service
 
 
@@ -284,3 +286,51 @@ class EmptyConversation(unittest.TestCase):
         with self.assertRaises(ValueError):
             require_messages(openai_to_messages({})[0])
         require_messages(openai_to_messages({"messages": [{"role": "user", "content": "hi"}]})[0])
+
+
+# the lines of each model's template that take its thinking (a stand-in, not the model's own file)
+GLM_TPL = ("{%- set e = reasoning_effort if reasoning_effort is defined and reasoning_effort in ['low', 'high'] "
+           "else 'max' -%}Reasoning Effort: {{ e | capitalize }}<arg_key>{%- for m in messages %}{{ m.content }}"
+           "{%- endfor %}{%- if add_generation_prompt %}<|assistant|><think>{%- endif %}")
+HARMONY_TPL = ("Reasoning: {{ reasoning_effort | default('medium') }}<|channel|>{%- for m in messages %}{{ m.content }}"
+               "{%- endfor %}{%- if add_generation_prompt %}<|start|>assistant{%- endif %}")
+QWEN38_TPL = ("{{ reasoning_effort | default('xhigh') }}{%- for m in messages %}{{ m.content }}{%- endfor %}"
+              "{%- if enable_thinking is defined and enable_thinking is false %}off{%- endif %}")
+ONOFF_TPL = ("{%- for m in messages %}{{ m.content }}{%- endfor %}{%- if add_generation_prompt %}<|im_start|>"
+             "assistant\n{%- if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>"
+             "{%- else %}<think>{%- endif %}{%- endif %}")
+
+
+class ThinkingLevels(unittest.TestCase):
+    """Each template's thinking levels by their own names (/health's "thinking") and the efforts it is given."""
+
+    def template(self, source: str) -> ChatTemplate:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "chat_template.jinja"
+            p.write_text(source, encoding="utf-8")
+            return ChatTemplate(p)
+
+    def render(self, t: ChatTemplate, **kw) -> str:
+        return t.render([{"role": "user", "content": "hi"}], add_generation_prompt=True, **kw)
+
+    def test_levels_by_template(self):
+        for source, levels, default in ((GLM_TPL, ["none", "low", "high", "max"], "max"),
+                                        (HARMONY_TPL, ["none", "low", "medium", "high"], "medium"),
+                                        (QWEN38_TPL, ["none", "low", "medium", "high"], "high"),
+                                        (ONOFF_TPL, ["none", "on"], "on")):
+            self.assertEqual(self.template(source).thinking, {"levels": levels, "default": default})
+
+    def test_glm_takes_its_efforts_by_name(self):
+        t = self.template(GLM_TPL)
+        for given, level in (("low", "Low"), ("medium", "High"), ("high", "High"), ("xhigh", "Max"),
+                             ("max", "Max"), (None, "Max")):
+            self.assertIn(f"Reasoning Effort: {level}", self.render(t, **effort_kwargs(given)), given)
+
+    def test_harmony_high_and_no_thinking(self):
+        t = self.template(HARMONY_TPL)
+        for given, level in (("high", "high"), ("xhigh", "high"), ("max", "high"), ("low", "low"), (None, "medium")):
+            self.assertIn(f"Reasoning: {level}", self.render(t, **effort_kwargs(given)), given)
+        self.assertTrue(self.render(t, **effort_kwargs("none")).endswith(HARMONY_TURN + HARMONY_NO_THINKING +
+                                                                          HARMONY_TURN))
+        self.assertTrue(self.render(t).endswith("hi" + HARMONY_TURN))
+
