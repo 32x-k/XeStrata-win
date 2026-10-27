@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -419,6 +420,10 @@ core::PerDevice<int>& nc_store() {
 }
 template <int HD, int G>
 int nc_of(sycl::queue& q) {
+    if (const char* e = std::getenv("STRATA_QSA_NC")) {   // 2, 4 or 8 over the timed choice (the parity test, --bench)
+        const long v = std::strtol(e, nullptr, 10);
+        if (v == 2 || v == 4 || v == 8) return (int) v;
+    }
     return nc_store<HD, G>().get(q.get_device(), [] { return 2; });
 }
 
