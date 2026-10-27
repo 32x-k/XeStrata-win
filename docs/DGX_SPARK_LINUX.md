@@ -1,90 +1,113 @@
-# Strata on the NVIDIA DGX Spark (Linux, arm64)
+# Strata on the NVIDIA DGX Spark (Linux, ARM64)
 
-One desktop box with a GB10 GPU, 20 Arm CPU cores and 128 GB of memory shared by the GPU and the CPU. This page is the
-arm64 Linux build of Strata from source: what works, how to build it, how to install a model and how the speed was
-measured. It is experimental: one Spark, one driver, one toolkit.
+The DGX Spark is a small desktop box with a GB10 chip: a Blackwell GPU (compute capability 12.1, 48 SMs) and 20 Arm CPU cores that share
+128 GB of memory. Strata 0.2.7.1 runs Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash on it. This page says what works, how to install it, what
+the Spark does with its memory, and how the speeds were measured. It was tested on one Spark (Ubuntu 24.04, driver 580.173, CUDA 13.0).
+Nothing here is known to work on another ARM machine.
 
 ## What works, and what does not
 
-- **Works:** the CUDA engine (`strata`), Qwen3.8-Flash-Next IQ3_S and the NVFP4 GPTQ pack, 64K context, pictures off,
-  the DeepSeek-V4.1 engine built from source (`strata-dsv41`).
-- **Not checked here:** the picture reader (`strata-vision` builds, not exercised in these runs), 128K context,
-  DeepSeek serving (the engine builds; no model was downloaded in this session), the app, the Terminal and the
-  ready-made engine feed, which are x86_64 only.
-- **CPU experts:** Strata's own CPU expert kernels are x86 AVX/AVX-512; the arm64 build leaves them out and a native
-  pack's CPU experts run on ggml-cpu's NEON rows. A canonical Q2_0 pack (no `native_experts.txt`) still needs AVX-512
-  and is refused at start.
+- **Works:** Qwen3.8-Flash-Next IQ3_S and the NVFP4 GPTQ pack (64K context, every expert in the GPU's cache), DeepSeek-V4.1-Flash 2.00 bpw
+  (a short chat), the Terminal (`strata launch`, `strata update`, `strata serve`) and the engine packages of the signed feed.
+- **Not built for ARM:** the desktop app (no AppImage; use the Terminal), the HIP, SYCL and CPU-only engines, and the Q2_0 and Gyro packs,
+  whose CPU kernels are x86-only (the engine refuses them at start). Picture reading is compiled in and was not tried on the Spark.
+- **Not tested:** contexts above 128K, batches of more than four chats, a long soak. `strata doctor --live` lists the GB10 with no memory
+  figure, because `nvidia-smi` reports none for it.
 
-## Build the engine
+## Install with the Terminal
 
-Needs an arm64 Linux with the CUDA 13.0 toolkit (`/usr/local/cuda`; DGX OS has it) and Python 3.10+ with venv.
+```sh
+curl -fsSL https://github.com/Niko1221/Strata/releases/latest/download/install.sh -o install.sh && sh install.sh
+strata launch
+```
+
+`install.sh` unpacks the Terminal into `~/.local/share/strata` (no administrator rights) and checks the release's signed feed. `strata launch`
+fetches the `linux-aarch64` engine package, shows what each model needs, downloads the one you choose and starts it. Pick Qwen3.8-Flash-Next
+IQ3_S (84 GB download) or the NVFP4 pack, or DeepSeek-V4.1-Flash 2.00 bpw (257 GB). The engine package needs glibc 2.39 or newer
+(Ubuntu 24.04, DGX OS 7) and NVIDIA driver 580.65 or newer.
+
+## Install from a source checkout
+
+```sh
+./setup.sh --setup --family qwen --model IQ3_S --context 65536 --vision no --yes --no-start --data-dir ~/Strata-data
+./setup.sh --setup --family nvfp4 --model NVFP4 --context 65536 --vision no --yes --no-start --data-dir ~/Strata-data
+```
+
+`--data-dir` must be a folder you can write (the default, next to the checkout, may be under `/home`, which a normal user cannot create).
+Setup finds the GB10, calls it unified memory, takes the engine from the feed (or compiles it with `spark/build_engine.sh` when the release
+has none) and writes the run config with the settings measured on this part:
+
+| Setting | Why |
+|---|---|
+| `--mmap-experts` | the experts are read from the model files in place, so the GPU's cache holds all 24,576 of them instead of a second copy in RAM |
+| `--prefill auto:32768` | a 32,768-token prompt chunk; the automatic 8,192 measured 2 to 6% slower here |
+| `--mtp-q4 all` | the draft layer as 4-bit copies: +3.5% decode, the answers do not change because the target checks every draft |
+| `--mtp-hnorm stream` | one norm per hyper-connection stream in the draft layer: draft acceptance 0.60 to 0.63, +4.3% decode |
+
+Setup prints `--draft-vocab en` as a tip and does not set it: it measured +3.1% decode on English prompts, and it would cut the Chinese,
+Japanese and Korean drafts.
+
+Start a model with its run script (`./run-iq3_s.sh`) or `./setup.sh`.
+
+## Build the engine yourself
+
+You need the CUDA 13.0 toolkit (`/usr/local/cuda`; DGX OS has it), cmake, ninja and Python 3.10 or newer.
 
 ```sh
 python3 -m venv .venv-build
 .venv-build/bin/pip install -r requirements.txt -r requirements-build.txt
-PATH="$PWD/.venv-build/bin:/usr/local/cuda/bin:$PATH" PYTHON="$PWD/.venv-build/bin/python" \
-  JOBS=20 sh spark/build_engine.sh
-```
-
-About 3 minutes on the Spark with 20 jobs (the first run also fetches llama.cpp at the pinned commit). It leaves
-`out-spark/engine/` with `strata`, `libstrata_kq.so`, the CUDA libraries it needs and a `BUILD.json` that says
-`linux-aarch64`, arch `121`.
-
-`BUILD_VISION=0` skips the picture reader; `BUILD_DSV41=0` skips the DeepSeek engine; `ARCHS=121` is the default and
-is what a Spark needs.
-
-Put it where setup looks for an engine:
-
-```sh
+PATH="$PWD/.venv-build/bin:/usr/local/cuda/bin:$PATH" PYTHON="$PWD/.venv-build/bin/python" JOBS=16 sh spark/build_engine.sh
 cp -r out-spark/engine ./engine
 ```
 
-## Install a model
+About 3 minutes for the Qwen engine and 6 with the DeepSeek engine and the picture reader (the first run also fetches llama.cpp at the
+pinned commit). `out-spark/engine/` holds `strata`, `strata-dsv41`, `strata-vision`, `libstrata_kq.so`, the CUDA libraries and a `BUILD.json`.
+`BUILD_VISION=0` and `BUILD_DSV41=0` leave a part out. `packaging/build_cuda_linux_aarch64.sh` runs this build and makes the engine packages
+for the feed ([packaging/README.md](../packaging/README.md)). A model on a Q2_0 pack cannot run: its CPU kernels need AVX-512.
 
-```sh
-./setup.sh --setup --family qwen --model IQ3_S  --context 65536 --vision no --yes --no-start --data-dir ~/Strata-data
-./setup.sh --setup --family nvfp4 --model NVFP4  --context 65536 --vision no --yes --no-start --data-dir ~/Strata-data
-```
+## What the Spark does with its memory
 
-`--data-dir` must be a folder you can write (on a DGX Spark the default `../Strata-data` next to the checkout is under
-`/home`, which `dev` cannot create; `~/Strata-data` works). Setup finds the GB10, reports it as unified memory, and
-passes `--mmap-experts`: the experts are read from the model files in place, so the GPU's cache holds all 24,576 of them
-instead of a second copy in RAM.
-
-Start a model with its run script (`./run-iq3_s.sh`) or `./setup.sh`. `./bench.sh` runs the quick speed check.
-
-## What the Spark does with the memory
+The GPU's memory and the CPU's are the same 121.6 GB, so a model's experts are held once. With `--mmap-experts` there is one copy: the model
+file's pages, which the GPU cache uses.
 
 | | IQ3_S | NVFP4 GPTQ |
 |---|---|---|
 | Expert bytes | 50.3 GB | 68.0 GB |
 | Expert cache | 24,576 of 24,576 slots, 46.84 GiB | 24,576 of 24,576 slots, 63.29 GiB |
-| n-gram table | 28.8 GB, locked in RAM (`--ple-io ram`) | 51.2 GB, read from the SSD (`direct`) |
+| n-gram table | 28.8 GB, locked in RAM (`--ple-io ram`) | 51.2 GB, read from the SSD |
 | Context | 64K, 8-bit KV, 32,768 cells streamed | same |
-| Free VRAM at start | ~1.0-1.2 GiB | ~1.2 GiB |
+| Free memory at start | about 1 GiB | about 1.2 GiB |
 
-The NVFP4 table does not fit in RAM beside the page cache the 68 GB expert file needs: locking it measured 137 tok/s
-on a 4K prompt and 26 tok/s decode against 1,252 and 39 without. Leave it on the SSD.
+The NVFP4 table does not fit in RAM beside the page cache the 68 GB expert file needs. Locking it measured 137 tok/s on a 4K prompt and 26 tok/s
+decode, against 1,252 and 39 without. Leave it on the SSD (setup does).
 
-## Speeds (medians, one Spark, 26 October 2026)
+DeepSeek-V4.1-Flash 2.00 bpw places 12,163 of its 15,744 experts in the GPU's share and runs the rest on the CPU lane from the model's files.
+The engine sizes that from the memory Linux can still give back (`MemAvailable` less 6 GiB, `DS4_UMA_HEADROOM_GIB`), because the model files' page
+cache is most of the memory `cudaMemGetInfo` calls used.
 
-Measured with `tools/dgx_bench.py`: fresh 4K / 16K / 32K prompts at temperature 0, 256-token replies, the engine's own
-`timings`, three paired rounds against steddyman's 0.1.49.2 engine built on the same machine.
+## Speeds
 
-| Model | prompt tok/s (4K / 16K / 32K) | decode tok/s |
+[[SPEEDS]]
+
+## The four speed defaults of this part
+
+On a GB10 the engine switches on four settings that were measured here, and prints them at every start. `STRATA_SM121_PERF=0` (or
+`STRATA_DEFAULTS=026`, which gives back everything 0.2.7.1 changed) turns the whole set off; a switch you set yourself is kept.
+
+| Switch | What it does | Measured on the Spark |
 |---|---|---|
-| Qwen3.8-Flash-Next IQ3_S, this build | 1,416 / 1,597 / 1,581 | 45.5 / 45.0 / 44.0 |
-| Qwen3.8-Flash-Next IQ3_S, the fork | 1,237 / 1,331 / 1,402 | 44.4 / 43.4 / 43.1 |
-| Qwen3.8-Flash-Next NVFP4, this build | see HANDOVER.md | see HANDOVER.md |
-| Qwen3.8-Flash-Next NVFP4, the fork | see HANDOVER.md | see HANDOVER.md |
+| `STRATA_PF_FUSED=1` | the fused IQ prompt kernels | IQ3_S prompt +10 to 27% |
+| `STRATA_PREFILL_NVFP4=w4a4` | NVFP4 prompt matrix product with FP4 activations | NVFP4 prompt +16% |
+| `STRATA_HC_UPMIX=1` | the hyper-connection read's up projection and mix in one kernel | decode +5.4% |
+| `STRATA_SPEC_COST=1` | the draft window follows what a draft costs | decode +4.7% |
 
-On IQ3_S that is +16% prompts over the fork and +3% decode. The prompt gain is `--prefill auto:32768` plus the fused
-IQ prompt path (`STRATA_PF_FUSED=1`, opt-in on this card because the fused kernels round differently from MMQ).
-Decode is GPU-work-bound on the 48-SM GB10 (109 kernel launches per token, ~99% GPU busy); the remaining decode work is
-kernel work, not configuration - see the handover's backlog.
+[[QUALITY]]
 
-## Rules for this machine
+With `"parallel": 4` (the default) the set adds up: 32 clients at 2,000-token prompts read 41.3 tok/s with all four on and 35.7 with all off. At
+`"parallel": 8` the two decode switches cost about 3.5% each; set `STRATA_HC_UPMIX=0 STRATA_SPEC_COST=0` there.
 
-- Don't shut it down or restart it without agreement.
-- Never publish the SSH key or put it in a repository.
-- Ask the machine's owner for extra rights or installs.
+## What this does not cover
+
+Decode on the 48-SM GB10 is limited by the GPU's work, about 930 kernel launches per token. No configuration switch measured here moved it more
+than a few percent. A DFlash2 drafter is slower here than the MTP drafter (37 against 45 tok/s) and is not used. Teacher-forced quality over
+long text and task suites was run only for the prompt path (above).
