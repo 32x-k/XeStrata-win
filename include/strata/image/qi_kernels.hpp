@@ -9,6 +9,8 @@
 #pragma once
 
 #include <cstdint>
+#include <utility>
+#include <vector>
 
 namespace strata::image {
 
@@ -42,19 +44,35 @@ constexpr int64_t qi_attn_rows(int64_t T) { return (T + 127) / 128 * 128; }
 
 /// The same attention on the GPU's matrix engines where it has them (src/image/qi_attn.cpp), FP16 out16
 /// [T - first][heads * head_dim]: the query rows from `first` on (the rows before it, a cached prefix's, are not
-/// asked); else qi_attention_plain through `scratch` (FP32 [T][heads * head_dim]).
+/// asked); else qi_attention_plain through `scratch` (FP32 [T][heads * head_dim]).  `int8`: the rows that see every key
+/// may take the int8 kernel where it is the faster (qi_attention_i8: a model whose images it keeps, Qwen-Image's; not
+/// Mage-Flow's, whose image stream's outlier channels int8's row scales lose).  `spans`: prefix rows [a, b) that see
+/// keys 0 .. b - 1 and no others (an edit's references, as key_lim says on the GPU): they take the image rows' kernels,
+/// as rows past a context of b keys.
 void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
                   int64_t head_dim, int64_t n_text, uint16_t* out16, float* scratch, void* stream,
-                  const int32_t* key_lim = nullptr, int64_t first = 0);
+                  const int32_t* key_lim = nullptr, int64_t first = 0, bool int8 = false,
+                  const std::vector<std::pair<int64_t, int64_t>>* spans = nullptr);
 
 /// The path qi_attention takes on the current GPU, for the report.
 const char* qi_attention_path();
 
 /// The attention of query rows q0 .. q1 - 1 over all T keys (no mask), FP16 out16 [q1 - q0][heads * head_dim] (the
 /// layout of qi_attention's), through a GPU maker's kernel where the build has one for the GPU (src/image/qi_sdpa.cpp:
-/// oneDNN's SDPA on Intel GPUs); false where none takes it.
+/// oneDNN's SDPA on Intel GPUs); false where none takes it.  `causal`: each query row t reads keys 0 .. t only (q0 0,
+/// q1 T: the text encoder's prompt), so far through aotriton on AMD GPUs alone.
 bool qi_sdpa(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t q0, int64_t q1, int64_t T,
-             int64_t heads, int64_t head_dim, uint16_t* out16, void* stream);
+             int64_t heads, int64_t head_dim, uint16_t* out16, void* stream, bool causal = false);
+/// qi_sdpa can take a causal attention on the stream's GPU (a kernel for it in the build and the GPU's runtime).
+bool qi_sdpa_causal(void* stream);
+
+/// qi_attention's int8 kernel (src/image/qi_attn.cpp) alone: query rows r0 .. T - 1, which see all T keys (no mask), to
+/// out16 [rows from `first`][heads * 128]; false where it is not built for the GPU or its buffers do not fit.
+/// qi_attention takes it, where it is the faster, for Qwen-Image's image rows (STRATA_IMAGE_ATTN_I8).
+bool qi_attention_i8(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
+                     int64_t r0, int64_t first, uint16_t* out16, void* stream);
+/// The keys of qi_attention_i8's chunks: P in int8 at 127 steps of a row's largest in each chunk (from key 0).
+int qi_attention_i8_chunk();
 
 /// The text encoder's q and k ([T][q_heads * head_dim], [T][kv_heads * head_dim]): each head RMS-normed (wq, wk; eps
 /// 1e-6), then rotated as NEOX does (pair (j, j + head_dim / 2) by a position times theta^(-2j / head_dim)); FP16 out,
@@ -68,6 +86,10 @@ void qi_text_qk_rope16(const float* q, const float* k, const float* v, const flo
 /// head_dim] FP32, the plain form (the text encoder's few tokens).
 void qi_attention_causal(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t q_heads,
                          int64_t kv_heads, int64_t head_dim, float* out, void* stream);
+/// Grouped K/V heads [T][kv_heads * head_dim] (FP16) repeated to one a query head, out [T][q_heads * head_dim] (query
+/// head h's the K/V head h / (q_heads / kv_heads)): a grouped attention as qi_sdpa's plain one.
+void qi_repeat_kv16(const uint16_t* src, int64_t T, int64_t q_heads, int64_t kv_heads, int64_t head_dim, uint16_t* out,
+                    void* stream);
 
 /// h16[t, i] = gu[t, inter + i] * silu(gu[t, i]) (the fused gate_up product: gate first, then up).
 void qi_swiglu16(const float* gu, int64_t T, int64_t inter, uint16_t* h16, void* stream);
@@ -119,9 +141,11 @@ void qi_axpy(float* x, const float* v, float a, int64_t n, void* stream);
 
 /// An edit with a mask, after a sampler's step to time s: x [C][HW] where m [HW] is 0 (the part kept) becomes the
 /// base image's latent z0 at that time, (1 - s) z0 + s noise (the flow's path from the same noise); where m is 1 it
-/// stays the DiT's.
+/// stays the DiT's.  `tokens`: x, z0 and noise are [HW][C] instead (Mage-Flow's latent tokens).
 void qi_inpaint_blend(float* x, const float* z0, const float* noise, const float* m, float s, int64_t C, int64_t HW,
-                      void* stream);
+                      void* stream, bool tokens = false);
+/// x = (1 - s) z0 + s noise over n values: the base image's latent at time s on the flow's path (img2img's start).
+void qi_noise_mix(float* x, const float* z0, const float* noise, float s, int64_t n, void* stream);
 
 // --- the vision encoder (Qwen3-VL's ViT, src/image/qi_vision.cpp)
 

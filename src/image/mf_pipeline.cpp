@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <stdexcept>
 
 namespace strata::image {
@@ -152,6 +153,10 @@ bool MfPipeline::open(const std::string& dit, const std::string& vae, const std:
     if (!(te_size_->open(text, s_, err, true) && dit_size_->open(dit, s_, err, true, true) &&
           dit16_size_->open(dit, s_, err, true, false) && vae_size_->open(vae, s_, err, true)))
         return false;
+    {   // the encoder's sizes, for a base image: a VAE file without one makes images but takes no base image
+        std::string no;
+        base_encoder_ = vae_size_->open_encoder(no, true);
+    }
     if (!edit_path_.empty() || !vision_path_.empty()) {
         if (edit_path_.empty() || vision_path_.empty()) {
             err = "image engine: Mage-Flow's edits need both the edit DiT and the vision encoder";
@@ -191,7 +196,21 @@ bool MfPipeline::want_q8(int64_t rows, int n, int64_t max_text, int64_t n_ids) c
     const uint64_t fixed = d16.weight_bytes() + vae_size_->weight_bytes() + kScratch +
                            (vision_size_ ? vae_size_->encoder_bytes() : 0);
     const uint64_t work = std::max(d16.activation_bytes(rows, n, max_text), te_size_->activation_bytes(n_ids));
-    return fixed + d16.block_bytes() + work + te_size_->layer_bytes() > budget();
+    if (fixed + d16.block_bytes() + work + te_size_->layer_bytes() > budget()) return true;
+    // both forms fit: the faster on this GPU, the MLP's first product timed in each at this image's rows (the engine's
+    // small warm-up image first, again once an image has more than twice the rows).  The RX 9060 XT (2026-10-27): W8A8
+    // 1.04 s for Turbo's 4 steps at 1024 x 1024 against FP16's 1.36 (rocBLAS's FP16 products with FP32 sums)
+    if ((w8_faster_ < 0 || rows > 2 * w8_rows_) && prefill::Gemm::i8_usable(s_)) {
+        const auto [f16, w8] = d16.time_forms(rows);
+        if (f16 > 0.0 && w8 > 0.0) {
+            w8_faster_ = w8 < f16 ? 1 : 0;
+            w8_rows_ = rows;
+            std::fprintf(stderr, "image engine: Mage-Flow's DiT in %s (its MLP's product at %lld rows: %.2f ms in "
+                                 "FP16, %.2f in W8A8)\n", w8_faster_ ? "8 bits" : "16 bits", (long long) rows, 1e3 * f16,
+                         1e3 * w8);
+        }
+    }
+    return w8_faster_ == 1;
 }
 
 // the DiT for a generation or an edit: the other gives its VRAM back (its Q8_0 kept in RAM with keep_, else let go),
@@ -241,7 +260,6 @@ void MfPipeline::fit(uint64_t reserve) {
 
 QiNeed MfPipeline::need(int64_t n_text, int64_t width, int64_t height,
                         const std::vector<std::pair<int64_t, int64_t>>& refs, bool mask, int64_t n_neg) {
-    (void) mask;
     const MfDit& dit = q8_ == 0 ? *dit16_size_ : *dit_size_;   // the least: Q8_0's, unless FP16 is asked for
     const MfDit& full = q8_ == 1 ? *dit_size_ : *dit16_size_;  // all resident: FP16's, unless Q8_0 is
     const QiText& te = *te_size_;
@@ -261,6 +279,11 @@ QiNeed MfPipeline::need(int64_t n_text, int64_t width, int64_t height,
         }
         edit = std::max(edit, vae.encode_scratch_bytes(h, w) + (uint64_t) (3 * height * width) * 4);
         hw += (int64_t) refs.size() * h * w;
+    }
+    if (mask && base_encoder_) {   // a base image (img_start.hpp): its encode, and its latent (and a mask's) kept
+        if (refs.empty() || !vision_size_) fixed += vae.encoder_bytes();
+        edit = std::max(edit, vae.encode_scratch_bytes(h, w) + (uint64_t) (3 * height * width) * 4);
+        fixed += LatentStart::bytes(dit.latent_channels() * h * w, h * w, true);
     }
     const int64_t max_text = std::max(n_text, n_neg);
     const int n = n_neg > 0 ? 2 : 1;
@@ -451,12 +474,23 @@ std::vector<uint8_t> MfPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     using clock = std::chrono::steady_clock;
     if (r.width % 16 != 0 || r.height % 16 != 0 || r.width <= 0 || r.height <= 0)
         throw std::invalid_argument("image engine: the size must be a multiple of 16");
-    if (!r.mask.rgba.empty()) throw std::invalid_argument("image engine: Mage-Flow's edits take no mask");
     if ((int64_t) r.ids.size() <= r.drop) throw std::invalid_argument("image engine: no prompt after the system turn");
     const bool guided = r.cfg > 1.0f && !r.neg_ids.empty(), editing = !r.refs.empty();
     if (guided && (int64_t) r.neg_ids.size() <= r.drop)
         throw std::invalid_argument("image engine: no negative prompt after the system turn");
     const int64_t h = r.height / 16, w = r.width / 16, HW = r.width * r.height;
+    const bool mask = !r.mask.rgba.empty();
+    const QiRef* base = base_image(r);
+    if ((mask || r.strength < 1.0) && base == nullptr)
+        throw std::invalid_argument("image engine: a mask or a strength below 1 needs a base image (an init image or "
+                                    "a reference)");
+    if (mask && r.mask.rgba.size() != (size_t) (r.mask.width * r.mask.height * 4))
+        throw std::invalid_argument("image engine: the mask is empty");
+    if (base != nullptr && !base_encoder_)
+        throw std::invalid_argument("image engine: the VAE file has no encoder for a base image");
+    const std::vector<float> sigmas =
+        strength_sigmas(r.sigmas.empty() ? mage_sigmas(kTurboSteps) : r.sigmas, r.strength);
+    LatentStart ls;
     const auto t0 = clock::now();
     ensure_open();
     // the references first (the vision encoder and the VAE's encoder in VRAM the DiT's cache gives way to)
@@ -471,6 +505,10 @@ std::vector<uint8_t> MfPipeline::generate(const QiRequest& r, QiTimes* times, Qi
         if (held() + more > budget()) release(false);
         edit_refs(r, e);
         vae_->drop_scratch();
+    }
+    if (base != nullptr) {
+        if (stage && !editing) stage("refs");
+        encode_base(r, *base, ls);
     }
     const int64_t max_ids = (int64_t) std::max(editing ? e.ids.size() : r.ids.size(),
                                                editing ? e.neg_ids.size() : r.neg_ids.size());
@@ -526,10 +564,18 @@ std::vector<uint8_t> MfPipeline::generate(const QiRequest& r, QiTimes* times, Qi
         throw std::runtime_error(std::string("image engine: GPU memory: ") + gpu::last_error());
     }
     std::vector<float> out((size_t) (4 * HW));
+    // a mask: the tokens with a pixel of the mask less than opaque change, the rest follow the base image's latent
+    // from the seed's noise (img_start.hpp)
+    std::vector<uint8_t> mask_px;
     try {
+        if (mask) {
+            mask_px = resize_nearest(r.mask, r.width, r.height);
+            ls.set_mask(latent_mask(mask_px, r.width, r.height, 16), tokens, Cl, h * w, true);
+        }
         gpu::copy(x, tokens.data(), (size_t) n * 4);
+        if (r.strength < 1.0) ls.start(x, sigmas[0], s_);   // img2img: from the base image's latent at that time
         if (stage) stage("sampling");
-        d.sample(x, h, w, r.sigmas.empty() ? mage_sigmas(kTurboSteps) : r.sigmas, guided ? r.cfg : 1.0f, step);
+        d.sample(x, h, w, sigmas, guided ? r.cfg : 1.0f, step, ls.after(s_));
         d.set_refs(nullptr, {});
         const auto t2 = clock::now();
         if (stage) stage("decode");
@@ -569,7 +615,36 @@ std::vector<uint8_t> MfPipeline::generate(const QiRequest& r, QiTimes* times, Qi
         for (int c = 0; c < 4; ++c)
             img[(size_t) (q * 4 + c)] =
                 (uint8_t) std::lround(std::clamp(out[(size_t) (c * HW + q)], 0.0f, 1.0f) * 255.0f);
+    // a mask's kept part is the base image's own pixels (not through the VAE), blended by the mask's alpha
+    if (mask) keep_pixels(img, resize_nearest(*base, r.width, r.height), mask_px);
     return img;
+}
+
+void MfPipeline::encode_base(const QiRequest& r, const QiRef& base, LatentStart& ls) {
+    const int64_t h = r.height / 16, w = r.width / 16;
+    if (r.refs.empty()) {   // the encoder's room: the cache gives way when the budget is short of it (an edit's
+        const uint64_t more = need(0, r.width, r.height, {}, true).least - need(0, r.width, r.height).least;
+        if (held() + more > budget()) release(false);   // references made it already)
+    }
+    std::string err;
+    if (!vae_->open_encoder(err)) throw std::runtime_error(err);
+    // the VAE's input at the image's size, over white, resized as the references are (PIL's bicubic)
+    std::vector<float> px = resize_bicubic(ref_rgb(base), base.width, base.height, r.width, r.height);
+    for (float& v : px) v = v / 127.5f - 1.f;
+    float* rgb = nullptr;
+    if (!gpu::alloc_device(&rgb, px.size() * 4))
+        throw std::runtime_error(std::string("image engine: GPU memory: ") + gpu::last_error());
+    try {
+        float* z0 = ls.base(dit_size_->latent_channels() * h * w);
+        gpu::copy(rgb, px.data(), px.size() * 4);
+        vae_->encode(rgb, h, w, nullptr, z0);   // the posterior's mean
+    } catch (...) {
+        gpu::free(rgb);
+        vae_->drop_scratch();
+        throw;
+    }
+    gpu::free(rgb);
+    vae_->drop_scratch();
 }
 
 }  // namespace strata::image

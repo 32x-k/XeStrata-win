@@ -4,7 +4,7 @@
 //
 //   strata-image --dit DIT.gguf --vae VAE.safetensors --text TEXT_ENCODER.gguf [--vision MMPROJ.gguf]
 //                [--budget-mib M] (--ids 1,2,3 [--drop N] [--width W] [--height H] [--seed S] [--sigmas 1,...,0]
-//                [--ref IMAGE]... [--mask IMAGE] [--repeat N] --out IMAGE.rgba | --serve)
+//                [--ref IMAGE]... [--mask IMAGE] [--init IMAGE] [--strength F] [--repeat N] --out IMAGE.rgba | --serve)
 //   strata-image --dit DIT.safetensors ... [--dit-q8 auto|0|1] [--edit-dit EDIT_DIT.safetensors --vision MMPROJ.gguf]
 //                [--dit-keep 0|1]
 //
@@ -28,8 +28,11 @@
 // times in the process (the cache's effect); --sigmas, the sampler's sigmas from 1 down to the terminal 0, one step
 // between each two (default Turbo's 8 steps; serve/images.py's base_sigmas for the base model); --ref, an edit's
 // reference image (PNG, JPEG, BMP, GIF; its pad in --ids is one <|image_pad|>, which the engine widens to the image's
-// tokens), with the vision encoder (--vision, Qwen3-VL's mmproj); --mask, the edit's mask over the first --ref
-// (OpenAI's: a PNG whose transparent pixels are where the image changes, the rest kept as the reference has it).
+// tokens), with the vision encoder (--vision, Qwen3-VL's mmproj); --init, img2img's base image for a model without
+// edits; --strength, how much of the schedule runs from the base image (diffusers' strength, above 0 and at most 1;
+// 1, the default, starts from noise); --mask, a mask over the base image (the --init image, else the first --ref;
+// OpenAI's: a PNG whose transparent pixels are where the image changes, the rest kept as the base has it); see
+// img_start.hpp.
 // Writes RGBA8 rows to --out and a line of times and of the budget's split a run.
 //
 // --serve: the engine stays, its layers and the last prompt's states kept between requests, and takes lines on stdin
@@ -37,11 +40,13 @@
 //   IMG <width> <height> <seed> <drop> <out path> <ids, commas> [SIGMAS:<sigmas, commas>] [REF:<path>]...
 //                            -> STAGE <refs|text|sampling|decode> as each stage starts and STEP <done> <steps> lines,
 //                            then IMAGE key=value ... (times, the budget's split); SIGMAS: as --sigmas; REF: an
-//                            edit's reference images; MASK: as --mask; NEG:<ids, commas> and CFG:<scale> (above 1):
+//                            edit's reference images; MASK:, INIT: and STRENGTH: as --mask, --init and --strength;
+//                            NEG:<ids, commas> and CFG:<scale> (above 1):
 //                            classifier-free guidance with that negative prompt (its pads as the prompt's); GUID:
 //                            <scale> is HunyuanImage 3.0's guidance token instead (it samples once: no NEG:, no CFG:)
-//   NEED <width> <height> <n> [REF:<path>]... [MASK:<path>] [NEG:<n>]  the VRAM an image of n prompt ids needs (from
-//                            the files); NEG: guidance's negative prompt of n ids
+//   NEED <width> <height> <n> [REF:<path>]... [MASK:<path>] [INIT:<path>] [NEG:<n>]  the VRAM an image of n prompt
+//                            ids needs (from the files); MASK: or INIT:, a base image (with a strength below 1 and
+//                            references, MASK:<their first>); NEG: guidance's negative prompt of n ids
 //                                                                                          -> NEED least_mib=...
 //                            full_mib=... held_mib=... free_mib=... cap_mib=... host_mib=... (si::QiNeed)
 //   FREE                     the free VRAM and what the engine holds                        -> FREE free_mib=... held_mib=...
@@ -109,12 +114,14 @@ si::QiRef read_image(const std::string& path) {
     return f;
 }
 
-// the words left on an IMG line: its REF:<path> images (and SIGMAS:, MASK:)
+// the words left on an IMG line: its REF:<path> images (and SIGMAS:, MASK:, INIT:, STRENGTH:...)
 std::vector<si::QiRef> read_refs(std::istringstream& ls, si::QiRequest& r) {
     std::vector<si::QiRef> refs;
     for (std::string word; ls >> word;) {
         if (word.rfind("SIGMAS:", 0) == 0) r.sigmas = parse_sigmas(word.substr(7));
         else if (word.rfind("MASK:", 0) == 0) r.mask = read_image(word.substr(5));
+        else if (word.rfind("INIT:", 0) == 0) r.init = read_image(word.substr(5));
+        else if (word.rfind("STRENGTH:", 0) == 0) r.strength = std::stod(word.substr(9));
         else if (word.rfind("NEG:", 0) == 0) r.neg_ids = parse_ids(word.substr(4));
         else if (word.rfind("CFG:", 0) == 0) r.cfg = std::stof(word.substr(4));
         else if (word.rfind("GUID:", 0) == 0) r.guidance = std::stof(word.substr(5));
@@ -125,11 +132,11 @@ std::vector<si::QiRef> read_refs(std::istringstream& ls, si::QiRequest& r) {
     return refs;
 }
 
-// a NEED line's: the REF:<path> images' sizes; MASK:<path> sets `mask`, NEG:<n> `n_neg`
+// a NEED line's: the REF:<path> images' sizes; MASK:<path> or INIT:<path> (a base image) sets `mask`, NEG:<n> `n_neg`
 std::vector<std::pair<int64_t, int64_t>> ref_sizes(std::istringstream& ls, bool& mask, int64_t& n_neg) {
     std::vector<std::pair<int64_t, int64_t>> sizes;
     for (std::string word; ls >> word;) {
-        if (word.rfind("MASK:", 0) == 0) {
+        if (word.rfind("MASK:", 0) == 0 || word.rfind("INIT:", 0) == 0) {
             mask = true;
             continue;
         }
@@ -349,6 +356,8 @@ int main(int argc, char** argv) {
             else if (a == "--ratio") ratio = true;
             else if (a == "--ref") ref_paths.push_back(val());
             else if (a == "--mask") r.mask = read_image(val());
+            else if (a == "--init") r.init = read_image(val());
+            else if (a == "--strength") r.strength = std::stod(val());
             else if (a == "--neg-ids") r.neg_ids = parse_ids(val());
             else if (a == "--cfg") r.cfg = std::stof(val());
             else if (a == "--out") out = val();
@@ -382,7 +391,8 @@ int main(int argc, char** argv) {
             (!serving && ((out.empty() && !ratio) || ids.empty()))) {
             std::fprintf(stderr, "usage: %s --dit F --vae F --text F [--vision F] [--budget-mib M] (--ids 1,2,3 "
                          "[--drop N] [--width W] [--height H] [--seed S] [--sigmas 1,...,0] [--ref IMAGE]... "
-                         "[--mask IMAGE] [--repeat N] --out IMAGE.rgba | --serve) [--dit-q8 auto|0|1] [--edit-dit F] "
+                         "[--mask IMAGE] [--init IMAGE] [--strength F] [--repeat N] --out IMAGE.rgba | --serve) "
+                         "[--dit-q8 auto|0|1] [--edit-dit F] "
                          "[--dit-keep 0|1]\n",
                          argv[0]);
             std::fprintf(stderr, "       %s: HunyuanImage 3.0 (a quantized .safetensors --dit) takes no --text "

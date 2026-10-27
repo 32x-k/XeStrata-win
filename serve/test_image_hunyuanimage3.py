@@ -30,7 +30,7 @@ def cfg(**kw) -> dict:
            "quant": "w4a8", "diffusion_model": "dit.safetensors", "vae": "vae.safetensors",
            "tokenizer": "tokenizer.json", "system_prompt": "en_unified.txt", "vision": "shard.safetensors",
            "max_refs": 3, "steps": 8, "guidance": 2.5,
-           "schedule": "hunyuanimage3", "mask": False, "transparency": False, "resolutions": RESOLUTIONS,
+           "schedule": "hunyuanimage3", "transparency": False, "resolutions": RESOLUTIONS,
            "gpu_policy": "auto", "uma": False, "ssd_offload": False}
     out.update(kw)
     return out
@@ -132,8 +132,10 @@ class Requests(unittest.TestCase):
         with self.assertRaises(images.ImageRequestError):
             images.parse_request({"prompt": "a cube", "background": "transparent"}, cfg())
         png = b"\x89PNG\r\n\x1a\n" + bytes(8) + (1920).to_bytes(4, "big") + (1080).to_bytes(4, "big") + bytes(40)
-        with self.assertRaises(images.ImageRequestError):
-            images.parse_edit_request({"prompt": "a cube"}, [png], cfg(vision=None))
+        job = images.parse_edit_request({"prompt": "a cube"}, [png], cfg(vision=None))
+        self.assertNotIn("refs", job, "without the vision file the image is no edit's reference")
+        self.assertEqual((job["init"], job["strength"]), (png, images.STRENGTH_IMG2IMG),
+                         "it is the image img2img starts from, at the default strength")
         job = images.parse_edit_request({"prompt": "a cube"}, [png], cfg())
         self.assertEqual((job["width"], job["height"]), (1280, 720),
                          "size auto: the first reference's shape, at its bucket")

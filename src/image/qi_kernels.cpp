@@ -586,15 +586,36 @@ void qi_axpy(float* x, const float* v, float a, int64_t n, void* stream) {
     finish(stream, e, "qi_axpy");
 }
 
+void qi_repeat_kv16(const uint16_t* src, int64_t T, int64_t q_heads, int64_t kv_heads, int64_t head_dim, uint16_t* out,
+                    void* stream) {
+    if (T <= 0) return;
+    const int64_t group = q_heads / kv_heads, row = q_heads * head_dim, kvrow = kv_heads * head_dim;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (T * row)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t t = i / row, c = i - t * row, h = c / head_dim, d = c - h * head_dim;
+        out[i] = src[t * kvrow + (h / group) * head_dim + d];
+    });
+    finish(stream, e, "qi_repeat_kv16");
+}
+
 void qi_inpaint_blend(float* x, const float* z0, const float* noise, const float* m, float s, int64_t C, int64_t HW,
-                      void* stream) {
+                      void* stream, bool tokens) {
     if (C * HW <= 0) return;
     const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) (C * HW)), [=](sycl::id<1> id) {
         const auto i = static_cast<int64_t>(id[0]);
-        const float k = m[i % HW];
+        const float k = m[tokens ? i / C : i % HW];
         x[i] = k * x[i] + (1.f - k) * ((1.f - s) * z0[i] + s * noise[i]);
     });
     finish(stream, e, "qi_inpaint_blend");
+}
+
+void qi_noise_mix(float* x, const float* z0, const float* noise, float s, int64_t n, void* stream) {
+    if (n <= 0) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        x[i] = (1.f - s) * z0[i] + s * noise[i];
+    });
+    finish(stream, e, "qi_noise_mix");
 }
 
 void qi_bias_add(float* y, const float* b, int64_t T, int64_t N, void* stream) {

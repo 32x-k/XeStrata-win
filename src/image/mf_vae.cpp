@@ -76,6 +76,23 @@ void im2col3(const uint16_t* in16, int64_t H, int64_t W, int64_t C, int64_t p0, 
     });
 }
 
+// the Flux2 VAE encoder's downsampling: col16[r][(dy * 3 + dx) * C + c] = in16[2 y + dy][2 x + dx][c] (0 past the
+// bottom and right edges: the 0, 1, 0, 1 padding before the 3 x 3 convolution of stride 2), output pixel p0 + r =
+// y * (W / 2) + x
+void im2col3_s2(const uint16_t* in16, int64_t H, int64_t W, int64_t C, int64_t p0, int64_t rows, uint16_t* col16,
+                void* s) {
+    const int64_t C8 = C / 8, Wo = W / 2;
+    q_of(s).parallel_for(sycl::range<1>((size_t) (rows * 9 * C8)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t rk = i / C8, r = rk / 9, kk = rk - r * 9, c8 = (i - rk * C8) * 8;
+        const int64_t p = p0 + r, y = 2 * (p / Wo) + kk / 3, x = 2 * (p % Wo) + kk % 3;
+        using V = sycl::vec<uint16_t, 8>;
+        V v(0);
+        if (y < H && x < W) v = *reinterpret_cast<const V*>(in16 + (y * W + x) * C + c8);
+        *reinterpret_cast<V*>(col16 + rk * C + c8) = v;
+    });
+}
+
 // the group norm's partial sums over chunks of kGnChunk pixels, a work-group a chunk and group: part[k][g] = the sum
 // over chunk k's pixels and group g's channels of x - m, or of (x - m)^2 with `sq`, m the group's mean in stats[2 g]
 // (0 without `sq`).  A pixel a sum (the Flux2 VAE's millions of them) left gn_stats too long a loop
@@ -338,6 +355,28 @@ void f2_unpatch16(const float* z, const float* mean, const float* sd, int64_t h,
         const int64_t p = i / 32, c = i - p * 32, Y = p / W, X = p - Y * W;
         const int64_t k = 4 * c + 2 * (Y % 2) + X % 2;
         out16[i] = f16_from_f32(z[((Y / 2) * w + X / 2) * 128 + k] * sd[k] + mean[k]);
+    });
+}
+
+// the Flux2 VAE encoder's input: out16[p][c] = rgb[c][p] for the 3 channels, 0 for the other 5 (its first
+// convolution's input widened to 8 channels)
+void f2_rgb8_16(const float* rgb, int64_t HW, uint16_t* out16, void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (8 * HW)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t p = i / 8, c = i - p * 8;
+        out16[i] = f16_from_f32(c < 3 ? rgb[c * HW + p] : 0.f);
+    });
+}
+
+// f2_unpatch16's inverse: z[(Y / 2) w + X / 2][4 c + 2 (Y % 2) + X % 2] = (m[Y][X][c] - mean) / std (the same
+// index) over the posterior's mean, the first 32 of the moments m [2 h][2 w][64]
+void f2_patch(const float* m, const float* mean, const float* sd, int64_t h, int64_t w, float* z, void* s) {
+    const int64_t W = 2 * w;
+    q_of(s).parallel_for(sycl::range<1>((size_t) (4 * h * w * 32)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t p = i / 32, c = i - p * 32, Y = p / W, X = p - Y * W;
+        const int64_t k = 4 * c + 2 * (Y % 2) + X % 2;
+        z[((Y / 2) * w + X / 2) * 128 + k] = (m[p * 64 + c] - mean[k]) / sd[k];
     });
 }
 
@@ -708,6 +747,16 @@ void MfVae::conv(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, floa
     if (c.b != nullptr) qi_bias_add(out, c.b, HW, c.out, s_);
 }
 
+void MfVae::conv_s2(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, float* out) {
+    const int64_t HWo = (H / 2) * (W / 2), K = 9 * c.in, rows = std::max<int64_t>(1, col_cap_ / K);
+    for (int64_t p0 = 0; p0 < HWo; p0 += rows) {
+        const int64_t n = std::min(rows, HWo - p0);
+        im2col3_s2(in16, H, W, c.in, p0, n, col16_, s_);
+        gemm_.f16(col16_, c.w, out + p0 * c.out, n, c.out, K);
+    }
+    if (c.b != nullptr) qi_bias_add(out, c.b, HWo, c.out, s_);
+}
+
 void MfVae::gn_silu16(const float* x, const float* w, const float* b, int64_t HW, int64_t C, bool silu_on,
                       uint16_t* y16) {
     gn_partial(x, vec_, HW, C, false, gn_part_, s_);
@@ -786,8 +835,20 @@ void MfVae::dico(const DiCo& d, float* s, int64_t H, int64_t W, const DiCoBufs& 
 bool MfVae::open_encoder(std::string& err, bool dry) {
     if (has_encoder()) return true;
     if (f2_) {
-        err = "image engine (Flux2 VAE): no encoder (edits take Mage-VAE)";
-        return false;
+        try {
+            const bool was_dry = dry_;
+            const uint64_t before = weight_bytes_;
+            dry_ = dry;
+            SafeTensors st(path_);
+            open_flux2_encoder(st);
+            enc_bytes_ = weight_bytes_ - before;
+            if (dry) weight_bytes_ = before;   // sizes only (kept for encode_scratch_bytes): not weights held
+            dry_ = was_dry;
+            return true;
+        } catch (const std::exception& ex) {
+            err = ex.what();
+            return false;
+        }
     }
     try {
         const bool was_dry = dry_;
@@ -892,6 +953,7 @@ bool MfVae::open_encoder(std::string& err, bool dry) {
 }
 
 uint64_t MfVae::encode_scratch_bytes(int64_t h, int64_t w) const {
+    if (f2_) return f2_bytes(f2_enc_walk(h, w));
     const int64_t n = h * w, Ch = enc_head_.empty() ? 768 : enc_head_[0].c1.out,
                   Fh = enc_head_.empty() ? 3072 : enc_head_[0].c4.out;
     return (uint64_t) n * (uint64_t) (Ch + C_ + 2 * Fh) * 4 + (uint64_t) n * (uint64_t) std::max(Fh, 3 * kPix) * 2 +
@@ -899,6 +961,7 @@ uint64_t MfVae::encode_scratch_bytes(int64_t h, int64_t w) const {
 }
 
 void MfVae::encode_moments(const float* rgb, int64_t h, int64_t w, float* moments) {
+    if (f2_) throw std::runtime_error("image engine (Flux2 VAE): its encoder gives the latent only (encode)");
     if (!has_encoder()) throw std::runtime_error("image engine (Mage-VAE): the encoder is not loaded");
     const int64_t n = h * w, Ch = enc_head_[0].c1.out, Fh = enc_head_[0].c4.out;
     std::vector<void*> tmp;
@@ -924,6 +987,10 @@ void MfVae::encode_moments(const float* rgb, int64_t h, int64_t w, float* moment
 }
 
 void MfVae::encode(const float* rgb, int64_t h, int64_t w, const float* eps, float* z) {
+    if (f2_) {
+        f2_encode(rgb, h, w, z);
+        return;
+    }
     const int64_t n = h * w, Z = e_out_.out / 2;
     float* mom = nullptr;
     if (!gpu::alloc_device(&mom, (size_t) (n * 2 * Z) * 4))
@@ -1128,6 +1195,10 @@ uint64_t MfVae::f2_bytes(const F2Sizes& z) const {
     int64_t cmax = C_;
     for (const F2Level& l : f2_levels_)
         for (const F2Res& r : l.blocks) cmax = std::max(cmax, r.c1.in);
+    for (const F2Down& l : f2_down_) {
+        for (const F2Res& r : l.blocks) cmax = std::max(cmax, r.c1.in);
+        cmax = std::max(cmax, l.down.in);
+    }
     const int64_t col_rows = std::min<int64_t>(z.pix, 32768);
     return (uint64_t) z.most * (3 * 4 + 2) +                           // x, y, t; a16
            (uint64_t) col_rows * 9 * cmax * 2 +                        // the unfolded neighbourhoods, a band
@@ -1157,6 +1228,10 @@ void MfVae::f2_grow(const F2Sizes& z) {
     int64_t cmax = C_;
     for (const F2Level& l : f2_levels_)
         for (const F2Res& r : l.blocks) cmax = std::max(cmax, r.c1.in);
+    for (const F2Down& l : f2_down_) {
+        for (const F2Res& r : l.blocks) cmax = std::max(cmax, r.c1.in);
+        cmax = std::max(cmax, l.down.in);
+    }
     f2_x_ = alloc<float>(allocs_, n.most);
     f2_y_ = alloc<float>(allocs_, n.most);
     f2_t_ = alloc<float>(allocs_, n.most);
@@ -1200,12 +1275,12 @@ void MfVae::f2_resblock(const F2Res& r, float*& x, int64_t H, int64_t W) {
 }
 
 // x += proj(softmax(q k^T / sqrt(C)) v), q, k, v of GN(x): one head over every position, a band of query rows at a time
-void MfVae::f2_attention(float* x, int64_t H, int64_t W) {
-    const int64_t T = H * W, C = f2_attn_.qkv.in, rows = f2_cap_.rows;
+void MfVae::f2_attention(const Attn& a, float* x, int64_t H, int64_t W) {
+    const int64_t T = H * W, C = a.qkv.in, rows = f2_cap_.rows;
     float *qkv = nullptr, *o = nullptr;
     f2_others(x, qkv, o);
-    gn_silu16(x, f2_attn_.nw, f2_attn_.nb, T, C, false, a16_);
-    conv(f2_attn_.qkv, a16_, H, W, qkv);
+    gn_silu16(x, a.nw, a.nb, T, C, false, a16_);
+    conv(a.qkv, a16_, H, W, qkv);
     uint16_t *q16 = f2_qk16_, *k16 = f2_qk16_ + T * C, *vt16 = f2_qk16_ + 2 * T * C;
     qkv_split16(qkv, T, C, q16, k16, vt16, s_);
     for (int64_t r0 = 0; r0 < T; r0 += rows) {
@@ -1215,7 +1290,7 @@ void MfVae::f2_attention(float* x, int64_t H, int64_t W) {
         gemm_.f16(f2_p16_, vt16, o + r0 * C, n, C, T);
     }
     qi_to_f16(o, T * C, a16_, s_);
-    conv(f2_attn_.proj, a16_, H, W, qkv);
+    conv(a.proj, a16_, H, W, qkv);
     qi_axpy(x, qkv, 1.0f, T * C, s_);
 }
 
@@ -1229,7 +1304,7 @@ void MfVae::f2_front(const float* z, int64_t h, int64_t w, int k, float*& x, int
     x = f2_x_;
     conv(cin_, a16_, H, W, x);
     f2_resblock(f2_mid_[0], x, H, W);
-    f2_attention(x, H, W);
+    f2_attention(f2_attn_, x, H, W);
     f2_resblock(f2_mid_[1], x, H, W);
     c = C_;
     f2_levels(0, k, x, H, W, c);
@@ -1347,6 +1422,168 @@ void MfVae::f2_decode_tiled(const float* z, int64_t h, int64_t w, float* rgb, in
     tile_finish(acc, H * W, rgb, s_);
     gpu::stream_sync(s_);
     for (void* p : tmp) gpu::free(p);
+}
+
+// ---- the Flux2 VAE's encoder
+
+void MfVae::open_flux2_encoder(SafeTensors& st) {
+    // the LDM checkpoint's names, or diffusers' (FLUX.2-klein's vae/: down_blocks counted the same way, from the
+    // largest; quant_conv outside the encoder)
+    const bool df = st.find("encoder.mid_block.resnets.0.conv1.weight") != nullptr;
+    auto nm = [df](const std::string& k) -> std::string {
+        if (!df) return k;
+        static const std::pair<const char*, const char*> fixed[] = {
+            {"encoder.quant_conv", "quant_conv"},
+            {"encoder.mid.block_1.", "encoder.mid_block.resnets.0."},
+            {"encoder.mid.block_2.", "encoder.mid_block.resnets.1."},
+            {"encoder.mid.attn_1.norm", "encoder.mid_block.attentions.0.group_norm"},
+            {"encoder.mid.attn_1.q", "encoder.mid_block.attentions.0.to_q"},
+            {"encoder.mid.attn_1.k", "encoder.mid_block.attentions.0.to_k"},
+            {"encoder.mid.attn_1.v", "encoder.mid_block.attentions.0.to_v"},
+            {"encoder.mid.attn_1.proj_out", "encoder.mid_block.attentions.0.to_out.0"},
+            {"encoder.norm_out", "encoder.conv_norm_out"}};
+        for (const auto& [from, to] : fixed) {   // a whole name, or a prefix of the names under it
+            const std::string f(from);
+            if (k.rfind(f, 0) == 0 && (k.size() == f.size() || f.back() == '.' || k[f.size()] == '.'))
+                return to + k.substr(f.size());
+        }
+        if (k.rfind("encoder.down.", 0) == 0) {
+            const size_t e = k.find('.', 13);
+            std::string rest = k.substr(e + 1);
+            if (rest.rfind("block.", 0) == 0) {
+                rest = "resnets." + rest.substr(6);
+                const size_t n = rest.find("nin_shortcut");
+                if (n != std::string::npos) rest.replace(n, 12, "conv_shortcut");
+            } else if (rest.rfind("downsample.", 0) == 0) {
+                rest = "downsamplers.0." + rest.substr(11);
+            }
+            return "encoder.down_blocks." + k.substr(13, e - 13) + "." + rest;
+        }
+        return k;
+    };
+    const std::string e = "encoder.";
+    if (st.find(nm(e + "conv_in.weight")) == nullptr)
+        throw std::runtime_error("image engine (Flux2 VAE): the file has no encoder");
+    {   // conv_in's 3 input channels widened to 8 (zero weights), as the products take them
+        const std::string n = nm(e + "conv_in");
+        const SafeTensor* t = st.find(n + ".weight");
+        if (t->shape.size() != 4 || t->shape[1] != 3 || t->shape[2] != 3 || t->shape[3] != 3)
+            throw std::runtime_error("image engine (Flux2 VAE): the encoder's conv_in is not 3 x 3 over RGB");
+        f2_ein_.out = t->shape[0];
+        f2_ein_.in = 8;
+        f2_ein_.k = 3;
+        weight_bytes_ += (uint64_t) (f2_ein_.out * 9 * 8) * 2;
+        if (!dry_) {
+            const auto w = st.f32(n + ".weight");   // [out][3][3][3]
+            std::vector<uint16_t> h((size_t) (f2_ein_.out * 9 * 8), 0);
+            for (int64_t o = 0; o < f2_ein_.out; ++o)
+                for (int64_t i = 0; i < 3; ++i)
+                    for (int64_t k = 0; k < 9; ++k)
+                        h[(size_t) ((o * 9 + k) * 8 + i)] = kernels::f16_from_f32(w[(size_t) ((o * 3 + i) * 9 + k)]);
+            uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size());
+            gpu::copy(d, h.data(), h.size() * 2);
+            f2_ein_.w = d;
+        }
+        f2_ein_.b = vec(st, n + ".bias");
+    }
+    auto res = [&](const std::string& p) {
+        F2Res r;
+        r.n1w = vec(st, nm(p + "norm1.weight"));
+        r.n1b = vec(st, nm(p + "norm1.bias"));
+        r.c1 = conv_w(st, nm(p + "conv1"));
+        r.n2w = vec(st, nm(p + "norm2.weight"));
+        r.n2b = vec(st, nm(p + "norm2.bias"));
+        r.c2 = conv_w(st, nm(p + "conv2"));
+        if (st.find(nm(p + "nin_shortcut.weight")) != nullptr) r.nin = conv_w(st, nm(p + "nin_shortcut"));
+        if (r.c1.in % kGroups != 0 || r.c1.out % kGroups != 0)
+            throw std::runtime_error("image engine (Flux2 VAE): " + p + ": channels not a multiple of 32");
+        return r;
+    };
+    std::vector<F2Down> levels;
+    for (int i = 0; st.find(nm(e + "down." + std::to_string(i) + ".block.0.conv1.weight")) != nullptr; ++i) {
+        const std::string p = e + "down." + std::to_string(i) + ".";
+        F2Down l;
+        for (int j = 0; st.find(nm(p + "block." + std::to_string(j) + ".conv1.weight")) != nullptr; ++j)
+            l.blocks.push_back(res(p + "block." + std::to_string(j) + "."));
+        if (st.find(nm(p + "downsample.conv.weight")) != nullptr) l.down = conv_w(st, nm(p + "downsample.conv"));
+        levels.push_back(std::move(l));
+    }
+    int downs = 0;
+    for (const F2Down& l : levels) downs += l.down.out > 0;
+    if (downs != 3) throw std::runtime_error("image engine (Flux2 VAE): the encoder does not halve the image 3 times");
+    f2_emid_[0] = res(e + "mid.block_1.");
+    const std::string a = e + "mid.attn_1.", qkv[3] = {nm(a + "q"), nm(a + "k"), nm(a + "v")};
+    f2_eattn_ = attn_w(st, nm(a + "norm"), qkv, nm(a + "proj_out"), f2_emid_[0].c2.out);
+    if (f2_eattn_.qkv.in != C_)
+        throw std::runtime_error("image engine (Flux2 VAE): the encoder's middle is not the decoder's width");
+    f2_emid_[1] = res(e + "mid.block_2.");
+    f2_enw_ = vec(st, nm(e + "norm_out.weight"));
+    f2_enb_ = vec(st, nm(e + "norm_out.bias"));
+    f2_eout_ = conv_w(st, nm(e + "conv_out"));
+    if (f2_eout_.out != 64) throw std::runtime_error("image engine (Flux2 VAE): the encoder's moments are not 2 x 32");
+    f2_qc_ = Conv();
+    if (st.find(nm(e + "quant_conv.weight")) != nullptr) f2_qc_ = conv_w(st, nm(e + "quant_conv"));
+    f2_down_ = std::move(levels);
+}
+
+// The encoder's stage sizes for an h x w latent's image (16 h x 16 w pixels), as f2_walk's
+MfVae::F2Sizes MfVae::f2_enc_walk(int64_t h, int64_t w) const {
+    F2Sizes z;
+    int64_t pix = 256 * h * w, c = f2_ein_.out;
+    z.pix = pix;
+    z.most = pix * std::max<int64_t>(8, c);
+    for (const F2Down& l : f2_down_) {
+        for (const F2Res& r : l.blocks) z.most = std::max(z.most, pix * std::max(r.c1.in, r.c2.out));
+        if (!l.blocks.empty()) c = l.blocks.back().c2.out;
+        if (l.down.out > 0) {
+            pix /= 4;
+            c = l.down.out;
+            z.most = std::max(z.most, pix * c);
+        }
+    }
+    z.mid = pix;
+    z.most = std::max({z.most, pix * 3 * C_, pix * 64});
+    z.rows = std::max<int64_t>(1, std::min<int64_t>(z.mid, (int64_t) (16 << 20) / z.mid));
+    z.c = c;
+    return z;
+}
+
+void MfVae::f2_encode(const float* rgb, int64_t h, int64_t w, float* z) {
+    if (!has_encoder()) throw std::runtime_error("image engine (Flux2 VAE): the encoder is not loaded");
+    int64_t H = 16 * h, W = 16 * w;
+    f2_grow(f2_enc_walk(h, w));
+    f2_rgb8_16(rgb, H * W, a16_, s_);
+    float* x = f2_x_;
+    conv(f2_ein_, a16_, H, W, x);
+    int64_t c = f2_ein_.out;
+    for (const F2Down& l : f2_down_) {
+        for (const F2Res& r : l.blocks) f2_resblock(r, x, H, W);
+        if (!l.blocks.empty()) c = l.blocks.back().c2.out;
+        if (l.down.out > 0) {
+            qi_to_f16(x, H * W * c, a16_, s_);
+            float *y = nullptr, *unused = nullptr;
+            f2_others(x, y, unused);
+            conv_s2(l.down, a16_, H, W, y);
+            H /= 2;
+            W /= 2;
+            x = y;
+            c = l.down.out;
+        }
+    }
+    f2_resblock(f2_emid_[0], x, H, W);
+    f2_attention(f2_eattn_, x, H, W);
+    f2_resblock(f2_emid_[1], x, H, W);
+    gn_silu16(x, f2_enw_, f2_enb_, H * W, c, true, a16_);
+    float *m = nullptr, *t = nullptr;
+    f2_others(x, m, t);
+    conv(f2_eout_, a16_, H, W, m);
+    if (f2_qc_.out > 0) {
+        qi_to_f16(m, H * W * f2_eout_.out, a16_, s_);
+        conv(f2_qc_, a16_, H, W, t);
+        m = t;
+    }
+    f2_patch(m, f2_mean_, f2_std_, h, w, z, s_);
+    gpu::stream_sync(s_);
 }
 
 }  // namespace strata::image

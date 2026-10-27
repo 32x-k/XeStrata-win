@@ -41,6 +41,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace strata::image {
@@ -99,11 +100,18 @@ public:
 
     /// Sampling: x [h w][128] (device FP32, the initial noise) stepped through sigmas (descending, the last 0) by
     /// Euler; with cfg > 1 and a negative context, the velocity neg + cfg (pos - neg).  step(i, n) after each step:
-    /// false stops (QiStopped).
+    /// false stops (QiStopped).  `after` (if set) is given x and the step's new sigma first, on the sampler's stream
+    /// (a mask: img_start.hpp's blend).
     void sample(float* x, int64_t h, int64_t w, const std::vector<float>& sigmas, float cfg,
-                const std::function<bool(int, int)>& step = {});
+                const std::function<bool(int, int)>& step = {},
+                const std::function<void(float*, float)>& after = {});
 
     int64_t hidden() const { return C_; }
+    /// The time of `rows` image rows through the MLP's first product (the hidden width to the MLP's, a block's largest)
+    /// in each of the two forms on this stream's GPU, the best of three after one: {FP16 weights and activations, FP32
+    /// sums; W8A8: the activations rotated and quantized, int32 sums scaled} in seconds, 0 for a form the GPU's library
+    /// does not take (W8A8: prefill::Gemm::i8_usable) or the memory for it short.  Needs only the file's sizes (dry).
+    std::pair<double, double> time_forms(int64_t rows) const;
     int64_t latent_channels() const { return in_ch_; }
     bool q8() const { return q8_; }
     int64_t text_dim() const { return txt_dim_; }

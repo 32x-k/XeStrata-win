@@ -17,12 +17,16 @@
 // edit DiT takes their latents after the target's.  The DiT not in use gives its VRAM back; with keep its Q8_0 stays
 // in RAM for the next switch, without it the DiT is read from its file again.
 //
+// img2img and a mask (img_start.hpp) take the base image through the VAE's encoder at the image's size (Mage-VAE's,
+// or the Flux2 VAE's for MageTrail), the posterior's mean; with the edit DiT their base image is the first reference.
+//
 // The DiT's weights (q8 auto, the default): FP16 on the GPU, the matrix units taking them as they are, when its blocks
 // all fit the budget beside the request's working memory; else Q8_0 (half the VRAM, and half the bytes of a streamed
 // block), dequantized at each product.  The choice is made as the DiT is opened, and again when a request finds the
 // FP16 blocks no longer fit (the DiT opened again as Q8_0).
 #pragma once
 
+#include "strata/image/img_start.hpp"
 #include "strata/image/mf_dit.hpp"
 #include "strata/image/mf_vae.hpp"
 #include "strata/image/pipeline.hpp"
@@ -69,11 +73,17 @@ private:
     MfDit* active() const { return edit_active_ ? edit_dit_.get() : dit_.get(); }
     MfDit& dit() { return *active(); }
     void edit_refs(const QiRequest& r, Edit& e);
+    void encode_base(const QiRequest& r, const QiRef& base, LatentStart& ls);
 
     void* s_ = nullptr;
     std::string dit_path_, vae_path_, text_path_, edit_path_, vision_path_;
     int q8_ = -1;
+    /// --dit-q8 auto with both forms in the budget: the 8-bit form is the faster on this GPU (MfDit::time_forms: 1 yes,
+    /// 0 no, -1 not yet), timed at w8_rows_ image rows (again for an image of more than twice as many)
+    mutable int w8_faster_ = -1;
+    mutable int64_t w8_rows_ = 0;
     bool keep_ = true, edit_active_ = false;
+    bool base_encoder_ = false;   // the VAE's file has the encoder a base image takes (img2img, a mask)
     std::unique_ptr<QiText> te_;
     std::unique_ptr<MfDit> dit_, edit_dit_;
     std::unique_ptr<QiVision> vision_;        // the edits' vision encoder, while the budget has room for it

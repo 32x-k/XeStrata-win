@@ -516,7 +516,7 @@ def image_config(quant: str, exe: Path, models_dir: Path, *, model: str = DEFAUL
                 "system_prompt": str(system_prompt_path(models_dir)), "steps": DITS[dit][1],
                 "vision": str(local_path(models_dir, "hunyuanimage3-vision")), "max_refs": HUNYUANIMAGE3_MAX_REFS,
                 "ratio_head": str(ratio_head_path(models_dir)),
-                "guidance": HUNYUANIMAGE3_GUIDANCE, "schedule": "hunyuanimage3", "mask": False,
+                "guidance": HUNYUANIMAGE3_GUIDANCE, "schedule": "hunyuanimage3",
                 "transparency": False, "resolutions": hunyuanimage3_resolutions(),
                 "gpu_policy": policy, "uma": bool(uma), "ssd_offload": bool(ssd_offload)}
     if is_mage(dit):
@@ -525,13 +525,13 @@ def image_config(quant: str, exe: Path, models_dir: Path, *, model: str = DEFAUL
                 "vision": str(local_path(models_dir, "mf-mmproj"))} if dit in MF_EDIT else {}
         return {**q8, "model_name": name, "family": "mage-flow", "exe": str(exe), "quant": "bf16",
                 "diffusion_model": str(local_path(models_dir, f"{dit}-bf16")), "steps": DITS[dit][1],
-                "schedule": "mage", "cfg_scale": MF_CFG[dit], "mask": False, **edit, "dit_keep": bool(dit_keep),
+                "schedule": "mage", "cfg_scale": MF_CFG[dit], **edit, "dit_keep": bool(dit_keep),
                 "transparency": False, "vae": str(local_path(models_dir, MF_VAE.get(dit, "mf-vae"))),
                 "llm": str(local_path(models_dir, text_file(text_encoder, text_quant))), "text_encoder": text_encoder,
                 "text_quant": text_quant, "gpu_policy": policy, "uma": bool(uma), "ssd_offload": bool(ssd_offload)}
     return {"model_name": name, "exe": str(exe), "quant": quant,
             "diffusion_model": str(local_path(models_dir, f"{dit}-{quant}")), "steps": DITS[dit][1],
-            "schedule": dit, "mask": True, "transparency": True, "vae": str(local_path(models_dir, "vae")),
+            "schedule": dit, "transparency": True, "vae": str(local_path(models_dir, "vae")),
             "llm": str(local_path(models_dir, text_file(text_encoder, text_quant))), "text_encoder": text_encoder,
             "text_quant": text_quant,
             "vision": str(local_path(models_dir, "mmproj")),

@@ -390,6 +390,7 @@ void QiDit::swap_context() {
     std::swap(target_pos_, other_.target_pos);
     std::swap(pre_pos_, other_.pre_pos);
     std::swap(key_lim_, other_.key_lim);
+    std::swap(ref_spans_, other_.ref_spans);
     other_.pk.resize(blocks_.size(), nullptr);
     other_.pv.resize(blocks_.size(), nullptr);
     for (size_t i = 0; i < blocks_.size(); ++i) {
@@ -447,6 +448,7 @@ void QiDit::set_context(const float* ctx, int64_t n_ctx, const std::vector<Ref>&
     // the prefix: the context's rows, each reference's pads its latent's tokens
     pre_pos_.assign((size_t) (n_pre * 3), 0.0f);
     std::vector<int32_t> lim((size_t) n_pre);
+    ref_spans_.clear();
     int64_t src = 0, dst = 0;
     float pos = 0;
     auto text_rows = [&](int64_t upto) {
@@ -472,6 +474,7 @@ void QiDit::set_context(const float* ctx, int64_t n_ctx, const std::vector<Ref>&
                 lim[(size_t) (dst + y * r.w + x)] = (int32_t) (dst + hw);   // the whole image, and the prefix before it
             }
         pos += (float) std::max(r.h, r.w);
+        ref_spans_.emplace_back(dst, dst + hw);
         dst += hw;
         src += r.slots;
     }
@@ -627,7 +630,8 @@ void QiDit::forward(const float* x, float t, int64_t H, int64_t W, bool prefix, 
             }
         }
         // the queries from r0 on: a cached prefix's rows are not asked again (an edit's references: most of them)
-        qi_attention(q16_, k16_, v16_, T, heads_, kHead, n_text_, o16_ + r0 * C, attn_scratch_, s_, key_lim_, r0);
+        qi_attention(q16_, k16_, v16_, T, heads_, kHead, n_text_, o16_ + r0 * C, attn_scratch_, s_, key_lim_, r0, true,
+                     key_lim_ != nullptr ? &ref_spans_ : nullptr);
         const bool od = product(o16_ + r0 * C, wo, h_, Tr, 0, 0, -1, false, true);
         qi_gate_add(xr, h_, mod(1), ntr, Tr, C, s_, od ? &i8_ : nullptr);
         for (int64_t m0 = 0; m0 < Tr; m0 += mlp_rows_) {   // the MLP a band of rows at a time (its 2 x inter wide product)
@@ -717,8 +721,8 @@ void QiDit::forward_pair(const float* x, float t, int64_t H, int64_t W, float* o
             gpu::copy_async(k16b, o.pk[(size_t) bi], bytes_b, s_);
             gpu::copy_async(v16b, o.pv[(size_t) bi], bytes_b, s_);
         }
-        qi_attention(q16_, k16_, v16_, Ta, heads_, kHead, na, o16_, attn_scratch_, s_, key_lim_, na);
-        qi_attention(q16b, k16b, v16b, Tb, heads_, kHead, nb, o16_ + HW * C, attn_scratch_, s_, o.key_lim, nb);
+        qi_attention(q16_, k16_, v16_, Ta, heads_, kHead, na, o16_, attn_scratch_, s_, key_lim_, na, true);
+        qi_attention(q16b, k16b, v16b, Tb, heads_, kHead, nb, o16_ + HW * C, attn_scratch_, s_, o.key_lim, nb, true);
         const bool od = product(o16_, wo, h_, R, 0, 0, -1, false, true);
         qi_gate_add(x_, h_, mod(1), 0, R, C, s_, od ? &i8_ : nullptr);
         for (int64_t m0 = 0; m0 < R; m0 += mlp_rows_) {   // the MLP a band of rows at a time

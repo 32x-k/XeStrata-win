@@ -92,7 +92,8 @@ public:
     /// carries as `<img>` tokens: the walk's sequence is exactly `n_text` tokens, so unlike the other pipelines
     /// nothing is added to it.  The image is (width x height)/16 on a side in tokens.  `refs` (their sizes): an
     /// edit's reference images, whose encoding before the walk takes the VAE encoder's and SigLIP2's buffers;
-    /// `mask` and `n_neg`: what this model does not take - ignored.
+    /// `mask`: a base image (img_start.hpp: img2img's or a mask's) encoded at the image's size before the walk;
+    /// `n_neg`: what this model does not take - ignored.
     QiNeed need(int64_t n_text, int64_t width, int64_t height,
                 const std::vector<std::pair<int64_t, int64_t>>& refs = {}, bool mask = false,
                 int64_t n_neg = 0) override;
@@ -129,6 +130,10 @@ private:
     QiPlan size_plan(int64_t T, int64_t th, int64_t tw, bool refs, uint64_t encode) const;
     /// The GPU memory the largest of the first `n` blocks' reference encodes works in (their grids set).
     uint64_t refs_encode_bytes(const std::vector<HunyuanImage3Block>& blocks, size_t n) const;
+    /// What a base image's encode at a tw x th token grid works in, and its latent [32][th][tw] (host) through the
+    /// VAE's encoder (the posterior's mean), placed as hunyuanimage3_vae_copy places a reference.
+    uint64_t base_encode_bytes(int64_t tw, int64_t th) const;
+    std::vector<float> base_latent(const QiRef& base, int64_t tw, int64_t th);
     void ensure_open();
     /// The request's sequence: trimmed, its image blocks read (the reference images' grids from the buckets the ids
     /// name and the images' naflex sizes, the generated block's from the size), positioned, with the attention's

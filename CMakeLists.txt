@@ -688,6 +688,7 @@ if(STRATA_ENABLE_XE)
   # against stable-diffusion.cpp's values, timed
   add_library(strata_image STATIC src/image/qi_kernels.cpp src/image/qi_attn.cpp src/image/qi_dit.cpp
                            src/image/qi_vae.cpp src/image/qi_text.cpp src/image/qi_pipeline.cpp
+                           src/image/img_start.cpp
                            src/image/mf_vae.cpp src/image/mf_dit.cpp
                            src/image/mf_pipeline.cpp
                            src/image/qi_stream.cpp src/image/qi_vision.cpp src/image/qi_image_io.cpp
@@ -935,6 +936,10 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(strata-image-vae-probe PRIVATE strata_image)
   add_executable(strata-image-text-probe src/image/qi_text_probe.cpp)
   target_link_libraries(strata-image-text-probe PRIVATE strata_image)
+  # the image attention (its 16-bit path and the int8 kernel) against FP64 (synthetic; --bench: a benchmark too)
+  add_executable(qi_attn_parity src/image/qi_attn_parity.cpp)
+  target_link_libraries(qi_attn_parity PRIVATE strata_image)
+  add_test(NAME qi_attn_parity COMMAND qi_attn_parity)
   add_executable(strata-image-mf-probe src/image/mf_probe.cpp)
   target_link_libraries(strata-image-mf-probe PRIVATE strata_image)
   add_executable(strata-image-hunyuanimage3-probe src/image/hunyuanimage3_probe.cpp)
