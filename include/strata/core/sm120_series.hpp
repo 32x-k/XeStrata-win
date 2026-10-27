@@ -73,8 +73,44 @@ inline bool gr_v3_default(bool hip, int major, int minor, bool integrated, doubl
 /// resolves it (an emulated or forced Turing counts as 75).  Measured on sm_120 (RTX PRO 5000) and sm_86 (2x RTX A4000): +1.1 .. +1.8% prompt.
 inline bool prompt_attn_imma_default(bool hip, int cc, bool v026 = false) { return !v026 && !hip && cc >= 80; }
 
+/// STRATA_MMVQ_IL_89 (#3453: the decode kernel row tables of an Ada card, the cells where an RTX 4070 and an RTX 4080 agreed; bitwise the same
+/// output, only the rows-a-warp split differs) when the user set nothing: ON for compute capability 8.9 only (owner decision, 26 October: not yet
+/// measured on an Ada card by us), off under STRATA_DEFAULTS=026 and in HIP builds.  `cc` = 10 * major + minor as the engine resolves it.
+inline bool mmvq_il_89_default(bool hip, int cc, bool v026 = false) { return !v026 && !hip && cc == 89; }
+
+/// The two sm_80-only defaults of 0.2.7 (#3779: the wide dense dequant and the MMVQ-IL sm_80 tables, both bitwise the old output, measured on a
+/// CMP 170HX only) given the text of their variable (nullptr = unset): "1" on and "0" off win, unset is on unless STRATA_DEFAULTS=026.
+inline bool sm80_default_on(const char* env, bool v026 = false) {
+    if (env != nullptr && env[0] == '1') return true;
+    if (env != nullptr && env[0] == '0') return false;
+    return !v026;
+}
+
+/// The answer for STRATA_MMVQ_IL_89 given the variable's text (nullptr = unset): "1" on and "0" off win over everything, anything else (unset,
+/// empty, other text) is the rule above.
+inline bool mmvq_il_89_resolve(const char* env, bool hip, int cc, bool v026 = false) {
+    if (env != nullptr && env[0] == '1') return true;
+    if (env != nullptr && env[0] == '0') return false;
+    return mmvq_il_89_default(hip, cc, v026);
+}
+
 /// STRATA_GR_UP_WIDE (the hyper-connection up projection, one warp a row; bitwise the old kernel) when the user set nothing: ON for a compute
 /// capability 12.0 card (STRATA_SM120_PERF=0 turns the set off), CUDA builds only.
 inline bool gr_up_wide_default(bool hip, int major, int minor, bool v026 = false) { return !v026 && !hip && sm120_default(major, minor); }
+
+/// STRATA_PREFILL_LAYER_MAJOR (#3976: the layer-major prompt walk, which reads each layer's streamed experts once per super-chunk instead of once
+/// per chunk; another summation order of the routed experts, so KL-checked, not bitwise) when the user set nothing: ON for a CUDA layer split
+/// (`stages` = the number of GPUs the prompt path runs on, 2 or more), OFF on one GPU, in a HIP build and under STRATA_DEFAULTS=026.  Measured on
+/// 2x RTX A4000 (sm_86) with Qwen3.8-Flash-Next IQ3_XXS and streamed experts only.  The engine adds its own per-prompt declines (image prompts,
+/// DFlash2 taps, KVA, a batch read that yields, a peer GPU, no VRAM for a super-chunk): those read the chunk-major path as before.
+inline bool prefill_layer_major_default(bool hip, int stages, bool v026 = false) { return !v026 && !hip && stages >= 2; }
+
+/// The answer for STRATA_PREFILL_LAYER_MAJOR given the variable's text (nullptr = unset): any text that starts a number other than 0 is on, "0" (or any
+/// text that reads as 0) is off, both win over everything; unset or empty is the rule above.  An explicit "1" is honoured on one GPU too (the
+/// opt-in of the first ports); a HIP build still declines at run time.
+inline bool prefill_layer_major_resolve(const char* env, bool hip, int stages, bool v026 = false) {
+    if (env != nullptr && env[0] != '\0') return std::atoi(env) != 0;
+    return prefill_layer_major_default(hip, stages, v026);
+}
 
 }  // namespace strata

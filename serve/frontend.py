@@ -955,14 +955,24 @@ class OutputParser:
         # the client has no tool to run).  The Responses route leaves it off: a Codex compaction request keeps its
         # conversation's tools in the prompt only, and its calls come back as before.
         self.declared_only = declared_only
-        # PR #3556: the native namespace__member spelling of a declared namespace.member tool is accepted without advertising a
-        # duplicate tool.  Only an unambiguous alias counts (two namespaces can end in the same member), and an exactly declared
+        # A declared namespace.member tool is also accepted as namespace__member (PR #3556),
+        # namespace=member (Qwen writes the <function= tag's equals sign into the name),
+        # namespace_member (one underscore dropped), and the bare member when exactly one
+        # declared tool has it. Only an unambiguous alias counts, and an exactly declared
         # name always wins over an alias.
         aliases = {}
         for name in self.schemas:
             if isinstance(name, str) and "." in name:
                 namespace, member = name.rsplit(".", 1)
-                aliases.setdefault(f"{namespace}__{member}", set()).add(name)
+                for alias in (f"{namespace}__{member}", f"{namespace}={member}",
+                              f"{namespace}_{member}", member):
+                    aliases.setdefault(alias, set()).add(name)
+        # #3796: the same tool written with every `__` collapsed to `_` (`mcp__playwright__browser_navigate` as
+        # `mcp_playwright_browser_navigate`, the way Qwen often flattens a name) is that tool.  Only a spelling of a declared
+        # name: a reordered or renamed tool (`server1_label_values` for `label_values_mcp_server1`) is not guessed.
+        for name in self.schemas:
+            if isinstance(name, str) and "__" in name:
+                aliases.setdefault(name.replace("__", "_"), set()).add(name)
         self.aliases = {alias: next(iter(names)) for alias, names in aliases.items()
                         if len(names) == 1 and alias not in self.schemas}
         self.unread = 0              # #3441: `<tool_call>` blocks that opened like a call and were returned as text

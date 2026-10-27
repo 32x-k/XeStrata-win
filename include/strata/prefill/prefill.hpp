@@ -169,6 +169,11 @@ public:
     /// build with the pointer-table MMQ (STRATA_MMQ_TAB).
     static size_t slot_guard_bytes();
 
+    /// STRATA_EXPERT_NIBBLE=1: whether every converted layer's experts reach the prompt path's MMQ gather only (the
+    /// GGUF blocks rebuilt from the 4-bit slots); false with the first layer and the reason in `why`.  Pure: the
+    /// layers' formats, the environment and the visible GPUs (generate.cpp asks once, before anything is allocated).
+    static bool nibble_prompt_check(std::string& why);
+
     /// Positions [pos0, pos0 + n) holding `tokens`; `ss.ple_prev` must be the two tokens before pos0 (oldest
     /// first, -1 for none) and is advanced to the last two of these.
     bool run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
@@ -257,10 +262,29 @@ public:
     /// the share is on for chunks below 1024 tokens (STRATA_PREFILL_CPU_SHARE=0 turns it off).
     static void arm_cpu_share(bool applies, bool by_default = false);
 
+    /// Layer-major prefill (STRATA_PREFILL_LAYER_MAJOR=1): true while `on_chunk` reports a sub-chunk before the end of
+    /// its super-chunk.  The session state is already at the super-chunk's end then, so no checkpoint may be taken.
+    /// On a layer split it is the last stage's (the one that reports the rows), asked through the first.
+    bool layer_major_mid() const {
+        const Prefill* p = this;
+        while (p->next_ != nullptr) p = p->next_;
+        return p->lm_mid_;
+    }
+
 private:
     static uint64_t bytes_needed_impl(const core::ModelGeometry& g, const core::SessionState& ss, int64_t chunk,
                                       bool owned_pages, bool src);
     kernels::cpu::ExpertPool* cpu_pool_ = nullptr;   ///< set_cpu_pool
+    // Layer-major prefill: the super-chunk's buffers for an n-token prompt (its size, 0 = not this prompt: `why`),
+    // the run, and the buffers given back after it.  `cap` (> 0): at most that many tokens (a layer split's stages
+    // share one size); lm_prepare_chain sizes every stage of a split.
+    int64_t lm_prepare(int64_t n, std::string& why, int64_t cap = 0);
+    int64_t lm_prepare_chain(int64_t n, std::string& why);
+    void lm_release_chain();
+    bool run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
+    void lm_release();
+    bool lm_mid_ = false;
+    bool lm_by_default_ = false;   ///< the walk is on because nothing was set (a wider VRAM margin, the measured super-chunk size)
     // Stage-1 pipeline: intermediate stages return after handing their chunk to
     // the direct successor. The public run() drains the chain once at prompt end.
     bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);

@@ -303,6 +303,24 @@ int main() {
         CHECK(!gr_up_wide_default(true, 12, 0));
         CHECK(!gr_up_wide_default(false, 8, 6));
         CHECK(!gr_up_wide_default(false, 12, 1));
+        // #3453: the sm_89 MMVQ-IL tables: on by default for compute capability 8.9 only, off under 026 and in HIP; "1" and "0" win
+        CHECK(mmvq_il_89_default(false, 89));
+        CHECK(!mmvq_il_89_default(false, 86) && !mmvq_il_89_default(false, 80) && !mmvq_il_89_default(false, 90) &&
+              !mmvq_il_89_default(false, 120) && !mmvq_il_89_default(false, 75) && !mmvq_il_89_default(false, 70) &&
+              !mmvq_il_89_default(false, 60) && !mmvq_il_89_default(false, 0));
+        CHECK(!mmvq_il_89_default(true, 89));
+        CHECK(!mmvq_il_89_default(false, 89, true));                       // STRATA_DEFAULTS=026
+        CHECK(mmvq_il_89_resolve(nullptr, false, 89, false));              // unset: the rule
+        CHECK(!mmvq_il_89_resolve(nullptr, false, 89, true));              // unset + 026: off
+        CHECK(!mmvq_il_89_resolve(nullptr, false, 86, false));             // another card: off
+        CHECK(!mmvq_il_89_resolve("0", false, 89, false));                 // STRATA_MMVQ_IL_89=0 turns it off
+        CHECK(mmvq_il_89_resolve("1", false, 89, true));                   // an explicit =1 wins over the master switch
+        CHECK(mmvq_il_89_resolve("1", false, 86, false));                  // (the tables are only looked up for cc 89 anyway)
+        CHECK(mmvq_il_89_resolve("", false, 89, false) && !mmvq_il_89_resolve("", false, 89, true));   // empty text: the rule
+        // #3779: the two sm_80-only defaults (wide dequant, MMVQ-IL sm_80 tables): on unless STRATA_DEFAULTS=026; "1" and "0" win
+        CHECK(sm80_default_on(nullptr, false) && !sm80_default_on(nullptr, true));
+        CHECK(!sm80_default_on("0", false) && sm80_default_on("1", true));
+        CHECK(sm80_default_on("", false) && !sm80_default_on("", true));
         // GR_V3 and IMMA
         CHECK(gr_v3_default(false, 12, 0, false, 72.0 * GiB, false));
         CHECK(!gr_v3_default(false, 12, 0, false, 72.0 * GiB, true));
@@ -377,6 +395,31 @@ int main() {
         CHECK(!prompt_attn_imma_default(false, 70));                        // Volta
         CHECK(!prompt_attn_imma_default(false, 60));                        // Pascal (P100)
         CHECK(!prompt_attn_imma_default(true, 120));                        // HIP
+    }
+    {
+        using namespace strata;
+        // the layer-major prompt walk (#3976): on by default for a CUDA layer split only
+        CHECK(prefill_layer_major_default(false, 2));                       // 2x RTX A4000 / A6000: measured 5x time to first token
+        CHECK(prefill_layer_major_default(false, 4));
+        CHECK(!prefill_layer_major_default(false, 1));                      // one GPU: opt-in only
+        CHECK(!prefill_layer_major_default(false, 0));
+        CHECK(!prefill_layer_major_default(true, 2));                       // HIP builds
+        CHECK(!prefill_layer_major_default(false, 2, true));                // STRATA_DEFAULTS=026
+        CHECK(!prefill_layer_major_default(true, 1, true));
+        // the variable wins in both directions, whatever the rule says
+        CHECK(!prefill_layer_major_resolve("0", false, 2));                 // the off switch
+        CHECK(prefill_layer_major_resolve("1", false, 1));                  // the opt-in of the first ports: one GPU too
+        CHECK(prefill_layer_major_resolve("1", false, 2, true));            // explicit beats STRATA_DEFAULTS=026
+        CHECK(!prefill_layer_major_resolve("0", false, 2, false));
+        CHECK(!prefill_layer_major_resolve("0", true, 2));
+        CHECK(prefill_layer_major_resolve("2", false, 1));                  // any non-zero number is on
+        CHECK(!prefill_layer_major_resolve("off", false, 2));               // text that reads as 0 is off (atoi), as before this rule existed
+        // unset or empty: the rule
+        CHECK(prefill_layer_major_resolve(nullptr, false, 2));
+        CHECK(prefill_layer_major_resolve("", false, 2));
+        CHECK(!prefill_layer_major_resolve(nullptr, false, 1));
+        CHECK(!prefill_layer_major_resolve(nullptr, false, 2, true));
+        CHECK(!prefill_layer_major_resolve(nullptr, true, 2));
     }
     return fails ? 1 : 0;
 }
