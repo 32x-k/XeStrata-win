@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // serve/web/app.js - the Strata web app: Chat, Monitor, About. No framework, no network beyond this server.
 // The Monitor tab rebuilds PR #22's dashboard idea (code-martin) on the server's own /metrics.
+/* global StrataI18n */   // serve/web/i18n.js, math.js, preview.js, loaded before this file
 "use strict";
 
 const $ = (id) => document.getElementById(id);
@@ -1320,16 +1321,37 @@ $("drawer-close").onclick = () => openDrawer(false);
 $("scrim").onclick = () => openDrawer(false);
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && $("drawer").dataset.open === "true") openDrawer(false); });
 
+// ------------------------------------------------------------------ language (serve/web/i18n.js)
+// The user's own choice, kept in this browser: English until they pick another. /?lang=de shows one for this visit only.
+const urlLang = new URLSearchParams(location.search).get("lang");
+$("lang").innerHTML = StrataI18n.LANGUAGES.map(([code, name]) => `<option value="${esc(code)}">${esc(name)}</option>`).join("");
+function showLanguage() {
+  $("lang").value = StrataI18n.lang;
+  renderChat();
+  setBusy(!!busy);
+  if (lastMetrics) render(lastMetrics);
+}
+$("lang").onchange = async () => {
+  store.set("lang", $("lang").value);
+  await StrataI18n.setLanguage($("lang").value);
+  showLanguage();
+};
+
 // ------------------------------------------------------------------ start
-setBusy(false);
-renderChat();
-const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
-if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
-thinkingButtons();   // the four of before until /health says the model's own
-loadHealth().then(loadSwitcher).then(loadMcp).then(() => loadUpdate()).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
-showTab(location.hash.slice(1) || "chat");
-poll();
-setInterval(() => { if (!switching) loadSwitcher(); }, 15000);   // a switch started elsewhere shows here too
+async function start() {
+  await StrataI18n.setLanguage(urlLang || store.get("lang", "en"));
+  $("lang").value = StrataI18n.lang;
+  setBusy(false);
+  renderChat();
+  const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
+  if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
+  thinkingButtons();   // the four of before until /health says the model's own
+  loadHealth().then(loadSwitcher).then(loadMcp).then(() => loadUpdate()).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
+  showTab(location.hash.slice(1) || "chat");
+  poll();
+  setInterval(() => { if (!switching) loadSwitcher(); }, 15000);   // a switch started elsewhere shows here too
+}
+start();
 
 // ------------------------------------------------------------------ images (POST /v1/images/generations)
 function readAsDataURL(f) {
