@@ -31,7 +31,9 @@
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/dsv41/moe_win.hpp"
 #include "strata/dsv41/sampler.hpp"
+#if defined(STRATA_USE_HIP)
 #include "wmma_gemm.h"   // strata_pf_gemm_f16_ld: the RDNA3 WMMA dense GEMM (gemm() prefers it over hipBLAS on gfx11; -Isrc/prefill)
+#endif
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -6354,7 +6356,6 @@ struct Model::Impl {
         ++n_calls;
         double tp0 = now_ms();
         const float lim = g.lim;
-        const double tp0 = now_ms();
         {   // (os::prefetch_cold, as above: the resident ones are left alone - on Windows the hint walks every page of a
             // range, ~0.13 ms an IQ2_XXS expert, on the lane's critical path before the first entry computes.
             // off by default (the mmap path, owner PC: not faster in every pair); DS4_IQ_PF_COLD=1 turns it on)

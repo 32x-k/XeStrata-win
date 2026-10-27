@@ -434,7 +434,7 @@ inline uint64_t huge_free_bytes() {
 /// or the kernel cannot.  (Unlike THP, a pin of this memory keeps 2 MB pages: a DMA from it does not need 4 KB
 /// translations, which is what DS4_COPY_PIN's registered arena wanted.)
 inline void* huge_alloc(size_t bytes, size_t* got = nullptr) {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__APPLE__)   // (macOS has no MAP_HUGETLB)
     (void) bytes, (void) got;
     return nullptr;
 #else
