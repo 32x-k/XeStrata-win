@@ -23,11 +23,11 @@ path = ["data/gguf_fingerprints.json", "serve/web/locales/*.json"]
 SPDX-FileCopyrightText = ["2026 Niko1221 and the Strata contributors", "2026 MistVVK and the XeStrata contributors"]
 SPDX-License-Identifier = "LGPL-3.0-or-later AND MIT"
 
-# the icon sprite: upstream's, with the icons of later upstream versions that XeStrata has taken in
+# the icon sprite: upstream's as it is (0.2.7)
 [[annotations]]
 path = ["serve/web/sprite.svg"]
-SPDX-FileCopyrightText = ["2026 Niko1221 and the Strata contributors", "2026 MistVVK and the XeStrata contributors"]
-SPDX-License-Identifier = "LGPL-3.0-or-later AND MIT"
+SPDX-FileCopyrightText = ["2026 Niko1221 and the Strata contributors"]
+SPDX-License-Identifier = "MIT"
 
 # XeStrata's own files without a comment of their own: the expert profiles of the other models
 [[annotations]]
