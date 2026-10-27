@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
-// src/image/strata_image.cpp - strata-image: Qwen-Image-2.1, Mage-Flow or HunyuanImage 3.0 text to image on the GPU.
+// src/image/strata_image.cpp - strata-image: Qwen-Image-2.1, Mage-Flow, HunyuanImage 3.0 or MOSS-Image text to image on
+// the GPU.
 //
 //   strata-image --dit DIT.gguf --vae VAE.safetensors --text TEXT_ENCODER.gguf [--vision MMPROJ.gguf]
 //                [--budget-mib M] (--ids 1,2,3 [--drop N] [--width W] [--height H] [--seed S] [--sigmas 1,...,0]
@@ -22,6 +23,12 @@
 // then carry each reference's block before the prompt (hunyuanimage3_pipeline.hpp).  Mage-Flow's edits take
 // its edit DiT (--edit-dit) and Qwen3-VL-4B's mmproj (--vision), up to three --ref; --dit-keep 1, the default, keeps the
 // DiT not in use in RAM between a generation and an edit (0: read from its file again).
+// MOSS-Image's DiT is its diffusers transformer folder (or a safetensors file of its weights) with the Flux2 VAE
+// (--vae, its narrower decoder) and Qwen3.5-9B's GGUF (--text): its prompt in its own chat form, all of it (--drop 0),
+// guidance with --neg-ids (the empty negative prompt's ids, the model's own) and --cfg (its 3), --steps (50) and
+// --shift (5) its schedule's, --uncond-skip the blocks the negative pass skips (22; none), skip-layer guidance with
+// --slg-layers and --slg-scale, both active from --slg-start to --slg-stop (shares of the steps, 0 and 1), and --te /
+// --neg-te the chat engine's states (its ENCODE files) in place of encoding the ids.
 //
 // One image: --ids, the prompt in the model's chat form, tokenized (the server's tokenizer); --drop, the leading ids of
 // the system turn; --budget-mib, the VRAM the engine may take (default: the free VRAM); --repeat, the image again N
@@ -46,9 +53,12 @@
 //                            <scale> is HunyuanImage 3.0's guidance token instead (it samples once: no NEG:, no CFG:);
 //                            PREVIEW:<steps, commas>: partial images after those steps, each a line PREVIEW <index>
 //                            <step> <path> before the next STEP, its RGBA8 rows at <out path>.p<index>
+//                            MOSS-Image's SHIFT:, USKIP:<blocks|none>, SLG:<blocks>, SLGSCALE:, SLGSTART:, SLGSTOP:
+//                            as the options, and TE:<path>, NEGTE:<path> the chat engine's states
 //   NEED <width> <height> <n> [REF:<path>]... [MASK:<path>] [INIT:<path>] [NEG:<n>]  the VRAM an image of n prompt
 //                            ids needs (from the files); MASK: or INIT:, a base image (with a strength below 1 and
-//                            references, MASK:<their first>); NEG: guidance's negative prompt of n ids
+//                            references, MASK:<their first>); NEG: guidance's negative prompt of n ids; TE: the
+//                            states come from the chat's engine (MOSS-Image: no text encoder counted)
 //                                                                                          -> NEED least_mib=...
 //                            full_mib=... held_mib=... free_mib=... cap_mib=... host_mib=... (si::QiNeed)
 //   FREE                     the free VRAM and what the engine holds                        -> FREE free_mib=... held_mib=...
@@ -68,6 +78,7 @@
 #include "strata/image/hunyuanimage3_pipeline.hpp"
 #include "strata/image/qi_image_io.hpp"
 #include "strata/image/mf_pipeline.hpp"
+#include "strata/image/moss_pipeline.hpp"
 #include "strata/image/qi_pipeline.hpp"
 
 #include <atomic>
@@ -108,6 +119,23 @@ std::vector<float> parse_sigmas(const std::string& s) {
     return sig;
 }
 
+// a list of block indices, commas ("none" or nothing: no block)
+std::vector<int> parse_blocks(const std::string& s) {
+    std::vector<int> b;
+    if (s == "none") return b;
+    std::stringstream ss(s);
+    for (std::string tok; std::getline(ss, tok, ',');)
+        if (!tok.empty()) b.push_back(std::stoi(tok));
+    return b;
+}
+
+// the chat engine's states file (MossText::read_states) into rows
+void read_states(const std::string& path, std::vector<float>& rows, int64_t& n) {
+    std::string err;
+    int64_t width = 0;
+    if (!si::MossText::read_states(path, rows, n, width, err)) throw std::invalid_argument(err);
+}
+
 si::QiRef read_image(const std::string& path) {
     si::QiRef f;
     std::string err;
@@ -130,18 +158,34 @@ std::vector<si::QiRef> read_refs(std::istringstream& ls, si::QiRequest& r) {
         else if (word.rfind("STEPS:", 0) == 0) r.steps = std::stoll(word.substr(6));
         else if (word.rfind("PREVIEW:", 0) == 0)
             for (const int64_t k : parse_ids(word.substr(8))) r.preview.push_back((int) k);
+        else if (word.rfind("SHIFT:", 0) == 0) r.shift = std::stof(word.substr(6));
+        else if (word.rfind("USKIP:", 0) == 0) {
+            r.uncond_skip = parse_blocks(word.substr(6));
+            r.uncond_skip_set = true;
+        }
+        else if (word.rfind("SLG:", 0) == 0) r.slg_layers = parse_blocks(word.substr(4));
+        else if (word.rfind("SLGSCALE:", 0) == 0) r.slg_scale = std::stof(word.substr(9));
+        else if (word.rfind("SLGSTART:", 0) == 0) r.slg_start = std::stof(word.substr(9));
+        else if (word.rfind("SLGSTOP:", 0) == 0) r.slg_stop = std::stof(word.substr(8));
+        else if (word.rfind("TE:", 0) == 0) read_states(word.substr(3), r.te, r.te_rows);
+        else if (word.rfind("NEGTE:", 0) == 0) read_states(word.substr(6), r.neg_te, r.neg_te_rows);
         else if (word.rfind("REF:", 0) == 0) refs.push_back(read_image(word.substr(4)));
         else throw std::invalid_argument("unknown word " + word);
     }
     return refs;
 }
 
-// a NEED line's: the REF:<path> images' sizes; MASK:<path> or INIT:<path> (a base image) sets `mask`, NEG:<n> `n_neg`
-std::vector<std::pair<int64_t, int64_t>> ref_sizes(std::istringstream& ls, bool& mask, int64_t& n_neg) {
+// a NEED line's: the REF:<path> images' sizes; MASK:<path> or INIT:<path> (a base image) sets `mask`, NEG:<n> `n_neg`,
+// TE:<path> (the chat engine's states) `states`
+std::vector<std::pair<int64_t, int64_t>> ref_sizes(std::istringstream& ls, bool& mask, int64_t& n_neg, bool& states) {
     std::vector<std::pair<int64_t, int64_t>> sizes;
     for (std::string word; ls >> word;) {
         if (word.rfind("MASK:", 0) == 0 || word.rfind("INIT:", 0) == 0) {
             mask = true;
+            continue;
+        }
+        if (word.rfind("TE:", 0) == 0 || word.rfind("NEGTE:", 0) == 0) {
+            states = true;
             continue;
         }
         if (word.rfind("NEG:", 0) == 0) {
@@ -279,10 +323,13 @@ int serve(si::ImagePipeline& p) {
                 int64_t w = 0, h = 0, n = 0;
                 ls >> w >> h >> n;
                 if (!ls) throw std::invalid_argument("NEED <width> <height> <n> [REF:<path>]... [MASK:<path>]");
-                bool mask = false;
+                bool mask = false, states = false;
                 int64_t n_neg = 0;
-                const auto sizes = ref_sizes(ls, mask, n_neg);
+                const auto sizes = ref_sizes(ls, mask, n_neg, states);
+                auto* moss = dynamic_cast<si::MossPipeline*>(&p);
+                if (moss != nullptr) moss->set_states_given(states);
                 const si::QiNeed nd = p.need(n, w, h, sizes, mask, n_neg);
+                if (moss != nullptr) moss->set_states_given(false);
                 std::printf("NEED least_mib=%llu full_mib=%llu held_mib=%llu free_mib=%llu cap_mib=%llu host_mib=%llu\n",
                             (unsigned long long) (nd.least >> 20), (unsigned long long) (nd.full >> 20),
                             (unsigned long long) (nd.held >> 20), (unsigned long long) (nd.free >> 20),
@@ -379,6 +426,17 @@ int main(int argc, char** argv) {
             else if (a == "--sigmas") r.sigmas = parse_sigmas(val());
             else if (a == "--steps") r.steps = std::stoll(val());
             else if (a == "--guidance") r.guidance = std::stof(val());
+            else if (a == "--shift") r.shift = std::stof(val());
+            else if (a == "--uncond-skip") {
+                r.uncond_skip = parse_blocks(val());
+                r.uncond_skip_set = true;
+            }
+            else if (a == "--slg-layers") r.slg_layers = parse_blocks(val());
+            else if (a == "--slg-scale") r.slg_scale = std::stof(val());
+            else if (a == "--slg-start") r.slg_start = std::stof(val());
+            else if (a == "--slg-stop") r.slg_stop = std::stof(val());
+            else if (a == "--te") read_states(val(), r.te, r.te_rows);
+            else if (a == "--neg-te") read_states(val(), r.neg_te, r.neg_te_rows);
             else if (a == "--budget-mib") budget = std::stoull(val()) << 20;
             else if (a == "--repeat") repeat = std::stoi(val());
             else if (a == "--serve") serving = true;
@@ -395,10 +453,11 @@ int main(int argc, char** argv) {
         // alone, no weights)
         const bool safetensors = dit.size() > 12 && dit.compare(dit.size() - 12, 12, ".safetensors") == 0;
         const bool hunyuanimage3 = safetensors && si::hunyuanimage3_is_dit_file(dit);
-        const bool mage = safetensors && !hunyuanimage3;
+        const bool moss = !hunyuanimage3 && si::moss_is_dit(dit);
+        const bool mage = safetensors && !hunyuanimage3 && !moss;
         const bool need_text = !hunyuanimage3;
         if (dit.empty() || vae.empty() || (need_text && text.empty()) ||
-            (!serving && ((out.empty() && !ratio) || ids.empty()))) {
+            (!serving && ((out.empty() && !ratio) || (ids.empty() && r.te_rows == 0)))) {
             std::fprintf(stderr, "usage: %s --dit F --vae F --text F [--vision F] [--budget-mib M] (--ids 1,2,3 "
                          "[--drop N] [--width W] [--height H] [--seed S] [--sigmas 1,...,0] [--ref IMAGE]... "
                          "[--mask IMAGE] [--init IMAGE] [--strength F] [--repeat N] --out IMAGE.rgba | --serve) "
@@ -411,6 +470,11 @@ int main(int argc, char** argv) {
                          "--ratio-head F prints the size it chooses (the ids ending with <boi> <img_size_N>) in "
                          "place of an image\n",
                          argv[0]);
+            std::fprintf(stderr, "       %s: MOSS-Image (--dit its transformer folder, --text Qwen3.5-9B's GGUF) takes "
+                         "[--neg-ids I] [--cfg C] [--steps N] [--shift S] [--uncond-skip B,...|none] [--slg-layers "
+                         "B,...] [--slg-scale F] [--slg-start F] [--slg-stop F] [--te F] [--neg-te F] [--init IMAGE] "
+                         "[--strength F] [--mask IMAGE]\n",
+                         argv[0]);
             return 2;
         }
         std::unique_ptr<si::ImagePipeline> pipe;
@@ -419,6 +483,10 @@ int main(int argc, char** argv) {
             auto h = std::make_unique<si::HunyuanImage3Pipeline>();
             if (!h->open(dit, vae, err, 0, vision, ratio_head)) throw std::runtime_error(err);
             pipe = std::move(h);
+        } else if (moss) {
+            auto m = std::make_unique<si::MossPipeline>();
+            if (!m->open(dit, vae, text, err, dit_q8)) throw std::runtime_error(err);
+            pipe = std::move(m);
         } else if (mage) {
             auto m = std::make_unique<si::MfPipeline>();
             if (!m->open(dit, vae, text, err, dit_q8, edit_dit, vision, dit_keep)) throw std::runtime_error(err);

@@ -49,6 +49,19 @@ struct QiRequest {
     // the same either way.  HunyuanImage 3.0 makes none (its VAE needs the room of the sampling's sequence).
     std::vector<int> preview;
     std::function<void(int, int, const std::vector<uint8_t>&)> on_preview;
+    // MOSS-Image's (the other models leave them): its schedule's shift (0: the model's own); the blocks guidance's
+    // negative pass skips (uncond_skip_set false: the model's own, block 22); skip-layer guidance, a third pass of the
+    // prompt with slg_layers skipped, slg_scale times the difference added; both active in the steps from slg_start to
+    // slg_stop (shares of the schedule's steps, as the reference counts them)
+    float shift = 0.0f;
+    std::vector<int> uncond_skip;
+    bool uncond_skip_set = false;
+    std::vector<int> slg_layers;
+    float slg_scale = 0.0f, slg_start = 0.0f, slg_stop = 1.0f;
+    // the text encoder's states made by the chat's engine (MOSS-Image's: [rows][width], every row of the prompt's ids
+    // and of the negative prompt's); empty: the image engine encodes the ids itself
+    std::vector<float> te, neg_te;
+    int64_t te_rows = 0, neg_te_rows = 0;
 };
 
 struct QiTimes {

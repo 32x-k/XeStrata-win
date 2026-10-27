@@ -1,0 +1,102 @@
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// include/strata/image/moss_pipeline.hpp - MOSS-Image's text to image on the GPU: the text encoder's states (Qwen3.5-9B,
+// every token after the final norm: MossText, or the chat's engine's through the request), the DiT's flow sampling
+// from the seed's noise (MossDit), and the Flux2 VAE's image (MfVae, MOSS-Image's narrower decoder), within a VRAM
+// budget.
+//
+// The sampler is the reference pipeline's: Euler over its schedule (the shifted grid snapped to the training's 1000
+// steps), the timestep sigma times 1000, guidance u + cfg (c - u) with the negative prompt (empty by default) whose pass
+// skips block 22, and skip-layer guidance on request (MossDit::Guide).  The seed's noise is PyTorch's on the CPU
+// (torch.randn with a CPU generator, float32, [128][h][w]), as the reference makes it.
+//
+// The budget: the weights that always stay (the DiT's parts outside its blocks and its text embedder, the VAE's), then
+// the DiT's activations (the MLP in bands of rows when the whole would take too much) and its blocks, then the text
+// encoder's fixed part and its blocks (LayerStream).  The encoder stays open beside the DiT only where every block of
+// the DiT fits too; else it is closed once the states are made, the DiT's blocks giving way to it while it runs where
+// they must (a streamed block costs every step, opening the encoder again a second or two a prompt).  The text
+// embedder's weights go once a context is set, where the DiT's blocks do not all fit beside them.  The VAE decodes in
+// what is left, the DiT's activations and then the encoder's layers giving way to it (and in tiles past that).  The
+// same prompt's states are kept, and its context in the DiT.
+//
+// img2img and a mask (img_start.hpp) take the init image through the Flux2 VAE's encoder at the image's size (the
+// posterior's mean).
+#pragma once
+
+#include "strata/image/img_start.hpp"
+#include "strata/image/mf_vae.hpp"
+#include "strata/image/moss_dit.hpp"
+#include "strata/image/moss_text.hpp"
+#include "strata/image/pipeline.hpp"
+
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace strata::image {
+
+/// The reference scheduler's sigmas for n steps at `shift` (training_shift 1, 1000 training steps): the shifted grid
+/// shift v / (1 + (shift - 1) v), v from 1 down to shift / (1000 + shift - 1), each snapped to the nearest of the
+/// training's 1000 sigmas, repeats dropped; then the terminal 0.  In float32, as PyTorch computes it.
+std::vector<float> moss_sigmas(int n, float shift = 5.0f);
+
+/// PyTorch's torch.randn(n, generator=torch.Generator("cpu").manual_seed(seed)) in float32 (its mt19937 and the
+/// Box-Muller of its normal_fill, sixteen values at a time).
+std::vector<float> torch_cpu_randn(uint64_t seed, uint64_t n);
+
+/// The path is MOSS-Image's DiT: a diffusers transformer folder (its config.json's MOSSImageTransformer), or a
+/// safetensors file with its shared modulation.
+bool moss_is_dit(const std::string& path);
+
+class MossPipeline : public ImagePipeline {
+public:
+    /// Reads the parts' files for their sizes; the parts go on the GPU with the first request.  `dit`: the transformer
+    /// (its folder or a file), `vae`: the Flux2 VAE's safetensors, `text`: Qwen3.5-9B's GGUF.  `q8`: the DiT's blocks
+    /// in 8 bits (1), FP16 (0) or by the budget (-1).
+    bool open(const std::string& dit, const std::string& vae, const std::string& text, std::string& err, int q8 = -1);
+
+    void set_budget(uint64_t bytes) override;
+    uint64_t budget() const override { return budget_ > 0 ? budget_ : auto_budget_; }
+    void release(bool all = false) override;
+    void fit(uint64_t reserve) override;
+    uint64_t held() const override;
+    QiNeed need(int64_t n_text, int64_t width, int64_t height,
+                const std::vector<std::pair<int64_t, int64_t>>& refs = {}, bool mask = false,
+                int64_t n_neg = 0) override;
+    /// need() for a request whose states the chat's engine makes (the server's TE:): no text encoder counted
+    void set_states_given(bool given) { states_given_ = given; }
+    std::vector<uint8_t> generate(const QiRequest& r, QiTimes* times = nullptr, QiPlan* plan = nullptr,
+                                  const std::function<bool(int, int)>& step = {},
+                                  const std::function<void(const char*)>& stage = {}) override;
+
+private:
+    QiPlan plan(int64_t hw, int n, int64_t max_text, bool text = false);
+    void ensure_open(bool q8);
+    bool want_q8(int64_t rows, int n, int64_t max_text);
+    bool open_text();
+    void encode(const std::vector<int32_t>& ids, std::vector<float>& out);
+    uint64_t text_fixed() const;
+    void encode_base(const QiRequest& r, const QiRef& base, LatentStart& ls);
+
+    void* s_ = nullptr;
+    std::string dit_path_, vae_path_, text_path_;
+    int q8_ = -1;
+    mutable int w8_faster_ = -1;   // as MfPipeline's: the 8-bit DiT is the faster here (1 yes, 0 no, -1 not timed)
+    mutable int64_t w8_rows_ = 0;
+    bool base_encoder_ = false, states_given_ = false;
+    std::unique_ptr<MossText> te_;
+    std::unique_ptr<MossDit> dit_, dit_size_, dit16_size_;
+    std::unique_ptr<MfVae> vae_, vae_size_;
+    // the text encoder's file: its blocks' bytes, the largest block's, the rest; its fixed VRAM as measured at its
+    // first open and first encode (0: not yet; te_measure_ 0 neither, 1 the open, 2 both)
+    uint64_t te_layers_ = 0, te_layer_max_ = 0, te_other_ = 0, te_fixed_ = 0;
+    int te_measure_ = 0;
+    uint64_t budget_ = 0, auto_budget_ = 0, dit_set_ = 0, te_set_ = 0;
+    int64_t mlp_set_ = -1;
+    std::vector<int32_t> last_ids_, last_neg_ids_;
+    std::vector<float> last_states_, last_neg_states_;
+    std::vector<float> ctx_states_[2];   // the states the DiT's contexts were set from
+};
+
+}  // namespace strata::image
