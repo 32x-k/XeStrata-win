@@ -1111,12 +1111,13 @@ Its answers and state match a run without parking byte for byte:
 with FP16, INT8 (also with KV streaming), Q4_0 and K8V4 KV, and with INT8 on the small configuration (8 GB, no XMX).
 With parking off, the engine gives the same tokens and state as the engine before the change.
 
-### Conversation cache copies on a slow host link (opt-in)
+### Conversation cache copies on a slow host link
 
 Where the card sits behind a slow host link, the conversation cache's copies are on the path of the next request.
 A checkpoint copies the DeltaNet state (118 MB on Qwen3.8-Flash-Next) from the card to RAM, and parking a conversation copies its K/V and its checkpoints before the next prompt can start.
 These variables (the engine's environment) move the copies card-to-card in VRAM and onto background threads (upstream #3779).
-All are off unless set, and the answers and the parked images are the same bytes.
+The answers and the parked images are the same bytes.
+Under `--serve`, when the link to the card probes below 12 GB/s and none of the three is set, `STRATA_CKPT_ASYNC`, `STRATA_CKPT_GATHER` and `STRATA_PARK_ASYNC` are set to 1 by themselves (the start log says so). Otherwise they are off, and setting any of them to 0 keeps all three as set.
 
 - `STRATA_CKPT_ASYNC=1`: a checkpoint's state is copied into a VRAM stage and moved to RAM by a background thread (the checkpoint at the start of the assistant turn into its pinned staging buffer). A reader waits only for the copy it needs. The stage is the size of the state, allocated at the first save; if it cannot be had, the save copies as before.
 - `STRATA_CKPT_VRAM_SLOTS=N` (0-16, with `STRATA_CKPT_ASYNC=1`): the last N saved states also stay in VRAM (N x 118 MB), and a restore from one copies card-to-card.

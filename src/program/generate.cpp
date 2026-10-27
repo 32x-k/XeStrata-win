@@ -3190,10 +3190,12 @@ int main(int argc, char** argv) {
     // link (the copy kernel, since 0.1.14), so on a slower link it must shrink or the window waits for it.  The
     // real H2D bandwidth is probed once; from 20 GB/s up (x16 PCIe 4/5) the measured default stays.  The canonical
     // pack's 0.2 was never measured against the link, so it is left alone.  `--calibrate` measures it outright.
+    double link_gbps = -1.0;   // the host->device link, when probed here (the conversation copies below read it too)
     if (o.pcie_frac < 0.0) {
         const double base = native_pack ? 0.55 : 0.2;
         std::string bursts;
         const double bw = native_pack ? probe_pcie_h2d_gbps(&bursts) : -1.0;
+        link_gbps = bw;
         if (!native_pack) {
             o.pcie_frac = base;
         } else if (bw > 0.0) {
@@ -3203,6 +3205,28 @@ int main(int argc, char** argv) {
         } else {
             o.pcie_frac = base;
             std::fprintf(stderr, "strata generate: PCIe probe failed -> pcie_frac default %.2f\n", base);
+        }
+    }
+    // The conversation cache's copies off the decode's path on a slow host link (upstream 0f7224d16, f73b3c86a,
+    // ca378670b: STRATA_CKPT_ASYNC, STRATA_CKPT_GATHER, STRATA_PARK_ASYNC, opt-in there): on by themselves under
+    // --serve when the link probes below 12 GB/s and none of the three is set.  Measured 2026-10-28 (IQ3_XXS, serve
+    // 32K): the RTX 4070 on a 6.4 GB/s link waited 226 -> 201 ms for a follow-up and decoded 72.1 -> 73.4 tok/s; the
+    // B70 on a 28 GB/s link waited 155 -> 172 ms.  Setting any of them to 0 or 1 keeps the user's choice.
+    if (o.serve && std::getenv("STRATA_CKPT_ASYNC") == nullptr && std::getenv("STRATA_CKPT_GATHER") == nullptr &&
+        std::getenv("STRATA_PARK_ASYNC") == nullptr) {
+        std::string bursts;
+        if (link_gbps <= 0.0) link_gbps = probe_pcie_h2d_gbps(&bursts);
+        if (link_gbps > 0.0 && link_gbps < 12.0) {
+            for (const char* k : {"STRATA_CKPT_ASYNC", "STRATA_CKPT_GATHER", "STRATA_PARK_ASYNC"}) {
+#if defined(_WIN32)
+                _putenv_s(k, "1");
+#else
+                setenv(k, "1", 0);
+#endif
+            }
+            std::fprintf(stderr, "strata generate: the host link carries %.1f GB/s: the conversation cache copies in the "
+                                 "background (STRATA_CKPT_ASYNC, STRATA_CKPT_GATHER and STRATA_PARK_ASYNC; set one to 0 "
+                                 "to keep the copies in line)\n", link_gbps);
         }
     }
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
