@@ -659,6 +659,9 @@ if(STRATA_ENABLE_XE)
                                     src/prefill/plain_prompt_glm5.cpp)
   target_include_directories(strata_prefill PUBLIC include)
   target_link_libraries(strata_prefill PUBLIC strata_engine)
+  # mmq::swiglu_quantize writes the bytes kernels::iq_mmq_quantize writes, and swiglu feeds both: the same
+  # floating-point rules as strata_kernels, or the two paths round differently (an AMD build parted the greedy text)
+  set_source_files_properties(src/prefill/moe_mmq.cpp PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
   if(TARGET onemath)
     # the library and its headers without its usage requirements: oneMath's cuBLAS backend puts
     # -fsycl-targets=nvptx64-nvidia-cuda on them, which would replace the engine's own targets

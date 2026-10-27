@@ -612,9 +612,16 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
             gu.type = up_type; gu.xq = up_xq2 ? P.xq2 : P.xq; gu.dst = P.gu + FF; gu.woff = f.up_off;
         }
         pg.mmq.run(gu, cs);
-        prefill::mmq::swiglu(P.gu + (int64_t) r0 * 2 * FF, P.hh + (int64_t) r0 * FF, nr, FF,
-                             /*interleaved=*/false, cs);
-        prefill::mmq::quantize(P.hh + (int64_t) r0 * FF, nullptr, P.hq, f.d_type, FF, FF, nr, cs);
+        // STRATA_SWIGLU_QUANT=1: swiglu and the down product's int8 rows in one kernel, the same bytes (upstream
+        // dd97421d3); opt-in, as in prefill.cpp
+        static const bool sq = [] { const char* e = std::getenv("STRATA_SWIGLU_QUANT"); return e != nullptr && e[0] == '1'; }();
+        if (sq && FF % 32 == 0) {
+            prefill::mmq::swiglu_quantize(P.gu + (int64_t) r0 * 2 * FF, P.hq, f.d_type, nr, FF, /*interleaved=*/false, cs);
+        } else {
+            prefill::mmq::swiglu(P.gu + (int64_t) r0 * 2 * FF, P.hh + (int64_t) r0 * FF, nr, FF,
+                                 /*interleaved=*/false, cs);
+            prefill::mmq::quantize(P.hh + (int64_t) r0 * FF, nullptr, P.hq, f.d_type, FF, FF, nr, cs);
+        }
         prefill::mmq::Product dn;
         dn.type = f.d_type; dn.w_rows = N; dn.w_cols = FF; dn.n = G; dn.xq = P.hq;
         dn.bounds = P.rbounds + g0 + gi; dn.ids = P.entry + r0; dn.total_rows = nr; dn.max_rows = mr;
