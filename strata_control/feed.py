@@ -33,9 +33,9 @@ SCHEMA_VERSION = 1
 FEED_NAME = "strata-feed.json"
 SIGNATURE_SUFFIX = ".sig"
 FORMATS = ("tar.gz", "tar.xz", "zip")
-PLATFORMS = ("windows-x86_64", "linux-x86_64", "macos-arm64", "macos-x86_64")
-#: Tauri's names for the same platforms.
-TAURI_TARGETS = {"windows-x86_64": "windows-x86_64", "linux-x86_64": "linux-x86_64",
+PLATFORMS = ("windows-x86_64", "linux-x86_64", "linux-aarch64", "macos-arm64", "macos-x86_64")
+#: Tauri's names for the same platforms (no desktop app is built for linux-aarch64: the entry only keeps the name parsable).
+TAURI_TARGETS = {"windows-x86_64": "windows-x86_64", "linux-x86_64": "linux-x86_64", "linux-aarch64": "linux-aarch64",
                  "macos-arm64": "darwin-aarch64", "macos-x86_64": "darwin-x86_64"}
 _VERSION = re.compile(r"\d+\.\d+\.\d+(?:\.\d+)?")
 _HEX64 = re.compile(r"[0-9a-f]{64}")
