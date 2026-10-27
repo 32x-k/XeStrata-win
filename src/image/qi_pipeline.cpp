@@ -163,7 +163,7 @@ void QiPipeline::set_budget(uint64_t bytes) {
 void QiPipeline::release(bool all) {
     if (!(dit_ && vae_ && te_)) return;
     if (all) {   // every buffer the parts hold goes with them; the next request opens them again
-        gpu::stream_sync(s_);
+        drop_kept();
         te_.reset();
         dit_.reset();
         vae_.reset();
@@ -261,14 +261,26 @@ void QiPipeline::edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::v
         }
     }
     std::vector<std::pair<int64_t, int64_t>> grids;   // each reference's worked size
+    // their latents (owned by kept_): the kept ones for the same references, else encoded again
+    const std::string key = refs_key(r.refs);
+    const bool same = key == kept_.refs && kept_.z.size() == r.refs.size();
+    if (!same) {
+        drop_kept(false);
+        kept_.refs.clear();
+    }
     for (const QiRef& f : r.refs) {
         if (f.width <= 0 || f.height <= 0 || f.rgba.size() != (size_t) (f.width * f.height * 4))
             throw std::invalid_argument("image engine: a reference image is empty");
         int64_t rw = 0, rh = 0;
         qi_ref_size(f.width, f.height, rw, rh);
-        // resized as stable-diffusion.cpp resizes it (nearest), 0 .. 1; the vision encoder's input over white
-        std::vector<float> rgba((size_t) (4 * rh * rw)), rgb((size_t) (3 * rh * rw));
-        for (int64_t y = 0; y < rh; ++y)
+        // resized as stable-diffusion.cpp resizes it (nearest), 0 .. 1; the vision encoder's input over white (neither
+        // needed for kept states and a kept latent)
+        std::vector<float> rgba, rgb;
+        if (vision || !same) {
+            rgba.resize((size_t) (4 * rh * rw));
+            rgb.resize((size_t) (3 * rh * rw));
+        }
+        for (int64_t y = 0; y < (vision || !same ? rh : 0); ++y)
             for (int64_t x = 0; x < rw; ++x) {
                 const uint8_t* px = f.rgba.data() + ((y * f.height / rh) * f.width + x * f.width / rw) * 4;
                 const float a = (float) px[3] / 255.f;
@@ -287,17 +299,25 @@ void QiPipeline::edit_refs(const QiRequest& r, std::vector<int32_t>& ids, std::v
             v.grid_w = was.grid_w;
             vouts.push_back(std::move(v));
         }
+        grids.emplace_back(rw, rh);
+        if (same) {
+            ref_z.push_back(kept_.z[ref_z.size()]);
+            continue;
+        }
         float *d = nullptr, *z = nullptr;
-        if (!gpu::alloc_device(&d, rgba.size() * 4) || !gpu::alloc_device(&z, (size_t) (64 * (rh / 16) * (rw / 16)) * 4))
+        if (!gpu::alloc_device(&z, (size_t) (64 * (rh / 16) * (rw / 16)) * 4))
             throw std::runtime_error(std::string("image engine: GPU memory: ") + gpu::last_error());
+        kept_.z.push_back(z);
         ref_z.push_back(z);
+        if (!gpu::alloc_device(&d, rgba.size() * 4))
+            throw std::runtime_error(std::string("image engine: GPU memory: ") + gpu::last_error());
         gpu::copy(d, rgba.data(), rgba.size() * 4);
         vae_->encode(d, rh, rw, z);
         gpu::free(d);
-        grids.emplace_back(rw, rh);
     }
     vision_.reset();   // its weights go: an edit opens it again
     vae_->drop_scratch();
+    kept_.refs = key;   // every reference's latent is in kept_ now
     if (vision) {   // their shapes, for the next edit of the same request and references
         last_vision_.clear();
         for (const QiVisionOut& v : vouts) {
@@ -359,13 +379,7 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     std::vector<QiVisionOut> vouts;
     std::vector<QiText::Image> te_images;
     std::vector<QiDit::Ref> dit_refs;
-    std::vector<float*> ref_z;
-    struct FreeZ {
-        std::vector<float*>& z;
-        ~FreeZ() {
-            for (float* p : z) gpu::free(p);
-        }
-    } free_z{ref_z};
+    std::vector<float*> ref_z;   // the references' latents (kept_'s)
     const bool mask = !r.mask.rgba.empty();
     const QiRef* base = base_image(r);
     if ((mask || r.strength < 1.0) && base == nullptr)
@@ -512,6 +526,13 @@ void QiPipeline::encode_base(const QiRequest& r, const QiRef& base, LatentStart&
     }
     ensure_open();
     if (!vae_->has_encoder()) throw std::invalid_argument("image engine: the VAE file has no encoder for a base image");
+    const int64_t n = dit_->channels() * (r.height / 16) * (r.width / 16);
+    float* z0 = ls.base(n);
+    const std::string key = refs_key({base}) + "@" + std::to_string(r.width) + "x" + std::to_string(r.height);
+    if (kept_.base_z != nullptr && key == kept_.base) {   // the same image at the same size: its kept latent
+        gpu::copy_async(z0, kept_.base_z, (size_t) n * 4, s_);
+        return;
+    }
     const std::vector<uint8_t> px = resize_nearest(base, r.width, r.height);
     const int64_t HW = r.width * r.height;
     std::vector<float> rgba((size_t) (4 * HW));
@@ -520,12 +541,33 @@ void QiPipeline::encode_base(const QiRequest& r, const QiRef& base, LatentStart&
     float* d = nullptr;
     if (!gpu::alloc_device(&d, rgba.size() * 4))
         throw std::runtime_error(std::string("image engine: GPU memory: ") + gpu::last_error());
-    float* z0 = ls.base(dit_->channels() * (r.height / 16) * (r.width / 16));
     gpu::copy(d, rgba.data(), rgba.size() * 4);
     const bool ok = vae_->encode(d, r.height, r.width, z0);
     gpu::free(d);
     vae_->drop_scratch();
     if (!ok) throw std::runtime_error("image engine: the VAE's encoder failed on the base image");
+    // kept for the next request of the same image (1 MiB at 1024 x 1024); without the room, not kept
+    if (kept_.base_z != nullptr) gpu::free(kept_.base_z);
+    kept_.base_z = nullptr;
+    kept_.base.clear();
+    if (gpu::alloc_device(&kept_.base_z, (size_t) n * 4)) {
+        gpu::copy_async(kept_.base_z, z0, (size_t) n * 4, s_);
+        kept_.base = key;
+    }
 }
+
+void QiPipeline::drop_kept(bool base_too) {
+    gpu::stream_sync(s_);
+    for (float* p : kept_.z) gpu::free(p);
+    kept_.z.clear();
+    kept_.refs.clear();
+    if (base_too) {
+        if (kept_.base_z != nullptr) gpu::free(kept_.base_z);
+        kept_.base_z = nullptr;
+        kept_.base.clear();
+    }
+}
+
+QiPipeline::~QiPipeline() { drop_kept(); }
 
 }  // namespace strata::image

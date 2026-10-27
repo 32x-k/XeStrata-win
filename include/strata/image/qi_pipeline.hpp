@@ -48,6 +48,7 @@ public:
     /// Frees what the engine holds on the GPU beyond its fixed weights (the cache): the next request loads again.
     /// `all`: the fixed weights and the products' scratch too (the parts are opened again on the next request).
     void release(bool all = false) override;
+    ~QiPipeline() override;
     /// The budget set to what the engine holds and the VRAM free now, less `reserve` (another program's room): taken
     /// before a request when the GPU's memory is shared.
     void fit(uint64_t reserve) override;
@@ -107,6 +108,15 @@ private:
     /// these, without the vision encoder, whose output only the text encoder reads
     std::vector<int32_t> last_req_ids_, last_req_neg_;
     std::vector<QiVisionOut> last_vision_;
+    /// The VAE's latents kept for the same images: the references' (the DiT's input; refs_key of them, empty none) and
+    /// a mask's or img2img's base image's at the picture's size (its key and the size): an edit of the same images
+    /// again encodes neither
+    struct Kept {
+        std::string refs, base;
+        std::vector<float*> z;
+        float* base_z = nullptr;
+    } kept_;
+    void drop_kept(bool base_too = true);
 };
 
 }  // namespace strata::image
