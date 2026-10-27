@@ -365,3 +365,9 @@ main { flex: 1; min-height: 0; display: flex; }
 }
 
 .st-toast .st-btn { white-space: nowrap; }
+
+/* Raster MCP results remain visible outside the collapsed tool details. */
+.tool-image { margin: 16px 0; max-width: 100%; }
+.tool-image img { display: block; width: 100%; max-width: 640px; height: auto; border-radius: var(--st-r-md); }
+.tool-image figcaption { margin-top: 10px; }
+.tool-image a:not([href]) { opacity: .5; pointer-events: none; }
