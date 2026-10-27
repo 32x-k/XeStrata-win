@@ -7524,6 +7524,7 @@ int main(int argc, char** argv) {
         // a failed write loses only the saved copy: the conversation is read again when it comes back
         auto save_one = [&](const strata::core::SavedConversation& image, const char* why) {
             if (!disk.enabled()) return;
+            strata::core::conversation_checkpoint_join(nullptr);   // STRATA_CKPT_ASYNC: its running states have landed
             const auto t0 = Clock::now();
             size_t written = 0;
             std::string de;
@@ -7806,7 +7807,9 @@ int main(int argc, char** argv) {
             if (as_tail) {   // only one tail checkpoint stays alive: the previous request's goes
                 const int64_t old_tail = tail_ckpt_len;
                 checks.erase(std::remove_if(checks.begin(), checks.end(), [&](const ConvCheckpoint& k) {
-                                 return old_tail >= 0 && (int64_t) k.ids.size() == old_tail;
+                                 if (old_tail < 0 || (int64_t) k.ids.size() != old_tail) return false;
+                                 strata::core::conversation_checkpoint_join(k.gdn.data());   // (STRATA_CKPT_ASYNC)
+                                 return true;
                              }), checks.end());
                 tail_ckpt_len = L;
             } else if (L == tail_ckpt_len) {
@@ -7839,6 +7842,8 @@ int main(int argc, char** argv) {
                                                                  tail_flags.get(), pin_flags.get())
                     : strata::program::conv_cache::eviction_victim(stamps.data(), n, o.prompt_cache, tail_flags.get(),
                                                                    pin_flags.get());
+                // STRATA_CKPT_ASYNC: the victim's copy may still be in flight (a no-op for any other)
+                strata::core::conversation_checkpoint_join(checks[victim].gdn.data());
                 checks.erase(checks.begin() + (std::ptrdiff_t) victim);
             }
         };
@@ -7857,6 +7862,7 @@ int main(int argc, char** argv) {
             if (parts != nullptr) {
                 if (parts->size() != stages.size() + 1) return false;
                 c.gdn = std::move((*parts)[0].gdn);
+                c.dev_tag = (*parts)[0].dev_tag;
                 c.ple = std::move((*parts)[0].ple);
                 c.tails = std::move((*parts)[0].tails);
                 c.dead = std::move((*parts)[0].dead);
@@ -7865,7 +7871,7 @@ int main(int argc, char** argv) {
             } else if (stage && ckpt_staging != nullptr && stages.empty() && ckpt_staged_len < 0) {
                 std::string e;
                 if (!strata::gpu::device_sync() || !strata::core::conversation_checkpoint_stage(ckpt_staging, ckpt_stream, ss, g,
-                                                                                             (size_t) L, e)) {
+                                                                                             (size_t) L, e, &c.dev_tag)) {
                     std::fprintf(stderr, "strata serve: checkpoint stage: %s\n", e.c_str());
                     return false;
                 }
@@ -8965,9 +8971,10 @@ int main(int argc, char** argv) {
                 if (!strata::gpu::device_sync()) { e = "batch admission: device sync failed"; return false; }
                 strata::core::ConversationCheckpoint ck;
                 ck.ids = ids;
-                if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
-                    !strata::core::conversation_checkpoint_restore(ck, to, g, e))
-                    return false;
+                const bool moved = strata::core::conversation_checkpoint_save(ck, from, g, e) &&
+                                   strata::core::conversation_checkpoint_restore(ck, to, g, e);
+                strata::core::conversation_checkpoint_join(ck.gdn.data());   // (STRATA_CKPT_ASYNC: before `ck` goes)
+                if (!moved) return false;
                 for (int64_t j = from.qsa_ord0; j < from.qsa_ord0 + from.qsa_alloc; ++j) {   // the owned layers
                     strata::core::ConversationKv img;
                     if (!strata::core::conversation_kv_save(img, from.qsa_states[j], g, upto, true, e)) return false;
@@ -9007,9 +9014,10 @@ int main(int argc, char** argv) {
             } else {
                 strata::core::ConversationCheckpoint ck;
                 ck.ids = bs[(size_t) b].ids;
-                if (!strata::core::conversation_checkpoint_save(ck, from, g, e) ||
-                    !strata::core::conversation_checkpoint_restore(ck, ss, g, e))
-                    return false;
+                const bool moved = strata::core::conversation_checkpoint_save(ck, from, g, e) &&
+                                   strata::core::conversation_checkpoint_restore(ck, ss, g, e);
+                strata::core::conversation_checkpoint_join(ck.gdn.data());   // (STRATA_CKPT_ASYNC: before `ck` goes)
+                if (!moved) return false;
             }
             for (int64_t j = from.qsa_ord0; j < from.qsa_ord0 + from.qsa_alloc; ++j) {
                 strata::core::ConversationKv img;
@@ -9601,6 +9609,9 @@ int main(int argc, char** argv) {
                     std::fflush(stdout);
                 };
                 strata::core::progress_at(save ? "saving a session" : "restoring a session");
+                // the background copy of the last checkpoint (STRATA_CKPT_ASYNC) lands before anything below copies, frees
+                // or writes the checkpoints
+                strata::core::conversation_checkpoint_join(nullptr);
                 if (path.empty()) { refuse("missing path"); continue; }
                 if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
                 if (o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
@@ -10043,6 +10054,7 @@ int main(int argc, char** argv) {
             }
             cur = ids;
             const Clock::time_point r0 = Clock::now();
+            strata::core::conversation_checkpoint_join(nullptr);   // STRATA_CKPT_ASYNC: the last save's copy has landed
             // ---- where this request starts reading: the live session, or a checkpoint, whose tokens AND pictures are
             // exactly the start of this prompt - at most n - 1 of them, the last token is always the first window
             auto starts_with = [&](const std::vector<int32_t>& pre, const std::vector<ImgKey>& pre_imgs) -> bool {

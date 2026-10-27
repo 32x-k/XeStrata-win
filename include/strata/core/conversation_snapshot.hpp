@@ -65,6 +65,13 @@ bool conversation_checkpoint_validate(const ConversationCheckpoint& checkpoint, 
                                       const ModelGeometry& g, std::string& error);
 bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const SessionState& session,
                                   const ModelGeometry& g, std::string& error);
+/// STRATA_CKPT_ASYNC=1 (opt-in): conversation_checkpoint_save (and _stage) copies the GDN state into a VRAM stage and
+/// moves it into the checkpoint's host vector (the staging) on a background thread, so the copy over the link overlaps
+/// what follows (the rest of the prompt, the reply).  This waits for that copy; every reader of a checkpoint's bytes
+/// calls it first (restore, snapshot save and restore, the parked copies, the session file, the serve loop at each
+/// request, unstage).  No-op when nothing is in flight.
+/// `only` (non-null): wait only when the copy in flight is into those bytes (a checkpoint's `gdn.data()`, the staging).
+void conversation_checkpoint_join(const void* only = nullptr);
 bool conversation_checkpoint_restore(const ConversationCheckpoint& checkpoint, SessionState& session,
                                      const ModelGeometry& g, std::string& error);
 /// A checkpoint's save in two steps: `stage` copies the running state into `staging` (pinned host memory of
@@ -72,8 +79,9 @@ bool conversation_checkpoint_restore(const ConversationCheckpoint& checkpoint, S
 /// and waits for it, `unstage` later fills `checkpoint` (its ids set) from it on the host, as
 /// conversation_checkpoint_save would have.  The reply waits only for the copies over the link.
 size_t conversation_checkpoint_staged_bytes(const SessionState& session, const ModelGeometry& g);
+/// `dev_tag` (optional): the tag of the GDN state's VRAM copy (STRATA_CKPT_VRAM_SLOTS; 0: none), for the checkpoint.
 bool conversation_checkpoint_stage(void* staging, void* stream, const SessionState& session, const ModelGeometry& g,
-                                   size_t tokens, std::string& error);
+                                   size_t tokens, std::string& error, uint64_t* dev_tag = nullptr);
 bool conversation_checkpoint_unstage(ConversationCheckpoint& checkpoint, const void* staging,
                                      const SessionState& session, const ModelGeometry& g, std::string& error);
 

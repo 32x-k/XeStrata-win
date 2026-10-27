@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -28,6 +29,9 @@ struct ConversationCheckpoint {
     std::vector<ConversationImageKey> imgs;
     std::vector<uint8_t> gdn, ple, tails, dead, block_pos;
     uint64_t used = 0; // upstream root-pinned/LRU checkpoint retention
+    // STRATA_CKPT_VRAM_SLOTS: the tag of the device copy of `gdn` (0: none).  Set by conversation_checkpoint_save (and
+    // the staged save), the only writers of a checkpoint's GDN bytes besides a whole copy, which keeps the tag.
+    uint64_t dev_tag = 0;
     // A shared-prefix pin (the request key pin=N): this checkpoint is the read-only prefix many suffix queries branch
     // from, so retention never evicts it (conv_cache.hpp) and a parked conversation holding it stays parked.  A run-time
     // mark only: it is not in the session file, a request that pins the same prefix again sets it.
@@ -79,6 +83,9 @@ struct SavedConversation {
     std::vector<ConversationCheckpoint> checkpoints;
     std::vector<ConversationKv> kv; // main layers followed by the draft layer
     bool cvec = true;
+    // STRATA_CKPT_ASYNC: set while a background copy fills `live.gdn`; its deleter waits for that copy, and as the last
+    // member it runs before any buffer is freed (whichever copy of the image goes last)
+    std::shared_ptr<void> live_pending;
 
     /// Holds a pinned shared prefix (see ConversationCheckpoint::pinned): the parked-conversation budget keeps it.
     bool pinned() const {
