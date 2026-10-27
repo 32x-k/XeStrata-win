@@ -32,8 +32,10 @@ def sh(cmd: str) -> tuple[int, str]:
 
 def check_setup(data_dir: str) -> tuple[bool, str]:
     rc, out = sh(f"{PY} setup.py --check --yes --data-dir '{data_dir}' 2>&1 | head -8")
-    ok = "unified memory" in out and "arm64" in out
-    return ok, out.strip().splitlines()[0] if out.strip() else "no output"
+    low = out.lower()
+    ok = "unified memory" in low and "arm64" in low
+    gpu = next((line.strip() for line in out.splitlines() if "GPU:" in line), "")
+    return ok, gpu or (out.strip().splitlines()[0] if out.strip() else "no output")
 
 
 def bench(config: str, cell: str, out_dir: str) -> dict | None:
