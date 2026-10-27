@@ -103,6 +103,22 @@ int env_tri(const char* name) {
 double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+// rows past the chunk that the Metal expert tile may read (its 16-row load of the last partial tile); CUDA and HIP allocate none
+#if defined(STRATA_METAL)
+constexpr size_t kH16Pad = 16;
+#else
+constexpr size_t kH16Pad = 0;
+#endif
+// the embedding rows' upload: asynchronous on the device's stream; on Metal a synchronous copy (the batched dispatches read the rows when
+// they are committed, and h_emb is written again by the next window)
+inline cudaError_t emb_upload(void* dst, const void* src, size_t n, cudaStream_t s) {
+#if defined(STRATA_METAL)
+    (void) s;
+    return cudaMemcpy(dst, src, n, cudaMemcpyHostToDevice);
+#else
+    return cudaMemcpyAsync(dst, src, n, cudaMemcpyHostToDevice, s);
+#endif
+}
 
 size_t align256(size_t n) { return (n + 255) & ~(size_t) 255; }
 
@@ -1265,7 +1281,7 @@ struct Model::Impl {
         return e;
     }
     void prof_mark(const Dev& d, int stage) {
-        if (std::getenv("DS4_TLOG")) {   // the host's own phase times (what the GPU meters do not see)
+        if (ds4_dbg("DS4_TLOG")) {   // the host's own phase times (what the GPU meters do not see)
             static double t_last = 0, acc[5] = {0, 0, 0, 0, 0}; static long n = 0; static bool reg = false;
             if (!reg) {
                 reg = true;
@@ -1862,6 +1878,7 @@ struct Model::Impl {
         for (int r = 0; r < 3; ++r)
             if (!gg::type_on_device(l.lay.K[r])) {
                 l.cpu_only = true;
+#if defined(STRATA_METAL)
                 static bool said = false;   // (a mixed pack has many such layers: one line, not one a layer)
                 if (!said) {
                     said = true;
@@ -1870,6 +1887,12 @@ struct Model::Impl {
                                  "experts stay on the CPU lane (ggml-cpu's rows; VRAM tier: none)\n",
                                  gg::type_name(l.lay.K[r]));
                 }
+#else
+                std::fprintf(stderr,
+                             "ds4: layer %d %s is %s: no GPU kernel for it, its experts stay on the CPU lane "
+                             "(ggml-cpu's rows; VRAM tier: none)\n", l.il, r == 2 ? "down" : "gate/up",
+                             gg::type_name(l.lay.K[r]));
+#endif
                 break;
             }
         return true;
@@ -2529,7 +2552,7 @@ struct Model::Impl {
                       dalloc(d, d.ext, ((size_t) g.win + W) * g.hd, err) && dalloc(d, d.xe, P * D, err) &&
                       dalloc(d, d.xg, P * g.ff, err) && dalloc(d, d.xu, P * g.ff, err) && dalloc(d, d.xhh, P * g.ff, err) &&
                       dalloc(d, d.ed, P * D, err) && dalloc(d, d.plan_ptr, P, err);
-        if (ok && std::getenv("DS4_DBG_DEVH"))
+        if (ok && ds4_dbg("DS4_DBG_DEVH"))
             std::fprintf(stderr, "DBG devh: id=%d h=%p h2=%p\n", d.id, (void*) d.h, (void*) d.h2);
             if (!ok) return false;
             d.attn_scr.max_t = kAttnScratchT;
@@ -2697,7 +2720,7 @@ struct Model::Impl {
                 err = "embed.weight: read failed";
                 return false;
             }
-            if (std::getenv("DS4_DBG_EMB")) std::fprintf(stderr,
+            if (ds4_dbg("DS4_DBG_EMB")) std::fprintf(stderr,
                     "DBG emb pinned: %04x %04x %04x %04x  (row1: %04x %04x)\n",
                     (unsigned) embed_pinned[0], (unsigned) embed_pinned[1],
                     (unsigned) embed_pinned[2], (unsigned) embed_pinned[3],
@@ -3244,7 +3267,7 @@ struct Model::Impl {
                       dalloc(d, c.rw, C * kPicks, err) && dalloc(d, c.bounds, 2048, err) &&
                       dalloc(d, c.row_tok, C * kPicks, err) && dalloc(d, c.pos, C * kPicks, err) &&
                       dalloc(d, c.sg, C * FF, err) && dalloc(d, c.su, C * FF, err) && dalloc(d, c.sh16, C * FF, err) &&
-                      dalloc(d, c.h16, (C + 16) * FF, err) && dalloc(d, c.y, C * D, err) && dalloc(d, c.w16, c.w16_elems, err) &&
+                      dalloc(d, c.h16, (C + kH16Pad) * FF, err) && dalloc(d, c.y, C * D, err) && dalloc(d, c.w16, c.w16_elems, err) &&
                       halloc(c.bounds_pin, 2048, err);
             if (!ok) return false;
             if (has_first && !dalloc(d, c.emb, C * D, err)) return false;
@@ -6088,7 +6111,7 @@ struct Model::Impl {
                 std::memcpy(d.second.first, r.dst, (size_t) hd);
                 std::memcpy(d.second.second, r.scales, (size_t) hd / 32);
             }
-            if (std::getenv("DS4_DBG_EG") && pk.eg_hd >= 32) {   // DBG: a row whose IQ4_NL block scale is not finite
+            if (ds4_dbg("DS4_DBG_EG") && pk.eg_hd >= 32) {   // DBG: a row whose IQ4_NL block scale is not finite
                 for (size_t i = 0; i < b.reads.size(); ++i) {
                     const EgRead& r = b.reads[i];
                     for (int k = 0; k < hd / 32; ++k) {
@@ -6312,7 +6335,7 @@ struct Model::Impl {
             la_guess.assign(L.size(), {});
             pool = new LaPool();
         }
-        if (std::getenv("DS4_CPU_LOG") && !reg) {
+        if (ds4_dbg("DS4_CPU_LOG") && !reg) {
             reg = true;
             static Impl* self = this;
             std::atexit([] { std::fprintf(stderr, "lookahead: %ld of %ld CPU-lane experts were guessed; %ld matrices queued\n", self->la_hit, self->la_all, self->la_issued); });
@@ -6352,8 +6375,9 @@ struct Model::Impl {
             return;
         }
         static double t_pre = 0, t_q1 = 0, t_r1 = 0, t_q2 = 0, t_r2 = 0; static long n_calls = 0; static bool reg = false;
-        if (std::getenv("DS4_CPU_LOG") && !reg) { reg = true; std::atexit([] { std::fprintf(stderr, "cpu_experts_iq phases (ms over %ld calls): prefetch %.1f, quant1 %.1f, gate_up %.1f, quant2 %.1f, down %.1f\n", n_calls, t_pre, t_q1, t_r1, t_q2, t_r2); }); }
-        ++n_calls;
+        if (ds4_dbg("DS4_CPU_LOG") && !reg) { reg = true; std::atexit([] { std::fprintf(stderr, "cpu_experts_iq phases (ms over %ld calls): prefetch %.1f, quant1 %.1f, gate_up %.1f, quant2 %.1f, down %.1f\n", n_calls, t_pre, t_q1, t_r1, t_q2, t_r2); }); }
+        const bool cpulog = ds4_dbg("DS4_CPU_LOG");   // (the Mac engine's counters; false elsewhere)
+        if (cpulog) ++n_calls;
         double tp0 = now_ms();
         const float lim = g.lim;
         {   // (os::prefetch_cold, as above: the resident ones are left alone - on Windows the hint walks every page of a
@@ -6365,7 +6389,7 @@ struct Model::Impl {
                     for (int r = 0; r < 3; ++r) want.push_back({mx_mat(l, en.e, r), mx_part_bytes(l, r)});
             static const bool pf_all = std::getenv("DS4_IQ_PF_COLD") == nullptr || std::atoi(std::getenv("DS4_IQ_PF_COLD")) == 0;
 #if defined(__APPLE__)   // (macOS: the cold reads of a call's matrices in parallel, and a page-cache census under DS4_CPU_LOG)
-            if (pf_all && std::getenv("DS4_CPU_LOG")) {   // how many of the experts' matrices are in the page cache (mincore, the first 64 pages)
+            if (pf_all && ds4_dbg("DS4_CPU_LOG")) {   // how many of the experts' matrices are in the page cache (mincore, the first 64 pages)
                 static long cold_n = 0, warm_n = 0; static double cold_ms = 0, warm_ms = 0; static bool reg2 = false;
                 if (!reg2) { reg2 = true; std::atexit([] { std::fprintf(stderr, "prefetch: %ld matrices cold (%.1f ms), %ld warm (%.1f ms)\n", cold_n, cold_ms, warm_n, warm_ms); }); }
                 for (const auto& w : want) {
@@ -6393,7 +6417,7 @@ struct Model::Impl {
             else os::prefetch_cold(want);
 #endif
         }
-        double tp1 = now_ms(); t_pre += tp1 - tp0;
+        double tp1 = now_ms(); if (cpulog) t_pre += tp1 - tp0;
         // the activations in c_xh's bytes, E 4 apart: token t's (t < kWin) at row t - quantized once, whatever number of
         // entries take it - then a row a slot (kWin + slot): a token past the window's input (none on the decode or
         // chunk paths), then (x no longer needed) the slot's h
@@ -6412,7 +6436,7 @@ struct Model::Impl {
                     gg::iq_cpu_quant(fm.gu_act, x + (size_t) t * ldx, E, x_act(en, i));
                 }
         }
-        double tq1 = now_ms(); t_q1 += tq1 - tp1;
+        double tq1 = now_ms(); if (cpulog) t_q1 += tq1 - tp1;
         std::function<void(int)> f[4];
         for (int X = 0; X < NH; ++X)
             f[X] = [&, X](int j) {
@@ -6430,12 +6454,12 @@ struct Model::Impl {
                                    r0 - X * FFh, r1 - X * FFh, lim);
             };
         run_nodes(ne * GB, f);
-        double tr1 = now_ms(); t_r1 += tr1 - tq1;
+        double tr1 = now_ms(); if (cpulog) t_r1 += tr1 - tq1;
         for (const Ent& en : ents)
             for (int i = 0; i < en.n; ++i)
                 gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF, FF,
                                  aq + (size_t) (kWin + en.slot0 + i) * E * 4);
-        double tq2 = now_ms(); t_q2 += tq2 - tr1;
+        double tq2 = now_ms(); if (cpulog) t_q2 += tq2 - tr1;
         for (int X = 0; X < NH; ++X)
             f[X] = [&, X](int j) {
                 const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / DB] : j / DB)];
@@ -6449,7 +6473,7 @@ struct Model::Impl {
                 gg::iq_cpu_down(fm, mx_part_ptr(l, en.e, 2, X), hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
             };
         run_nodes(ne * DB, f);
-        t_r2 += now_ms() - tq2;
+        if (cpulog) t_r2 += now_ms() - tq2;
         {   // DS4_PROF: where the CPU lane's time goes (act prep + prefetch, gate/up, h quant, down), summed
             static const bool on = std::getenv("DS4_PROF") != nullptr;
             if (on) {
@@ -7408,16 +7432,16 @@ struct Model::Impl {
         Dev& d = devs[(size_t) d_dev];
         cudaSetDevice(d.id);
         for (int t = 0; t < T; ++t) std::memcpy(h_emb + (size_t) t * D, embed_pinned + (size_t) tk[t] * D, (size_t) D * 2);
-        CK(cudaMemcpy(d.emb_rows, h_emb, (size_t) T * D * 2, cudaMemcpyHostToDevice));
+        CK(emb_upload(d.emb_rows, h_emb, (size_t) T * D * 2, d.st));
         embed(d.emb_rows, T, d.h, D, H, d.st);
-        if (std::getenv("DS4_DBG_EMB")) {
+        if (ds4_dbg("DS4_DBG_EMB")) {
             ds4_metal_flush();
             float *hp = d.h;
             float hh[4] = {0,0,0,0};
             cudaMemcpy(hh, hp, sizeof(hh), cudaMemcpyDeviceToHost);
             std::fprintf(stderr, "DBG at embed site %d: h[0..3] = %g %g %g %g\n", __LINE__, hh[0], hh[1], hh[2], hh[3]);
         }
-        if (std::getenv("DS4_DBG_EMB")) {
+        if (ds4_dbg("DS4_DBG_EMB")) {
             ds4_metal_flush();
             float hh[4] = {0, 0, 0, 0};
             cudaMemcpy(hh, d.h, sizeof(hh), cudaMemcpyDeviceToHost);
@@ -7746,9 +7770,14 @@ struct Model::Impl {
         }
         prof_mark(d, 4);
         // attention
+#if defined(STRATA_METAL)
         // the mix and the split in one dispatch (hc_mix + hc_split were two, back to back on the same token)
         hc_mix_split(c.h, l.hca_fn, g.hc * g.dim, (2 + g.hc) * g.hc, T, g.eps, c.mix, l.hca_scale, l.hca_base, H,
                      g.sinkhorn, g.hc_eps, c.a_pre, c.a_post, c.a_comb, s);
+#else
+        if (!hc_mix_chunk(d, c, c.h, l.hca_fn, T, c.mix, err)) return false;
+        hc_split(c.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, c.a_pre, c.a_post, c.a_comb, s);
+#endif
         dump_sub(d, "mix0", l.il, p0, T, c.mix, (size_t) T * 32 * 4);
         hc_pre_norm(c.h, c.pre, l.attn_norm, D, H, T, g.eps, c.x, s);
         dump_sub(d, "a_mix", l.il, p0, T, c.mix, (size_t) T * 32 * 4);
@@ -7971,9 +8000,14 @@ struct Model::Impl {
         if (dump_l != nullptr && mi == 0) dump_layer(d, c.h, 1000 + l.il, p0, T);   // (after the attention, as the window path)
         prof_mark(d, 1);
         // the MoE
+#if defined(STRATA_METAL)
         // the FFN half of the same fusion: mix and split in one dispatch
         hc_mix_split(c.h, l.hcf_fn, g.hc * g.dim, (2 + g.hc) * g.hc, T, g.eps, c.mix, l.hcf_scale, l.hcf_base, H,
                      g.sinkhorn, g.hc_eps, c.f_pre, c.f_post, c.f_comb, s);
+#else
+        if (!hc_mix_chunk(d, c, c.h, l.hcf_fn, T, c.mix, err)) return false;
+        hc_split(c.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, c.f_pre, c.f_post, c.f_comb, s);
+#endif
         hc_pre_norm(c.h, c.a_pre, l.ffn_norm, D, H, T, g.eps, c.x, s);
         x3::rows_f16(c.x, D, nullptr, T, D, c.x16, s);
         gemv_f32(l.gate_w, c.x, l.n_exp, D, T, c.glog, 1024, s);   // (F32 x: the token path's bits)
@@ -8254,7 +8288,7 @@ struct Model::Impl {
                     CK(cudaMemcpyAsync(c.emb, c.emb_host[slot], (size_t) T * D * 2, cudaMemcpyHostToDevice, s));
                     CK(cudaEventRecord(c.emb_ev[slot], s));
                     embed(c.emb, T, c.h, D, H, s);
-                    if (std::getenv("DS4_DBG_EMB")) {
+                    if (ds4_dbg("DS4_DBG_EMB")) {
                         ds4_metal_flush();
                         float *hp = c.h;
                         float hh[4] = {0,0,0,0};
@@ -8427,7 +8461,7 @@ struct Model::Impl {
                         CK(cudaMemcpyAsync(c.emb, c.emb_host[slot], (size_t) T * D * 2, cudaMemcpyHostToDevice, s));
                         CK(cudaEventRecord(c.emb_ev[slot], s));
                         embed(c.emb, T, c.h, D, H, s);
-                        if (std::getenv("DS4_DBG_EMB")) {
+                        if (ds4_dbg("DS4_DBG_EMB")) {
                             ds4_metal_flush();
                             float *hp = c.h;
                             float hh[4] = {0,0,0,0};
@@ -8937,7 +8971,7 @@ struct Model::Impl {
                          : yoco_mode() == 2 ? g.win : (g.nl - yl) * (g.win - 1) + g.win;
         const int a = yl > 0 && n - keep >= kYocoMin ? n - keep : 0;
         const int nc = (n + chunk - 1) / chunk, per = (n + nc - 1) / nc;
-        if (std::getenv("DS4_DBG_CHUNK")) std::fprintf(stderr, "forward_chunks n %d nc %d per %d\n", n, nc, per);
+        if (ds4_dbg("DS4_DBG_CHUNK")) std::fprintf(stderr, "forward_chunks n %d nc %d per %d\n", n, nc, per);
         Run run;
         for (int x = 0; x < n; x += per) {
             run.p0.push_back(pos + x);
@@ -9394,13 +9428,13 @@ struct Model::Impl {
     bool forward_serial(int64_t p0, int T, std::string& err) {
         const int D = g.dim, H = g.hc;
         int cur = L[0].dev;
-        if (std::getenv("DS4_SYNC_WIN")) cudaDeviceSynchronize();
+        if (ds4_dbg("DS4_SYNC_WIN")) cudaDeviceSynchronize();
         {
             Dev& d = devs[(size_t) cur];
             cudaSetDevice(d.id);
-            CK(cudaMemcpy(d.emb_rows, h_emb, (size_t) T * D * 2, cudaMemcpyHostToDevice));
+            CK(emb_upload(d.emb_rows, h_emb, (size_t) T * D * 2, d.st));
             embed(d.emb_rows, T, d.h, D, H, d.st);
-            if (std::getenv("DS4_DBG_EMB")) {
+            if (ds4_dbg("DS4_DBG_EMB")) {
                 ds4_metal_flush();
                 float *hp = d.h;
                 float hh[4] = {0,0,0,0};
@@ -9408,7 +9442,7 @@ struct Model::Impl {
                 std::fprintf(stderr, "DBG at embed site %d: h[0..3] = %g %g %g %g\n", __LINE__, hh[0], hh[1], hh[2], hh[3]);
             }
             init_pre(d.pre, T, d.st);
-            if (std::getenv("DS4_DBG_EMB")) dbg_h("after init_pre", d, T);
+            if (ds4_dbg("DS4_DBG_EMB")) dbg_h("after init_pre", d, T);
         }
         std::vector<float> dump;
         if (dump_h != nullptr) dump.resize((size_t) T * g.nl * H * D);
@@ -9435,7 +9469,7 @@ struct Model::Impl {
                 cur = l.dev;
             }
             if (!tap(devs[(size_t) l.dev], il, T, err)) return false;
-            if (il == 0 && std::getenv("DS4_DBG_EMB")) dbg_h("after tap", devs[(size_t) l.dev], T);
+            if (il == 0 && ds4_dbg("DS4_DBG_EMB")) dbg_h("after tap", devs[(size_t) l.dev], T);
             if (!layer(l, 0, p0, T, wplan, err)) return false;
             if (dump_h != nullptr) {   // DS4_DUMP_H: every layer's residual stream, for tools/ds4/compare.py --layers
                 Dev& dd = devs[(size_t) l.dev];
@@ -9508,9 +9542,9 @@ struct Model::Impl {
             if (!started) {   // the window's input: the embedding rows, or the previous group's hand-off
                 started = true;
                 if (il == 0) {
-                    CK(cudaMemcpy(d.emb_rows, h_emb, (size_t) T * D * 2, cudaMemcpyHostToDevice));
+                    CK(emb_upload(d.emb_rows, h_emb, (size_t) T * D * 2, s));
                     embed(d.emb_rows, T, d.h, D, H, s);
-                    if (std::getenv("DS4_DBG_EMB")) {
+                    if (ds4_dbg("DS4_DBG_EMB")) {
                         ds4_metal_flush();
                         float *hp = d.h;
                         float hh[4] = {0,0,0,0};
@@ -9587,7 +9621,7 @@ struct Model::Impl {
         const int D = g.dim, H = g.hc, HD = g.hd, NHL = l.ahn, HQ = NHL * HD, OG = l.ogn, FF = l.ffn;
         const ArGroup& ag = groups[(size_t) L0.grp].ar;
         const float* freqs = l.ratio ? d.freqs_comp : d.freqs_win;
-        if (std::getenv("DS4_DBG_SLOTS") && l.il < 2 && l.lay.fmt == gg::kFmtMXFP4) {   // DBG: a resident expert's bytes against its file's
+        if (ds4_dbg("DS4_DBG_SLOTS") && l.il < 2 && l.lay.fmt == gg::kFmtMXFP4) {   // DBG: a resident expert's bytes against its file's
             ds4_metal_flush();
             int shown = 0;
             for (int e = 0; e < l.n_exp && shown < 3; ++e) {
@@ -9602,8 +9636,8 @@ struct Model::Impl {
                 ++shown;
             }
         }
-        if (std::getenv("DS4_TRACE_DISP")) std::fprintf(stderr, "TRACE layer %d p0=%lld T=%d\n", l.il, (long long) p0, T);
-        if (std::getenv("DS4_DBG_H") && mi == 0 && (l.il < 2 || std::getenv("DS4_DBG_ALL"))) {   // DBG
+        if (ds4_dbg("DS4_TRACE_DISP")) std::fprintf(stderr, "TRACE layer %d p0=%lld T=%d\n", l.il, (long long) p0, T);
+        if (ds4_dbg("DS4_DBG_H") && mi == 0 && (l.il < 2 || ds4_dbg("DS4_DBG_ALL"))) {   // DBG
             std::vector<float> hv((size_t) T * H * D);
             cudaSetDevice(d.id);
             ds4_metal_flush();
@@ -9641,7 +9675,7 @@ struct Model::Impl {
             engram_dequant(d.eg_rows, sc, T * cols, ehd, d.eg_x, s, (int) eg_fmt[(size_t) l.eg]);
             dump_sub(d, "eg_rows", l.il, p0, T, d.eg_rows, (size_t) T * cols * ehd);
             dump_sub(d, "eg_x", l.il, p0, T, d.eg_x, (size_t) T * cols * ehd * 4);
-            if (std::getenv("DS4_DBG_EG")) {
+            if (ds4_dbg("DS4_DBG_EG")) {
                 dbg_nf("eg_x", l.il, d.eg_x, (size_t) T * cols * ehd);
                 const float* xv = (const float*) strata::gpu::host_view(d.eg_x);
                 for (size_t i = 0; i < (size_t) T * cols * ehd; ++i)
@@ -9656,13 +9690,13 @@ struct Model::Impl {
                     }
             }
             if (!mv(d, {job(l.eg_wkv, d.eg_x, d.eg_kv, T, (size_t) cols * ehd, (size_t) (H + 1) * D)}, err)) return false;
-            if (std::getenv("DS4_DBG_EG")) dbg_nf("eg_kv", l.il, d.eg_kv, (size_t) T * (H + 1) * D);
+            if (ds4_dbg("DS4_DBG_EG")) dbg_nf("eg_kv", l.il, d.eg_kv, (size_t) T * (H + 1) * D);
             dump_sub(d, "eg_kv", l.il, p0, T, d.eg_kv, (size_t) T * (H + 1) * D * 4);
             dump_sub(d, "eg_h0", l.il, p0, T, d.h, (size_t) T * H * D * 4);
             dump_sub(d, "eg_w", l.il, p0, 1, l.eg_w, (size_t) H * D * 4);
             engram_gate(d.h, d.eg_kv, l.eg_w, H, D, T, g.eps, s);
             dump_sub(d, "eg_h", l.il, p0, T, d.h, (size_t) T * H * D * 4);
-            if (std::getenv("DS4_DBG_EG")) dbg_nf("h_after_gate", l.il, d.h, (size_t) T * H * D);
+            if (ds4_dbg("DS4_DBG_EG")) dbg_nf("h_after_gate", l.il, d.h, (size_t) T * H * D);
         }
         dump_sub(d, "h_in", l.il, p0, T, d.h, (size_t) T * H * D * 4);
         dump_sub(d, "ring_in", l.il, p0, T, l.win, (size_t) g.win * kv_row_bytes(kKvFp8, HD));
@@ -9960,7 +9994,7 @@ struct Model::Impl {
                 if (zc_stage_buf != nullptr && l.zc_tab != nullptr)   // (the store's experts copied to VRAM at the PCIe rate first)
                     zc_stage(d.plan_ptr, d.ridx, l.zc_tab, l.k_exp, zc_stage_buf, zc_stride, l.blob, s);
                 // DS4_TLOG2: the expert stage's three host spans (gate/up issue, the CPU-lane wait, down issue)
-                static const bool tlog2 = std::getenv("DS4_TLOG2") != nullptr;
+                static const bool tlog2 = ds4_dbg("DS4_TLOG2");
                 static double t_moe_gu = 0, t_moe_wait = 0, t_moe_dn = 0; static long t_moe_n = 0; static bool t_moe_reg = false;
                 if (tlog2 && !t_moe_reg) {
                     t_moe_reg = true;
@@ -10035,7 +10069,7 @@ struct Model::Impl {
             return false;
         }
         // (glog rows are 1024 apart: route reads them so)
-        static const bool phases = std::getenv("DS4_PHASES") != nullptr;   // debugging: where a decode layer's host time goes
+        static const bool phases = ds4_dbg("DS4_PHASES");   // debugging: where a decode layer's host time goes
         static double ph[8] = {0}, ph_prev = 0; static long ph_n = 0;
         const double ph0 = phases ? now_ms() : 0.0;
         gemv_f32(l.gate_w, d.x, l.n_exp, D, T, d.glog, 1024, s);
@@ -10066,10 +10100,10 @@ struct Model::Impl {
             if (la_n > 0) CK(cudaEventRecord(d.ev2, s));
         }
 #endif
-        if (std::getenv("DS4_DBG_MOE")) { dbg_nf("x", l.il, d.x, (size_t) T * D); dbg_nf("sg", l.il, d.sg, (size_t) T * g.ff); dbg_nf("su", l.il, d.su, (size_t) T * g.ff);
+        if (ds4_dbg("DS4_DBG_MOE")) { dbg_nf("x", l.il, d.x, (size_t) T * D); dbg_nf("sg", l.il, d.sg, (size_t) T * g.ff); dbg_nf("su", l.il, d.su, (size_t) T * g.ff);
             std::fprintf(stderr, "DBG s1 fmt=%d K=%d k=%d n=%d ld=%d raw=%p\n", l.s1.fmt, l.s1.K, l.s1.k, l.s1.n, l.s1.ld, (void*) l.s1.raw); }
         swiglu(d.sg, d.su, T * g.ff, g.lim, d.sh, s);
-        if (std::getenv("DS4_DBG_MOE")) dbg_nf("sh", l.il, d.sh, (size_t) T * g.ff);
+        if (ds4_dbg("DS4_DBG_MOE")) dbg_nf("sh", l.il, d.sh, (size_t) T * g.ff);
         if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, g.ff, D)}, err)) return false;
         const double tw = now_ms();
         CK(cudaEventSynchronize(d.ev));
@@ -10150,7 +10184,7 @@ struct Model::Impl {
         if (nrows > 0) {
             gather_rows(d.x, ga, nrows, D, d.xe, s);
             dump_sub(d, "xe", l.il, p0, nrows, d.xe, (size_t) nrows * D * 4);
-            { std::vector<int> vmap; for (int i = 0; i < nvex; ++i) { vmap.push_back(vex[i]); vmap.push_back(vrow0[i]); vmap.push_back(vn[i]); }
+            if (dump_s != nullptr) { std::vector<int> vmap; for (int i = 0; i < nvex; ++i) { vmap.push_back(vex[i]); vmap.push_back(vrow0[i]); vmap.push_back(vn[i]); }
               dump_sub_host("vmap", l.il, p0, nvex, vmap.data(), vmap.size() * 4); }
             x3::MvJob j[2 * kWin * kPicks];
             int nj = 0;
@@ -10178,9 +10212,9 @@ struct Model::Impl {
             ds4_metal_kick();   // (the VRAM experts run on the GPU while the CPU lane works)
             ds4_busy_begin();   // (and the GPU is kept out of its idle clocks until the lane is done)
 #endif
-            static const bool skip_cpu = std::getenv("DS4_SKIP_CPU") != nullptr;   // (timing only: the CPU lane's experts left out)
+            static const bool skip_cpu = ds4_dbg("DS4_SKIP_CPU");   // (timing only: the CPU lane's experts left out)
             if (!skip_cpu) cpu_experts(l, h_x, ents);
-            else if (const char* fk = std::getenv("DS4_FAKE_CPU_US")) std::this_thread::sleep_for(std::chrono::microseconds(std::atoi(fk)));   // (timing only)
+            else if (const char* fk = ds4_dbg("DS4_FAKE_CPU_US")) std::this_thread::sleep_for(std::chrono::microseconds(std::atoi(fk)));   // (timing only)
 #if defined(STRATA_METAL)
             ds4_busy_end();
 #endif
@@ -10191,9 +10225,9 @@ struct Model::Impl {
                 const float* y = c_yd.data() + (size_t) sl * D;
                 for (int e = 0; e < D; ++e) o[e] += wv * y[e];
             }
-            { static double ms = 0; static long calls = 0, exps = 0; static bool reg = false;
+            if (ds4_dbg("DS4_CPU_LOG")) { static double ms = 0; static long calls = 0, exps = 0; static bool reg = false;
               ms += now_ms() - tc; ++calls; exps += (long) ents.size();
-              if (std::getenv("DS4_CPU_LOG") && !reg) { reg = true; std::atexit([] { std::fprintf(stderr, "cpu lane calls: %ld, experts %ld, %.1f ms (%.3f ms a call, %.3f ms an expert)%c", calls, exps, ms, ms / (double) calls, ms / (double) exps, 10); }); }
+              if (ds4_dbg("DS4_CPU_LOG") && !reg) { reg = true; std::atexit([] { std::fprintf(stderr, "cpu lane calls: %ld, experts %ld, %.1f ms (%.3f ms a call, %.3f ms an expert)%c", calls, exps, ms, ms / (double) calls, ms / (double) exps, 10); }); }
               (void) 0; (void) ms; }
             st.cpu_ms += now_ms() - tc;
             dump_sub_host("cpu_part", l.il, p0, T, h_part, (size_t) T * D * 4);
@@ -10201,7 +10235,7 @@ struct Model::Impl {
         }
         combine(d.ed, ents.empty() ? nullptr : d.cpu_part, d.sh_out, cm, T, D, d.moe_out, s);
         dump_sub(d, "moe_out", l.il, p0, T, d.moe_out, (size_t) T * D * 4);
-        if (std::getenv("DS4_DBG_MOE")) {
+        if (ds4_dbg("DS4_DBG_MOE")) {
             float hp = 0.0f;
             for (size_t i = 0; i < (size_t) T * D; ++i) hp = std::max(hp, std::fabs(h_part[i]));
             std::fprintf(stderr, "DBG moe il=%d T=%d vram_rows=%d cpu_slots=%d max|h_part|=%.4g", l.il, T, nrows, nslots, (double) hp);
@@ -10323,7 +10357,7 @@ bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
     Impl& p = *p_;
     p.pm.last = -1;
     p.halted = false;
-    if (std::getenv("DS4_DBG_CHUNK")) std::fprintf(stderr, "feed n %d chunk %d chunk_min %d\n", n, p.chunk, p.chunk_min);
+    if (ds4_dbg("DS4_DBG_CHUNK")) std::fprintf(stderr, "feed n %d chunk %d chunk_min %d\n", n, p.chunk, p.chunk_min);
     if (p.chunk > 0 && n >= p.chunk_min) {   // a long run - or one the flow could take, if it is the faster path here
         const double t0 = now_ms();   // (every row's logits (tests): the chunked path, which keeps them all)
         const bool ok = logits_rows > kWin || p.pick_path(n) ? p.forward_chunks(tokens, n, logits_rows, err)

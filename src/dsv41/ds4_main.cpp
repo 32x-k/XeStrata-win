@@ -24,6 +24,7 @@
 #include <unistd.h>
 #include <libproc.h>   // proc_pid_rusage: the bytes this process had the storage read (io_read_bytes)
 #endif
+#include "ds4_launch.h"   // ds4_dbg
 #include "ds4_model.hpp"
 #include "ds4_experts_rule.hpp"
 #include "ds4_os.hpp"
@@ -186,11 +187,11 @@ struct RoundTimes {   // DS4_ROUND_TIMES: where a decode round's time goes (ms, 
     unsigned long long draft_d = 0, verify_d = 0, step_d = 0;
     long rounds = 0, spec_rounds = 0, steps = 0;
     ~RoundTimes() {
-        if (std::getenv("DS4_ROUND_TIMES") && rounds > 0)
+        if (ds4_dbg("DS4_ROUND_TIMES") && rounds > 0)
             std::fprintf(stderr, "rounds: %ld (%ld speculative, %ld plain steps): draft %.1f ms (%.2f a round), verify %.1f ms (%.2f), plain step %.1f ms (%.2f)\n",
                          rounds, spec_rounds, steps, draft, spec_rounds ? draft / (double) spec_rounds : 0.0, verify, spec_rounds ? verify / (double) spec_rounds : 0.0,
                          step, steps ? step / (double) steps : 0.0);
-        if (std::getenv("DS4_ROUND_TIMES") && rounds > 0)
+        if (ds4_dbg("DS4_ROUND_TIMES") && rounds > 0)
             std::fprintf(stderr, "dispatches a round: draft %.0f, verify %.0f, plain step %.0f\n", spec_rounds ? (double) draft_d / (double) spec_rounds : 0.0, spec_rounds ? (double) verify_d / (double) spec_rounds : 0.0, steps ? (double) step_d / (double) steps : 0.0);
     }
 } g_rt;
@@ -1464,7 +1465,7 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "prompt: %zu tokens in %.0f ms (%.2f tok/s, windows of %d)\n", ids.size(), t1 - t0,
                  1000.0 * (double) ids.size() / (t1 - t0), window);
 #if defined(STRATA_METAL)
-    if (std::getenv("DS4_SEQ_LOG")) std::fprintf(stderr, "dispatch seq after the prompt: %llu\n", ds4_dispatch_seq());
+    if (ds4_dbg("DS4_SEQ_LOG")) std::fprintf(stderr, "dispatch seq after the prompt: %llu\n", ds4_dispatch_seq());
 #endif
     const strata::ds4::Stats s0 = m.stats();
     if (s0.eg_rows > 0)
@@ -1489,7 +1490,7 @@ int main(int argc, char** argv) {
             }
             std::printf("%d,", tok);
             std::fflush(stdout);
-            if (std::getenv("DS4_PROGRESS") && out.size() % 200 == 0) {   // (sustained-run time series)
+            if (ds4_dbg("DS4_PROGRESS") && out.size() % 200 == 0) {   // (sustained-run time series)
                 static double tp = now_ms();
                 static size_t np = 0;
                 const double tn = now_ms();

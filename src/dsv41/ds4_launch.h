@@ -26,3 +26,12 @@ namespace strata::gpu {
 inline void* host_view(const void* p) { return const_cast<void*>(p); }
 }
 #endif
+
+// ds4_dbg("NAME"): the Mac engine's opt-in diagnostics (DS4_DBG_*, DS4_CPU_LOG, DS4_TLOG, ...).  On Metal it is an environment
+// lookup; everywhere else it is the constant false, so the CUDA and HIP engines carry none of those checks on their hot paths.
+#if defined(STRATA_METAL)
+#include <cstdlib>
+inline bool ds4_dbg(const char* name) { return std::getenv(name) != nullptr; }
+#else
+constexpr bool ds4_dbg(const char*) { return false; }
+#endif

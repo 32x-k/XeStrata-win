@@ -1,4 +1,4 @@
-﻿// Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+// Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
 // Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 // src/ds4/ds4_gguf.cu - a GGUF's BF16 matrices and MXFP4 experts on the device (see ds4_gguf.cuh).
 #include "ds4_launch.h"   // strata_ds4_launch: <<<>>> on CUDA and HIP, a dispatch on Metal
@@ -8,7 +8,9 @@
 #endif
 
 #include "ds4_iq.cuh"
-#include "ds4_gguf_cpu.hpp"
+#if defined(STRATA_METAL)
+#include "ds4_gguf_cpu.hpp"   // gg_row_to_bf16 (the DS4_DBG_IQ check)
+#endif
 #include "ds4_numerics.cuh"
 
 #include <cuda_fp16.h>
@@ -1086,8 +1088,11 @@ bool type_on_chunk(int type) {
     // ds4_mm.metal instantiates the tile GEMM for IQ2_XXS / IQ2_XS / IQ2_S only; IQ1_M (the 2.00 bpw pack's type) has
     // the matvec kernel but no tile one, so a chunked prompt would stop in "kernel launch with no Metal dispatch".
     if (type == iq::kIQ1_S || type == iq::kIQ4_NL) return false;   // (IQ1_M: the tile kernels since DS4_MM_INST(29) and iq_bs)
-#endif
     return type_on_device(type);
+#else
+    (void) type;
+    return true;   // CUDA and HIP: the chunk path takes whatever the layer holds (types with no GPU kernel stay on the CPU lane)
+#endif
 }
 
 namespace {
@@ -1168,7 +1173,7 @@ x3::Mat view(const x3::Mat& m, int c0, int nc) {
 bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
     if (n <= 0 || n > x3::kMaxMvJobs) return false;
 #if defined(STRATA_METAL)
-    if (std::getenv("DS4_MV_LOG")) {   // how the engine batches its matvec jobs (one call = one quantiser dispatch)
+    if (ds4_dbg("DS4_MV_LOG")) {   // how the engine batches its matvec jobs (one call = one quantiser dispatch)
         static std::atomic<unsigned long long> calls{0}, jobsum{0};
         static std::atomic<unsigned long long> hist[9];
         static std::atomic<int> seen{0};
@@ -1264,7 +1269,7 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
     quant_flush(QI, s);
     for (int f = 0; f < 3; ++f) mv_set(f, J[f], nj[f], max_n[f], max_c[f], vec[f], s);
 #if defined(STRATA_METAL)
-    if (std::getenv("DS4_DBG_Q8") && nj[2] > 0) {   // DBG: the Q8_0 matvec's first job against a host recompute
+    if (ds4_dbg("DS4_DBG_Q8") && nj[2] > 0) {   // DBG: the Q8_0 matvec's first job against a host recompute
         ds4_metal_flush();
         const BfJob& b = J[2].j[0];
         const uint8_t* w = (const uint8_t*) strata::gpu::host_view(b.w);
@@ -1295,7 +1300,7 @@ bool mv(const x3::MvJob* jobs, int n, cudaStream_t s) {
         return false;
     }
 #if defined(STRATA_METAL)
-    if (std::getenv("DS4_DBG_IQ") && nij > 0) {   // DBG: the low-bit matvec's first job against a host decode of its rows
+    if (ds4_dbg("DS4_DBG_IQ") && nij > 0) {   // DBG: the low-bit matvec's first job against a host decode of its rows
         ds4_metal_flush();
         for (int ji = 0; ji < std::min(nij, 2); ++ji) {
             const iq::MvJob& b = IJ[ji];

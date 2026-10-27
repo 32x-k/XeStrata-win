@@ -2153,7 +2153,7 @@ void zc_stage(unsigned long long* plan, const int* idx, const unsigned long long
 
 void init_pre(float* pre, int T, cudaStream_t s) {
 #if defined(STRATA_METAL)
-    if (std::getenv("DS4_SKIP_INITPRE")) return;
+    if (ds4_dbg("DS4_SKIP_INITPRE")) return;
 #endif
 #if defined(STRATA_METAL)
     if (strata::dsv41::metal_host::init_pre(pre, T, s)) return;   // the ported MSL kernel
@@ -2517,7 +2517,7 @@ void ring_restore_batch(const RingBatch& b, int64_t p0, int n, int keep, int T, 
 }
 void hc_mean(const float* h, int T, int hc, int dim, float* out, long long out_stride, cudaStream_t s) {
 #if defined(STRATA_METAL)
-    if (std::getenv("DS4_SKIP_HCMEAN")) return;
+    if (ds4_dbg("DS4_SKIP_HCMEAN")) return;
 #endif
 #if defined(STRATA_METAL)
     // hc_mean_kernel on the Metal dispatch; the launch below is the fallback
