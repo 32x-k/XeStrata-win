@@ -5951,6 +5951,10 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
     if (kva_config().on) { why = "STRATA_KVA is on"; return 0; }
     if (stop_at_chunk) { why = "a batch read that yields at chunk boundaries"; return 0; }
     if (force_chunk_ > 0) { why = "a --prefill-pipe plan sets the chunks of this read"; return 0; }   // (left set for run_impl)
+#if STRATA_EXPERT_NIBBLE_BUILT   // the 4-bit expert slots (STRATA_EXPERT_NIBBLE) are gathered for MMQ only by run_impl
+    for (int64_t l = 0; l < g.n_layers; ++l)
+        if (core::nibble::layer(l).on) { why = "STRATA_EXPERT_NIBBLE (the experts are 4-bit slots)"; return 0; }
+#endif
     // run_impl's debug hooks on the routing and the rows have no layer-major form
     if (std::getenv("STRATA_DBG_FEAT") || std::getenv("STRATA_DBG_ROUTE_OVERRIDE") || std::getenv("STRATA_PREFILL_DUMP_R_ALL")) {
         why = "a routing or row debug dump";
