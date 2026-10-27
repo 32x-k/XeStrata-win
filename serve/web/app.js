@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // serve/web/app.js - the Strata web app: Chat, Monitor, About. No framework, no network beyond this server.
 // The Monitor tab rebuilds PR #22's dashboard idea (code-martin) on the server's own /metrics.
-/* global StrataI18n */   // serve/web/i18n.js, math.js, preview.js, loaded before this file
+/* global StrataI18n, StrataMath */   // serve/web/i18n.js, math.js, preview.js, loaded before this file
 "use strict";
 
 const $ = (id) => document.getElementById(id);
@@ -754,7 +754,7 @@ function markdown(text) {
 // 0.7 / 0.8 / 20 with a presence penalty). Before 0.1.45 the page sent 0.6 itself; a stored 0.6 with the other two
 // values untouched counts as "not set" too.
 const DEFAULTS = {thinking: "", temperature: 1.0, top_p: 0.95, top_k: 20, min_p: "", max: "", seed: "", show: true, esp: true,
-                  mcp: true};
+                  mcp: true, math: false};
 const OLD_DEFAULT_TEMPERATURE = 0.6;
 function samplingUntouched(s) {
   const t = +s.temperature;
@@ -844,16 +844,20 @@ function toolHtml(t, k) {
       `<a href="${esc(u.replace(/^\//, ""))}" target="_blank" rel="noopener"><img src="${esc(u.replace(/^\//, ""))}" alt="${esc(t.tool || "image")}"></a>`).join("")}</div>` : "");
 }
 // the answer's text with the tool blocks where the model called them
+// math (opt-in, serve/web/math.js): formulas become placeholders before the Markdown runs and are drawn after it
+function answerMarkdown(text) {
+  return settings.math ? StrataMath.markdown(text, markdown) : markdown(text);
+}
 function answerHtml(m) {
-  if (!m.tools || !m.tools.length) return markdown(m.text || "");
+  if (!m.tools || !m.tools.length) return answerMarkdown(m.text || "");
   let html = "", pos = 0;
   m.tools.forEach((t, k) => {
     const at = Math.min(Math.max(t.at || 0, pos), m.text.length);
-    if (at > pos) html += markdown(m.text.slice(pos, at));
+    if (at > pos) html += answerMarkdown(m.text.slice(pos, at));
     pos = at;
     html += toolHtml(t, k);
   });
-  return html + markdown(m.text.slice(pos));
+  return html + answerMarkdown(m.text.slice(pos));
 }
 // a tool event from the stream (the `strata_mcp` field of a chunk)
 function onTool(m, x) {
@@ -890,6 +894,7 @@ function updateAssistant(el, m, streaming) {
     bubble.innerHTML = m.reasoning ? `<span class="muted cursor">Writing</span>` : `<span class="cursor"></span>`;
   } else {
     bubble.innerHTML = answerHtml(m);
+    if (settings.math) StrataMath.hydrate(bubble);
     if (streaming) bubble.classList.add("cursor"); else bubble.classList.remove("cursor");
   }
   el.querySelector(".meta-text").textContent = m.meta || (streaming ? "" : m.stopped ? "Stopped" : "");
@@ -1205,6 +1210,7 @@ function loadDrawer(s = settings) {
   for (const b of $("s-thinking").children) b.setAttribute("aria-checked", String(b.dataset.v === level));
   $("s-temp").value = s.temperature; $("s-topp").value = s.top_p; $("s-topk").value = s.top_k;
   $("s-max").value = s.max; $("s-seed").value = s.seed; $("s-minp").value = s.min_p ?? "";
+  $("s-math").setAttribute("aria-checked", String(!!s.math));
   $("s-show").setAttribute("aria-checked", String(!!s.show));
   $("s-esp").setAttribute("aria-checked", String(s.esp !== false));
   $("esp-row").hidden = !projectionLoaded();
@@ -1288,6 +1294,7 @@ function outputs() {
   for (const id of ["s-topp", "s-topk", "s-minp"]) $(id).disabled = t === 0;
 }
 for (const id of ["s-temp", "s-topp", "s-topk"]) $(id).oninput = outputs;
+$("s-math").onclick = () => $("s-math").setAttribute("aria-checked", String($("s-math").getAttribute("aria-checked") !== "true"));
 $("s-show").onclick = () => $("s-show").setAttribute("aria-checked", String($("s-show").getAttribute("aria-checked") !== "true"));
 $("s-esp").onclick = () => $("s-esp").setAttribute("aria-checked", String($("s-esp").getAttribute("aria-checked") !== "true"));
 $("s-mcp").onclick = () => $("s-mcp").setAttribute("aria-checked", String($("s-mcp").getAttribute("aria-checked") !== "true"));
@@ -1298,10 +1305,16 @@ $("s-apply").onclick = async () => {
   settings = {thinking: sel && sel.dataset.v !== thinkingInfo().default ? sel.dataset.v : "", thinking_v: 2, temperature: +$("s-temp").value, top_p: +$("s-topp").value,
               top_k: +$("s-topk").value, min_p: $("s-minp").value.trim(), max: $("s-max").value.trim(),
               seed: $("s-seed").value.trim(),
+              math: $("s-math").getAttribute("aria-checked") === "true",
               show: $("s-show").getAttribute("aria-checked") === "true",
               esp: $("s-esp").getAttribute("aria-checked") === "true",
               mcp: $("s-mcp").getAttribute("aria-checked") === "true"};
   store.set("sampling", settings);
+  StrataMath.reset();                                  // math on or off: every answer is drawn again
+  for (const el of $("chat").querySelectorAll(".st-msg--assistant")) {
+    const m = messages[+el.dataset.i];
+    updateAssistant(el, m, !!busy && busy.msg === m);  // the element send() holds stays the same while an answer streams
+  }
   const share = $("s-share").getAttribute("aria-checked") === "true";
   openDrawer(false);
   if (share || sharedOn) {

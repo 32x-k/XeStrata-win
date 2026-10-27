@@ -1674,7 +1674,7 @@ Strata's design, measurements and bottlenecks are in upstream's paper, **[docs/p
 
 The whole of XeStrata is under the [LGPL-3.0-or-later](../COPYING.LESSER).
 The code from Strata and from ggml / llama.cpp (both MIT) is part of it under the LGPL too; their copyright and permission notices are in [NOTICE](../NOTICE).
-The exceptions stay under their own licenses: the patches to intel/llvm, the changes to oneMath, the copies in `third_party/main/` (`ggml-common.h`, `ggml-common-tq.h`, `quantscope.py`, `stb_image.h`, Outfit) and the patch to AOTriton, and `third_party/nonfree/` (below and [third_party/main/README.md](../third_party/main/README.md)).
+The exceptions stay under their own licenses: the patches to intel/llvm, the changes to oneMath, the copies in `third_party/main/` (`ggml-common.h`, `ggml-common-tq.h`, `quantscope.py`, `stb_image.h`, Outfit, KaTeX) and the patch to AOTriton, and `third_party/nonfree/` (below and [third_party/main/README.md](../third_party/main/README.md)).
 The model files are not part of it; their licenses apply to them (below).
 
 - **The original software**: [Strata](https://github.com/Niko1221/Strata) by Niko1221 and the Strata contributors.
@@ -1713,6 +1713,7 @@ The model files are not part of it; their licenses apply to them (below).
    - [nextsycl](https://github.com/maxfridbe/nextsycl), by maxfridbe (which kernels the decode of the Qwen3.5 family's
      models merges; the code is written anew).
 - **The web app's font**: [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1, see `third_party/main/outfit/OFL.txt`;
-  without it the app uses the system font). Its Monitor tab started from @code-martin's dashboard idea (PR #22).
+  without it the app uses the system font). The chat draws math with [KaTeX](https://katex.org/) 0.19.0 (MIT, see
+  `third_party/main/katex/LICENSE`). Its Monitor tab started from @code-martin's dashboard idea (PR #22).
 - **`third_party/nonfree/`**: Qwen Community License 1.0, not free; XeStrata runs without it.
   It holds the experimental speed projection's vector, made from the model's activations, and the original model's chat template (see its README).

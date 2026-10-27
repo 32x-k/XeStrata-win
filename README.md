@@ -399,7 +399,8 @@ permission under GPL section 7, what goes in, and how to report).
    - the image engine's attention: [oneDNN](https://github.com/uxlfoundation/oneDNN) (Apache-2.0, Intel GPUs), [AOTriton](https://github.com/ROCm/aotriton) (MIT, AMD GPUs)
      and [cuDNN Frontend](https://github.com/NVIDIA/cudnn-frontend) (Apache-2.0, parts MIT, NVIDIA GPUs); for reading reference images, [stb_image](https://github.com/nothings/stb) (MIT or the Unlicense);
    - [quantscope](https://github.com/1872183316/quantscope) (MIT or Apache-2.0): what `setup.py --inspect` reads a GGUF's contents with;
-   - the web app's font, [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1).
+   - the web app's font, [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1);
+   - [KaTeX](https://katex.org/) (MIT), which draws the math in the chat.
 - **Ideas from:**
    - [Splash](https://github.com/incoai/splash), by Inco AI and the Splash contributors;
    - [ninfer](https://github.com/Neroued/ninfer), by Neroued;
@@ -434,6 +435,7 @@ XeStrata (copyright MistVVK and the XeStrata contributors) is free software; the
    - Unmodified copies: ggml's `ggml-common.h` and agentionai's llama.cpp's `ggml-common-tq.h` (`third_party/main/ggml/`, MIT),
      `quantscope.py` (`third_party/main/quantscope/`, MIT or Apache-2.0), `stb_image.h` (`third_party/main/stb/`, MIT or the Unlicense).
    - The app's font Outfit (`third_party/main/outfit/`): SIL Open Font License 1.1.
+   - KaTeX, which draws the math in the chat (`third_party/main/katex/`): MIT.
    - `third_party/nonfree/`: what is not free software. The original model's chat template and the experimental
      speed projection's vector, both under the Qwen Community License 1.0.
 - **Without `third_party/nonfree/`,** XeStrata still builds and runs. The packages leave it out.

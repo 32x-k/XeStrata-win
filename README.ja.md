@@ -381,6 +381,7 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
      [cuDNN Frontend](https://github.com/NVIDIA/cudnn-frontend)（Apache-2.0、一部 MIT、NVIDIA の GPU）。参照画像の読み込みに [stb_image](https://github.com/nothings/stb)（MIT か Unlicense）。
    - [quantscope](https://github.com/1872183316/quantscope)（MIT か Apache-2.0）: `setup.py --inspect` が GGUF の中身を確かめるのに使います。
    - 画面のフォント [Outfit](https://github.com/Outfitio/Outfit-Fonts)（SIL Open Font License 1.1）。
+   - チャットの数式を描く [KaTeX](https://katex.org/)（MIT）。
 - **参考にした考え方**:
    - Inco AI と Splash の貢献者による [Splash](https://github.com/incoai/splash)。
    - Neroued による [ninfer](https://github.com/Neroued/ninfer)。
@@ -409,6 +410,7 @@ XeStrata（著作権は MistVVK と XeStrata の貢献者）は自由ソフト�
    - 変えていない写し: ggml の `ggml-common.h` と、agentionai の llama.cpp の `ggml-common-tq.h`（`third_party/main/ggml/`、MIT）、
      `quantscope.py`（`third_party/main/quantscope/`、MIT か Apache-2.0）、`stb_image.h`（`third_party/main/stb/`、MIT か Unlicense）。
    - 画面のフォント Outfit（`third_party/main/outfit/`）: SIL Open Font License 1.1。
+   - チャットの数式を描く KaTeX（`third_party/main/katex/`）: MIT。
    - `third_party/nonfree/`: 自由ソフトウェアでないもの。元のモデルのチャットテンプレートと、実験的な速度向上用の射影のベクトルで、
      どちらも Qwen Community License 1.0 です。
 - **`third_party/nonfree/` がなくても**、XeStrata はビルドでき、動きます。パッケージには入れていません。

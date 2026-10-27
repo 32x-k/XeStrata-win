@@ -1636,7 +1636,7 @@ Strata の設計、測定、ボトルネックは、upstream の論文 **[docs/p
 
 XeStrata は全体が [LGPL-3.0-or-later](../COPYING.LESSER) です。
 Strata と ggml / llama.cpp（どちらも MIT）から来たコードも XeStrata の一部として LGPL で、著作権表示と許諾表示は [NOTICE](../NOTICE) にあります。
-例外は、元のライセンスのままの intel/llvm へのパッチと oneMath への変更、`third_party/main/` の写し（`ggml-common.h`、`ggml-common-tq.h`、`quantscope.py`、`stb_image.h`、Outfit）と AOTriton へのパッチ、`third_party/nonfree/` です（下と [third_party/main/README.md](../third_party/main/README.md)）。
+例外は、元のライセンスのままの intel/llvm へのパッチと oneMath への変更、`third_party/main/` の写し（`ggml-common.h`、`ggml-common-tq.h`、`quantscope.py`、`stb_image.h`、Outfit、KaTeX）と AOTriton へのパッチ、`third_party/nonfree/` です（下と [third_party/main/README.md](../third_party/main/README.md)）。
 モデルのファイルは XeStrata に含まれず、それぞれのライセンスが適用されます（下）。
 
 - **元のソフトウェア**: Niko1221 と Strata の貢献者による [Strata](https://github.com/Niko1221/Strata)。
@@ -1673,6 +1673,7 @@ Strata と ggml / llama.cpp（どちらも MIT）から来たコードも XeStra
      （VRAM にないエキスパートを CPU と PCIe に分ける数の決め方、[XE](XE.ja.md#外れたエキスパートの-cpu-と-pcie-への分け方)）。
    - maxfridbe による [nextsycl](https://github.com/maxfridbe/nextsycl)（Qwen3.5 系のモデルの decode でカーネルをまとめるやり方。コードは書き起こし）。
 - **ウェブの画面のフォント**: [Outfit](https://github.com/Outfitio/Outfit-Fonts)（SIL Open Font License 1.1、`third_party/main/outfit/OFL.txt`。なければシステムのフォントを使う）。
+  チャットの数式は [KaTeX](https://katex.org/) 0.19.0（MIT、`third_party/main/katex/LICENSE`）で描きます。
   Monitor のタブは @code-martin のダッシュボードの案（PR #22）から始まりました。
 - **`third_party/nonfree/`**: Qwen Community License 1.0 で、自由ソフトウェアではありません。XeStrata はこれなしでも動きます。
   実験的な速度向上用の射影のベクトル（モデルの活性化から作ったもの）と、元のモデルのチャットテンプレートが入っています（その README を参照）。

@@ -9,3 +9,6 @@ bench/prompts/** -text
 
 # Pack fixtures are parsed byte for byte.
 tests/data/native_experts/** -text
+
+# vendored KaTeX: the files are hashed byte for byte (PROVENANCE.json), never convert their line endings.
+third_party/main/katex/** -text

@@ -172,6 +172,7 @@ install(DIRECTORY serve tools ref DESTINATION ${_pkg_share}
 install(DIRECTORY serve/web DESTINATION ${_pkg_share}/serve)
 install(DIRECTORY data DESTINATION ${_pkg_share})
 install(DIRECTORY third_party/main/outfit DESTINATION ${_pkg_share}/third_party/main)
+install(DIRECTORY third_party/main/katex DESTINATION ${_pkg_share}/third_party/main)   # the web chat's math
 install(DIRECTORY third_party/main/quantscope DESTINATION ${_pkg_share}/third_party/main PATTERN "__pycache__" EXCLUDE)
 install(DIRECTORY ${STRATA_GGML_DIR}/gguf-py DESTINATION ${_pkg_share}/third_party/main/llama.cpp
         PATTERN "__pycache__" EXCLUDE PATTERN "tests" EXCLUDE)
