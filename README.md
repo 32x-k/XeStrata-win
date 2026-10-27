@@ -158,6 +158,7 @@ Follow the prompts to download and start a model. [Terminal guide](docs/TERMINAL
 | **Intel Arc · Linux** | [Intel setup](docs/INTEL_ARC.md) |
 | **Apple Silicon · M1 or newer** | [Mac setup](docs/MAC.md) |
 | **AMD Ryzen AI Max · Strix Halo** | [Strix Halo setup](docs/STRIX_HALO.md) |
+| **NVIDIA DGX Spark · Linux** | [DGX Spark setup](docs/DGX_SPARK_LINUX.md) |
 
 <a id="using-it"></a>
 
