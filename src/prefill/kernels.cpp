@@ -6,6 +6,7 @@
 // is linearised the way CUDA numbers its threads (x fastest).  __expf, rsqrtf, powf, cosf, sinf and log1pf are the
 // precise SYCL functions.
 #include "strata/prefill/kernels.hpp"
+#include "gdn_tc.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/mrope.hpp"
@@ -76,6 +77,9 @@ inline float block_sum(const sycl::nd_item<1>& it, float v, float* sh) {
 constexpr int CONV_TILE = 64;
 constexpr int RG = 4, RPG = S / RG;
 constexpr int CB = 32, NCB = S / CB;
+// STRATA_GDN_TC: the prep and the scan's two launches a super-block cost more than they save on shorter chunks
+// (upstream's threshold, measured on a CMP 170HX)
+constexpr int64_t kGdnTcMin = 128;
 
 template <int REG>
 void route_launch(sycl::queue& q, const float* logits, int32_t* ids, float* wout, int64_t T) {
@@ -955,7 +959,15 @@ struct Gdn {
         // 1016 tokens, 5.3x at 16384), and the output copy of a 16384-token chunk (256 MiB) did not fit beside a full
         // expert cache, which left the 5x slower D-2 on unmeasured (32K serve prompt 1,943 -> 1,687 tok/s).
         static int pick = -1;   // 1: the key-head form
-        if (gdn_lane_ok(q))
+        // STRATA_GDN_TC=1 (opt-in, upstream 8c2a84694): the recurrence of a prompt chunk of kGdnTcMin+ tokens as a
+        // chunked scan on the matrix engines (gdn_tc.cpp; not these kernels' bits).  A GPU without them, a shorter
+        // chunk or no room for its scratch takes the kernels below
+        static const bool tc_on = [] {
+            const char* v = std::getenv("STRATA_GDN_TC");
+            return v != nullptr && std::strtol(v, nullptr, 10) != 0;
+        }();
+        if (tc_on && T >= kGdnTcMin && gdn_rec_tc(q, HK, HV, state, h, gate, beta, y, T)) {
+        } else if (gdn_lane_ok(q))
             q.parallel_for(sycl::nd_range<1>((size_t) HV * S, 16), GdnRecLane<16>{state, h, gate, beta, y, T});
         else {
             if (pick < 0 && kh_on && T >= 64) {
