@@ -14,14 +14,18 @@
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/kv_q4.hpp"
+#include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_qsa_decode_attn
 #include "strata/kernels/device_arch_tag.hpp"
 
 #include <algorithm>
 #include <cfloat>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <string>
+#include <vector>
 
 namespace strata::kernels {
 namespace {
@@ -154,7 +158,7 @@ inline float dotn(const float* k, const float* q) {
 
 // LOOP: a slot reads more than one chunk (n_slots below the chunks); without it every expression is the one this file
 // had before the slots.
-template <int HD, int G, int KV_MODE, bool LOOP>
+template <int HD, int G, int KV_MODE, bool LOOP, int NC>
 sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPools p, const int32_t* ids_all,
                          const int32_t* step_all, int n_kv_heads, int page_size, float scale, float* part_acc_all,
                          float* part_m_all, float* part_l_all, int n_slots, size_t n_q, int cap,
@@ -217,8 +221,7 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                 // scores: each sub-group takes cells warp, warp+WARPS, ...; each lane holds N of the HD dimensions.
                 // NC cells per step (warp + WARPS * (i + j)): a lane's q slice comes out of local memory once for all
                 // of them (upstream fd95405); every dot product is the same expression as for a single cell, so the
-                // scores are unchanged.
-                constexpr int NC = 2;
+                // scores are unchanged.  NC is the GPU's own (nc_of, timed by qsa_dense_attn_tune).
                 const int hd_lane = head_of_lane(lane);
                 for (int i = 0; i < CHUNK / WARPS; i += NC) {
                     int cc[NC];
@@ -395,13 +398,28 @@ int kv_mode_of(const QsaAttnPools& pools) {
 }
 
 template <int HD, int G, bool LOOP>
-void launch_kv(int kv_mode, sycl::queue& queue, const float* q, const QsaAttnPools& pools, const int32_t* ids,
+void launch_kv(int kv_mode, int nc, sycl::queue& queue, const float* q, const QsaAttnPools& pools, const int32_t* ids,
                const int32_t* steps, int nkv, int ps, float scale, float* part_acc, float* part_m, float* part_l,
                int n_slots, size_t n_q, int cap, long long stride) {
-    if (kv_mode == 3) launch_chunk<HD, G, 3, LOOP>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride);
-    else if (kv_mode == 2) launch_chunk<HD, G, 2, LOOP>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride);
-    else if (kv_mode == 1) launch_chunk<HD, G, 1, LOOP>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride);
-    else launch_chunk<HD, G, 0, LOOP>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride);
+    if (kv_mode == 3) launch_chunk<HD, G, 3, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride);
+    else if (kv_mode == 2) launch_chunk<HD, G, 2, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride);
+    else if (kv_mode == 1) launch_chunk<HD, G, 1, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride);
+    else if (nc == 8) launch_chunk<HD, G, 0, LOOP, 8>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride);
+    else if (nc == 4) launch_chunk<HD, G, 0, LOOP, 4>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride);
+    else launch_chunk<HD, G, 0, LOOP, 2>(queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots, n_q, cap, stride);
+}
+
+// The cells a step of the fp16 score loop takes (NC): 2 unless qsa_dense_attn_tune timed this GPU and shape.  2, 4 and
+// 8 are not the same on every GPU (Qwen3.5-9B's 32K decode, 2026-10-27: the RX 9060 XT 38.9 / 40.2 / 40.5 tok/s, the
+// RTX 4070 67.7 / 67.4 / 64.0, the B70 43.1 / 42.9 / 40.3), so the choice is timed rather than set.
+template <int HD, int G>
+core::PerDevice<int>& nc_store() {
+    static core::PerDevice<int> store;
+    return store;
+}
+template <int HD, int G>
+int nc_of(sycl::queue& q) {
+    return nc_store<HD, G>().get(q.get_device(), [] { return 2; });
 }
 
 template <int HD, int G>
@@ -415,12 +433,13 @@ void run_shape(const float* q, const QsaAttnPools& pools, const int32_t* ids, co
     float* part_m = scratch + (size_t) n_slots * s.n_head * HD;
     float* part_l = part_m + (size_t) n_slots * s.n_head;
     const float scale = 1.0f / std::sqrt((float) HD);
+    const int nc = nc_of<HD, G>(queue);
     if (n_slots < (cap + CHUNK - 1) / CHUNK)
-        launch_kv<HD, G, true>(kv_mode, queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots,
-                               n_q, (int) cap, stride);
+        launch_kv<HD, G, true>(kv_mode, nc, queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l,
+                               n_slots, n_q, (int) cap, stride);
     else
-        launch_kv<HD, G, false>(kv_mode, queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l, n_slots,
-                                n_q, (int) cap, stride);
+        launch_kv<HD, G, false>(kv_mode, nc, queue, q, pools, ids, steps, nkv, ps, scale, part_acc, part_m, part_l,
+                                n_slots, n_q, (int) cap, stride);
     const auto e = launch_merge<HD, G>(queue, part_acc, part_m, part_l, n_slots, attn, (size_t) s.n_head, n_q, stride);
     if (!stream) core::Runtime::get().wait(e, "qsa_decode_attn");
 }
@@ -440,6 +459,90 @@ void run(const float* q, const QsaAttnPools& pools, const int32_t* ids, const in
     else if (s.head_dim == 256 && g == 8) run_shape<256, 8>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
     else if (s.head_dim == 256 && g == 4) run_shape<256, 4>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
     else run_shape<128, 10>(q, pools, ids, steps, cap, s, scratch, attn, n_q, stride, stream);
+}
+
+// qsa_dense_attn_tune's timing: the fp16 score loop's NC = 2, 4 and 8 over `cells` cells of a dummy cache, as the
+// engine runs it (16 launches with their merge in a graph, the graphs replayed in turns, the first round a warm-up, the
+// fastest round of each kept); 2 when the buffers cannot be had
+template <int HD, int G>
+int time_nc(sycl::queue& q, const QsaShapes& s, int64_t cells) {
+    const int64_t ps = s.page_size, pages = (cells + ps - 1) / ps;
+    cells = pages * ps;
+    const size_t pool = (size_t) (pages * s.n_head_kv * ps * HD), heads = (size_t) s.n_head * HD;
+    const uint64_t n_scratch = qsa_decode_attn_scratch_floats(cells, s);
+    uint16_t* k = sycl::malloc_device<uint16_t>(pool, q);
+    uint16_t* v = sycl::malloc_device<uint16_t>(pool, q);
+    int32_t* table = sycl::malloc_device<int32_t>((size_t) pages, q);
+    int32_t* step = sycl::malloc_device<int32_t>(kStepCount, q);
+    float* qv = sycl::malloc_device<float>(heads, q);
+    float* scratch = sycl::malloc_device<float>(n_scratch, q);
+    float* attn = sycl::malloc_device<float>(heads, q);
+    const auto release = [&] {
+        for (void* x : {(void*) k, (void*) v, (void*) table, (void*) step, (void*) qv, (void*) scratch, (void*) attn})
+            sycl::free(x, q);
+    };
+    if (!k || !v || !table || !step || !qv || !scratch || !attn) {
+        release();
+        return 2;
+    }
+    std::vector<int32_t> pt((size_t) pages);
+    for (int64_t i = 0; i < pages; ++i) pt[(size_t) i] = (int32_t) i;
+    int32_t hs[kStepCount];
+    qsa_step_fill(hs, cells - 1, s);
+    q.fill(k, (uint16_t) 0x2c00, pool);   // 0.0625: moderate scores
+    q.fill(v, (uint16_t) 0x2c00, pool);
+    q.fill(qv, 0.01f, heads);
+    q.memcpy(table, pt.data(), pt.size() * sizeof(int32_t));
+    q.memcpy(step, hs, sizeof(hs)).wait();
+    QsaAttnPools pools;
+    pools.k_pool = k;
+    pools.v_pool = v;
+    pools.page_table = table;
+    const int nkv = (int) s.n_head_kv, n_slots = slots_for(q, cells, nkv, 1);
+    float* part_m = scratch + (size_t) n_slots * s.n_head * HD;
+    float* part_l = part_m + (size_t) n_slots * s.n_head;
+    const float scale = 1.0f / std::sqrt((float) HD);
+    const bool loop = n_slots < (cells + CHUNK - 1) / CHUNK;
+    namespace sx = sycl::ext::oneapi::experimental;
+    const int ncs[3] = {2, 4, 8};
+    std::vector<sx::command_graph<sx::graph_state::executable>> exec;
+    for (int nc : ncs) {
+        sx::command_graph<sx::graph_state::modifiable> graph(q.get_context(), q.get_device());
+        graph.begin_recording(q);
+        for (int i = 0; i < 16; ++i) {
+            if (loop)
+                launch_kv<HD, G, true>(0, nc, q, qv, pools, nullptr, step, nkv, (int) ps, scale, scratch, part_m, part_l,
+                                       n_slots, 1, (int) cells, 0);
+            else
+                launch_kv<HD, G, false>(0, nc, q, qv, pools, nullptr, step, nkv, (int) ps, scale, scratch, part_m,
+                                        part_l, n_slots, 1, (int) cells, 0);
+            launch_merge<HD, G>(q, scratch, part_m, part_l, n_slots, attn, (size_t) s.n_head, 1, 0);
+        }
+        graph.end_recording(q);
+        exec.push_back(graph.finalize());
+    }
+    double best[3] = {};
+    for (int round = 0; round < 5; ++round)
+        for (int i = 0; i < 3; ++i) {
+            const auto t0 = std::chrono::steady_clock::now();
+            q.ext_oneapi_graph(exec[(size_t) i]);
+            q.wait();
+            const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+            if (round > 0 && (best[i] == 0.0 || us < best[i])) best[i] = us;
+        }
+    release();
+    int pick = 0;
+    for (int i = 1; i < 3; ++i)
+        if (best[i] < best[pick]) pick = i;
+    std::fprintf(stderr, "strata: the decode attention (%lld/%lld heads of %d) takes %d cells a step (timed at %lld "
+                         "cells: 2: %.0f us, 4: %.0f, 8: %.0f)\n", (long long) s.n_head, (long long) s.n_head_kv, HD,
+                 ncs[pick], (long long) cells, best[0] / 16, best[1] / 16, best[2] / 16);
+    return ncs[pick];
+}
+
+template <int HD, int G>
+void tune_shape(sycl::queue& q, const QsaShapes& s, int64_t cells) {
+    nc_store<HD, G>().get(q.get_device(), [&] { return time_nc<HD, G>(q, s, cells); });
 }
 
 bool pools_ok(const QsaAttnPools& pools) {
@@ -483,6 +586,16 @@ void qsa_dense_attn_step(const float* q, const QsaAttnPools& pools, const int32_
         throw core::DeviceError("qsa_dense_attn: unsupported geometry (" + shape_name(s) + ") or missing buffers");
     if (!pools_ok(pools)) throw core::DeviceError("qsa_dense_attn: incomplete KV pools");
     run(q, pools, nullptr, step, max_cells, s, scratch, attn, 1, 0, stream);
+}
+
+void qsa_dense_attn_tune(const QsaShapes& s, int64_t max_cells, void* stream) {
+    if (!shape_ok(s) || max_cells < CHUNK || s.page_size <= 0) return;
+    auto& q = queue_for(stream);
+    const int64_t cells = std::min<int64_t>(max_cells, 16384), g = s.n_head / s.n_head_kv;
+    if (s.head_dim == 256 && g == 12) tune_shape<256, 12>(q, s, cells);
+    else if (s.head_dim == 256 && g == 8) tune_shape<256, 8>(q, s, cells);
+    else if (s.head_dim == 256 && g == 4) tune_shape<256, 4>(q, s, cells);
+    else tune_shape<128, 10>(q, s, cells);
 }
 
 void qsa_dense_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* steps, int64_t max_cells,

@@ -56,5 +56,10 @@ void qsa_dense_attn_step(const float* q, const QsaAttnPools& pools, const int32_
                          const QsaShapes& s, float* scratch, float* attn, void* stream);
 void qsa_dense_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* steps, int64_t max_cells,
                           const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
+/// Times the fp16 score loop's forms (the cells a step takes) for shape `s` on the stream's GPU, once a GPU and shape,
+/// over a dummy cache of up to 16K of `max_cells` cells, and keeps the fastest for qsa_dense_attn_step / _batch with an
+/// fp16 cache.  Call before a graph that holds them is recorded (it allocates and synchronizes); without it they take
+/// two cells a step.
+void qsa_dense_attn_tune(const QsaShapes& s, int64_t max_cells, void* stream);
 
 }  // namespace strata::kernels

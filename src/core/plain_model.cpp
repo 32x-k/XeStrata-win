@@ -659,6 +659,16 @@ bool PlainModel::load_qwen(std::string& err) {
     }
     n_pages_ = (opt_.max_cells + qs.page_size - 1) / qs.page_size;
     opt_.max_cells = n_pages_ * qs.page_size;
+    // the decode attention's form for this GPU (an fp16 cache), timed before any graph is recorded and before the cache
+    // takes its VRAM
+    if (!opt_.kv_int8) {
+        try {
+            k::qsa_dense_attn_tune(qs, opt_.max_cells, cs_);
+        } catch (const std::exception& e) {
+            err = std::string("plain model: timing the decode attention: ") + e.what();
+            return false;
+        }
+    }
     {
         const size_t cells = (size_t) (n_pages_ * qs.n_head_kv * qs.page_size);
         k_pool_.assign((size_t) n_attn, nullptr);
