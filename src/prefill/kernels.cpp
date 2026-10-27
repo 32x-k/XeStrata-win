@@ -1098,6 +1098,24 @@ void moe_combine(const float* Dm, const int32_t* slot, const float* w, const flo
         bo[i] = s + shared[i] * sigm(sg[t]);
     });
 }
+void moe_shared_init(const float* shared, const float* sg, float* acc, int64_t T, void* stream) {
+    if (T <= 0) return;
+    Q(stream).parallel_for(sycl::range<1>((size_t) (T * N)), [=](sycl::id<1> id) {
+        const int64_t i = (int64_t) id[0];
+        acc[i] = shared[i] * sigm(sg[i / N]);
+    });
+}
+// one work-item per (token of the group, column): the token's rows summed in the group's row order
+void moe_scatter_add(const float* Dm, const int32_t* u_tok, const int32_t* u_off, const int32_t* u_rows,
+                     const float* u_w, int64_t n_u, float* acc, void* stream) {
+    if (n_u <= 0) return;
+    Q(stream).parallel_for(sycl::range<2>((size_t) n_u, (size_t) N), [=](sycl::id<2> id) {
+        const int64_t u = (int64_t) id[0], d = (int64_t) id[1];
+        float s = 0.0f;
+        for (int32_t j = u_off[u]; j < u_off[u + 1]; ++j) s = sycl::fma(u_w[j], Dm[(int64_t) u_rows[j] * N + d], s);
+        acc[(int64_t) u_tok[u] * N + d] += s;
+    });
+}
 
 // ---------------------------------------------------------------- QSA helpers
 void rms_rows(float* x, const float* w, int64_t rows, int64_t cols, int64_t ld, float eps, void* stream) {
