@@ -34,15 +34,15 @@ the default 8K context, the others 64K context with `--context 64k`):
 | Test | Result |
 | --- | --- |
 | Short chat, answer speed | **12.1 to 13.6 tok/s** |
-| 4K prompt | **214 to 226 tok/s** (about 19 s to the first token) |
+| 4K prompt | **214 to 234 tok/s** (about 18 s to the first token) |
 | 16K prompt | **326 tok/s** (51 s) |
 | 32K prompt | **342 tok/s** (97 s) |
 | Coding-agent session, 6 turns | 70% from the conversation cache; answers 14.2 tok/s; 17 to 31 s to the first token per turn |
 
-These are speed measurements. They say nothing about answer quality, and the short-chat range depends on the text. The DeepSeek 2.25 bpw set
+The prompt rows use the word-list prompt of `tools/strata_bench.py`; ordinary text is costlier for the experts and reads slower (124 to 164 tok/s on 3 to 5K-token pieces of prose). Measured again on the final build, the 4K row reads 229 to 234 tok/s warm. These are speed measurements. They say nothing about answer quality, and the short-chat range depends on the text. The DeepSeek 2.25 bpw set
 and the other Qwen sizes were not measured for this page.
 
-The DeepSeek 4K prompt here (214 to 226 tok/s) is higher than the 87 tok/s on [STRIX_HALO.md](STRIX_HALO.md), which was measured on 2026-10-25 with an
+The DeepSeek 4K prompt here (214 to 234 tok/s) is higher than the 87 tok/s on [STRIX_HALO.md](STRIX_HALO.md), which was measured on 2026-10-25 with an
 earlier build. The 0.2.7 DeepSeek defaults explain most of the gap (the same build with `DS4_DEFAULTS=026` reads 133 to 139 tok/s); the table there
 changes one thing at a time.
 
