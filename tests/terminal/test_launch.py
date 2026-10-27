@@ -144,8 +144,13 @@ class CatalogRules(unittest.TestCase):
         with Home():
             cat = catalog(hw)
             rows = {r.model: r for r in cat.rows()}
-            self.assertEqual(set(rows), {"Q2_0", "IQ3_XXS", "IQ3_S", "Gyro-S", "Gyro-M"})
+            self.assertEqual(set(rows), {"Q2_0", "IQ3_XXS", "IQ3_S", "Gyro-S", "Gyro-M", "IST-DAS-2.00bpw", "IST-DAS-2.25bpw"})   # DeepSeek (0.2.7.1): the two sets run on a Mac
             self.assertEqual([r.model for r in rows.values() if r.recommended], ["Q2_0"])
+            for name in ("IST-DAS-2.00bpw", "IST-DAS-2.25bpw"):            # a 32 GB Mac: said plainly (mostly read from the SSD), never refused
+                self.assertEqual(rows[name].family, "deepseek41")
+                self.assertEqual(rows[name].verdict, "tight")
+                self.assertFalse(rows[name].images)
+                self.assertGreater(rows[name].spill_gb, 100)
             self.assertEqual((rows["Q2_0"].verdict, rows["Q2_0"].words), ("fits", "fits, part read from SSD"))
             self.assertEqual(rows["IQ3_S"].verdict, "tight")
             self.assertGreater(rows["IQ3_S"].spill_gb, 10)
