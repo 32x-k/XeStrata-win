@@ -52,6 +52,8 @@ The prefill has four opt-in switches, set in the engine's environment. None of t
 - `STRATA_EMBED_VRAM=1`: the native embedding table in VRAM instead of mapped host memory. Without room for the table plus 512 MiB it stays in host memory, and the log says so.
 - `STRATA_DEQUANT_SIDE=1`: the dense weights' dequantization to FP16 runs on a side stream, overlapping the product before it. It takes a second scratch buffer.
 
+`STRATA_GDN_TC=1` (opt-in, changes the reply, upstream 8c2a84694) runs the DeltaNet recurrence of prompt chunks of 128 tokens or more as a scan over blocks of 32 tokens on the matrix engines (Intel's XMX, NVIDIA's tensor cores, RDNA3 and RDNA4's WMMA). Its products take the values split in two FP16 parts and add in FP32, so the rounding differs from the default FP32 recurrence. A GPU without matrix engines, and `STRATA_NO_XMX=1`, keeps the default recurrence. It takes about 60 MiB of VRAM for its scratch.
+
 ### Decode (tokens/s)
 
 | Model | 1K | 4K | 32K | 64K | 128K | 262K |
