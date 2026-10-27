@@ -104,6 +104,8 @@ public:
     /// them all here.
     virtual bool chunk_pieces(const float* rows, gpu::Event* const* landed, int pieces, const int64_t* tokens,
                               int64_t T, int64_t p0, std::string& err);
+    /// The next stage when it is in this process (null: elsewhere).  The layer-major prefill drives it directly.
+    virtual Prefill* local_next() const { return nullptr; }
 };
 
 /// STRATA_HANDOFF_PIPE: rows [r0, r0 + nr) of piece i of a T-row chunk in P pieces (both sides of a hand-off).
@@ -121,6 +123,7 @@ public:
     bool wait(std::string& err) override;
     bool chunk_pieces(const float* rows, gpu::Event* const* landed, int pieces, const int64_t* tokens, int64_t T,
                       int64_t p0, std::string& err) override;
+    Prefill* local_next() const override { return next_; }
 
 private:
     bool start(const int64_t* tokens, int64_t T, int64_t p0);
@@ -252,7 +255,12 @@ public:
 
     /// Layer-major prefill (STRATA_PREFILL_LAYER_MAJOR=1): true while `on_chunk` reports a sub-chunk before the end of
     /// its super-chunk.  The session state is already at the super-chunk's end then, so no checkpoint may be taken.
-    bool layer_major_mid() const { return lm_mid_; }
+    /// On a layer split it is the last stage's (the one that reports the rows), asked through the first.
+    bool layer_major_mid() const {
+        const Prefill* p = this;
+        while (p->lm_next() != nullptr) p = p->lm_next();
+        return p->lm_mid_;
+    }
 
 private:
     /// The default walk: each chunk through all the stage's layers.
@@ -264,7 +272,11 @@ private:
     void lm_release_chain();
     bool run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
     void lm_release();
+    bool lm_drain(std::string& err);
+    Prefill* lm_next() const { return next_ != nullptr ? next_->local_next() : nullptr; }
     bool lm_mid_ = false;
+    std::future<bool> lm_next_run_;   ///< a layer split: the next stage's run of the last super-chunk handed on
+    std::string lm_next_err_;
     int64_t stage_lb_ = 0, stage_le_ = -1;
     PrefillLink* next_ = nullptr;       ///< set_stage: the next stage, through this link only
     InProcessPrefill local_next_;
