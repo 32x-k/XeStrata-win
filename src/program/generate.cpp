@@ -9839,6 +9839,9 @@ int main(int argc, char** argv) {
             // with the token's log-probability and the K most likely tokens', from the verify window's head logits
             // (before sampling, penalties and temperature).  -1 (absent): no LP lines
             int req_logprobs = -1;
+            // allowed=a,b,c: the LP line names only these ids after the chosen one (the server renormalises over them;
+            // OpenAI's allowed_token_ids, upstream 9ea044962).  Empty: the K most likely tokens, as before
+            std::vector<int32_t> req_allowed;
             if (endp != nullptr) {   // GENI takes the same keys (#75: image requests were always greedy); its
                                      // embedding file path is the first token without an =
                 for (;;) {
@@ -9861,6 +9864,16 @@ int main(int argc, char** argv) {
                     else if (key == "min_p") req_min_p = fv;
                     else if (key == "penalty_last_n") req_penalty_last_n = (int) std::strtol(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "logprobs") req_logprobs = (int) std::clamp(std::strtol(tok.c_str() + eq + 1, nullptr, 10), -1L, 20L);
+                    else if (key == "allowed") {   // allowed=a,b,c: with logprobs, these ids only (upstream 9ea044962, #3200)
+                        req_allowed.clear();
+                        for (const char* c = tok.c_str() + eq + 1; *c != '\0';) {
+                            char* end = nullptr;
+                            const long id = std::strtol(c, &end, 10);
+                            if (end == c) break;
+                            req_allowed.push_back((int32_t) id);
+                            c = *end == ',' ? end + 1 : end;
+                        }
+                    }
                     else if (key == "penalty_repeat") req_penalty_repeat = fv;
                     else if (key == "penalty_freq") req_penalty_freq = fv;
                     else if (key == "penalty_present") req_penalty_present = fv;
@@ -11918,7 +11931,12 @@ int main(int argc, char** argv) {
                             for (const float v : lrow) se += std::exp((double) v - mx);
                             const double lse = (double) mx + std::log(se);
                             std::printf("LP %.6f", (double) lrow[(size_t) outv[(size_t) i]] - lse);
-                            if (req_logprobs > 0) {
+                            if (!req_allowed.empty()) {
+                                for (const int32_t id : req_allowed) {   // never the chosen one or an id past the vocabulary
+                                    if (id == outv[(size_t) i] || id < 0 || (size_t) id >= lrow.size()) continue;
+                                    std::printf(" %d:%.6f", (int) id, (double) lrow[(size_t) id] - lse);
+                                }
+                            } else if (req_logprobs > 0) {
                                 lord.resize(lrow.size());
                                 for (size_t v = 0; v < lrow.size(); ++v) lord[v] = (int32_t) v;
                                 std::partial_sort(lord.begin(), lord.begin() + req_logprobs, lord.end(),
