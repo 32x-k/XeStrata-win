@@ -315,6 +315,18 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(split_rules_test PRIVATE include)
   add_test(NAME split_rules_test COMMAND split_rules_test)
 
+  # #3797: the out-of-memory report at start (per card free/total, the largest other programs): the text is a pure
+  # function; the driver query (NVML, loaded at run time) is only checked to be safe to call. No GPU needed.
+  add_executable(gpu_report_test tests/program/gpu_report_test.cpp)
+  target_include_directories(gpu_report_test PRIVATE include)
+  target_link_libraries(gpu_report_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME gpu_report_test COMMAND gpu_report_test)
+
+  # #3702: the later-stage reserve of the layer split search (header-only arithmetic, pinned against the old expression)
+  add_executable(stage_reserve_test tests/program/stage_reserve_test.cpp)
+  target_include_directories(stage_reserve_test PRIVATE include)
+  add_test(NAME stage_reserve_test COMMAND stage_reserve_test)
+
   # the prompt planner's host-memory model (#2824): header-only, no GPU
   add_executable(prefill_plan_test tests/program/prefill_plan_test.cpp)
   target_include_directories(prefill_plan_test PRIVATE include)

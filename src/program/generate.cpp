@@ -84,6 +84,8 @@
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
 #include "strata/program/split_rules.hpp"
+#include "strata/program/stage_reserve.hpp"
+#include "strata/program/gpu_report.hpp"
 #include "strata/prefill/share_rules.hpp"
 #include "strata/platform/host_limits.hpp"
 #include "strata/program/split_ring.hpp"
@@ -1591,6 +1593,49 @@ int64_t res_check(const int32_t* d_res, const std::vector<int32_t>& host_res, st
             }
         }
     return bad;
+}
+
+/// #3797: when the engine cannot start for lack of GPU memory, the cards' free and total memory and the largest other
+/// programs that hold some, as a warning added to the message that says it (program/gpu_report.hpp). Best effort: a
+/// card that cannot be asked, or a driver that does not list its programs, is left out or said so; it never changes the
+/// failure and never throws. `devices`: the CUDA ordinals to report (duplicates are skipped).
+static void print_startup_gpu_report(const std::vector<int>& devices) {
+    namespace gr = strata::program::gpu_report;
+    std::vector<gr::Card> cards;
+    int count = 0, prev = 0;
+    if (cudaGetDeviceCount(&count) != cudaSuccess) { (void) cudaGetLastError(); return; }
+    if (cudaGetDevice(&prev) != cudaSuccess) { (void) cudaGetLastError(); prev = 0; }
+    std::vector<int> seen;
+    for (const int d : devices) {
+        if (d < 0 || d >= count || std::find(seen.begin(), seen.end(), d) != seen.end()) continue;
+        seen.push_back(d);
+        if (cudaSetDevice(d) != cudaSuccess) { (void) cudaGetLastError(); continue; }   // no context fits there either
+        size_t free_b = 0, total_b = 0;
+        if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) { (void) cudaGetLastError(); continue; }
+        gr::Card c;
+        c.index = d;
+        c.free_mib = (uint64_t) (free_b >> 20);
+        c.total_mib = (uint64_t) (total_b >> 20);
+        cudaDeviceProp prop{};
+        if (cudaGetDeviceProperties(&prop, d) == cudaSuccess) c.name = prop.name;
+        else (void) cudaGetLastError();
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+        char bus[64] = {};
+        if (cudaDeviceGetPCIBusId(bus, (int) sizeof bus, d) == cudaSuccess) c.processes_known = gr::query_other_processes(bus, c.processes);
+        else (void) cudaGetLastError();
+#endif
+        cards.push_back(std::move(c));
+    }
+    if (prev >= 0 && prev < count) (void) cudaSetDevice(prev);
+    (void) cudaGetLastError();
+    if (cards.empty()) return;
+#if defined(_WIN32)
+    const uint32_t self = (uint32_t) GetCurrentProcessId();
+#else
+    const uint32_t self = (uint32_t) getpid();
+#endif
+    std::fprintf(stderr, "strata generate: GPU memory right now (best effort):\n%s\n",
+                 gr::format_gpu_memory_report(cards, self).c_str());
 }
 
 /// The pre-launch hook's patch: the changed entries of the host's residency table (`idx`) as (index, entry) pairs into
@@ -3920,6 +3965,13 @@ int main(int argc, char** argv) {
                              "nvidia-smi / rocm-smi lists them\n",
                      (unsigned long long) pool_bytes, cudaGetErrorString(ce), (unsigned long long) (free_b >> 20),
                      (unsigned long long) (total_b >> 20));
+        {   // #3797: every card of the run, and who else is on it
+            std::vector<int> report_devs;
+            int cur = 0;
+            if (cudaGetDevice(&cur) == cudaSuccess) report_devs.push_back(cur); else (void) cudaGetLastError();
+            for (const int d : split_devs) report_devs.push_back(d);
+            print_startup_gpu_report(report_devs);
+        }
         return 1;
     }
     mem_mark("the CUDA context and the weight arena");
@@ -4417,6 +4469,13 @@ int main(int argc, char** argv) {
                          err.empty() ? "the weight arena does not fit" : err.c_str(),
                          (unsigned long long) (pool_s >> 20), (unsigned long long) (free_b >> 20),
                          (unsigned long long) (total_b >> 20));
+            {   // #3797: every card of the run, and who else is on it
+                std::vector<int> report_devs;
+                int cur = 0;
+                if (cudaGetDevice(&cur) == cudaSuccess) report_devs.push_back(cur); else (void) cudaGetLastError();
+                for (const int d : split_devs) report_devs.push_back(d);
+                print_startup_gpu_report(report_devs);
+            }
             return false;
         }
         if (!o.native_dense_gguf.empty() && !st.dense.load(o.native_dense_gguf, st.wt, err, o.native_ple_key)) {
@@ -4592,8 +4651,8 @@ int main(int argc, char** argv) {
     // the entire difference between CUDA0's cache and CUDA1's: 814 slots against 188, 2026-09-30.  Both of
     // those allocations are already made before a stage's cache is sized, so what has to be held back here is
     // the windows and - only on the stage that carries them - the drafter and the head.
-    const int64_t kWindowMib = 96;       // the verify windows; 75 MiB measured, rounded up
-    const int64_t kDrafterMib = 1000;    // the MTP drafter (839 MiB) + the head, on the last stage only
+    // (the arithmetic is program/stage_reserve.hpp's: 96 MiB for the verify windows - 75 MiB measured, rounded up -
+    // and 1000 MiB for the MTP drafter and the head on the last stage only; pinned by tests/program/stage_reserve_test.cpp)
     // --pipeline-windows: a second verifier on every stage (its arena alone is 70-75 MiB and its graphs come on top:
     // 64 MiB left two RTX 5070 Ti under Linux short of it) and, with the decode pipelined, two copies of the first
     // stage's GDN state (sized from its session where the first card's cache is sized; this is the split search's
@@ -4653,9 +4712,14 @@ int main(int argc, char** argv) {
         const int64_t pf = search && split_own_auto && !place_with_reserve ? 0 : split_pf_mib;
         const int64_t base_reserve =
             later && o.vram_reserve_later_mib >= 0 ? o.vram_reserve_later_mib : o.vram_reserve_mib;
-        const int64_t reserve = (base_reserve + pf + (later ? kWindowMib : kPipeSnapMib) +
-                                 kPipeWindowMib + (drafter ? kDrafterMib : 0)) << 20;
-        return std::max<int64_t>((int64_t) fb - reserve, 0);
+        strata::program::stage_reserve::Inputs rin;
+        rin.base_reserve_mib = base_reserve;
+        rin.prompt_buffers_mib = pf;
+        rin.later = later;
+        rin.drafter = drafter;
+        rin.pipe_window_mib = kPipeWindowMib;
+        rin.pipe_snap_mib = kPipeSnapMib;
+        return strata::program::stage_reserve::room_bytes((int64_t) fb, rin);
     };
     if (multi_gpu && split_auto) {
         const auto& lay = strata::kernels::cpu::expert_layout();
@@ -9018,6 +9082,7 @@ int main(int argc, char** argv) {
             if (!sp.set_peer(&peer, rows, err)) {
                 std::fprintf(stderr, "strata serve: %s - the prompt path stays on the primary GPU\n", err.c_str());
                 err.clear();
+                (void) cudaGetLastError();   // a failed allocation here must not end the engine at the next kernel's check
             }
         }
         // a layer split: a one-chunk prompt runs the stages one after the other, so each stage's prompt path gets the
@@ -9030,6 +9095,7 @@ int main(int argc, char** argv) {
                 if (!paths[i].first->set_stage_helper(paths[(i + 1) % paths.size()].first, err)) {
                     std::fprintf(stderr, "strata serve: %s - stage %zu reads its prompts alone\n", err.c_str(), i);
                     err.clear();
+                    (void) cudaGetLastError();   // (as above)
                 }
             }
         }
@@ -11223,6 +11289,16 @@ int main(int argc, char** argv) {
                                  "a full card can stall a request",
 #endif
                                  (long long) (later_reserve + 768 - sf_mib));
+                if (sf_mib < 512) {   // #3702: how far the plan was off, so the reserve to ask for is not a guess
+                    strata::program::stage_reserve::Inputs rin;
+                    rin.base_reserve_mib = later_reserve;
+                    rin.prompt_buffers_mib = split_pf_mib;
+                    rin.later = true;
+                    rin.pipe_window_mib = kPipeWindowMib;
+                    const std::string why = strata::program::gpu_report::planned_vs_free_text(
+                        strata::program::stage_reserve::reserve_mib(rin), sf_mib);
+                    if (!why.empty()) std::fprintf(stderr, "strata serve: CUDA%d: %s\n", stp->dev, why.c_str());
+                }
             }
         }
         // what the server's Monitor tab shows (servers before 0.1.8 skip unknown lines until READY)

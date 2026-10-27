@@ -1238,16 +1238,19 @@ bool finish_capture(cudaStream_t cs, bool ok, cudaGraphExec_t& exec, const char*
         if (graph) cudaGraphDestroy(graph);
         return false;
     }
-    if (ce != cudaSuccess || cudaGraphInstantiate(&exec, graph, 0) != cudaSuccess) {
+    cudaGraphExec_t got = nullptr;   // (a failed instantiate leaves nothing in the member)
+    const cudaError_t ie = ce != cudaSuccess ? ce : cudaGraphInstantiate(&got, graph, 0);
+    if (ie != cudaSuccess) {
         if (graph) cudaGraphDestroy(graph);
-        err = std::string("mtp: ") + what + " capture: " + cudaGetErrorString(ce);
+        err = std::string("mtp: ") + what + " capture: " + cudaGetErrorString(ie);   // the status that failed
         return false;
     }
+    exec = got;
     mtp_list_nodes(graph, what);
     cudaGraphDestroy(graph);
-    // an explicit upload: the first launch's implicit one blocked behind a device-side spin (verify.cpp)
-    cudaGraphUpload(exec, cs);
-    cudaStreamSynchronize(cs);
+    // an explicit upload: the first launch's implicit one blocked behind a device-side spin (verify.cpp); only a warm-up,
+    // so a failure (no VRAM left) is cleared and the first launch uploads it
+    if (cudaGraphUpload(exec, cs) != cudaSuccess || cudaStreamSynchronize(cs) != cudaSuccess) (void) cudaGetLastError();
     return true;
 }
 }  // namespace
