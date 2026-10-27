@@ -1337,12 +1337,17 @@ Restart XeStrata after a change.
   A server that stops later is started again at its next call.
 - In the chat each call shows as a small block (tool, arguments, result).
   The model reads the result and goes on, up to `max_rounds` calls in a row per answer.
+  At `max_rounds` it answers once more, with no tools, from the results it already has.
   A tool that fails or takes longer than `timeout_s` (default 60 s) gives the model an `error: ...` result instead of ending the chat.
   Results longer than `max_result_chars` (default 20,000 characters) are cut, with a note, before the model reads them.
   Stop stops a running tool too.
 - Only the chat page uses them.
   API clients (omp, Claude Code, the OpenAI and Anthropic SDKs) see the API exactly as before and keep their own tools.
   A request to `/v1/chat/completions` opts in with `"strata_mcp": true` (it then gets `strata_mcp` tool events in the stream).
+- Pictures a tool returns (PNG, JPEG, WebP) show in the chat with `"mcp": {"image_results": true}` (off by default).
+  They are kept by their SHA-256 in `<config name>.tool-media/` beside the run configuration, and the chat reads them from `/tool-media/<name>`, behind the API key.
+  At most four a call, about 18 MB each.
+  With a picture reader (`--vision`) the model reads them too; without one it reads the text only, as before.
 
 **Security.** MCP tools run on your PC with your user's rights, and **the model decides when to call them**,
 also because of what it reads (a web page or a file can contain instructions).

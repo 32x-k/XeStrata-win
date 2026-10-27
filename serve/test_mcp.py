@@ -368,14 +368,25 @@ class ToolLoop(unittest.TestCase):
         self.assertNotIn("y" * 501, second)
 
     def test_max_rounds(self):
-        self.start(call_script("fake__echo", text="again"))          # the model never stops calling
+        self.start(call_script("fake__echo", text="first result"),
+                   call_script("fake__echo", text="second result"), "</think>\n\nSummary of both results.")
         code, text = self.post({"strata_mcp": True})
-        mcp = [c["strata_mcp"] for c in self.chunks(text) if "strata_mcp" in c]
-        self.assertEqual(len(self.engine.prompts), 3)                # 2 rounds of tools, then the limit
+        self.assertEqual(code, 200, text)
+        chunks = self.chunks(text)
+        mcp = [chunk["strata_mcp"] for chunk in chunks if "strata_mcp" in chunk]
+        self.assertEqual(len(self.engine.prompts), 3)
         self.assertEqual(sum(m["event"] == "call" for m in mcp), 2)
         self.assertIn({"event": "limit", "max_rounds": 2}, mcp)
-        self.assertTrue(mcp[-1].get("skipped"))
-        self.assertEqual(self.chunks(text)[-1]["choices"][0]["finish_reason"], "stop")
+        self.assertFalse(any(m.get("skipped") for m in mcp))
+        reply = "".join(chunk["choices"][0]["delta"].get("content", "") for chunk in chunks)
+        self.assertIn("Summary of both results.", reply)
+        final_prompt = self.engine.prompt_text(2)
+        self.assertIn("<tool_response>\nfirst result\n</tool_response>", final_prompt)
+        self.assertIn("<tool_response>\nsecond result\n</tool_response>", final_prompt)
+        self.assertIn("No tools are available for this final reply", final_prompt)
+        self.assertNotIn("<tools>", final_prompt)
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
+        self.assertEqual(chunks[-1]["usage"]["prompt_tokens"], len(self.engine.prompts[2]))
 
     def test_stop_during_a_tool(self):
         """Closing the connection while a slow tool runs stops the tool (notifications/cancelled) and the loop."""
