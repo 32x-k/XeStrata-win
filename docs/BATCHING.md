@@ -90,7 +90,11 @@ Every `--adapt-every` windows (default 4) the engine swaps the most-routed exper
 The swaps run beside the window's commit, emits and drafts, and have landed before the next window starts.
 The tier stands still while a long prompt is read beside decoding slots (the prompt may hold a loan of cache slots).
 With `--adapt-async` (the default in the resident RAM mode) no window waits for a round: each batch window moves the round on a step (upstream 495dc436), and a request that arrives finishes the round in flight before it starts.
-The pipelined groups of `--batch-groups` do not adapt.
+The pipelined groups of `--batch-groups` do not adapt by default: their windows count the routing, but no round starts while groups are in flight, so the tier moves only when the slots go back to the solo path.
+`STRATA_PIPE_ADAPT_EVERY=N` (opt-in; unset or 0 keeps the old behaviour) lets the pipelined path adapt (upstream a3bb38ec4).
+After N group windows it starts no new group, lets the groups in flight finish, runs one round as the serial batch windows do, and goes on. The swaps run while no card has a window waiting on the host, so no window reads a cache slot that is changing, and the swapped-in experts land before the next group starts.
+It stands still while a prompt is read beside decoding slots, and does nothing with `--adapt-async 1`. The engine says so at start, and the `strata batch (pipelined ...)` line adds the rounds, the experts swapped in and the time spent.
+Upstream measured it on 2x RTX 5090 (layer split, `--batch 6 --batch-groups 2`, `--adapt-every 16`, eight bursts of six streams right after start): 309 rows/s on average without it, 410 with 128 and 402 with 32 (32 empties the pipeline four times as often).
 The `strata batch:` log line shows the rounds, the experts swapped in and the wait per window (`adapt wait`).
 Swaps move experts between the GPU and the CPU, which round differently, so greedy output can differ from run to run; `--adapt-every 1000000` keeps the tier fixed (Exactness, below).
 
