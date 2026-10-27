@@ -44,11 +44,7 @@
 #include <fstream>
 #include <sstream>
 #include <vector>
-#if defined(_WIN32)
-#include <intrin.h>
-#elif defined(__x86_64__)
-#include <immintrin.h>
-#endif
+#include "strata/platform/cpu_relax.hpp"
 
 #ifdef STRATA_NATIVE_EXPERTS
 #include "ggml.h"   // --mtp-q4: the head rows' and projections' formats, dequantized and requantized at load
@@ -1689,10 +1685,11 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             uint32_t spins = 0;
             while (((volatile int32_t*) h_out_)[j] < 0) {
 #if defined(_WIN32) || defined(__x86_64__)
-                _mm_pause();
+                strata_cpu_pause();
 #endif
                 if ((++spins & 1023u) == 0 && cudaStreamQuery(cs_) != cudaErrorNotReady) break;
             }
+            strata_load_fence();   // the token was seen: its probability is read after it (a no-op on x86)
             drafts[j] = ((volatile int32_t*) h_out_)[j];
             if (probs) probs[j] = ((volatile float*) h_prob_)[j];
             prefetch_ple(drafts[j]);
@@ -1725,10 +1722,11 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
             uint32_t spins = 0;
             while (((volatile int32_t*) h_out_)[j] < 0) {
 #if defined(_WIN32) || defined(__x86_64__)
-                _mm_pause();
+                strata_cpu_pause();
 #endif
                 if ((++spins & 1023u) == 0 && cudaStreamQuery(cs_) != cudaErrorNotReady) break;
             }
+            strata_load_fence();
         };
         tl = Clock::now();
         wait_step(0);

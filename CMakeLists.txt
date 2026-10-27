@@ -59,6 +59,17 @@ function(strata_utf8_manifest target)
   endif()
 endfunction()
 
+# The AVX kernels exist for x86 only.  On aarch64 (DGX Spark / GB10) portable.cpp stands in for them and
+# native experts run on ggml-cpu's NEON dot products.
+if(NOT CMAKE_SYSTEM_PROCESSOR OR CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|x64|X64|i[3-6]86|x86|X86)$")   # an unset processor stays the x86 build, as before
+  set(STRATA_CPU_X86 ON)
+else()
+  set(STRATA_CPU_X86 OFF)
+endif()
+if(STRATA_ISA_FLOOR AND NOT STRATA_CPU_X86)
+  message(WARNING "STRATA_ISA_FLOOR is an x86 older-CPU build and does not apply to ${CMAKE_SYSTEM_PROCESSOR}; ignored")
+  set(STRATA_ISA_FLOOR "" CACHE STRING "" FORCE)
+endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -1192,7 +1203,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # the Gyro trellis decode kernels (TQ2_T / TQK6 / TQK7) on synthetic blocks: decode-once vs per-column bitwise, output
   # checksums to compare two builds byte for byte, --bench for timings (GPU, no model)
   add_executable(tq_pascal_bench src/kernels/tq_pascal_bench.cpp)
-  target_include_directories(tq_pascal_bench PRIVATE ${_strata_gpu_include_directories})
+  target_include_directories(tq_pascal_bench PRIVATE ${_strata_gpu_include_directories} ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml)
   target_link_libraries(tq_pascal_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME tq_pascal_bench COMMAND tq_pascal_bench)
   set_tests_properties(iq_multi_parity PROPERTIES ENVIRONMENT "STRATA_KQ_SPLIT=1")   # the Q4_K / Q5_K / Q8_0 Split path against the old kernels
@@ -1732,8 +1743,13 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_test(NAME batch_groups_test COMMAND batch_groups_test)
 endif()
 
-add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
-            src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/hadamard.cpp)
+if(STRATA_CPU_X86)
+  add_library(strata_kernels_cpu STATIC src/kernels/cpu/expert.cpp src/kernels/cpu/pool.cpp
+              src/kernels/cpu/expert_layout.cpp src/kernels/cpu/q2_avx2.cpp src/kernels/cpu/hadamard.cpp)
+else()
+  add_library(strata_kernels_cpu STATIC src/kernels/cpu/portable.cpp src/kernels/cpu/pool.cpp
+              src/kernels/cpu/expert_layout.cpp src/kernels/cpu/hadamard.cpp)
+endif()
 target_include_directories(strata_kernels_cpu PUBLIC include)
 # Plan v0.3 P6: only the kernel files get the AVX-512 / AVX2 flags; the pool and the probe run on any x86-64,
 # and the engine picks the kernels at run time (cpu_avx512_ok).
@@ -1845,11 +1861,13 @@ if(STRATA_NATIVE_EXPERTS)
   endif()
   # part of strata_kernels_cpu (the pool calls these and they call its CPU probe: one library, so GNU ld's
   # one-pass static linking has no cycle to resolve)
-  target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp src/kernels/cpu/iq_avx512.cpp
-                                           src/kernels/cpu/iq_avx2.cpp src/kernels/cpu/kq_avx2.cpp
-                                           src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/q2_avx1.cpp src/kernels/cpu/iq_avx1.cpp
-                                           src/kernels/cpu/nvfp4_avx512.cpp src/kernels/cpu/nvfp4_avx2.cpp
-                                           src/kernels/cpu/tq_cpu.cpp src/kernels/cpu/tq_avx2.cpp src/kernels/cpu/tq_avx512.cpp)
+  target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/native_expert.cpp)
+  if(STRATA_CPU_X86)
+    target_sources(strata_kernels_cpu PRIVATE src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/iq_avx2.cpp
+                                             src/kernels/cpu/kq_avx2.cpp src/kernels/cpu/kq_avx1.cpp src/kernels/cpu/q2_avx1.cpp
+                                             src/kernels/cpu/iq_avx1.cpp src/kernels/cpu/nvfp4_avx512.cpp src/kernels/cpu/nvfp4_avx2.cpp
+                                             src/kernels/cpu/tq_cpu.cpp src/kernels/cpu/tq_avx2.cpp src/kernels/cpu/tq_avx512.cpp)
+  endif()
   target_include_directories(strata_kernels_cpu PRIVATE third_party/ggml)
   if(MSVC)
     set_source_files_properties(src/kernels/cpu/iq_avx512.cpp src/kernels/cpu/nvfp4_avx512.cpp
@@ -1966,6 +1984,11 @@ if(STRATA_NATIVE_EXPERTS)
   # tree leaves them to the FP16 prompt path
   if(STRATA_GGML_DIR AND EXISTS "${STRATA_GGML_DIR}/ggml/src/ggml-cuda/template-instances/mmq-instance-tqk6.cu")
     list(APPEND _strata_mmq_types tq2_t tqk6 tqk7)
+    # Gyro-L's pair trellis (types 147-149): the same fork's ggml has their MMQ instances
+    if(EXISTS "${STRATA_GGML_DIR}/ggml/src/ggml-cuda/template-instances/mmq-instance-tqp5.cu")
+      list(APPEND _strata_mmq_types tqp5 tqp6 tqp7)
+      set(_strata_mmq_tqp ON)   # moe_mmq.cu names GGML_TYPE_TQP5-7 only where the ggml has them (STRATA_MMQ_TQP)
+    endif()
     set(_strata_mmq_tq ON)
   elseif(STRATA_MMQ_TQ_OVERLAY AND (STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP))
     # an upstream llama.cpp: the trellis MMQ instances come from an overlay of the pinned ggml-cuda headers written at
@@ -1982,6 +2005,7 @@ if(STRATA_NATIVE_EXPERTS)
       configure_file(third_party/ggml/ggml-common-tq.h "${_strata_tq_overlay_dir}/ggml-common-tq.h" COPYONLY)
       configure_file(src/kernels/cuda/tq_lut_i8.cuh "${_strata_tq_overlay_dir}/tq_lut_i8.cuh" COPYONLY)
       set(_strata_mmq_tq ON)
+      set(_strata_mmq_tqp ON)   # the overlay adds the pair-trellis enumerators and instances
       set(_strata_mmq_tq_overlay ON)
       message(STATUS "trellis MMQ (Gyro prompts): overlay on the pinned ggml-cuda in ${_strata_tq_overlay_dir}")
       if(STRATA_BUILD_TESTS)
@@ -2037,7 +2061,7 @@ if(STRATA_NATIVE_EXPERTS)
       target_sources(strata_mmq PRIVATE ${_strata_mmq}/template-instances/mmq-instance-${_t}.cu)
     endforeach()
     if(_strata_mmq_tq_overlay)
-      foreach(_t tq2_t tqk6 tqk7)
+      foreach(_t tq2_t tqk6 tqk7 tqp5 tqp6 tqp7)
         target_sources(strata_mmq PRIVATE ${_strata_tq_overlay_dir}/template-instances/mmq-instance-${_t}.cu)
       endforeach()
       # first on the include path: the patched mmq.cuh / ggml.h shadow the pinned ones for this target only
@@ -2155,6 +2179,9 @@ if(STRATA_NATIVE_EXPERTS)
     if(_strata_mmq_tq)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_TQ=1)
     endif()
+    if(_strata_mmq_tqp)
+      target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_TQP=1)
+    endif()
     target_link_libraries(strata_prefill PUBLIC strata_mmq)
     target_compile_definitions(strata_prefill PUBLIC STRATA_PREFILL_MMQ=1 STRATA_PREFILL_FUSED=1)
     if(STRATA_EXPERIMENTAL_SM60 AND NOT STRATA_HIP_GFX906)
@@ -2264,7 +2291,7 @@ if(STRATA_NATIVE_EXPERTS)
       list(APPEND _strata_mmq_sources "${_strata_mmq}/template-instances/mmq-instance-${_t}.cu")
     endforeach()
     if(_strata_mmq_tq_overlay)
-      foreach(_t tq2_t tqk6 tqk7)
+      foreach(_t tq2_t tqk6 tqk7 tqp5 tqp6 tqp7)
         list(APPEND _strata_mmq_sources "${_strata_tq_overlay_dir}/template-instances/mmq-instance-${_t}.cu")
       endforeach()
     endif()
@@ -2288,6 +2315,9 @@ if(STRATA_NATIVE_EXPERTS)
     endif()
     if(_strata_mmq_tq)
       target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_TQ=1)
+    endif()
+    if(_strata_mmq_tqp)
+      target_compile_definitions(strata_mmq PRIVATE STRATA_MMQ_TQP=1)
     endif()
     target_link_libraries(strata_mmq PUBLIC ggml-base hip::host roc::hipblas)
     target_link_libraries(strata_prefill PUBLIC strata_mmq)
@@ -2394,7 +2424,11 @@ if(STRATA_NATIVE_EXPERTS)
       # APR: the trellis expert types and the Hadamard activation rotation, when ggml comes from the agention fork
       # (the only tree with these types; marked by its ggml-cuda/tq.cuh)
       if(STRATA_GGML_DIR AND EXISTS "${STRATA_GGML_DIR}/ggml/src/ggml-cuda/tq.cuh")
-        foreach(_pair tqk6/tqk7 tq2_t/tq2_t)
+        set(_strata_tq_pairs tqk6/tqk7 tq2_t/tq2_t)
+        if(EXISTS "${STRATA_GGML_DIR}/ggml/src/ggml-cuda/template-instances/mmq-instance-tqp5.cu")   # Gyro-L's pair trellis
+          list(APPEND _strata_tq_pairs tqp5/tqp5 tqp6/tqp6 tqp7/tqp7)
+        endif()
+        foreach(_pair ${_strata_tq_pairs})
           string(REPLACE "/" "_" _name "${_pair}")
           add_test(NAME native_expert_parity_${_name} COMMAND native_expert_parity --synthetic ${_pair})
           add_test(NAME native_expert_parity_hadamard_${_name} COMMAND native_expert_parity --synthetic-hadamard ${_pair})
@@ -2468,6 +2502,13 @@ if(STRATA_BUILD_TESTS)
     add_test(NAME tq_cpu_parity COMMAND tq_cpu_parity)
     add_test(NAME tq_cpu_parity_avx2 COMMAND ${CMAKE_COMMAND} -E env STRATA_FORCE_AVX2=1 $<TARGET_FILE:tq_cpu_parity>)
     set_tests_properties(tq_cpu_parity tq_cpu_parity_avx2 PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+    # Gyro-L's pair trellis (types 147-149) and the older trellis rows on synthetic blocks, no ggml and no model: the scalar
+    # kernel against a bit-by-bit reference, every ISA bit for bit equal to scalar, the type predicates unchanged
+    add_executable(tqp_cpu_test src/kernels/cpu/tqp_cpu_test.cpp)
+    target_link_libraries(tqp_cpu_test PRIVATE strata_kernels_cpu)
+    add_test(NAME tqp_cpu_test COMMAND tqp_cpu_test)
+    add_test(NAME tqp_cpu_test_avx2 COMMAND ${CMAKE_COMMAND} -E env STRATA_FORCE_AVX2=1 $<TARGET_FILE:tqp_cpu_test>)
+    set_tests_properties(tqp_cpu_test tqp_cpu_test_avx2 PROPERTIES TIMEOUT 120)
   endif()
 
   add_executable(expert_parity src/kernels/cpu/expert_parity.cpp)
@@ -2607,7 +2648,7 @@ if(STRATA_HIP_GFX906)
     # f16kq::covers() answers false and the int8 kernels run, as on every other card)
     if(_strata_mmq_tq_overlay)
       set(_strata_tq_hip ${_strata_tq_overlay_dir}/quantize.cu)
-      foreach(_t tq2_t tqk6 tqk7)
+      foreach(_t tq2_t tqk6 tqk7 tqp5 tqp6 tqp7)
         list(APPEND _strata_tq_hip ${_strata_tq_overlay_dir}/template-instances/mmq-instance-${_t}.cu)
       endforeach()
       list(APPEND _strata_cu ${_strata_tq_hip})
