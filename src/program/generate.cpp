@@ -65,6 +65,7 @@
 #include "strata/core/mtp.hpp"
 #include "strata/core/coupled_draft.hpp"
 #include "strata/prefill/prefill.hpp"
+#include "strata/prefill/kva.hpp"   // STRATA_KVA: the engine's part (kva_engine)
 #include "strata/prefill/share_rules.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/program/plain_generate.hpp"
@@ -4668,6 +4669,21 @@ int main(int argc, char** argv) {
     // the draft layer is the canonical model's MTP head (512 experts) even when the target is pruned, so it always sees
     // the canonical geometry; `static` because MtpDrafter keeps a reference (the batch slots' draft K/V copies too)
     static const strata::core::ModelGeometry draft_geometry{};
+    // KVA (opt-in, STRATA_KVA=1; unset is the exact prompt read): what only the engine knows.  A layer split across GPUs
+    // and the batch slots read their prompts in stages and in pieces, which the one-GPU, one-cold-read rule of the
+    // approximate prompt read cannot follow, so they stay on the exact path (and say so here, once).  The draft layer
+    // (MTP) keeps its window.
+    {
+        const strata::prefill::KvaConfig& kc = strata::prefill::kva_config();
+        strata::prefill::KvaEngine& ke = strata::prefill::kva_engine();
+        if (kc.on) {
+            if (multi_gpu) ke.blocked = "a layer split across GPUs";
+            else if (o.batch > 0) ke.blocked = "batch slots (--batch)";
+            if (!ke.blocked.empty())
+                std::fprintf(stderr, "strata generate: KVA (the approximate late-layer prompt read) is off here: %s\n",
+                             ke.blocked.c_str());
+        }
+    }
     if (!o.mtp.empty()) {
         if (o.spec < 2) {
             std::fprintf(stderr, "strata generate: --mtp is ignored without --spec T (T >= 2)\n");

@@ -42,6 +42,7 @@
 #include "strata/kernels/iq_mmq.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/prefill/kernels.hpp"
+#include "strata/prefill/kva.hpp"   // STRATA_KVA: the approximate late-layer prompt read (opt-in)
 
 #include "strata/core/gpu.hpp"
 
@@ -1852,6 +1853,119 @@ struct PfTimer {
         for (strata::gpu::Event* e : ev) strata::gpu::event_destroy(e);
     }
 };
+
+// ---- KVA (STRATA_KVA, research): the capture and oracle taps of the late layers' block inputs ---------------
+//
+// A capture run writes, for every layer at or after the split and every chunk, the chunk's multi-stream residual
+// R [T, hc*n_embd] as it ENTERS the layer - exactly the vector a projector would have to produce.  One file per
+// layer (`L<layer>.bin`), rows in position order, bf16 (fp32 with STRATA_KVA_CAPTURE_FP32, for parity runs): a
+// reader seeks straight to a position.  The oracle mode replays such a file in place of a projector, which is how
+// the state-only path is checked against the full one before any weights are fitted.
+struct KvaTap {
+    std::string dir;
+    bool fp32 = false;
+    std::vector<std::FILE*> f;      // one per layer, opened on first use
+    std::vector<int64_t> next_pos;  // where the next record must start (0: nothing written yet)
+    std::vector<float> host;        // one chunk's rows, fp32
+    std::vector<uint16_t> bf;       // their bf16 image
+    std::string err;
+
+    void open(const std::string& d, bool is_fp32) {
+        dir = d;
+        fp32 = is_fp32;
+        f.assign(128, nullptr);
+        next_pos.assign(128, 0);
+    }
+    void close() {
+        for (std::FILE*& p : f) { if (p != nullptr) std::fclose(p); p = nullptr; }
+    }
+    /// A new cold read starts: a capture file holds one prompt's rows, so every layer starts over.
+    void begin_prompt() {
+        close();
+        if (next_pos.empty()) next_pos.assign(f.size(), 0);
+        for (int64_t& p : next_pos) p = 0;
+    }
+    std::string path(int64_t layer) const { return dir + "/L" + std::to_string((long long) layer) + ".bin"; }
+
+    /// The chunk's rows of `layer` from the device residual `R` - a capture.
+    bool write(int64_t layer, const float* R, int64_t T, int64_t p0, int64_t Dw, strata::gpu::Stream cs) {
+        if (layer < 0 || layer >= (int64_t) f.size()) { err = "kva capture: layer out of range"; return false; }
+        if (next_pos[(size_t) layer] != p0) {
+            err = "kva capture: layer " + std::to_string((long long) layer) + " expects position " +
+                  std::to_string((long long) next_pos[(size_t) layer]) + ", got " + std::to_string((long long) p0) +
+                  " (a capture needs one cold, in-order read)";
+            return false;
+        }
+        host.resize((size_t) (T * Dw));
+        if (!strata::gpu::copy_async(host.data(), R, (size_t) (T * Dw) * 4, cs) || !strata::gpu::stream_sync(cs)) {
+            err = "kva capture: the residual copy failed";
+            return false;
+        }
+        std::FILE*& p = f[(size_t) layer];
+        if (p == nullptr) {
+            p = std::fopen(path(layer).c_str(), "wb");
+            if (p == nullptr) { err = "kva capture: cannot write " + path(layer); return false; }
+        }
+        if (fp32) {
+            std::fwrite(host.data(), 4, host.size(), p);
+        } else {
+            bf.resize(host.size());
+            for (size_t i = 0; i < bf.size(); ++i) {   // round to nearest even, as STRATA_PREFILL_DUMP_R_ALL does
+                uint32_t u;
+                std::memcpy(&u, &host[i], 4);
+                u += 0x7fffu + ((u >> 16) & 1u);
+                bf[i] = (uint16_t) (u >> 16);
+            }
+            std::fwrite(bf.data(), 2, bf.size(), p);
+        }
+        std::fflush(p);
+        next_pos[(size_t) layer] = p0 + T;
+        return true;
+    }
+
+    /// The chunk's rows of `layer` into the device residual `R` - an oracle replay.
+    bool read(int64_t layer, float* R, int64_t T, int64_t p0, int64_t Dw, strata::gpu::Stream cs) {
+        if (layer < 0 || layer >= (int64_t) f.size()) { err = "kva oracle: layer out of range"; return false; }
+        std::FILE*& p = f[(size_t) layer];
+        if (p == nullptr) {
+            p = std::fopen(path(layer).c_str(), "rb");
+            if (p == nullptr) { err = "kva oracle: cannot read " + path(layer); return false; }
+        }
+        const int64_t nv = T * Dw;
+        const int64_t esz = fp32 ? 4 : 2;
+        const long long off = (long long) p0 * Dw * esz;
+#if defined(_WIN32)
+        const bool seek_ok = _fseeki64(p, off, SEEK_SET) == 0;
+#else
+        const bool seek_ok = fseeko(p, (off_t) off, SEEK_SET) == 0;
+#endif
+        if (!seek_ok) { err = "kva oracle: cannot seek " + path(layer); return false; }
+        // the previous chunk's upload may still read `host`: it is refilled only once that copy has landed
+        if (!strata::gpu::stream_sync(cs)) { err = "kva oracle: the stream failed"; return false; }
+        host.resize((size_t) nv);
+        size_t got = 0;
+        if (fp32) {
+            got = std::fread(host.data(), 4, (size_t) nv, p);
+        } else {
+            bf.resize((size_t) nv);
+            got = std::fread(bf.data(), 2, (size_t) nv, p);
+            for (size_t i = 0; i < got; ++i) {   // bf16 -> fp32: the top half, exactly
+                const uint32_t u = (uint32_t) bf[i] << 16;
+                std::memcpy(&host[i], &u, 4);
+            }
+        }
+        if (got != (size_t) nv) {
+            err = "kva oracle: short read of " + path(layer) + " at position " + std::to_string((long long) p0) +
+                  ": wanted " + std::to_string((long long) nv) + " values, got " + std::to_string((long long) got);
+            return false;
+        }
+        if (!strata::gpu::copy_async(R, host.data(), (size_t) nv * 4, cs)) {
+            err = "kva oracle: the upload failed";
+            return false;
+        }
+        return true;
+    }
+};
 }  // namespace
 
 bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
@@ -1862,6 +1976,32 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     core::SessionState& ss = *m.ss;
     const auto t_start = Clock::now();
     const int64_t LB = stage_lb_, LE = stage_le_;
+    // STRATA_KVA: the approximate-prefix plan of this run, if it qualifies (a cold read of one long prompt, one
+    // stage, no capture).  Positions [0, kva_frontier) are approximated in the layers at and after the split.
+    const KvaConfig& kva = kva_config();
+    const KvaEngine& kva_eng = kva_engine();
+    const int64_t kva_suffix = kva.effective_suffix();
+    const bool kva_unmeasured = g.n_layers != 48 || g.n_expert != 512;   // Qwen3.8-Flash-Next's shape
+    const char* kva_why_not = kva.decline(kva_eng, pos0, n, LB, LE, (int64_t) g.n_layers, embd_rows != nullptr,
+                                          kva_unmeasured);
+    if (kva_why_not == nullptr && kva_unmeasured) {
+        // STRATA_KVA_ANY_MODEL=1 (research): allowed on a shape KVA was not measured on, with a warning once
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            std::fprintf(stderr, "strata prefill: WARNING: STRATA_KVA_ANY_MODEL=1: KVA was only measured on Qwen3.8-Flash-Next "
+                                 "(48 layers, 512 experts); this model has %lld layers and %lld experts\n",
+                         (long long) g.n_layers, (long long) g.n_expert);
+    }
+    const bool kva_run = kva_why_not == nullptr;
+    const int64_t kva_split = std::min<int64_t>(std::max<int64_t>(kva.split, 1), g.n_layers);
+    const int64_t kva_frontier = std::max<int64_t>(0, n - kva_suffix);
+    static KvaTap kva_capture;   // process-wide: one cold read at a time, so the per-layer position is enough
+    static KvaTap kva_oracle;
+    int64_t kva_positions = 0, kva_chunks = 0;   // what actually took the approximate path (diagnostics)
+    if (kva.capture && kva_capture.f.empty()) kva_capture.open(kva.capture_dir, kva.capture_fp32);
+    if (kva.capture && pos0 == 0 && hand_in_ == nullptr) kva_capture.begin_prompt();   // one prompt per capture
+    if (kva_run && kva.mode == KvaConfig::Mode::Oracle && kva_oracle.f.empty())
+        kva_oracle.open(kva.oracle_dir, kva.oracle_fp32);
     // the next stage reads chunk c while this one reads chunk c + 1 (declared first: an early return waits for it
     // before anything it reads goes away)
     struct NextWait {
@@ -1939,6 +2079,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             std::fflush(stderr);
         }
         const int64_t T = std::min(m.T, n - c0), p0 = pos0 + c0;
+        // STRATA_KVA: this chunk is approximated in the layers at and after the split when its last position is
+        // before the request's full-computation suffix; a chunk in the suffix runs the ordinary path everywhere.
+        const bool kva_approx = kva_run && (p0 + T <= kva_frontier);
+        if (kva_approx) {
+            kva_positions += T;
+            ++kva_chunks;
+        }
         core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);
         ++stats_.chunks;
         pt.mark(kPfStart, cs);
@@ -2106,11 +2253,18 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         std::vector<StreamEntry> seq;
         std::vector<size_t> seq_start;
         size_t issued = 0, consumed = 0;
+        // STRATA_KVA: `kva_layer(l)` - layer l of this chunk has no consumer left for its output: it advances only its
+        // state (or, STRATA_KVA_SKIP=moe, skips only its MoE half), so its MoE half and its expert transfers are skipped
+        auto kva_layer = [&](int64_t l) {
+            return kva_approx && l >= kva_split &&
+                   (kva.only == KvaConfig::Only::All || (kva.only == KvaConfig::Only::Gdn) == !core::is_qsa_layer(g, l));
+        };
         if (stream_all) {
             seq_start.assign((size_t) g.n_layers + 1, 0);
             std::vector<Stager::Job> js;
             for (int64_t l = LB; l < LE; ++l) {
                 seq_start[(size_t) l] = seq.size();
+                if (kva_layer(l)) continue;   // no transfer for a layer whose MoE half is skipped
                 for (int32_t e = 0; e < m.g->n_expert; ++e) {
                     if (m.host_res && m.cache && m.host_res[(size_t) l * m.g->n_expert + e] >= 0) continue;
                     const bool tr = m.src->transient(l, e);   // copied by the source in the stager (never pinned)
@@ -2219,6 +2373,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
             core::progress_at("reading the prompt (batched): layer", l, p0);   // a stall names layer and chunk
             const core::LayerView v(*m.wt, l);
+            // STRATA_KVA: a state-only layer advances its state and writes nothing to R; STRATA_KVA_SKIP=moe runs the
+            // whole attention half and skips the MoE half; `kva_subst` replays the block input from a capture (oracle)
+            const bool kva_l = kva_layer(l);
+            const bool kva_moe_only = kva_l && kva.skip == KvaConfig::Skip::Moe;
+            const bool kva_state_only = kva_l && !kva_moe_only;
+            const bool kva_subst = kva_l && kva.mode == KvaConfig::Mode::Oracle;
+            const bool kva_cap_layer = kva.capture && LB == 0 && LE == g.n_layers && l >= kva_split;
             if (l == std::max<int64_t>(LB, 1) && !ple_land()) return false;   // the PLE rows, read from layer 1 on
             // ---- the PLE block at layer 1, token by token (its conv reads the previous tokens' rows)
             if (l == 1 && ple_on && ple_batch) {
@@ -2275,7 +2436,24 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 }
                 stats_.ms_ple += ms_since(tp);
             }
+            // STRATA_KVA: the capture and the oracle hook the residual ENTERING the layer - the vector a projector
+            // has to produce for it.  A capture run is an ordinary full read; the oracle replaces the input.
+            if (kva_cap_layer && !kva_capture.write(l, m.R, T, p0, D, cs)) { err = kva_capture.err; return false; }
+            if (kva_subst) {
+                if (!kva_oracle.read(l, m.R, T, p0, D, cs)) { err = kva_oracle.err; return false; }
+                normed = false;   // the previous half's norm of R is stale once the input is replaced
+            }
             for (int half = 0; half < 2; ++half) {
+                if (kva_moe_only && half == 1) {
+                    // KVA moe-skip: the attention half wrote its output into R (its write normed R with this layer's
+                    // FFN weights, which nothing reads now); this layer's MoE half has no consumer left
+                    normed = false;
+                    if (stream_all) {   // the stream holds no entry of this layer: what came before is given back
+                        consumed = std::max(consumed, seq_start[(size_t) l + 1]);
+                        give_back(consumed);
+                    }
+                    break;
+                }
                 // ---- the hyper-connection read of this half
                 const char* pre = half == 0 ? "hc_attn_" : "hc_ffn_";
                 const std::string sn = std::string(pre) + "norm.weight", sd = std::string(pre) + "down.weight",
@@ -2311,17 +2489,37 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
                     if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
+                    // KVA: the gate projection feeds only the output normalization, which a state-only layer skips
+                    // (STRATA_KVA_GDN_NORM=1 keeps the full recurrence as the A/B control for the state-only one)
+                    static const bool kva_gdn_norm = [] {
+                        const char* e = std::getenv("STRATA_KVA_GDN_NORM");
+                        return e != nullptr && (int) std::strtol(e, nullptr, 10) != 0;
+                    }();
+                    if ((!kva_state_only || kva_gdn_norm) &&
+                        !native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                     if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV, m.mixed_bf_lo)) return false;
                     pt.mark(kPfGdnConv, cs);   // "gdn" is the projections in; the rest on their own lines
                     gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
                     gdn_conv(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, m.cs);
                     pt.mark(kPfGdnRec, cs);
-                    gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs);
+                    if (kva_state_only && !kva_gdn_norm)   // KVA: the recurrence without the output normalization
+                        gdn_recurrence_state_only(state, m.hbuf, m.gate, m.beta, m.y, T, m.cs);
+                    else
+                        gdn_recurrence(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h, T, m.cs);
                     pt.mark(kPfGdnOut, cs);
-                    if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err)) return false;
+                    // KVA: the out projection feeds only the residual write and the MoE half
+                    if (!kva_state_only && !native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err)) return false;
                     ++gdn_index;
+                    if (kva_state_only) {
+                        // the layer consumes no expert (its stream holds none): what came before is given back, so
+                        // the issuer thread never waits for this layer
+                        if (stream_all) {
+                            consumed = std::max(consumed, seq_start[(size_t) l + 1]);
+                            give_back(consumed);
+                        }
+                        break;   // state advanced: no gated residual write, no MoE half of this layer
+                    }
                 } else if (half == 0) {
                     // ======================= QSA =======================
                     const core::QsaState& st = ss.qsa_states[qsa_index];
@@ -2336,9 +2534,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     pt.mark(kPfQsa, cs);
                     if (!native_proj(m.gemm, wk, m.mixed_h, m.Kc, T, v.name("attn_k.weight"), err)) return false;
                     if (!native_proj(m.gemm, wv, m.mixed_h, m.Vc, T, v.name("attn_v.weight"), err)) return false;
-                    if (!native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
+                    // KVA: the query projections have no consumer when only the KV/indexer state advances
+                    if (!kva_state_only && !native_proj(m.gemm, wq, m.mixed_h, m.Qf, T, v.name("attn_q.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wik, m.mixed_bf, m.idx_raw, T, v.name("indexer.k_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
-                    if (!bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
+                    if (!kva_state_only && !bf16_proj(m.gemm, wiq, m.mixed_bf, m.q_idx, T, v.name("indexer.q_proj.weight"), err, 0, m.mixed_bf_lo)) return false;
                     rms_rows(m.Kc, (const float*) wkn->data, T * 2, 256, 256, EPS, m.cs);
                     rope(m.Kc, T, 2, 256, 512, p0, strata::kernels::rope_scaling(), m.cs);
                     // KV streaming: this layer's cells [0, p0) come in from the host copy to the staging pool, and the
@@ -2377,12 +2576,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                       st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs,
                                       &st.host, staged ? &m.stage : nullptr);
                     }
-                    split_q(m.Qf, m.q, T, m.cs);
-                    rms_rows(m.q, (const float*) wqn->data, T * 24, 256, 256, EPS, m.cs);
-                    rope(m.q, T, 24, 256, 6144, p0, strata::kernels::rope_scaling(), m.cs);
-                    if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(m.q, T * 24, m.cs);
-                    rms_rows(m.q_idx, (const float*) wiqn->data, T * 4, 128, 128, EPS, m.cs);
-                    rope(m.q_idx, T, 4, 128, 512, p0, strata::kernels::rope_scaling(), m.cs);
+                    if (!kva_state_only) {   // KVA: a state-only layer has no queries
+                        split_q(m.Qf, m.q, T, m.cs);
+                        rms_rows(m.q, (const float*) wqn->data, T * 24, 256, 256, EPS, m.cs);
+                        rope(m.q, T, 24, 256, 6144, p0, strata::kernels::rope_scaling(), m.cs);
+                        if (st.kv_rot) strata::kernels::fwht256_inplace_cuda(m.q, T * 24, m.cs);
+                        rms_rows(m.q_idx, (const float*) wiqn->data, T * 4, 128, 128, EPS, m.cs);
+                        rope(m.q_idx, T, 4, 128, 512, p0, strata::kernels::rope_scaling(), m.cs);
+                    }
                     // the indexer appends, token by token; then scores + selection for many queries at once:
                     // a query reads completed blocks (final once completed) and `dead` for its own tail block
                     const strata::kernels::QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
@@ -2403,6 +2604,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                        strata::kernels::rope_scaling(), m.cs);
                         }
                     } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
+                    // KVA: the KV pages and the indexer's keys/pool are complete for this chunk.  Nothing that reads
+                    // them (query side, selection, attention, output projection, the MoE half) has a consumer left, so
+                    // the layer ends here.
+                    if (kva_state_only) {
+                        ++qsa_index;
+                        if (stream_all) {   // the stream holds no entry of this layer: what came before is given back
+                            consumed = std::max(consumed, seq_start[(size_t) l + 1]);
+                            give_back(consumed);
+                        }
+                        break;
+                    }
                     pt.mark(kPfQsaSel, cs);
                     for (int64_t t0 = 0; t0 < T; t0 += m.sel_batch) {
                         const int64_t nb = std::min(m.sel_batch, T - t0);
@@ -3627,6 +3839,42 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                              "(the timing's own cost, charged to 'host grouping'), the grouping %.0f ms\n",
                      host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple, host_route_ms, host_fold_ms, host_group_ms);
     }
+    if (kva_run || kva.capture) {
+        const char* mode = kva.skip == KvaConfig::Skip::Moe ? "moe-skip"
+                         : kva.mode == KvaConfig::Mode::Oracle ? "oracle"
+                         : kva.mode == KvaConfig::Mode::Linear ? "linear" : "identity";
+        const char* only = kva.only == KvaConfig::Only::Gdn ? ", gdn layers only"
+                         : kva.only == KvaConfig::Only::Qsa ? ", qsa layers only" : "";
+        std::fprintf(stderr, "strata prefill: KVA %s: split %lld, suffix %lld, approximated %lld of %lld positions "
+                             "in %lld of %lld chunks, mode %s%s%s\n",
+                     kva_run ? "on" : "off (capture)", (long long) kva_split, (long long) kva_suffix,
+                     (long long) kva_positions, (long long) n, (long long) kva_chunks,
+                     (long long) (n > 0 && m.T > 0 ? (n + m.T - 1) / m.T : 0), mode, only,
+                     kva.capture ? ", capturing the late layers' inputs" : "");
+        if (kva_positions > 0) {
+            // What a later turn does with this state (serve): it continues from the live session or a checkpoint of
+            // it and reads only the new tokens, exactly, over the cells this read left; nothing is approximated twice.
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true))
+                std::fprintf(stderr, "strata prefill: KVA: the late layers (%lld and up) hold approximated cells for "
+                                     "the first %lld positions of this prompt; a follow-up turn that continues from "
+                                     "this state reads its new tokens exactly on top of them (nothing is approximated "
+                                     "twice); STRATA_KVA=0 reads every prompt exactly\n",
+                             (long long) kva_split, (long long) kva_positions);
+        }
+    } else if (kva.on) {
+        // a run that was configured for KVA but read exactly says so and why, or an operator cannot tell it apart
+        // from a run where the feature was never asked for (KVA runs only when STRATA_KVA=1 asked for it)
+        if (kva_why_not == kKvaShapeReason)
+            std::fprintf(stderr, "strata prefill: KVA configured but NOT applied: this model's shape (%lld layers, %lld experts) "
+                                 "is not one KVA was measured on (STRATA_KVA_ANY_MODEL=1 allows it)\n",
+                         (long long) g.n_layers, (long long) g.n_expert);
+        else
+            std::fprintf(stderr, "strata prefill: KVA configured but NOT applied: %s (prompt %lld positions, "
+                                 "min_prompt %lld, suffix %lld, split %lld)\n",
+                         kva_why_not != nullptr ? kva_why_not : "not applicable", (long long) n, (long long) kva.min_prompt,
+                         (long long) kva_suffix, (long long) kva_split);
+    }
     if (std::getenv("STRATA_STATE_HASH_GDN") != nullptr) {   // debug: the GDN states as the prompt path leaves them
         strata::gpu::stream_sync(m.cs);
         std::vector<uint8_t> b((size_t) gdn_floats * 4);
@@ -3749,6 +3997,8 @@ int64_t Prefill::lm_prepare(int64_t n, std::string& why, int64_t cap) {
     }
     if (helper_ != nullptr) { why = "a helper GPU's expert share"; return 0; }
     if (embd_rows != nullptr) { why = "an image prompt"; return 0; }
+    // KVA's approximate late layers have no layer-major form: a prompt that wants them reads chunk-major (upstream 0.2.7)
+    if (kva_config().on) { why = "STRATA_KVA is on"; return 0; }
     // the default path's debug dump of every row has no layer-major form
     if (std::getenv("STRATA_PREFILL_DUMP_R_ALL")) { why = "a row debug dump (STRATA_PREFILL_DUMP_R_ALL)"; return 0; }
     const MmqPlan& mp = mmq_plan();
