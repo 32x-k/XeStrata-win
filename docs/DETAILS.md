@@ -1285,7 +1285,7 @@ It asks before unloading and is off while an answer is being written or an image
 **Language.** About > Settings lists the page's languages: English, German, French, Spanish, Japanese, Korean, Portuguese, Russian and Chinese.
 The default, **Automatic**, takes the first of the browser's languages (`navigator.languages`) the page has (the region dropped when the whole tag is not one: `ja-JP` is `ja`, `pt-BR` is `pt`), else English.
 A language you pick is kept in this browser; picking Automatic forgets it.
-The Chat view, its settings and the header are translated; Monitor, Images and About are still English.
+The Chat view, its settings, the header and the Images view are translated; Monitor and About are still mostly English.
 A language is a file `serve/web/locales/<lang>.json`; the English text lives in the code next to its key.
 `python tools/web_i18n.py` checks every file for the same keys and placeholders (`--write` rewrites `en.json`).
 `/?lang=de` shows a language for one visit.

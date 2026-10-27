@@ -1255,7 +1255,7 @@ HTML のページには警告のボタン **Run scripts** もあり、確かめ�
 **Language.** About > Settings に画面の言語が並びます。英語、ドイツ語、フランス語、スペイン語、日本語、韓国語、ポルトガル語、ロシア語、中国語です。
 既定の **Automatic** は、ブラウザーの言語の設定（`navigator.languages`）を順に見て、画面にある最初の言語を使います（`ja-JP` は `ja`、`pt-BR` は `pt` のように地域を外して比べます）。どれもなければ英語です。
 言語を選ぶとこのブラウザーに残り、Automatic を選ぶとその選択を消します。
-Chat の画面とその設定、ヘッダーを訳し、Monitor・Images・About はまだ英語です。
+Chat の画面とその設定、ヘッダー、Images の画面を訳し、Monitor と About はまだほとんど英語です。
 言語は `serve/web/locales/<lang>.json` のファイルで、英語の文はコードの中の鍵の横にあります。
 `python tools/web_i18n.py` がどのファイルも同じ鍵と {placeholder} を持つかを確かめます（`--write` で `en.json` を書き直します）。
 `/?lang=de` は、その回だけ言語を変えます。
