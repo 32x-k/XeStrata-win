@@ -98,6 +98,29 @@ Upstream measured it on 2x RTX 5090 (layer split, `--batch 6 --batch-groups 2`, 
 The `strata batch:` log line shows the rounds, the experts swapped in and the wait per window (`adapt wait`).
 Swaps move experts between the GPU and the CPU, which round differently, so greedy output can differ from run to run; `--adapt-every 1000000` keeps the tier fixed (Exactness, below).
 
+## MTP drafts in the pipelined groups (`STRATA_PIPED_MTP`, opt-in)
+
+Grouped windows (`--batch-groups` above 1) verify no MTP proposals, and `--batch-mtp` in one group keeps one GPU busy at a time.
+`STRATA_PIPED_MTP=N` together with `--batch-mtp` gives both: the groups stay pipelined, and each slot verifies its proposals in them (upstream 17878ac57).
+Without the variable nothing changes.
+
+A group's window carries, for each of its slots, the slot's token and up to N MTP proposals (at most `--spec` - 1; the first always, each further one while the draft layer was at least `--spec-min-p` sure of the one before).
+The last GPU judges each slot's proposals on their own.
+How many rows to keep is known only then, and by then the earlier GPUs already run other groups' windows, so the rows the commit replays are copied to the group's own saved rows right behind each window, and after the verdict every GPU queues the commit of the kept rows.
+An earlier GPU's commit is queued only while no window there waits on the host (before its next window, or at once when it is idle).
+A slot's drafter catches up on its own rows and drafts the next proposals as an asynchronous chain; a group whose chain has not landed lets another group start first.
+Anything that reads a slot's state (an admission, a parked conversation, the solo path taking a slot back) first finishes the groups in flight and the queued commits.
+
+It runs on a layer split with two or more groups whose windows (the group's slots x (1 + N)) hold at most 8 rows.
+When it cannot run, the engine says why and leaves it off, and turns `--batch-mtp` off as well if the slots stay in pipelined groups.
+Every GPU keeps the saved rows (25.5 MiB at `=1` and 38.2 MiB at `=2` with 4 slots, upstream's numbers), taken from the expert cache.
+
+Upstream found `=1` the setting to use.
+On 2x RTX A6000 (every expert in VRAM, `--batch 4` in 2 groups of 2 slots, total tok/s) 2 streams went from 125.7 without drafts to 146.3 at `=1` (+16%) and 145.1 at `=2`, and 4 streams from 171.4 to 188.8 at `=1` (+10%), 179.5 at `=2` and 165.6 at `=3`.
+On 2x RTX A4000 (Q2_0, the experts do not all fit in VRAM) `=1` gained 18-20% at 2 streams and 6-8% at 4, and `=2` was slower than no drafts at 4.
+One stream runs on the solo path and does not change.
+Greedy outputs were each slot's solo tokens (upstream, on the A6000 box). Where the experts do not all fit, the drafters' VRAM changes which experts are cached, and with it the output can change.
+
 ## Exactness
 
 A batch row's arithmetic is the single-token window's, so with greedy decoding **every conversation of a batch produces exactly the tokens it produces alone**.
