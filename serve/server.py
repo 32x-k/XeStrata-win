@@ -66,7 +66,8 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.sh) as well as a module
 SETUP_CMD = "xestrata" if (ROOT / "PACKAGED").is_file() else "./setup.sh"   # a deb or rpm package's command (setup.py)
 from serve.frontend import (THINK_END, ChatTemplate, Event, GlmOutputParser, HarmonyParser,  # noqa: E402
-                            OutputParser, ToolCall, anthropic_to_messages, forced_call, images_of, literal_tags,
+                            OutputParser, ToolCall, anthropic_format, anthropic_to_messages, forced_call, images_of,
+                            literal_tags,
                             mark_think_literals,
                             openai_to_messages, require_messages, tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, McpHub, hub_from_config  # noqa: E402
@@ -5413,6 +5414,57 @@ def anthropic_collect(events) -> dict:
     return msg
 
 
+def anthropic_prepare_format(req: dict, messages, tools):
+    """prepare_format for Anthropic's output_config.format -> (messages, validator or None); its errors name the
+    request's own field."""
+    try:
+        return prepare_format(anthropic_format(req), messages, with_tools=bool(tools))
+    except ValueError as e:
+        raise ValueError(str(e).replace("response_format", "output_config.format")) from None
+
+
+def anthropic_structured(events, validator):
+    """anthropic_events for a structured answer (output_config.format), buffered so a client never receives
+    unvalidated text: the text blocks are checked against the schema and sent as one, after the thinking.  An answer
+    that calls a tool goes out as written: the schema is for the final answer (as on /v1/responses, #782)."""
+    buffered = []
+    heartbeat = time.monotonic()
+    try:
+        for item in events:
+            if item is not None:
+                buffered.append(item)
+            if item is None or time.monotonic() - heartbeat >= 1:
+                heartbeat = time.monotonic()
+                yield None
+        msg = anthropic_collect(buffered)
+        if msg["stop_reason"] == "tool_use":
+            yield from buffered
+            return
+        text = "".join(b["text"] for b in msg["content"] if b["type"] == "text")
+        finish = "length" if msg["stop_reason"] == "max_tokens" else "stop"
+        content = validated_json(text, validator, finish)
+        index, in_text = 0, False
+        for name, e in buffered:
+            if name == "content_block_start":
+                in_text = e["content_block"]["type"] == "text"
+            if name.startswith("content_block_"):
+                if not in_text:
+                    yield name, {**e, "index": index}
+                    index += name == "content_block_stop"
+                elif name == "content_block_stop":
+                    in_text = False
+                continue
+            if name == "message_delta":
+                yield "content_block_start", {"type": "content_block_start", "index": index,
+                                              "content_block": {"type": "text", "text": ""}}
+                yield "content_block_delta", {"type": "content_block_delta", "index": index,
+                                              "delta": {"type": "text_delta", "text": content}}
+                yield "content_block_stop", {"type": "content_block_stop", "index": index}
+            yield name, e
+    finally:
+        events.close()
+
+
 # ------------------------------------------------------------------------------------------------ HTTP
 CHUNKED_BODY_MAX = 256 << 20                # #893: the most a Transfer-Encoding: chunked body may hold (in memory)
 
@@ -6662,6 +6714,7 @@ def make_handler(svc: Service):
             read for the same request, rendered and tokenized - the model does not run."""
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
+            messages, _ = anthropic_prepare_format(req, messages, tools)   # its instruction is part of the prompt
             stop_strings(req)                                 # the same 400 as the request itself would get
             check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw, store=False))})
@@ -6675,6 +6728,7 @@ def make_handler(svc: Service):
                 tools = None
             force = forced_call(req.get("tool_choice"), tools,        # "any" / {"type": "tool", "name": N}
                                 getattr(svc.template, "call_form", "qwen"))
+            messages, validator = anthropic_prepare_format(req, messages, tools)
             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
@@ -6684,9 +6738,14 @@ def make_handler(svc: Service):
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
+            if validator is not None:
+                events = anthropic_structured(events, validator)
             events = self._capture(events, "anthropic")
             if not req.get("stream"):
-                return self._json(200, anthropic_collect(events))
+                try:
+                    return self._json(200, anthropic_collect(events))
+                except StructuredOutputError as exc:
+                    return self._json(502, {"type": "error", "error": {"type": "api_error", "message": str(exc)}})
             self._sse()
             try:
                 for item in events:
@@ -6703,6 +6762,10 @@ def make_handler(svc: Service):
                 events.close()
             except EngineDied as e:                          # mid-stream: Anthropic's error event
                 err = {"type": "error", "error": {"type": "api_error", "message": f"{e}; the next request restarts it"}}
+                self._note(error=err["error"])
+                self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+            except StructuredOutputError as e:
+                err = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
                 self._note(error=err["error"])
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
             except ValueError as e:                          # the engine's ERR after the stream started

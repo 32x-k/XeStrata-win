@@ -763,6 +763,23 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     return _env_to_user(_late_system_to_user(messages)), tools, kwargs
 
 
+def anthropic_format(req: dict):
+    """Anthropic's structured output, `output_config.format` (or the beta's name for it, `output_format`):
+    {"type": "json_schema", "schema": {...}} -> the Chat Completions response_format prepare_format reads, or None."""
+    config = req.get("output_config")
+    fmt = config.get("format") if isinstance(config, dict) else None
+    if fmt is not None and req.get("output_format") is not None:
+        raise ValueError("give the format once: output_config.format or output_format, not both")
+    fmt = req.get("output_format") if fmt is None else fmt
+    if fmt is None:
+        return None
+    if not isinstance(fmt, dict) or fmt.get("type") != "json_schema":
+        raise ValueError('output_config.format must be {"type": "json_schema", "schema": {...}}')
+    if not isinstance(fmt.get("schema"), dict):
+        raise ValueError("output_config.format needs a schema object")
+    return {"type": "json_schema", "json_schema": {"name": "output", "schema": fmt.get("schema")}}
+
+
 # ------------------------------------------------------------------------------------------------ output parser
 @dataclass
 class ToolCall:
