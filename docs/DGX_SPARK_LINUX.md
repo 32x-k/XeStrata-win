@@ -87,21 +87,51 @@ cache is most of the memory `cudaMemGetInfo` calls used.
 
 ## Speeds
 
-[[SPEEDS]]
+Measured on the release-candidate engine package of 0.2.7.1 with `tools/dgx_bench.py`: fresh 4K, 16K and 32K prompts at temperature 0, 256-token
+answers, 64K context, the model's own run config, four samples a cell in two blocks (on, off, off, on), medians. "Table off" is
+`STRATA_SM121_PERF=0`. One Spark, 27 October 2026; the figures move a few percent between sessions.
+
+| Model | Table | Prompt tok/s (4K / 16K / 32K) | Decode tok/s (4K / 16K / 32K) |
+|---|---|---|---|
+| Qwen3.8-Flash-Next IQ3_S | on (default) | 1,296 / 1,680 / 1,735 | 45.5 / 46.5 / 46.5 |
+| Qwen3.8-Flash-Next IQ3_S | off | 1,203 / 1,416 / 1,276 | 48.5 / 45.3 / 45.2 |
+| Qwen3.8-Flash-Next NVFP4 | on (default) | 1,408 / 1,670 / 1,698 | 42.8 / 40.5 / 40.1 |
+| Qwen3.8-Flash-Next NVFP4 | off | 1,156 / 1,350 / 1,353 | 41.0 / 41.2 / 38.4 |
+
+The table makes prompts faster: IQ3_S 1.20x over the three sizes (90% interval 1.12 to 1.31; 1.08x at 4K, 1.19x at 16K, 1.36x at 32K), NVFP4
+1.24x (1.14 to 1.36). It does not change decode speed in this check: 0.996x (0.97 to 1.02) on IQ3_S, with the 4K cell 0.94x, and 1.02x (1.00 to
+1.05) on NVFP4. The first run of the port (26 October) had measured +5% each for the two decode switches; this check did not see it.
+
+DeepSeek-V4.1-Flash 2.00 bpw, 8K context, the default Faster mode (5 of 6 experts per word), 11,187 of 15,744 experts in the GPU's share: a
+short chat answers at 13 to 18 tok/s (the first answer after a start is the slowest). Full quality (`--experts 6`) places more of them and was
+measured at 17 to 23 tok/s on a 1.7K-token chat in the first run.
+
+Several chats at once (`"parallel"` is 4 on a Spark for `strata launch`; the setup script leaves it off): IQ3_S, 2K-token prompts, 128-token cap,
+the aggregate tokens per second over all clients: 8 clients 35.6, 16 clients 41.7, 32 clients 47.3 at 4 slots; 32 clients 54.2 at 8 slots. With
+a prompt of its own and a hidden code for each client, every answer named its own code and nobody else's (8 clients at 4 slots, 16 clients at 8
+slots), and none failed or hung.
 
 ## The four speed defaults of this part
 
 On a GB10 the engine switches on four settings that were measured here, and prints them at every start. `STRATA_SM121_PERF=0` (or
 `STRATA_DEFAULTS=026`, which gives back everything 0.2.7.1 changed) turns the whole set off; a switch you set yourself is kept.
 
-| Switch | What it does | Measured on the Spark |
+| Switch | What it does | Measured in the first run (26 October) |
 |---|---|---|
 | `STRATA_PF_FUSED=1` | the fused IQ prompt kernels | IQ3_S prompt +10 to 27% |
 | `STRATA_PREFILL_NVFP4=w4a4` | NVFP4 prompt matrix product with FP4 activations | NVFP4 prompt +16% |
 | `STRATA_HC_UPMIX=1` | the hyper-connection read's up projection and mix in one kernel | decode +5.4% |
 | `STRATA_SPEC_COST=1` | the draft window follows what a draft costs | decode +4.7% |
 
-[[QUALITY]]
+**What the first two switches do to the answers.** The fused prompt path and the FP4 activations round differently from the paths they replace,
+and the other two do not touch the text (the fused hyper-connection read gives bit-identical logits; the cost-aware window only chooses
+which drafts to try, and the target checks every draft). 24 short greedy prompts gave 24 identical answers on IQ3_S and on NVFP4. On
+24 long prompts (1.5K to 24K tokens, the first-token logits compared with the switches off, `STRATA_DUMP_FIRST_LOGITS`) the distribution
+does move: IQ3_S mean KL 0.019 (largest 0.082), NVFP4 0.032 (largest 0.126); the most likely token changed on 2 of 24 prompts for each, in
+IQ3_S's case a near tie both times (0.20 against 0.20, 0.15 against 0.14); and a 24-token greedy answer stayed the same on 1 of 6 prompts. Two runs
+of the same setting gave identical logits, so the difference is the switches, not noise. All of the IQ3_S difference comes from the fused
+prompt path, and all of the NVFP4 difference from `w4a4`. If you want the answers of 0.2.7, set `STRATA_SM121_PERF=0`: you keep the other
+Spark settings and lose the prompt speed-up.
 
 With `"parallel": 4` (the default) the set adds up: 32 clients at 2,000-token prompts read 41.3 tok/s with all four on and 35.7 with all off. At
 `"parallel": 8` the two decode switches cost about 3.5% each; set `STRATA_HC_UPMIX=0 STRATA_SPEC_COST=0` there.
