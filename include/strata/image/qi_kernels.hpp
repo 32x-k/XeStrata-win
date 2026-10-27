@@ -52,9 +52,12 @@ const char* qi_attention_path();
 
 /// The attention of query rows q0 .. q1 - 1 over all T keys (no mask), FP16 out16 [q1 - q0][heads * head_dim] (the
 /// layout of qi_attention's), through a GPU maker's kernel where the build has one for the GPU (src/image/qi_sdpa.cpp:
-/// oneDNN's SDPA on Intel GPUs); false where none takes it.
+/// oneDNN's SDPA on Intel GPUs); false where none takes it.  `causal`: each query row t reads keys 0 .. t only (q0 0,
+/// q1 T: the text encoder's prompt), so far through aotriton on AMD GPUs alone.
 bool qi_sdpa(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t q0, int64_t q1, int64_t T,
-             int64_t heads, int64_t head_dim, uint16_t* out16, void* stream);
+             int64_t heads, int64_t head_dim, uint16_t* out16, void* stream, bool causal = false);
+/// qi_sdpa can take a causal attention on the stream's GPU (a kernel for it in the build and the GPU's runtime).
+bool qi_sdpa_causal(void* stream);
 
 /// The text encoder's q and k ([T][q_heads * head_dim], [T][kv_heads * head_dim]): each head RMS-normed (wq, wk; eps
 /// 1e-6), then rotated as NEOX does (pair (j, j + head_dim / 2) by a position times theta^(-2j / head_dim)); FP16 out,
@@ -68,6 +71,10 @@ void qi_text_qk_rope16(const float* q, const float* k, const float* v, const flo
 /// head_dim] FP32, the plain form (the text encoder's few tokens).
 void qi_attention_causal(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t q_heads,
                          int64_t kv_heads, int64_t head_dim, float* out, void* stream);
+/// Grouped K/V heads [T][kv_heads * head_dim] (FP16) repeated to one a query head, out [T][q_heads * head_dim] (query
+/// head h's the K/V head h / (q_heads / kv_heads)): a grouped attention as qi_sdpa's plain one.
+void qi_repeat_kv16(const uint16_t* src, int64_t T, int64_t q_heads, int64_t kv_heads, int64_t head_dim, uint16_t* out,
+                    void* stream);
 
 /// h16[t, i] = gu[t, inter + i] * silu(gu[t, i]) (the fused gate_up product: gate first, then up).
 void qi_swiglu16(const float* gu, int64_t T, int64_t inter, uint16_t* h16, void* stream);
