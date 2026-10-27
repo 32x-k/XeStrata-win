@@ -4058,6 +4058,9 @@ class Service:
         thinking) is rendered as a default one up to the answer - the same prompt start, so the conversation cache
         keeps it - and its effort follows in a short system turn right before the answer (thinking off: the template's
         empty thinking block).  The engine (--tail-role-token) checkpoints in front of that turn."""
+        # thinking unless asked off, as the server counts it (encode_prompt): said to the template, since Unsloth's
+        # Qwen3.5-9B template thinks only when enable_thinking is given true (the others think unless it is false)
+        kwargs = {"enable_thinking": True, **kwargs}
         effort = kwargs.get("reasoning_effort")
         off = kwargs.get("enable_thinking") is False
         if not self.effort_end or (not off and effort in (None, "", "xhigh", "high")):
