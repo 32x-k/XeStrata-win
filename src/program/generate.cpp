@@ -1386,6 +1386,11 @@ struct ShortReadCost {
 using ImgKey = strata::core::ConversationImageKey;
 using ConvCheckpoint = strata::core::ConversationCheckpoint;
 
+bool park_async_env() {   // STRATA_PARK_ASYNC (strata/core/conversation_snapshot.hpp)
+    static const bool on = [] { const char* v = std::getenv("STRATA_PARK_ASYNC"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+
 uint64_t fnv1a(const void* data, size_t n, uint64_t h = 1469598103934665603ull) {
     const uint8_t* p = (const uint8_t*) data;
     for (size_t i = 0; i < n; ++i) { h ^= p[i]; h *= 1099511628211ull; }
@@ -7525,6 +7530,7 @@ int main(int argc, char** argv) {
         auto save_one = [&](const strata::core::SavedConversation& image, const char* why) {
             if (!disk.enabled()) return;
             strata::core::conversation_checkpoint_join(nullptr);   // STRATA_CKPT_ASYNC: its running states have landed
+            strata::core::conversation_park_join();                // STRATA_PARK_ASYNC: and its K/V
             const auto t0 = Clock::now();
             size_t written = 0;
             std::string de;
@@ -7631,6 +7637,9 @@ int main(int argc, char** argv) {
             bool main;                               ///< the main session (its retained K/V, a layer split's stages)
             const char* what;                        ///< the log's words after the token count
         };
+        // STRATA_PARK_ASYNC (upstream f73b3c86a): set by the request around its park - which of the main session's
+        // checkpoints it drops right after (they move into the parked image instead of being copied)
+        std::function<bool(const ConvCheckpoint&)> park_drops;
         auto park_source = [&](const ParkSource& src, size_t held) -> bool {
             // --conversation-cache-min-tokens (upstream 624070c5): a short conversation is not worth one of the slots.
             // Parking is a switch-time decision, so a client's small side requests would otherwise park themselves
@@ -7727,9 +7736,25 @@ int main(int argc, char** argv) {
                 } park_stage;
                 strata::core::SavedConversation image;
                 size_t reused_bytes = 0;
+                // STRATA_PARK_ASYNC: the checkpoints this request drops move into the image (the view keeps the rest);
+                // the main session's only, not an idle batch slot's, and not a layer split's (its own capture)
+                std::vector<ConvCheckpoint> moved;
+                if (park_drops && src.main && conv_stages.empty()) {
+                    size_t w = 0;
+                    for (size_t i = 0; i < src.checks.size(); ++i) {
+                        if (park_drops(static_cast<const ConvCheckpoint&>(src.checks[i]))) {
+                            moved.push_back(std::move(src.checks[i]));
+                            continue;
+                        }
+                        if (w != i) src.checks[w] = std::move(src.checks[i]);
+                        ++w;
+                    }
+                    src.checks.erase(src.checks.begin() + (std::ptrdiff_t) w, src.checks.end());
+                }
                 if (!src.main || conv_stages.empty()
                         ? !strata::core::conversation_snapshot_save(image, view, src.session, g, src.draft, err,
-                                                                    std::move(reuse), &reused_bytes)
+                                                                    std::move(reuse), &reused_bytes,
+                                                                    moved.empty() ? nullptr : &moved)
                                         : !strata::core::conversation_split_save(image, view, conv_stages, g,
                                                                                  mtp.kv_state(), err))
                     return false;
@@ -9612,6 +9637,7 @@ int main(int argc, char** argv) {
                 // the background copy of the last checkpoint (STRATA_CKPT_ASYNC) lands before anything below copies, frees
                 // or writes the checkpoints
                 strata::core::conversation_checkpoint_join(nullptr);
+                strata::core::conversation_park_join();   // (STRATA_PARK_ASYNC: the last park's K/V)
                 if (path.empty()) { refuse("missing path"); continue; }
                 if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
                 if (o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
@@ -10283,6 +10309,19 @@ int main(int argc, char** argv) {
                                          : 0;
             const bool park_worth = o.conversation_cache_park_gain <= 0 || park_held == 0 ||
                                     (int64_t) live.size() >= (int64_t) park_held + o.conversation_cache_park_gain;
+            // STRATA_PARK_ASYNC: the checkpoints this request drops after its park - all of them when another state
+            // comes in (a parked conversation, a borrow, a batch slot) or the cvec changes, else the ones off this
+            // prompt's path (the erase below) - move into the parked image
+            struct ParkDrops {
+                std::function<bool(const ConvCheckpoint&)>& f;
+                ~ParkDrops() { f = nullptr; }
+            } park_drops_reset{park_drops};
+            if (park_async_env()) {
+                const bool drops_all = incoming.has_value() || borrow || slot_source >= 0 || want_cvec != cvec_cached;
+                park_drops = [&, drops_all](const ConvCheckpoint& c) {
+                    return drops_all || (int64_t) c.ids.size() > resume || !starts_with(c.ids, c.imgs);
+                };
+            }
             if (borrow && !pin_sibling && park_worth) {
                 conversations.guard(parked.serial);   // parking the outgoing conversation must not evict the donor
                 const bool parked_ok = park_current(0);

@@ -72,6 +72,19 @@ bool conversation_checkpoint_save(ConversationCheckpoint& checkpoint, const Sess
 /// request, unstage).  No-op when nothing is in flight.
 /// `only` (non-null): wait only when the copy in flight is into those bytes (a checkpoint's `gdn.data()`, the staging).
 void conversation_checkpoint_join(const void* only = nullptr);
+/// STRATA_PARK_ASYNC: waits until the last parked image's K/V has landed in its host buffers (no-op otherwise); the
+/// readers of a parked image's K/V call it first, and the image itself before it frees them (SavedConversation::pending).
+void conversation_park_join();
+/// STRATA_PARK_ASYNC=1 (opt-in): between begin and launch, conversation_kv_save copies the device K/V device to device
+/// into a VRAM stage (only while the VRAM keeps its headroom beside it; else as before) and records where it goes;
+/// launch moves the stage into the host buffers on a background thread (4 MiB pieces through two pinned buffers), so
+/// the next prompt starts at once.  conversation_park_join (above) waits for it.
+/// begin: false when it is off (the saves then copy as before); `need` is the K/V bytes the saves will copy.
+bool conversation_park_async_begin(size_t need);
+/// The recorded copies start (the device copies into the stage have landed when it returns); false: a copy failed.
+bool conversation_park_async_launch(std::string& error);
+/// Abandons a begun park that was not launched (the error paths): nothing was queued to the background.
+void conversation_park_async_abandon();
 bool conversation_checkpoint_restore(const ConversationCheckpoint& checkpoint, SessionState& session,
                                      const ModelGeometry& g, std::string& error);
 /// A checkpoint's save in two steps: `stage` copies the running state into `staging` (pinned host memory of
@@ -101,10 +114,14 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
 // the uniquely owned reusable buffers, including on failure.
 // Caller admits the estimate before invoking capture. Allocation failures propagate
 // to the RAM policy; the active session is never modified by capture.
+// `moved` (optional, STRATA_PARK_ASYNC): checkpoints the caller drops after this, moved into the image after the
+// copies of the view's (the image holds the same checkpoints as with all of them in the view; nothing is copied for
+// these).
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
                                 const SessionState& session, const ModelGeometry& g,
                                 const QsaState& draft, std::string& error,
-                                ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr);
+                                ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr,
+                                std::vector<ConversationCheckpoint>* moved = nullptr);
 // Disk save without capturing the K/V on the host: `meta` gets everything but the K/V (running state copied,
 // checkpoints as given by the view), `sources` one streamed source per QSA layer then the draft.  Caller has
 // synchronized and must not run the session until the file is written.

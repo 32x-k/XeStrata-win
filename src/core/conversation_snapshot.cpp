@@ -5,15 +5,22 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "conversation_checked.hpp"
 #include "strata/core/gpu.hpp"
+#include "strata/core/on_device.hpp"
 #include "strata/kernels/kv_stream.hpp"
 #include "strata/kernels/qsa.hpp"
 
 #include <array>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <future>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <vector>
 
 namespace strata::core {
+namespace conversation_detail { bool conversation_vram_room(size_t want); }   // (conversation_state.cpp)
 namespace {
 struct Layout {
     int format;
@@ -114,6 +121,34 @@ bool valid(const QsaState& st, const Layout& l, int64_t upto, std::string& error
     return true;
 }
 
+// STRATA_PARK_ASYNC=1 (opt-in, upstream f73b3c86a): a park's device K/V goes device to device into a VRAM stage, and a
+// background thread moves it into the image's host buffers through two pinned 4 MiB buffers in turn, so the next
+// prompt does not wait for the copy over the link.  The stage is allocated while the VRAM keeps its headroom beside it
+// (conversation_vram_room); without it the park copies as before.
+struct ParkAsync {
+    std::mutex mu;
+    std::future<std::string> pending;   // the copy in flight: empty when it landed, else why it failed
+    struct Item { uint8_t* dst; size_t n, at; };
+    std::vector<Item> items;
+    uint8_t* stage = nullptr;
+    size_t cap = 0, used = 0;
+    void* host[2] = {nullptr, nullptr};   // pinned, kParkPiece each
+    strata::gpu::Stream stream = nullptr;   // a copy stream: the device copies into the stage, then the pieces
+    int dev = -1;
+    bool active = false;
+};
+ParkAsync& park_async() { static ParkAsync a; return a; }
+constexpr size_t kParkPiece = (size_t) 4 << 20;
+bool park_async_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PARK_ASYNC"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+// Whether part `i` of a layer is device memory, which the stage takes: the K/V pools of a resident layer (kv_mode 0)
+// and every layer's indexer rows; a streamed layer's and the draft ring's pools are their host copies.
+bool on_device(const QsaState& st, const void* p) {
+    return st.kv_mode == 0 || !strata::gpu::is_host_usm(p);
+}
+
 bool transfer(void* dst, const void* src, size_t n, std::string& error) {
     if (!n) return true;
     if (!src || !dst) { error = "conversation snapshot: missing state buffer"; return false; }
@@ -174,9 +209,22 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         const size_t keep = i == 4 ? (index ? size_t(unchanged_tokens / strata::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim * 4 : 0)
                                   : l.cells ? (sizes[i] / size_t(l.cells)) * size_t(whole_cells) : 0;
         if (keep > dst[i]->size()) { error = "conversation snapshot: missing reusable prefix"; return false; }
-        dst[i]->resize(sizes[i]);
+        // STRATA_PARK_ASYNC: device bytes go to the VRAM stage now and into the buffer on the background thread
+        ParkAsync& a = park_async();
+        const bool staged = a.active && src[i] != nullptr && sizes[i] > keep && a.used + (sizes[i] - keep) <= a.cap &&
+                            on_device(st, src[i]);
+        if (staged) dst[i]->resize_for_overwrite(sizes[i]);
+        else dst[i]->resize(sizes[i]);
         if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
-                return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error);
+                const uint8_t* s = src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr;
+                if (!staged) return transfer(p, s, n, error);
+                if (!strata::gpu::copy_async(a.stage + a.used, s, n, a.stream)) {
+                    error = std::string("conversation snapshot stage copy: ") + strata::gpu::last_error();
+                    return false;
+                }
+                a.items.push_back({p, n, a.used});
+                a.used += n;
+                return true;
             })) return false;
         if (reused_bytes) *reused_bytes += keep;
     }
@@ -211,6 +259,7 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
 
 bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                                     int64_t captured, int64_t upto, bool index, std::string& error) {
+    conversation_park_join();
     if (upto < 0 || upto > captured) {
         error = "conversation snapshot: prefix beyond the captured K/V";
         return false;
@@ -272,6 +321,7 @@ bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const Mode
 
 bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                             int64_t upto, bool index, uint64_t& fingerprint, std::string& error) {
+    conversation_park_join();
     if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
     std::array<uint8_t, 65536> buffer;
     uint64_t hash = 1469598103934665603ull;
@@ -310,6 +360,114 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, con
         }
     }
     fingerprint = hash;
+    return true;
+}
+
+void conversation_park_join() {
+    ParkAsync& a = park_async();
+    std::lock_guard<std::mutex> lk(a.mu);
+    if (a.pending.valid()) {
+        const std::string e = a.pending.get();
+        if (!e.empty()) std::fprintf(stderr, "strata: STRATA_PARK_ASYNC: a parked K/V copy failed (%s)\n", e.c_str());
+    }
+}
+
+bool conversation_park_async_begin(size_t need) {
+    conversation_park_join();   // (the stage is reused)
+    ParkAsync& a = park_async();
+    a.active = false;
+    a.items.clear();
+    a.used = 0;
+    if (!park_async_on() || need == 0) return false;
+    const int dev = current_device();
+    if (a.dev != dev || (a.stage != nullptr && a.cap < need)) {
+        if (a.stage) strata::gpu::free(a.stage);
+        a.stage = nullptr; a.cap = 0;
+    }
+    if (a.dev != dev) {
+        if (a.host[0]) strata::gpu::free(a.host[0]);
+        if (a.host[1]) strata::gpu::free(a.host[1]);
+        if (a.stream) strata::gpu::stream_destroy(a.stream);
+        a.stream = nullptr; a.host[0] = a.host[1] = nullptr;
+    }
+    a.dev = dev;
+    if (a.stream == nullptr) {
+        a.stream = strata::gpu::stream_create_copy();
+        if (a.stream != nullptr) {
+            a.host[0] = strata::gpu::alloc_host(kParkPiece);
+            a.host[1] = strata::gpu::alloc_host(kParkPiece);
+        }
+        if (a.stream == nullptr || a.host[0] == nullptr || a.host[1] == nullptr) {
+            if (a.host[0]) strata::gpu::free(a.host[0]);
+            if (a.host[1]) strata::gpu::free(a.host[1]);
+            if (a.stream) strata::gpu::stream_destroy(a.stream);
+            a.stream = nullptr; a.host[0] = a.host[1] = nullptr;
+            return false;
+        }
+    }
+    if (a.stage == nullptr) {
+        if (!conversation_detail::conversation_vram_room(need) ||
+            (a.stage = static_cast<uint8_t*>(strata::gpu::alloc_device(need))) == nullptr) return false;
+        a.cap = need;
+    }
+    a.active = true;
+    return true;
+}
+
+void conversation_park_async_abandon() {
+    ParkAsync& a = park_async();
+    if (!a.active) return;
+    a.active = false;
+    a.items.clear();
+    (void) strata::gpu::stream_sync(a.stream);   // nothing reads the stage after
+}
+
+bool conversation_park_async_launch(std::string& error) {
+    ParkAsync& a = park_async();
+    if (!a.active) return true;
+    a.active = false;
+    if (!strata::gpu::stream_sync(a.stream)) {   // the device-to-device copies into the stage
+        a.items.clear();
+        error = std::string("conversation snapshot stage: ") + strata::gpu::last_error();
+        return false;
+    }
+    if (a.items.empty()) return true;
+    std::vector<ParkAsync::Item> items;
+    items.swap(a.items);
+    const uint8_t* stage = a.stage;
+    void* host[2] = {a.host[0], a.host[1]};
+    const strata::gpu::Stream st = a.stream;
+    const int dev = a.dev;
+    std::lock_guard<std::mutex> lk(a.mu);
+    // two pinned pieces in turn: the next piece's copy over the link runs while this one is copied into its segment
+    a.pending = std::async(std::launch::async, [items = std::move(items), stage, host, st, dev]() -> std::string {
+        const OnDevice on(dev);
+        strata::gpu::Event* done[2] = {nullptr, nullptr};
+        bool ok = strata::gpu::event_create(&done[0]) && strata::gpu::event_create(&done[1]);
+        struct Piece { uint8_t* dst; size_t n; };
+        Piece held[2] = {{nullptr, 0}, {nullptr, 0}};
+        int b = 0;
+        auto land = [&](int k) {
+            if (held[k].dst == nullptr || !ok) return;
+            ok = strata::gpu::event_sync(done[k]);
+            if (ok) std::memcpy(held[k].dst, host[k], held[k].n);
+            held[k] = {nullptr, 0};
+        };
+        for (const auto& it : items)
+            for (size_t o = 0; ok && o < it.n; o += kParkPiece) {
+                const size_t n = std::min(kParkPiece, it.n - o);
+                land(b);
+                ok = ok && strata::gpu::copy_async(host[b], stage + it.at + o, n, st) &&
+                     strata::gpu::event_record(done[b], st);
+                if (ok) held[b] = {it.dst + o, n};
+                b ^= 1;
+            }
+        land(b);
+        land(b ^ 1);
+        std::string why = ok ? std::string() : std::string(strata::gpu::last_error());
+        for (strata::gpu::Event* d : done) if (d) strata::gpu::event_destroy(d);
+        return why;
+    });
     return true;
 }
 

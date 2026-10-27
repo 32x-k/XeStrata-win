@@ -566,8 +566,10 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
                                 const SessionState& ss, const ModelGeometry& g,
                                 const QsaState& draft, std::string& error,
-                                ConversationKvReuse reuse, size_t* reused_bytes) {
+                                ConversationKvReuse reuse, size_t* reused_bytes,
+                                std::vector<ConversationCheckpoint>* moved) {
     conversation_checkpoint_join(nullptr);   // the last turn checkpoint's copy (STRATA_CKPT_ASYNC)
+    conversation_park_join();                // the previous park's K/V copy (STRATA_PARK_ASYNC)
     using Steady = std::chrono::steady_clock;
     auto ms = [](Steady::time_point a, Steady::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
     const auto p0 = Steady::now();
@@ -579,6 +581,11 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     captured.live.ids = view.ids; captured.live.imgs = view.images;
     const auto p1 = Steady::now();
     captured.cvec = view.cvec; captured.checkpoints = copy_checkpoints_beating(view.checkpoints);
+    if (moved != nullptr)
+        for (auto& c : *moved) {
+            conversation_checkpoint_join(c.gdn.data());
+            captured.checkpoints.push_back(std::move(c));
+        }
     const auto p2 = Steady::now();
     const int64_t unchanged = reuse.kv.empty() ? 0 : reuse.unchanged_tokens;
     captured.kv = std::move(reuse.kv);
@@ -595,6 +602,12 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
         });
     const auto p3 = Steady::now();
     const int64_t upto = (int64_t) view.ids.size();
+    // STRATA_PARK_ASYNC: the K/V bytes these saves copy (the stage they need; an over-estimate by the kept prefix)
+    size_t kv_need = 0;
+    for (size_t j = 0; j < layers; ++j) kv_need += conversation_kv_bytes(owned(ss, j), g, upto, true);
+    kv_need += conversation_kv_bytes(draft, g, upto, false);
+    const bool staged = conversation_park_async_begin(kv_need);
+    struct Abandon { bool on; ~Abandon() { if (on) conversation_park_async_abandon(); } } abandon{staged};
     for (size_t j = 0; j < layers; ++j)
         if (!conversation_kv_save(captured.kv[j], owned(ss, j), g, upto, true, error,
                                   unchanged, reused_bytes)) return false;
@@ -609,6 +622,13 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     // reached. Refresh that page even when the main prefix continued unchanged.
     if (!conversation_kv_save(captured.kv.back(), draft, g, upto, false, error,
                               std::max<int64_t>(0, unchanged - 1), reused_bytes)) return false;
+    abandon.on = false;
+    if (staged && !conversation_park_async_launch(error)) return false;
+    if (staged)
+        captured.pending = std::shared_ptr<void>(new char, [](void* q) {
+            conversation_park_join();
+            delete static_cast<char*>(q);
+        });
     image = std::move(captured);
     return true;
 }
@@ -685,6 +705,7 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
                                                    const ModelGeometry& g, const QsaState& draft, std::string& error) {
     conversation_checkpoint_join(image.live.gdn.data());
     for (const auto& c : image.checkpoints) conversation_checkpoint_join(c.gdn.data());
+    conversation_park_join();
     if (!conversation_snapshot_validate(image, ss, g, draft, error)) return ConversationRestore::invalid;
     if (!sync(error)) return ConversationRestore::transfer_failed;
     const int64_t upto = (int64_t) image.live.ids.size();
@@ -861,6 +882,7 @@ ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation
                                                           const QsaState& draft, std::string& error) {
     conversation_checkpoint_join(image.live.gdn.data());
     for (const auto& c : image.checkpoints) conversation_checkpoint_join(c.gdn.data());
+    conversation_park_join();
     if (!conversation_snapshot_validate(image, ss, g, draft, error)) return ConversationRestore::invalid;
     const int64_t captured = (int64_t) image.live.ids.size();
     if (upto < 1 || upto > captured) {
