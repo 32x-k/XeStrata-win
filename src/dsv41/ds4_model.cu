@@ -3993,8 +3993,10 @@ struct Model::Impl {
                 sa.bounds = d_bounds + i0;
                 sa.row0 = a;
                 sa.max_rows = max_rows;
+#if defined(STRATA_METAL)
                 sa.hbounds = b + i0;
                 sa.total_rows = nrows;
+#endif
                 sa.n_embd = D;
                 sa.n_ff = FF;
                 sa.limit = g.lim;
