@@ -349,7 +349,8 @@ bool PlainModel::prompt_dense_int8(const W& w, const float* x, int64_t ldx, floa
 // product (a time of its own, whatever the rows) and multiplies it in the products' library.  Each is timed as
 // a + b rows from 16 rows and the chunk's (the best of three, after one), and dense_native_rows_ is where they cross.
 // The RX 9060 XT, Qwen3.5-9B Q4_K_M (2026-10-27): int8 faster at 16 and 23 tokens, FP16 at 128 and above (2289 tok/s
-// at 1K against 843).
+// at 1K against 843).  Gemm::native is timed with its sums in FP32 and in FP16 too: the RTX 4070 takes FP16's (1K
+// 2842 -> 3572 tok/s warm, 32K 1524 -> 1681), the B70 FP32's (oneMKL's half GEMM is slower there: 3476 against 3304).
 void PlainModel::prompt_dense_calibrate() {
     PromptBufs& P = pb_;
     if (blocks_.empty() || P.T < 32) return;
@@ -377,27 +378,34 @@ void PlainModel::prompt_dense_calibrate() {
             prefill::mmq::iota(P.identity, P.T, cs_);
             pg.identity = true;
         }
-        double n[2], q[2];
+        // Gemm::native with its sums in FP32 and in FP16 (h), the faster at the chunk's rows taken for the products
+        // from the normed rows
+        double n[2], h[2], q[2];
         for (int i = 0; i < 2; ++i) {
             const int64_t T = i == 0 ? lo : hi;
             P.h_dense_bounds[0] = 0;
             P.h_dense_bounds[1] = (int32_t) T;
             if (!strata::gpu::copy_async(P.dense_bounds, P.h_dense_bounds, 2 * sizeof(int32_t), cs_)) return;
             n[i] = best([&] { gm.native(P.x16, w.type, w.data, P.sh_gate, T, w.n_out, w.n_in, 0); });
+            h[i] = best([&] { gm.native(P.x16, w.type, w.data, P.sh_gate, T, w.n_out, w.n_in, 0, true); });
             q[i] = best([&] { prompt_dense_int8(w, P.hn, w.n_in, P.sh_gate, T, 0); });
-            if (n[i] < 0 || q[i] < 0) return;
+            if (n[i] < 0 || h[i] < 0 || q[i] < 0) return;
         }
+        dense_half_sums_ = h[1] < n[1];
+        if (dense_half_sums_) { n[0] = h[0]; n[1] = h[1]; }
         // native - int8 = d0 + d1 (T - lo): FP16 from where it turns negative
         const double d0 = n[0] - q[0], d1 = ((n[1] - q[1]) - d0) / (double) (hi - lo);
         if (d0 <= 0) dense_native_rows_ = 0;
         else if (d1 < 0) dense_native_rows_ = lo + (int64_t) std::ceil(d0 / -d1);
-        std::fprintf(stderr, "strata plain: dense products in FP16 (the products' library) from %s rows, in int8 below "
-                             "(%.2f / %.2f ms at %lld rows, %.2f / %.2f at %lld)\n",
+        std::fprintf(stderr, "strata plain: dense products in FP16 (the products' library, %s sums) from %s rows, in "
+                             "int8 below (%.2f / %.2f ms at %lld rows, %.2f / %.2f at %lld)\n",
+                     dense_half_sums_ ? "FP16" : "FP32",
                      dense_native_rows_ == INT64_MAX ? "no" : std::to_string(dense_native_rows_).c_str(), 1e3 * n[0],
                      1e3 * q[0], (long long) lo, 1e3 * n[1], 1e3 * q[1], (long long) hi);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "strata plain: timing the dense products: %s (int8 kept)\n", e.what());
         dense_native_rows_ = INT64_MAX;
+        dense_half_sums_ = false;
     }
 }
 
@@ -808,8 +816,8 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
     auto dense = [&](const W& w, const float* x, int64_t ldx, float* y, int64_t T, int64_t ldy = 0) {
         return T < dense_native_rows_ && prompt_dense_int8(w, x, ldx, y, T, ldy);
     };
-    auto proj = [&](const W& w, float* y, int64_t T, int64_t ldy = 0) {
-        gm.native(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, ldy);
+    auto proj = [&](const W& w, float* y, int64_t T, int64_t ldy = 0, bool half_sums = false) {
+        gm.native(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, ldy, half_sums);
     };
     // the routed experts in their quantized blocks (int8 products, iq_mmq: on the matrix engines, else by dp4a where the
     // FP16 products have none either) where every layer's types are theirs (prompt_int8, decided with the buffers),
@@ -887,9 +895,10 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                 prefill::mmq::iota(P.identity, rows_id, cs);
                 pg.identity = true;
             }
-            // from the normed rows: int8 where it can, else FP16 (x16, written once a layer if any product needs it)
+            // from the normed rows: int8 where it can, else FP16 (x16, written once a layer if any product needs it),
+            // its sums in FP16 where that was measured faster (a norm's rows keep them in FP16's range)
             auto proj_hn = [&](const W& w, float* y, int64_t ldy = 0) {
-                if (!dense(w, P.hn, N, y, T, ldy)) proj(w, y, T, ldy);
+                if (!dense(w, P.hn, N, y, T, ldy)) proj(w, y, T, ldy, dense_half_sums_);
             };
             // the last token's logits, by the decode's head
             auto last_logits = [&] {
@@ -973,8 +982,10 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     prefill::gdn_recurrence(gdn_state_[(size_t) b.gdn], P.h, P.gate, P.beta, P.z, b.ssm_norm, eps, P.y,
                                             P.y16, T, cs, HK, HV, /*silu=*/true);
                     part(8);
-                    // (y16, the normed and gated output, exists only in FP16: no float rows to round to int8)
-                    gm.native(P.y16, b.ssm_out.type, b.ssm_out.data, P.mix, T, b.ssm_out.n_out, b.ssm_out.n_in);
+                    // (y16, the normed and gated output, exists only in FP16: no float rows to round to int8; normed,
+                    // its sums in FP16 as proj_hn's)
+                    gm.native(P.y16, b.ssm_out.type, b.ssm_out.data, P.mix, T, b.ssm_out.n_out, b.ssm_out.n_in, 0,
+                              dense_half_sums_);
                     part(9);
                 } else {
                     const int64_t a = b.attn;
@@ -1021,7 +1032,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     }
                     if (!dense(b.o, ao, NH * HD, P.mix, T)) {
                         f16(ao, T, NH * HD);
-                        proj(b.o, P.mix, T);
+                        proj(b.o, P.mix, T, 0, dense_half_sums_);   // averages of V's rows: in FP16's range as well
                     }
                 }
                 k::add_inplace(P.x, P.mix, T * N, cs);
@@ -1039,7 +1050,9 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                         dense(b.sh_down, P.sh_gate, FS, P.moe_out, T);
                     } else {   // into FP16 (x16 is free again) for Gemm::native
                         prefill::swiglu_pair(P.sh_gate, P.sh_up, P.x16, T, cs, FS);
-                        proj(b.sh_down, P.moe_out, T);
+                        // its sums in FP16 too where they were measured faster, as llama.cpp's cuBLAS products of FP16
+                        // weights take every product's (its default precision): the SwiGLU's rows are in FP16 already
+                        proj(b.sh_down, P.moe_out, T, 0, dense_half_sums_);
                     }
                     k::add_inplace(P.x, P.moe_out, T * N, cs);
                     mark(3, t_mark);

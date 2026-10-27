@@ -471,6 +471,9 @@ private:
     /// Dense products of at least this many rows go through Gemm::native, fewer in int8 (INT64_MAX: always in int8,
     /// as the MoE models' dense products)
     int64_t dense_native_rows_ = INT64_MAX;
+    /// A dense model's: Gemm::native's products from the normed rows with their sums in FP16 (measured faster at a
+    /// chunk's rows by prompt_dense_calibrate: cuBLAS's HGEMM on GeForce cards; not oneMKL's on the B70)
+    bool dense_half_sums_ = false;
     /// The chunk's routed experts of MoE layer `ml`: pb_.hn its T normed rows (and pb_.x16 their FP16 copy for the FP16
     /// path), pb_.ids their routes; writes pb_.parts in routing order, the routes into `routes` (null: not kept).
     /// `mark(stage)` is the profile's (1 the grouping, 2 the experts).
