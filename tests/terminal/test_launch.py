@@ -837,6 +837,17 @@ class FlagsCommand(unittest.TestCase):
         self.assertNotIn("--pool-cores", p["settings"]["extra"])
         self.assertTrue(any("pool-cores" in w for w in p["warnings"]))
 
+    def test_dspark_on_a_mac_is_warned_about_and_not_refused(self):
+        # the drafter has no Metal kernels yet: --dspark on is passed on as asked, with a plain warning (recommend, never force)
+        import sys
+        from unittest import mock
+        with mock.patch.object(sys, "platform", "darwin"):
+            p = self.plan("--model", "q2_0", "--dspark", "on")
+        self.assertEqual(p["settings"]["extra"].get("--dspark"), "on")
+        self.assertTrue(any("DSpark" in w and "Mac" in w for w in p["warnings"]), p["warnings"])
+        p = self.plan("--model", "q2_0", "--dspark", "auto")
+        self.assertFalse(any("DSpark" in w and "Mac" in w for w in p["warnings"]))
+
     def test_dspark_takes_a_word_and_the_word_reaches_the_engine_line(self):
         # --set dspark=on used to start strata-dsv41 with a lone "--dspark" ("--dspark needs a value", #3959)
         from strata_cli.launch import settings as S

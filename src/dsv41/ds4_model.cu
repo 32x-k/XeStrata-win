@@ -2232,9 +2232,13 @@ struct Model::Impl {
 #if defined(STRATA_METAL)
         // On a Mac the drafter is off unless it is asked for outright: it gave the same answers and no speed-up there, and the head of its
         // quantised Markov bias has no Metal kernel (the engine stopped with "kernel launch with no Metal dispatch" on the setup test).
-        if (o.dspark_auto && o.dspark && g.n_mtp > 0) {
-            o.dspark = false;
-            std::fprintf(stderr, "ds4: DSpark not loaded on a Mac (--dspark on loads it anyway)\n");
+        if (o.dspark && g.n_mtp > 0) {
+            if (o.dspark_auto) {
+                o.dspark = false;
+                std::fprintf(stderr, "ds4: the DSpark drafter is not supported on a Mac yet, so it is not loaded\n");
+            } else {   // --dspark on / off: loaded as asked
+                std::fprintf(stderr, "ds4: WARNING: the DSpark drafter is not supported on a Mac yet; --dspark on will probably stop at the Markov bias step (kernel launch with no Metal dispatch)\n");
+            }
         }
 #endif
         if (o.dspark_auto && o.dspark && g.n_mtp > 0) {   // (see Options::dspark_auto)
