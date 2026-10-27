@@ -1286,15 +1286,21 @@ sycl::event launch_native_gu_fused(sycl::queue& q, size_t cap_groups, const unsi
     });
 }
 
-template<int TD, int LPR>
+// WS (STRATA_DOWN_WS, upstream 6a6d58ad0: down_ws_on): the work-group's kM8Rows weight rows are first copied into
+// local memory, 16 bytes a load where the rows' start allows, and the row dots read that copy.  The copy keeps the
+// rows' start address modulo 16, so every load inside a row sees the alignment it has in device memory, and the sums
+// are the same code on the same bytes: the output is bitwise the kernel's without WS.
+template<int TD, int LPR, bool WS = false>
 sycl::event launch_native_down_lds(sycl::queue& q, size_t cap_groups, const unsigned long long* grp_ptr,
                                    const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
                                    const block_q8_1* hq, NativeExpertLayout L, float* out) {
     constexpr int RPW = kWarp / LPR, WG = 8 * kWarp;
     static_assert(kM8Rows % (8 * RPW) == 0, "whole passes");
     const int hb = (int) (L.n_ff / 32);
+    const size_t wvecs = WS ? ((size_t) kM8Rows * L.d_row + 15) / 16 + 1 : 1;   // + 1: room to keep the alignment
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<int, 1> sh(sycl::range<1>((size_t) kEntriesPass * hb * 9), h);
+        sycl::local_accessor<sycl::vec<uint32_t, 4>, 1> sw(sycl::range<1>(wvecs), h);
         h.parallel_for(sycl::nd_range<2>({cap_groups, (size_t) ((L.n_embd + kM8Rows - 1) / kM8Rows) * WG}, {1, WG}),
                        [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
             const int g = (int) it.get_group(0);
@@ -1306,6 +1312,21 @@ sycl::event launch_native_down_lds(sycl::queue& q, size_t cap_groups, const unsi
             const auto* shb = reinterpret_cast<const block_q8_1*>(sh.template get_multi_ptr<sycl::access::decorated::no>().get());
             const uint8_t* blob = (const uint8_t*) grp_ptr[g];
             const int e0 = grp_start[g], e1 = grp_start[g + 1];
+            const int rb = (int) it.get_group(1) * kM8Rows;   // the work-group's first row
+            [[maybe_unused]] const uint8_t* lw = nullptr;     // its rows in local memory (WS)
+            if constexpr (WS) {
+                const uint8_t* wbase = blob + L.down_off + (size_t) rb * L.d_row;
+                const size_t nbytes = (size_t) sycl::min(kM8Rows, (int) L.n_embd - rb) * L.d_row;
+                const size_t off = (size_t) ((uintptr_t) wbase & 15);
+                uint8_t* lb = reinterpret_cast<uint8_t*>(sw.template get_multi_ptr<sycl::access::decorated::no>().get());
+                if (off == 0 && nbytes % 16 == 0) {
+                    const auto* src = reinterpret_cast<const sycl::vec<uint32_t, 4>*>(wbase);
+                    for (size_t i = (size_t) tid; i < nbytes / 16; i += WG) sw[i] = src[i];
+                } else {
+                    for (size_t i = (size_t) tid; i < nbytes; i += WG) lb[off + i] = wbase[i];
+                }
+                lw = lb + off;   // made visible by the barrier before the entries' activations are read
+            }
             for (int c0 = e0; c0 < e1; c0 += kEntriesPass) {
                 const int cn = sycl::min(kEntriesPass, e1 - c0);
                 sycl::group_barrier(it.get_group());
@@ -1321,8 +1342,10 @@ sycl::event launch_native_down_lds(sycl::queue& q, size_t cap_groups, const unsi
                     const bool valid = r < L.n_embd;
                     const int nb = valid ? (int) (L.n_ff / Fmt<TD>::qk) : 0;
                     float s[kEntriesPass];
-                    seg_dot_multi<TD, LPR, kEntriesPass, void, false>(sg, blob + L.down_off + (size_t) (valid ? r : 0) * L.d_row,
-                                                         xs, cn, nb, (int) (L.n_ff / Fmt<TD>::qk), seg_lane, s);
+                    const uint8_t* wr = WS ? lw + (size_t) (valid ? r - rb : 0) * L.d_row
+                                           : blob + L.down_off + (size_t) (valid ? r : 0) * L.d_row;
+                    seg_dot_multi<TD, LPR, kEntriesPass, void, false>(sg, wr, xs, cn, nb, (int) (L.n_ff / Fmt<TD>::qk),
+                                                                      seg_lane, s);
                     if (valid && seg_lane == 0)
                         for (int j = 0; j < cn; ++j) out[(size_t) ent_dst[c0 + j] * L.n_embd + r] = s[j];
                 }
@@ -1348,6 +1371,25 @@ size_t local_mem_bytes(sycl::queue& q) {
     static core::PerDevice<size_t> per_device;
     const sycl::device d = q.get_device();
     return per_device.get(d, [&d] { return (size_t) d.get_info<sycl::info::device::local_mem_size>(); });
+}
+
+// STRATA_DOWN_WS=1 (upstream 6a6d58ad0, opt-in): the mode-8 down rows of IQ4_NL and Q2_0 staged in local memory
+// (launch_native_down_lds' WS) on a device that reports compute capability 6.0 (Pascal GP100: no dp4a, its row dots
+// wait on 2-byte loads from device memory).  Upstream measured it on one GP100 die only (a one-token window's down
+// 72.6 / 53.5 us -> 42.3 / 38.6 us for IQ4_NL / Q2_0); there is no such GPU here.  Elsewhere the switch does nothing.
+bool down_ws_on(sycl::queue& q) {
+    static const bool env = [] {
+        const char* v = std::getenv("STRATA_DOWN_WS");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (!env) return false;
+    static core::PerDevice<bool> gp100;
+    const sycl::device d = q.get_device();
+    return gp100.get(d, [&d] {
+        namespace syclex = sycl::ext::oneapi::experimental;
+        return d.get_backend() == sycl::backend::ext_oneapi_cuda &&
+               d.get_info<syclex::info::device::architecture>() == syclex::architecture::nvidia_gpu_sm_60;
+    });
 }
 
 // ---------------------------------------------------------------- q8_1 (quantize.cu)
@@ -2375,8 +2417,9 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const bool fused_gu = m8 && (L.up_type < 0 || L.up_type == L.gu_type) && (L.gu_type == 16 || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 ||
                                  L.gu_type == 23) &&
                           grid_bytes + xbytes + (size_t) kEntriesPass * kM8Rows * sizeof(float) <= local_mem_bytes(q);
-    const bool lds_down = m8 && (L.d_type == 20 || L.d_type == 42) &&
-                          (size_t) kEntriesPass * (size_t) (L.n_ff / 32) * sizeof(block_q8_1) <= local_mem_bytes(q);
+    const size_t hbytes = (size_t) kEntriesPass * (size_t) (L.n_ff / 32) * sizeof(block_q8_1);
+    const bool lds_down = m8 && (L.d_type == 20 || L.d_type == 42) && hbytes <= local_mem_bytes(q);
+    const bool ws_down = lds_down && down_ws_on(q) && hbytes + (size_t) kM8Rows * L.d_row + 32 <= local_mem_bytes(q);
     if (fused_gu) {
         const size_t cgs = (size_t) cap_groups;
         switch (L.gu_type) {
@@ -2461,7 +2504,10 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     sycl::event e;
     if (lds_down) {
         const size_t cgs = (size_t) cap_groups;
-        if (L.d_type == 20) e = launch_native_down_lds<20, down_lpr<20>()>(q, cgs, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        if (ws_down) {
+            if (L.d_type == 20) e = launch_native_down_lds<20, down_lpr<20>(), true>(q, cgs, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+            else e = launch_native_down_lds<42, down_lpr<42>(), true>(q, cgs, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        } else if (L.d_type == 20) e = launch_native_down_lds<20, down_lpr<20>()>(q, cgs, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
         else e = launch_native_down_lds<42, down_lpr<42>()>(q, cgs, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     } else
     switch (L.d_type) {

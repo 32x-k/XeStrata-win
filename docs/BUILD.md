@@ -135,6 +135,7 @@ sm_60 has no dp4a instruction, so that one product is computed a byte at a time 
 The kernels for the tensor cores compile an empty body in code for an architecture before sm_70 and are never launched on such a GPU.
 Built with sm_60 code only and run on the RTX 4070 (the driver compiles the PTX), CTest passed its 59 tests, and with the matrix engines left out (`STRATA_NO_XMX=1`)
 IQ2_XS gave the same answers as sm_89 code on all 8 questions (the expert cache size pinned; decode 3-5% slower).
+On a GPU of compute capability 6.0 (GP100: the P100), `STRATA_DOWN_WS=1` copies the routed experts' IQ4_NL and Q2_0 down weight rows into the work-group's local memory before their products (upstream 6a6d58ad0, opt-in; the output is bitwise the same, and other GPUs ignore it).
 
 On Volta (sm_70), `STRATA_SM70_TABLE=1` takes two decode kernels upstream measured on a V100 (opt-in until confirmed, as in upstream's c85b7c87).
 One is the routed experts' "mode 8": gate/up, SwiGLU and the q8_1 quantization in one pass, with the codebook grid and the activations in the work-group's local memory (`src/kernels/xe/iq_kernels.cpp`, upstream f6330507: 227 -> 159 µs on a V100).
