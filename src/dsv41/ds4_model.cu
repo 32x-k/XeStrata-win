@@ -203,6 +203,28 @@ uint64_t ram_avail() {
     return avail;
 }
 
+// the device memory the experts' placement may count on: cudaMemGetInfo's free, but on an integrated NVIDIA GPU on Linux
+// (a DGX Spark's GB10, one memory with the CPU) what the kernel can still give back, MemAvailable less
+// DS4_UMA_HEADROOM_GIB (6): cudaMemGetInfo counts only MemFree there, and the model's files just read fill the page cache
+// (measured on a GB10: 55 GB "free" with 115 GB available).  Not on HIP: a Strix Halo's GPU memory is its carve-out plus
+// the GTT pool, which hipMemGetInfo already counts and MemAvailable may exceed
+size_t uma_free(int dev, size_t fr) {
+#if !defined(_WIN32) && !defined(STRATA_USE_HIP)
+    int integrated = 0;
+    if (cudaDeviceGetAttribute(&integrated, cudaDevAttrIntegrated, dev) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return fr;
+    }
+    if (!integrated) return fr;
+    const char* h = std::getenv("DS4_UMA_HEADROOM_GIB");
+    const uint64_t head = (uint64_t) (h ? std::atof(h) : 6.0) << 30, avail = ram_avail();
+    if (avail != ~uint64_t{0} && avail > head && avail - head > fr) return (size_t) (avail - head);
+#else
+    (void) dev;
+#endif
+    return fr;
+}
+
 float bf16_to_f32(uint16_t b) {
     uint32_t u = (uint32_t) b << 16;
     float f;
@@ -1980,6 +2002,7 @@ struct Model::Impl {
                 return false;
             }
             CK(cudaMemGetInfo(&d.free0, &d.total));
+            d.free0 = uma_free(d.id, d.free0);
         }
         // the groups' width: o.tp, less while the experts' blocks do not split in it (a member takes n_ff / tp of each
         // expert: the down's inputs in whole blocks - a GGUF's 256-value types split n_ff 2304 in 1, 3 or 9 parts)
@@ -2742,6 +2765,7 @@ struct Model::Impl {
                 cudaSetDevice(d.id);
                 size_t fr = 0, tot = 0;
                 CK(cudaMemGetInfo(&fr, &tot));
+                fr = uma_free(d.id, fr);
                 room += std::max(0.0, (double) fr - (double) ((size_t) o.reserve_mib << 20)) * o.vram_experts;
             }
             for (const Layer& l : L) all += (double) l.blob * l.n_exp;
@@ -4094,6 +4118,7 @@ struct Model::Impl {
                 cudaSetDevice(devs[(size_t) m].id);
                 size_t fr = 0, tot = 0;
                 CK(cudaMemGetInfo(&fr, &tot));
+                fr = uma_free(devs[(size_t) m].id, fr);
                 // (an integrated GPU, Windows: its memory is the system's.  What it allocates after the experts - the long
                 // prompt's buffers, the GEMM workspaces - spills into RAM when the experts took every byte of the GPU's
                 // address space, and on a 32K prompt that ran the machine out of RAM.  So the experts leave room for them,
@@ -5671,6 +5696,7 @@ struct Model::Impl {
         img_tok = tok;
         CK(cudaSetDevice(d.id));
         CK(cudaMemGetInfo(&d.free0, &d.total));   // (the split sees what the tower left)
+        d.free0 = uma_free(d.id, d.free0);
         if (o.verbose)
             std::fprintf(stderr, "ds4: vision tower (%d blocks) on CUDA%d: %.0f MiB, up to %d patches, %.1f s\n",
                          vg.layers, d.id, (double) vt.device_bytes() / (1 << 20), vt.max_patches(),
