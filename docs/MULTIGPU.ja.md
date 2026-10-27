@@ -8,6 +8,8 @@ SPDX-License-Identifier: LGPL-3.0-or-later
 最初の GPU が前の層を、次の GPU がその続きの層を受け持ちます。
 各 GPU は自分の層の密な重み（PLE のテンソルはどの GPU にも）、セッション（GDN の再帰状態、QSA の K/V）、エキスパートのキャッシュを持ちます。
 VRAM が増えた分だけ多くのエキスパートを GPU に置けるので、CPU が計算するエキスパートが減ります。
+そのため、1 枚では窓が CPU のエキスパートの計算を待っている PC（RAM を読む速さの遅い CPU）ほど、分割で速くなります。
+どれだけ待っているかは、エンジンの環境に `STRATA_DECODE_TIMING=1` を置くと、要求ごとのログの `strata decode timing:` の行に出ます（ウィンドウあたりの GPU の待ち `GPU-reach wait` と、層・ウィンドウあたりの CPU のエキスパートの数 `CPU experts`）。
 メーカーの違う GPU（Intel・AMD・NVIDIA。NVIDIA を含むときは contrib-llvm のビルド）も組み合わせられます。
 
 GPU の間の受け渡しは、検証のウィンドウごとに 1 回、CPU のメモリを通します（1 トークンあたり 12,804 個の float）。

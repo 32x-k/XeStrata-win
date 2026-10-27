@@ -8,6 +8,8 @@ The model's layers can be spread over two or more GPUs in one PC.
 The first GPU runs the early layers, the next GPU the layers after them.
 Each GPU holds its own layers' dense weights (the PLE tensors on every GPU), their sessions (the GDN recurrent state, the QSA K/V) and an expert cache of its own.
 The extra VRAM keeps more experts on GPUs, so fewer are computed on the CPU.
+So the split pays most on a PC where one GPU's window waits on the CPU's experts (a CPU that reads RAM slowly).
+How long it waits is in the `strata decode timing:` line the log gets for each request with `STRATA_DECODE_TIMING=1` in the engine's environment (the GPU's wait per window, `GPU-reach wait`, and the CPU's experts per layer and window, `CPU experts`).
 GPUs of different makers can be combined (Intel, AMD and NVIDIA; with NVIDIA, in the contrib-llvm build).
 
 The GPUs hand off once per verify window, through the CPU's memory (12,804 floats a token).
