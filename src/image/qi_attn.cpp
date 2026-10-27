@@ -781,7 +781,8 @@ int qi_attention_i8_chunk() { return i8::CH; }
 
 void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
                   int64_t head_dim, int64_t n_text, uint16_t* out16, float* scratch, void* stream,
-                  const int32_t* key_lim, int64_t first, bool int8) {
+                  const int32_t* key_lim, int64_t first, bool int8,
+                  const std::vector<std::pair<int64_t, int64_t>>* spans) {
     if (T <= first) return;
     if (head_dim != D) throw std::invalid_argument("qi_attention: head_dim 128");
     // the image rows (they see every key) through the int8 kernel where it is the faster, else the GPU maker's kernel
@@ -867,37 +868,60 @@ void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
     // block, the B70 4 (11.88 -> 11.44 ms), the RTX 4070 2 (11.55 -> 10.53 ms).  Until then, the most.
     static core::PerDevice<std::shared_ptr<std::atomic<int>>> tuned_of;
     std::atomic<int>& tuned = *tuned_of.get(q.get_device(), [] { return std::make_shared<std::atomic<int>>(0); });
-    auto run = [&](int nsg) -> sycl::event {
+    // rows f .. e - 1 by the kernel below
+    auto run = [&](int nsg, int64_t f, int64_t e) -> sycl::event {
+        uint16_t* o = out16 + (f - first) * heads * head_dim;
         switch (p) {
-        case 0: return launch<0>(q, q16, k16, v16, T, heads, n_text, key_lim, out16, nsg, first, row_end);
-        case 1: return launch<1>(q, q16, k16, v16, T, heads, n_text, key_lim, out16, nsg, first, row_end);
-        case 2: return launch<2>(q, q16, k16, v16, T, heads, n_text, key_lim, out16, nsg, first, row_end);
-        default: return launch<3>(q, q16, k16, v16, T, heads, n_text, key_lim, out16, nsg, first, row_end);
+        case 0: return launch<0>(q, q16, k16, v16, T, heads, n_text, key_lim, o, nsg, f, e);
+        case 1: return launch<1>(q, q16, k16, v16, T, heads, n_text, key_lim, o, nsg, f, e);
+        case 2: return launch<2>(q, q16, k16, v16, T, heads, n_text, key_lim, o, nsg, f, e);
+        default: return launch<3>(q, q16, k16, v16, T, heads, n_text, key_lim, o, nsg, f, e);
         }
     };
+    // The references' rows (spans) as image rows past a context of b keys, through the image rows' kernels (the int8
+    // one or the GPU maker's, timed as the image rows' are; an edit's 4096 rows of a reference, 4104 keys: 22.8 ms a
+    // block in the kernel below, 6.3 in AMD's on the RX 9060 XT); the rows between them, the text's, by the kernel below
+    std::vector<std::pair<int64_t, int64_t>> segs;   // the rows left to the kernel below
+    {
+        int64_t f = first;
+        if (p >= 0 && spans != nullptr)
+            for (const auto& [a, b] : *spans) {
+                if (a < f || b > std::min(row_end, n_text)) continue;   // a span asked only in part: the kernel below
+                qi_attention(q16, k16, v16, b, heads, head_dim, a, out16 + (a - first) * heads * head_dim, scratch,
+                             stream, nullptr, a, int8);
+                if (a > f) segs.emplace_back(f, a);
+                f = b;
+            }
+        if (row_end > f) segs.emplace_back(f, row_end);
+    }
     const int most = p == 0 ? nsg_most<0>(q.get_device()) : p == 1 ? nsg_most<1>(q.get_device())
                    : p == 2 ? nsg_most<2>(q.get_device()) : p == 3 ? nsg_most<3>(q.get_device()) : 1;
     int nsg = tuned.load();
-    if (p >= 0 && nsg == 0 && T >= 2048) {
+    const auto big = std::max_element(segs.begin(), segs.end(), [](const auto& x, const auto& y) {
+        return x.second - x.first < y.second - y.first;
+    });
+    if (p >= 0 && nsg == 0 && big != segs.end() && big->second - big->first >= 2048) {
         q.wait();
         double best = 1e30;
         std::string said;
         for (int n = most; n >= std::max(1, most / 4); n /= 2) {
-            run(n).wait();   // its kernel built, its caches warm
+            run(n, big->first, big->second).wait();   // its kernel built, its caches warm
             const auto t0 = std::chrono::steady_clock::now();
-            run(n).wait();
+            run(n, big->first, big->second).wait();
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             said += (said.empty() ? "" : ", ") + std::to_string(n) + ": " + std::to_string(ms).substr(0, 5) + " ms";
             if (ms < best) { best = ms; nsg = n; }
         }
         tuned.store(nsg);
-        std::fprintf(stderr, "strata-image: the attention takes %d sub-groups a work-group (timed at %lld rows: %s)\n",
-                     nsg, (long long) T, said.c_str());
+        std::fprintf(stderr, "strata-image: the attention takes %d sub-groups a work-group (timed at %lld rows of %lld "
+                             "keys: %s)\n", nsg, (long long) (big->second - big->first), (long long) T, said.c_str());
     }
     if (nsg == 0) nsg = most;
     sycl::event e;
     switch (p) {
-    case 0: case 1: case 2: case 3: e = run(nsg); break;
+    case 0: case 1: case 2: case 3:
+        for (const auto& [f, end] : segs) e = run(nsg, f, end);
+        break;
     default:
         qi_attention_plain(q16, k16, v16, T, heads, head_dim, n_text, scratch, stream, key_lim);
         qi_to_f16(scratch + first * heads * head_dim, (row_end - first) * heads * head_dim, out16, stream);

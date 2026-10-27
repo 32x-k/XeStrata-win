@@ -9,6 +9,8 @@
 #pragma once
 
 #include <cstdint>
+#include <utility>
+#include <vector>
 
 namespace strata::image {
 
@@ -44,10 +46,13 @@ constexpr int64_t qi_attn_rows(int64_t T) { return (T + 127) / 128 * 128; }
 /// [T - first][heads * head_dim]: the query rows from `first` on (the rows before it, a cached prefix's, are not
 /// asked); else qi_attention_plain through `scratch` (FP32 [T][heads * head_dim]).  `int8`: the rows that see every key
 /// may take the int8 kernel where it is the faster (qi_attention_i8: a model whose images it keeps, Qwen-Image's; not
-/// Mage-Flow's, whose image stream's outlier channels int8's row scales lose).
+/// Mage-Flow's, whose image stream's outlier channels int8's row scales lose).  `spans`: prefix rows [a, b) that see
+/// keys 0 .. b - 1 and no others (an edit's references, as key_lim says on the GPU): they take the image rows' kernels,
+/// as rows past a context of b keys.
 void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
                   int64_t head_dim, int64_t n_text, uint16_t* out16, float* scratch, void* stream,
-                  const int32_t* key_lim = nullptr, int64_t first = 0, bool int8 = false);
+                  const int32_t* key_lim = nullptr, int64_t first = 0, bool int8 = false,
+                  const std::vector<std::pair<int64_t, int64_t>>* spans = nullptr);
 
 /// The path qi_attention takes on the current GPU, for the report.
 const char* qi_attention_path();

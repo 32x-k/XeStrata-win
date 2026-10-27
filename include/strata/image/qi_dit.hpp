@@ -176,12 +176,14 @@ private:
     std::vector<float> pre_pos_;      // the prefix rows' positions [n_text][3]
     int64_t target_pos_ = 0;          // the image's first position
     int32_t* key_lim_ = nullptr;      // the prefix rows' key limits, with references (null: each its own prefix)
+    std::vector<std::pair<int64_t, int64_t>> ref_spans_;   // the references' rows [a, b): they see keys 0 .. b - 1
     // the other context (guidance's negative prompt): the same state, swapped in while it runs (swap_context)
     struct Context {
         float* text = nullptr;
         int64_t n_text = 0, target_pos = 0;
         std::vector<float> pre_pos;
         int32_t* key_lim = nullptr;
+        std::vector<std::pair<int64_t, int64_t>> ref_spans;
         std::vector<uint16_t*> pk, pv;
         float *cos = nullptr, *sin = nullptr;   // its rotary tables (forward_pair), for this size and prefix
         int64_t rope_H = -1, rope_W = -1, rope_text = -1, rope_cap = 0;
