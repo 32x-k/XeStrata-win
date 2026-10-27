@@ -7388,10 +7388,15 @@ int main(int argc, char **argv) try {
                     return 1;
                 }
             }
-            if (!ver_b.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
-                std::fprintf(stderr, "strata serve: --pipeline-windows: the second verifier on CUDA0 (the first card): "
-                                     "%s (raise --vram-reserve-mib by ~200, or --pipeline-windows 0)\n", err.c_str());
-                return 1;
+            {
+                // Verifier::init takes the CURRENT device, so the first card's second verifier is made while card 0
+                // (stage 0 always runs on the default device in this port) is current: the block above ended its scope.
+                const strata::core::OnDevice on_first(0);
+                if (!ver_b.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
+                    std::fprintf(stderr, "strata serve: --pipeline-windows: the second verifier on CUDA0 (the first card): "
+                                         "%s (raise --vram-reserve-mib by ~200, or --pipeline-windows 0)\n", err.c_str());
+                    return 1;
+                }
             }
             ver_b.set_next(&gs.ver_b, &split_drive_b);   // the setters reach it; the pipeline never chains run/commit
         }
@@ -10404,10 +10409,19 @@ int main(int argc, char **argv) try {
                         for (int t = 0; t < w.T; ++t) w1[(size_t) t] = (int32_t) cur[(size_t) (w.q + t)];
                         strata::core::Verifier& v = *PV[1][l1 & 1];
                         if (pl_mtp_live[l1 & 1]) {   // the drafter has read this parity's previous rows first
-                            const strata::core::OnDevice on(mtp.device());
-                            (v.stream())
-                                ->ext_oneapi_submit_barrier(
-                                    {*pl_mtp_ev[l1 & 1]});
+                            // SYCL keeps an event in its context, so another card's queue cannot take it as a
+                            // dependency ("Cannot submit to a queue with a dependency from a graph that is
+                            // associated with a different context", the first pipelined window on a split).  The
+                            // drafter's rows must be in memory before stage 1 reads them, so on two cards the
+                            // host waits for the drafter here and the window is launched without the barrier.
+                            if (mtp.device() == v.device()) {
+                                const strata::core::OnDevice on(mtp.device());
+                                (v.stream())
+                                    ->ext_oneapi_submit_barrier(
+                                        {*pl_mtp_ev[l1 & 1]});
+                            } else if (DPCT_CHECK_ERROR(pl_mtp_ev[l1 & 1]->wait()) != 0) {
+                                return fail("the drafter's rows did not land before the window");
+                            }
                         }
                         if (!v.pl_launch(w.T, w1.data(), w.q, e) || !v.pl_commit_async(w.T, e)) return fail(e);
                         ++l1;

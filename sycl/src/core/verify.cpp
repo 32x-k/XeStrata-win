@@ -697,6 +697,18 @@ bool Verifier::init(const WeightTable &wt, const ModelGeometry &g,
         err = "verify: stream create failed";
         return false;
     }
+    if (std::getenv("STRATA_VERIFY_DEBUG") != nullptr) {
+        // SYCL: a queue belongs to one context, so ev_fork_/ev_join_ (recorded on cs_) can only be waited on by
+        // sh_cs_ when the two streams are the same card.  Print both, and whether the streams are the shared ones.
+        auto dn = [](dpct::queue_ptr q) -> std::string {
+            if (q == nullptr) return "<null>";
+            try { return q->get_device().get_info<sycl::info::device::name>(); } catch (...) { return "<no device>"; }
+        };
+        std::fprintf(stderr, "strata verify: init device %d, cs '%s', sh_cs '%s', ext_stream %s, copy '%s'\n",
+                     device_, dn(cs_).c_str(), dn(sh_cs_).c_str(),
+                     ext_stream_ == nullptr ? "none" : dn(ext_stream_).c_str(), dn(copy_).c_str());
+        std::fflush(stderr);
+    }
     if (DPCT_CHECK_ERROR(commit_done_ = new sycl::event()) != 0 ||
         DPCT_CHECK_ERROR(ev_fork_ = new sycl::event()) != 0 ||
         DPCT_CHECK_ERROR(ev_join_ = new sycl::event()) != 0) {
@@ -1657,6 +1669,24 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
     return true;
 }
 
+// SYCL port: a failed queue wait reported as what it was.  DPCT_CHECK_ERROR keeps only "error" from the SYCL
+// exception and drops the device, which made a pipelined-window failure on a layer split impossible to place:
+// the same text came from either card and from any of the four verifiers.  These two helpers say which.
+static dpct::err0 queue_wait_diag(sycl::queue *cs, int dev, const char *what) {
+    if (cs == nullptr) return dpct::default_error;
+    try {
+        cs->wait();
+        return dpct::success;
+    } catch (std::exception const &e) {
+        std::string qdev = "<unknown>";
+        try { qdev = cs->get_device().get_info<sycl::info::device::name>(); } catch (...) {}
+        std::fprintf(stderr, "strata verify: %s: the queue wait failed on verifier device %d (queue device: %s): %s\n",
+                     what, dev, qdev.c_str(), e.what());
+        std::fflush(stderr);
+        return dpct::default_error;
+    }
+}
+
 std::string Verifier::profile_report() {
     if (!prof_on_ || prof_windows_ == 0) return std::string();
     static const char* names[kProfPer] = {"-", "hc-read0", "q8+qkv/q-idx gemv", "conv", "ab", "z", "rec", "q8+kv-idx",
@@ -2329,7 +2359,7 @@ bool Verifier::run(int T, const int32_t *tokens, int64_t pos0, PoolMultiFn pool,
     // watchdog then releases every verifier's GPU waits (release_live_verifiers) before it ends the engine, so no
     // spin kernel outlives the process.  The wait itself stays a blocking sync (a polling wait cost decode upstream).
     trace_ev("SYNC", -1, -1, 0);
-    const dpct::err0 se = DPCT_CHECK_ERROR(cs_->wait());
+    const dpct::err0 se = queue_wait_diag(cs_, device_, "window sync");
     trace_ev("SYNCED", -1, -1, (int64_t) se);
     const Clock::time_point t_done = Clock::now();
     if (std::getenv("STRATA_VERIFY_DEBUG") != nullptr) {
@@ -3842,7 +3872,15 @@ catch (sycl::exception const &exc) {
 bool Verifier::done(std::string &err) try {
     if (!fl_active_ || fl_k_ < fl_total_) return false;
     const OnDevice on_device(device_);
-    const dpct::err0 q = dpct::sycl_event_query(ev_done_);
+    dpct::err0 q;
+    try {
+        q = (dpct::err0) dpct::sycl_event_query(ev_done_);
+    } catch (std::exception const &e) {
+        // a dead or foreign event used to read as the bare word "error"
+        err = std::string("verify: the window's completion event could not be queried on device ") +
+              std::to_string(device_) + ": " + e.what();
+        return false;
+    }
 
     /*
     DPCT1009: SYCL reports errors using exceptions and does not use error
@@ -3856,6 +3894,19 @@ bool Verifier::done(std::string &err) try {
     DPCT1000: Error handling if-stmt was detected but could not be
     rewritten.
     */
+    if (q == 1) {
+        // SYCL's "not complete" is CUDA's cudaErrorNotReady: the window is still running, which is not an error.
+        // The DPCT migration dropped that branch, so the first poll of every pipelined window failed with
+        // "verify: error" and --pipeline-windows never ran on this backend.  Same body as the CUDA original.
+        const double now = now_ms();
+        if (now - fl_flush_ms_ > 2.0) {
+            fl_flush_ms_ = now;
+            (void)DPCT_CHECK_ERROR(cs_->ext_oneapi_empty());
+        }
+        if (now - fl_since_ms_ > 20000.0)   // every layer served, and the graph still runs: #267 as above
+            err = "verify: the window never finished" + released_note(release_gpu_waits(5000));
+        return false;
+    }
     if (q != 0) {
       err = std::string("verify: ") + dpct::get_error_string_dummy(q);
       return false;
