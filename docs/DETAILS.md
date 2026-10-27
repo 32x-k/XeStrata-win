@@ -1396,6 +1396,8 @@ The GPU encoder's own VRAM can leave the expert cache smaller and the text a lit
 
 **The encoder only while there are pictures** (opt-in, upstream ca41a6b9): with the config's `"vram_elastic": true`, `"elastic": true` in the `"vision"` section keeps the GPU encoder from starting with the server, so the expert cache keeps all of the VRAM.
 The first picture's request makes the cache keep `"elastic_mib"` (default 2048) free on top of the reserve and starts the encoder there (a few seconds).
+If the cache cannot shrink (the resident low-RAM mode, an engine without `--vram-elastic`, a layer split) the encoder starts anyway and the log says why; on a layer split the server says at start that the encoder's VRAM has to be kept free with `--vram-reserve-mib`.
+An encoder that fails to start (out of VRAM) ends the request with a `503`; the next picture tries again.
 After `"elastic_idle_s"` (default 120) without a picture it stops between requests and the cache takes the VRAM back.
 A `POST /v1/vram` while the encoder runs stacks the reserve on top of the encoder's share; an unload stops the encoder too.
 Without `"vram_elastic"` the server says so and starts the encoder with the model, as before.
