@@ -60,8 +60,11 @@ struct ConversationKvReuse {
     std::vector<ConversationKv> kv;
     // Original image extent for validation, and the earliest subsequent rewrite.
     int64_t captured_tokens = 0, unchanged_tokens = 0;
+    // The conversation the image was captured from: a park reuses it only for the prefix it shares with the
+    // conversation then in the main session (a batch slot may have replaced that session's K/V since; upstream #1503).
+    std::vector<int32_t> ids;
     size_t bytes() const {
-        size_t n = kv.capacity() * sizeof(ConversationKv);
+        size_t n = kv.capacity() * sizeof(ConversationKv) + ids.capacity() * sizeof(int32_t);
         for (const auto& layer : kv) n += layer.bytes();
         return n;
     }
@@ -118,6 +121,21 @@ inline bool conversation_chain_holds(const ConversationCheckpoint& c, const std:
     return false;
 }
 
+/// `c` holds the state `ids` (with `images`) describes, or a continuation of it: its tokens start with `ids` and its
+/// pictures below ids.size() are exactly `images` (upstream 01e404c14: an idle batch slot need not park it again).
+inline bool conversation_covers(const ConversationCheckpoint& c, const std::vector<int32_t>& ids,
+                                const std::vector<ConversationImageKey>& images) {
+    const size_t n = ids.size();
+    if (n == 0 || c.ids.size() < n || !std::equal(ids.begin(), ids.end(), c.ids.begin())) return false;
+    size_t j = 0;
+    for (const auto& image : c.imgs) {
+        if (image.start >= (int64_t) n) continue;
+        if (j == images.size() || !(images[j] == image)) return false;
+        ++j;
+    }
+    return j == images.size();
+}
+
 class ConversationCache {
 public:
     struct Match {
@@ -147,9 +165,10 @@ public:
 
     // Retain only the restored K/V buffers, not duplicate running checkpoints.
     // This optimization never evicts a parked conversation to make itself fit.
-    void retain(std::vector<ConversationKv>&& kv, int64_t tokens) {
+    // `ids`: the conversation the K/V belongs to (take_reuse_for refuses it for any other; none: never reused).
+    void retain(std::vector<ConversationKv>&& kv, int64_t tokens, std::vector<int32_t> ids = {}) {
         reuse_ = {};
-        ConversationKvReuse candidate{std::move(kv), tokens, tokens};
+        ConversationKvReuse candidate{std::move(kv), tokens, tokens, std::move(ids)};
         if (enabled() && candidate.bytes() <= budget_ - bytes_) reuse_ = std::move(candidate);
     }
     void limit_reuse(int64_t first_dirty) {
@@ -157,6 +176,30 @@ public:
         if (reuse_.unchanged_tokens <= 0) reuse_ = {};
     }
     ConversationKvReuse take_reuse() { return std::exchange(reuse_, {}); }
+    // The retained K/V for parking `live`: limited to the prefix `live` shares with the conversation it was captured
+    // from, and nothing when they share none.  Without it a park after a batch slot gave its conversation back to the
+    // main session wrote the restored conversation's K/V into the new one's image (upstream f8ff3420d, #1503).
+    ConversationKvReuse take_reuse_for(const std::vector<int32_t>& live) {
+        ConversationKvReuse r = std::exchange(reuse_, {});
+        const size_t n = std::min(r.ids.size(), live.size());
+        size_t same = 0;
+        while (same < n && r.ids[same] == live[same]) ++same;
+        r.unchanged_tokens = std::min(r.unchanged_tokens, (int64_t) same);
+        if (r.unchanged_tokens <= 0) return {};
+        return r;
+    }
+    /// A parked conversation holds this state already (its live tokens or one of its checkpoints start with `ids`,
+    /// same pictures, same steering).  Read-only; no LRU effect.
+    bool holds(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images, bool cvec) const {
+        for (const auto& e : entries_) {
+            if (e.cvec != cvec) continue;
+            if (conversation_covers(e.live, ids, images)) return true;
+            for (const auto& c : e.checkpoints)
+                if (conversation_covers(c, ids, images)) return true;
+        }
+        return false;
+    }
+    int64_t retained_tokens() const { return reuse_.kv.empty() ? 0 : reuse_.unchanged_tokens; }
     size_t retained_bytes() const { return reuse_.bytes(); }
     bool can_fit(size_t incoming, size_t held = 0) const {
         return enabled() && held <= budget_ && incoming <= budget_ - held &&
