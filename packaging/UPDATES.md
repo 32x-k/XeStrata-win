@@ -178,7 +178,7 @@ was made (a second `sign-and-notarize.sh` run) makes a new archive: sign and add
 `build-feed` also writes `RELEASE/install-manifest.txt`, the file the one-line installers read: one line per Control package,
 `platform version url sha256 size`, taken from the `*.entry.json` files in `RELEASE/control`. The Control package is the Terminal that `install.sh` unpacks (it must hold `bin/strata`).
 `install.sh` unpacks with `tar -xzf` and `install.ps1` with `Expand-Archive`, so `windows-x86_64` must be packed with `--format zip` and the other platforms as `tar.gz`;
-`build-feed` leaves a pack in the wrong format out of the manifest and says so. Pack Control for every platform you want the one-line install to cover (`install.sh` knows `linux-x86_64` and `macos-arm64`, `install.ps1` `windows-x86_64`);
+`build-feed` leaves a pack in the wrong format out of the manifest and says so. Pack Control for every platform you want the one-line install to cover (`install.sh` knows `linux-x86_64`, `linux-aarch64` and `macos-arm64`, `install.ps1` `windows-x86_64`);
 a platform with no line gets "this release has no Terminal for <platform>". Upload `install.sh` and `install.ps1` from `packaging/` unchanged: their built-in address is the release folder.
 
 The feed is hosted as the files of a GitHub release of `Niko1221/Strata`. The built-in address is
