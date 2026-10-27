@@ -96,11 +96,18 @@ class ChatTemplate:
         if self.call_form == "glm":        # its efforts: low, high and max (the default)
             effort = kwargs.get("reasoning_effort")
             kwargs = {**kwargs, "reasoning_effort": {"low": "low", "medium": "high"}.get(str(effort))}
+        elif self.harmony and kwargs.get("reasoning_effort") == "xhigh":   # Harmony's efforts: low, medium and high
+            kwargs = {**kwargs, "reasoning_effort": "high"}
         text = self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                     **kwargs)
         if (self.call_form == "glm" and add_generation_prompt and kwargs.get("enable_thinking", True) is False
                 and text.endswith("<think>")):   # GLM's template always opens the thinking: closed at once
             text += THINK_END
+        if (self.harmony and add_generation_prompt and kwargs.get("enable_thinking", True) is False
+                and text.endswith(HARMONY_TURN)):
+            # Harmony has no switch for thinking: an empty analysis message, so the model goes on with the final
+            # answer or a call (a forced final channel would leave it no call)
+            text += HARMONY_NO_THINKING + HARMONY_TURN
         return text
 
     def _detect_caps(self) -> dict[str, bool]:
@@ -987,6 +994,8 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
 # ------------------------------------------------------------------------------------------------ harmony
 HARMONY_ENDS = ("<|end|>", "<|return|>", "<|call|>")
 HARMONY_MESSAGE = "<|message|>"
+HARMONY_TURN = "<|start|>assistant"                    # the generation prompt's end
+HARMONY_NO_THINKING = "<|channel|>analysis<|message|><|end|>"
 
 
 class HarmonyParser:
