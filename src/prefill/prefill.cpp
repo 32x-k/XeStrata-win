@@ -1271,6 +1271,9 @@ bool Prefill::carve(size_t T, void* alloc) {
                                                                            m.attn_batch, s), moe_set_bytes(T, m.g->n_expert),
                                           hc_in_region() ? hc_set_bytes(T) : (uint64_t) 0});
         uint8_t* base = o.take<uint8_t>((size_t) region, ok);
+        // no region: the sub-allocators below would each allocate their share (hundreds of MiB) on a card that has
+        // just shown it has no room (upstream 2a9a67c17).  The caller reports the failure.
+        if (base == nullptr && !o.count_only) return false;
         m.region = base;
         m.region_bytes = region;
         if (hc_in_region()) {
