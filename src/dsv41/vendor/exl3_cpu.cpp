@@ -1,3 +1,7 @@
+#if !(defined(__x86_64__) || defined(_M_X64))   // (x86 defines it below, inside its guard)
+// the band GEMM's chunk width, defined here because the uses are outside the AVX-512 guard
+constexpr int kGemmK = 256;
+#endif
 // Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
 // Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 // src/kernels/cpu/exl3_cpu.cpp - EXL3 routed experts on the CPU (see include/strata/kernels/cpu/exl3_cpu.hpp).
