@@ -1260,8 +1260,13 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     o.owned = &m.owned;
     {
         uint16_t* gs = o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
+        // STRATA_DEQUANT_SIDE: the second dequant scratch (counted by bytes_needed, retaken by relayout)
+        uint16_t* gs2 = gemm_dequant_side() ? o.take<uint16_t>((size_t) GEMM_SCRATCH, ok) : nullptr;
         if (!ok) { err = "prefill: GEMM scratch does not fit"; return false; }
         m.gemm.init_external(stream, gs, GEMM_SCRATCH);
+        if (std::string side_err; !m.gemm.set_dequant_side(gs2, side_err))
+            std::fprintf(stderr, "prefill: STRATA_DEQUANT_SIDE=1 not taken (%s): the dense weights are dequantized in "
+                                 "front of their products\n", side_err.c_str());
     }
     if (!carve(T, &o)) {
         err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit" +
@@ -1428,7 +1433,11 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
     o.cap = borrow_bytes;
     o.owned = &m.owned;
     uint16_t* gs = o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
+    uint16_t* gs2 = gemm_dequant_side() ? o.take<uint16_t>((size_t) GEMM_SCRATCH, ok) : nullptr;   // STRATA_DEQUANT_SIDE
     if (ok) m.gemm.rebind(gs, GEMM_SCRATCH);
+    if (std::string side_err; ok && !m.gemm.set_dequant_side(gs2, side_err))
+        std::fprintf(stderr, "prefill: STRATA_DEQUANT_SIDE=1 not taken (%s): the dense weights are dequantized in "
+                             "front of their products\n", side_err.c_str());
     if (!ok || !carve((size_t) chunk, &o)) {
         err = "prefill: device buffers for a chunk of " + std::to_string(chunk) + " tokens do not fit" +
               fit_failure(o);
@@ -1613,6 +1622,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
     Alloc o;
     o.count_only = true;
     o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
+    if (gemm_dequant_side()) o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);   // STRATA_DEQUANT_SIDE: the second scratch
     auto f = [&](size_t n) { o.take<float>(n, ok); };
     f(T * N); f(T * D); f(T * HC);
     if (!hc_in_region()) o.take<uint8_t>((size_t) hc_set_bytes(T), ok);

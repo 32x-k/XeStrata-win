@@ -14,6 +14,8 @@
 #include <cstdint>
 #include <string>
 
+namespace strata::gpu { struct Event; }
+
 namespace strata::prefill {
 
 class Gemm {
@@ -67,6 +69,13 @@ public:
     /// Caller-owned buffer only: the scratch moved (the prompt path laid its buffers out again).
     void rebind(uint16_t* scratch, int64_t scratch_elems);
 
+    /// STRATA_DEQUANT_SIDE=1 (gemm_dequant_side): a second dequant scratch of scratch_elems() elements, caller-owned
+    /// like the first.  native() then dequantizes on a side stream into the two in turn, so a weight's dequant runs
+    /// while the kernels queued ahead of its product do; events order every write and read of each scratch, so the
+    /// products are the serial form's, bit for bit.  nullptr: the serial form.  Called after init_external and after
+    /// every rebind, on the device of the Gemm's stream.
+    bool set_dequant_side(uint16_t* scratch2, std::string& err);
+
     uint16_t* scratch() const { return scratch_; }
     int64_t scratch_elems() const { return scratch_elems_; }
     void* stream() const { return stream_; }
@@ -81,6 +90,18 @@ private:
     uint16_t* tc_w_ = nullptr;   // bf16_through_f16's FP16 images of W and of a slice of X, grown on demand
     uint16_t* tc_x_ = nullptr;
     int64_t tc_w_elems_ = 0, tc_x_elems_ = 0;
+    // STRATA_DEQUANT_SIDE (set_dequant_side): the second scratch, the side stream and, per scratch, "the dequant
+    // landed" (recorded on the side stream) and "the product read it" (recorded on the compute stream); side_cur_ is
+    // the scratch the next native() dequantizes into (0: scratch_, 1: side_scratch_)
+    uint16_t* side_scratch_ = nullptr;
+    void* side_stream_ = nullptr;
+    strata::gpu::Event* side_ready_[2] = {};
+    strata::gpu::Event* side_free_[2] = {};
+    int side_cur_ = 0;
 };
+
+/// STRATA_DEQUANT_SIDE=1: the prompt path's dense-weight dequant on a side stream with a second GEMM scratch
+/// (Gemm::set_dequant_side; the prompt path takes the scratch from its region when this is on).  Off by default.
+bool gemm_dequant_side();
 
 }  // namespace strata::prefill
