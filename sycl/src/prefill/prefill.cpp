@@ -734,7 +734,11 @@ struct Prefill::Impl {
     float* sel_scores = nullptr;          // [sel_batch, max_blocks]
     int64_t sel_batch = 256, max_blocks = 0;
     float* attn_scratch = nullptr;
-    int64_t attn_batch = 32, cap = 0;
+    int64_t attn_batch = [] {   // SYCL port: how many queries the prompt path hands the FP32 attention kernel at once
+        const char* v = std::getenv("STRATA_ATTN_BATCH");   // (the tensor-core kernel is opt-in and slower here)
+        const long long n = v ? std::atoll(v) : 32;         // 32 was picked for a vector-matrix kernel; more queries
+        return (n >= 1 && n <= 1024) ? (int64_t) n : 32LL;  // per launch give it more to overlap.  Scratch grows too.
+    }(), cap = 0;
     // MoE
     float *logits = nullptr, *w = nullptr, *GU = nullptr, *Dm = nullptr, *sgate = nullptr, *sup = nullptr,
           *shared = nullptr, *sg = nullptr;
