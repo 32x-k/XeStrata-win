@@ -5,8 +5,9 @@ shared by the CPU and the GPU). Strata runs there through the same HIP backend a
 **Status: experimental.**
 
 **DeepSeek V4.1-Flash runs here on Windows** (since 0.2.7): its own engine package is built for gfx1151 and the official IST-DAS
-1.75 / 2.00 / 2.25 bpw sets run through it. Measured on the 128 GB box (64 GB BIOS carve-out plus 64 GB seen by Windows) with 2.00 bpw and the default Faster mode: answers 15-17
-tokens/s on code, 10-11 on chat; a 4K prompt 87 tokens/s, an 8K prompt 125 and a 32K prompt 177. The graphics chip and the CPU share the RAM, so the
+1.75 / 2.00 / 2.25 bpw sets run through it. Measured on the 128 GB box (64 GB BIOS carve-out plus 64 GB seen by Windows) with 2.00 bpw and the default Faster mode, on the
+2026-10-25 build (before the DeepSeek defaults of 0.2.7): answers 15-17 tokens/s on code, 10-11 on chat; a 4K prompt 87 tokens/s, an 8K prompt 125 and a 32K prompt 177.
+On the 0.2.7 build the same box reads a 4K prompt at 214-233 tokens/s; the table below says which number comes from which build. The graphics chip and the CPU share the RAM, so the
 engine counts it once and reads the rest of the experts from the SSD. [DeepSeek on Strix Halo](#deepseek-v41-flash) has the details,
 the driver it needs and the limits.
 
@@ -32,6 +33,8 @@ change BIOS or kernel settings. The manual Linux toolchain below is for reproduc
 DeepSeek V4.1-Flash comes with its own engine package on Windows and needs nothing extra: pick the model and the app or `strata launch`
 downloads it ([DeepSeek on Strix Halo](#deepseek-v41-flash)).
 
+On Windows, [STRIX_HALO_WINDOWS.md](STRIX_HALO_WINDOWS.md) has the speeds measured on 0.2.7 with Qwen IQ3_S and DeepSeek, how memory is used and the traps.
+
 ## DeepSeek V4.1-Flash
 
 The model runs through its own engine, `strata-dsv41`, as on the other platforms ([DEEPSEEK41.md](DEEPSEEK41.md)); on Windows the
@@ -45,7 +48,8 @@ package is the AMD one built for gfx1151 (`strata-dsv41-...-windows-x86_64-hip-r
 | Context | 8K default; 32K and 64K work (an 8-hour 32K soak passed) |
 | Disk | the sets above; keep the files on the NVMe drive, they are read while it answers |
 
-Measured on the maintainers' box (Ryzen AI Max+ 395, 128 GB unified, Windows 11, 2.00 bpw, Faster mode, DSpark auto, engine 0.1.51):
+Measured on the maintainers' box (Ryzen AI Max+ 395, 128 GB unified, Windows 11, 2.00 bpw, Faster mode, DSpark auto, engine 0.1.51) on 2026-10-25, with the
+build of that day and the DeepSeek stream's own test harness (before the 0.2.7 DeepSeek defaults; the 0.2.7 numbers are in the next table):
 
 | Workload | Result |
 | --- | --- |
@@ -57,6 +61,21 @@ Measured on the maintainers' box (Ryzen AI Max+ 395, 128 GB unified, Windows 11,
 | 32K prompt | about 177 tokens/s |
 | Stability | 100-request, 1-hour (243 requests) and 8-hour 32K (646 requests) soaks passed on the engine line this package is built from |
 
+Measured again on 2026-10-26 on the same box with the 0.2.7 release candidate (f-027-int2 `3e468f5de`, engine 0.1.51), installed through `strata launch` from a local
+signed test feed, 2.00 bpw, Faster mode, DSpark auto, the default 8K context, `tools/strata_bench.py` through the server (three fresh prompts of 4,125
+tokens, 24 new tokens; chat is the median of nine answers of up to 100 tokens). One change at a time, to see which one moved the 4K prompt:
+
+| Setup on the 0.2.7 candidate | 4K prompt (tok/s) | Chat decode (tok/s) |
+| --- | ---: | ---: |
+| what `strata launch` writes (`--prefill-chunk 16384`) | 214-226 | 12.1-13.6 |
+| `--prefill-chunk 8192` | 229 (214-234) | 14.9 (12.0-18.2) |
+| `--prefill-chunk 8192` and `DS4_DEFAULTS=026` (the 0.2.6 DeepSeek defaults) | 139 (133-144) | 13.7 (11.9-22.0) |
+| `--prefill-chunk 1024` and `DS4_DEFAULTS=026` | 133 (129-136) | 14.2 (12.3-22.1) |
+
+The 0.2.7 DeepSeek defaults account for the gap between 139 and 229; the chunk size matters much less than that on this build. The 0.2.7
+candidate with the 0.2.6 defaults still reads 133-139, above the 78.7-87.2 of 2026-10-25 below. That rest is not explained: the build of that
+day, the harness and the prompt were different, and only this table changes one thing at a time. Compare numbers within one table, not across.
+
 The verify window runs synchronously on this PC: setup writes `DS4_ASYNC_T=4` in the config's env (`STRATA_DSV41_ASYNC_T=8`
 restores the engine's default, any other value overrides). The engine's mailbox ("async") path is sized for cards that hold most
 of the experts and is slower here: measured 2026-10-25 (2.00 bpw, greedy, 256 tokens): code 15.87-16.33 → 20.14-21.28 tok/s
@@ -65,7 +84,7 @@ the scheduling changes, and the drafter's own single-token windows stay async. T
 (its experts leave no room for it) and does not change.
 
 Prompts are read in 8,192-token chunks: setup writes `--prefill-chunk 8192` on this PC (STRATA_DSV41_NO_BIG_CHUNK=1 leaves the
-engine's 1,024-token default). Measured 2026-10-25: 4K 78.7 → 87.2, 8K 108.9 → 125.1, 32K 155.2 → 176.9 tok/s; decode unchanged
+engine's 1,024-token default). Measured 2026-10-25 (the build of that day, before the 0.2.7 defaults): 4K 78.7 → 87.2, 8K 108.9 → 125.1, 32K 155.2 → 176.9 tok/s; decode unchanged
 (16.53 → 16.59), because the chunk buffers take ~5 GB from the GPU expert tier and the RAM store's hit rate rises to compensate. The
 chunk's summation order changes, not the model (the repo's chunk-size KL check: 1024 0.1705, 2048 0.1692, 4096 0.1688, 8192 0.1695).
 
@@ -167,7 +186,7 @@ kernel): they change speed, not answers. Nothing here applies to CUDA or to anot
 | `STRATA_Q8_PACKED`, `STRATA_Q6_PACKED`, `STRATA_MMVF_ROWS`, `STRATA_ATTN_LANECELL` | Decode layouts and kernels: packed Q8_0 / Q6_K weights, 4-row BF16 GEMV, one-cell-per-thread attention scores. |
 | `STRATA_EXPERT_V2`, `STRATA_TSUM`, `STRATA_LFUSE` | The grouped decode experts (IQ3_S / IQ4_NL), single-butterfly warp sums, fewer launches around the shared expert and the KV append. |
 | `STRATA_GDN_SPLIT`, `STRATA_QFUSE`, `STRATA_PLE_BATCH` | The GDN step over four blocks per head, activation images written by their producers, the PLE key / value projections of a verify window at once. |
-| `STRATA_SH_STREAM=1` | The shared expert on a second stream beside the routed experts. Off by default on other AMD cards, but it pays on gfx1151 (decode +1.8% UD-IQ4_XS, +6.7% UD-Q4_K_XL at 8K). |
+| `STRATA_SH_STREAM=1` | The shared expert on a second stream beside the routed experts. Off by default on other AMD cards, but it pays on Linux gfx1151 (decode +1.8% UD-IQ4_XS, +6.7% UD-Q4_K_XL at 8K). **Off by default on Windows gfx1151 since 0.2.7:** it measured 6.9% slower there with the same token ids ([STRIX_HALO_WINDOWS.md](STRIX_HALO_WINDOWS.md)). `STRATA_SH_STREAM=1` turns it back on. |
 
 Two further defaults change bits. `STRATA_HC_Q8` reads the hyper-connection weights as 8-bit (`STRATA_HC_Q8=0` restores the BF16
 read), and on Windows the prompt is read in chunks of 8192 tokens (`STRATA_GFX1151_CHUNK=0` keeps 6144). About `STRATA_HC_Q8`: it
@@ -272,7 +291,7 @@ more than the differences because other jobs shared the box, so read them as unc
 | IQ3_XXS | 8K | 1,127 -> 1,212 (+7.6%) | 51.64 -> 50.95 (-1.3%) |
 | IQ3_XXS | 128K | 1,252 -> 1,250 (-0.1%) | 50.88 -> 50.22 (-1.3%) |
 
-With the shared-expert stream (`STRATA_SH_STREAM=1`, now a default) at 8K, 4 pairs: UD-IQ4_XS output 53.1 -> 54.05 (+1.8%),
+With the shared-expert stream (`STRATA_SH_STREAM=1`, a default on Linux; Windows leaves it off since 0.2.7) at 8K, 4 pairs: UD-IQ4_XS output 53.1 -> 54.05 (+1.8%),
 UD-Q4_K_XL 49.5 -> 52.8 (+6.7%), prompt unchanged.
 
 **Other switch measurements** (Measured on: the same Ryzen AI Max+ 395)

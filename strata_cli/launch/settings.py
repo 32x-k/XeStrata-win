@@ -277,15 +277,26 @@ def settings_from_pairs(pairs: list[str]) -> dict[str, str]:
     return out
 
 
+#: Options whose value is a WORD the engine reads (on, off, auto, none): the word goes through as typed. Making "on" a bare flag
+#: started strata-dsv41 with a lone `--dspark`, which it refuses ("--dspark needs a value", #3959), and "off" removed the flag instead of
+#: switching the drafter off.
+WORD_VALUE_FLAGS = frozenset({"--dspark"})
+
+
 def as_argv_changes(extra: dict[str, str], bool_flags: frozenset[str]) -> tuple[dict[str, Any], dict[str, str | None]]:
     """Turn the Advanced table's values into `tune_knobs.apply_to_argv` changes and environment changes.
 
-    A flag without a value (or on/true/yes) is "present"; off/false/no/none removes it; anything else is a value."""
+    A flag without a value (or on/true/yes) is "present"; off/false/no/none removes it; anything else is a value.
+    A word-valued option (WORD_VALUE_FLAGS) keeps its word."""
     args: dict[str, Any] = {}
     env: dict[str, str | None] = {}
     for key, value in extra.items():
         if key.startswith("--"):
             low = value.lower()
+            if key in WORD_VALUE_FLAGS and key not in bool_flags:
+                if low:
+                    args[key] = low
+                continue                          # an empty value is no change, as for every option that takes one (#3504)
             if low == "" and key not in bool_flags:
                 continue                          # an empty value for an option that takes one is no change, never a bare flag (#3504)
             if key in bool_flags or low in ("on", "true", "yes", ""):

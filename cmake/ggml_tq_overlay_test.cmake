@@ -1,6 +1,8 @@
 # cmake -DLLAMA=<llama.cpp dir> -DOUT=<scratch dir> -P cmake/ggml_tq_overlay_test.cmake
 # The trellis MMQ overlay on a pinned llama.cpp: it generates, every copied header is the pinned one except the patched
 # ones, and the patched ones only gain lines (TQ routing, three externs, config copies of IQ2_XS's).
+# a -P script has no cmake_minimum_required, so CMake 3.x applies the OLD CMP0057 and IN_LIST below is not an operator (#3412)
+cmake_policy(SET CMP0057 NEW)
 get_filename_component(CMAKE_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}/.." ABSOLUTE)
 include(${CMAKE_CURRENT_LIST_DIR}/strata_ggml_tq_overlay.cmake)
 file(REMOVE_RECURSE "${OUT}")

@@ -156,7 +156,7 @@ def assess(catalog, family: str | None, model: str | None, *, vision: str = "off
     # not installed: whatever of the weights is in the model's folder counts
     if family and model:
         base = data or Path(catalog.data_dir())
-        folder = base / "models" / catalog.tag_of(family, model)
+        folder = catalog.model_folder(base, family, model)
         got = 0
         try:
             got = sum(f.stat().st_size for f in folder.glob("*.gguf") if not f.name.lower().startswith("mmproj"))

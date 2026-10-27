@@ -296,7 +296,9 @@ files, read time; `routing prefetch`: how many file reads had been warmed). The 
 `GET /metrics` lists `ram_blobs`, `file_blobs`, `file_mb`, `drafts_offered` and `drafts_accepted` per recent request, with
 `totals` since the start. `hit_rate` is the VRAM share of the experts looked up; experts the GPU reads over PCIe
 (`--pcie-frac`) are not in it, so a higher `--pcie-frac` raises it even when decoding gets slower. `pcie_share` is their
-share of all routed experts. The Monitor tab shows both.
+share of all routed experts. The Monitor tab shows both. The request list in the Monitor tab also shows the prompt's own speed: what the cache already held is not read
+again, so it is the fresh tokens (`prompt_tokens` minus `reused`) over the prompt time (`prompt_ms`), and a request that read no
+new token shows no number.
 
 Profiling: start the server with `STRATA_DECODE_TIMING=1` (and `STRATA_VERIFY_PROFILE=1` for the GPU side). After each request
 the engine log has a `strata decode timing:` line and a `strata decode GPU stages (ms/window):` line. The GPU profile slows
@@ -493,9 +495,20 @@ applies at the next start. Network, key, MCP and program keys are not editable t
   every 15 s and `GET /status` says what it is doing. Closing the connection or pressing stop in your app stops the model.
 - A tool call counts only when it names a tool the request declared. A namespaced tool (`mcp__filesystem.write_file`) is
   that call when the model writes `mcp__filesystem__write_file`, `mcp__filesystem=write_file`, `mcp__filesystem_write_file`,
-  or the bare member (`write_file`) and exactly one declared tool has that member. Any other call, or any call in a request
-  that declared no tools, comes back as the text it was written as. A call whose envelope drifted by a token (`<=NAME>`,
+  or the bare member (`write_file`) and exactly one declared tool has that member. A name with `__` in it (`mcp__playwright__browser_navigate`)
+  is also that call when the model writes every `__` as `_` (`mcp_playwright_browser_navigate`), unless two declared tools collapse to the same
+  spelling. Any other call, or any call in a request that declared no tools, comes back as the text it was written as. Names are never
+  guessed: `bash` is not `shell`, and a reordered name (`server1_label_values` for `label_values_mcp_server1`) is not the declared one.
+  A call whose envelope drifted by a token (`<=NAME>`,
   `<function:NAME>` or `<NAME>` instead of `<function=NAME>`) is read as the call when NAME is a declared tool.
+- **A call that came back as text because its name was not declared (#3796).** The text stays exactly as the model wrote it and
+  `finish_reason` stays `stop` (or `end_turn` on `/v1/messages`). Next to it the reply carries a list, only when there is something in it:
+  `"strata_rejected_tool_calls": [{"name": "bash", "reason": "undeclared"}]` (at the top level of a Chat Completions reply, in
+  its last streamed chunk, and in the `message_delta` event and the message of `/v1/messages`; up to five names). A client that
+  wants to recover can answer the model with the tool names it does have and ask again; Strata never runs or forwards a call for a
+  tool the request did not declare. The server window prints the same names (`N <tool_call> block(s) ... went back as text`), and
+  `/metrics/prometheus` counts the blocks in `strata:tool_calls_unread_total`. A block that is malformed (not an undeclared name) is counted
+  there and in the window, but has no name to list.
 - JSON output: `response_format: {"type":"json_object"}` or `{"type":"json_schema", ...}` on `/v1/chat/completions`. The schema
   must accept only JSON objects at its root (`"type":"object"`, or `anyOf`/`oneOf` of object schemas). Local `#` references
   work and remote ones are refused. This is schema prompting followed by server validation, not grammar-constrained
@@ -573,6 +586,8 @@ tables per token). The scaling is fixed for the whole run, because the KV cache 
   `--host 0.0.0.0 --api-key some-long-secret`, or add `"host": "0.0.0.0"` and `"api_key": "..."` to the config. A key is
   recommended, not required: without one the server starts and warns that anyone who can reach the port can use the model
   and its tools. `--no-api-key` (or `"api_key": "none"`) says it is on purpose. The server window prints this PC's addresses.
+  For IPv6 use `--host ::` (or `"host": "::"`, all IPv6 interfaces) and put the address in brackets in URLs, for example
+  `http://[2001:db8::7]:8080/v1`.
   On Windows allow the port in the firewall for private networks:
   `New-NetFirewallRule -DisplayName "Strata 8080" -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow -Profile Private`
   (admin PowerShell).
@@ -583,7 +598,10 @@ tables per token). The scaling is fixed for the whole run, because the KV cache 
 - **Browser pages (CORS):** off by default. `"cors_origins": ["https://chat.example.com"]` lets those origins call `/v1/*`;
   `["*"]` lets any page and is only sensible with an API key. It never opens `/settings`, `/unload` or the MCP tools. It
   belongs to the engine's own server; the desktop app answers browser pages on its own API address and already allows
-  pages of any site there.
+  pages of any site there. When you share with other devices or run a tunnel, the shared address answers them too, with an
+  API key: the key decides, not the site. The browser's preflight (`OPTIONS`) is answered without a key, since a browser never
+  sends one with it; the request that follows still needs the key. Without an API key the shared address sends no CORS
+  headers, so a page of another site cannot read your model through it - only devices on your network can.
 - **Host names (DNS rebinding):** without an API key the server answers only requests whose `Host` is `localhost`, an IP
   address, the address it listens on, or (when it listens beyond this PC) this PC's name and `host.docker.internal`. Others
   get **403** naming the setting. Add a name with `"allowed_hosts": ["strata.example.com"]` or
@@ -648,7 +666,7 @@ system prompt with a billing header that changes on every request; the server pi
 | Option | Effect |
 | --- | --- |
 | `--prompt-cache N` | Number of checkpoints (`0` = off, which also disables parking). |
-| `--prompt-cache-every N`, `--prompt-cache-root N`, `--turn-token ID` | Checkpoint interval, the system-prompt checkpoint (`0` = none) and the turn token. |
+| `--prompt-cache-every N`, `--prompt-cache-root N`, `--turn-token ID` | Checkpoint interval, the system-prompt checkpoint (`0` = none) and the turn token. The interval is not a piece-size setting: [what it does](PROMPT_CACHE_TAIL.md#prompt-cache-every-does-not-set-the-size-of-the-pieces-a-prompt-is-read-in). |
 | `--prompt-cache-spread` (opt-in) | The checkpoint that leaves is the one whose removal leaves the smallest gap, so the kept points thin out geometrically back from the end. An agent that rewrites its history a few thousand tokens back then resumes near the edit instead of at the system prompt. Same RAM. |
 | `"strata_checkpoint": false` (per request) | A one-shot request that no later request continues saves no checkpoints and keeps no session. |
 | `"strata_prefix": {"messages": 1}` (per request, opt-in) | One long document, many questions. Marks where the document ends: `{"messages": 1}`, `{"message": 0, "chars": 210000}` or `{"tokens": 12345}`. The checkpoint at the boundary is pinned, so 20 questions cost one read of the document. One pinned prefix at a time per engine; needs `--prompt-cache 3` or more; a malformed field is a 400. See [RESEARCH_RUNS.md](RESEARCH_RUNS.md). |
@@ -706,6 +724,56 @@ curl -X POST "http://127.0.0.1:8080/slots/0?action=restore" -H "Content-Type: ap
 - Not supported with `--layer-split`, `--peer-device`, `--batch` or `--prompt-cache 0`. The engine has been run on Linux and CUDA
   only for this feature. Exact token replay across restarts is not guaranteed: expert residency and CPU/GPU rounding can
   change later output.
+
+### The web page (Chat, Images, Monitor, About)
+
+Open the server's address in a browser. Everything in it runs from the server's own files: no CDN, no outside address. Chats,
+settings and the API key stay in the browser.
+
+**Chat settings** (the button next to the message box) holds the sampling and thinking settings and the switches below. Every
+switch below is **off by default**; with all of them off the page behaves as it did before.
+
+- **Render math.** Equations written as `\( ... \)`, `\[ ... \]`, `$x$` or `$$ ... $$` are drawn as formulas by KaTeX 0.19.0, which
+  ships in `serve/web/vendor/katex` (MIT; `PROVENANCE.json` there lists the package and a hash of every file). The text of a
+  message is never changed: copying, the Markdown export and the next request all carry what the model wrote. Code, prices
+  (`$5 and $10`) and a formula still being written stay text. A formula KaTeX cannot read stays as its source. A formula can only
+  draw: it cannot make a link, load a picture or run anything (`\href`, `\url`, `\includegraphics` and `\htmlClass` are shown as
+  their own names).
+- **Saved chats list.** Keeps every chat in a list on the left, with search over titles and text, rename, delete (with Undo) and
+  days as headings. The chats live in this browser's IndexedDB; a picture or file is kept by name only. Nothing goes to the server.
+  In a private window, or when the browser's storage is full, the list stays in memory and the page says so once. Turning it on
+  keeps the chat on the screen as the first one in the list; turning it off keeps that chat as the single chat.
+- **Edit and rewind messages.** Under each message: **Regenerate** (a new answer to the same question), **Edit answer** (correct its
+  text; the old thinking and tool calls go and no request is sent) and **Rewind to here**. Rewind asks what you want. On your
+  message, **Edit and send again here** hides it and the messages after it and puts it in the box; on an answer, **Continue from
+  here** hides the messages after it. **Branch from here** (needs the saved chats list) starts a new chat from the messages up to
+  that point and leaves this chat as it is; the branch keeps a name such as "Branch of ..." and links back to the original. An
+  **Undo** bar above the box brings back what was hidden, until your next question, another chat or a reload. A picture or file
+  that was only kept by name is not sent again: the page asks you to attach it again.
+- **When you send while it is answering.** *Wait* (the default): Send is off until the answer is done. *Send after*: your message
+  waits and goes when the answer is done. *Interrupt*: the answer stops where it is, what was written stays and is marked
+  interrupted, and your message goes at once; a tool that is running finishes first. Only one message waits, and **Take back**
+  returns it to the box. Stop keeps a waiting message for you to send yourself.
+
+An answer's ` ```svg ` or ` ```html ` block gets a **Preview** button. The code is drawn in a frame that is cut off from the page:
+an empty sandbox (no scripts, forms, popups or downloads, and no access to the page, its storage or the server), a policy inside
+the frame that allows no address at all, and a page header (`Content-Security-Policy: frame-src 'none'`) that keeps a link or a
+redirect in the model's HTML from loading a web page into it. An svg is shown as a picture. For an HTML page there is also a
+warning button, **Run scripts**: after you confirm, that one block runs with scripts, still with no way to the page and no network,
+until you close the preview. It can still use your CPU, and it is code the model wrote.
+
+**Load / Unload** in the header loads the model or frees the GPU (`POST /load`, `POST /unload`). It asks before unloading and is off
+while an answer is being written or an image is made.
+
+**Language.** About > Settings lists the page's languages: English (the default), German, Spanish, Japanese, Korean, Portuguese,
+Russian and Chinese. The Chat view, its settings and the header are translated; Monitor, Images and About are still English. A
+language is a file `serve/web/locales/<lang>.json`; the English text lives in the code next to its key, and
+`python tools/web_i18n.py` checks every file for the same keys and placeholders (`--write` rewrites `en.json`). `/?lang=de` shows a
+language for one visit.
+
+Tests: `serve/test_web_*.py` and `serve/test_web_*.js` (Node), and a browser run against a stand-in server with no model:
+`WEBTEST_MODULES=<folder with puppeteer-core> node tools/webtest/browser_test.mjs`. `tools/webtest/shots.mjs` takes the page's
+screenshots.
 
 ### API request monitor
 
@@ -799,8 +867,9 @@ after a change.
   needed for `npx` servers. An **address** (`url`, optional `headers`) uses MCP's Streamable HTTP transport (the older SSE-only
   transport is not supported). `"disabled": true` leaves an entry out.
 - Servers start with Strata. The server window says what each offers or why it did not start. The Monitor tab lists them, and
-  the Sampling drawer has **Use tools from MCP servers** (on by default). A server that stops later is started again at its next call.
-- In the chat each call shows as a small block. The model reads the result and goes on, up to `max_rounds` calls in a row. A tool
+  Chat settings has **Use tools from MCP servers** (on by default). A server that stops later is started again at its next call.
+- In the chat each call shows as a small block. The model reads the result and goes on, up to `max_rounds` rounds of calls (one round can hold several calls). At the limit
+  the model gets one final reply with no tools, using the results already found, so the answer is not cut off. A tool
   that fails or takes longer than `timeout_s` gives the model an `error: ...` result. Results longer than `max_result_chars` are
   cut with a note. Stop stops a running tool too.
 - Only the chat page uses them. API clients see the API exactly as before and keep their own tools. A request to
@@ -933,7 +1002,7 @@ them on your own card.
 | `STRATA_PREFILL_EQUAL=1` | CUDA | A prompt segment is read in chunks of equal size, not full chunks and a short last one. Changes rounding. | |
 | `STRATA_OWNED_PRICE=exact` | CUDA | The cache sizing prices the prompt path's own buffers by their real allocation. | |
 | `STRATA_IQ_MT_MIN=1`, `STRATA_IQ3S_MT1=1` | CPU | See [Draft layer](#draft-layer) (reproducible output; the second gives IQ3_S the multi-token kernel for one token on Alder Lake and later without AVX-512). | |
-| `STRATA_ROUTE_PRIOR`, `STRATA_ROUTE_RESIDENT`, `STRATA_ROUTE_RESIDENT_MTP` | CUDA | Routing changes that add speed and also add KL. | Not recommended. |
+| `STRATA_ROUTE_PRIOR`, `STRATA_ROUTE_RESIDENT`, `STRATA_ROUTE_RESIDENT_MTP` | CUDA | Routing changes that add speed and also add KL. | Not recommended, except that 0.2.7 turns `STRATA_ROUTE_PRIOR=1.5` on by itself on a discrete NVIDIA card of 13 GiB or less (the owner approved the quality trade for 12 GB cards; the first 0.2.7 candidates used 2.0, see the 12 GB default in the release notes for why it is 1.5); `STRATA_ROUTE_PRIOR=0` turns it off and an explicit value wins. It is never a default on a Radeon, an integrated GPU or a bigger card. |
 | `STRATA_HOST_CORE=last\|sibling` (or `--host-core`) | Windows | `last` puts the host thread on the last physical core, away from the core that gets the GPU's interrupts. `sibling` keeps it on the first core's other hardware thread, so the workers keep every core. The default `first` leaves a hybrid CPU as it is. | One layer-split box went from a ±6% swing to steady and 8% faster. |
 | `--pool-affinity measure` | Hybrid CPUs, native packs | Times the `all` and `p-cores` layouts at start (about a second) and takes the faster. The measurement is taken once; where the E-cores' speed changes while the engine runs, `--pool-affinity p-cores` is the steady choice. | |
 | `STRATA_KEEP_EMPTY_TURNS=1`, `STRATA_TOPK_STREAM=0` | | See [TROUBLESHOOTING.md](TROUBLESHOOTING.md). | |
@@ -953,7 +1022,8 @@ measured. "Exact" means the 10-prompt and 4K/20K identity gate with the switch o
 | `STRATA_B6_MMVQ_ROWS=1` | Exact multi-column MMVQ reusing the activation fragment across rows | Exact; on by default on sm_86 and sm_60 |
 | `STRATA_QSA_SPLIT_ATTN=1` | Decode attention split across blocks on the int8 mma path (sm_80+, int8 KV) | Rounding level |
 | `STRATA_HC_UPMIX=1` | Hyper-connection up projection and `gr_mix_r` in one kernel (sm_80+) | Exact |
-| `STRATA_PROMPT_ATTN_IMMA=1` | Int8-KV prompt attention on INT8 tensor cores | Rounding level |
+| `STRATA_PROMPT_ATTN_IMMA` | Int8-KV prompt attention on INT8 tensor cores | Rounding level. On by default since 0.2.7 on NVIDIA Ampere and newer (+1.1% to +1.8% prompt at 8K/16K on an RTX PRO 5000 and 2x RTX A4000); `=0` brings the 0.2.6 kernel back. |
+| `STRATA_GR_V3` | The hyper-connection read split over two kernels | Rounding level. On by default since 0.2.7 on a discrete compute capability 12.0 card (RTX 50, RTX PRO Blackwell) with more than 13 GiB (RTX PRO 5000: +1.2% decode with identical tokens); slower on sm_86, so off there. `=0` / `=1` forces it off / on. |
 | `STRATA_HC_REQ8=1` | Hyper-connection projections as int8 plus a scale per 32 (more expert-cache slots) | Rounding level |
 | `STRATA_QUANT_GATHER=1`, `STRATA_PREFILL_GROUP_GATHER=0` | Per-row gather for the MoE input quantization; the short-prompt grouped gather off | No gain measured; keep the defaults |
 
@@ -1096,7 +1166,7 @@ your own prompts. The Monitor marks every request ESP or stock.
 ```
 
 The engine log then says `control vector mode = project, dir = per-layer, layers 4..44 (41 steered)`. A loaded vector is on for
-every request unless it says otherwise: the Sampling drawer has a switch, and the API takes `"experimental_speed_projection": false`
+every request unless it says otherwise: Chat settings has a switch, and the API takes `"experimental_speed_projection": false`
 (config default: `"sampling": {"experimental_speed_projection": false}`). Switching drops the conversation cache once. Switched
 off, the output is token for token the stock model's.
 
@@ -1124,6 +1194,8 @@ On 12.0 cards (sm_120) these also apply:
 
 - The interleaved small-batch matvec (`native_mmvq_il`, [MMVQ_IL_TABLE.md](MMVQ_IL_TABLE.md)) runs 5 to 8 tokens, with a 12.0 table
   and, on cards with 80 or more SMs, its own 2-4 token table. `STRATA_MMVQ_IL_WIDE=0` and `STRATA_MMVQ_IL_120=0` turn them off.
+  RTX 40 cards (compute capability 8.9) have their own 2-4 token tables and a one-token Q3_K row, on by default in 0.2.7 and not yet measured
+  on an RTX 40 card by us (same output bit for bit): `STRATA_MMVQ_IL_89=0` or `STRATA_DEFAULTS=026` turns them off.
 - With 80 or more SMs the native packs' prompt experts run on the fused int8 kernels (`STRATA_PF_FUSED`) for IQ2_S, IQ3_XXS,
   IQ3_S and IQ4_XS gate/up. IQ2_XXS and IQ2_XS keep MMQ. Smaller 12.0 cards (an RTX 5070 with 48 SMs) keep MMQ because the fused
   kernels were 4.7% slower on 20K prompts there. `STRATA_PF_FUSED=0` keeps MMQ.
@@ -1133,7 +1205,7 @@ On 12.0 cards (sm_120) these also apply:
   prompt time and start-up time, which is why smaller PCs keep the SSD reads.
 
 A prompt chunk above 8192 (`--prefill auto:16384` or `auto:32768`) is not bit-exact on CUDA, so the default stays 8192 on
-NVIDIA. It is exact on gfx12, where 16384 is the default. `STRATA_ROUTE_PRIOR=0.5` stays opt-in because it raises KL.
+NVIDIA. It is exact on gfx12, where 16384 is the default. `STRATA_ROUTE_PRIOR` raises KL, so below 0.2.7 it was opt-in; 0.2.7 sets 1.5 by itself only on a discrete NVIDIA card of 13 GiB or less.
 
 ---
 
@@ -1208,6 +1280,9 @@ Strata itself: [MIT](../LICENSE). The model files are not part of it; their lice
   [HyperQwen](https://github.com/syv-ai/HyperQwen); references in the paper.
 - The web app's font: [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1, see `serve/web/fonts/OFL.txt`). Its
   Monitor tab started from @code-martin's dashboard idea (PR #22).
+  Math is drawn by [KaTeX](https://katex.org) (MIT, vendored in `serve/web/vendor/katex`). The chat page's wide-window layout, svg/html preview, math, Load/Unload, saved
+  chats, edit and rewind came from PRs #3176 (@mnott), #1628 (@thoives), #2972 and #2974 (@CC-David-CC), #3550 (@sakuumomo), #1787 (@Scotty-Hudson) and
+  #2615 (@uppet), and the rewind choice and sending while answering from issues #3823 and #4004 (@xvcezrqpbxtpzblrt).
 - The experimental speed projection's vector (`data/experimental-speed-projection/`): Qwen Community License 1.0, made from the model's
   activations (see its README).
 
@@ -1389,3 +1464,47 @@ mean KL from the stock model 0.063 nats (max 4.1), perplexity +15% on code, +2.3
   the original 2,682 in 46 s. Speed: 4K IQ2_XS 465 prompt / 78.7 output tokens/s against 467 / 78.3 for the original.
 - UD-Q4_K_XL on a 64 GB PC with a 12 GB RTX 5070: 7-8.5 tok/s, picks the same tokens as llama.cpp on the same file at 97.5-99% of the
   positions of short greedy answers and 90-91% after a 16K prompt ([UNSLOTH_Q4.md](UNSLOTH_Q4.md#quality-against-llamacpp-on-the-same-file)).
+
+## Conversation cache copies on a slow host link (CUDA, opt-in)
+
+Where the card sits behind a slow host link, the conversation cache's copies are on the critical path of the next request. A turn checkpoint copies the DeltaNet state (118 MB on Qwen3.8-Flash-Next) from the card to the host. Parking a conversation copies its K/V and its checkpoints before the next prompt can start. These switches move the copies card-to-card in VRAM or onto background threads. All are off unless you set them. On HIP, gfx906 and Metal `STRATA_CKPT_ASYNC`, `STRATA_CKPT_GATHER` and `STRATA_PARK_ASYNC` stay off, and so do the two slot switches that need them. The answers and the parked images are the same bytes.
+
+The times below were measured by the author of the change (linxuhao, PR #3779) on one CMP 170HX (GA100, sm_80) on a PCIe Gen2 x4 link. We have no sm_80 card and did not measure them. Some of their park figures were taken with other opt-in switches set.
+
+| Switch | What | Reporter's figure (CMP 170HX) |
+|---|---|---|
+| `STRATA_CKPT_ASYNC=1` | A turn checkpoint's state is copied card-to-card into a VRAM stage and moved to the host by a background thread. A reader waits only for the copy it needs. The stage is one buffer the size of the state, allocated at the first save; if the allocation fails the save copies as before. | checkpoint 104-105 -> 34-35 ms (fresh vectors), 71.4 -> 0.9 ms (reused vectors) |
+| `STRATA_CKPT_VRAM_SLOTS=N` (0-16, with `STRATA_CKPT_ASYNC=1`) | The last N saved states also stay in VRAM (N x 118 MB, only while 1.5 GB stay free). A restore from one copies card-to-card. | restore 114-126 -> 28-47 ms |
+| `STRATA_PARK_ASYNC=1` | A park copies the K/V card-to-card into a VRAM stage (only while 1.5 GB stay free) and moves it to the host in the background. The checkpoints the request drops move into the parked image instead of being copied. | park of a 3.3K / 13K-token conversation 212-217 / 329-334 -> 64-75 / 68 ms |
+| `STRATA_CKPT_POOL_READY=N` (1-16, with `STRATA_CKPT_POOL=1`) | The checkpoint pool keeps N ready checkpoints, sized at start and topped up in the background, so a save never faults in a fresh vector. It holds N x 118 MB of host memory from start-up. `STRATA_CKPT_POOL=1` alone is unchanged: it reuses dropped checkpoints and allocates nothing ahead of time. | with `STRATA_PARK_ASYNC=1` and `STRATA_CKPT_GATHER=1`: park 21.5-40.1 / 26.9 ms |
+| `STRATA_CKPT_GATHER=1` | A checkpoint's 37 small card-to-host copies are gathered into one buffer and fetched with one copy. Not tested with a layer split across cards. | (in the row above) |
+| `STRATA_PARK_VRAM_MIB=N` (with `STRATA_PARK_ASYNC=1`) | A park also keeps the K/V in VRAM slots (64 MiB granules, up to N MiB, only while 1.5 GB stay free). Switching back restores it card-to-card. | second and later restores of a run 33-51 -> 7-13 ms; the first is not faster |
+| `STRATA_PARK_TRACE=1` | Diagnostic: the park's joins and timers on stderr. | - |
+
+An independent user (bitaccesscomau, one RTX 3090 on PCIe 3.0 x16) tried the `STRATA_CKPT_ASYNC=1` commit on its own on 0.2.6: the checkpoint save went from 73.2 to 62.4 ms, the first token of a short prompt came about 13 ms of 350 ms sooner (median of 4 pairs), and the answers were byte-identical. On a fast link the gain is small.
+
+The serve loop's `strata trace:` lines (`STRATA_TRACE`) now end with `@<ms>`, a steady-clock timestamp.
+
+## CUDA opt-in decode switches measured on a CMP 170HX (sm_80; off unless you set them)
+
+The author of the change (linxuhao, PR #3779) measured these on one CMP 170HX (GA100, 70 SMs) with the Qwen3.8-Flash-Next IQ3_S native pack, `--spec 3`, decode after a prompt of about 3,000 words, a fresh engine per run, reference and switch runs interleaved. We have no sm_80 card and did not measure them. Both switches keep every output bit by construction (the greedy answers to 11 prompts were the same with the switch on and off, on their card). Neither does anything on HIP, gfx906 or Metal.
+
+| Switch | What | Answers | Reporter's figure (CMP 170HX) |
+|---|---|---|---|
+| `STRATA_GRAPH_PRIO=1` | The verify window graph's kernel nodes run at their capturing stream's priority (`cudaGraphInstantiateFlagUseNodePriority`): the GDN gates and the QSA indexer branch at the highest, the shared expert at the lowest. Nothing changes on a card whose priority range is 0..0. | bit-exact | decode +1.8 % with `STRATA_QIL=1` (both runs above every reference run) |
+| `STRATA_MMVQ_IL_PF=1` | Hoisted-load, exact-integer kernels for the interleaved small-batch matvec where the sm_80 table picks them (Q6_K only so far, [MMVQ_IL_TABLE.md](MMVQ_IL_TABLE.md)). On a card that is not sm_80 the value 1 does nothing. `=2` to `=6` force one variant everywhere (A/B only). | bit-exact | decode +1.4 % (two reference / on / reference / on sets) |
+
+Two sm_80 defaults come with the same change and are on without a switch, only on a compute capability 8.0 card: the wide dense dequant kernels (`STRATA_DEQUANT_WIDE=0` turns them off) and the sm_80 rows tables of the interleaved matvec (`STRATA_MMVQ_IL_SM80=0` turns them off). Both are bitwise. The reporter's figures: prompt GPU time of a 3,259-token prompt 857 -> 792 ms for the dequant, decode +2.7..+3.2 % for the tables.
+
+## CUDA opt-in prompt switches for sm_80 cards (off unless you set them)
+
+Also from PR #3779, measured by its author on the same CMP 170HX; none of the figures was measured here. `STRATA_PF_FUSED_NT=256` and `STRATA_PF_BATCH=N` keep every output bit. `STRATA_PF_FUSED_F16=1`, `STRATA_PF_FUSED_WS=1` and `STRATA_GDN_TC=1` change the output at rounding level: the author's teacher-forced KL against the bitwise base on 20 prompts is mean 0.0062 (F16 / WS) and 0.0157 (GDN_TC), top-1 agreement 100 %.
+
+| Switch | What | Reporter's figure (CMP 170HX) |
+|---|---|---|
+| `STRATA_PF_FUSED_NT=256` | The fused prompt-expert kernels with 256 threads and two blocks a multiprocessor (bitwise). Adds device code to every CUDA build. | one MoE layer of 3,256 tokens 8.27 ms |
+| `STRATA_PF_BATCH=N` | Up to N experts per launch (above 128 only with the 256-thread kernels; bitwise). | with NT=256: prompts +7.6 % (4K), +4.9 % (16K), +4.3 % (52K) |
+| `STRATA_PF_FUSED_F16=1` | f16 mma instead of the int8 products in the 256-thread kernels (rounding level). | 7.90 ms for the same layer |
+| `STRATA_PF_FUSED_WS=1` | Warp-specialized kernel with the same F16 products; needs about 101 KB of shared memory, so sm_80 and sm_90 only (it says "not available" elsewhere). | 7.65 ms for the same layer |
+| `STRATA_GDN_TC=1` | The DeltaNet recurrence of a prompt as a chunked scan on the tensor cores; needs 122 KB of shared memory a block (sm_80, sm_90). | recurrence 105 -> 34 ms at 3.3K tokens; prompts +3.9 % (4K), +6.0 % (16K), +6.7 % (52K) |
+| `STRATA_PLE_COMPACT=1`, `STRATA_PLE_COPY_STREAM=1`, `STRATA_EMBED_VRAM=1`, `STRATA_DEQUANT_SIDE=1` | The PLE rows go up raw and are dequantized on the card, on their own stream; the token-embedding table in VRAM; the dense dequant on a side stream (CUDA only). All bitwise. | prompts +2.2 % to +2.6 % for the four together |

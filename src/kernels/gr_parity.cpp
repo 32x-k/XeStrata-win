@@ -480,6 +480,12 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
 }  // namespace
 
 int main(int argc, char** argv) {
+    // this test compares the default kernels bit for bit; the split read (a default on a 12.0 card since 0.2.7) is STRATA_GR_V3=1 below
+#if defined(_WIN32)
+    if (std::getenv("STRATA_GR_V3") == nullptr) _putenv_s("STRATA_GR_V3", "0");
+#else
+    if (std::getenv("STRATA_GR_V3") == nullptr) setenv("STRATA_GR_V3", "0", 1);
+#endif
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--selftest") selftest = true;

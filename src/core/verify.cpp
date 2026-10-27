@@ -2,9 +2,11 @@
 #include "strata/core/batch_rows.hpp"
 #include "strata/core/sm75_series.hpp"
 #include "strata/core/sm120_series.hpp"
+#include "strata/core/defaults_026.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/window_evict.hpp"
+#include "strata/core/expert_nibble.hpp"
 #include "strata/core/pin_budget.hpp"
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
 #include "strata/core/host_graph_launch.hpp"
@@ -64,6 +66,7 @@
 #include <algorithm>
 #include <atomic>
 #include <map>
+#include <set>
 #include <mutex>
 #include <string>
 #include <optional>
@@ -167,6 +170,32 @@ inline bool g_qdedup() { static const bool on = [] { const char* v = std::getenv
 // fork F4 (Eddoursul): 2-4 token dense projections read an interleaved copy of the q8_1 activations (bitwise the same
 // outputs); STRATA_MMVQ_IL=0 keeps native_mmvq's multi-column kernels
 inline bool g_mmvq_il() { static const bool on = [] { const char* v = std::getenv("STRATA_MMVQ_IL"); return v == nullptr || v[0] != '0'; }(); return on; }
+// STRATA_SELECT_LONG=1 (opt-in): a window graph past select_long_at() cells takes the long-context QSA select
+// (qsa_block_topk_long's multi-CTA top-k through topk_scratch_, qsa_block_scores_long's shuffle-free decode scorer;
+// both compute capability 6.x by default, the same ids and score bits).  Each costs ~6 more kernels a call, which only
+// a longer context pays back (4x GP100: 0.5 ms a window more at 1K, even at 30K, 4.0-4.7 ms less at 300K), so the
+// verifier keeps a second set of window graphs for it.  Off: no scratch, no second graphs.
+inline bool select_long_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_SELECT_LONG");
+        if (v == nullptr || v[0] != '1') return false;
+        if (strata::kernels::qsa_topk_multi_scratch_ints(1) <= 0) {   // a build without the multi-CTA kernels: no second graphs
+            std::fprintf(stderr, "strata verify: STRATA_SELECT_LONG=1 needs the CUDA build with STRATA_EXPERIMENTAL_SM60; "
+                                 "ignored\n");
+            return false;
+        }
+        return true;
+    }();
+    return on;
+}
+// STRATA_SELECT_LONG_AT: the threshold in cells (default 65536; 0: always)
+inline int64_t select_long_at() {
+    static const int64_t at = [] {
+        const char* v = std::getenv("STRATA_SELECT_LONG_AT");
+        return v != nullptr && v[0] != 0 ? (int64_t) std::atoll(v) : (int64_t) 65536;
+    }();
+    return at;
+}
 // 143-amdk: STRATA_QFUSE_HC - only the hyper-connection read writes its consumer's q8_1 image (not the GDN recurrence): gfx12 default (=0 / 1 forces off / on)
 inline bool g_qfuse_hc() {
 #if defined(STRATA_USE_HIP)
@@ -183,6 +212,38 @@ inline bool g_qfuse_hc() {
     return false;
 #endif
 }
+// STRATA_GRAPH_PRIO=1 (opt-in): the window graph's kernel nodes keep their capturing stream's
+// priority (side_ high, sh_cs_ low).  Unset / 0: every node at the launch stream's priority, as before.
+[[maybe_unused]] inline bool graph_prio_on() {   // (every HIP caller is guarded off)
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
+    return false;
+#else
+    static const bool on = [] { const char* v = std::getenv("STRATA_GRAPH_PRIO"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+#endif
+}
+// STRATA_GRAPH_PRIO: the capture and graph queries by CUDA version (13 renamed the edge-data forms: the same split as
+// verify_kernels.cu's and the PDL edge check above).  Nothing is returned for the edge data.
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+inline cudaError_t prio_capture_deps(cudaStream_t s, cudaStreamCaptureStatus* st, const cudaGraphNode_t** deps, size_t* n) {
+#if CUDART_VERSION >= 13000
+    return cudaStreamGetCaptureInfo(s, st, nullptr, nullptr, deps, nullptr, n);
+#elif CUDART_VERSION >= 12030
+    return cudaStreamGetCaptureInfo_v3(s, st, nullptr, nullptr, deps, nullptr, n);
+#else
+    return cudaStreamGetCaptureInfo_v2(s, st, nullptr, nullptr, deps, n);
+#endif
+}
+inline cudaError_t prio_node_deps(cudaGraphNode_t node, cudaGraphNode_t* deps, size_t* n) {
+#if CUDART_VERSION >= 13000
+    return cudaGraphNodeGetDependencies(node, deps, nullptr, n);
+#elif CUDART_VERSION >= 12030
+    return cudaGraphNodeGetDependencies_v2(node, deps, nullptr, n);
+#else
+    return cudaGraphNodeGetDependencies(node, deps, n);
+#endif
+}
+#endif
 // fork 34a35db + b063c13 (Eddoursul), STRATA_SIDE_MIXER=1 / =2: the mixer's work that reads only the layer's input on
 // branches of the window's graph (bitwise the same outputs); 0 = in line, and no branch stream is created.  Unset: 2 on a
 // compute capability 12.0 card (sm120_series.hpp; STRATA_SM120_PERF=0 turns it off), 0 elsewhere.
@@ -203,6 +264,34 @@ inline int g_side_mixer() {
         per_dev[dev] = 1 + (ok && strata::sm120_default(maj, mnr) ? 2 : 0);
     }
     return per_dev[dev] - 1;
+#endif
+}
+// STRATA_ROUTE_PRIOR=lambda: residency-biased routing (the top-10 picked again with a logit bonus for the resident
+// experts; route_prior.cu).  Unset: 1.5 (strata::kRoutePriorSmallCard, sm120_series.hpp; it was 2.0 until the owner decision of
+// 2026-10-26: defects in the copy and code check at 2.0, none in 19 tasks at 1.5) on a DISCRETE NVIDIA card of 13 GiB or less
+// (CUDA builds only), 0 elsewhere.
+// Measured on an RTX 3060 12 GB only (IQ3_XXS, 5 interleaved pairs at 2.0: +37.6% / +35.2% decode; at 1.5 story +15%, code +37%); the owner approved the
+// quality trade for 12 GB cards (it changes which experts run).  Not a default in a HIP build (a 12 GB Radeon, or a
+// Strix Halo whose reported VRAM is a small carve-out of unified memory: unmeasured there) and not on an integrated GPU.
+// STRATA_ROUTE_PRIOR=0 turns it off, any other value wins everywhere.  The default is read from the device properties
+// (no allocation, no stream work), and Verifier::init asks once per card, so the first ask is never inside a graph capture.
+inline float g_route_prior() {
+    static const char* const env_s = std::getenv("STRATA_ROUTE_PRIOR");
+    static const float env = env_s ? (float) std::atof(env_s) : 0.0f;
+    if (env_s != nullptr) return env;
+#if defined(STRATA_USE_HIP) || defined(STRATA_GPU_METAL)
+    return 0.0f;
+#else
+    static float per_dev[64];   // 0 unknown, else prior + 1
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return 0.0f; }
+    if (per_dev[dev] == 0.0f) {
+        cudaDeviceProp p;
+        const bool ok = cudaGetDeviceProperties(&p, dev) == cudaSuccess;
+        if (!ok) cudaGetLastError();
+        per_dev[dev] = 1.0f + (ok ? strata::route_prior_default(false, p.integrated != 0, (double) p.totalGlobalMem, strata::qwen_defaults_026()) : 0.0f);
+    }
+    return per_dev[dev] - 1.0f;
 #endif
 }
 inline bool g_qfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_QFUSE"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
@@ -260,7 +349,9 @@ bool batch_self_commits(const int* rows, int S) { return g_batch_self_commit && 
 // profiler turns the fork off to time the stages, so a profiled run never showed that.  #816 reports the same fall on a
 // gfx1030 (RX 6800, Windows, 42.5 -> 56.4 t/s).  STRATA_SH_STREAM overrides either default: `=1` forks, `=0` does not.
 // Strix Halo (gfx1151, unified memory) is the exception: the fork pays there (+1.8% UD-IQ4_XS, +6.7% UD-Q4_K_XL decode
-// at 8K, ids identical), so the gfx1151 arch table sets STRATA_SH_STREAM=1.  Read on first use, after that table ran.
+// at 8K, ids identical), so the gfx1151 arch table sets STRATA_SH_STREAM=1 on Linux.  On Windows gfx1151 the fork is slower (0.2.7,
+// Qwen IQ3_S: decode -6.4% with it, ids identical), so there the table leaves it out and this default (off on HIP) applies.
+// Read on first use, after that table ran.
 bool sh_stream_on() {
     static const bool on = [] {
         if (const char* v = std::getenv("STRATA_SH_STREAM")) return v[0] != '0';
@@ -618,10 +709,12 @@ Verifier::~Verifier() {
     }
     if (cs_) cudaStreamSynchronize(cs_);
     if (sh_cs_) cudaStreamSynchronize(sh_cs_);
-    for (auto& e : exec_)
-        if (e) cudaGraphExecDestroy(e);
-    for (auto& e : exec_nr_)
-        if (e) cudaGraphExecDestroy(e);
+    for (auto& row : exec_)
+        for (auto& e : row)
+            if (e) cudaGraphExecDestroy(e);
+    for (auto& row : exec_nr_)
+        for (auto& e : row)
+            if (e) cudaGraphExecDestroy(e);
     if (commit_exec_) cudaGraphExecDestroy(commit_exec_);
     for (auto& kv : exec_bm_)
         if (kv.second) cudaGraphExecDestroy(kv.second);
@@ -704,6 +797,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     release_gpu_fn().store(&release_live_verifiers);
     cudaGetDevice(&device_);   // a layer split's stage on another GPU: its streams, graphs and buffers live there
     rr_stats_ = route_resident_cfg().stats_on(device_);   // STRATA_ROUTE_RESIDENT: this GPU's counters, outside graph capture
+    {   // once per card, here: record_window (graph capture) only reads the cached value
+        const float rp = g_route_prior();
+        if (rp > 0.0f && std::getenv("STRATA_ROUTE_PRIOR") == nullptr)
+            std::fprintf(stderr, "strata verify: residency-biased routing is on by default on this card (STRATA_ROUTE_PRIOR=%.1f: a card of 13 GiB "
+                                 "or less; it changes which experts run; STRATA_ROUTE_PRIOR=0 turns it off)\n", (double) rp);
+    }
     strata::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
     strata::kernels::fused_gr_persist_init();   // opt-in STRATA_HC_PERSIST=1 (HIP)
     wt_ = &wt;
@@ -879,6 +978,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         kcur_ = b.take<float>(T * NKV * HD); vcur_ = b.take<float>(T * NKV * HD);
         idx_raw_L_ = b.take<float>(nQ * T * ID); qidx_ = b.take<float>(T * IQ * ID);
         scores_ = b.take<float>(T * (uint64_t) max_blocks_); sel_ = b.take<int32_t>(T * (uint64_t) cap_);
+        if (select_long_on() && strata::kernels::qsa_topk_multi_scratch_ints(T) > 0)   // STRATA_SELECT_LONG only
+            topk_scratch_ = b.take<int32_t>((uint64_t) strata::kernels::qsa_topk_multi_scratch_ints(T));
         attn_ = b.take<float>(T * NH * HD); attn32_ = b.take<float>(T * NH * HD);
         attn_scratch_ = b.take<float>(T * (uint64_t) attn_scratch_floats_);
         tail_snap_ = b.take<float>(nQ * TS);
@@ -966,9 +1067,24 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     sink_.staging = (unsigned long long) staging_;
     sink_.staging_cap = kStagingBlobs;
     (void) TS;
+    // STRATA_GRAPH_PRIO=1 (opt-in): the window's streams carry priorities that their captured kernel
+    // nodes keep (the window graph is instantiated with cudaGraphInstantiateFlagUseNodePriority): the GDN gates / QSA
+    // indexer branch (side_) at the device's highest, cs_ and side2_ in the middle, the shared expert (sh_cs_) at the
+    // lowest (= the default).  The indexer chain's 1-block kernels are then dispatched ahead of the q GEMV's queued
+    // blocks, and the shared expert behind the experts.  Unset: every stream at the default priority, as before.
+    int gp_lo = 0, gp_hi = 0;
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+    const bool gprio = graph_prio_on() && cudaDeviceGetStreamPriorityRange(&gp_lo, &gp_hi) == cudaSuccess && gp_lo != gp_hi;
+    if (graph_prio_on() && !gprio) (void) cudaGetLastError();   // (only a failed range query's error: unset clears nothing)
+#else
+    const bool gprio = false;   // (HIP: the default priority, as make_stream's below)
+#endif
+    const int gp_mid = gprio ? (gp_lo + gp_hi) / 2 : 0;
+    if (gprio) std::fprintf(stderr, "strata verify: STRATA_GRAPH_PRIO: stream priorities side %d, cs / side2 %d, shared expert %d\n",
+                            gp_hi, gp_mid, gp_lo);
     // STRATA_PIPED_CONCURRENT=1 (opt-in): a prompt can run on the same GPU while the batch windows run, so the windows'
     // streams get the device's highest priority (HIP: the default priority, as the drafter's)
-    auto make_stream = [](cudaStream_t* s) -> cudaError_t {
+    auto make_stream = [&](cudaStream_t* s, int gp = 0) -> cudaError_t {
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
         static const bool hi = [] {   // (STRATA_PIPED_CONCURRENT_PRIO=0: the default priority)
             const char* v = std::getenv("STRATA_PIPED_CONCURRENT");
@@ -982,6 +1098,12 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
                 return cudaSuccess;
             cudaGetLastError();   // (only the failed priority call's error: the default path clears nothing)
         }
+        if (gprio) {   // STRATA_GRAPH_PRIO: this stream's own priority (gp)
+            if (cudaStreamCreateWithPriority(s, cudaStreamNonBlocking, gp) == cudaSuccess) return cudaSuccess;
+            cudaGetLastError();
+        }
+#else
+        (void) gp;
 #endif
         return cudaStreamCreateWithFlags(s, cudaStreamNonBlocking);
     };
@@ -1003,8 +1125,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         return false;
     }
     if (ext_stream_ != nullptr) cs_ = ext_stream_;   // set_stream (pipelined windows): the stage's shared stream
-    else if (make_stream(&cs_) != cudaSuccess) cs_ = nullptr;
-    if (cs_ == nullptr || make_stream(&sh_cs_) != cudaSuccess) {
+    else if (make_stream(&cs_, gp_mid) != cudaSuccess) cs_ = nullptr;
+    if (cs_ == nullptr || make_stream(&sh_cs_, gp_lo) != cudaSuccess) {
         err = "verify: stream create failed";
         return false;
     }
@@ -1050,10 +1172,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         }
     }
     if (g_side_mixer() > 0 &&
-        (cudaStreamCreateWithFlags(&side_, cudaStreamNonBlocking) != cudaSuccess ||
+        ((gprio ? make_stream(&side_, gp_hi) : cudaStreamCreateWithFlags(&side_, cudaStreamNonBlocking)) != cudaSuccess ||
         cudaEventCreateWithFlags(&mfork_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&mjoin_, cudaEventDisableTiming) != cudaSuccess ||
-        cudaStreamCreateWithFlags(&side2_, cudaStreamNonBlocking) != cudaSuccess ||
+        (gprio ? make_stream(&side2_, gp_mid) : cudaStreamCreateWithFlags(&side2_, cudaStreamNonBlocking)) != cudaSuccess ||
         cudaEventCreateWithFlags(&pfork_, cudaEventDisableTiming) != cudaSuccess ||
         cudaEventCreateWithFlags(&pjoin_, cudaEventDisableTiming) != cudaSuccess)) {
         err = "verify: the mixer branch's stream / events could not be created";
@@ -1129,6 +1251,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const bool side_mixer = side_mixer_mode >= 1;
     const bool side_proj = side_mixer_mode >= 2 && !batch_rec_;   // fork b063c13: the GDN gate projection, the QSA queries
     auto branch = [&](cudaEvent_t e, cudaStream_t from, cudaStream_t to, const char* what) {
+        if (to == side_) note_prio_fork(from);   // STRATA_GRAPH_PRIO: where the high-priority branch leaves cs
         if (cudaEventRecord(e, from) == cudaSuccess && cudaStreamWaitEvent(to, e, 0) == cudaSuccess) return true;
         err = std::string("verify: the mixer branch could not ") + what;
         return false;
@@ -1432,6 +1555,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     gdn_ab_multi(xm, (const uint16_t*) wa->data, (const uint16_t*) wb->data, (const float*) wdt->data,
                                  (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N,
                                  (int) HV, n, side_);
+                    note_prio_tail(side_, 1);
                     if (cudaEventRecord(mjoin_, side_) != cudaSuccess) { err = "verify: the GDN gates' branch could not join"; return false; }
                 }
                 if (!q8_attn) quant_in(xm, (int) N);
@@ -1663,6 +1787,13 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         }
                 };
                 auto idx_select = [&](cudaStream_t ns) {
+                    if (sel_long_) {   // STRATA_SELECT_LONG: the long-context window graphs (the same ids)
+                        qsa_block_scores_long(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n,
+                                              max_blocks_, s, scores_ + (size_t) tb * max_blocks_, ns, -1);
+                        qsa_block_topk_long(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_,
+                                            cap_, s, sel_ + (size_t) tb * cap_, ns, -1, topk_scratch_);
+                        return;
+                    }
                     qsa_block_scores(st.idx_pooled, st.idx_dead, qidx_ + tb * IQ * ID, step_ + tb * kStepCount, n, max_blocks_,
                                      s, scores_ + (size_t) tb * max_blocks_, ns);
                     qsa_block_topk(scores_ + (size_t) tb * max_blocks_, step_ + tb * kStepCount, n, max_blocks_, cap_, s,
@@ -1715,6 +1846,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     idx_append(side_);
                     idx_query(side_);
                     idx_select(side_);
+                    note_prio_tail(side_, 1);
                     if (cudaEventRecord(mjoin_, side_) != cudaSuccess) { err = "verify: the indexer's branch could not join"; return false; }
                 }
                 if (side_proj) {   // the queries beside the keys and values (fork b063c13)
@@ -1931,6 +2063,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const bool sh_fork_late = sh_fork && sh_fork_late_env && !ar_on();
         cudaStream_t sh_stream = sh_fork ? sh_cs_ : cs;
         if (sh_fork && !sh_fork_late) {
+            note_prio_fork(cs);
             cudaEventRecord(ev_fork_, cs);
             cudaStreamWaitEvent(sh_cs_, ev_fork_, 0);
         }
@@ -1967,9 +2100,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
         }
-        // STRATA_ROUTE_PRIOR=lambda (opt-in, changes the output): the top-10 picked again with a logit bonus for the
-        // resident experts; the weights stay the router's (route_prior.cu)
-        static const float route_prior = [] { const char* v = std::getenv("STRATA_ROUTE_PRIOR"); return v ? (float) std::atof(v) : 0.0f; }();
+        // STRATA_ROUTE_PRIOR=lambda (changes the output): the top-10 picked again with a logit bonus for the resident
+        // experts; the weights stay the router's (route_prior.cu).  The default is g_route_prior() above: 1.5 on a
+        // discrete CUDA card of 13 GiB or less, off elsewhere (measured on an RTX 3060 12 GB at 2.0: story +37.6%, code +35.2%;
+        // on an RTX PRO 5000 72 GB -1.9% / -0.5%, on 2x RTX A4000 -4.2% / +11.0%, hence not a default on bigger cards).
+        const float route_prior = g_route_prior();
         if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr)
             route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
         if (route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
@@ -2009,6 +2144,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                      m_x_ + tb * N, m_ids_ + tb * K, m_seq_, cs);
             }
             if (sh_fork_late) {
+                note_prio_fork(cs);
                 cudaEventRecord(ev_fork_, cs);
                 cudaStreamWaitEvent(sh_cs_, ev_fork_, 0);
             }
@@ -2046,7 +2182,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 err = std::string("verify shared expert: ") + e.what();
                 return false;
             }
-            if (sh_fork) cudaEventRecord(ev_join_, sh_cs_);
+            if (sh_fork) {
+                note_prio_tail(sh_cs_, -1);
+                cudaEventRecord(ev_join_, sh_cs_);
+            }
         }
         if (strata::kernels::cpu::expert_layout().native) {
             // APR: Hadamard-folded gate/up take H (s * x); xm itself stays as it is (the shared expert above and the
@@ -2091,11 +2230,21 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         // plan v0.3 P6: the VRAM groups now; the PCIe groups once the copy engine has landed them in staging.
         // `gy`: the native launch's groups side by side (0: cap, one block row per possible group).
-        auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn, int64_t gy, float* dst_buf) {
+        // `vram`: the groups point into this GPU's expert slots - a layer STRATA_EXPERT_NIBBLE converted holds its
+        // gate/up there as 4-bit codes (expert_nibble.hpp); the PCIe share's blobs (host memory, staging) never do.
+        auto grouped = [&](const unsigned long long* gp, const int32_t* gs, const int32_t* gn, int64_t gy, float* dst_buf,
+                           bool vram) {
             if (lay.native) {
                 // the layer's GGUF formats (i-quant gate/up, Q2_0 / IQ4_NL down)
                 const auto& f = lay.fmt[(size_t) l];
+#if STRATA_EXPERT_NIBBLE_BUILT
+                NativeExpertLayout L = vram && strata::core::nibble::layer(l).on
+                                           ? native_expert_layout_nib(f.gu_type, f.d_type, f.n_embd, f.n_ff)
+                                           : native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+#else
+                (void) vram;
                 NativeExpertLayout L = native_expert_layout(f.gu_type, f.d_type, f.n_embd, f.n_ff);
+#endif
                 if (f.had_d) { L.had_block = f.had_block; L.d_signs = had_sh_; }   // APR: h is rotated in there
                 native_expert_grouped(L, gp, gs, gn, p_dst, p_tok, cap, cap,
                                       nat_xq_ + (size_t) tb * (N / 32) * 36, hit_scratch_, dst_buf, cs, gy);
@@ -2107,7 +2256,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         bool hits_in_combine = false;
         if (ar_on()) {
             stamp(l, 19, grp);
-            grouped(p_ptr, p_start, p_counts, 0, parts_out);
+            grouped(p_ptr, p_start, p_counts, 0, parts_out, true);
             stamp(l, 20, grp);
         } else {
             if (device_plan_) {   // E-6: skipped when the device planned this group (all its experts resident)
@@ -2125,7 +2274,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
             }
             stamp(l, 19, grp);
-            grouped(p_ptr, p_start, p_counts, 0, hit_out);
+            grouped(p_ptr, p_start, p_counts, 0, hit_out, true);
             stamp(l, 20, grp);
             if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
             else if (m_bal_ != nullptr)   // set_pcie_balance: the PCIe part starts
@@ -2140,7 +2289,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             stamp(l, 21, grp);
             // the PCIe share is pcie_frac of the misses: a few groups when the cache is cold, usually none (always none at
             // pcie_frac 0), so its launch is kPcieGroupRows block rows striding over the groups, not cap of them
-            grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out);
+            grouped(p_ptr2, p_start2, p_counts + 2, kPcieGroupRows, hit_out, false);
             stamp(l, 22, grp);
             if (device_plan_) {   // no CPU share when the device planned the group: its rows are zeros
                 wait_flag_ge_or(m_flag_, ring, skip_ + grp, cs);
@@ -2453,7 +2602,7 @@ void Verifier::refresh_ar() {
 }
 
 bool Verifier::capture(int T, std::string& err) {
-    cudaGraphExec_t& exec_t = ar_off_ ? exec_nr_[T] : exec_[T];
+    cudaGraphExec_t& exec_t = ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T];
     if (exec_t != nullptr) return true;
     {   // said before the capture: a process that exits inside it (#1275: Windows, 313 MiB free) leaves this line as the trace
         size_t free_b = 0, total_b = 0;
@@ -2466,6 +2615,10 @@ bool Verifier::capture(int T, std::string& err) {
         err = "verify: begin capture failed";
         return false;
     }
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+    prio_forks_.clear();
+    prio_tails_.clear();
+#endif
     std::string rerr;
     const bool ok = record_window(T, cs_, rerr);
     cudaGraph_t graph = nullptr;
@@ -2576,7 +2729,14 @@ bool Verifier::capture(int T, std::string& err) {
 #endif
     }
 #endif
-    const bool made = instantiate_evicting(exec_t, graph, {}, "verify: instantiate: ", err, T);
+    unsigned long long iflags = 0;
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+    if (graph_prio_on()) {   // STRATA_GRAPH_PRIO: the nodes run at their own (captured or repaired) priorities
+        apply_node_priorities(graph, T);
+        iflags = cudaGraphInstantiateFlagUseNodePriority;
+    }
+#endif
+    const bool made = instantiate_evicting(exec_t, graph, {}, "verify: instantiate: ", err, T, iflags);
     cudaGraphDestroy(graph);
     if (!made) return false;
     const cudaError_t ue = cudaGraphUpload(exec_t, cs_);
@@ -2858,7 +3018,8 @@ bool Verifier::chain_overlap() const {
 bool Verifier::prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string& err) {
     const OnDevice on_device(device_);
     prelaunched_ = 0;
-    cudaGraphExec_t exec_t = ar_off_ ? exec_nr_[T] : exec_[T];   // #871: the variant the previous stage refreshed
+    sel_long_ = select_long_on() && pos0 + T >= select_long_at() ? 1 : 0;   // the variant the previous stage captured
+    cudaGraphExec_t exec_t = ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T];   // #871: the variant the previous stage refreshed
     if (T < 1 || T > max_t_ || exec_t == nullptr) { err = "verify: prelaunch before the window was captured"; return false; }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
     if (pos0 + T > ss_->qsa_states[ss_->qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
@@ -2902,11 +3063,14 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     prelaunched_ = 0;
     if (!pre && pre_launch_ && !pre_launch_(cs_, err)) return false;   // (a prelaunched window's was served with the first stage's)
     if (!pre) refresh_ar();
+    // STRATA_SELECT_LONG: the select kernels this window's context pays off with (the same on every stage)
+    sel_long_ = select_long_on() && pos0 + T >= select_long_at() ? 1 : 0;
     if (!capture(T, err) || !capture_commit(err)) return false;
     const bool chain = chain_overlap();
     if (chain) {   // capture the next stage's window here, on this thread, so the helper only stages and launches
         const OnDevice on_next(next_->device_);
         next_->refresh_ar();                     // #871: the variant its prelaunch and its run() will both use
+        next_->sel_long_ = sel_long_;
         if (!next_->capture(T, err) || !next_->capture_commit(err)) return false;
     }
     VDBG("captured; staging\n");
@@ -2929,7 +3093,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
 #endif
     const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;   // #267 test hook (off: false)
     bool flag_raised = false;   // the PLE flag went up before the launch (early_ple_flag_mode)
-    bool& graph_launched = ar_off_ ? launched_nr_[T] : launched_[T];
+    bool& graph_launched = ar_off_ ? launched_nr_[sel_long_][T] : launched_[sel_long_][T];
     if (!pre && ar_on() && !test_stall && (early_ple_flag_mode() == 1 || (early_ple_flag_mode() == 2 && !graph_launched))) {
         if (do_ple) {
             const Clock::time_point tp = Clock::now();
@@ -2958,11 +3122,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             const char* value = std::getenv("STRATA_VERIFY_ASYNC_LAUNCH");
             return value != nullptr && value[0] == '1';
         }();
-        launch_o.emplace(ar_off_ ? exec_nr_[T] : exec_[T], cs_, device_, threaded_launch,
+        launch_o.emplace(ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T], cs_, device_, threaded_launch,
                          [this] { (void) release_gpu_waits(5000); });
         const cudaError_t le = launch_o->status();
 #else
-        const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
+        const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[sel_long_][T] : exec_[sel_long_][T], cs_);
 #endif
         trace_ev("LAUNCHED", -1, -1, (int64_t) le);
         graph_launched = true;
@@ -3550,6 +3714,7 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
     row_base_ = hbase;
     for (int t = 0; t < S; ++t) brow_[t] = rows[t];
     std::string rerr;
+    sel_long_ = 0;   // batch rows: the one-CTA select
     const bool ok = record_window(S, cs_, rerr);
     batch_rec_ = false;
     row_base_ = 0;
@@ -3718,34 +3883,130 @@ bool Verifier::evict_window_graph(int keep_t, bool& evicted, std::string& err) {
     evicted = false;
     if (no_window_eviction_ || keep_t < 1) return true;
     bool have[9] = {};
-    for (int t = 1; t <= max_t_ && t < 9; ++t) have[t] = (ar_off_ ? exec_nr_[t] : exec_[t]) != nullptr;
+    for (int t = 1; t <= max_t_ && t < 9; ++t) have[t] = (ar_off_ ? exec_nr_[sel_long_][t] : exec_[sel_long_][t]) != nullptr;
     const int victim = strata::core::pick_window_victim(have, std::min(max_t_, 8), keep_t, prelaunched_);
     if (victim == 0) return true;
     if (cudaStreamSynchronize(cs_) != cudaSuccess) {
         err = "verify: synchronizing before window graph eviction failed";
         return false;
     }
-    cudaGraphExec_t& e = ar_off_ ? exec_nr_[victim] : exec_[victim];
+    cudaGraphExec_t& e = ar_off_ ? exec_nr_[sel_long_][victim] : exec_[sel_long_][victim];
     cudaGraphExecDestroy(e);
     e = nullptr;
-    (ar_off_ ? launched_nr_ : launched_)[victim] = false;   // the next graph of that size is a cold first launch again
+    (ar_off_ ? launched_nr_ : launched_)[sel_long_][victim] = false;   // the next graph of that size is a cold first launch again
     evicted = true;
     return true;
 }
 
+// STRATA_GRAPH_PRIO: the capture-time notes.  A fork note keeps cs's current tail (the node the branch's first kernel
+// will depend on); a tail note keeps a priority stream's current tail and the priority its nodes should run at
+// (1 = the device's highest, -1 = its lowest).  No-ops with the switch off, outside a capture, and on HIP / Metal.
+void Verifier::note_prio_fork(cudaStream_t from) {
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+    if (!graph_prio_on()) return;
+    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+    const cudaGraphNode_t* deps = nullptr;
+    size_t nd = 0;
+    if (prio_capture_deps(from, &st, &deps, &nd) != cudaSuccess || st != cudaStreamCaptureStatusActive) {
+        (void) cudaGetLastError();
+        return;
+    }
+    for (size_t i = 0; i < nd; ++i) prio_forks_.push_back(deps[i]);
+#else
+    (void) from;
+#endif
+}
+
+void Verifier::note_prio_tail(cudaStream_t on, int prio) {
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+    if (!graph_prio_on()) return;
+    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+    const cudaGraphNode_t* deps = nullptr;
+    size_t nd = 0;
+    if (prio_capture_deps(on, &st, &deps, &nd) != cudaSuccess || st != cudaStreamCaptureStatusActive) {
+        (void) cudaGetLastError();
+        return;
+    }
+    for (size_t i = 0; i < nd; ++i) prio_tails_.push_back({deps[i], prio});
+#else
+    (void) on; (void) prio;
+#endif
+}
+
+// STRATA_GRAPH_PRIO: what priorities the captured kernel nodes carry (a histogram, logged once per window graph).  If the
+// capture copied none from the streams (design 1's R1: some drivers read back 0 everywhere), each priority stream's
+// nodes are found by walking its noted tails back to the noted forks and the attribute is set per node.
+void Verifier::apply_node_priorities(cudaGraph_t graph, int T) {
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906) && !defined(STRATA_GPU_METAL)
+    int lo = 0, hi = 0;
+    if (cudaDeviceGetStreamPriorityRange(&lo, &hi) != cudaSuccess) { (void) cudaGetLastError(); return; }
+    auto histogram = [&](std::map<int, int>& h) {
+        size_t nn = 0;
+        cudaGraphGetNodes(graph, nullptr, &nn);
+        std::vector<cudaGraphNode_t> nodes(nn);
+        cudaGraphGetNodes(graph, nodes.data(), &nn);
+        h.clear();
+        for (cudaGraphNode_t nd : nodes) {
+            cudaGraphNodeType ty;
+            if (cudaGraphNodeGetType(nd, &ty) != cudaSuccess || ty != cudaGraphNodeTypeKernel) continue;
+            cudaKernelNodeAttrValue v{};
+            if (cudaGraphKernelNodeGetAttribute(nd, cudaKernelNodeAttributePriority, &v) == cudaSuccess) ++h[v.priority];
+            else { (void) cudaGetLastError(); ++h[999]; }
+        }
+    };
+    std::map<int, int> h;
+    histogram(h);
+    bool captured = false;
+    for (auto& [p, c] : h) captured = captured || (p != 0 && p != 999 && c > 0);
+    int repaired = 0, walked_forks = (int) prio_forks_.size(), walked_tails = (int) prio_tails_.size();
+    if (!captured && !prio_tails_.empty()) {   // the fallback: per node from the capture-time notes
+        std::set<cudaGraphNode_t> stop(prio_forks_.begin(), prio_forks_.end()), seen;
+        for (auto& [tail, pr] : prio_tails_) {
+            std::vector<cudaGraphNode_t> stack{tail};
+            while (!stack.empty()) {
+                cudaGraphNode_t nd = stack.back();
+                stack.pop_back();
+                if (stop.count(nd) || !seen.insert(nd).second) continue;
+                cudaGraphNodeType ty;
+                if (cudaGraphNodeGetType(nd, &ty) == cudaSuccess && ty == cudaGraphNodeTypeKernel) {
+                    cudaKernelNodeAttrValue v{};
+                    v.priority = pr > 0 ? hi : lo;
+                    if (cudaGraphKernelNodeSetAttribute(nd, cudaKernelNodeAttributePriority, &v) == cudaSuccess) ++repaired;
+                    else (void) cudaGetLastError();
+                }
+                size_t nd_n = 0;
+                prio_node_deps(nd, nullptr, &nd_n);
+                std::vector<cudaGraphNode_t> deps(nd_n);
+                if (nd_n > 0 && prio_node_deps(nd, deps.data(), &nd_n) == cudaSuccess)
+                    for (size_t i = 0; i < nd_n; ++i) stack.push_back(deps[i]);
+                else (void) cudaGetLastError();
+            }
+        }
+        histogram(h);
+    }
+    std::string s;
+    for (auto& [p, c] : h) s += " " + std::to_string(c) + " x prio " + (p == 999 ? std::string("?") : std::to_string(p)) + ";";
+    std::fprintf(stderr, "strata verify: the %d-token window's kernel node priorities (range %d..%d):%s %s (%d forks, %d tails noted%s)\n",
+                 T, lo, hi, s.c_str(), captured ? "captured from the streams" : "NOT captured from the streams",
+                 walked_forks, walked_tails, repaired > 0 ? (", " + std::to_string(repaired) + " nodes set from the notes").c_str() : "");
+#else
+    (void) graph; (void) T;
+#endif
+}
+
 bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, const std::vector<int>& key,
-                                   const char* what, std::string& err, int keep_t) {
+                                   const char* what, std::string& err, int keep_t, unsigned long long flags) {
     // #997: every layout of active slots keeps its own graph pair (20-30 MiB each on an L40S), and with an expert cache
     // sized to the reserve the next window graph - a batch layout or a one-request window captured on first use - can
     // find no VRAM left: free the least recently used layouts until it fits (they are captured again when needed)
-    cudaError_t ie = cudaGraphInstantiate(&ex, graph, 0);
+    cudaError_t ie = cudaGraphInstantiate(&ex, graph, flags);
     int freed = 0;
     for (bool evicted = true; ie == cudaErrorMemoryAllocation && evicted;) {
         (void) cudaGetLastError();
         if (!evict_batch_graph(key, evicted, err)) return false;
         if (evicted) {
             ++freed;
-            ie = cudaGraphInstantiate(&ex, graph, 0);
+            ie = cudaGraphInstantiate(&ex, graph, flags);
         }
     }
     if (freed > 0)
@@ -3758,7 +4019,7 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
         if (!evict_window_graph(keep_t, evicted, err)) return false;
         if (evicted) {
             ++freed_sizes;
-            ie = cudaGraphInstantiate(&ex, graph, 0);
+            ie = cudaGraphInstantiate(&ex, graph, flags);
         }
     }
     if (freed_sizes > 0)
@@ -4261,8 +4522,14 @@ bool Verifier::capture_all(std::string& err) {
         explicit NoEvict(bool& flag) : f(flag) { f = true; }
         ~NoEvict() { f = false; }
     } no_evict(no_window_eviction_);
-    for (int T = 1; T <= max_t_; ++T)
-        if (!capture(T, err)) return false;
+    // STRATA_SELECT_LONG: both select variants (see select_long_at): pl_launch takes the one its window's context
+    // needs, and nothing can be captured once pipelined windows are in flight.  Without it only [0]
+    for (int sl = 0; sl < (select_long_on() ? 2 : 1); ++sl) {
+        sel_long_ = sl;
+        for (int T = 1; T <= max_t_; ++T)
+            if (!capture(T, err)) return false;
+    }
+    sel_long_ = 0;
     if (!capture_commit(err)) return false;
     if ((ev_done_ == nullptr && cudaEventCreateWithFlags(&ev_done_, cudaEventDisableTiming) != cudaSuccess) ||
         (ev_commit_ == nullptr && cudaEventCreateWithFlags(&ev_commit_, cudaEventDisableTiming) != cudaSuccess)) {
@@ -4317,7 +4584,8 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     if (T < 1 || T > max_t_) { err = "verify: window size out of range"; return false; }
     SessionState& ss = *ss_;
     if (pos0 + T > ss.qsa_states[ss.qsa_primary()].max_cells) { err = "verify: the window runs past the context"; return false; }
-    if (exec_[T] == nullptr || commit_exec_ == nullptr || ev_done_ == nullptr || pl_ple_rows_.empty()) {
+    const int sl = select_long_on() && pos0 + T >= select_long_at() ? 1 : 0;   // the variant this window's context pays off with
+    if (exec_[sl][T] == nullptr || commit_exec_ == nullptr || ev_done_ == nullptr || pl_ple_rows_.empty()) {
         err = "verify: pipelined window not prepared (capture_all)";
         return false;
     }
@@ -4339,7 +4607,7 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     std::atomic_thread_fence(std::memory_order_seq_cst);
     trace_ev("WINDOW (pipelined)", -1, -1, pos0 * 16 + T);
     ms_host += ms_since(t0);
-    const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
+    const cudaError_t le = cudaGraphLaunch(exec_[sl][T], cs_);
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
     if (fl_prof_) cudaMemcpyAsync(prof_pin_, prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost, cs_);
