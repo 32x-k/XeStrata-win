@@ -94,6 +94,12 @@ inline bool ple_compact_on() {
     static const bool on = [] { const char* v = std::getenv("STRATA_PLE_COMPACT"); return v != nullptr && v[0] == '1'; }();
     return on;
 }
+// STRATA_PLE_COPY_STREAM=1 (opt-in with PLE_COMPACT, upstream d6428bf29): the raw rows go up on a stream of their own
+// instead of the compute stream, which otherwise idles for the copy; the same bytes and kernels
+inline bool ple_copy_stream_on() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_PLE_COPY_STREAM"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
 // A host table the GPU reads or writes every layer (the routing ids, the row maps, the group bounds): USM host
 // memory that a kernel reads and writes in place (to_device / from_device: copy_i32_from_mapped), so these small copies
 // never queue behind the streamed experts on the copy engine (upstream 1b3bb8f8).  A copy from or to pageable memory
@@ -572,6 +578,8 @@ struct Prefill::Impl {
     std::vector<uint32_t> ple_rows[2];
     bool ple_compact[2] = {false, false};    // STRATA_PLE_COMPACT: the pinned buffer holds raw IQ4_NL rows
     uint8_t* ple_raw_dev = nullptr;          // their device copy (the chunk's 16 rows a token)
+    strata::gpu::Stream ple_copy = nullptr;  // STRATA_PLE_COPY_STREAM: the raw rows' upload stream (null: on cs)
+    strata::gpu::Event* ple_raw_free = nullptr;   // cs has dequantized ple_raw_dev: the next upload may overwrite it
     float* ple_norm = nullptr;
     uint8_t* region = nullptr;               // the attention/MoE scratch region (idle while the PLE block runs)
     uint64_t region_bytes = 0;
@@ -796,6 +804,7 @@ void Prefill::release() {
     impl_->stager.reset();
     if (impl_->cs) strata::gpu::stream_sync(impl_->cs);
     if (impl_->copy) strata::gpu::stream_sync(impl_->copy);
+    if (impl_->ple_copy) strata::gpu::stream_sync(impl_->ple_copy);
     impl_->steps_up.release();
     impl_->tok_up.release();
     impl_->draft_tok_up.release();
@@ -820,6 +829,8 @@ void Prefill::release() {
         if (impl_->ple_emb_host[b] && impl_->ple_pageable[b].empty()) strata::gpu::free(impl_->ple_emb_host[b]);
     }
     if (impl_->ple_raw_dev) strata::gpu::free(impl_->ple_raw_dev);
+    if (impl_->ple_copy) strata::gpu::stream_destroy(impl_->ple_copy);
+    if (impl_->ple_raw_free) strata::gpu::event_destroy(impl_->ple_raw_free);
     if (impl_->copy) strata::gpu::stream_destroy(impl_->copy);
     for (void* p : impl_->owned) strata::gpu::free(p);
 }
@@ -1221,6 +1232,17 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         !strata::gpu::alloc_device((void**) &m.ple_raw_dev,
                                    T * strata::kernels::PLE_N_HEADS * strata::kernels::PLE_ROW_BYTES))
         m.ple_raw_dev = nullptr;
+    // STRATA_PLE_COPY_STREAM: a stream of its own, not the expert copy stream - that one may hold a ring of blobs and
+    // waits on their slots' release, so a wait on it could idle the compute stream for longer than the copy itself
+    if (ple_copy_stream_on() && m.ple_raw_dev != nullptr) {
+        if (!m.ple_copy) m.ple_copy = strata::gpu::stream_create_copy();
+        if (m.ple_copy == nullptr || (!m.ple_raw_free && !strata::gpu::event_create(&m.ple_raw_free))) {
+            // an optional optimization: the raw rows go up on the compute stream as with STRATA_PLE_COMPACT alone
+            if (m.ple_copy) { strata::gpu::stream_destroy(m.ple_copy); m.ple_copy = nullptr; }
+            std::fprintf(stderr, "prefill: STRATA_PLE_COPY_STREAM=1: the upload stream could not be created, the PLE "
+                                 "rows go up on the compute stream\n");
+        }
+    }
     if (ss.qsa_states[ss.qsa_primary()].kv_mode == 1) {   // KV streaming: the staging pool's identity page table
         const int64_t pages = ss.qsa_states[ss.qsa_primary()].n_pages;
         std::vector<int32_t> ident((size_t) pages);
@@ -1723,6 +1745,10 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             if (l != nullptr) (void) l->wait(e);
         }
     } next_wait{next_};
+    struct PleDrain {   // STRATA_PLE_COPY_STREAM: no upload left in flight from a buffer the next run refills
+        strata::gpu::Stream s;
+        ~PleDrain() { if (s) strata::gpu::stream_sync(s); }
+    } ple_drain{m.ple_copy};
     int hand_buf = 0;
     double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // STRATA_PREFILL_TIMING: the host's share
     double host_route_ms = 0, host_fold_ms = 0, host_group_ms = 0;   // ...at each MoE layer: the routing's sync, the
@@ -1906,10 +1932,17 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                 return false;
             }
             if (m.ple_compact[ple_buf]) {
+                // STRATA_PLE_COPY_STREAM: the raw rows go up on their own stream once the previous chunk's dequant
+                // has read the buffer (ple_raw_free), and the compute stream waits for them (ple_copied) only at the
+                // dequant.  ple_copied still marks the buffer's upload done for the host-side reuse guard below.
+                const strata::gpu::Stream up = m.ple_copy != nullptr ? m.ple_copy : m.cs;
+                if (up != m.cs) strata::gpu::stream_wait_event(up, m.ple_raw_free);
                 strata::gpu::copy_async(m.ple_raw_dev, m.ple_emb_host[ple_buf],
-                                        (size_t) T * strata::kernels::PLE_N_HEADS * strata::kernels::PLE_ROW_BYTES, m.cs);
-                strata::gpu::event_record(m.ple_copied[ple_buf], m.cs);
+                                        (size_t) T * strata::kernels::PLE_N_HEADS * strata::kernels::PLE_ROW_BYTES, up);
+                strata::gpu::event_record(m.ple_copied[ple_buf], up);
+                if (up != m.cs) strata::gpu::stream_wait_event(m.cs, m.ple_copied[ple_buf]);
                 strata::kernels::ple_iq4nl_dequant(m.ple_raw_dev, T * strata::kernels::PLE_N_HEADS, m.ple_emb, m.cs);
+                if (up != m.cs) strata::gpu::event_record(m.ple_raw_free, m.cs);
             } else {
                 strata::gpu::copy_async(m.ple_emb, m.ple_emb_host[ple_buf], (size_t) T * N * 4, m.cs);
                 strata::gpu::event_record(m.ple_copied[ple_buf], m.cs);
