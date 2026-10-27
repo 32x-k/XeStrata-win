@@ -4218,7 +4218,24 @@ struct Model::Impl {
         mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT;
         double foot = 0;
         if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t) &ti, &cnt) == KERN_SUCCESS) foot = (double) ti.phys_footprint;
-        return std::max(4.0 * gb, cap - foot - 1.0 * gb);
+        // Other programs' anonymous memory (a browser, another model's server).  The cap above was measured with a small server beside
+        // the engine (NEIGHBOUR_ALLOWANCE); with more anonymous memory held elsewhere the same share leaves macOS too little and the Mac
+        // pages (a 128 GB M5 Max froze twice with a 60 GB Qwen server running next to this engine).  The rest comes off the experts, so
+        // they stream from the SSD a little more.  STRATA_METAL_NEIGHBOURS=0 turns it off.
+        double neighbours = 0;
+        const char* ne = std::getenv("STRATA_METAL_NEIGHBOURS");
+        if (ne == nullptr || std::atoi(ne) != 0) {
+            vm_statistics64_data_t vs;
+            mach_msg_type_number_t vc = HOST_VM_INFO64_COUNT;
+            if (host_statistics64(mach_host_self(), HOST_VM_INFO64, (host_info64_t) &vs, &vc) == KERN_SUCCESS) {
+                const double anon = ((double) vs.internal_page_count + (double) vs.total_uncompressed_pages_in_compressor) * (double) vm_page_size;
+                constexpr double NEIGHBOUR_ALLOWANCE = 8.0e9;
+                neighbours = std::max(0.0, anon - foot - NEIGHBOUR_ALLOWANCE);
+                if (neighbours > 0.5e9)
+                    std::fprintf(stderr, "ds4: other programs hold %.1f GB of anonymous memory: %.1f GB less for the experts\n", anon / gb, neighbours / gb);
+            }
+        }
+        return std::max(4.0 * gb, cap - foot - 1.0 * gb - neighbours);
     }
 #endif
 #if defined(STRATA_METAL)
