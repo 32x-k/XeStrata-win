@@ -442,11 +442,12 @@ def text_format(req: dict):
     kind = fmt.get("type")
     if kind in (None, "text"):
         return None
+    extra = {"repair_latex_escapes": True} if fmt.get("repair_latex_escapes") is True else {}   # #2893, opt-in
     if kind == "json_object":
-        return {"type": "json_object"}
+        return {"type": "json_object", **extra}
     if kind == "json_schema":
         spec = {k: fmt[k] for k in ("name", "schema", "strict", "description") if k in fmt}
-        return {"type": "json_schema", "json_schema": spec}
+        return {"type": "json_schema", "json_schema": spec, **extra}
     raise ResponsesError("text.format.type must be text, json_object or json_schema", "text.format.type")
 
 

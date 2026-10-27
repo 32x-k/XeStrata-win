@@ -1213,6 +1213,11 @@ JSON formats combined with tools/MCP are refused explicitly.
 Without `response_format`, ordinary text and tool behavior stays the same.
 Structured SSE buffers the answer while sending keep-alive comments, emits the content only after validation, then usage/timings and `[DONE]`.
 A failure emits an SSE error and `[DONE]` without invalid content.
+Math answers often hold LaTeX such as `\alpha`, which is not a valid JSON escape.
+Add `"repair_latex_escapes": true` to the `response_format` (or to `text.format` on `/v1/responses`) and, only after the strict parse failed, the server doubles the backslashes that are not valid escapes and checks the answer again.
+Valid output is never touched.
+`\b`, `\f`, `\n`, `\r`, `\t` and `\uXXXX` are valid JSON, so they stay: a `\beta` beside a `\alpha` comes back with a backspace.
+Off by default.
 `/v1/status.structured_output` advertises the formats, the validation method and the buffered streaming.
 
 ### API request monitor
