@@ -1,6 +1,6 @@
 """DeepSeek-V4.1-Flash on an Apple Silicon Mac: the fit numbers (`strata_control/dsv41_fit.py`, `mac_expert_cap_gb` and
-`mac_plan`).  The cap mirrors the engine's own rule, so 128 GiB must give the 71.4 GB of VRAM experts measured on the M5
-Max on 2026-10-25.  Pure: nothing here builds, downloads or starts anything."""
+`mac_plan`).  The cap mirrors the engine's own rule, so 128 GiB must give the 68-69 GB of VRAM experts measured on the M5
+Max on 2026-10-27.  Pure: nothing here builds, downloads or starts anything."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from strata_control import dsv41_fit as F
 
 class MacExpertCap(unittest.TestCase):
     def test_the_m5_max_gives_the_measured_71_4_gb(self):
-        self.assertAlmostEqual(F.mac_expert_cap_gb(128), 71.4, delta=0.3)
+        self.assertAlmostEqual(F.mac_expert_cap_gb(128), 69.4, delta=0.3)
 
     def test_a_32_gb_mac_mini_keeps_little(self):
         # 32 GiB: leave = 15% (4.8 GiB = 5.15 GB) and the working set caps it at 3/4 of 34.4 GB
@@ -31,8 +31,8 @@ class MacPlan(unittest.TestCase):
     def test_the_default_pack_on_the_m5_max_streams(self):
         p = F.mac_plan(128, "IQ2_XS")
         self.assertEqual(p["verdict"], "streams")
-        self.assertAlmostEqual(p["resident_gb"], 71.4, delta=0.3)
-        self.assertAlmostEqual(p["streaming_gb"], 149.06 - 71.4, delta=0.3)
+        self.assertAlmostEqual(p["resident_gb"], 69.4, delta=0.3)
+        self.assertAlmostEqual(p["streaming_gb"], 149.06 - 69.4, delta=0.3)
         self.assertEqual(p["dense_gb"], 6.17)
         self.assertIn("streams", p["words"])
         self.assertIn("M5 Max", p["words"])
@@ -78,7 +78,7 @@ class MacInThePlan(unittest.TestCase):
         p = F.plan(self.card(128), 128, 900.0, 8192, model="IST-DAS-2.00bpw")
         self.assertTrue(p["mac"])
         self.assertEqual(p["mac_verdict"], "streams")
-        self.assertAlmostEqual(p["vram_experts_gb"], 71.5, delta=0.5)
+        self.assertAlmostEqual(p["vram_experts_gb"], 69.5, delta=0.5)
         self.assertAlmostEqual(p["streamed_gb"], p["experts_gb"] - p["vram_experts_gb"], delta=0.2)
         self.assertEqual(p["tp"], 1)
         self.assertEqual(p["args"], [])
@@ -95,7 +95,7 @@ class MacInThePlan(unittest.TestCase):
         self.assertFalse(any("refuse" in w.lower() for w in p["warnings"]))
 
     def test_the_file_cache_floor_grows_with_the_memory(self):
-        self.assertAlmostEqual(F.mac_expert_cap_gb(128), 71.4, delta=0.3)          # the measured M5 Max
+        self.assertAlmostEqual(F.mac_expert_cap_gb(128), 69.4, delta=0.3)          # the measured M5 Max
         self.assertGreater(F.mac_expert_cap_gb(64), 20.0)                          # a 64 GB Mac is not told it keeps nothing
         self.assertLess(F.mac_expert_cap_gb(64), F.mac_expert_cap_gb(96))
 

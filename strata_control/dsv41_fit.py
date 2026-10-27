@@ -494,19 +494,19 @@ MAC_PACKS: dict[str, dict[str, Any]] = {
     "IQ2_XS": {"name": "2.25 bpw (IQ2_XS), the quality one", "routed_gb": 149.06, "backbone_gb": 155.23, "bpw": 2.25},
 }
 MAC_ENGRAM_GB = 110.60          # the same Engram table for all three, read row by row off the SSD
-MAC_ENGINE_FOOTPRINT_GB = 10.0  # the process' anonymous memory after the load (Metal buffers, host buffers, the KV cache)
+MAC_ENGINE_FOOTPRINT_GB = 12.0  # the process' anonymous memory after the load (Metal buffers, host buffers, the KV cache)
 MAC_DEVICE_SHARE = 0.75         # recommendedMaxWorkingSetSize as a share of the RAM (107.5 of 128 GB on the M5 Max)
 MAC_FILECACHE_FLOOR_GB = 37.2   # vm.vm_page_filecache_min on the 128 GB M5 Max
 MAC_HEADROOM_GB = 12.0          # beside that floor: macOS itself and one more program
-MAC_MEASURED = ("M5 Max, 128 GB, 2.25 bpw, 2026-10-25: 14.4-15.8 tokens/s for an answer (12.4-12.6 on agent "
-                "work), a 3,000-token prompt at 380-382 tokens/s, 32,000 at 306; the engine kept 71.4 GB of the "
-                "experts resident and read 93.4 MB a token from the SSD")
+MAC_MEASURED = ("M5 Max, 128 GB, 2.25 bpw: 13-15 tokens/s for a short answer (10-12 after a long prompt), a 3,000-token "
+                "prompt at about 310 tokens/s, 32,000 at about 720; the engine kept about 68 GB of the experts resident "
+                "and read about 110 MB a token from the SSD")
 
 
-# What each pack did on that Mac (the owner's measurements, 2026-10-25/26; the release build's numbers replace them in MAC_MEASURED_PACK).
+# What each pack did on that Mac (measured on the 0.2.7.1 build, 2026-10-27, product flags, frozen placement).
 MAC_MEASURED_PACK = {
-    "IQ2_XXS": ("M5 Max, 128 GB, 2.00 bpw: 19-20 tokens/s for a short answer (14-17 after a long prompt), a 3,000-token prompt at 362-377 "
-                "tokens/s, 32,000 at 303; the engine kept 71.4 GB of the experts resident and read 40 MB a token from the SSD"),
+    "IQ2_XXS": ("M5 Max, 128 GB, 2.00 bpw: 15-18 tokens/s for a short answer (14-15 after a long prompt), a 3,000-token prompt at about 270 "
+                "tokens/s, 32,000 at about 630; the engine kept about 69 GB of the experts resident and read about 48 MB a token from the SSD"),
     "IQ2_XS": MAC_MEASURED,
 }
 
@@ -514,7 +514,7 @@ MAC_MEASURED_PACK = {
 def mac_expert_cap_gb(ram_gb: float) -> float:
     """The expert budget the engine will pick on a Mac of `ram_gb` (GiB, as the rest of the app reports memory), in
     decimal GB: the RAM less what macOS keeps, less the process' own footprint.  Mirrors metal_expert_cap() with its
-    big-Mac rule (>= 64 GB: 40% left, at least the file-cache floor + 12 GB).  128 GiB gives the 71.4 GB measured on
+    big-Mac rule (>= 64 GB: 40% left, at least the file-cache floor + 12 GB).  128 GiB gives the 68-69 GB measured on
     the M5 Max."""
     gib = 1.073741824
     p = float(ram_gb) * gib
