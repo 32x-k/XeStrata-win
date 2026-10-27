@@ -127,6 +127,7 @@ async function loadHealth() {
     $("img-note").hidden = !health.image_note;
     $("img-note").textContent = health.image_note || "";
     imgModels();
+    thinkingButtons();
     if (location.hash === "#images" && health.image_generation) showTab("images");
   } catch (e) {
     setTimeout(loadHealth, 2000);
@@ -751,7 +752,7 @@ function markdown(text) {
 // fields: the server picks the card's set for the request's thinking state (thinking 1.0 / 0.95 / 20, not thinking
 // 0.7 / 0.8 / 20 with a presence penalty). Before 0.1.45 the page sent 0.6 itself; a stored 0.6 with the other two
 // values untouched counts as "not set" too.
-const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, min_p: "", max: "", seed: "", show: true, esp: true,
+const DEFAULTS = {thinking: "", temperature: 1.0, top_p: 0.95, top_k: 20, min_p: "", max: "", seed: "", show: true, esp: true,
                   mcp: true};
 const OLD_DEFAULT_TEMPERATURE = 0.6;
 function samplingUntouched(s) {
@@ -759,6 +760,8 @@ function samplingUntouched(s) {
   return (t === DEFAULTS.temperature || t === OLD_DEFAULT_TEMPERATURE) && +s.top_p === DEFAULTS.top_p && +s.top_k === DEFAULTS.top_k;
 }
 let settings = {...DEFAULTS, ...store.get("sampling", {})};
+// before the model's own levels (thinking_v 2) "high" was every model's default and saved as it: the default again
+if (settings.thinking_v !== 2 && settings.thinking === "high") settings.thinking = "";
 if (samplingUntouched(settings)) settings.temperature = DEFAULTS.temperature;
 let messages = store.get("chat", []);
 let attachments = [];                 // {name, url}
@@ -989,8 +992,9 @@ async function send() {
   busy = {controller, msg: m};
   setBusy(true);
 
-  const body = {model: health.model, messages: apiMessages(), stream: true,
-                reasoning_effort: settings.thinking};
+  const body = {model: health.model, messages: apiMessages(), stream: true};
+  const effort = thinkingEffort(settings);
+  if (effort) body.reasoning_effort = effort;
   if (!(settings.temperature > 0)) {
     body.temperature = 0;
   } else if (!samplingUntouched(settings)) {
@@ -1196,7 +1200,8 @@ function openDrawer(open) {
   if (open) { loadDrawer(); loadShared(); loadMcp(); }
 }
 function loadDrawer(s = settings) {
-  for (const b of $("s-thinking").children) b.setAttribute("aria-checked", String(b.dataset.v === s.thinking));
+  const level = thinkingChosen(s);
+  for (const b of $("s-thinking").children) b.setAttribute("aria-checked", String(b.dataset.v === level));
   $("s-temp").value = s.temperature; $("s-topp").value = s.top_p; $("s-topk").value = s.top_k;
   $("s-max").value = s.max; $("s-seed").value = s.seed; $("s-minp").value = s.min_p ?? "";
   $("s-show").setAttribute("aria-checked", String(!!s.show));
@@ -1216,7 +1221,9 @@ async function loadShared() {
   $("s-share").setAttribute("aria-checked", String(sharedOn));
 }
 function sharedDefaults(s) {
-  const d = {reasoning_effort: s.thinking};
+  const d = {};
+  const effort = thinkingEffort(s);
+  if (effort) d.reasoning_effort = effort;
   if (!(+s.temperature > 0)) d.temperature = 0;
   else if (!samplingUntouched(s)) Object.assign(d, {temperature: +s.temperature, top_p: +s.top_p, top_k: +s.top_k});
   if (+s.temperature > 0 && s.min_p !== "" && s.min_p != null) d.min_p = +s.min_p;
@@ -1240,16 +1247,45 @@ function projectionLoaded() {
   const c = lastMetrics && lastMetrics.engine ? lastMetrics.engine.cvec : 0;
   return !!c && c !== "0";
 }
+// the thinking levels: the model's own (/health's "thinking": GLM-5.3-Flash's low, high and max, a model that only
+// turns its thinking on and off its on), an older server's the four of before.  The model's default is sent as no
+// reasoning_effort at all, so the model's own default applies (llm-jp-4.1's medium, GLM-5.3-Flash's max)
+function thinkingInfo() {
+  return health.thinking || {levels: ["none", "low", "medium", "high"], default: "high"};
+}
+function thinkingChosen(s) {
+  const t = thinkingInfo();
+  return t.levels.includes(s.thinking) ? s.thinking : t.default;
+}
+function thinkingEffort(s) {
+  const v = thinkingChosen(s);
+  return v && v !== thinkingInfo().default && v !== "on" ? v : undefined;
+}
+function thinkingButtons() {
+  const t = thinkingInfo(), names = {none: "Off", low: "Low", medium: "Medium", high: "High", max: "Max", on: "On"};
+  $("s-thinking").replaceChildren(...t.levels.map((v) => {
+    const b = document.createElement("button");
+    Object.assign(b, {type: "button", textContent: names[v] || v});
+    b.setAttribute("role", "radio");
+    b.dataset.v = v;
+    b.onclick = () => { for (const x of $("s-thinking").children) x.setAttribute("aria-checked", String(x === b)); outputs(); };
+    return b;
+  }));
+  $("s-thinking").closest(".st-field").hidden = !t.levels.length;
+  loadDrawer();
+}
 function outputs() {
   const t = +$("s-temp").value;
   $("o-temp").textContent = t === 0 ? "0 · greedy" : t.toFixed(2);
   $("o-topp").textContent = (+$("s-topp").value).toFixed(2);
   $("o-topk").textContent = $("s-topk").value;
   const sel = [...$("s-thinking").children].find((b) => b.getAttribute("aria-checked") === "true");
-  $("o-thinking").textContent = sel ? {none: "answers right away", low: "short", medium: "medium", high: "thorough (default)"}[sel.dataset.v] : "";
+  const what = {none: "answers right away", low: "short", medium: "medium", high: "thorough", max: "the most thorough",
+                on: "thinks first"};
+  $("o-thinking").textContent = sel ? what[sel.dataset.v] + (sel.dataset.v === thinkingInfo().default ? " (default)" : "")
+                                    : "";
   for (const id of ["s-topp", "s-topk", "s-minp"]) $(id).disabled = t === 0;
 }
-for (const b of $("s-thinking").children) b.onclick = () => { for (const x of $("s-thinking").children) x.setAttribute("aria-checked", String(x === b)); outputs(); };
 for (const id of ["s-temp", "s-topp", "s-topk"]) $(id).oninput = outputs;
 $("s-show").onclick = () => $("s-show").setAttribute("aria-checked", String($("s-show").getAttribute("aria-checked") !== "true"));
 $("s-esp").onclick = () => $("s-esp").setAttribute("aria-checked", String($("s-esp").getAttribute("aria-checked") !== "true"));
@@ -1258,7 +1294,7 @@ $("s-share").onclick = () => $("s-share").setAttribute("aria-checked", String($(
 $("s-reset").onclick = () => loadDrawer(DEFAULTS);
 $("s-apply").onclick = async () => {
   const sel = [...$("s-thinking").children].find((b) => b.getAttribute("aria-checked") === "true");
-  settings = {thinking: sel ? sel.dataset.v : "high", temperature: +$("s-temp").value, top_p: +$("s-topp").value,
+  settings = {thinking: sel && sel.dataset.v !== thinkingInfo().default ? sel.dataset.v : "", thinking_v: 2, temperature: +$("s-temp").value, top_p: +$("s-topp").value,
               top_k: +$("s-topk").value, min_p: $("s-minp").value.trim(), max: $("s-max").value.trim(),
               seed: $("s-seed").value.trim(),
               show: $("s-show").getAttribute("aria-checked") === "true",
@@ -1289,6 +1325,7 @@ setBusy(false);
 renderChat();
 const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
 if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
+thinkingButtons();   // the four of before until /health says the model's own
 loadHealth().then(loadSwitcher).then(loadMcp).then(() => loadUpdate()).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
 showTab(location.hash.slice(1) || "chat");
 poll();

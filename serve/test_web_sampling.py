@@ -6,6 +6,7 @@
 The page used to send temperature 0.6 / top_p 0.95 / top_k 20 with every request, so the server's model-card defaults
 (thinking 1.0, not thinking 0.7 + presence penalty) never applied to it.  Pins, with node, the page's own functions:
 untouched (the shown defaults, or the old stored 0.6) sends nothing, a changed value is sent whole, 0 is greedy.
+The thinking level the model takes by default is no reasoning_effort either (its own default applies).
 Skipped without node.
 
     python -m unittest serve.test_web_sampling -v
@@ -30,6 +31,7 @@ def slice_between(src: str, start: str, end: str) -> str:
 @unittest.skipUnless(shutil.which("node"), "node is not installed")
 class WebSampling(unittest.TestCase):
     defaults: str
+    thinking: str
     shared: str
     body: str
 
@@ -37,11 +39,13 @@ class WebSampling(unittest.TestCase):
     def setUpClass(cls):
         src = APP.read_text(encoding="utf-8")
         cls.defaults = slice_between(src, "const DEFAULTS", "let settings")
+        cls.thinking = slice_between(src, "function thinkingInfo", "function thinkingButtons")
         cls.shared = slice_between(src, "function sharedDefaults", "async function saveShared")
         cls.body = slice_between(src, "  if (!(settings.temperature > 0)) {", "  if (settings.seed)")
 
     def run_js(self, settings: dict, pieces: str):
-        js = (self.defaults + "function projectionLoaded() { return false; }\n" + self.shared +
+        js = (self.defaults + "function projectionLoaded() { return false; }\nconst health = {};\n" + self.thinking +
+              self.shared +
               f"\nconst settings = {json.dumps(settings)};\nconst body = {{}};\n{pieces}\n"
               "console.log(JSON.stringify({body, shared: sharedDefaults(settings)}));")
         out = subprocess.run(["node", "-e", js], capture_output=True, text=True, timeout=30)
@@ -58,7 +62,7 @@ class WebSampling(unittest.TestCase):
         for t in (1.0, 0.6):                       # the shown default, and the old stored default
             body, shared = self.sampling(temperature=t)
             self.assertEqual(body, {})
-            self.assertEqual(shared, {"reasoning_effort": "high"})
+            self.assertEqual(shared, {})
 
     def test_changed_values_are_sent_whole(self):
         body, shared = self.sampling(temperature=0.3)
