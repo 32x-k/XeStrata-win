@@ -549,6 +549,7 @@ RAM に 23〜50 GB を読み込むのに時間がかかりますが、何もダ�
 `run-<model>.sh` は、そのモデルを直接起動します。
 同じモデルに setup をやり直すと（別の文脈の長さなど）、setup が書くキー（`exe`、`args`、`port`、`gpu_pci`、`vision` など）を書き直し、あなたが足したキー（`sampling`、`mcp_servers`、`cors_origins` など）と、指定しなかった `host`・`api_key` は残します。
 前のファイルは `xestrata-<model>.json.bak` に残します。
+Qwen3.8-Flash-Next の大きさの質問では、入っている大きさを `(installed)` と示して既定にし、`--yes` もそれを選びます。やり直しても、勧める大きさに替わってダウンロードし直すことはありません。
 `"args"` に手で足したエンジンのオプションは引き継がず、setup がその名前を示すので、足し直します（upstream #629）。
 
 ```text
@@ -1638,6 +1639,7 @@ B70 では、`cvec_parity` が制御ベクトルのカーネルを確かめて�
 | 初回の起動に数分かかる | RAM に 23〜50 GB を読み込んでいます。ファイルが OS のキャッシュにある間は、2 回目の方が速くなります。 |
 | 起動の間、PC が数分固まる | とくに初回はよくあります（server のウィンドウに、そうなる時点が出ます）。エンジンがエキスパートを RAM に読み込み、GPU のためにその一部を登録し、エキスパートのキャッシュの大きさを決めています。ウィンドウを閉じずに待ちます。10 分たっても固まったままなら、PC を再起動し、ほかのプログラムを閉じてやり直すか、小さい大きさを選びます。 |
 | 起動に何分もかかり、その間カーネルがメモリーの圧縮（`kcompactd`）で忙しい | 透過的なヒュージページ（THP）が `madvise` のとき、エンジンはアリーナに `MADV_HUGEPAGE` を頼み、断片化した RAM では fault のたびに圧縮が走ることがあります（upstream #771）。`STRATA_NO_ARENA_THP=1` で頼まなくなります（THP が `always` のときは、エンジンは初めから頼みません）。 |
+| 起動のエラーに `the engine process ended: ...` とある | システムがエンジンのプロセスを終わらせました。エラーがその終わり方を示します（Linux では `killed by signal 4 (SIGILL, Illegal instruction)`、Windows では `exit code 0xC000001D: illegal instruction` など）。不正な命令（illegal instruction）は、CPU が実行できない命令をエンジンが使ったということで、Linux ではエラーが CPU に欠けている AVX・AVX2・FMA・F16C を挙げるか、すべてあるならエンジンのバグだと示します。CPU の型番を添えて issue を立ててください。 |
 | `the engine stopped unexpectedly (exit code ...)` | 答えの途中でエンジンのプロセスが終わりました。たいていは RAM 不足で、Linux がいちばん大きなプログラムを終わらせます（`journalctl -k \| grep -i -E 'killed process\|out of memory'`）。次の要求で、エンジンは自分で起動し直します。繰り返すなら、ほかのプログラムを閉じるか、小さい大きさを選びます。server は、モデルのエキスパートがほかのために約 6 GB の RAM を残さないとき、起動時に警告します。 |
 | decode が遅く、ディスクのランプが点きっぱなし | 空いている RAM が足りません。ほかのプログラムを閉じるか、Q2_0 か IQ2_XS を選びます。 |
 | `prompt ... exceeds the context` | 要求が、選んだ文脈より長くなっています。もっと大きな `--context` で setup をやり直します。 |

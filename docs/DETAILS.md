@@ -576,6 +576,7 @@ Closing the window stops the model.
 With more than one model installed, it asks which one to start; `run-<model>.sh` starts a model directly.
 Running setup again for the same model (another context, say) rewrites the keys setup writes (`exe`, `args`, `port`, `gpu_pci`, `vision`, ...) and keeps the ones you added (`sampling`, `mcp_servers`, `cors_origins`, ...) and a `host` and `api_key` this run does not give.
 The earlier file is kept as `xestrata-<model>.json.bak`.
+For Qwen3.8-Flash-Next the size question marks the installed size `(installed)` and makes it the default, and `--yes` takes it: a repeat run does not move the model to the recommended size and download it.
 Engine options you added to `"args"` by hand are not carried over: setup names them, and you add them again (upstream #629).
 
 ```text
@@ -1673,6 +1674,7 @@ On the B70, `cvec_parity` checks the control-vector kernel ([XE.md](XE.md#valida
 | The first start takes minutes | It is reading 23–50 GB into RAM; the second start is faster while the files are in the OS cache. |
 | The PC freezes for a few minutes at the start | Normal, most of all the first time (the server window says when it happens): the engine loads the experts into RAM, registers part of it for the GPU and sizes the expert cache. Wait; don't close the window. Still frozen after 10 minutes: restart the PC, close other programs, try again, or pick a smaller size. |
 | The start takes many minutes while the kernel is busy compacting memory (`kcompactd`) | With transparent huge pages on `madvise`, the engine asks for `MADV_HUGEPAGE` on its arena, and on fragmented RAM every fault can then compact memory (upstream #771). `STRATA_NO_ARENA_THP=1` stops the request (with THP on `always` the engine does not make it at all). |
+| The start error says `the engine process ended: ...` | The system ended the engine process, and the error says how: `killed by signal 4 (SIGILL, Illegal instruction)` on Linux, `exit code 0xC000001D: illegal instruction` on Windows, and so on. An illegal instruction means the engine ran an instruction the CPU cannot execute; on Linux the error lists which of AVX, AVX2, FMA and F16C the CPU lacks, or says the CPU has them all, which is a bug in the engine. Open an issue with the CPU model. |
 | `the engine stopped unexpectedly (exit code ...)` | The engine process ended mid-answer, usually out of RAM (Linux ends the biggest program: `journalctl -k \| grep -i -E 'killed process\|out of memory'`). The next request starts it again by itself. If it repeats, close other programs or pick a smaller size. The server also warns at start when the model's experts leave less than ~6 GB of RAM for everything else. |
 | Slow decode, disk light busy | Not enough free RAM: close other programs, or choose Q2_0 / IQ2_XS. |
 | `prompt ... exceeds the context` | The request is longer than the context you chose: run setup again with a bigger `--context`. |
