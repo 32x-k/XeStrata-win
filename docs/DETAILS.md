@@ -1090,6 +1090,22 @@ Its answers and state match a run without parking byte for byte:
 with FP16, INT8 (also with KV streaming), Q4_0 and K8V4 KV, and with INT8 on the small configuration (8 GB, no XMX).
 With parking off, the engine gives the same tokens and state as the engine before the change.
 
+### Conversation cache copies on a slow host link (opt-in)
+
+Where the card sits behind a slow host link, the conversation cache's copies are on the path of the next request.
+A checkpoint copies the DeltaNet state (118 MB on Qwen3.8-Flash-Next) from the card to RAM, and parking a conversation copies its K/V and its checkpoints before the next prompt can start.
+These variables (the engine's environment) move the copies card-to-card in VRAM and onto background threads (upstream #3779).
+All are off unless set, and the answers and the parked images are the same bytes.
+
+- `STRATA_CKPT_ASYNC=1`: a checkpoint's state is copied into a VRAM stage and moved to RAM by a background thread (the checkpoint at the start of the assistant turn into its pinned staging buffer). A reader waits only for the copy it needs. The stage is the size of the state, allocated at the first save; if it cannot be had, the save copies as before.
+- `STRATA_CKPT_VRAM_SLOTS=N` (0-16, with `STRATA_CKPT_ASYNC=1`): the last N saved states also stay in VRAM (N x 118 MB), and a restore from one copies card-to-card.
+- `STRATA_CKPT_GATHER=1`: a checkpoint's 37 small copies are gathered into one buffer and fetched with one copy.
+- `STRATA_PARK_ASYNC=1`: a park copies the K/V into a VRAM stage and moves it to RAM in the background. The checkpoints the request drops move into the parked image instead of being copied.
+- `STRATA_PARK_VRAM_MIB=N` (with `STRATA_PARK_ASYNC=1`): a parked conversation's K/V also stays in VRAM slots (64 MiB granules, up to N MiB in all), and switching back restores it card-to-card. When the K/V needs the VRAM to grow, the slots go first.
+- `STRATA_PARK_TRACE=1`: diagnostic, the save and park steps' waits and timings on stderr.
+
+The VRAM stages and slots are taken only while a sixteenth of the card's memory stays free beside them.
+
 ### Keeping parked conversations across restarts (opt-in)
 
 With `"conversation_save": "<folder>"` in the config, the engine also writes its parked conversations to that folder and puts them back from there after a restart.
