@@ -339,6 +339,18 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(split_rules_test PRIVATE include)
   add_test(NAME split_rules_test COMMAND split_rules_test)
 
+  # #3797: the out-of-memory report at start (per card free/total, the largest other programs): the text is a pure
+  # function; the driver query (NVML, loaded at run time) is only checked to be safe to call. No GPU needed.
+  add_executable(gpu_report_test tests/program/gpu_report_test.cpp)
+  target_include_directories(gpu_report_test PRIVATE include)
+  target_link_libraries(gpu_report_test PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME gpu_report_test COMMAND gpu_report_test)
+
+  # #3702: the later-stage reserve of the layer split search (header-only arithmetic, pinned against the old expression)
+  add_executable(stage_reserve_test tests/program/stage_reserve_test.cpp)
+  target_include_directories(stage_reserve_test PRIVATE include)
+  add_test(NAME stage_reserve_test COMMAND stage_reserve_test)
+
   # the prompt planner's host-memory model (#2824): header-only, no GPU
   add_executable(prefill_plan_test tests/program/prefill_plan_test.cpp)
   target_include_directories(prefill_plan_test PRIVATE include)
@@ -1321,6 +1333,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(gdn_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(gdn_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME gdn_parity COMMAND gdn_parity --selftest)
+  # #3948: the same checks through the 4-blocks-a-head GDN step (the default on gfx1151), whose output-norm kernel writes the
+  # STRATA_QFUSE q8_1 image on its own
+  add_test(NAME gdn_parity_split COMMAND gdn_parity --selftest)
+  set_tests_properties(gdn_parity_split PROPERTIES ENVIRONMENT "STRATA_GDN_SPLIT=1")
 
   # v100/gdn-chunk: the chunked GDN prompt recurrence vs the token recurrence and a host reference (GPU,
   # synthetic, no model).  The chunked path changes the summation order - FP32-level, not bit-exact - so the
@@ -1592,6 +1608,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(ple_reader_test PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(ple_reader_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME ple_reader_selftest COMMAND ple_reader_test --selftest)
+
+  # #3602: the same reader under load - several clients, a tiny row cache, one in-flight slot, injected delays, rows on
+  # every page phase, late-writer checks, the reader after a failed read. CPU and a temp file only; 77 = no direct reads here.
+  add_executable(ple_reader_stress_test src/ngram/ple_reader_stress_test.cpp)
+  target_include_directories(ple_reader_stress_test PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(ple_reader_stress_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME ple_reader_stress COMMAND ple_reader_stress_test)
+  set_tests_properties(ple_reader_stress PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 
   # 0.2.7: the PLE residency rule (table + expert arena + headroom); header-only, needs nothing
   add_executable(ple_residency_test src/core/ple_residency_test.cpp)

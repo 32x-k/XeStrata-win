@@ -2744,6 +2744,12 @@ bool Verifier::capture(int T, std::string& err) {
     const cudaError_t us = cudaStreamSynchronize(cs_);
     std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s)\n", T,
                  cudaGetErrorString(ue), cudaGetErrorString(us));
+    // The upload only warms the graph; the first launch does it otherwise. A failed one (out of memory on a full card)
+    // must not stay pending: the next kernel wrapper's cudaGetLastError would read it and end the engine (#3702).
+    if (ue != cudaSuccess || us != cudaSuccess) {
+        (void) cudaGetLastError();
+        std::fprintf(stderr, "strata verify: the %d-token window's upload was skipped (the first launch does it)\n", T);
+    }
     return true;
 }
 
@@ -2867,13 +2873,16 @@ bool Verifier::capture_commit(std::string& err) {
         if (graph) cudaGraphDestroy(graph);
         return false;
     }
-    if (ce != cudaSuccess || cudaGraphInstantiate(&commit_exec_, graph, 0) != cudaSuccess) {
+    if (ce != cudaSuccess) {
         if (graph) cudaGraphDestroy(graph);
         err = std::string("verify: commit capture: ") + cudaGetErrorString(ce);
         return false;
     }
+    // (through the same path as the window graphs: on a full card it frees older batch layouts and retries, and the error
+    // it reports is the instantiate's own)
+    const bool made = instantiate_evicting(commit_exec_, graph, {}, "verify: commit instantiate: ", err, 0);
     cudaGraphDestroy(graph);
-    return true;
+    return made;
 }
 
 void Verifier::stage_inputs(int T, const int32_t* tokens, int64_t pos0) {
@@ -3760,8 +3769,8 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
     const bool made = instantiate_evicting(ex, graph, bkey(rows, S, hbase), "verify: batch instantiate: ", err);
     cudaGraphDestroy(graph);
     if (!made) return false;
-    cudaGraphUpload(ex, cs_);
-    cudaStreamSynchronize(cs_);
+    if (cudaGraphUpload(ex, cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess)
+        (void) cudaGetLastError();   // only a warm-up: the first launch uploads it (see capture)
     std::string list;
     for (int t = 0; t < S; ++t) list += (t ? "," : "") + std::to_string(rows[t]);
     std::fprintf(stderr, "strata verify: captured the batch window over slots %s\n", list.c_str());
@@ -4031,14 +4040,17 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
     // #997: every layout of active slots keeps its own graph pair (20-30 MiB each on an L40S), and with an expert cache
     // sized to the reserve the next window graph - a batch layout or a one-request window captured on first use - can
     // find no VRAM left: free the least recently used layouts until it fits (they are captured again when needed)
-    cudaError_t ie = cudaGraphInstantiate(&ex, graph, flags);
+    // (into a local: what a failed instantiate leaves in the output is not specified, and `ex` is a member that
+    // capture() reads as "captured" when it is not null)
+    cudaGraphExec_t got = nullptr;
+    cudaError_t ie = cudaGraphInstantiate(&got, graph, flags);
     int freed = 0;
     for (bool evicted = true; ie == cudaErrorMemoryAllocation && evicted;) {
         (void) cudaGetLastError();
         if (!evict_batch_graph(key, evicted, err)) return false;
         if (evicted) {
             ++freed;
-            ie = cudaGraphInstantiate(&ex, graph, flags);
+            ie = cudaGraphInstantiate(&got, graph, flags);
         }
     }
     if (freed > 0)
@@ -4051,7 +4063,7 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
         if (!evict_window_graph(keep_t, evicted, err)) return false;
         if (evicted) {
             ++freed_sizes;
-            ie = cudaGraphInstantiate(&ex, graph, flags);
+            ie = cudaGraphInstantiate(&got, graph, flags);
         }
     }
     if (freed_sizes > 0)
@@ -4059,9 +4071,11 @@ bool Verifier::instantiate_evicting(cudaGraphExec_t& ex, cudaGraph_t graph, cons
                              "sizes (they are captured again when used; a larger --vram-reserve-mib or "
                              "--vram-reserve-later-mib keeps them)\n", keep_t, freed_sizes);
     if (ie != cudaSuccess) {
+        got = nullptr;
         err = std::string(what) + cudaGetErrorString(ie);
         return false;
     }
+    ex = got;
     return true;
 }
 

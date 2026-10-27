@@ -8343,6 +8343,8 @@ def apply_saved_tuning(cfg: dict, *, say=None) -> dict:
             say(f"[strata] saved tuning '{applied['preset']['name']}' applied: "
                 f"{' '.join(f'{k} {v}' for k, v in changes.items()) or 'the standard settings (nothing to change)'}"
                 f"{'; ' + note if note and 'identical' not in note else ''}")
+            for warning in applied.get("warnings") or []:   # #3844: outside the range the tuner tries, kept
+                say(f"[strata] warning: {warning}")
             if applied.get("state") == "soft":
                 say("[strata] this PC or engine changed since it was saved (" + "; ".join(applied["reasons"]) +
                     "): a short re-check is available (strata presets recheck)")

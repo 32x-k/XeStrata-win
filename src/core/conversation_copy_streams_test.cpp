@@ -40,6 +40,35 @@ int main() {
     check(cudaMalloc(&d, bytes) == cudaSuccess, "device buffer");
     std::vector<char> h(bytes, 7);
 
+    // 0. #2409: what the first copy stream and event of a card cost, on a context that is warm (the buffer above is
+    //    allocated, and a first copy has loaded the copy path's code on a thread that is then discarded)
+    {
+        bool fresh_ready = true;
+        std::thread probe([&] { fresh_ready = copy_stream_ready(0); });
+        probe.join();
+        check(!fresh_ready, "before any copy no thread has a stream for the card (copy_stream_ready is false)");
+        cudaDeviceSynchronize();
+        size_t free0 = 0, free1 = 0, tot = 0;
+        check(cudaMemGetInfo(&free0, &tot) == cudaSuccess, "free memory before the first stream");
+        bool ok = false, ready_after = false;
+        std::thread t([&] {
+            ok = one_thread(0, d, h.data(), bytes);
+            ready_after = copy_stream_ready(0);
+        });
+        t.join();
+        check(ok && ready_after, "the first copy creates the stream, and the thread then has it");
+        check(cudaMemGetInfo(&free1, &tot) == cudaSuccess, "free memory after the first stream");
+        const long long used = (long long) free0 - (long long) free1;
+        std::printf("conversation_copy_streams_test: the first copy stream + event of the card took %lld KiB of device memory\n",
+                    used / 1024);
+        // the restore's guard (program/conv_cache.hpp kRestoreFirstUseMib = 64) is 4x this bound
+        check(used <= (16ll << 20), "a card's first copy stream and event take under 16 MiB");
+        bool pooled = false;
+        std::thread t2([&] { pooled = copy_stream_ready(0); });
+        t2.join();
+        check(pooled, "a finished thread's stream is in the pool: the next thread needs no new one");
+    }
+
     // 1. 200 threads, one after the other (a chunk per std::async thread): the handles are reused, not created per thread
     const long s0 = copy_streams_created(), e0 = copy_events_created();
     for (int i = 0; i < 200; ++i) {
