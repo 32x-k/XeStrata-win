@@ -74,6 +74,9 @@ struct PlainOptions {
     /// An image model's text encoder (encode: MOSS-Image reads Qwen3.5-9B's states): no head, no decode attention
     /// timed; the prompt runs in chunks only.  A dense model (qwen35) on one GPU.
     bool encoder = false;
+    /// An encoder's block matrices left in the mapped file (block_spans): a BlockSource puts each block's on the device
+    /// as the prompt walks the blocks (strata-image's LayerStream, within its budget)
+    bool stream_blocks = false;
     /// --vram-elastic (#533; --serve, one GPU with virtual memory): the expert slots in physical segments of
     /// vram_segment_mib that `vram` gives back to the driver and maps again between requests
     bool vram_elastic = false;
@@ -204,6 +207,26 @@ public:
     /// n_embd floats, every token's last block output through the final norm (host).  The state is reset first and left
     /// as the prompt leaves it.  False with the reason, also when the device cannot lend the prompt's buffers.
     bool encode(const int32_t* tokens, int64_t n, float* hidden, std::string& err);
+
+    /// A streamed encoder's (PlainOptions::stream_blocks) block matrices on the device, block by block: begin(l) gives
+    /// block l's region for work about to be queued on stream(), end(l) says that work is queued.
+    struct BlockSource {
+        virtual ~BlockSource() = default;
+        virtual const uint8_t* begin(int l) = 0;
+        virtual void end(int l) = 0;
+    };
+    struct HostSpan {
+        const void* host = nullptr;   ///< in the mapped file
+        uint64_t bytes = 0;
+    };
+    /// Block l's matrices in the mapped file, in the order set_block_source's offsets take them.
+    std::vector<HostSpan> block_spans(int64_t l) const;
+    /// Where the blocks' matrices are while the prompt runs: block l's region from `src`, its spans at offsets[l].
+    void set_block_source(BlockSource* src, std::vector<std::vector<uint64_t>> offsets);
+    /// Queues on stream() what a block's region needs each time its matrices are copied there (the engine's row
+    /// layouts of Q6_K and Q8_0, as upload makes them).
+    void prepare_block(int64_t l, uint8_t* region);
+    strata::gpu::Stream stream() const { return cs_; }
     /// Whether every MoE layer's experts take the int8 products on this GPU (iq_mmq; STRATA_PLAIN_MMQ=0: no).
     bool prompt_int8() const;
 
@@ -320,6 +343,18 @@ private:
         const float* sh_gate_inp = nullptr;                   // F32 [n_embd]
         W sh_gate, sh_up, sh_down;                            // the shared expert, or qwen35's dense FFN
     };
+    /// stream_blocks: each block's matrices in the mapped file (W::data set as the block is bound), and their source
+    struct Streamed {
+        W* w = nullptr;
+        HostSpan span;
+        uint64_t offset = 0;     ///< in the block's region
+    };
+    std::vector<std::vector<Streamed>> streamed_;
+    std::vector<Streamed>* stream_into_ = nullptr;   ///< load_block's block, while it loads
+    BlockSource* block_src_ = nullptr;
+    /// Block l's matrices at their source's region (streamed blocks; nothing else), and that work queued.
+    void bind_block(int64_t l);
+    void unbind_block(int64_t l);
 
     /// A projection's GGUF tensor into VRAM: its first dimension the input, every other the outputs (a 3-D tensor, the
     /// MLA's per-head wk_b and wv_b, is its heads' matrices one after another).  `f32`: an F32 matrix is taken as it is

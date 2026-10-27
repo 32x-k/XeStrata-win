@@ -298,6 +298,8 @@ bool PlainModel::prompt_warm_products(std::string& err) {
             warm(mtp_eh_, P.x);
         }
         for (const Block* bp : all) {
+            const int64_t l = bp == &mtp_ ? -1 : bp - blocks_.data();   // the MTP layer: nothing to bind
+            bind_block(l);
             const Block& b = *bp;
             if (b.recurrent) {
                 warm(b.qkv, P.qkv);
@@ -316,6 +318,7 @@ bool PlainModel::prompt_warm_products(std::string& err) {
                 warm(b.sh_up, P.sh_up);
                 warm(b.sh_down, P.shared);
             }
+            unbind_block(l);
         }
     } catch (const std::exception& e) {
         err = std::string("plain prompt: warming: ") + e.what();
@@ -354,6 +357,11 @@ bool PlainModel::prompt_dense_int8(const W& w, const float* x, int64_t ldx, floa
 void PlainModel::prompt_dense_calibrate() {
     PromptBufs& P = pb_;
     if (blocks_.empty() || P.T < 32) return;
+    bind_block(0);
+    struct Unbind {
+        PlainModel* m;
+        ~Unbind() { m->unbind_block(0); }
+    } unbind{this};
     const W& w = blocks_.front().sh_gate;   // the dense FFN's gate: the largest of the products a chunk takes
     if (!dense_int8_ok(w)) return;
     prefill::Gemm& gm = prompt_gemm().gemm;
@@ -974,6 +982,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                         proj(mtp_eh_, P.x, T);
                     }
                 }
+                if (!is_mtp) bind_block(l);   // a streamed block's matrices
                 const Block& b = is_mtp ? mtp_ : blocks_[(size_t) l];
                 const int64_t pa = is_mtp ? p0 + 1 : p0;   // the rows' first position
                 k::native_qsa_rms_norm_weighted(P.x, b.attn_norm, P.hn, (int) N, (int) T, eps, cs);
@@ -1077,6 +1086,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     }
                     k::add_inplace(P.x, P.moe_out, T * N, cs);
                     mark(3, t_mark);
+                    if (!is_mtp) unbind_block(l);
                     continue;
                 }
 

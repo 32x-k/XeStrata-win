@@ -132,6 +132,13 @@ bool PlainModel::upload(const GgufModel& m, const std::string& name, W& w, std::
         return false;
     }
     const uint64_t bytes = tensor_payload_bytes(*t);
+    if (stream_into_ != nullptr) {   // a streamed block's: left in the file, laid out as below when it is copied
+        stream_into_->push_back({&w, {m.shard(at).tensor_data(*t), bytes}, 0});
+        if (w.type == kQ6K && k::native_q6_k_rows_ok(w.n_in)) w.type = k::kNativeQ6KRows;
+        else if (w.type == kQ80 && k::native_q8_0_rows_ok(w.n_in)) w.type = k::kNativeQ8Rows;
+        w.data = nullptr;
+        return true;
+    }
     void* d = nullptr;
     if (!strata::gpu::alloc_device(&d, bytes)) {
         err = "plain model: no VRAM for " + name;
@@ -247,6 +254,37 @@ bool PlainModel::load_block(const GgufModel& m, int64_t l, Block& b, std::string
         return false;
     }
     return true;
+}
+
+std::vector<PlainModel::HostSpan> PlainModel::block_spans(int64_t l) const {
+    std::vector<HostSpan> out;
+    if (l >= 0 && l < (int64_t) streamed_.size())
+        for (const Streamed& st : streamed_[(size_t) l]) out.push_back(st.span);
+    return out;
+}
+
+void PlainModel::set_block_source(BlockSource* src, std::vector<std::vector<uint64_t>> offsets) {
+    block_src_ = src;
+    for (size_t l = 0; l < streamed_.size() && l < offsets.size(); ++l)
+        for (size_t i = 0; i < streamed_[l].size() && i < offsets[l].size(); ++i) streamed_[l][i].offset = offsets[l][i];
+}
+
+void PlainModel::prepare_block(int64_t l, uint8_t* region) {
+    for (const Streamed& st : streamed_[(size_t) l]) {
+        void* d = region + st.offset;
+        if (st.w->type == k::kNativeQ6KRows) k::native_q6_k_to_rows(d, st.w->n_in, st.w->n_out, cs_);
+        else if (st.w->type == k::kNativeQ8Rows) k::native_q8_0_to_rows(d, st.w->n_in, st.w->n_out, cs_);
+    }
+}
+
+void PlainModel::bind_block(int64_t l) {
+    if (block_src_ == nullptr || l < 0 || l >= (int64_t) streamed_.size()) return;
+    const uint8_t* region = block_src_->begin((int) l);
+    for (Streamed& st : streamed_[(size_t) l]) st.w->data = region + st.offset;
+}
+
+void PlainModel::unbind_block(int64_t l) {
+    if (block_src_ != nullptr && l >= 0 && l < (int64_t) streamed_.size()) block_src_->end((int) l);
 }
 
 std::vector<PlainModel*> PlainModel::chain() {
@@ -489,8 +527,9 @@ bool PlainModel::load_qwen(std::string& err) {
         const char* e = std::getenv("STRATA_PLAIN_EAGER");
         eager_ = e != nullptr && (e[0] == '0' || e[0] == '1') ? e[0] - '0' : -1;
     }
-    if (opt_.encoder && (!dense_ || !opt_.split_at.empty() || opt_.split_auto)) {
-        err = "plain model: an encoder is a dense model (qwen35) on one GPU";
+    if ((opt_.encoder || opt_.stream_blocks) &&
+        (!opt_.encoder || !dense_ || !opt_.split_at.empty() || opt_.split_auto)) {
+        err = "plain model: an encoder (streamed or not) is a dense model (qwen35) on one GPU";
         return false;
     }
     if (opt_.encoder) opt_.spec = 0;   // no decode: no MTP layer, no drafts
@@ -570,7 +609,13 @@ bool PlainModel::load_qwen(std::string& err) {
         b.recurrent = s.recurrent[(size_t) l];
         if (b.recurrent) b.gdn = n_gdn++;
         else b.attn = n_attn++;
-        if (l >= lb_ && l < le_ && !load_block(m, l, b, err)) return false;
+        if (opt_.stream_blocks) {
+            streamed_.resize((size_t) s.n_layer);
+            stream_into_ = &streamed_[(size_t) l];
+        }
+        const bool ok = l < lb_ || l >= le_ || load_block(m, l, b, err);
+        stream_into_ = nullptr;
+        if (!ok) return false;
     }
     // the MTP layer, when the window checks drafts and the file has it (its K/V the last attention block's): the last
     // stage's
