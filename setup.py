@@ -1335,7 +1335,11 @@ def cpu_info():
     else:
         try:
             txt = open("/proc/cpuinfo").read()
-            flags = set(re.search(r"^flags\s*:\s*(.*)$", txt, re.M).group(1).split())
+            mflags = re.search(r"^flags\s*:\s*(.*)$", txt, re.M)
+            if mflags is None:
+                # aarch64 lists Features, not the x86 flags line. The normal engine is the native one.
+                return name, False, False
+            flags = set(mflags.group(1).split())
             avx2 = "avx2" in flags
             avx512 = {"avx512f", "avx512bw", "avx512vl", "avx512_vnni", "avx512vbmi"} <= flags
             m = re.search(r"^model name\s*:\s*(.*)$", txt, re.M)
@@ -1366,6 +1370,11 @@ def _cpuid_floor() -> str:
         return ""
 
 
+def is_arm64() -> bool:
+    """An ARM64 CPU (DGX Spark / GB10, Grace): there is no AVX here, and no ready-made engine for it."""
+    return platform.machine().lower() in ("aarch64", "arm64")
+
+
 def cpu_floor(avx2: bool) -> str:
     """The experimental older-CPU build this PC needs (#394 #595 #623): "" with AVX2 (the normal engine), "avx" (Sandy /
     Ivy Bridge, AMD Bulldozer), "none" (SSE4.2 + POPCNT: Nehalem, Westmere), or "unsupported".  STRATA_ISA_FLOOR=avx|
@@ -1373,6 +1382,8 @@ def cpu_floor(avx2: bool) -> str:
     forced = os.environ.get("STRATA_ISA_FLOOR", "").strip().lower()
     if forced in ("avx", "none"):
         return forced
+    if is_arm64():
+        return ""
     if avx2:
         return ""
     if WIN:
@@ -1457,7 +1468,21 @@ def gpus():
     for line in s.strip().splitlines():
         try:
             idx, name, mem, cc, drv = [x.strip() for x in line.split(",")]
-            found.append({"index": int(idx), "name": name, "vram_gb": float(mem) / 1024.0, "arch": cc.replace(".", ""),
+            try:
+                mem_gb = float(mem) / 1024.0   # nvidia-smi nounits: MiB
+            except ValueError:
+                if not is_arm64():
+                    raise   # as before on x86: a card whose memory nvidia-smi does not report is not listed
+                # GB10 unified memory: memory.total is [N/A]. The pool is the machine RAM.
+                mem_gb = 0.0
+                try:
+                    for info in open("/proc/meminfo"):
+                        if info.startswith("MemTotal:"):
+                            mem_gb = int(info.split()[1]) / 1024.0 / 1024.0
+                            break
+                except OSError:
+                    pass
+            found.append({"index": int(idx), "name": name, "vram_gb": mem_gb, "arch": cc.replace(".", ""),
                           "driver": drv})
         except ValueError:
             continue
@@ -9014,7 +9039,7 @@ def main() -> int:
     pf = page_file_gb()
     if pf is not None and pf < 4:
         warn(page_file_advice(pf, page_file_setting()))
-    ok(f"CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2' if avx2 else 'no AVX2'})")
+    ok(f"CPU: {cpu} ({'ARM64' if is_arm64() else 'AVX-512' if avx512 else 'AVX2' if avx2 else 'no AVX2'})")
     link = None if hip else pcie_link(int(gpu.get("index", 0)))
     if link is not None:
         line, problem = pcie_lines(link)
@@ -9024,7 +9049,13 @@ def main() -> int:
     floor = cpu_floor(avx2)
     if floor == "unsupported":
         fail("this CPU has neither AVX2 nor SSE4.2; Strata needs at least SSE4.2 (Intel Nehalem, 2008, or newer)")
-    if not avx2:
+    if is_arm64():
+        # DGX Spark / GB10 (#3622): no ready-made ARM64 engine; setup compiles it here. A warning, not a stop.
+        warn("ARM64 CPU: setup compiles the engine on this PC (once). The CPU's share of the experts runs on ggml-cpu's "
+             "NEON kernels. Tested: GGUF packs with i-quant experts (IQ3_S). The Q2_0 and Gyro packs need the x86 "
+             "kernels and do not run on this CPU. This port is new and has not been measured against an x86 PC")
+        a.build = True
+    elif not avx2:
         # #394 #595 #623: the ready-made engine is AVX2; an older CPU gets one compiled here, whose CPU experts run on
         # ggml-cpu's kernels for this CPU.  Experimental: measured only on newer CPUs with the older path forced, and by
         # users on a few Xeons.  A warning, not a stop.
