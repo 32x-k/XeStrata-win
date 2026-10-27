@@ -314,7 +314,10 @@ def apply_choices(cfg: dict, s: S.LaunchSettings) -> dict:
     kv = s.kv or ("int8" if (s.context or 32768) > 8192 else "fp16")
     if "--kv" in args or s.kv:
         put("--kv", kv)
-    if s.vision == "off":
+    if cfg.get("arch") == "deepseek41":                      # the engine's own tower: --vision on / off is its whole picture setting
+        if s.vision:
+            put("--vision", "off" if s.vision == "off" else "on")
+    elif s.vision == "off":
         args = [a for a in args if a != "--vision"]
         cfg.pop("vision", None)                              # the picture reader's own settings: the server adds --vision for them
     elif s.vision and "--vision" not in args:

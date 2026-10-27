@@ -220,7 +220,7 @@ class Install(unittest.TestCase):
         self.assertEqual(self.cfg["engine_ready_s"], 3600)
         self.assertEqual(self.cfg["backend"], "hip")
         self.assertTrue(self.cfg["tokenizer"].endswith("tokenizer"))
-        self.assertNotIn("--vision", a)
+        self.assertEqual(a[a.index("--vision") + 1], "on")      # 0.2.7: the engine reads pictures with its own tower
         self.assertNotIn("--mtp", a)
         self.assertIn("4 cards, one block of layers on each", out)
         self.assertIn("n-gram table", out)
@@ -291,7 +291,9 @@ class Install(unittest.TestCase):
     def test_pictures_and_flash_next_settings_are_said(self):
         rc, out = self.install(vision="yes", kv="int8", context=131072)
         self.assertEqual(rc, 0, out)
-        self.assertIn("cannot read pictures in this Strata version", out)
+        self.assertNotIn("cannot read pictures", out)                          # 0.2.7: the engine's own tower reads them
+        a = self.cfg["args"]
+        self.assertEqual(a[a.index("--vision") + 1], "on")
         self.assertIn("Flash-Next settings", out)
         self.assertEqual(self.cfg["args"][self.cfg["args"].index("--max-context") + 1], "131072")
         self.assertIn("checked at 4K and 8K", out)
@@ -308,7 +310,7 @@ class Catalog(unittest.TestCase):
         self.assertEqual((small_sets["IST-DAS-2.00bpw"]["download_gb"], small_sets["IST-DAS-2.25bpw"]["download_gb"]), (256.8, 273.8))
         self.assertTrue(small_sets["IST-DAS-2.00bpw"]["on_this_pc"].startswith("fits"))
         size = small_sets["UD-Q8_K_XL"]
-        self.assertEqual((size["model"], size["id"], size["download_gb"], size["images"]), ("UD-Q8_K_XL", "deepseek-v4.1-flash-ud-q8_k_xl", 508.4, False))
+        self.assertEqual((size["model"], size["id"], size["download_gb"], size["images"]), ("UD-Q8_K_XL", "deepseek-v4.1-flash-ud-q8_k_xl", 508.4, True))
         self.assertTrue(size["on_this_pc"].startswith("fits"))
         self.assertTrue(size["mem_total"] and size["multi_file"])
         self.assertEqual(size["gpu_options"]["recommended"], "all")
@@ -338,7 +340,7 @@ class Catalog(unittest.TestCase):
                                           "cpu": {"avx2": True}}
         s.disk_free = lambda p: 2000.0
         plan, a = M.Tools(s).install_plan("deepseek41", "UD-Q8_K_XL", None, None, None, None, None, None, None, None, None)
-        self.assertEqual((plan["title"], plan["download_gb"], plan["context"], plan["images"]), ("DeepSeek-V4.1-Flash UD-Q8_K_XL", 508.4, 8192, "no"))
+        self.assertEqual((plan["title"], plan["download_gb"], plan["context"], plan["images"]), ("DeepSeek-V4.1-Flash UD-Q8_K_XL", 508.4, 8192, "yes"))   # 0.2.7: pictures on by default
         self.assertEqual(a[:6], ["--yes", "--no-start", "--family", "deepseek41", "--model", "UD-Q8_K_XL"])
         self.assertTrue(plan["ram"].startswith("fits"))
         for flag in ("--kv", "--low-ram", "--experimental-speed-projection"):

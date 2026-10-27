@@ -109,7 +109,12 @@ The server speaks to the engine as it does for the other models, so `/v1/chat/co
   (`STRATA_DS4_SLOT_GB`) and are removed after a week. The system prompt and tools shared by an agent
   and its sub-agents are kept as a checkpoint too. `STRATA_DS4_SLOT_KEEP=0` and `STRATA_DS4_AUTO_PIN=0` turn this off.
 
-Not in this version: several requests at once (`--parallel` is ignored with a warning) and pictures (`--vision` is ignored with a warning).
+Pictures are on by default: the engine reads them with its own vision tower (319 MiB of graphics memory, loaded with the model; no separate
+picture reader). The server decodes each picture, brings it to a size the tower takes (both sides a multiple of 42, at most 1024 image
+tokens) and hands it to the engine; it needs Pillow for that (`python -m pip install pillow`; setup installs it). `--vision no` in `strata launch`
+(or `--vision off` for the engine) turns them off; a request with a picture then gets a 400 that says so.
+
+Not in this version: several requests at once (`--parallel` is ignored with a warning).
 
 ## Speed: Faster or Full quality
 
