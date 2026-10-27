@@ -5342,7 +5342,9 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
                 open_kind = want
                 block = {"thinking": {"type": "thinking", "thinking": "", "signature": ""},
                          "text": {"type": "text", "text": ""},
-                         "tool_use": {"type": "tool_use", "id": ev.call.id if ev.call else "", "name":
+                         # Anthropic's ids start "toolu_"; the client sends it back as tool_result.tool_use_id
+                         "tool_use": {"type": "tool_use", "id": "toolu_" + ev.call.id.removeprefix("call_")
+                                      if ev.call else "", "name":
                                       ev.call.name if ev.call else "", "input": {}}}[want]
                 yield "content_block_start", {"type": "content_block_start", "index": index, "content_block": block}
             if want == "thinking":

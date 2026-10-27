@@ -31,7 +31,7 @@ import time
 import uuid
 from typing import Any
 
-from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs
+from serve.frontend import Event, _late_system_to_user, _order_tool_results, _parts_of, effort_kwargs
 
 ENCRYPTED_PREFIX = "strata.r1:"                   # our own reasoning replay strings; others' are ignored
 HOSTED_TOOLS = ("web_search", "web_search_preview", "file_search", "computer_use_preview", "computer_use",
@@ -213,29 +213,6 @@ def input_messages(req: dict) -> list[dict]:
     if lead > 1:
         messages[:lead] = [{"role": "system", "content": "\n\n".join(m["content"] for m in messages[:lead])}]
     return _late_system_to_user(messages)
-
-
-def _order_tool_results(messages):
-    """The template places tool results by position: each run of tool messages is put in the order of the calls of
-    the assistant turn before it (a client may send the results in the order they finished), then the private call
-    ids are dropped."""
-    i = 0
-    while i < len(messages):
-        if messages[i]["role"] != "tool":
-            i += 1
-            continue
-        j = i
-        while j < len(messages) and messages[j]["role"] == "tool":
-            j += 1
-        prev = messages[i - 1] if i else {}
-        order = [c.get("_call_id") for c in prev.get("tool_calls") or []]
-        rank = {cid: k for k, cid in enumerate(order) if cid}
-        messages[i:j] = sorted(messages[i:j], key=lambda m: rank.get(m.get("_call_id"), len(order)))
-        i = j
-    for m in messages:
-        m.pop("_call_id", None)
-        for c in m.get("tool_calls") or []:
-            c.pop("_call_id", None)
 
 
 def request_tools(req: dict):

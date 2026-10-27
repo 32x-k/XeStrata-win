@@ -493,6 +493,29 @@ def _late_system_to_user(messages: list[dict]) -> list[dict]:
     return [dict(m, role="user") if m.get("role") == "system" and i > 0 else m for i, m in enumerate(messages)]
 
 
+def _order_tool_results(messages):
+    """The template places tool results by position: each run of tool messages is put in the order of the calls of
+    the assistant turn before it (a client may send the results in the order they finished), then the private call
+    ids are dropped."""
+    i = 0
+    while i < len(messages):
+        if messages[i]["role"] != "tool":
+            i += 1
+            continue
+        j = i
+        while j < len(messages) and messages[j]["role"] == "tool":
+            j += 1
+        prev = messages[i - 1] if i else {}
+        order = [c.get("_call_id") for c in prev.get("tool_calls") or []]
+        rank = {cid: k for k, cid in enumerate(order) if cid}
+        messages[i:j] = sorted(messages[i:j], key=lambda m: rank.get(m.get("_call_id"), len(order)))
+        i = j
+    for m in messages:
+        m.pop("_call_id", None)
+        for c in m.get("tool_calls") or []:
+            c.pop("_call_id", None)
+
+
 def _object_list(value, name: str) -> list[dict]:
     """#460: a request's "messages" (or a message's "tool_calls") as a list of objects.  Some clients send the array
     double-encoded, as a JSON string, which used to be iterated character by character and crashed on m.get: such a
@@ -693,12 +716,15 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
             elif kind == "thinking":
                 reasoning.append(block.get("thinking", ""))
             elif kind == "tool_use":
-                calls.append({"function": {"name": block.get("name"), "arguments": tool_arguments(block.get("input"))}})
+                calls.append({"function": {"name": block.get("name"), "arguments": tool_arguments(block.get("input"))},
+                              "_call_id": block.get("id")})
             elif kind == "tool_result":
                 # A tool's image (Claude Code's Read of a picture) reaches the encoder like a user's, as the OpenAI
-                # path's tool messages already do; a text-only result is one string, as before.
+                # path's tool messages already do; a text-only result is one string, as before.  Its tool_use_id
+                # puts it beside its call (_order_tool_results): parallel results may come in any order.
                 messages.append({"role": "tool", "content": _parts_of(_check_parts(
-                    block.get("content"), f"messages[{i}].content[{j}].content", TEXT_PARTS + IMAGE_PARTS))})
+                    block.get("content"), f"messages[{i}].content[{j}].content", TEXT_PARTS + IMAGE_PARTS)),
+                    "_call_id": block.get("tool_use_id")})
         if text or calls or reasoning or parts:
             # an image sent beside tool results stays in this turn instead of being dropped
             out = {"role": m["role"], "content": _parts_of(parts) if _has_image(parts) else "".join(text)}
@@ -707,6 +733,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
             if calls:
                 out["tool_calls"] = calls
             messages.append(out)
+    _order_tool_results(messages)
     tools = [{"name": t["name"], "description": t.get("description", ""), "parameters": t.get("input_schema", {})}
              for t in _tool_list(req.get("tools"), None)] or None
     kwargs = {}
