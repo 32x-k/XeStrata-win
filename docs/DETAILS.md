@@ -518,6 +518,12 @@ applies at the next start. Network, key, MCP and program keys are not editable t
   correctness change, not a speed change. `spec_admission_test` enumerates the rule exactly for a two-token vocabulary,
   `gated_proposal_test` checks the proposal packet and `spec_proposal_parity` checks the GPU verifier against a CPU
   reference. A model-level distribution run is not published yet.
+- With `STRATA_SPEC_PROB=1` the CPU experts of a native (IQ) pack compute a token's rows the same way whatever the window
+  width: the grouped kernels that round differently from the one-token result are replaced by the one-token arithmetic,
+  and the grouped kernels that already match it stay. Prefill and every other decode keep their arithmetic.
+  `native_arithmetic_parity` checks every group width from 1 to 8 for the supported formats, bit for bit. Comparing other
+  decode modes against each other still needs one target evaluator; `STRATA_IQ_MT_MIN=1` selects the grouped IQ arithmetic
+  at every width and also changes prefill, so keep it the same in both arms.
 - **Non-finite logits end the request and drop the cached state (on by default).** If a verify window's logits are NaN, the
   window emits no tokens, the request ends, and the next request drops the live session, checkpoints and parked
   conversations and reads its prompt from token 0. The server retries a request that had sent nothing once, transparently.
