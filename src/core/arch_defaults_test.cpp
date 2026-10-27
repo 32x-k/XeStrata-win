@@ -396,5 +396,30 @@ int main() {
         CHECK(!prompt_attn_imma_default(false, 60));                        // Pascal (P100)
         CHECK(!prompt_attn_imma_default(true, 120));                        // HIP
     }
+    {
+        using namespace strata;
+        // the layer-major prompt walk (#3976): on by default for a CUDA layer split only
+        CHECK(prefill_layer_major_default(false, 2));                       // 2x RTX A4000 / A6000: measured 5x time to first token
+        CHECK(prefill_layer_major_default(false, 4));
+        CHECK(!prefill_layer_major_default(false, 1));                      // one GPU: opt-in only
+        CHECK(!prefill_layer_major_default(false, 0));
+        CHECK(!prefill_layer_major_default(true, 2));                       // HIP builds
+        CHECK(!prefill_layer_major_default(false, 2, true));                // STRATA_DEFAULTS=026
+        CHECK(!prefill_layer_major_default(true, 1, true));
+        // the variable wins in both directions, whatever the rule says
+        CHECK(!prefill_layer_major_resolve("0", false, 2));                 // the off switch
+        CHECK(prefill_layer_major_resolve("1", false, 1));                  // the opt-in of the first ports: one GPU too
+        CHECK(prefill_layer_major_resolve("1", false, 2, true));            // explicit beats STRATA_DEFAULTS=026
+        CHECK(!prefill_layer_major_resolve("0", false, 2, false));
+        CHECK(!prefill_layer_major_resolve("0", true, 2));
+        CHECK(prefill_layer_major_resolve("2", false, 1));                  // any non-zero number is on
+        CHECK(!prefill_layer_major_resolve("off", false, 2));               // text that reads as 0 is off (atoi), as before this rule existed
+        // unset or empty: the rule
+        CHECK(prefill_layer_major_resolve(nullptr, false, 2));
+        CHECK(prefill_layer_major_resolve("", false, 2));
+        CHECK(!prefill_layer_major_resolve(nullptr, false, 1));
+        CHECK(!prefill_layer_major_resolve(nullptr, false, 2, true));
+        CHECK(!prefill_layer_major_resolve(nullptr, true, 2));
+    }
     return fails ? 1 : 0;
 }

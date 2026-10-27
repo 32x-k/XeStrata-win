@@ -284,6 +284,7 @@ private:
     bool run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
     void lm_release();
     bool lm_mid_ = false;
+    bool lm_by_default_ = false;   ///< the walk is on because nothing was set (a wider VRAM margin, the measured super-chunk size)
     // Stage-1 pipeline: intermediate stages return after handing their chunk to
     // the direct successor. The public run() drains the chain once at prompt end.
     bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
