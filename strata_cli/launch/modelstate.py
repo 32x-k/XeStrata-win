@@ -112,7 +112,8 @@ def assess(catalog, family: str | None, model: str | None, *, vision: str = "off
     row = next((r for r in (rows if rows is not None else catalog.rows()) if r.family == family and r.model == model), None) if (family and model) else None
     st.total_gb = float(row.download_gb) if row else 0.0
     # DeepSeek reads pictures with its own engine's tower: nothing separate to fetch or to start (the tower's file is part of its setup)
-    own_tower = bool(family) and bool(catalog.strata.multi_family(family))
+    multi = getattr(getattr(catalog, "strata", None), "multi_family", None)
+    own_tower = bool(family) and multi is not None and bool(multi(family))
     wants_pictures = vision != "off" and (row is None or row.images) and not own_tower
     data = Path(data_dir) if data_dir else None
     if model_path:
