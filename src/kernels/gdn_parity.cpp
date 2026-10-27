@@ -98,6 +98,7 @@ double rel_l1(const std::vector<float>& a, const std::vector<float>& b) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    std::setvbuf(stdout, nullptr, _IONBF, 0);   // (progress lines survive a crash)
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--selftest") selftest = true;
@@ -509,6 +510,7 @@ int main(int argc, char** argv) {
                 // at (t - tb) * value_dim: the bytes native_quantize_q8_1 makes of y rows [tb, n), the outputs and the state
                 // unchanged by asking for it, and nothing written past those rows (the engine's second group has tb > 0)
                 if (c.tb < n) {
+                    if (std::getenv("STRATA_GDN_PARITY_TRACE")) std::printf("    trace: T=%d '%s' with a q8_1 destination\n", T, c.name);
                     const size_t qb = (size_t) (vd / 32) * 36, rows = (size_t) (n - c.tb);
                     void *d_q = dev((size_t) T * qb), *d_qr = dev((size_t) T * qb);
                     check(cudaMemset(d_q, 0x5a, (size_t) T * qb), "q0");
@@ -517,7 +519,9 @@ int main(int argc, char** argv) {
                     check(cudaMemset(d_y, 0, (size_t) T * vd * 4), "y1");
                     strata::kernels::gdn_step_norm_multi(d_st, d_h, C, d_gate, d_beta, d_z, d_gm, eps, d_y, h_k, h_v, T,
                                                          c.n_keep >= 0 ? d_nk : nullptr, nullptr, c.tb, d_q);
-                    strata::kernels::native_quantize_q8_1(d_y + (size_t) c.tb * vd, d_qr, vd, (int) rows, nullptr);
+                    static cudaStream_t qstream = nullptr;   // (native_quantize_q8_1 refuses the null stream; a blocking stream orders with the legacy one)
+                    if (qstream == nullptr) check(cudaStreamCreate(&qstream), "qstream");
+                    strata::kernels::native_quantize_q8_1(d_y + (size_t) c.tb * vd, d_qr, vd, (int) rows, qstream);
                     check(cudaDeviceSynchronize(), "q sync");
                     std::vector<uint8_t> hq((size_t) T * qb), hr((size_t) T * qb);
                     check(cudaMemcpy(hq.data(), d_q, hq.size(), cudaMemcpyDeviceToHost), "q read");

@@ -468,7 +468,9 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
     // shows), direct and as a graph replay. After every repetition: both groups' q8_1 bytes equal what
     // native_quantize_q8_1 makes of `mixed`, nothing outside the written ranges changed, and the counters are back at zero.
     if (!v3) {
-        constexpr int REPS = 200;
+        // (STRATA_GRP_REPS=N more repetitions, STRATA_GRP_KEEP_GOING=1 counts every failure instead of stopping at the first: to measure a rare one)
+        const int REPS = std::getenv("STRATA_GRP_REPS") ? std::max(1, std::atoi(std::getenv("STRATA_GRP_REPS"))) : 200;
+        const bool keep_going = std::getenv("STRATA_GRP_KEEP_GOING") != nullptr;
         const size_t B = (size_t) (N / 32) * 36;   // one token's q8_1 image
         uint8_t *d_qa = nullptr, *d_qb = nullptr, *d_qabs = nullptr, *d_ref2 = nullptr;
         unsigned* d_cnt2 = nullptr;
@@ -484,7 +486,7 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
         std::vector<unsigned> h_cnt(N / 32);
         int g2bad = 0;
         long runs = 0;
-        for (int tt = 2; tt <= T && !g2bad; ++tt) {
+        for (int tt = 2; tt <= T && (!g2bad || keep_going); ++tt) {
             const int h = (tt + 1) / 2;   // verify.cpp: tb_/te_ = {0, (T + 1) / 2}, {(T + 1) / 2, T}
             std::vector<FusedGrArgs> rel1(args.begin(), args.begin() + h), rel2(args.begin() + h, args.begin() + tt);
             std::vector<FusedGrArgs> abs1 = rel1, abs2 = rel2;
@@ -504,7 +506,7 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
             check(cudaStreamEndCapture(stream, &gg), "qfuse2 end");
             check(cudaGraphInstantiate(&gx, gg, nullptr, nullptr, 0), "qfuse2 instantiate");
             if (!w1 || !w2) { std::printf("  QFUSE two groups: T=%d: a group did not write its q8_1\n", tt); ++g2bad; }
-            for (int rep = 0; rep < REPS && !g2bad; ++rep) {
+            for (int rep = 0; rep < REPS && (!g2bad || keep_going); ++rep) {
                 for (auto& x : r) x = pn(prng);
                 for (auto& x : bo) x = pn(prng);
                 for (auto& x : inj) x = pn(prng);
@@ -541,6 +543,13 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
                         for (int t = 0; t < tt; ++t)
                             if (std::memcmp(g_all.data() + (size_t) t * B, g_ref.data() + (size_t) t * B, B) != 0) {
                                 std::printf("  QFUSE two groups (window-indexed): T=%d rep %d: token %d (group %d) differs\n", tt, rep, t, t < h ? 0 : 1);
+                                int nd = 0;   // where: block = 32 columns, bytes 0-3 the (scale, sum) pair, 4-35 the codes
+                                for (size_t o = 0; o < B && nd < 6; ++o)
+                                    if (g_all[(size_t) t * B + o] != g_ref[(size_t) t * B + o]) {
+                                        std::printf("    block %zu byte %zu (%s): got 0x%02x, separate quantise 0x%02x\n", o / 36, o % 36,
+                                                    o % 36 < 4 ? "scale/sum" : "code", g_all[(size_t) t * B + o], g_ref[(size_t) t * B + o]);
+                                        ++nd;
+                                    }
                                 break;
                             }
                         ++g2bad;
@@ -552,6 +561,12 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
                     check(cudaMemcpy(g_b.data(), d_qb, (size_t) T * B, cudaMemcpyDeviceToHost), "qfuse2 read b");
                     if (std::memcmp(g_a.data(), g_ref.data(), (size_t) h * B) != 0) {
                         std::printf("  QFUSE two groups (group-relative, %s): T=%d rep %d: group 0 differs\n", mode == 2 ? "graph" : "direct", tt, rep);
+                        for (size_t o = 0, nd = 0; o < (size_t) h * B && nd < 6; ++o)
+                            if (g_a[o] != g_ref[o]) {
+                                std::printf("    token %zu block %zu byte %zu (%s): got 0x%02x, separate quantise 0x%02x\n", o / B, (o % B) / 36,
+                                            o % 36, o % 36 < 4 ? "scale/sum" : "code", g_a[o], g_ref[o]);
+                                ++nd;
+                            }
                         ++g2bad;
                     }
                     if (std::memcmp(g_b.data(), g_ref.data() + (size_t) h * B, (size_t) (tt - h) * B) != 0) {
