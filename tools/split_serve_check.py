@@ -7,7 +7,7 @@
 Run it from the repository root (it imports serve.server and serve.split).  CONFIG.json:
 
   {"exe": "/path/strata", "cwd": "/path/repo", "args": ["--serve", "--pack", ..., "--max-context", "40960", ...],
-   "env": {"STRATA_STATE_HASH": "1", ...}, "prompts": "/path/prompts", "dir": "/path/work",
+   "env": {...}, "prompts": "/path/prompts", "dir": "/path/work",
    "prefill_gpu": 0, "decode_gpu": 1, "arena": "/path/arena.bin" (optional), "min_prompt_tokens": 2048}
 
 `args` holds no --layer-split, --shared-expert-arena or card choice: the tool adds them for each arm.
@@ -62,7 +62,7 @@ def mem_available_gib():
     return 0.0
 
 
-def make_engine(cfg, gpus, tag, extra_args=(), arena=None, min_free_gib=8.0):
+def make_engine(cfg, gpus, tag, extra_args=(), arena=None, min_free_gib=8.0, state_hash=False):
     free = mem_available_gib()
     if free < min_free_gib:
         raise SystemExit(f"only {free:.1f} GiB of RAM available (< {min_free_gib}): not starting an engine")
@@ -72,7 +72,8 @@ def make_engine(cfg, gpus, tag, extra_args=(), arena=None, min_free_gib=8.0):
     c["log"] = os.path.join(cfg["dir"], f"engine-{tag}.log")
     open(c["log"], "w").close()
     env = srv.child_env(c)
-    env["STRATA_STATE_HASH"] = "1"
+    if state_hash:                  # the fingerprint after every request costs time proportional to the prompt: exact mode only
+        env["STRATA_STATE_HASH"] = "1"
     for k, v in (cfg.get("env") or {}).items():
         env[str(k)] = str(v)
     t0 = time.time()
@@ -141,7 +142,7 @@ def cmd_exact(a, cfg):
     res = {"prompt_tokens": len(ids), "new_tokens": a.tokens, "runs": {}}
     # 1. the reference twice: a fresh engine on the decode card each time
     for k in (1, 2):
-        e = make_engine(cfg, Dg, f"ref{k}", arena=arena)
+        e = make_engine(cfg, Dg, f"ref{k}", arena=arena, state_hash=True)
         pos = log_size(e)
         r = run_gen(e, ids, a.tokens)
         h = state_hashes(log_tail(e, pos))
@@ -150,7 +151,7 @@ def cmd_exact(a, cfg):
         print(f"ref{k}: {len(r['tokens'])} tokens, wall {r['wall_s']:.1f} s", flush=True)
         close_all(e)
     # 2. the split: prefill engine, save, fresh decode engine, restore, answer
-    pe = make_engine(cfg, P, "prefill", arena=arena)
+    pe = make_engine(cfg, P, "prefill", arena=arena, state_hash=True)
     pos = log_size(pe)
     cancel = threading.Event()
     for _ in pe.generate(ids, 0, {}, cancel, prefill_only=True):
@@ -160,7 +161,7 @@ def cmd_exact(a, cfg):
     saved = pe.session_file("save", path)
     print(f"prefill engine: held {saved['tokens']} tokens, saved {saved['bytes'] / 2**20:.0f} MiB in {saved['ms']:.0f} ms",
           flush=True)
-    de = make_engine(cfg, Dg, "decode", arena=arena)
+    de = make_engine(cfg, Dg, "decode", arena=arena, state_hash=True)
     restored = de.session_file("restore", path)
     print(f"decode engine: restored {restored['tokens']} tokens in {restored['ms']:.0f} ms", flush=True)
     pos = log_size(de)
