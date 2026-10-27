@@ -961,6 +961,7 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
 - **From other devices on your network.** The server listens on your PC only (`127.0.0.1`) unless you say otherwise:
   run `./setup.sh --host 0.0.0.0 --api-key some-long-secret` (kept in the model's config for the next starts), or add `"host": "0.0.0.0"` and `"api_key": "..."` to `xestrata-<model>.json`.
   The server window then prints this PC's addresses (`from other devices: http://192.168.x.x:8095/`).
+  For IPv6 use `--host ::` (or `"host": "::"`, all IPv6 interfaces) and put the address in brackets in URLs, for example `http://[2001:db8::7]:8095/v1`.
   Open that on the other device, or use `.../v1` as an API base URL.
 - **From the internet.** Put a tunnel in front of it, for example
   [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/):

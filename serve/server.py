@@ -6811,6 +6811,11 @@ class Server(ThreadingHTTPServer):
     # kernel (STRATA_HTTP_BACKLOG overrides it)
     request_queue_size = max(5, int(os.environ.get("STRATA_HTTP_BACKLOG") or 256))
 
+    def __init__(self, server_address, RequestHandlerClass, bind_and_activate=True):
+        if ":" in server_address[0]:                    # an IPv6 address (`::`): an IPv6 socket (upstream eba3106c0)
+            self.address_family = socket.AF_INET6
+        super().__init__(server_address, RequestHandlerClass, bind_and_activate)
+
     def handle_error(self, request, client_address):
         if not isinstance(sys.exc_info()[1], ConnectionError):   # a client that hangs up needs no stack trace
             super().handle_error(request, client_address)
@@ -7451,7 +7456,8 @@ def main() -> int:
                                      "written by setup.py")
     ap.add_argument("--host", default=None,
                     help="the address to listen on: 127.0.0.1 = this PC only (the default), "
-                         "0.0.0.0 = also other devices on your network (set an API key); also \"host\" in the config")
+                         "0.0.0.0 = also other devices on your network, :: = all IPv6 interfaces (set an API key); "
+                         "also \"host\" in the config")
     ap.add_argument("--script", action="append",
                     help="the mock engine's answer (default: a short greeting); given more than once, requests get "
                          "them in turn and the last one repeats")
@@ -7510,7 +7516,7 @@ def main() -> int:
         cfg["gpu"] = int(a.gpu) if a.gpu.strip().isdigit() else a.gpu
     a.host = a.host or cfg.get("host") or "127.0.0.1"   # issue #26: the run scripts pass no --host, the config can
     try:                                                # before the minutes of loading: is the port free?
-        ThreadingHTTPServer((a.host, a.port), BaseHTTPRequestHandler).server_close()
+        Server((a.host, a.port), BaseHTTPRequestHandler).server_close()
     except OSError as e:
         ap.error(listen_problem(a.host, a.port, e))
     if cfg.get("tokenizer"):
@@ -7791,25 +7797,28 @@ def main() -> int:
     httpd = serve(svc, host=a.host, port=a.port)
     svc.start_idle_unload()
     svc.start_vision_idle()
-    here = "127.0.0.1" if a.host in ("0.0.0.0", "", "::") else a.host
+    # an IPv6 address goes in brackets in a URL (upstream eba3106c0, #3212)
+    here = ("[::1]" if a.host == "::" else "127.0.0.1" if a.host in ("0.0.0.0", "")
+            else f"[{a.host}]" if ":" in a.host else a.host)
     print(f"ready: http://{here}:{a.port}/v1  (OpenAI: /v1/chat/completions, Anthropic: /v1/messages, "
           f"context {engine.max_context} tokens{', images on' if vision else ''}"
           f"{', API key required' if svc.api_key else ''})", flush=True)
     print(f"       open http://{here}:{a.port}/ in a browser to chat; close this window to stop the model", flush=True)
     if a.host not in ("127.0.0.1", "localhost", "::1"):
         # issue #26: reachable from other devices - say at which address, and what can still block it
-        ips = lan_addresses()
+        ips = [f"[{a.host}]"] if ":" in a.host and a.host != "::" else [] if a.host == "::" else lan_addresses()
         for ip in ips:
             print(f"       from other devices: http://{ip}:{a.port}/   (API: http://{ip}:{a.port}/v1)", flush=True)
         if not ips:
-            print("       from other devices: http://<this PC's IP address>:" + str(a.port) + "/", flush=True)
+            address = "[<this PC's IPv6 address>]" if a.host == "::" else "<this PC's IP address>"
+            print(f"       from other devices: http://{address}:{a.port}/", flush=True)
         if not svc.api_key:
             print("       WARNING: " + open_server_warning(a.port, tools=svc.mcp is not None), flush=True)
     if release_check.enabled():                         # at the start and every six hours, said here once
         svc.updates.watch(lambda line: print("[strata] " + line, flush=True))
     if a.open and cfg.get("open_browser") is not False:   # #609: the config's "open_browser": false wins (an older
         import webbrowser                                  # run-<model>.sh still passes --open)
-        webbrowser.open(f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/")
+        webbrowser.open(f"http://{here}:{a.port}/")
     # #96: docker stop sends SIGTERM, which Python ignores by default, so the container's PID 1 would be killed after
     # the grace period with the engine still running. SIGTERM takes Ctrl+C's path below (QUIT to the engine).
     # SIGINT keeps Python's own handler, so Ctrl+C and a second Ctrl+C work as before.

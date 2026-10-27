@@ -928,6 +928,7 @@ print(r.choices[0].message.content)
 - **同じネットワークのほかの機器から**: 指定しなければ、server はこの PC（`127.0.0.1`）でだけ待ち受けます。
   `./setup.sh --host 0.0.0.0 --api-key 長い秘密の文字列` で起動するか（モデルの設定に保存され、次からも使われます）、`xestrata-<model>.json` に `"host": "0.0.0.0"` と `"api_key": "..."` を書きます。
   server のウィンドウに、この PC のアドレスが出ます（`from other devices: http://192.168.x.x:8095/`）。
+  IPv6 では `--host ::`（または `"host": "::"`。IPv6 のすべてのインターフェース）を使い、URL ではアドレスを角かっこで囲みます（例: `http://[2001:db8::7]:8095/v1`）。
   ほかの機器でそれを開くか、`.../v1` を API のベース URL に使います。
 - **インターネットから**: 前にトンネルを置きます。
   たとえば [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/) なら
