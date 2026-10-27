@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -731,7 +732,9 @@ std::pair<double, double> MfDit::time_forms(int64_t rows) const {
                     qi_i8_scale(y, T, N, N, sx, sw, nullptr, s_);
                 });
         }
-    } catch (const std::exception&) {   // a form the library could not run: not chosen
+    } catch (const std::exception& e) {   // a form the library could not run: the 8-bit one is not chosen
+        std::fprintf(stderr, "image engine: timing Mage-Flow's DiT in 16 and 8 bits: %s (16 bits kept)\n", e.what());
+        w8 = 0.0;
     }
     gpu::stream_sync(s_);
     for (void* p : held) gpu::free(p);
