@@ -4204,7 +4204,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
             for (int32_t r = 0; r < gp.nr; ++r) {
                 const int32_t p = fillp[(size_t) slot[(size_t) row_tok[gp.r0 + r]]]++;
                 u_rows[gp.r0 + p] = r;
-                u_w[gp.r0 + p] = row_w[(size_t) (gp.r0 + r)];
+                u_w[gp.r0 + p] = row_w[(size_t) gp.r0 + (size_t) r];
             }
             for (int64_t i = 0; i < nu; ++i) slot[(size_t) ut[i]] = -1;
             gp.nu = nu;
@@ -4574,7 +4574,6 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                         return false;
                     }
                 }
-                bool normed = false;
                 for (int half = 0; half < 2; ++half) {
                     // ---- the hyper-connection read of this half (the default path's)
                     const char* pre = half == 0 ? "hc_attn_" : "hc_ffn_";
@@ -4584,8 +4583,8 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                                           *wu = need(v, su.c_str(), err), *wi = need(v, si.c_str(), err);
                     if (!wn || !wd || !wu || !wi) return false;
                     pt.mark(kPfHc, cs);
-                    if (!normed) gr_norm_rs(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, cs, m.xn16_lo);
-                    normed = false;
+                    // (the FFN half's norm ran with the attention half's write: gr_write_norm_rs below)
+                    if (half == 0) gr_norm_rs(m.R, (const float*) wn->data, EPS, m.xn, m.xn16, T, cs, m.xn16_lo);
                     // STRATA_HC_Q8 with the BF16 copies dropped: each from its Q8_0 copy, dequantized on cs
                     core::WeightRef wdv = *wd, wuv = *wu;
                     if (wd->data == nullptr) wdv.data = core::hc_bf16_view(wd, 0, cs);
@@ -4751,7 +4750,6 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                     if (!wnn) return false;
                     pt.mark(kPfHcWrite, cs);
                     gr_write_norm_rs(m.R, m.bo, m.inj, HC, (const float*) wnn->data, EPS, m.xn, m.xn16, T, cs, m.xn16_lo);
-                    normed = true;
                 }
                 if (!lb.r_dev) {   // down on the copy stream once this sub-chunk's work is done
                     strata::gpu::event_record(lb.ev_done[c & 1], cs);
