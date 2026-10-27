@@ -39,6 +39,80 @@ bool tq_rows_own(int type) {
     return type >= (int) GGML_TYPE_COUNT || traits(type) == nullptr || traits(type)->vec_dot == nullptr;
 }
 
+// Window-invariant arithmetic (NativeArithmetic::WindowInvariant): the reference rows below reproduce ggml-cpu's one-token dot bit for bit
+// only if that ggml was built to sum the same way (contraction of the scalar tail into an FMA, for one, depends on the build). So each
+// reference is checked once against the linked ggml on synthetic blocks, odd block counts included, and a mismatch sends the invariant
+// path to ggml's own one-token dot per token (slower, never different).
+bool iq4nl_reference_ok() {
+    static const bool ok = [] {
+        const ggml_type_traits_cpu* tr = traits(GGML_TYPE_IQ4_NL);
+        const ggml_type_traits_cpu* t8 = traits(GGML_TYPE_Q8_0);
+        if (tr == nullptr || tr->vec_dot == nullptr || t8 == nullptr || t8->from_float == nullptr) return false;
+        uint32_t seed = 4242u;
+        auto rnd = [&seed] { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+        for (const int n : {64, 96, 160, 640}) {   // even and odd numbers of blocks: the odd one ends in the scalar tail
+            constexpr int rows = 16;
+            const size_t rb = ggml_row_size(GGML_TYPE_IQ4_NL, (int64_t) n), nb = (size_t) n / 32, bb = rb / nb;
+            std::vector<uint8_t> w((size_t) rows * rb), act(ggml_row_size(GGML_TYPE_Q8_0, (int64_t) n));
+            for (auto& b : w) b = (uint8_t) rnd();
+            for (int r = 0; r < rows; ++r)
+                for (size_t k = 0; k < nb; ++k) { uint8_t* d = &w[(size_t) r * rb + k * bb]; d[0] = 0x66; d[1] = 0x2e; }
+            std::vector<float> x((size_t) n);
+            for (auto& v : x) v = ((float) (rnd() % 2001) - 1000.f) * 0.001f;
+            t8->from_float(x.data(), act.data(), n);
+            std::vector<float> got((size_t) rows), want((size_t) rows);
+            const void* hp[1] = {act.data()};
+            float* op[1] = {got.data()};
+            iq4nl_reference_rows(w.data(), rb, n, hp, 1, op, 0, rows);
+            for (int r = 0; r < rows; ++r) tr->vec_dot(n, &want[(size_t) r], 0, w.data() + (size_t) r * rb, 0, act.data(), 0, 1);
+            if (std::memcmp(got.data(), want.data(), got.size() * sizeof(float)) != 0) {
+                std::fprintf(stderr, "strata: the window-invariant IQ4_NL rows differ from this ggml-cpu's dot (n=%d): its dot runs per token instead\n", n);
+                return false;
+            }
+        }
+        return true;
+    }();
+    return ok;
+}
+
+// The same check for the AVX-512 accumulation of IQ3_XXS / IQ3_S / IQ2_S gate/up rows (types 18, 21, 22), SwiGLU included.
+bool iq512_reference_ok(int type) {
+    static std::mutex mu;
+    static std::map<int, bool> memo;
+    std::lock_guard<std::mutex> lk(mu);
+    if (const auto it = memo.find(type); it != memo.end()) return it->second;
+    bool ok = false;
+    const ggml_type_traits_cpu* tr = traits(type);
+    const ggml_type_traits_cpu* t8 = traits(GGML_TYPE_Q8_K);
+    if (tr != nullptr && tr->vec_dot != nullptr && t8 != nullptr && t8->from_float != nullptr) {
+        constexpr int n = 2560, rows = 24;
+        const size_t rb = ggml_row_size((ggml_type) type, n), nb = (size_t) n / 256, bb = rb / nb;
+        std::vector<uint8_t> w((size_t) 2 * rows * rb), act(ggml_row_size(GGML_TYPE_Q8_K, n));
+        uint32_t seed = 777u;
+        auto rnd = [&seed] { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+        for (auto& b : w) b = (uint8_t) rnd();
+        for (int r = 0; r < 2 * rows; ++r)
+            for (size_t k = 0; k < nb; ++k) { uint8_t* d = &w[(size_t) r * rb + k * bb]; d[0] = 0x66; d[1] = 0x2e; }
+        std::vector<float> x(n);
+        for (auto& v : x) v = ((float) (rnd() % 2001) - 1000.f) * 0.001f;
+        t8->from_float(x.data(), act.data(), n);
+        std::vector<float> got((size_t) rows), want((size_t) rows);
+        const void* ap[1] = {act.data()};
+        float* fp[1] = {got.data()};
+        iq512_reference_gu_rows(type, w.data(), rb, (size_t) rows * rb, n, ap, 1, fp, 0, rows);
+        for (int r = 0; r < rows; ++r) {
+            float g = 0.f, u = 0.f;
+            tr->vec_dot(n, &g, 0, w.data() + (size_t) r * rb, 0, act.data(), 0, 1);
+            tr->vec_dot(n, &u, 0, w.data() + (size_t) rows * rb + (size_t) r * rb, 0, act.data(), 0, 1);
+            want[(size_t) r] = (g / (1.f + std::exp(-g))) * u;
+        }
+        ok = std::memcmp(got.data(), want.data(), got.size() * sizeof(float)) == 0;
+        if (!ok) std::fprintf(stderr, "strata: the window-invariant 512-bit rows of type %d differ from this ggml-cpu's dot: its dot runs per token instead\n", type);
+    }
+    memo[type] = ok;
+    return ok;
+}
+
 // 0.2.5: the 512-bit exact rows (iq512x_rows) take one token of an IQ3_XXS / IQ3_S expert only if this build's ggml-cpu dot gives
 // the same bits on synthetic blocks of that type (a ggml built for AVX-512 may carry another summation order): checked once a type.
 bool x512_one_ok(int type) {
@@ -379,7 +453,7 @@ void native_gu_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* co
         if (singleton_iq) {
 #if defined(__x86_64__) || defined(_M_X64)
             if (avx512 && ggml_cpu_has_avx2() && ggml_cpu_has_fma() &&
-                (f.gu_type == 18 || f.gu_type == 21 || f.gu_type == 22)) {
+                (f.gu_type == 18 || f.gu_type == 21 || f.gu_type == 22) && iq512_reference_ok(f.gu_type)) {
                 iq512_reference_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
                 return;
             }
@@ -465,7 +539,7 @@ void native_down_rows_impl(const NativeFmt& f, const uint8_t* blob, const void* 
             return;
         }
 #if defined(__x86_64__) || defined(_M_X64)
-        if (ggml_cpu_has_avx2() && ggml_cpu_has_fma()) {
+        if (ggml_cpu_has_avx2() && ggml_cpu_has_fma() && iq4nl_reference_ok()) {
             iq4nl_reference_rows(blob + f.down_off, f.d_row, (int) f.n_ff, hq, nt, out, r0, r1);
             return;
         }
