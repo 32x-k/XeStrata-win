@@ -2379,8 +2379,9 @@ void cand_blocks(const float* score, long long stride, int T, const Rows& r, int
             nb_max = rb.n[t] > nb_max ? rb.n[t] : nb_max;
         }
 #if defined(STRATA_METAL)
-    // block_max_kernel on the Metal dispatch; the launch below is the fallback
-    if (strata::dsv41::metal_host::block_max(score, stride, T, &r, blk, bm, bm_stride, nb_max)) return;
+    // block_max_kernel on the Metal dispatch; the launch below is the fallback.  The selection of the best blocks (topk) follows either way:
+    // returning here skipped it, the candidate list stayed unwritten and every context past 16K tokens (4,096 compressed rows) read garbage.
+    if (!strata::dsv41::metal_host::block_max(score, stride, T, &r, blk, bm, bm_stride, nb_max))
 #endif
     strata_ds4_launch(block_max_kernel, dim3(cdiv(nb_max, kThreads), T), kThreads, 0, s, score, stride, r, blk, bm, bm_stride);
     topk(bm, bm_stride, T, rb, nullptr, 0, 1, out, out_stride, s);
