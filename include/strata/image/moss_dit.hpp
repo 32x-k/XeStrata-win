@@ -22,6 +22,10 @@
 //
 // Guidance: up to two contexts (the prompt and the negative prompt) run through each product together, a context's
 // rows after the other's; a context may skip blocks (the reference pipeline's negative branch skips block 22).
+// Skip-layer guidance runs the prompt a third time with its blocks skipped (sample).
+//
+// The text embedder's weights (0.4 GiB) are needed only by set_context: drop_text gives their VRAM back, and the next
+// set_context reads them again from the file.
 #pragma once
 
 #include "strata/image/mf_dit.hpp"
@@ -29,6 +33,7 @@
 #include "strata/prefill/gemm.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -54,6 +59,22 @@ public:
     /// The blocks context i skips (none by default).
     void set_skip(int i, std::vector<int> blocks) { ctx_[i].skip = std::move(blocks); }
 
+    /// The sampler's guidance (the reference pipeline's arguments).  cfg: with context 1, u + cfg (c - u);
+    /// uncond_skip: the blocks context 1 skips; slg (with slg_scale above 0): a third pass of context 0 with those
+    /// blocks skipped, slg_scale (c - k) added.  Both skips act in the steps whose share of the schedule is in
+    /// [start, stop).
+    struct Guide {
+        float cfg = 1.f;
+        std::vector<int> uncond_skip, slg;
+        float slg_scale = 0.f, start = 0.f, stop = 1.f;
+    };
+    /// Euler steps over sigmas (n steps and the terminal 0) from x [h w][128] (device FP32, in place), each at the
+    /// timestep sigma times 1000.  first, total: the schedule's steps before sigmas' first and in all (the shares the
+    /// guide's window is in).  step: the progress, false to stop (QiStopped); after: at each step's next sigma (a mask's
+    /// blend).
+    void sample(float* x, int64_t h, int64_t w, const std::vector<float>& sigmas, const Guide& g, int first, int total,
+                const std::function<bool(int, int)>& step = {}, const std::function<void(float*, float)>& after = {});
+
     /// The velocity [n][h w][128] (device FP32) of the latent tokens x [h w][128] (device FP32) at `timestep` (sigma
     /// times 1000, as the reference pipeline gives it), for the contexts 0 .. n - 1 (n 1 or 2).
     void forward(const float* x, float timestep, int64_t h, int64_t w, int n, float* out);
@@ -72,11 +93,19 @@ public:
     int resident_blocks() const { return blocks_stream_.resident(); }
     uint64_t blocks_vram() const { return blocks_stream_.vram(); }
     void drop_blocks() { blocks_stream_.drop(); }
-    uint64_t weight_bytes() const { return weight_bytes_; }   // what stays on the GPU besides the blocks
+    uint64_t weight_bytes() const { return weight_bytes_; }   // what stays on the GPU besides the blocks and the text's
+    uint64_t text_bytes() const { return text_bytes_; }       // the text embedder's weights
+    bool text_loaded() const { return text_loaded_; }
+    void drop_text();
+    uint64_t scratch_bytes() const { return (uint64_t) scratch_ * 2; }   // the products' dequantization scratch
     /// The working buffers n contexts of hw image rows take (text rows up to max_text a context), with the MLP a band
     /// of mlp_rows rows at a time (0: all).
     uint64_t activation_bytes(int64_t hw, int n, int64_t max_text, int64_t mlp_rows = 0) const;
     void set_mlp_rows(int64_t rows) { mlp_cap_ = rows; }
+    /// What the working buffers take now
+    uint64_t activations_held() const {
+        return cap_hw_ > 0 ? activation_bytes(cap_hw_, (int) cap_n_, cap_text_, mlp_rows_) : 0;
+    }
     void drop_activations();
 
     /// The rows of context 0 after block 0 and the text embedder's rows of context 0 (device FP32 [h w + rows][C],
@@ -109,6 +138,10 @@ private:
         float *cos = nullptr, *sin = nullptr;
         int64_t rope_h = -1, rope_w = -1, rope_rows = -1;
     };
+    W dense(const std::vector<std::string>& names, bool biased, const float** bias, std::vector<void*>& owned,
+            uint64_t& bytes);
+    const float* vec(const std::string& name, std::vector<void*>& owned, uint64_t& bytes);
+    void load_text();
     MfOut product(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y, int64_t T,
                   const float* bias, bool same_input = false, bool defer = false);
     void ensure(int64_t hw, int n, int64_t max_text);
@@ -125,9 +158,10 @@ private:
     std::vector<std::vector<uint8_t>> host_;   // the blocks' quantized weights and FP32 vectors, when not in place
     void* s_ = nullptr;
     prefill::Gemm gemm_;
-    std::vector<void*> allocs_;
-    uint64_t weight_bytes_ = 0;
-    bool dry_ = false, q8_ = true, w8_ = false, keep0_ = false;
+    std::vector<void*> allocs_, text_allocs_;
+    uint64_t weight_bytes_ = 0, text_bytes_ = 0;
+    int64_t scratch_ = 0;
+    bool dry_ = false, q8_ = true, w8_ = false, keep0_ = false, text_loaded_ = false;
     int64_t C_ = 3072, F_ = 8192, heads_ = 24, hd_ = 128, in_ch_ = 128, txt_dim_ = 4096, freq_ = 256;
     double rope_base_ = 10000.0;
     // the parts outside the blocks, FP16 on the GPU

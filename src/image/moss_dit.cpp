@@ -9,6 +9,7 @@
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/image/mapped_file.hpp"
+#include "strata/image/pipeline.hpp"
 #include "strata/image/qi_kernels.hpp"
 #include "strata/image/safetensors.hpp"
 #include "strata/kernels/bf16_bits.hpp"
@@ -229,6 +230,7 @@ MossDit::MossDit() = default;
 MossDit::~MossDit() {
     blocks_stream_.drop();
     for (void* p : allocs_) gpu::free(p);
+    for (void* p : text_allocs_) gpu::free(p);
 }
 
 bool MossDit::open(const std::string& path, void* stream, std::string& err, bool dry, bool q8) {
@@ -245,101 +247,22 @@ bool MossDit::open(const std::string& path, void* stream, std::string& err, bool
             if (const size_t at = cfg.find("\"rope_base\""); at != std::string::npos)
                 rope_base_ = std::stod(cfg.substr(cfg.find(':', at) + 1));
         }
-        // the parts outside the blocks: the rows of the named weights one after the other as FP16, their biases FP32
-        auto dense = [&](const std::vector<std::string>& names, bool biased, const float** bias) {
-            W w;
-            w.type = kTypeF16;
-            std::vector<const uint8_t*> src;
-            for (const auto& name : names) {
-                const uint8_t* d = nullptr;
-                const SafeTensor& t = f.bf16(name + ".weight", &d);
-                if (w.k != 0 && t.shape[1] != w.k)
-                    throw std::runtime_error("image engine (MOSS-Image DiT): " + name + ": columns differ");
-                w.k = t.shape[1];
-                w.n += t.shape[0];
-                src.push_back(d);
-            }
-            w.row_bytes = (uint64_t) w.k * 2;
-            weight_bytes_ += (uint64_t) (w.n * w.k) * 2 + (biased ? (uint64_t) w.n * 4 : 0);
-            if (dry_) return w;
-            std::vector<uint16_t> h((size_t) (w.n * w.k));
-            std::vector<float> b;
-            size_t at = 0;
-            for (size_t j = 0; j < names.size(); ++j) {
-                const int64_t n = f.bf16(names[j] + ".weight", nullptr).shape[0];
-                const auto* s16 = reinterpret_cast<const uint16_t*>(src[j]);
-                for (int64_t i = 0; i < n * w.k; ++i) h[at++] = f16_from_f32(bf16_value(s16[i]));
-                if (biased) {
-                    const auto v = f.f32(names[j] + ".bias");
-                    b.insert(b.end(), v.begin(), v.end());
-                }
-            }
-            uint16_t* d = alloc<uint16_t>(allocs_, (int64_t) h.size());
-            gpu::copy(d, h.data(), h.size() * 2);
-            w.d = d;
-            if (biased) {
-                float* db = alloc<float>(allocs_, (int64_t) b.size());
-                gpu::copy(db, b.data(), b.size() * 4);
-                *bias = db;
-            }
-            return w;
-        };
-        auto vec = [&](const std::string& name) -> const float* {
-            const int64_t n = f.bf16(name, nullptr).elements();
-            weight_bytes_ += (uint64_t) n * 4;
-            if (dry_) return nullptr;
-            const auto v = f.f32(name);
-            float* d = alloc<float>(allocs_, n);
-            gpu::copy(d, v.data(), v.size() * 4);
-            return d;
-        };
-        // a W's rows r0 .. r0 + n of a dense one (the text blocks' q, k and v of their one qkv)
-        auto rows = [](const W& w, int64_t r0, int64_t n) {
-            W r = w;
-            r.n = n;
-            if (r.d != nullptr) r.d = static_cast<const uint16_t*>(w.d) + r0 * w.k;
-            return r;
-        };
-        vin_ = dense({"video_embedder"}, true, &b_vin_);
+        vin_ = dense({"video_embedder"}, true, &b_vin_, allocs_, weight_bytes_);
         in_ch_ = vin_.k;
         C_ = vin_.n;
-        tproj_ = dense({"text_embedder.proj"}, true, &b_tproj_);
-        txt_dim_ = tproj_.k;
-        t1_ = dense({"time_embedding.0"}, true, &b_t1_);
+        t1_ = dense({"time_embedding.0"}, true, &b_t1_, allocs_, weight_bytes_);
         freq_ = t1_.k;
-        t2_ = dense({"time_embedding.2"}, true, &b_t2_);
-        smod_ = dense({"shared_block_modulation"}, true, &b_smod_);
-        hmod_ = dense({"video_head_modulation"}, true, &b_hmod_);
-        fout_ = dense({"final_linear_video"}, false, nullptr);
-        fnorm_ = vec("final_norm_video.weight");
+        t2_ = dense({"time_embedding.2"}, true, &b_t2_, allocs_, weight_bytes_);
+        smod_ = dense({"shared_block_modulation"}, true, &b_smod_, allocs_, weight_bytes_);
+        hmod_ = dense({"video_head_modulation"}, true, &b_hmod_, allocs_, weight_bytes_);
+        fout_ = dense({"final_linear_video"}, false, nullptr, allocs_, weight_bytes_);
+        fnorm_ = vec("final_norm_video.weight", allocs_, weight_bytes_);
         hd_ = f.bf16("layers.0.q_norm.weight", nullptr).shape[0];
         heads_ = C_ / hd_;
         if (C_ % hd_ != 0 || hd_ % 8 != 0 || smod_.n != 6 * C_ || hmod_.n != 2 * C_)
             throw std::runtime_error("image engine (MOSS-Image DiT): an unexpected shape");
-        for (int i = 0;; ++i) {
-            const std::string p = "text_embedder.blocks." + std::to_string(i) + ".";
-            if (f.find(p + "qkv.weight") == nullptr) break;
-            TextBlock b;
-            const float* bqkv = nullptr;
-            const W qkv = dense({p + "qkv"}, true, &bqkv);
-            b.q = rows(qkv, 0, C_);
-            b.k = rows(qkv, C_, C_);
-            b.v = rows(qkv, 2 * C_, C_);
-            if (!dry_) {
-                b.bq = bqkv;
-                b.bk = bqkv + C_;
-                b.bv = bqkv + 2 * C_;
-            }
-            b.o = dense({p + "proj"}, true, &b.bo);
-            b.up_gate = dense({p + "ffn_up", p + "ffn_gate"}, true, &b.bug);
-            b.down = dense({p + "ffn_down"}, true, &b.bdown);
-            b.n1 = vec(p + "norm1.weight");
-            b.n2 = vec(p + "norm2.weight");
-            b.nq = vec(p + "q_norm.weight");
-            b.nk = vec(p + "k_norm.weight");
-            tblocks_.push_back(b);
-        }
-        int64_t scratch = 0;
+        load_text();
+        int64_t& scratch = scratch_;
         for (int i = 0;; ++i) {
             const std::string p = "layers." + std::to_string(i) + ".";
             if (f.find(p + "proj.q.weight") == nullptr) break;
@@ -426,6 +349,105 @@ bool MossDit::open(const std::string& path, void* stream, std::string& err, bool
         err = e.what();
         return false;
     }
+}
+
+// a part outside the blocks: the rows of the named weights one after the other as FP16, their biases FP32 (in `owned`,
+// their bytes added to `bytes`)
+MossDit::W MossDit::dense(const std::vector<std::string>& names, bool biased, const float** bias,
+                          std::vector<void*>& owned, uint64_t& bytes) {
+    const Shards& f = *files_;
+    W w;
+    w.type = kTypeF16;
+    std::vector<const uint8_t*> src;
+    for (const auto& name : names) {
+        const uint8_t* d = nullptr;
+        const SafeTensor& t = f.bf16(name + ".weight", &d);
+        if (w.k != 0 && t.shape[1] != w.k)
+            throw std::runtime_error("image engine (MOSS-Image DiT): " + name + ": columns differ");
+        w.k = t.shape[1];
+        w.n += t.shape[0];
+        src.push_back(d);
+    }
+    w.row_bytes = (uint64_t) w.k * 2;
+    bytes += (uint64_t) (w.n * w.k) * 2 + (biased ? (uint64_t) w.n * 4 : 0);
+    if (dry_) return w;
+    std::vector<uint16_t> h((size_t) (w.n * w.k));
+    std::vector<float> b;
+    size_t at = 0;
+    for (size_t j = 0; j < names.size(); ++j) {
+        const int64_t n = f.bf16(names[j] + ".weight", nullptr).shape[0];
+        const auto* s16 = reinterpret_cast<const uint16_t*>(src[j]);
+        for (int64_t i = 0; i < n * w.k; ++i) h[at++] = f16_from_f32(bf16_value(s16[i]));
+        if (biased) {
+            const auto v = f.f32(names[j] + ".bias");
+            b.insert(b.end(), v.begin(), v.end());
+        }
+    }
+    uint16_t* d = alloc<uint16_t>(owned, (int64_t) h.size());
+    gpu::copy(d, h.data(), h.size() * 2);
+    w.d = d;
+    if (biased) {
+        float* db = alloc<float>(owned, (int64_t) b.size());
+        gpu::copy(db, b.data(), b.size() * 4);
+        *bias = db;
+    }
+    return w;
+}
+
+const float* MossDit::vec(const std::string& name, std::vector<void*>& owned, uint64_t& bytes) {
+    const int64_t n = files_->bf16(name, nullptr).elements();
+    bytes += (uint64_t) n * 4;
+    if (dry_) return nullptr;
+    const auto v = files_->f32(name);
+    float* d = alloc<float>(owned, n);
+    gpu::copy(d, v.data(), v.size() * 4);
+    return d;
+}
+
+// the text embedder: its input projection and its blocks (their q, k and v rows of one qkv), FP16 on the GPU
+void MossDit::load_text() {
+    text_bytes_ = 0;
+    auto rows = [](const W& w, int64_t r0, int64_t n) {
+        W r = w;
+        r.n = n;
+        if (r.d != nullptr) r.d = static_cast<const uint16_t*>(w.d) + r0 * w.k;
+        return r;
+    };
+    tproj_ = dense({"text_embedder.proj"}, true, &b_tproj_, text_allocs_, text_bytes_);
+    txt_dim_ = tproj_.k;
+    tblocks_.clear();
+    for (int i = 0;; ++i) {
+        const std::string p = "text_embedder.blocks." + std::to_string(i) + ".";
+        if (files_->find(p + "qkv.weight") == nullptr) break;
+        TextBlock b;
+        const float* bqkv = nullptr;
+        const W qkv = dense({p + "qkv"}, true, &bqkv, text_allocs_, text_bytes_);
+        b.q = rows(qkv, 0, C_);
+        b.k = rows(qkv, C_, C_);
+        b.v = rows(qkv, 2 * C_, C_);
+        if (!dry_) {
+            b.bq = bqkv;
+            b.bk = bqkv + C_;
+            b.bv = bqkv + 2 * C_;
+        }
+        b.o = dense({p + "proj"}, true, &b.bo, text_allocs_, text_bytes_);
+        b.up_gate = dense({p + "ffn_up", p + "ffn_gate"}, true, &b.bug, text_allocs_, text_bytes_);
+        b.down = dense({p + "ffn_down"}, true, &b.bdown, text_allocs_, text_bytes_);
+        b.n1 = vec(p + "norm1.weight", text_allocs_, text_bytes_);
+        b.n2 = vec(p + "norm2.weight", text_allocs_, text_bytes_);
+        b.nq = vec(p + "q_norm.weight", text_allocs_, text_bytes_);
+        b.nk = vec(p + "k_norm.weight", text_allocs_, text_bytes_);
+        tblocks_.push_back(b);
+    }
+    text_loaded_ = !dry_;
+}
+
+void MossDit::drop_text() {
+    if (!text_loaded_) return;
+    gpu::stream_sync(s_);
+    for (void* p : text_allocs_) gpu::free(p);
+    text_allocs_.clear();
+    text_loaded_ = false;
 }
 
 std::pair<double, double> MossDit::time_forms(int64_t rows) const {
@@ -720,6 +742,7 @@ void MossDit::set_context(int i, const float* states, int64_t rows) {
     c.rows = rows;
     c.rope_rows = -1;
     if (rows <= 0) return;
+    if (!text_loaded_) load_text();
     ensure(cap_hw_, std::max<int>(1, (int) cap_n_), std::max(cap_text_, rows));
     // the input projection (the states' rows scaled into FP16's range), then the text blocks over the text's rows
     float* xs = alloc<float>(allocs_, rows * txt_dim_);
@@ -795,6 +818,65 @@ void MossDit::forward(const float* x, float timestep, int64_t h, int64_t w, int 
         rows16(RmsMod{x_ + off[(size_t) i] * C, fnorm_, head_, head_ + C, C}, HW, C, h16_, rs_, s_);
         product(h16_, rs_, fout_, nullptr, out + i * HW * in_ch_, HW, nullptr);
     }
+}
+
+namespace {
+
+// an Euler step x += ds p in FP32, the prediction p as the reference pipeline makes it: the prompt's velocity c, with
+// guidance (u: the negative pass's) u + cfg (c - u), with skip-layer guidance (k: the skipping pass's) that (or k
+// without guidance) plus slg (c - k)
+void moss_euler(float* x, const float* c, const float* u, const float* k, int64_t n, float cfg, float slg, float ds,
+                void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const size_t i = id[0];
+        const float ci = c[i];
+        float p = u != nullptr ? u[i] + cfg * (ci - u[i]) : ci;
+        if (k != nullptr) p = (u != nullptr ? p : k[i]) + slg * (ci - k[i]);
+        x[i] += ds * p;
+    });
+}
+
+}  // namespace
+
+void MossDit::sample(float* x, int64_t h, int64_t w, const std::vector<float>& sigmas, const Guide& g, int first,
+                     int total, const std::function<bool(int, int)>& step,
+                     const std::function<void(float*, float)>& after) {
+    const int n = g.cfg != 1.f && ctx_[1].rows > 0 ? 2 : 1;
+    const bool slg = !g.slg.empty() && g.slg_scale > 0.f;
+    const int64_t HW = h * w, N = HW * in_ch_;
+    float* out = alloc<float>(allocs_, (n + (slg ? 1 : 0)) * N);
+    const std::vector<int> before = ctx_[1].skip;
+    const int steps = (int) sigmas.size() - 1;
+    try {
+        for (int i = 0; i < steps; ++i) {
+            // both skips act in the steps whose share of the whole schedule is in [start, stop)
+            const double at = (double) (first + i) / (double) total;
+            const bool active = g.start <= at && at < g.stop;
+            ctx_[1].skip = active ? g.uncond_skip : std::vector<int>{};
+            const float t = sigmas[(size_t) i] * 1000.f;
+            forward(x, t, h, w, n, out);
+            const float* k = nullptr;
+            if (slg && active) {
+                ctx_[0].skip = g.slg;
+                forward(x, t, h, w, 1, out + n * N);
+                ctx_[0].skip.clear();
+                k = out + n * N;
+            }
+            moss_euler(x, out, n == 2 ? out + N : nullptr, k, N, g.cfg, g.slg_scale,
+                       sigmas[(size_t) i + 1] - sigmas[(size_t) i], s_);
+            if (after) after(x, sigmas[(size_t) i + 1]);
+            if (step && !step(i + 1, steps)) throw QiStopped();
+        }
+    } catch (...) {
+        gpu::stream_sync(s_);
+        ctx_[0].skip.clear();
+        ctx_[1].skip = before;
+        release(allocs_, out);
+        throw;
+    }
+    gpu::stream_sync(s_);
+    ctx_[1].skip = before;
+    release(allocs_, out);
 }
 
 }  // namespace strata::image
