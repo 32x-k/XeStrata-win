@@ -9822,6 +9822,10 @@ int main(int argc, char** argv) {
             // parked after it.  It still resumes from a checkpoint it matches, and still saves the system-prompt root
             // when that reaches --prompt-cache-root.  Absent = checkpointed as before.
             int req_ckpt = 1;
+            // prefill=1 (with max_new 0): split serving (upstream 690172c46).  Read the prompt as a request would, up to
+            // the place where the first verify window starts (the session holds n - 1 tokens, exactly what a next turn
+            // that continues it needs), and stop: no token is made.  A SAVE after it is the hand-over to another engine.
+            bool req_prefill_only = false;
             // pin=N: the first N prompt tokens are a shared read-only prefix (a long document that many short queries
             // follow).  The prompt is read in two parts at N, the checkpoint there is PINNED (retention never evicts it,
             // a parked conversation holding it stays parked) and a later request that resumes from it does not park the
@@ -9859,6 +9863,7 @@ int main(int argc, char** argv) {
                     if (key == "logit_bias") { req_bias_text = tok.substr(eq + 1); req_bias_present = true; }
                     else if (key == "cvec") req_cvec = (int) std::strtol(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "ckpt") req_ckpt = std::strtol(tok.c_str() + eq + 1, nullptr, 10) != 0;
+                    else if (key == "prefill") req_prefill_only = std::strtol(tok.c_str() + eq + 1, nullptr, 10) != 0;
                     else if (key == "pin") req_pin = std::max<long long>(0, std::strtoll(tok.c_str() + eq + 1, nullptr, 10));
                     else if (key == "temperature") req_temperature = fv;
                     else if (key == "top_p") req_top_p = fv;
@@ -9913,11 +9918,16 @@ int main(int argc, char** argv) {
             }
             std::vector<int64_t> ids;
             std::string pe;
-            if (max_new < 1 || endp == nullptr || (geni && emb_path.empty()) || !parse_i64_list(endp, ids, pe)) {
+            if ((max_new < 1 && !(max_new == 0 && req_prefill_only)) || (req_prefill_only && max_new != 0) ||
+                endp == nullptr || (geni && emb_path.empty()) || !parse_i64_list(endp, ids, pe)) {
                 std::printf("ERR bad request: %s\n", pe.empty() ? "max_new" : pe.c_str());
                 continue;
             }
             const int64_t n = (int64_t) ids.size();
+            if (req_prefill_only && (geni || o.batch > 0 || n < 2)) {
+                std::printf("ERR prefill=1 needs a text prompt of at least 2 tokens and no --batch\n");
+                continue;
+            }
             req_imgs.clear();
             if (geni && !o.vision) { std::printf("ERR this engine was started without --vision\n"); continue; }
             if (geni || !mrope_identity) {
