@@ -2320,9 +2320,10 @@ void PlainModel::set_adapt_period(int64_t period) {
 
 // STRATA_RAM_ADAPT, as generate.cpp: the RAM copy is chosen once, at load, so an expert it does not hold is read from
 // the file every time the conversation routes to it.  With this, between windows and while no adaptive round's copies
-// are in flight (they read the RAM copy), up to n experts the windows keep routing to (decayed count 2 or more) take
-// the places of experts of their layer that are not routed to (below 0.5), one pair per layer, the largest difference
-// first; one blob read each, on this thread.  One GPU only: a layer split's stages share the copy.
+// are in flight (they read the RAM copy), experts the windows keep routing to (decayed count 2 or more) take the places
+// of experts of their layer that are not routed to (below 0.5), up to 4 pairs per layer, the largest difference first;
+// out of a stage buffer when the incoming one is still there, else up to n of them with one blob read each, on this
+// thread (ram_adapt_round).  One GPU only: a layer split's stages share the copy.
 void PlainModel::ram_adapt() {
     static const int n = [] {
         const char* e = std::getenv("STRATA_RAM_ADAPT");
@@ -2331,8 +2332,7 @@ void PlainModel::ram_adapt() {
     if (n <= 0 || complement_ == nullptr || !complement_->complement_ready() || disp_.usage.empty() ||
         !next_.empty() || root_ != this || !pending_.empty() || windows_ < 2)
         return;
-    for (const TierSwap& x : choose_ram_swaps(disp_.usage.data(), res_.data(), n_moe_, spec_.n_expert, *complement_, n))
-        complement_->replace_resident(x.layer, x.in, x.out);
+    ram_adapt_round(disp_.usage.data(), res_.data(), n_moe_, spec_.n_expert, *complement_, n);
 }
 
 // The decode's PCIe share, measured: whether the GPU reading a share of the missed experts over PCIe beats the CPU

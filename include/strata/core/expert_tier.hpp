@@ -78,28 +78,52 @@ inline std::vector<TierSwap> choose_swaps(const float* usage, const int32_t* res
                         [](int64_t, int32_t) { return false; });
 }
 
-/// STRATA_RAM_ADAPT's rule (upstream d7298883): the RAM copy is chosen once, at start, so an expert it does not hold is
-/// read from the file every time the conversation routes to it.  In each layer the expert the windows route to most
-/// (a decayed count of 2 or more) of those neither in VRAM nor in the RAM copy takes the RAM place of the copy's least
-/// routed one (below 0.5): one pair a layer, the `n` with the largest difference.  `res` as choose_swaps'.
+/// STRATA_RAM_ADAPT's rule (upstream d7298883, 2b13a4493): the RAM copy is chosen once, at start, so an expert it does
+/// not hold is read from the file every time the conversation routes to it.  In each layer up to 4 of the experts the
+/// windows route to most (a decayed count of 2 or more) of those neither in VRAM nor in the RAM copy take the RAM places
+/// of the copy's least routed ones (below 0.5), paired in that order; all the layers' pairs, the largest difference
+/// first.  `res` as choose_swaps'.
 inline std::vector<TierSwap> choose_ram_swaps(const float* usage, const int32_t* res, int64_t layers, int64_t n_expert,
-                                              const FileExpertSource& src, int n) {
+                                              const FileExpertSource& src) {
     constexpr float kRouted = 2.0f, kUnused = 0.5f;
+    constexpr size_t kPerLayer = 4;
     std::vector<TierSwap> swaps;
+    std::vector<int32_t> ins, outs;
     for (int64_t l = 0; l < layers; ++l) {
         const float* u = usage + l * n_expert;
         const int32_t* r = res + l * n_expert;
-        int32_t in = -1, out = -1;
+        ins.clear();
+        outs.clear();
         for (int32_t e = 0; e < (int32_t) n_expert; ++e) {
             if (r[e] >= 0) continue;   // in VRAM: the RAM copy does not hold it
-            if (src.has_resident(l, e)) { if (out < 0 || u[e] < u[out]) out = e; }
-            else if (u[e] >= kRouted && (in < 0 || u[e] > u[in])) in = e;
+            if (src.has_resident(l, e)) outs.push_back(e);
+            else if (u[e] >= kRouted) ins.push_back(e);
         }
-        if (in >= 0 && out >= 0 && u[out] < kUnused) swaps.push_back({u[in] - u[out], (int32_t) l, in, out});
+        const size_t ni = std::min(ins.size(), kPerLayer), no = std::min(outs.size(), kPerLayer);
+        std::partial_sort(ins.begin(), ins.begin() + (std::ptrdiff_t) ni, ins.end(),
+                          [&](int32_t a, int32_t b) { return u[a] > u[b]; });
+        std::partial_sort(outs.begin(), outs.begin() + (std::ptrdiff_t) no, outs.end(),
+                          [&](int32_t a, int32_t b) { return u[a] < u[b]; });
+        for (size_t i = 0; i < ni && i < no && u[outs[i]] < kUnused; ++i)
+            swaps.push_back({u[ins[i]] - u[outs[i]], (int32_t) l, ins[i], outs[i]});
     }
     std::sort(swaps.begin(), swaps.end(), [](const TierSwap& a, const TierSwap& b) { return a.gain > b.gain; });
-    if ((int) swaps.size() > n) swaps.resize((size_t) std::max(n, 0));
     return swaps;
+}
+
+/// STRATA_RAM_ADAPT=<n>: one round of choose_ram_swaps' pairs.  The incoming expert was usually read for the window
+/// before: a pair whose `in` still sits in that read's stage buffer moves with a copy out of it (no file read), and `n`
+/// caps only the pairs that need the file read.  The caller's thread, between windows, as replace_resident.
+inline void ram_adapt_round(const float* usage, const int32_t* res, int64_t layers, int64_t n_expert,
+                            FileExpertSource& src, int n) {
+    int file_left = n;
+    for (const TierSwap& x : choose_ram_swaps(usage, res, layers, n_expert, src)) {
+        if (src.replace_resident_staged(x.layer, x.in, x.out)) continue;
+        if (file_left > 0) {
+            --file_left;
+            src.replace_resident(x.layer, x.in, x.out);
+        }
+    }
 }
 
 /// How many slots of a tier of `budget` bytes each layer takes, from its profile (`prior`, (layer, expert) pairs in

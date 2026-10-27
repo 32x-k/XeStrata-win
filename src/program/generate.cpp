@@ -11825,9 +11825,10 @@ int main(int argc, char** argv) {
                 // start, so an expert it does not hold is read from the file every time the conversation routes to
                 // it.  With this, before a window and while no adaptive round is in flight, up to n experts the windows
                 // keep routing to (the adaptive tier's decayed count, at least its own candidate floor of 2) take the
-                // RAM places of experts of their layer that are not routed to (count below 0.5), one pair per layer,
-                // the largest difference first.  One blob read each, on this thread; the RAM stays the same size, and
-                // the routing, the weights and the VRAM tier's own rule are untouched.
+                // RAM places of experts of their layer that are not routed to (count below 0.5), up to 4 pairs per
+                // layer, the largest difference first (choose_ram_swaps).  A pair whose incoming expert still sits in
+                // a stage buffer is copied out of it; n caps the others, one blob read each, on this thread.  The RAM
+                // stays the same size, and the routing, the weights and the VRAM tier's own rule are untouched.
                 static const int ram_adapt_n = [] {
                     const char* e = std::getenv("STRATA_RAM_ADAPT");
                     return e != nullptr ? std::max(0, (int) std::strtol(e, nullptr, 10)) : 0;
@@ -11835,9 +11836,8 @@ int main(int argc, char** argv) {
                 if (ram_adapt_n > 0 && !first_window && !drive.d.usage.empty() && pending.empty() &&
                     (!ajob || astate == AState::Idle) && src.complement_ready() && !multi_gpu &&
                     drive.d.remote_count == 0 && o.batch == 0) {
-                    for (const strata::core::TierSwap& x : strata::core::choose_ram_swaps(
-                             drive.d.usage.data(), host_res.data(), g.n_layers, g.n_expert, src, ram_adapt_n))
-                        src.replace_resident(x.layer, x.in, x.out);
+                    strata::core::ram_adapt_round(drive.d.usage.data(), host_res.data(), g.n_layers, g.n_expert, src,
+                                                  ram_adapt_n);
                 }
                 if (!adapt_tick(false)) {   // --adapt-async: the round in flight moves on a step when it can
                     std::printf("ERR an adaptive refill failed\n");
@@ -12238,8 +12238,9 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: route tail skip: %lld missed experts skipped (%lld entries) since the "
                                      "start\n", (long long) drive.d.tail_experts, (long long) drive.d.tail_skipped);
             if (src.ram_adapts() > 0)   // STRATA_RAM_ADAPT, cumulative
-                std::fprintf(stderr, "strata serve: resident RAM: %lld experts moved in from the file in place of "
-                                     "unused ones (STRATA_RAM_ADAPT)\n", (long long) src.ram_adapts());
+                std::fprintf(stderr, "strata serve: resident RAM: %lld experts moved in in place of unused ones, %lld of "
+                                     "them out of a stage buffer (STRATA_RAM_ADAPT)\n", (long long) src.ram_adapts(),
+                             (long long) src.ram_staged());
             if (ajob)   // --adapt-async, cumulative (a round may still be in flight: it lands before the next request)
                 std::fprintf(stderr, "strata serve: asynchronous adaptive tier: %lld rounds, %lld experts swapped in, "
                                      "%.1f ms per round (start to flip, between windows)%s\n",

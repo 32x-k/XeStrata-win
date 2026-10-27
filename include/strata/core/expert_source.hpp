@@ -679,7 +679,11 @@ public:
     /// windows, with no adaptive round in flight.  A failed read leaves the copy as it was.  Not with
     /// STRATA_EXCHANGE_ROTATE (false, nothing changes).
     bool replace_resident(int64_t layer, int64_t in, int64_t out);
+    /// STRATA_RAM_ADAPT: the same move as replace_resident, but `in` is copied out of the finished stage buffer a
+    /// demand read left it in (no file read).  False, nothing changed, when `in` is not staged or still filling.
+    bool replace_resident_staged(int64_t layer, int64_t in, int64_t out);
     int64_t ram_adapts() const { return ram_adapts_; }
+    int64_t ram_staged() const { return ram_staged_; }   ///< of ram_adapts(): copied out of a stage buffer
     /// STRATA_EXCHANGE_ROTATE=1 (opt-in, upstream 1e6cec80): a swap hands the exchange buffer over instead of copying
     /// the evicted blob into the RAM copy (equal-size blobs, a fully page-locked copy)
     bool exchange_rotation() const { return exchange_storage_.active(); }
@@ -905,7 +909,8 @@ private:
     std::unordered_map<int64_t, size_t> stage_of_;
     uint64_t stage_blob_ = 0;
     uint64_t stage_seq_ = 0;
-    int64_t ram_adapts_ = 0;                  ///< replace_resident: experts moved from the file into the compact copy
+    int64_t ram_adapts_ = 0;                  ///< replace_resident(_staged): experts moved into the compact copy
+    int64_t ram_staged_ = 0;                  ///< replace_resident_staged: of those, copied out of a stage buffer
     std::vector<uint8_t> ram_adapt_buf_;      ///< ...one blob, read here before it replaces another
     uint64_t epoch_ = 0;
     int64_t last_layer_ = -1;
