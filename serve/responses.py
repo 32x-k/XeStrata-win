@@ -272,6 +272,17 @@ def request_tools(req: dict):
     return tools or None, names, skipped
 
 
+def forced_choice(req: dict):
+    """The request's tool_choice in the shape forced_call reads: a named function or custom tool is
+    {"type": "function", "name": N}, with a namespace tool's name as the template sees it (namespace.name)."""
+    choice = req.get("tool_choice")
+    if isinstance(choice, dict) and choice.get("type") in ("function", "custom") and \
+            isinstance(choice.get("name"), str):
+        ns = choice.get("namespace")
+        return {"type": "function", "name": f"{ns}.{choice['name']}" if ns else choice["name"]}
+    return choice
+
+
 def _turn_body(req: dict):
     meta = req.get("client_metadata")
     raw = meta.get("x-codex-turn-metadata") if isinstance(meta, dict) else None

@@ -4981,7 +4981,7 @@ class ToolHubs:
 
 
 def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new, max_req, sampling, cancel,
-                 mcp_names):
+                 mcp_names, force=None):
     """Service.run with the MCP tools executed here: the model writes a call to an MCP tool, the server runs it, adds
     the call and its result to the conversation and lets the model continue - up to `max_rounds` times.  Yields what
     Service.run yields (text, thinking, the request's own tool calls) plus ("mcp", {...}) for the tool activity, and
@@ -4989,14 +4989,15 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
 
     `mcp_names`: the MCP tools this request offered; any other call is one of the request's own tools and ends the
     turn as always (the client answers it).  MCP calls written in the same answer are then not run (their results
-    could not reach the model before the client's)."""
+    could not reach the model before the client's).  `force` (forced_call): the first round's reply opens that call;
+    the rounds after a tool ran are the model's own."""
     max_rounds = int(hub.settings["max_rounds"])
     total, rounds = 0, 0
     done: dict = {}
     messages = list(messages)
     while True:
         text, reasoning, calls, own_calls = [], [], [], 0
-        for kind, x in svc.run(ids, thinking, tools, max_new, sampling, cancel, declared_only=True):
+        for kind, x in svc.run(ids, thinking, tools, max_new, sampling, cancel, force=force, declared_only=True):
             if kind == "done":
                 done = cast(dict, x)
                 continue
@@ -5026,6 +5027,7 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                               "chars": 0, "truncated": False, "ms": 0}
             break
         rounds += 1
+        force = None
         results = []
         for c in calls:
             s, tool = hub.routes().get(c.name, (None, c.name))
@@ -6530,7 +6532,7 @@ def make_handler(svc: Service):
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             try:
-                ids, thinking, tools, max_new, asm, validator, req = self._responses_prepare(req, cancel)
+                ids, thinking, tools, max_new, asm, validator, req, force = self._responses_prepare(req, cancel)
             except ClientGone:
                 self._note(outcome="disconnected")
                 return
@@ -6557,9 +6559,9 @@ def make_handler(svc: Service):
                     messages, kw = self.prepared
                     source = run_with_mcp(svc, image_tools, messages, tools, kw, ids, thinking, max_new,
                                           int(req.get("max_output_tokens") or 0), req, cancel,
-                                          set(image_tools.routes()))
+                                          set(image_tools.routes()), force=force)
                 else:
-                    source = svc.run(ids, thinking, tools, max_new, req, cancel)
+                    source = svc.run(ids, thinking, tools, max_new, req, cancel, force=force)
                 for kind, x in source:
                     if kind == "ping":
                         yield None
@@ -6653,6 +6655,8 @@ def make_handler(svc: Service):
                 tools = (tools or []) + self.image_tools.template_tools(exclude={t["name"] for t in tools or []})
                 skipped = [k for k in skipped if k != "image_generation"]
             kw = responses_api.template_kwargs(req, {"reasoning_effort": svc.effort_default()})
+            # "required" or a named tool: the reply opens that call (forced_call), as on the chat route
+            force = forced_call(responses_api.forced_choice(req), tools, getattr(svc.template, "call_form", "qwen"))
             try:
                 self._no_local_images(messages)              # as on the chat route: no file read for a foreign page
             except ValueError as e:
@@ -6687,13 +6691,13 @@ def make_handler(svc: Service):
             try:
                 try:
                     ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0,
-                                                         req=req, cancel=cancel)
+                                                         force=force, req=req, cancel=cancel)
                 except ValueError:
                     if shown is tools:
                         raise
                     shown = tools                            # too long with the kept tools: the request as sent
                     ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0,
-                                                         req=req, cancel=cancel)
+                                                         force=force, req=req, cancel=cancel)
             except ResponsesError:
                 raise
             except ValueError as e:                          # too long for the context, an image without vision
@@ -6707,7 +6711,7 @@ def make_handler(svc: Service):
                                           "reasoning.encrypted_content" in include, validator is not None)
             self.prepared = (messages, kw)
             # the request is also the sampling dict, as on the chat path (temperature, top_p, top_k, seed, ...)
-            return ids, thinking, tools, max_new, asm, validator, req
+            return ids, thinking, tools, max_new, asm, validator, req, force
 
         def _count_tokens(self, req):
             """Anthropic's token count, which Claude Code asks for its context figures: the prompt this server would
