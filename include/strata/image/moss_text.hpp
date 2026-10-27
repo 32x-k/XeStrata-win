@@ -30,7 +30,7 @@ public:
     MossText& operator=(const MossText&) = delete;
 
     /// Opens the GGUF for prompts of up to `max_tokens` tokens (MOSS-Image's 4096 at most), its blocks within
-    /// `layer_budget` bytes of VRAM (all of them by default).
+    /// `layer_budget` bytes of VRAM (all of them by default; two slots at least).
     bool open(const std::string& gguf, int64_t max_tokens, std::string& err, uint64_t layer_budget = UINT64_MAX);
     bool is_open() const { return model_ != nullptr; }
     /// Frees the weights and the buffers (open again for the next text).
@@ -42,7 +42,7 @@ public:
     /// The blocks' bytes (in the file) and the two slots a streamed walk takes at least.
     uint64_t layer_bytes() const { return layers_ != nullptr ? layers_->total() : 0; }
     uint64_t layer_min() const { return layers_ != nullptr ? layers_->min_budget() : 0; }
-    /// The VRAM the blocks may take (LayerStream: those that fit stay, the rest are streamed).
+    /// The VRAM the blocks may take (LayerStream: those that fit stay, the rest are streamed; two slots at least).
     void set_layer_budget(uint64_t bytes);
     int resident_layers() const { return layers_ != nullptr ? layers_->resident() : 0; }
     uint64_t layers_vram() const { return layers_ != nullptr ? layers_->vram() : 0; }

@@ -49,7 +49,7 @@ bool MossText::open(const std::string& gguf, int64_t max_tokens, std::string& er
         }
         core::PlainModel* mp = m.get();
         layers->set_prepare([mp](int l, uint8_t* d) { mp->prepare_block(l, d); });
-        layers->configure(std::min(layer_budget, layers->total()), m->stream());
+        layers->configure(std::min(std::max(layer_budget, layers->min_budget()), layers->total()), m->stream());
         src->layers = layers.get();
         m->set_block_source(src.get(), std::move(offsets));
         // the products' kernels loaded and the dense products' forms timed, as the chat's engine does at its start
@@ -71,7 +71,8 @@ void MossText::close() {
 }
 
 void MossText::set_layer_budget(uint64_t bytes) {
-    if (layers_ != nullptr) layers_->configure(std::min(bytes, layers_->total()), model_->stream());
+    if (layers_ != nullptr)
+        layers_->configure(std::min(std::max(bytes, layers_->min_budget()), layers_->total()), model_->stream());
 }
 
 std::vector<float> MossText::encode(const std::vector<int32_t>& ids, std::string& err) {
