@@ -612,7 +612,9 @@ struct Kernel {
             const int8_t* Vb = V0 + bf * D * VLD;
             const float* sk_ = &skl[bf * CH];
             const bool whole = j0 + CH <= T;   // no key of the chunk past T
-            // S^T: a tile's rows the keys nt * 16 + row_of(e), its column a query; K's operand read once for the tiles
+            // S^T: a tile's rows the keys nt * 16 + row_of(e), its column a query; K's operand read once for the tiles.
+            // The scores times the keys' scales only: the query's (positive) goes into exp2's argument, and the
+            // largest is taken before it, a multiply less a score
             float s[QT][CH / 16][8];
             float cmx[QT];
 #pragma unroll
@@ -635,7 +637,7 @@ struct Kernel {
                     const float ks = sk_[kr];
 #pragma unroll
                     for (int qt = 0; qt < QT; ++qt) {
-                        s[qt][nt][e] = in ? (float) c[qt][e] * sql[qt] * ks : -INFINITY;
+                        s[qt][nt][e] = in ? (float) c[qt][e] * ks : -INFINITY;
                         cmx[qt] = sycl::fmax(cmx[qt], s[qt][nt][e]);
                     }
                 }
@@ -644,7 +646,7 @@ struct Kernel {
             frag pb[QT][CH / 16];
 #pragma unroll
             for (int qt = 0; qt < QT; ++qt) {
-                cmx[qt] = sycl::fmax(cmx[qt], sycl::permute_group_by_xor(sg, cmx[qt], 16));   // the query's other keys
+                cmx[qt] = sycl::fmax(cmx[qt], sycl::permute_group_by_xor(sg, cmx[qt], 16)) * sql[qt];   // its other keys
                 if (cmx[qt] > m[qt]) {   // the output and the sum follow the new reference
                     const float corr = m[qt] == -INFINITY ? 0.f : sycl::native::exp2(m[qt] - cmx[qt]);
 #pragma unroll
@@ -659,15 +661,15 @@ struct Kernel {
                 float sum = 0.f;
 #pragma unroll
                 for (int nt = 0; nt < CH / 16; ++nt) {
+                    // 0 .. 127, rounded and packed a byte at a time by v_cvt_pk_u8_f32 (a score past T: exp2 of -inf,
+                    // 0); the sum of the values before their rounding, which is as often up as down
                     uint32_t w0 = 0, w1 = 0;
 #pragma unroll
                     for (int e = 0; e < 8; ++e) {
-                        const float qv =
-                            s[qt][nt][e] == -INFINITY ? 0.f : sycl::rint(sycl::native::exp2(s[qt][nt][e] - m[qt]) * inv);
-                        sum += qv;
-                        const uint32_t b8 = (uint32_t) (uint8_t) (int8_t) qv;
-                        if (e < 4) w0 |= b8 << (8 * e);
-                        else w1 |= b8 << (8 * (e - 4));
+                        const float pv = sycl::native::exp2(sycl::fma(s[qt][nt][e], sql[qt], -m[qt])) * inv;
+                        sum += pv;
+                        if (e < 4) w0 = __builtin_amdgcn_cvt_pk_u8_f32(pv, (uint32_t) e, w0);
+                        else w1 = __builtin_amdgcn_cvt_pk_u8_f32(pv, (uint32_t) (e - 4), w1);
                     }
 #if defined(__GFX12__)
                     // the lane's 8 keys are rows hi * 8 + e: B's K values hi * 8 + e, in order
