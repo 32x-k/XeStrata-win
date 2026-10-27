@@ -989,6 +989,9 @@ print(r.choices[0].message.content)
 最初から読んだプロンプトも、システムプロンプトが 2,048 トークン以上なら、その終わりでチェックポイントを取ります（upstream PR #62 と #65）。
 長いシステムプロンプトとツールの一覧を持つエージェントのクライアントにも、この起点ができます。
 エンジンの設定は `--prompt-cache N`（0 でオフ）、`--prompt-cache-every N`、`--prompt-cache-root N`（0 でシステムプロンプトのチェックポイントなし）、`--turn-token ID` です。
+`--prompt-cache-every` は、prompt を読む塊の大きさを決めません。N トークンごとのチェックポイントは prefill の塊の境目で取り、読みはそのまま続きます。
+読みを分けるのは、システムプロンプトの終わり（`--prompt-cache-root`）、最後の発言の始まり、`STRATA_CACHE_MESSAGE_BOUNDARY` の境目、`"strata_prefix"` の境目です（塊の大きさは `--prefill`）。
+`--prompt-cache-every 0` は、N トークンごとのチェックポイントも、`--prompt-cache-tail` のチェックポイントも取りません。前の発言を書き換えたクライアントは、それだけ前のチェックポイントから読み直します。
 
 続きの要求が来ない使い捨ての要求（分類や確認の呼び出し）は、本文に `"strata_checkpoint": false` を書けます。
 最後の発言の始まりと 16K トークンごとのチェックポイントを取らず、そのセッションを次の要求のために残しも置きもしません。

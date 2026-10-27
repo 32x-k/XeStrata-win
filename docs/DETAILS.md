@@ -1022,6 +1022,9 @@ The rest rotate by least recent use, so a **new** chat that shares that prefix s
 A prompt read from the start is also checkpointed at the end of its system prompt when that is 2,048 tokens or more (upstream PR #62 and #65),
 so the root exists for agent clients with long system prompts and tool lists.
 Engine options: `--prompt-cache N` (0 = off), `--prompt-cache-every N`, `--prompt-cache-root N` (0 = no system-prompt checkpoint), `--turn-token ID`.
+`--prompt-cache-every` does not set the size of the pieces a prompt is read in: the checkpoint every N tokens is taken at a chunk boundary of the prefill, and the read goes on.
+What splits a read is the end of the system prompt (`--prompt-cache-root`), the start of the last message, the `STRATA_CACHE_MESSAGE_BOUNDARY` boundary and the `"strata_prefix"` boundary (the chunk size is `--prefill`).
+`--prompt-cache-every 0` takes neither the checkpoint every N tokens nor the `--prompt-cache-tail` one, so a client that rewrote an earlier message reads again from a checkpoint that much farther back.
 
 A one-shot request that no later request continues (a classification call, a probe) can send `"strata_checkpoint": false` in its body.
 It takes no checkpoint at the start of its last turn nor every 16K tokens, and its session is neither kept nor parked for a next request.
