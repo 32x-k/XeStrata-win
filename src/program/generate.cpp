@@ -7973,12 +7973,15 @@ int main(int argc, char** argv) {
             strata::core::progress_at("reading the prompt (batched), done up to token", done);
             strata::core::progress_beat();
             std::fflush(stdout);
-            const bool periodic_checkpoint = o.prompt_cache_every > 0 && done >= pp_next_check;
+            // layer-major prefill: a sub-chunk before its super-chunk's end has the super-chunk's state - the
+            // checkpoint is taken at that end instead (upstream ffe40c169)
+            const bool periodic_checkpoint = o.prompt_cache_every > 0 && done >= pp_next_check && !sp.layer_major_mid();
             // Keep the prefill's existing chunk geometry. One extra near-tail checkpoint
             // can serve a branch whose shared prefix ends before the final cached state.
             const bool tail_checkpoint = o.prompt_cache_tail && o.prompt_cache > 0 && o.prompt_cache_every > 0 &&
                 !multi_gpu && !pp_tail_saved && pp_total - done > std::max<int64_t>(1, o.short_read) &&
-                pp_total - done <= T;   // this chunk's real size (--prefill auto chunks differ from o.prefill_chunk)
+                pp_total - done <= T &&   // this chunk's real size (--prefill auto chunks differ from o.prefill_chunk)
+                !sp.layer_major_mid();
             if (periodic_checkpoint || tail_checkpoint) {
                 bool saved = false;
                 if (multi_gpu) {   // the stages' parts, saved when each of them read this chunk
