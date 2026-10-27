@@ -855,8 +855,15 @@ print(r.choices[0].message.content)
 - **呼び出しとして返すツールの呼び出し**: 呼び出しになるのは、要求が宣言したツールの名前のものだけです。
   別の名前の呼び出しや、ツールを宣言していない Chat Completions・Anthropic の要求の呼び出しは、書かれたままの文として返すので、クライアントが差し出していないツールを動かすことはありません（Responses は Codex のまとめの要求のために前のままです）。
   名前空間のツール（`mcp__filesystem.write_file`）は、モデルが `mcp__filesystem__write_file`、`mcp__filesystem=write_file`、`mcp__filesystem_write_file` と書いたときと、そのメンバーを持つツールが宣言の中に 1 つだけのときにメンバーだけ（`write_file`）を書いたときも、その呼び出しになります。
+  `__` を含む名前（`mcp__playwright__browser_navigate`）は、モデルが `__` を全部 `_` と書いたとき（`mcp_playwright_browser_navigate`）も、宣言した 2 つのツールが同じ綴りにつぶれない限り、その呼び出しになります。
+  名前は推し量りません: `bash` は `shell` ではなく、順の入れ替わった名前（`label_values_mcp_server1` に対する `server1_label_values`）は宣言した名前になりません。
   囲みが 1 トークンずれた呼び出し（`<function=NAME>` でなく `<=NAME>`、`<function:NAME>`、`<NAME>`）は、NAME が宣言したツールなら呼び出しとして読みます。
   それでも呼び出しとして読めない `<tool_call>` の塊は、server のウィンドウで数を出します。
+- **宣言していない名前のために文として返した呼び出し**: 文はモデルが書いたままで、`finish_reason` は `stop`（`/v1/messages` では `end_turn`）のままです。
+  その横に、中身があるときだけ、一覧 `"strata_rejected_tool_calls": [{"name": "bash", "reason": "undeclared"}]` を付けます（Chat Completions の返事の一番上と、ストリームの最後の塊、`/v1/messages` の `message_delta` のイベントとメッセージ。名前は 5 つまで）。
+  立て直したいクライアントは、持っているツールの名前をモデルに伝えて聞き直せます。要求が宣言していないツールの呼び出しを XeStrata が動かしたり渡したりすることはありません。
+  server のウィンドウにも同じ名前が出て、`/metrics/prometheus` は塊の数を `strata:tool_calls_unread_total` で数えます。
+  形の崩れた塊（宣言していない名前でないもの）もそこで数えますが、挙げる名前はありません。
 - **チャットのアプリ**: 「OpenAI 互換」の接続先を持つアプリなら使えます。
   ベース URL は `http://127.0.0.1:8095/v1`、API キーは何でも構いません。
 - **OpenCode**（upstream #543）: `opencode.jsonc`（プロジェクトの中か `~/.config/opencode/`）の出発点です。

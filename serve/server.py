@@ -4001,6 +4001,9 @@ class Service:
             ("strata:requests_total", "counter", "Requests finished", t["requests"]),
             ("strata:drafts_offered_total", "counter", "Speculative draft tokens offered", t["drafts_offered"]),
             ("strata:drafts_accepted_total", "counter", "Speculative draft tokens accepted", t["drafts_accepted"]),
+            ("strata:tool_calls_unread_total", "counter",
+             "<tool_call> blocks returned as text (an undeclared name or a form the template does not use)",
+             t.get("tool_calls_unread", 0)),
             ("strata:model_loaded", "gauge", "1 while the model is loaded", int(self.loaded())),
         ]
         return "".join(f"# HELP {name} {help_}\n# TYPE {name} {kind}\n{name} {value}\n"
@@ -4837,11 +4840,18 @@ class Service:
             print(f"[strata] tool calls inside the thinking: {parser.rescued} read as calls, {parser.refused} kept as "
                   f"reasoning (quoted, or the turn did not end on a stop)", flush=True)
         unread = getattr(parser, "unread", 0)          # the Harmony reader keeps no such count
+        rejected = []
         if unread:
             named = getattr(parser, "unread_names", None)
             print(f"[strata] {unread} <tool_call> block(s) in the answer did not read as a call of a declared "
                   "tool and went back as text (a name the request did not declare, or a form the template does "
-                  "not use)" + (f"; the names the model wrote: {', '.join(named)}" if named else ""), flush=True)
+                  "not use)" + (f"; the names the model wrote: {', '.join(named)}" if named else "")
+                  + "; the response carries them as strata_rejected_tool_calls, /metrics counts them", flush=True)
+            with self.status_lock:
+                self.totals["tool_calls_unread"] = self.totals.get("tool_calls_unread", 0) + unread
+            # #3796 (upstream 805ebe17b): the same names for the client, a machine-readable marker next to the text,
+            # which stays as the model wrote it
+            rejected = [{"name": nm, "reason": "undeclared"} for nm in named or []]
         if stops is not None and stops.hit is None and stops.held:
             yield "event", Event("content", stops.flush())     # the held tail was not a stop string after all
         done = {"finish": finish, "completion_tokens": n, "reused": (timings or {}).get("cache_n", 0),
@@ -4849,6 +4859,8 @@ class Service:
                 "reasoning_recoveries": recovery_count}
         if stops is not None and stops.hit is not None:
             done["stop_sequence"] = stops.hit
+        if rejected:
+            done["rejected_tool_calls"] = rejected
         yield "done", done
 
 
@@ -5224,6 +5236,8 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
                              "prompt_tokens_details": {"cached_tokens": fin.get("reused") or 0}}
             if fin.get("timings"):
                 last["timings"] = fin["timings"]          # llama.cpp's field: the speed its clients show
+            if fin.get("rejected_tool_calls"):          # #3796: only when a call was refused as undeclared
+                last["strata_rejected_tool_calls"] = fin["rejected_tool_calls"]
             yield last
 
 
@@ -5273,6 +5287,8 @@ def openai_collect(chunks) -> dict:
            "usage": last["usage"]}
     if last.get("timings"):
         out["timings"] = last["timings"]
+    if last.get("strata_rejected_tool_calls"):
+        out["strata_rejected_tool_calls"] = last["strata_rejected_tool_calls"]
     if lps["content"] or lps["reasoning_content"]:
         out["choices"][0]["logprobs"] = {"content": lps["content"],
                                          **({"reasoning_content": lps["reasoning_content"]}
@@ -5374,11 +5390,13 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
             # (#1013)
             reused = max(0, min(x.get("reused") or 0, len(ids) - 1))
             read_now = len(ids) - reused
-            yield "message_delta", {"type": "message_delta", "delta": {"stop_reason": stop,
-                                                                       "stop_sequence": x.get("stop_sequence")},
-                                    "usage": {"input_tokens": 1, "cache_creation_input_tokens": read_now - 1,
-                                              "cache_read_input_tokens": reused,
-                                              "output_tokens": x["completion_tokens"]}}
+            delta_event = {"type": "message_delta",
+                           "delta": {"stop_reason": stop, "stop_sequence": x.get("stop_sequence")},
+                           "usage": {"input_tokens": 1, "cache_creation_input_tokens": read_now - 1,
+                                     "cache_read_input_tokens": reused, "output_tokens": x["completion_tokens"]}}
+            if x.get("rejected_tool_calls"):
+                delta_event["strata_rejected_tool_calls"] = x["rejected_tool_calls"]     # #3796
+            yield "message_delta", delta_event
             yield "message_stop", {"type": "message_stop"}
 
 
@@ -5411,6 +5429,8 @@ def anthropic_collect(events) -> dict:
             msg["stop_reason"] = e["delta"]["stop_reason"]
             msg["stop_sequence"] = e["delta"].get("stop_sequence")
             msg["usage"].update(e["usage"])
+            if e.get("strata_rejected_tool_calls"):
+                msg["strata_rejected_tool_calls"] = e["strata_rejected_tool_calls"]
     assert msg is not None                          # anthropic_events always starts with message_start
     msg["content"] = blocks
     return msg

@@ -890,8 +890,15 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
 - **Which tool calls come back as calls.** A call counts only when it names a tool the request declared.
   A call for another name, or any call in a Chat Completions or Anthropic request that declared no tools, is returned as the text it was written as, so a client never runs a tool it did not offer (the Responses route keeps its own rule for Codex's compaction requests).
   A namespaced tool (`mcp__filesystem.write_file`) is that call when the model writes `mcp__filesystem__write_file`, `mcp__filesystem=write_file`, `mcp__filesystem_write_file`, or the bare member (`write_file`) and exactly one declared tool has that member.
+  A name with `__` in it (`mcp__playwright__browser_navigate`) is also that call when the model writes every `__` as `_` (`mcp_playwright_browser_navigate`), unless two declared tools collapse to the same spelling.
+  Names are never guessed: `bash` is not `shell`, and a reordered name (`server1_label_values` for `label_values_mcp_server1`) is not the declared one.
   A call whose envelope drifted by a token, `<=NAME>`, `<function:NAME>` or `<NAME>` instead of `<function=NAME>`, is read as the call when NAME is a declared tool.
   A `<tool_call>` block that still does not read as a call is counted in the server window.
+- **A call that came back as text because its name was not declared.** The text stays exactly as the model wrote it and `finish_reason` stays `stop` (`end_turn` on `/v1/messages`).
+  Next to it the reply carries a list, only when there is something in it: `"strata_rejected_tool_calls": [{"name": "bash", "reason": "undeclared"}]` (at the top level of a Chat Completions reply, in its last streamed chunk, and in the `message_delta` event and the message of `/v1/messages`; up to five names).
+  A client that wants to recover can answer the model with the tool names it does have and ask again; XeStrata never runs or forwards a call for a tool the request did not declare.
+  The server window prints the same names, and `/metrics/prometheus` counts the blocks in `strata:tool_calls_unread_total`.
+  A block that is malformed (not an undeclared name) is counted there as well, but has no name to list.
 - **Chat apps.** Any app with an "OpenAI-compatible" provider works: base URL `http://127.0.0.1:8095/v1`, any API key.
 - **OpenCode** (upstream #543). A starting point for `opencode.jsonc` (in your project, or `~/.config/opencode/`).
   The field names are OpenCode's, so check its config docs if your version differs:
