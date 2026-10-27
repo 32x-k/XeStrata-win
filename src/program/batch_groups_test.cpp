@@ -107,6 +107,20 @@ int main() {
         check(r.groups == 2 && r.mtp_piped && !r.mtp_dropped,
               "STRATA_PIPED_MTP, --batch-groups 2 given: 2 groups of 2 slots, and the drafts stay");
     }
+    {   // 0.2.7: two NVIDIA cards pipeline by default; the serial default is opt-in (STRATA_BATCH_GROUPS_NV_SERIAL=1, STRATA_DEFAULTS=026)
+        check(!bg::nv_serial_wanted(nullptr, false), "NV_SERIAL unset: the pipeline");
+        check(!bg::nv_serial_wanted("", false), "NV_SERIAL empty: the pipeline");
+        check(!bg::nv_serial_wanted("0", false), "NV_SERIAL=0: the pipeline");
+        check(bg::nv_serial_wanted("1", false), "NV_SERIAL=1: serial");
+        check(bg::nv_serial_wanted("yes", false), "NV_SERIAL=yes: serial");
+        check(bg::nv_serial_wanted(nullptr, true), "STRATA_DEFAULTS=026: serial (v0.2.6's behaviour)");
+        check(!bg::nv_serial_wanted("0", true), "an explicit NV_SERIAL=0 wins over STRATA_DEFAULTS=026");
+        check(bg::nv_serial_wanted("", true), "NV_SERIAL empty and STRATA_DEFAULTS=026: serial");
+        bg::Input i = in(4, 1);
+        i.nv_serial_faster = bg::nv_serial_wanted(nullptr, false);
+        auto r = bg::resolve(i);
+        check(r.groups == 2 && r.serial == bg::Serial::None, "2 cards, 4 slots, nothing given: 2 pipelined groups, whatever the residency");
+    }
     {   // STRATA_PIPED_MTP unset: nothing changes, whatever --batch-mtp and the groups say
         bg::Input i = in(4, 1);
         i.batch_mtp = true;

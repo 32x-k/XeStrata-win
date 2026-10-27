@@ -57,7 +57,7 @@ struct Input {
     bool batch_mtp = false;    ///< --batch-mtp is on (it passed the gates that do not concern the groups)
     bool adapt_async = false;  ///< --adapt-async 1 was asked for
     bool mtp_serial = false;   ///< STRATA_BATCH_MTP_SERIAL=1: --batch-mtp with no --batch-groups runs one serial group (0.1.43)
-    bool nv_serial_faster = false;   ///< PROPOSED (0.2.1, owner decides): NVIDIA build, STRATA_BATCH_GROUPS_NV_SERIAL not 0 - two cards run faster in serial windows (z440 2x A4000, aggregate tok/s: +16% at 2 slots, +12% at 4, +15% at 8)
+    bool nv_serial_faster = false;   ///< opt-in (see nv_serial_wanted): NVIDIA build, two cards, STRATA_BATCH_GROUPS_NV_SERIAL=1 or STRATA_DEFAULTS=026 - one serial group, the 0.2.1-0.2.6 default
     bool mtp_piped = false;    ///< STRATA_PIPED_MTP=1: the pipelined groups draft too (each group carries its slots' rows)
 };
 
@@ -69,6 +69,16 @@ struct Result {
     bool mtp_dropped = false;          ///< --batch-mtp met the default pipeline: the pipeline wins, --batch-mtp is off
     bool mtp_piped = false;            ///< STRATA_PIPED_MTP: --batch-mtp's drafts run in the pipelined groups
 };
+
+/// Whether two NVIDIA cards run one serial group when --batch-groups is not given.  Not by default since 0.2.7: the pipelined groups
+/// measured faster on 2x RTX A6000 (IQ3_S, every expert resident) and on 2x RTX A4000 (Q2_0 pack); the serial default of 0.2.1-0.2.6
+/// had measured faster on 2x A4000 with IQ3_XXS.  STRATA_BATCH_GROUPS_NV_SERIAL asks for it with any value but 0 (an explicit 0 or
+/// non-zero value wins over the master switch); with the variable unset or empty, STRATA_DEFAULTS=026 (v0.2.6's behaviour) asks for
+/// it.  `env_value` is the variable's value (null when unset).
+inline bool nv_serial_wanted(const char* env_value, bool defaults_026) {
+    if (env_value != nullptr && env_value[0] != '\0') return env_value[0] != '0';
+    return defaults_026;
+}
 
 /// The most groups, at most one per stage of the layer split (`later_stages` + 1 GPUs), that divide `batch`.
 inline int auto_groups(int later_stages, int batch) {
@@ -107,7 +117,7 @@ inline Result resolve(const Input& in) {
 
 inline const char* serial_what(Serial s) {
     return s == Serial::BatchMtp ? "--batch-mtp" : s == Serial::AdaptAsync ? "--adapt-async 1"
-         : s == Serial::TwoCardsSerialFaster ? "serial windows (measured faster than pipelined groups on two NVIDIA cards; STRATA_BATCH_GROUPS_NV_SERIAL=0 keeps the pipeline)" : "";
+         : s == Serial::TwoCardsSerialFaster ? "serial windows (STRATA_BATCH_GROUPS_NV_SERIAL=1 or STRATA_DEFAULTS=026 asked for them on two NVIDIA cards; --batch-groups auto pipelines)" : "";
 }
 
 }  // namespace strata::program::batch_groups
