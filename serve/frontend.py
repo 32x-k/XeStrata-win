@@ -93,9 +93,9 @@ class ChatTemplate:
             messages = adjusted
         if tools and self.wrapped_tools:   # the template reads OpenAI's form, `tool.function` (llm-jp-4.1's)
             tools = [t if "function" in t else {"type": "function", "function": t} for t in tools]
-        if self.call_form == "glm":        # its efforts: low, high and max (the default)
+        if self.call_form == "glm":        # its efforts: low, high and max (the default), taken by name
             effort = kwargs.get("reasoning_effort")
-            kwargs = {**kwargs, "reasoning_effort": {"low": "low", "medium": "high"}.get(str(effort))}
+            kwargs = {**kwargs, "reasoning_effort": {"low": "low", "medium": "high", "high": "high"}.get(str(effort))}
         elif self.harmony and kwargs.get("reasoning_effort") == "xhigh":   # Harmony's efforts: low, medium and high
             kwargs = {**kwargs, "reasoning_effort": "high"}
         text = self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
@@ -179,10 +179,11 @@ def _text_of(content) -> str:
 
 IMAGE_PARTS = ("image_url", "input_image", "image")
 
-# Thinking levels.  The model's template knows low, medium and xhigh (its default; "high" means xhigh), and
-# enable_thinking=false for none.  Clients spell these many ways; everything maps onto those four.
+# Thinking levels.  Qwen3.8-Flash-Next's template knows low, medium and xhigh (its default; "high" means xhigh), and
+# enable_thinking=false for none.  Clients spell these many ways; everything maps onto none, low, medium, high and
+# xhigh, high kept apart from xhigh for the templates whose high is below their top (GLM-5.3-Flash's max).
 EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None,
-          "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh", "maximum": "xhigh"}
+          "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "xhigh", "maximum": "xhigh"}
 
 
 def effort_kwargs(value) -> dict:
