@@ -18057,10 +18057,15 @@ int main(int argc, char** argv) {
         // generated token and the MTP's first cell); otherwise the token loop already did that.
         bool first_window = native_pack;
         const int S_mtp = o.mtp_max_t > 0 ? std::min(o.mtp_max_t, o.spec) : o.spec;
+#if defined(STRATA_HAVE_DFLASH2)
+        const bool spec_uses_df2 = use_df2;
+#else
+        const bool spec_uses_df2 = false;   // no DFlash2 drafter in this build (Metal)
+#endif
         const bool gated_proposal = use_mtp && mtp.prob() && strata::core::spec_gate_pick() &&
             gated_proposal_usable(o.pipeline_windows < 2 && o.batch == 0 && !multi_gpu && drive.d.remote_count == 0,
                                   o.lookup_chain, o.adapt_swaps, o.pcie_frac != 0.0 || o.pcie_frac_auto,
-                                  spec_cost || use_df2 || !t_cycle.empty() || o.spec_corrupt > 0, o.spec, o.spec_min_p);
+                                  spec_cost || spec_uses_df2 || !t_cycle.empty() || o.spec_corrupt > 0, o.spec, o.spec_min_p);
         if (gated_proposal && !follow.empty())
             std::fprintf(stderr, "strata generate: --spec-follow replaces outputs before acceptance (teacher-forced diagnostic, not sampling-law evidence)\n");
         strata::core::MtpDrafter::DraftResult generation;
