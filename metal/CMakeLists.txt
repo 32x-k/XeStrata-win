@@ -143,7 +143,21 @@ list(APPEND STRATA_DS4_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/engine/exl3_legac
 # The CPU lane for the experts the GPU does not hold (ggml-cpu's NEON row dots): without it every non-resident expert contributes
 # zero and the residual stream stays the embedding (measured: layers 0-3 changed nothing, then random tokens).
 set_source_files_properties(${DS4}/ds4_gg_cpu.cpp PROPERTIES COMPILE_DEFINITIONS "STRATA_DSV41_TQ_CPU=1")
-add_executable(strata_ds4 ${STRATA_DS4_SOURCES})
+# The DeepSeek engine's queue, residency and barrier rules (deferred command buffers, the second queue, the residency set shared with
+# strata::gpu, ...) live in mtl_rt.mm and gpu/runtime.cpp behind STRATA_DS4_RUNTIME.  strata_ds4 compiles its own copy of these two
+# files with it; the Qwen engine (strata) and every other target keep the code of 0.2.7 (the macro is off there, so the files read
+# exactly as they did).  The copies are linked as objects, so they win over the same symbols in the libraries.
+add_library(ds4_rt_mm OBJECT src/mtl_rt.mm)
+target_include_directories(ds4_rt_mm PRIVATE src ${STRATA_ROOT}/third_party/ggml ${STRATA_ROOT}/include)
+target_compile_options(ds4_rt_mm PRIVATE $<$<COMPILE_LANGUAGE:OBJCXX>:-fobjc-arc>)
+target_compile_definitions(ds4_rt_mm PRIVATE STRATA_DS4_RUNTIME=1 STRATA_GGML_COMMON_DEFAULT="${GGML_COMMON}"
+  STRATA_METAL_KERNELS_DEFAULT="${CMAKE_CURRENT_SOURCE_DIR}/kernels")
+add_library(ds4_rt_gpu OBJECT src/gpu/runtime.cpp)
+target_include_directories(ds4_rt_gpu BEFORE PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include/metal_compat
+                           ${CMAKE_CURRENT_SOURCE_DIR}/include ${STRATA_ROOT}/include)
+target_include_directories(ds4_rt_gpu SYSTEM PRIVATE ${METAL_CPP_DIR})
+target_compile_definitions(ds4_rt_gpu PRIVATE STRATA_DS4_RUNTIME=1 STRATA_GPU_METAL=1)
+add_executable(strata_ds4 ${STRATA_DS4_SOURCES} $<TARGET_OBJECTS:ds4_rt_mm> $<TARGET_OBJECTS:ds4_rt_gpu>)
 target_include_directories(strata_ds4 PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include/metal_compat ${STRATA_ROOT}/include ${DS4} ${CMAKE_CURRENT_SOURCE_DIR}/src
   ${STRATA_ROOT}/third_party/ggml ${STRATA_GGML_DIR}/ggml/include ${STRATA_GGML_DIR}/ggml/src ${STRATA_GGML_DIR}/ggml/src/ggml-cpu)

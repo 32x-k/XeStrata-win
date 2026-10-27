@@ -6,6 +6,7 @@
 #include "resource_path.h"
 
 #include <chrono>
+#if defined(STRATA_DS4_RUNTIME)
 #include <execinfo.h>
 #include <algorithm>
 #include <atomic>
@@ -16,6 +17,7 @@
 #include <mach/mach_time.h>
 #include <map>
 #include <thread>
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -38,8 +40,11 @@ std::string read_file(const std::string& path) {
     return ss.str();
 }
 
+#if defined(STRATA_DS4_RUNTIME)
 extern "C" void* ds4_gpu_residency_set() __attribute__((weak_import));
+#endif
 struct Context::Impl {
+#if defined(STRATA_DS4_RUNTIME)
     id<MTLCommandBuffer> cb_def = nil;   // the open command buffer single dispatches accumulate in
     id<MTLComputeCommandEncoder> enc_def = nil;
     int def_n = 0;
@@ -49,6 +54,7 @@ struct Context::Impl {
     id<MTLCommandBuffer> inflight = nil;   // the last committed-but-not-waited deferred buffer (the queue runs them in order)
     std::vector<void*> graveyard;   // buffers freed while the deferred command buffer still references them (it holds none)
     std::recursive_mutex mu;   // helper threads (the stager, the expert cache) flush too: one writer on the open encoder
+#endif
     id<MTLDevice> dev;
     id<MTLCommandQueue> q;
     std::vector<id<MTLLibrary>> libs;
@@ -59,7 +65,11 @@ struct Context::Impl {
 static inline id<MTLBuffer> B(const Buffer& b) { return (__bridge id<MTLBuffer>)b.handle; }
 // the MTLBuffer and offset that bind byte `off` of b (a chunked buffer: the chunk the offset selects)
 static inline id<MTLBuffer> BO(const Buffer& b, size_t off, size_t& o) {
+#if defined(STRATA_DS4_RUNTIME)
     if (!b.chunks) { o = off + b.bias; return B(b); }
+#else
+    if (!b.chunks) { o = off; return B(b); }
+#endif
     const size_t k = std::min(off / b.stride, b.chunks->size() - 1);
     o = off - k * b.stride;
     return (__bridge id<MTLBuffer>)(*b.chunks)[k];
@@ -67,6 +77,7 @@ static inline id<MTLBuffer> BO(const Buffer& b, size_t off, size_t& o) {
 static inline id<MTLComputePipelineState> P(const Pipeline* p) { return (__bridge id<MTLComputePipelineState>)p->handle; }
 static std::string g_device_name = "unknown GPU";
 
+#if defined(STRATA_DS4_RUNTIME)
 
 // ---- DS4_TIMELINE=1: every deferred dispatch in its own encoder with start / end GPU timestamps; the report at exit gives, per kernel,
 // its GPU time and the gap the GPU sat idle before it (host waits, event waits, launch).  DS4_TL_FROM=N: only from dispatch N on.
@@ -281,23 +292,28 @@ extern "C" void ds4_busy_end() {
     g_busy.running = false;
 }
 
+#endif
 Context::Context() : impl_(new Impl) {
     impl_->dev = MTLCreateSystemDefaultDevice();
+#if defined(STRATA_DS4_RUNTIME)
     if (std::getenv("DS4_TIMELINE") && !g_tl.reg) {
         g_tl.on = true;
         g_tl.reg = true;
         static id<MTLDevice> tl_dev = impl_->dev;
         std::atexit([] { tl_report(tl_dev); });
     }
+#endif
     if (!impl_->dev) {
         std::fprintf(stderr, "mtl: no Metal device\n");
         std::exit(2);
     }
     impl_->q = [impl_->dev newCommandQueue];
+#if defined(STRATA_DS4_RUNTIME)
     if (ds4_gpu_residency_set && !std::getenv("DS4_NO_RESIDENCY")) {
         id<MTLResidencySet> rs = (__bridge id<MTLResidencySet>)ds4_gpu_residency_set();
         if (rs) [impl_->q addResidencySet:rs];
     }
+#endif
     // env, then <exe dir>/metal/ (a component package), then the compiled-in source-tree path
     ggml_common_path = strata_metal::resource("STRATA_GGML_COMMON", "ggml-common.h", STRATA_GGML_COMMON_DEFAULT);
     kernel_dir = strata_metal::resource("STRATA_METAL_KERNELS", "kernels", STRATA_METAL_KERNELS_DEFAULT);
@@ -349,6 +365,7 @@ int Context::compile(const std::vector<std::string>& files, const std::string& p
     return (int)impl_->libs.size() - 1;
 }
 
+#if defined(STRATA_DS4_RUNTIME)
 
 // ---- the keep-alive spin (see mtl_rt.h)
 static std::atomic<int64_t> g_last_act_ns{0};
@@ -433,7 +450,9 @@ uint64_t Context::zc_map(const void* p, size_t bytes) {
 }
 size_t Context::zc_count() const { std::lock_guard<std::mutex> lk(g_zc_mu); return g_zc.size(); }
 
+#endif
 Pipeline Context::pipeline(int lib, const std::string& fn, const Constants& c) {
+#if defined(STRATA_DS4_RUNTIME)
     // (cached: the host helpers ask for the same pipeline a dispatch at a time; newComputePipelineState costs ~0.3 ms and
     // [MTLDevice name] reads the preferences - the prompt path's expert copies (3 a streamed expert) spent seconds there)
     static std::mutex cache_mu;
@@ -455,6 +474,7 @@ Pipeline Context::pipeline(int lib, const std::string& fn, const Constants& c) {
 }
 
 Pipeline Context::pipeline_uncached(int lib, const std::string& fn, const Constants& c) {
+#endif
     NSError* err = nil;
     id<MTLFunction> f;
     NSString* name = [NSString stringWithUTF8String:fn.c_str()];
@@ -508,7 +528,11 @@ Pipeline Context::pipeline_uncached(int lib, const std::string& fn, const Consta
             p.name += (i ? "," : "") + std::to_string(c.vals[i].index) + "=" + std::to_string((int)c.vals[i].v);
         p.name += "}";
     }
+#if defined(STRATA_DS4_RUNTIME)
     if (g_device_name == "unknown GPU") g_device_name = [[impl_->dev name] UTF8String];
+#else
+    g_device_name = [[impl_->dev name] UTF8String];
+#endif
     return p;
 }
 
@@ -571,12 +595,15 @@ Buffer Context::wrap(void* p, size_t bytes, size_t max_span) {
     return r;
 }
 
+#if defined(STRATA_DS4_RUNTIME)
 // The runtime's own MTLBuffer under a CPU address (strata::gpu's allocations), when [p, p + bytes) lies inside one.  Binding it
 // - the same MTLBuffer, so the same GPU address, as every other kernel that touches this memory - instead of a fresh no-copy
 // buffer per call.  (Each fresh wrapper is a second GPU mapping of the same pages: the quantiser read the activations through
 // one mapping while the norm that produced them had written through another, and saw the previous layer's.)
 extern "C" void* ds4_gpu_buffer_for_cpu(const void* cpu, size_t bytes, size_t* off) __attribute__((weak_import));
+#endif
 Buffer Context::wrap(void* p, size_t bytes) {
+#if defined(STRATA_DS4_RUNTIME)
     if (ds4_gpu_buffer_for_cpu && !std::getenv("DS4_WRAP_COPY")) {
         size_t off = 0;
         if (void* mb = ds4_gpu_buffer_for_cpu(p, bytes, &off)) {
@@ -588,6 +615,7 @@ Buffer Context::wrap(void* p, size_t bytes) {
             return r;
         }
     }
+#endif
     id<MTLBuffer> b = [impl_->dev newBufferWithBytesNoCopy:p length:bytes options:MTLResourceStorageModeShared deallocator:nil];
     if (!b) {
         std::fprintf(stderr, "mtl: wrap %zu failed\n", bytes);
@@ -602,50 +630,71 @@ Buffer Context::wrap(void* p, size_t bytes) {
 }
 
 void Context::free(Buffer& b) {
+#if defined(STRATA_DS4_RUNTIME)
     // The deferred command buffer is made WITHOUT retained references: a buffer released here while a dispatch that names it
     // is still queued is read after it is gone (or after another alloc took its memory: the job arrays of iq_mv read the
     // NEXT call's jobs, measured as rows of zeros and different tokens every run).  Hold it until the buffer has completed.
     std::lock_guard<std::recursive_mutex> lk_(impl_->mu);
     const bool hold = impl_->cb_def != nil || impl_->inflight != nil;
+#endif
     if (b.chunks) {
+#if defined(STRATA_DS4_RUNTIME)
         for (void* h : *b.chunks) {
             if (hold) impl_->graveyard.push_back(h);
             else { id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)h; x = nil; }
         }
+#else
+        for (void* h : *b.chunks) { id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)h; x = nil; }
+#endif
         b = Buffer{};
         return;
     }
     if (b.handle) {
+#if defined(STRATA_DS4_RUNTIME)
         if (hold) impl_->graveyard.push_back(b.handle);
         else { id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)b.handle; x = nil; }
+#else
+        id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)b.handle;
+        x = nil;
+#endif
     }
     b = Buffer{};
 }
 
+#if defined(STRATA_DS4_RUNTIME)
 static std::mutex g_hist_mu;
 static std::unordered_map<void*, std::string> g_pipe_names;
 static std::unordered_map<std::string, uint64_t> g_kernel_counts;
 // DS4_ENC_TIMES: where a dispatch's encoding time goes - the pipeline state, the arguments, the dispatch call
 static std::atomic<uint64_t> g_t_pipe{0}, g_t_args{0}, g_t_disp{0};
+#endif
 static void encode(id<MTLComputeCommandEncoder> enc, const Dispatch& d) {
     require_fit(d, "dispatch");
+#if defined(STRATA_DS4_RUNTIME)
     static const bool enc_times = std::getenv("DS4_ENC_TIMES") != nullptr;
     const auto t_a = std::chrono::steady_clock::now();
+#endif
     [enc setComputePipelineState:P(d.p)];
+#if defined(STRATA_DS4_RUNTIME)
     const auto t_b = std::chrono::steady_clock::now();
+#endif
     for (size_t i = 0; i < d.args.size(); ++i) {
         const Arg& a = d.args[i];
         if (a.buf) {
             size_t o;
             id<MTLBuffer> mb = BO(*a.buf, a.off, o);
+#if defined(STRATA_DS4_RUNTIME)
             static const bool chkbuf = std::getenv("DS4_CHECK_BUF") != nullptr;
             if (chkbuf && o >= [mb length]) std::fprintf(stderr, "mtl: %s arg %zu: offset %zu past the buffer (%zu bytes; Buffer.bytes %zu bias %zu off %zu)\n", d.p->name.c_str(), i, o, (size_t) [mb length], a.buf->bytes, a.buf->bias, (size_t) a.off);
+#endif
             [enc setBuffer:mb offset:o atIndex:i];
         }
         else
             [enc setBytes:a.bytes.data() length:a.bytes.size() atIndex:i];
     }
+#if defined(STRATA_DS4_RUNTIME)
     const auto t_c = std::chrono::steady_clock::now();
+#endif
     if (d.tg_mem) [enc setThreadgroupMemoryLength:(d.tg_mem + 15) / 16 * 16 atIndex:0];
     if (d.indirect)
         [enc dispatchThreadgroupsWithIndirectBuffer:B(*d.indirect)
@@ -654,6 +703,7 @@ static void encode(id<MTLComputeCommandEncoder> enc, const Dispatch& d) {
     else
         [enc dispatchThreadgroups:MTLSizeMake(d.grid[0], d.grid[1], d.grid[2])
             threadsPerThreadgroup:MTLSizeMake(d.tg[0], d.tg[1], d.tg[2])];
+#if defined(STRATA_DS4_RUNTIME)
     if (enc_times) {
         const auto t_d = std::chrono::steady_clock::now();
         g_t_pipe.fetch_add((uint64_t) std::chrono::duration_cast<std::chrono::nanoseconds>(t_b - t_a).count(), std::memory_order_relaxed);
@@ -803,11 +853,15 @@ void Context::flush_runs() {
     }
     for (void* h : impl_->graveyard) { id<MTLBuffer> x = (__bridge_transfer id<MTLBuffer>)h; x = nil; }
     impl_->graveyard.clear();
+#endif
 }
 
 double Context::run(const std::vector<Dispatch>& ds, int reps, bool concurrent, bool barrier_between) {
+#if defined(STRATA_DS4_RUNTIME)
     std::lock_guard<std::recursive_mutex> lk_(impl_->mu);
+#endif
     @autoreleasepool {
+#if defined(STRATA_DS4_RUNTIME)
         if (ds.size() == 1 && reps == 1 && !barrier_between) {
             { static const std::string skipk = std::getenv("DS4_SKIP_K") ? std::string(",") + std::getenv("DS4_SKIP_K") + "," : std::string();   // debugging: drop these kernels (timing only)
               if (!skipk.empty() && skipk.find("," + ds[0].p->name + ",") != std::string::npos) return 0.0; }
@@ -860,13 +914,16 @@ double Context::run(const std::vector<Dispatch>& ds, int reps, bool concurrent, 
             return 0.0;
         }
         flush_runs();
+#endif
         id<MTLCommandBuffer> cb = [impl_->q commandBufferWithUnretainedReferences];
         id<MTLComputeCommandEncoder> enc =
             [cb computeCommandEncoderWithDispatchType:concurrent ? MTLDispatchTypeConcurrent : MTLDispatchTypeSerial];
         for (int r = 0; r < reps; ++r)
             for (const auto& d : ds) {
                 encode(enc, d);
+#if defined(STRATA_DS4_RUNTIME)
                 ++g_disp_count;
+#endif
                 if (barrier_between) [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             }
         [enc endEncoding];
