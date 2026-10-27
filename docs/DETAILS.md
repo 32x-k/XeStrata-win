@@ -788,6 +788,8 @@ The drafts then come from the suffix and prompt lookup only (one token a round w
 The draft layer's VRAM (about 0.7-1 GiB with its head) goes to the expert cache: 1,000 to 1,678 slots in upstream's comparison on an 8 GB card.
 Parked and saved conversations carry the draft layer's K/V, so without `--mtp` the conversation cache's parking, `--conversation-save` and the session files are off.
 
+A native Qwen3.8-Flash-Next pack (one whose experts are read from the GGUF files) takes `--spec` 2 at the smallest: the engine refuses to start with `--spec 0` or `--spec 1` (`it needs --native SHARD1, --spec T (T >= 2) and --prefill CHUNK`).
+
 ---
 
 ## Using it

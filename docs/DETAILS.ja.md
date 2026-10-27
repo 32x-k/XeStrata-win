@@ -753,6 +753,8 @@ server は `--mtp` なしでも動きます（upstream 3216d271）。
 upstream の 8 GB のカードでの比較では、キャッシュが 1,000 から 1,678 スロットになりました。
 退避した会話とファイルに保存した会話は推測の層の K/V を含むので、`--mtp` なしでは会話のキャッシュの退避、`--conversation-save`、セッションファイルは使えません。
 
+Qwen3.8-Flash-Next のネイティブの pack（エキスパートを GGUF のファイルから読む pack）では、`--spec` は 2 以上が要ります。`--spec 0` と `--spec 1` では、エンジンは起動しません（`it needs --native SHARD1, --spec T (T >= 2) and --prefill CHUNK`）。
+
 ---
 
 ## API
