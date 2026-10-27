@@ -503,6 +503,14 @@ MAC_MEASURED = ("M5 Max, 128 GB, 2.25 bpw, 2026-10-25: 14.4-15.8 tokens/s for an
                 "experts resident and read 93.4 MB a token from the SSD")
 
 
+# What each pack did on that Mac (the owner's measurements, 2026-10-25/26; the release build's numbers replace them in MAC_MEASURED_PACK).
+MAC_MEASURED_PACK = {
+    "IQ2_XXS": ("M5 Max, 128 GB, 2.00 bpw: 19-20 tokens/s for a short answer (14-17 after a long prompt), a 3,000-token prompt at 362-377 "
+                "tokens/s, 32,000 at 303; the engine kept 71.4 GB of the experts resident and read 40 MB a token from the SSD"),
+    "IQ2_XS": MAC_MEASURED,
+}
+
+
 def mac_expert_cap_gb(ram_gb: float) -> float:
     """The expert budget the engine will pick on a Mac of `ram_gb` (GiB, as the rest of the app reports memory), in
     decimal GB: the RAM less what macOS keeps, less the process' own footprint.  Mirrors metal_expert_cap() with its
@@ -543,7 +551,9 @@ def mac_plan(ram_gb: float, quant: str = "IQ2_XS", disk_free_gb: float | None = 
     lines, warns = out["lines"], out["warnings"]
     lines.append(f"DeepSeek-V4.1-Flash {pack['name']}: {routed:.0f} GB of routed experts and {dense:.1f} GB of dense "
                  "weights, plus a 111 GB Engram table that stays on the SSD and is read a few rows for each word.")
-    if ram_gb and ram_gb >= 96:
+    if ram_gb and ram_gb >= 96 and streaming <= 0.5:
+        lines.append(f"This Mac ({ram_gb:.0f} GB): the engine will keep all {routed:.0f} GB of the experts in memory.")
+    elif ram_gb and ram_gb >= 96:
         lines.append(f"This Mac ({ram_gb:.0f} GB): the engine will keep about {resident:.0f} GB of the experts in memory "
                      f"and read the other {streaming:.0f} GB from the SSD while it answers.")
     elif ram_gb:
@@ -617,7 +627,8 @@ def _plan_mac(key: str, model: str, card: dict, ram_gb: float | None, disk_free_
     lines.append(f"DeepSeek-V4.1-Flash, {v['title']}: a {download:.0f} GB download ({v['set_bytes'] / GB:.0f} GB of model, "
                  f"{ISTA_ENGRAM_BYTES / GB:.0f} GB n-gram table, {ISTA_DSPARK_BYTES / GB:.0f} GB drafter). Quality: {v['quality']}.")
     lines.extend(l for l in mp["lines"][1:] if not l.startswith("Measured on "))
-    lines.append("Measured on " + MAC_MEASURED + ".")
+    lines.append("Measured on " + MAC_MEASURED_PACK[MAC_SET_PACK[key]] + ".")
+    out["measured"] = MAC_MEASURED_PACK[MAC_SET_PACK[key]]
     warns.extend(mp["warnings"])
     if ram and ram < MAC_SMALL_RAM_GB and mp["verdict"] != "small":
         warns.append(f"This Mac has {ram:.0f} GB of memory and the set was measured on one with 128 GB: with less, more experts come from "
