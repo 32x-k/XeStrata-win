@@ -4314,6 +4314,49 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
         }
+        // Keep the table resident in RAM when the PC can afford it (upstream 3b34b6c7b, 472de9cda): a prompt token's
+        // rows are random reads of ~90 bytes in a table of tens of GB, so even a cached direct read pays ~100 us a token
+        // (upstream, R9700 IQ3_S 8K prompt: PLE 845 ms direct / 132 ms resident, the answer the same).  The routed
+        // experts' RAM arena is filled after this point and wants its own RAM, so the table is admitted only when RAM
+        // holds the table, every expert blob and 8 GiB more (a table admitted on table + 8 GiB alone took the lockable
+        // memory on a 64 GB Windows PC and the expert load failed).  Opt-in here (STRATA_PLE_AUTO_RAM=1): on the B70
+        // (xe, IQ3_XXS, 123 GB RAM, 2026-10-28) the locked table left 4 GB of MemFree once the prompt's buffers were
+        // taken, and a 32K prompt then hung the GPU (bcs CAT errors) where the direct reads finished; setup already
+        // writes --ple-io ram where the RAM can spare the table.  An explicit --ple-io wins.
+        bool ple_auto_ram = false;
+        if (pio.mode == strata::kernels::PleIo::Direct && !o.ple_io_explicit) {
+            const char* auto_ram = std::getenv("STRATA_PLE_AUTO_RAM");
+            const uint64_t need = ple_table.table_bytes();
+            uint64_t experts_ram = 0;
+            const auto& elay = strata::kernels::cpu::expert_layout();
+            for (int64_t l = 0; l < elay.n_layers; ++l) experts_ram += elay.blob_bytes(l) * (uint64_t) elay.n_expert;
+            const auto available = strata::core::available_host_bytes();
+            if (auto_ram != nullptr && (int) std::strtol(auto_ram, nullptr, 10) != 0 && need > 0 && experts_ram > 0 &&
+                strata::core::conversation_memory_admit(available, need + experts_ram, 8ull << 30)) {
+                const strata::kernels::PleIoOptions direct_pio = pio;
+                ple_table.close();
+                pio.mode = strata::kernels::PleIo::Mmap;
+                pio.lock = true;
+                pio.keepalive_ms = 0;
+                std::string ram_err;
+                if (ple_table.open(o.ple_gguf, ram_err, pio)) {
+                    ple_auto_ram = true;
+                    std::fprintf(stderr, "strata generate: --ple-io ram chosen by the residency policy (the table is %.1f "
+                                         "GiB, the expert arena %.1f GiB and %.1f GiB of RAM is available; "
+                                         "STRATA_PLE_AUTO_RAM=1 asked for it)\n",
+                                 (double) need / (1ull << 30), (double) experts_ram / (1ull << 30),
+                                 (double) *available / (1ull << 30));
+                } else {   // back to what was asked for: a table that cannot be mapped must not stop the engine
+                    std::fprintf(stderr, "strata generate: resident PLE table failed (%s); keeping direct reads\n",
+                                 ram_err.c_str());
+                    pio = direct_pio;
+                    if (!ple_table.open(o.ple_gguf, err, pio)) {
+                        std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                        return 1;
+                    }
+                }
+            }
+        }
         // Recommend, never force: when the default direct reads measure slow, say so.  The switch to the mapped reads
         // (40-100x faster on some DRAM-less NVMe drives) is made only with STRATA_PLE_AUTO_MMAP=1 (upstream #2040: the
         // 15K rows/s bar is NVMe-calibrated, a SATA SSD tops out at 10-14K with direct's 16 reads in flight, and mapped
@@ -4366,8 +4409,9 @@ int main(int argc, char** argv) {
         }
 #endif
         if (pio.lock)
-            std::fprintf(stderr, "strata generate: PLE table %s (--ple-io ram) in %.1f s\n",
+            std::fprintf(stderr, "strata generate: PLE table %s (%s) in %.1f s\n",
                          ple_table.locked() ? "locked in RAM" : "loaded (not locked)",
+                         ple_auto_ram ? "--ple-io ram chosen by the residency policy" : "--ple-io ram",
                          std::chrono::duration<double>(Clock::now() - tpl).count());
         std::fprintf(stderr, "strata generate: PLE table format %s\n", ple_table.format());
         if (pio.keepalive_ms > 0)

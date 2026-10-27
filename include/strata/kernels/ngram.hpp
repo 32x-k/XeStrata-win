@@ -205,6 +205,8 @@ public:
     /// True when `PleIoOptions::lock` was asked for and the OS lock succeeded (false: pages only pre-touched).
     bool locked() const;
     uint64_t rows() const;
+    /// Bytes of the whole table (rows x row bytes) while open; 0 when closed (the residency policy sizes it).
+    uint64_t table_bytes() const;
     /// "IQ4_NL" or "F8_E4M3" (a GGUF from tools/ple_fp8_pack.py: type I8, strata.ple.format = f8_e4m3).
     const char* format() const;
 
