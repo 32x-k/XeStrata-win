@@ -827,11 +827,15 @@ struct Gdn {
         });
     }
 
+    // `with_out` false (KVA's state-only layer): the same recurrence kernels without the output normalization, so z,
+    // gamma and y16 are not read; the one-group-per-head kernel fuses that norm, so it runs only with the output
     static void recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
-                           const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, bool silu, void* stream) {
+                           const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, bool silu, void* stream,
+                           bool with_out = true) {
         static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;   // the one-group-per-head kernel (A/B)
         auto& q = Q(stream);
-        if (serial || T <= 0) {
+        if (!with_out && T <= 0) return;
+        if ((serial && with_out) || T <= 0) {
             q.submit([&](sycl::handler& hd) {
                 sycl::local_accessor<float, 1> sk(sycl::range<1>(S), hd), sq(sycl::range<1>(S), hd),
                     red(sycl::range<1>((size_t) RG * S), hd), wsum(sycl::range<1>(16), hd);
@@ -1004,6 +1008,7 @@ struct Gdn {
             if (kh_on && pick == 1) launch_kh(state, y, T);
             else launch_d2(state, y, T);
         }
+        if (!with_out) return;
         q.submit([&](sycl::handler& hd) {
             sycl::local_accessor<float, 1> wsum(sycl::range<1>(4), hd);
             hd.parallel_for(sycl::nd_range<2>({(size_t) T, (size_t) HV * S}, {1, S}), [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(WARP)]] {
@@ -1047,6 +1052,13 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
                     int64_t h_v, bool silu) {
     gdn_dispatch(h_k, h_v, "gdn_recurrence", [&](auto g) {
         decltype(g)::recurrence(state, h, gate, beta, z, gamma, eps, y, y16, T, silu, stream);
+    });
+}
+
+void gdn_recurrence_state_only(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T,
+                               void* stream, int64_t h_k, int64_t h_v) {
+    gdn_dispatch(h_k, h_v, "gdn_recurrence_state_only", [&](auto g) {
+        decltype(g)::recurrence(state, h, gate, beta, nullptr, nullptr, 0.0f, y, nullptr, T, false, stream, false);
     });
 }
 

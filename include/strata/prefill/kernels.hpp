@@ -57,6 +57,11 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream, int64_t h_k = 16,
                     int64_t h_v = 48, bool silu = false);
+/// KVA (kva.hpp): the same recurrence kernels as gdn_recurrence, the same state bits, without the output
+/// normalization: state, h, gate, beta and the scratch `y` only.  A state-only late layer has no reader for the output
+/// projection or the gated residual write, nor for their input (z, the gate projection).
+void gdn_recurrence_state_only(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T,
+                               void* stream, int64_t h_k = 16, int64_t h_v = 48);
 // ---- MoE
 /// softmax over 512, top-10 (ties to the lower id), weights renormalised over the ten (the native router).
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream);
