@@ -449,6 +449,30 @@ compares the tier as a whole, not "batch windows only": the solo decode speed mo
 more varied workload the gain may be smaller (not measured). Upstream main runs no tier in batch windows, and this
 was not measured against an upstream binary.
 
+## Two NVIDIA cards: the pipelined groups are the default (0.2.7)
+
+With a layer split over exactly two NVIDIA cards, `--batch` and no `--batch-groups`, 0.2.1 to 0.2.6 ran one serial group
+(measured then on two RTX A4000, IQ3_XXS: +12 to 16% against the pipelined groups). From 0.2.7 the default is the pipelined
+groups, like on three or more cards. `STRATA_BATCH_GROUPS_NV_SERIAL=1` or `STRATA_DEFAULTS=026` gives the serial group back;
+`--batch-groups 1` asks for one group, `--batch-groups auto` or a number asks for the pipeline, and an explicit
+`STRATA_BATCH_GROUPS_NV_SERIAL=0` wins over `STRATA_DEFAULTS=026`.
+
+Why: with the 0.2.7 code the pipelined groups were faster at two and four streams on every box and quant measured
+(`tools/serve_load.py`, `--batch 4`, 256 tokens per request, interleaved pairs, total tokens per second, pipelined / serial):
+
+| box, model | experts in VRAM | 1 stream | 2 streams | 4 streams |
+| --- | --- | ---: | ---: | ---: |
+| 2x RTX A6000 48 GB, IQ3_S | all | 101.7 / 101.7 | 125.7 / 107.4 (+17%) | 171.4 / 141.0 (+22%) |
+| 2x RTX A4000 16 GB, Q2_0 | 17037 of 24576 pairs | 63.6-68.7 / 68.2-70.3 | 80.2-82.5 / 75.0-75.5 (+7 to 9%) | 110.8-111.5 / 94.8-95.3 (+17%) |
+| 2x RTX A4000 16 GB, IQ3_XXS | 13056 of 24576 pairs | 58.4-60.5 / 60.7-62.6 | 73.2-73.7 / 65.8-66.5 (+12%) | 100.5-100.7 / 82.9-83.6 (+20%) |
+
+The pipelined side was faster in every pair at two and four streams (3 pairs on the A6000, repeated in 3 more with the v0.2.6 binary; 4 clean pairs on the A4000
+with Q2_0, 3 on the A4000 with IQ3_XXS). The v0.2.6 binary measured the same on the A6000 (serial default 104.9 and 137.2
+tok/s at 2 and 4 streams, `--batch-groups auto` 124.6 and 169.6). A single stream runs on the solo path in both; on the A4000s
+the serial setting was about 4% faster for it (3 of 3 pairs with IQ3_XXS), on the A6000s it was equal. The 0.2.1 result
+(serial faster) did not repeat. Every slot's tokens equal its solo decode with the default (4 and 2 slots, greedy and seeded
+sampled streams, finishing slots, a cancelled slot).
+
 ## MTP drafts in the pipelined groups (`STRATA_PIPED_MTP`, opt-in)
 
 The pipelined groups run no drafts. `--batch-mtp` with serial windows (`--batch-groups 1`) keeps one card busy at a
@@ -473,7 +497,7 @@ Measured on a box with 2x RTX A6000 48 GB (`--layer-split auto`), Qwen3.8-Flash-
 VRAM, `--batch 4 --batch-groups auto` (2 groups of 2 slots), `tools/serve_load.py`, 256 tokens per request, reasoning
 off. Total output tokens per second: the median of the pairs, each pair the median of 3 bursts on a fresh engine start. The base arm
 (pipelined groups, no drafts) and `STRATA_PIPED_MTP=2` were run in 5 interleaved pairs, the other arms in 3 pairs. "Default" is
-`--batch 4` with no `--batch-groups`, which on exactly two NVIDIA cards means one serial group (`STRATA_BATCH_GROUPS_NV_SERIAL`):
+`--batch 4` with no `--batch-groups` as it ran in 0.2.1 to 0.2.6 on exactly two NVIDIA cards: one serial group (see the next section):
 
 | streams | pipelined, no drafts | `=1` | `=2` | `=3` | serial `--batch-mtp` (`--batch-groups 1`) | default (no flags) |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
