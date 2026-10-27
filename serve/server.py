@@ -6631,7 +6631,8 @@ def make_handler(svc: Service):
 
         def _responses_prepare(self, req, cancel=None):
             responses_api.check_request(req)
-            messages = responses_api.input_messages(req)
+            messages = responses_api.input_messages(        # an earlier answer's image is kept for edit_image
+                req, (lambda d: f"/v1/images/files/{svc.images.keep(d)}") if svc.images is not None else None)
             tools, names, skipped = responses_api.request_tools(req)
             # OpenAI's hosted image_generation tool: this server's image tools, run here (serve/images.py)
             self.image_tools = None

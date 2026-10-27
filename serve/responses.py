@@ -129,8 +129,10 @@ def _tool_output(item, param):
     return out if isinstance(out, str) else _content(out, param + ".output")
 
 
-def input_messages(req: dict) -> list[dict]:
-    """`instructions` + `input` -> the chat template's messages."""
+def input_messages(req: dict, keep_image=None) -> list[dict]:
+    """`instructions` + `input` -> the chat template's messages.  `keep_image(bytes)` -> the link of an earlier
+    answer's image (an image_generation_call's result) kept on this server, so edit_image can take it; None: there is
+    no image model to keep it for."""
     messages = []
     instructions = req.get("instructions")
     if instructions not in (None, ""):
@@ -194,6 +196,31 @@ def input_messages(req: dict) -> list[dict]:
                                                         "_call_id": item.get("call_id")})
         elif kind in ("function_call_output", "custom_tool_call_output"):
             messages.append({"role": "tool", "content": _tool_output(item, param), "_call_id": item.get("call_id")})
+            open_turn = None
+            thinking.clear()
+        elif kind == "image_generation_call":
+            # an earlier answer's image: the call and its result, as the model saw them when it made the image
+            text = "error: no image was made"
+            result = item.get("result")
+            if isinstance(result, str) and result:
+                try:
+                    data = base64.b64decode(result, validate=True)
+                except ValueError:
+                    raise ResponsesError("an image_generation_call's result must be the image in base64",
+                                         param + ".result") from None
+                try:
+                    url = keep_image(data) if keep_image is not None else None
+                except ValueError as e:
+                    raise ResponsesError(f"an image_generation_call's result: {e}", param + ".result") from None
+                text = (f"The image is made and the user sees it: {url}. To change it, call edit_image (its image: "
+                        f"{url}).") if url else "The image is made and the user sees it."
+            prompt = item.get("revised_prompt")
+            target = open_turn if open_turn is not None and not thinking else turn()
+            target.setdefault("tool_calls", []).append({"function": {
+                "name": "edit_image" if item.get("action") == "edit" else "generate_image",
+                "arguments": {"prompt": prompt} if isinstance(prompt, str) and prompt else {}},
+                "_call_id": item.get("id")})
+            messages.append({"role": "tool", "content": text, "_call_id": item.get("id")})
             open_turn = None
             thinking.clear()
         elif kind == "additional_tools":

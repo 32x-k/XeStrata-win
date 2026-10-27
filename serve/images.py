@@ -93,6 +93,7 @@ from __future__ import annotations
 import base64
 import collections
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -1449,6 +1450,29 @@ class ImageGen:
         name = f"{secrets.token_hex(16)}.{fmt}"
         (self.dir / name).write_bytes(data)
         self._prune()
+        return name
+
+    def keep(self, data: bytes) -> str:
+        """An image a client sends back (a Responses image_generation_call's result) kept as a stored image -> its
+        file name; ValueError when it is not a PNG, JPEG, WebP or JPEG XL.  The name is its content's hash: the same
+        image, sent again with every turn of a conversation, is one file (its time renewed, so pruning keeps it)."""
+        if data[:8] == b"\x89PNG\r\n\x1a\n":
+            fmt = "png"
+        elif data[:3] == b"\xff\xd8\xff":
+            fmt = "jpeg"
+        elif data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            fmt = "webp"
+        elif data[:2] == b"\xff\x0a" or data[:12] == b"\x00\x00\x00\x0cJXL \r\n\x87\n":
+            fmt = "jxl"
+        else:
+            raise ValueError("not a PNG, JPEG, WebP or JPEG XL image")
+        name = f"{hashlib.sha256(data).hexdigest()[:32]}.{fmt}"
+        p = self.dir / name
+        if p.is_file():
+            p.touch()
+        else:
+            p.write_bytes(data)
+            self._prune()
         return name
 
     def response(self, images: list[bytes], job: dict, figures: dict, base_url: str) -> dict:
