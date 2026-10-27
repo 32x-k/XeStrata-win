@@ -683,6 +683,9 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     captured.kv = std::move(reuse.kv);
     const size_t layers = owned_qsa(ss, g);
     captured.kv.resize(layers + 1);
+    // STRATA_PARK_VRAM_MIB: the retained layers' tokens go now (joined above, so no wait): held past the launch below,
+    // their replacement would join the copy just launched
+    for (auto& k : captured.kv) k.pending.reset();
     if (!conversation_checkpoint_save(captured.live, ss, g, error)) return false;
     // STRATA_CKPT_ASYNC: the running state may land in live.gdn after the save returns; the image waits for that copy
     // before the vector is freed (an eviction within the copy's time; upstream ca378670b).  The join is selective: a
@@ -726,11 +729,22 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
                               std::max<int64_t>(0, unchanged - 1), reused_bytes)) return false;
     abandon.on = false;
     if (staged && !conversation_park_async_launch(error)) return false;
-    if (staged)
-        captured.pending = std::shared_ptr<void>(new char, [](void* q) {
-            conversation_park_join();
-            delete static_cast<char*>(q);
-        });
+    if (staged) {
+        // STRATA_PARK_VRAM_MIB: the image's slot goes with the image, after the copy that reads it; each K/V layer
+        // carries a token of its own too (the layers outlive the image when they are retained for the next park, and
+        // the copy fills their buffers).  Without a slot: the image's join, no layer tokens.
+        const uint64_t slot = conversation_park_slot_tag();
+        auto token = [slot] {
+            return std::shared_ptr<void>(new char, [slot](void* q) {
+                conversation_park_join();
+                conversation_park_slot_release(slot);
+                delete static_cast<char*>(q);
+            });
+        };
+        captured.pending = token();
+        if (slot != 0)
+            for (auto& k : captured.kv) k.pending = token();
+    }
     image = std::move(captured);
     return true;
 }
@@ -807,7 +821,7 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
                                                    const ModelGeometry& g, const QsaState& draft, std::string& error) {
     conversation_checkpoint_join(image.live.gdn.data());
     for (const auto& c : image.checkpoints) conversation_checkpoint_join(c.gdn.data());
-    conversation_park_join();
+    conversation_park_join_for(image);   // (STRATA_PARK_VRAM_MIB: no wait when the K/V comes from its slot)
     if (!conversation_snapshot_validate(image, ss, g, draft, error)) return ConversationRestore::invalid;
     if (!sync(error)) return ConversationRestore::transfer_failed;
     const int64_t upto = (int64_t) image.live.ids.size();
@@ -984,7 +998,7 @@ ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation
                                                           const QsaState& draft, std::string& error) {
     conversation_checkpoint_join(image.live.gdn.data());
     for (const auto& c : image.checkpoints) conversation_checkpoint_join(c.gdn.data());
-    conversation_park_join();
+    conversation_park_join_for(image);   // (STRATA_PARK_VRAM_MIB: no wait when the K/V comes from its slot)
     if (!conversation_snapshot_validate(image, ss, g, draft, error)) return ConversationRestore::invalid;
     const int64_t captured = (int64_t) image.live.ids.size();
     if (upto < 1 || upto > captured) {
