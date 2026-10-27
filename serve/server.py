@@ -1210,6 +1210,35 @@ class StrataEngine:
             if time.time() > deadline:
                 raise EngineDied("the engine did not answer the VRAM command")
 
+    def encode(self, ids_path: str, out_path: str, timeout: float = 600.0) -> dict:
+        """`ENCODE <ids file> <states file>` between requests (the caller holds the service's FIFO; images.text_states):
+        the prompt's states after the final norm into the file, the engine's conversation set aside and put back.
+        -> {"tokens", "ms"}; ValueError with the engine's reason (a model it cannot encode with, a conversation it could
+        not set aside), EngineDied when it ended or did not answer."""
+        if " " in ids_path or any(c in ids_path + out_path for c in "\r\n\0"):   # the engine splits at the first space
+            raise ValueError("invalid encode paths")
+        proc = self.proc
+        if not self.alive() or proc is None or proc.stdin is None:
+            raise EngineDied("the engine is not running")
+        proc.stdin.write(f"ENCODE {ids_path} {out_path}\n")
+        proc.stdin.flush()
+        deadline = time.time() + timeout
+        while True:
+            try:
+                line = self.lines.get(timeout=max(0.1, deadline - time.time()))
+            except queue.Empty:
+                raise EngineDied("the engine did not answer the ENCODE command") from None
+            if line is None:
+                raise EngineDied("the engine ended")
+            line = line.strip()
+            if line.startswith("ERR"):
+                raise ValueError(line[4:].strip() or "the engine refused the ENCODE command")
+            if line.startswith("ENCODED "):
+                f = line.split()
+                return {"tokens": int(f[1]), "ms": float(f[2])}
+            if time.time() > deadline:
+                raise EngineDied("the engine did not answer the ENCODE command")
+
     RESTART_RETRY_S = 15.0   # between the tries of restart(): a dying engine's VRAM may take a while to come back
 
     @staticmethod

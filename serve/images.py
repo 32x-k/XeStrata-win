@@ -1307,7 +1307,8 @@ class ImageGen:
 
     @staticmethod
     def unstage(job: dict) -> None:
-        for p in (job.pop("ref_paths", []) or []) + [job.pop(k) for k in ("init_path", "mask_path") if job.get(k)]:
+        files = ("init_path", "mask_path", "te_path", "neg_te_path")
+        for p in (job.pop("ref_paths", []) or []) + [job.pop(k) for k in files if job.get(k)]:
             with contextlib.suppress(OSError):
                 os.unlink(p)
         if job.get("ref_dir"):
@@ -1316,12 +1317,14 @@ class ImageGen:
 
     @staticmethod
     def _refs_words(job: dict, need: bool = False) -> str:
-        """The engine's words of a job's images: REF:, MASK: and INIT:, and STRENGTH: below 1 (its repr, the double
-        strength_run counted with).  `need`: NEED's, where a strength's base image (an edit's first reference) is
-        counted by INIT:- when no mask or init image names it."""
+        """The engine's words of a job's files: REF:, MASK: and INIT:, the text states TE: and NEGTE: (text_states),
+        and STRENGTH: below 1 (its repr, the double strength_run counted with).  `need`: NEED's, where a strength's
+        base image (an edit's first reference) is counted by INIT:- when no mask or init image names it."""
         words = ("".join(f" REF:{p}" for p in job.get("ref_paths") or ())
                  + (f" MASK:{job['mask_path']}" if job.get("mask_path") else "")
-                 + (f" INIT:{job['init_path']}" if job.get("init_path") else ""))
+                 + (f" INIT:{job['init_path']}" if job.get("init_path") else "")
+                 + (f" TE:{job['te_path']}" if job.get("te_path") else "")
+                 + (f" NEGTE:{job['neg_te_path']}" if job.get("neg_te_path") else ""))
         if job.get("strength") is not None:
             if not need:
                 words += f" STRENGTH:{job['strength']!r}"
@@ -1905,6 +1908,65 @@ def partial_steps(steps: int, k: int) -> list[int]:
     return sorted({max(1, min(steps - 1, round(steps * (j + 1) / (k + 1)))) for j in range(k)})
 
 
+def same_model_file(a: str, b: str) -> bool:
+    """Whether two GGUF paths hold the same file: one file on disk (the same path, or a link to it), or the same size
+    and the same SHA-256 in setup's finish marks (<file>.done's "sha256 <hex>", written once the file matched its
+    pin)."""
+    try:
+        pa, pb = Path(a), Path(b)
+        if os.path.samefile(pa, pb):
+            return True
+        if pa.stat().st_size != pb.stat().st_size:
+            return False
+
+        def pins(p: Path) -> set[str]:
+            text = p.with_name(p.name + ".done").read_text(encoding="utf-8", errors="replace")
+            return {f[1] for f in (line.split() for line in text.splitlines()) if len(f) == 2 and f[0] == "sha256"}
+        return bool(pins(pa) & pins(pb))
+    except OSError:
+        return False
+
+
+def text_states(svc, gen: ImageGen, job: dict) -> None:
+    """MOSS-Image's text encoder by the chat's engine (its ENCODE command) when that engine reads the file of the image
+    model's text encoder (the config's "llm", same_model_file): the prompt's states, and under guidance the negative
+    prompt's, into files the IMG line names (job["te_path"] and job["neg_te_path"]: TE: and NEGTE:).  The engine sets
+    its conversation aside and puts it back.  Otherwise - another model, no engine running, parallel slots, or an
+    engine that refused - nothing: the image engine opens the encoder itself.  Called in the job's turn (gpu_turn),
+    before the text engine makes room."""
+    eng = getattr(svc, "engine", None)
+    te = gen.cfg.get("llm")
+    slots = getattr(eng, "batch", 0)
+    if (not te or eng is None or not hasattr(eng, "encode") or slots or not eng.alive()
+            or not same_model_file(getattr(eng, "model_path", ""), te)):
+        return
+    made: dict[str, str] = {}
+    tokens, ms = 0, 0.0
+    try:
+        for key, ids in (("te_path", gen.ids(job)), ("neg_te_path", job.get("neg_ids") if job.get("cfg") else None)):
+            if ids is None:
+                continue
+            stem = gen.dir / f"te-{secrets.token_hex(6)}"
+            ids_file, out = stem.with_suffix(".ids"), stem.with_suffix(".ste")
+            ids_file.write_text(",".join(str(i) for i in ids), encoding="ascii")
+            try:
+                r = eng.encode(str(ids_file), str(out))
+            finally:
+                with contextlib.suppress(OSError):
+                    os.unlink(ids_file)
+            made[key] = str(out)
+            tokens += r["tokens"]
+            ms += r["ms"]
+    except Exception as e:                       # noqa: BLE001 - the image engine encodes the text instead
+        for p in made.values():
+            with contextlib.suppress(OSError):
+                os.unlink(p)
+        gen._say(f"image job: the chat's engine did not encode the prompt ({e}); the image engine reads it")
+        return
+    job.update(made)
+    gen._say(f"image job: the prompt's states from the chat's engine ({tokens} tokens, {ms:.0f} ms)")
+
+
 def make_images(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = None,
                 preview=None) -> tuple[list[bytes], dict, str]:
     """`job`'s images in the GPU's turn (gpu_turn) -> (the PNG files' bytes, figures, the policy used).  When a request
@@ -1972,6 +2034,8 @@ def gpu_turn(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = Non
                         if cancel is not None and cancel.is_set():
                             raise _client_gone(svc)
                         time.sleep(0.25)
+                if gen.family == "moss-image":   # its text encoder by the chat's engine, while that holds the GPU
+                    text_states(svc, gen, job)
                 try:
                     need = gen.need(job)
                 except ImageJobFailed:
