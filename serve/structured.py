@@ -197,7 +197,9 @@ def prepare_format(response_format, messages, with_tools=False):
     return messages, validator
 
 
-def _extract_json(text: str) -> str:
+def extract_json(text: str) -> str:
+    """The first JSON object in `text`: a ```-fenced block's inside when there is one, else the text from its first
+    `{`.  Empty when there is nothing to take.  The server's json_schema logprobs read the model's own JSON with it."""
     s = (text or "").strip()
     if not s:
         return ""
@@ -250,13 +252,13 @@ def validated_json(text, validator, finish):
         raise StructuredOutputError(f"structured output was incomplete (finish_reason={finish}); "
                                     "increase the output budget")
     try:
-        value = json.loads(_extract_json(text), object_pairs_hook=pairs, parse_constant=constant)
+        value = json.loads(extract_json(text), object_pairs_hook=pairs, parse_constant=constant)
         canonical = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
     except (ValueError, TypeError) as exc:
         value = None
         if getattr(validator, "repair_escapes", False):      # opt-in (#2893); only after the strict parse failed
             try:
-                value = json.loads(repair_latex_escapes(_extract_json(text)), object_pairs_hook=pairs,
+                value = json.loads(repair_latex_escapes(extract_json(text)), object_pairs_hook=pairs,
                                    parse_constant=constant)
                 canonical = json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
                 print("[strata] structured output: repaired backslashes that were not valid JSON escapes", flush=True)

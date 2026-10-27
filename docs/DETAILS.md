@@ -1192,6 +1192,12 @@ The same held on the small configuration (8 GB, no XMX) and with the icpx build.
   The drafts kept on the 4070 rose from 64.1% to 70.8%.
   The result differs by card: measure on yours before turning it on.
 - **logprobs:** `"logprobs": true` with `"top_logprobs": K` (0–20) on `/v1/chat/completions` returns each token's log-probability and the K most likely candidates in `choices[].logprobs` (streamed too; from upstream's Intel port, 4ba35fd).
+  The tokens, joined, spell the reply exactly (a character split across two tokens lands in the one that finishes it).
+  `"allowed_token_ids": [ids]` keeps only those ids in `top_logprobs`, most likely first, renormalised to sum to 1; the chosen token is one of them when it was named (vLLM's field, but vLLM masks generation with it, while here it filters what is reported, so a token outside the named ids keeps its own `logprob` and an empty list).
+  An id past the model's vocabulary is a 400.
+  A token whose probability could not be read gets no entry, and the reply goes on.
+  A `json_schema` reply carries them only when its tokens spell the JSON returned.
+  On a server started with `--parallel`, only a `max_tokens` 1 request gets them, and a longer reply is a 400: a batch slot's `BT` lines carry none, and entries for a prefix only could not be told from the model's own answer.
   The values are the model's own, before sampling, temperature and penalties.
   Tokens written while it thinks are listed under `reasoning_content`; the stop token is not listed.
   On the B70 with IQ2_XS the answer was the same with and without it.

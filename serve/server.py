@@ -74,7 +74,7 @@ from serve.mcp import McpCancelled, McpHub, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve import release_check  # noqa: E402
-from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
+from serve.structured import StructuredOutputError, prepare_format, validated_json, extract_json  # noqa: E402
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
@@ -1069,7 +1069,7 @@ class StrataEngine:
 
     def _pump(self):
         proc, lines = self.proc, self.lines             # this process's: a restart replaces both (#344)
-        lp = self.__dict__.setdefault("lp_lines", collections.deque())   # (token id, LP line): logprobs
+        self.__dict__.setdefault("lp_lines", LPLines())   # (token id, LP line): logprobs
         last_t = None
         slot_q: list[queue.Queue] = getattr(self, "slot_q", [])
         line = None
@@ -1092,8 +1092,8 @@ class StrataEngine:
                     continue
                 except (IndexError, ValueError):
                     pass
-            if line.startswith("LP "):                  # beside the token before it, not in the queue
-                lp.append((last_t, line))
+            if line.startswith("LP "):                  # beside the token before it, not in the queue: in the lines of
+                self.lp_lines.append((last_t, line))    # the request that has the control lines now (LPLines)
                 continue
             if line.startswith("T "):
                 try:
@@ -1321,6 +1321,9 @@ class StrataEngine:
         k = top_logprobs(sampling)
         if k is not None:
             keys += f" logprobs={k}"
+            ids = allowed_ids(sampling)
+            if ids:     # only these ids are printed (upstream 9ea044962, #3200); renormalised in LogprobEntries
+                keys += " allowed=" + ",".join(str(i) for i in ids)
         # "strata_checkpoint": false - a one-shot call (a classification, a probe) whose turn no later request
         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
         if sampling.get("strata_checkpoint") is False:
@@ -1643,6 +1646,21 @@ class StrataEngine:
         with self.slot_cv:
             return any(e[0] * 2 <= plen for e in self.wait_lens)
 
+    def own_lp_lines(self, sampling, cancel, make_current=True):
+        """A request asking for logprobs gets LP lines of its own, tagged with its cancel Event and kept on it (one per
+        request, handed unchanged from the handler through Service.run): its last events can come after it left the
+        queue, when the next request has the engine's lines already (upstream 9ea044962, #3200).  None when it did
+        not ask; the engine's lines are then a fresh, untagged deque, as before."""
+        if top_logprobs(sampling or {}) is None or cancel is None:
+            if make_current:
+                self.lp_lines = LPLines()
+            return None
+        lines = LPLines(cancel)
+        cancel._strata_lp_lines = lines
+        if make_current:
+            self.lp_lines = lines
+        return lines
+
     def generate_batched(self, ids, max_new, sampling, cancel, embeddings=None):
         """--batch.  Alone (no slot busy, nobody waiting): the solo path (GEN, with drafts: the fastest stream)
         - and when another request arrives meanwhile, this one is STOPped and continues in a batch slot (BGEN with
@@ -1657,6 +1675,9 @@ class StrataEngine:
         self.progress, self.progress_ms, self.reused = None, 0, 0
         born = self.gen                                 # the engine process this request is sent to
         keys = self.sampling_keys(sampling or {})
+        # logprobs: only a request the server let through (max_tokens 1, see the handler) asks for them here; its LP
+        # lines go to its own LPLines, made the engine's while it has the control lines (below)
+        own_lp = self.own_lp_lines(sampling, cancel, make_current=False)
         out: list[int] = []
         pending: list[int] = []
         prompt, left = list(ids), int(max_new)
@@ -1685,6 +1706,8 @@ class StrataEngine:
                 if alone and left > 1:
                     head = f"GENI {left}{keys} {embeddings}" if embeddings else f"GEN {left}{keys}"
                     self._last_done = None                  # (#879: this request's DONE decides below)
+                    if own_lp is not None:
+                        self.lp_lines = own_lp
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     phase = "solo"
                     self._ctl_mode, self._ctl_result, self._yielded = "solo", None, None
@@ -1805,6 +1828,8 @@ class StrataEngine:
                             "started": time.time(), "first_token": None}
                     self.slot_live[slot] = live
                     self._last_done = None                  # (#879: this admission's DONE decides below)
+                    if own_lp is not None:
+                        self.lp_lines = own_lp
                     self._send(f"{head} {','.join(str(int(t)) for t in prompt)}")
                     self.slot_held[slot] = []               # the admission overwrites what the slot held
                     phase = "admit"
@@ -2050,7 +2075,7 @@ class StrataEngine:
             return
         self.progress, self.progress_ms, self.reused = None, 0, 0
         self.prefill_tok_s_mean = None
-        self.__dict__.setdefault("lp_lines", collections.deque()).clear()   # this request's LP lines only
+        self.own_lp_lines(sampling, cancel)             # this request's LP lines only
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
@@ -5108,18 +5133,124 @@ def top_logprobs(req: dict):
     return None
 
 
-def logprob_entry(tok, t, line: str):
-    """OpenAI's logprobs entry of an engine's "LP logprob id:logprob ..." line for token `t`, or None ("LP nan")."""
-    f = line.split()
-    if len(f) < 2 or f[1] == "nan":
-        return None
+def allowed_ids(req: dict) -> list:
+    """`allowed_token_ids`: the ids a caller named, or [] (vLLM's field; see LogprobEntries)."""
+    ids = req.get("allowed_token_ids")
+    if not isinstance(ids, (list, tuple)):
+        return []
+    return [x for x in ids if isinstance(x, int) and not isinstance(x, bool) and x >= 0]
 
-    def item(i, lp):
-        b = tok.token_bytes(i) if hasattr(tok, "token_bytes") else tok.decode([i]).encode()
-        return {"token": b.decode("utf-8", "replace"), "logprob": lp, "bytes": list(b)}
-    e = item(t, float(f[1])) if t is not None else {"token": "", "logprob": float(f[1]), "bytes": []}
-    e["top_logprobs"] = [item(int(i), float(v)) for i, _, v in (x.partition(":") for x in f[2:])]
-    return e
+
+def batch_slots_on(engine) -> bool:
+    """Does this engine run requests in batch slots ("parallel", whose `BT` lines carry no LP lines)?  Asked of each
+    engine behind a ReplicaEngine: a server with `--replicas 2` and no `--parallel` has none."""
+    return any(int(getattr(e, "batch", 0) or 0) for e in (getattr(engine, "engines", None) or [engine]))
+
+
+class LPLines(collections.deque):
+    """One request's (token id, LP line) pairs, tagged with its cancel Event (StrataEngine.own_lp_lines)."""
+
+    def __init__(self, owner=None):
+        super().__init__()
+        self.owner = owner
+
+
+class LogprobEntries:
+    """The engine's LP lines as OpenAI's logprobs.content entries (upstream 9ea044962, #3200).
+
+    Each token's "token" is the text it completes (an incremental UTF-8 decode, as the reply's text is made), so a
+    character split across tokens lands in the token that finishes it and the tokens, joined, spell the reply.
+    "bytes" are the token's own bytes.  The stop token ends the reply and is not listed (OpenAI does not list it
+    either), and a token that makes no text of the reply is left out: spell() gives each piece of text the tokens that
+    spell it.  A line whose values are not finite ("nan", MSVC's "-nan(ind)", a cut line) gives no entry.
+
+    `allowed_token_ids`: only those ids are kept, renormalised over them, so a caller asking about specific candidates
+    gets a distribution over exactly those.  vLLM, which named the field, masks generation with them; here they filter
+    what is reported, so the chosen token can be outside them.
+    """
+
+    def __init__(self, svc, allowed=(), owner=None):
+        self.tok, self.stop_ids = svc.tok, svc.stop_ids
+        self.allowed = list(allowed)
+        self.inc = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self.pending: list = []                    # entries read but not yet given to a piece of text
+        self.owner = owner                         # the request's cancel Event (LPLines)
+        self.lines = None                          # this request's current LPLines, kept once seen
+
+    def spell(self, eng, text: str) -> list:
+        """The entries whose tokens spell `text`, the next piece of the reply."""
+        self.pending += self.take(eng)
+        at = [0]
+        for e in self.pending:
+            at.append(at[-1] + len(e["token"]))
+        joined = "".join(e["token"] for e in self.pending)
+        i = joined.find(text)
+        while i >= 0 and text:
+            if i in at:
+                a = at.index(i)                    # the first token there
+                end = i + len(text)
+                b = next((j for j in range(a + 1, len(at)) if at[j] == end), None)
+                if b is not None:
+                    out, self.pending = self.pending[a:b], self.pending[b:]
+                    return out
+            i = joined.find(text, i + 1)
+        out, self.pending = self.pending, []
+        return out
+
+    def raw(self, t):
+        if hasattr(self.tok, "token_bytes"):
+            return self.tok.token_bytes(t)
+        return self.tok.decode([t]).encode("utf-8")
+
+    def take(self, eng) -> list:
+        # the request's own lines (on its cancel Event), else the engine's when they carry its Event; a later generate
+        # pass of the same request (an MCP round) makes new ones, and the old ones are read to the end first
+        own = getattr(self.owner, "_strata_lp_lines", None)
+        cur, old = (own if own is not None else getattr(eng, "lp_lines", None)), None
+        if cur is not self.lines and getattr(cur, "owner", None) is self.owner:
+            old, self.lines = self.lines, cur
+        out = []
+        for lines in (old, self.lines):
+            while lines:
+                t, line = lines.popleft()
+                if t is None or t in self.stop_ids:
+                    continue
+                f = line.split()
+                if len(f) < 2:
+                    continue
+                try:
+                    lp = float(f[1])
+                    alts = [(int(i), float(v)) for i, _, v in (x.partition(":") for x in f[2:])]
+                except ValueError:
+                    continue
+                if not math.isfinite(lp) or not all(math.isfinite(v) for _, v in alts):
+                    continue
+                b = self.raw(t)
+                e = {"token": self.inc.decode(b), "logprob": lp, "bytes": list(b), "top_logprobs": []}
+                if self.allowed:
+                    alts = self._renormalised(t, lp, alts)
+                    e["logprob"] = next((v for i, v in alts if i == t), lp)
+                for i, v in alts:
+                    alt = self.raw(i)
+                    e["top_logprobs"].append({"token": alt.decode("utf-8", "replace"), "logprob": v,
+                                              "bytes": list(alt)})
+                out.append(e)
+        return out
+
+    def _renormalised(self, t, lp, alts):
+        """Only the named ids, normalised over them so they sum to 1, most likely first.  The line carries the chosen
+        token's own logprob on its head and the named ids after it; the chosen token is put back among them when the
+        caller named it and the line did not list it (named alone, it is the whole distribution: logprob 0, as vLLM's
+        mask gives).  A line with none of the named ids gives no alternatives, and the entry keeps the chosen token's
+        own logprob: it is never dropped, since the reply's tokens have to keep spelling its text."""
+        alts = [(i, v) for i, v in alts if i in self.allowed]
+        if t in self.allowed and all(i != t for i, _ in alts):
+            alts = [(t, lp)] + alts
+        if not alts:
+            return alts
+        mx = max(v for _, v in alts)
+        lse = mx + math.log(sum(math.exp(v - mx) for _, v in alts))
+        return sorted(((i, v - lse) for i, v in alts), key=lambda x: -x[1])
 
 
 # The engine's last PP line stops short of the prompt: a short last part (`--short-read` tokens, or as many as the
@@ -5155,25 +5286,21 @@ def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel
     the engine wrote since the last one (the model's, before sampling, temperature and penalties; the stop token is
     not listed), under `content` or, while it thinks, `reasoning_content`."""
     chunks = _openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run, force)
-    lp = getattr(svc.engine, "lp_lines", None)
-    if top_logprobs(req) is None or lp is None:
+    if top_logprobs(req) is None:
         yield from chunks
         return
+    lp = LogprobEntries(svc, allowed_ids(req), cancel)
     try:
         for c in chunks:
-            if c and c.get("choices") and lp:
-                got = []
-                while lp:
-                    t, line = lp.popleft()
-                    if t in svc.stop_ids:           # the stop token ends the reply; OpenAI does not list it
-                        continue
-                    e = logprob_entry(svc.tok, t, line)
-                    if e is not None:
-                        got.append(e)
-                if got:
-                    d = c["choices"][0].get("delta") or {}
-                    key = "reasoning_content" if d.get("reasoning_content") and not d.get("content") else "content"
-                    c["choices"][0]["logprobs"] = {key: got}
+            if c and c.get("choices"):
+                d = c["choices"][0].get("delta") or {}
+                # the entries whose tokens spell this chunk's text (upstream 9ea044962): the thinking's under
+                # reasoning_content, the answer's under content
+                for key in ("reasoning_content", "content"):
+                    if d.get(key):
+                        got = lp.spell(svc.engine, d[key])
+                        if got:
+                            c["choices"][0].setdefault("logprobs", {})[key] = got
             yield c
     finally:
         chunks.close()                              # a client that went: the run stops now, as without logprobs
@@ -5302,6 +5429,64 @@ def openai_collect(chunks) -> dict:
     return out
 
 
+def logprob_span(text: str, part: str, entries: list):
+    """The entries whose tokens spell `part`, a piece of `text`, or None when the tokens do not spell `text` or no
+    token boundary falls at both ends of `part`."""
+    if "".join(e["token"] for e in entries) != text:
+        return None
+    start = text.find(part)
+    if start < 0:
+        return None
+    at, first = 0, None
+    for i, e in enumerate(entries):
+        if at == start and first is None:
+            first = i
+        if at == start + len(part) and first is not None:
+            return entries[first:i]
+        at += len(e["token"])
+    return entries[first:] if first is not None and at == start + len(part) else None
+
+
+def _same_json(a: str, b: str) -> bool:
+    """Are two strings the same JSON value (whitespace and key order aside)?"""
+    try:
+        return json.loads(a) == json.loads(b)
+    except ValueError:
+        return False
+
+
+def _structured_logprobs(choice: dict, content: str):
+    """(content, logprobs) of a validated json_schema / json_object reply (upstream 9ea044962, #3200).
+
+    structured_chunks returns the canonical JSON the validator made, which the model never wrote, so its tokens do not
+    spell it.  A run of tokens that spells what is returned is used as it is; tokens that spell the model's own JSON,
+    the same JSON value (the fenced-with-spaces case, the common one), return the model's form, so the joined tokens
+    are the content again.  Otherwise no logprobs: a caller joining the tokens must not get something that differs."""
+    lps = choice.get("logprobs")
+    if not lps or not lps.get("content"):
+        return content, None
+    raw = choice["message"]["content"] or ""
+    entries = lps["content"]
+    if raw == content:
+        return content, _with_reasoning(lps, entries)
+    span = logprob_span(raw, content, entries)
+    if span is not None:
+        return content, _with_reasoning(lps, span)
+    inner = extract_json(raw)
+    if inner and _same_json(inner, content):
+        span = logprob_span(raw, inner, entries)
+        if span is not None:
+            return inner, _with_reasoning(lps, span)
+    return content, None
+
+
+def _with_reasoning(lps: dict, entries: list) -> dict:
+    out = {"content": entries}
+    if lps.get("reasoning_content"):
+        out["reasoning_content"] = lps["reasoning_content"]
+    return out
+
+
 def structured_chunks(chunks, validator):
     """Buffer structured streams so a client never receives unvalidated content."""
     buffered = []
@@ -5317,12 +5502,21 @@ def structured_chunks(chunks, validator):
         result = openai_collect(buffered)
         choice = result["choices"][0]
         content = validated_json(choice["message"]["content"], validator, choice["finish_reason"])
+        # logprobs: the entries spell what the model wrote, which is replaced here with the canonical JSON;
+        # _structured_logprobs gives back the form the tokens spell, or None
+        content, logprobs = _structured_logprobs(choice, content)
         yield buffered[0]
         delta = {"content": content}
         if choice["message"].get("reasoning_content"):
             delta["reasoning_content"] = choice["message"]["reasoning_content"]
-        yield {**buffered[0], "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
-        yield buffered[-1]
+        piece = {"index": 0, "delta": delta, "finish_reason": None}
+        if logprobs:
+            piece["logprobs"] = logprobs
+        yield {**buffered[0], "choices": [piece]}
+        end = buffered[-1]
+        if end["choices"][0].get("logprobs"):       # those went out in the piece above (or were dropped with it)
+            end = {**end, "choices": [{k: v for k, v in end["choices"][0].items() if k != "logprobs"}]}
+        yield end
     finally:
         chunks.close()
 
@@ -6464,6 +6658,18 @@ def make_handler(svc: Service):
                 raise ValueError("structured response_format with tools/MCP is not supported")
             svc.load()
             max_req = max_new = int(req.get("max_completion_tokens") or req.get("max_tokens") or 0)   # 0/-1: the rest
+            if top_logprobs(req) is not None and batch_slots_on(svc.engine) and max_req != 1:
+                # --parallel: a slot's "BT <slot> <id>" lines carry no LP line; an admission - a max_tokens 1
+                # request - does.  Past that token a reply would hold entries for a prefix only, which a client cannot
+                # tell from the model's own answer, so the longer one is refused (upstream 9ea044962, #3200)
+                raise ValueError('logprobs is available with "parallel" (batch slots) only for max_tokens 1; '
+                                 'run the server without "--parallel" for longer replies')
+            n_vocab = len(getattr(svc.tok, "tokens", ())) or None
+            if top_logprobs(req) is not None and n_vocab:
+                # the engine indexes the logits row with each named id: one past the vocabulary is refused here
+                bad = [i for i in allowed_ids(req) if i >= n_vocab]
+                if bad:
+                    raise ValueError(f"allowed_token_ids: {bad[0]} is outside the vocabulary (0..{n_vocab - 1})")
             bias_api.validate_request(req, svc.engine, len(getattr(svc.tok, "tokens", ())) or None)
             use_mcp = req.get("strata_mcp") is True and svc.mcp is not None      # the web app's opt-in (serve/mcp.py)
             own = {t.get("name") for t in tools or [] if isinstance(t, dict)}   # #592: a second line of defence
