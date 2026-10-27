@@ -737,7 +737,7 @@ void MfVae::conv(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, floa
     if (c.k == 1) {
         gemm_.f16(in16, c.w, out, HW, c.out, c.in);
     } else {
-        const int64_t K = 9 * c.in, rows = std::max<int64_t>(1, col_cap_ / K);
+        const int64_t K = 9 * c.in, rows = std::max<int64_t>(1, (f2_ ? f2_band_ : col_cap_) / K);
         for (int64_t p0 = 0; p0 < HW; p0 += rows) {
             const int64_t n = std::min(rows, HW - p0);
             im2col3(in16, H, W, c.in, p0, n, col16_, s_);
@@ -748,7 +748,7 @@ void MfVae::conv(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, floa
 }
 
 void MfVae::conv_s2(const Conv& c, const uint16_t* in16, int64_t H, int64_t W, float* out) {
-    const int64_t HWo = (H / 2) * (W / 2), K = 9 * c.in, rows = std::max<int64_t>(1, col_cap_ / K);
+    const int64_t HWo = (H / 2) * (W / 2), K = 9 * c.in, rows = std::max<int64_t>(1, (f2_ ? f2_band_ : col_cap_) / K);
     for (int64_t p0 = 0; p0 < HWo; p0 += rows) {
         const int64_t n = std::min(rows, HWo - p0);
         im2col3_s2(in16, H, W, c.in, p0, n, col16_, s_);
@@ -1152,6 +1152,7 @@ void MfVae::open_flux2(SafeTensors& st) {
     gnb_ = vec(st, nm(d + "norm_out.bias"));
     cout_ = conv_w(st, nm(d + "conv_out"));
     C_ = cin_.out;
+    f2_ac_ = C_;
 }
 
 // The sizes of the stages from level k0 up to k1 (front: from the latent, its 1 x 1 convolution, conv_in and the
@@ -1203,7 +1204,7 @@ uint64_t MfVae::f2_bytes(const F2Sizes& z) const {
     return (uint64_t) z.most * (3 * 4 + 2) +                           // x, y, t; a16
            (uint64_t) col_rows * 9 * cmax * 2 +                        // the unfolded neighbourhoods, a band
            (uint64_t) z.pix * kGroups * 2 * 4 + 4 * (uint64_t) cmax * 4 +   // the group norms' sums, stats
-           (uint64_t) z.mid * C_ * 3 * 2 +                             // q, k, v^T
+           (uint64_t) z.mid * f2_ac_ * 3 * 2 +                         // q, k, v^T
            (uint64_t) z.rows * z.mid * (4 + 2);                        // a band's scores, probabilities
 }
 
@@ -1228,6 +1229,9 @@ void MfVae::f2_grow(const F2Sizes& z) {
     int64_t cmax = C_;
     for (const F2Level& l : f2_levels_)
         for (const F2Res& r : l.blocks) cmax = std::max(cmax, r.c1.in);
+    // the convolutions' bands by the decoder's widths alone, so that a decode is the same whether the encoder (wider
+    // in MOSS-Image's VAE) is loaded or not
+    f2_band_ = std::min<int64_t>(n.pix, 32768) * 9 * cmax;
     for (const F2Down& l : f2_down_) {
         for (const F2Res& r : l.blocks) cmax = std::max(cmax, r.c1.in);
         cmax = std::max(cmax, l.down.in);
@@ -1240,7 +1244,7 @@ void MfVae::f2_grow(const F2Sizes& z) {
     col16_ = alloc<uint16_t>(allocs_, col_cap_);
     gn_part_ = alloc<float>(allocs_, n.pix * kGroups * 2);
     vec_ = alloc<float>(allocs_, 4 * cmax);
-    f2_qk16_ = alloc<uint16_t>(allocs_, n.mid * C_ * 3);
+    f2_qk16_ = alloc<uint16_t>(allocs_, n.mid * f2_ac_ * 3);
     f2_q_ = alloc<float>(allocs_, n.rows * n.mid);
     f2_p16_ = alloc<uint16_t>(allocs_, n.rows * n.mid);
     f2_cap_ = n;
@@ -1514,8 +1518,7 @@ void MfVae::open_flux2_encoder(SafeTensors& st) {
     f2_emid_[0] = res(e + "mid.block_1.");
     const std::string a = e + "mid.attn_1.", qkv[3] = {nm(a + "q"), nm(a + "k"), nm(a + "v")};
     f2_eattn_ = attn_w(st, nm(a + "norm"), qkv, nm(a + "proj_out"), f2_emid_[0].c2.out);
-    if (f2_eattn_.qkv.in != C_)
-        throw std::runtime_error("image engine (Flux2 VAE): the encoder's middle is not the decoder's width");
+    f2_ac_ = std::max(C_, f2_eattn_.qkv.in);   // MOSS-Image's decoder is narrower than its encoder
     f2_emid_[1] = res(e + "mid.block_2.");
     f2_enw_ = vec(st, nm(e + "norm_out.weight"));
     f2_enb_ = vec(st, nm(e + "norm_out.bias"));
@@ -1542,7 +1545,7 @@ MfVae::F2Sizes MfVae::f2_enc_walk(int64_t h, int64_t w) const {
         }
     }
     z.mid = pix;
-    z.most = std::max({z.most, pix * 3 * C_, pix * 64});
+    z.most = std::max({z.most, pix * 3 * f2_eattn_.qkv.in, pix * 64});
     z.rows = std::max<int64_t>(1, std::min<int64_t>(z.mid, (int64_t) (16 << 20) / z.mid));
     z.c = c;
     return z;

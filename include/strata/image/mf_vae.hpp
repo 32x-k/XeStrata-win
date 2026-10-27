@@ -26,6 +26,8 @@
 // conv_out to the posterior's mean and log-variance, and the 1 x 1 quant_conv; the latent is the mean (diffusers'
 // Flux2 pipelines take its argmax), each 2 x 2 positions' 32 channels gathered into a token's 128 and normalized by
 // the batch norm's statistics, the decoder's input undone.  It runs on the whole image (not in tiles).
+// The widths are the weights' own: MOSS-Image's Flux2 VAE decodes with 96 to 384 channels and encodes with FLUX.2's
+// 128 to 512 (the convolutions' bands are the decoder's alone, so a decode is the same with the encoder loaded).
 // Where the whole does not fit the room decode is given, it runs the stages up to the deepest level that fits on the
 // whole latent (the middle's attention and the group norms there over all of it) and the rest in overlapping tiles (4
 // tokens, 64 pixels, on each side shared), blended linearly across the overlap as ComfyUI's tiled decode does; the
@@ -214,6 +216,8 @@ private:
     Attn f2_eattn_;
     const float *f2_enw_ = nullptr, *f2_enb_ = nullptr;
     F2Sizes f2_cap_;           // what the scratch holds (rows: the attention's query band)
+    int64_t f2_ac_ = 0;        // the widest middle attention's channels (the decoder's, or the encoder's once loaded)
+    int64_t f2_band_ = 0;      // the convolutions' unfolded band (values), by the decoder's widths
     uint64_t f2_held_ = 0;
     float *f2_x_ = nullptr, *f2_y_ = nullptr, *f2_t_ = nullptr, *f2_q_ = nullptr;
     uint16_t *f2_qk16_ = nullptr, *f2_p16_ = nullptr;
