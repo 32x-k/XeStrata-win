@@ -106,6 +106,9 @@ def main(argv=None) -> int:
             shutil.rmtree(copy.parent, ignore_errors=True)
     ft.build_feed(out, key=key, sequence=a.sequence, channel=a.channel, engine_dir=out / "engine" if a.engine else None,
                   control_dir=out / "control" if a.terminal else None, dsv41_dir=out / "dsv41" if a.dsv41 else None)
+    if any("linux-aarch64" in p.name for p in (out / "control").glob("*.entry.json")):       # the Linux ARM64 Terminal reads its own feed file (same bytes here)
+        for suffix in ("", ".sig"):
+            shutil.copy2(out / ("strata-feed.json" + suffix), out / ("strata-feed-linux-aarch64.json" + suffix))
     base = a.url.rstrip("/")
     for name in ("install.sh", "install.ps1"):
         text = (ROOT / "packaging" / name).read_text(encoding="utf-8").replace(RELEASE_FEED, base)

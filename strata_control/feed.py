@@ -27,10 +27,13 @@ import re
 from dataclasses import dataclass, field
 
 from strata_control import signing, transfer
-from strata_control.targets import BACKEND_MATRIX
+from strata_control.targets import BACKEND_MATRIX, host_platform
 
 SCHEMA_VERSION = 1
 FEED_NAME = "strata-feed.json"
+#: The Linux ARM64 (DGX Spark) Terminal reads this file instead. A Control older than 0.1.53 refuses a feed that names a platform it does not know, so
+#: the linux-aarch64 entries cannot sit in strata-feed.json: that file stays as every released client can read it. Same format, same key.
+AARCH64_FEED_NAME = "strata-feed-linux-aarch64.json"
 SIGNATURE_SUFFIX = ".sig"
 FORMATS = ("tar.gz", "tar.xz", "zip")
 PLATFORMS = ("windows-x86_64", "linux-x86_64", "linux-aarch64", "macos-arm64", "macos-x86_64")
@@ -339,6 +342,17 @@ def verify_and_parse(payload: bytes, signature_bytes: bytes, *, source: str, tru
     return feed
 
 
+def feed_name(platform: str | None = None) -> str:
+    """The feed file this machine reads from a folder or a release address: ``strata-feed-linux-aarch64.json`` on a Linux ARM64 machine, else
+    ``strata-feed.json``. A source that names its file (``.../x.json``) is used as given, whatever the machine."""
+    if platform is None:
+        try:
+            platform = host_platform()
+        except Exception:                                             # noqa: BLE001 - an unknown OS reads the common feed
+            platform = None
+    return AARCH64_FEED_NAME if platform == "linux-aarch64" else FEED_NAME
+
+
 def fetch(source: str, trusted: dict[str, bytes], **guards) -> Feed:
     """Read the feed and its signature from `source` (an https URL, a loopback http URL, a file URL or a folder/file path)."""
     if not trusted:
@@ -348,9 +362,11 @@ def fetch(source: str, trusted: dict[str, bytes], **guards) -> Feed:
     if transfer.kind_of(source) == "path":
         path = transfer._local_path(source)
         if path.is_dir():
-            location = str(path / FEED_NAME)
+            location = str(path / feed_name())
+            if not (path / feed_name()).is_file() and (path / FEED_NAME).is_file():
+                location = str(path / FEED_NAME)                 # a local folder made for the common feed (a test feed, an offline copy)
     elif transfer.kind_of(source) in ("http", "https") and not source.rsplit("/", 1)[-1].endswith(".json"):
-        location = source.rstrip("/") + "/" + FEED_NAME
+        location = source.rstrip("/") + "/" + feed_name()
     try:
         payload = transfer.read_small(location)
         signature = transfer.read_small(location + SIGNATURE_SUFFIX)
