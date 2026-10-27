@@ -486,10 +486,13 @@ pairs at both, `=3` in 3 of 3 at 2 streams and in none at 4. With `--batch 2` (2
 stream runs on the solo path in every arm and does not change. About 55% of the checked proposals were kept at `=2`
 and about 67% at `=1`. The acceptance falls as the window grows, which is why `=1` or `=2` is the choice and `=3` is not.
 
-Best setting here: `=2` with two streams, `=1` with four. More than four streams was not measured, and the gain at
-four streams is smaller than at two (not explained). Cost: the slot
+Best setting: `=1`. On the A6000 box `=1` gained the most at four streams and as much as `=2` at two; on the 2x RTX A4000 box
+(Q2_0 pack, the experts do not all fit in VRAM, `--batch 4`, 4 clean pairs, total tok/s, `=1` / `=2` / no drafts) it gave
+2 streams 96.7, 96.5, 96.3, 95.7 / 95.0-95.9 / 80.2-82.5 (+18 to 20%, +17 to 19% for `=2`) and 4 streams 117.8-120.0 / 99.7-105.8 /
+110.8-111.5 (`=1` +6 to 8% in 4 of 4 pairs, `=2` slower than no drafts in 4 of 4). One stream was unchanged. More than four streams was
+not measured, and why four streams gain less than two is not explained. Cost: the slot
 drafters and a save buffer per stage (25.5 MiB at `=1` and 38.2 MiB at `=2` with 4 slots), taken from the expert cache.
-On the A6000 box the cache stayed fully resident. On a 2x RTX A4000 box where the experts do not all fit, `--batch-mtp` took
+On the A6000 box the cache stayed fully resident. On the A4000 box, where the experts do not all fit, `--batch-mtp` took
 165 of 6959 cache slots on the second card; that changes which experts are in VRAM and so, in the last digits, which tokens come out.
 
 The first version of this was written by wannagoxuf (PR #4121), who measured +39% on 4x RTX 4090 with 4 streams
