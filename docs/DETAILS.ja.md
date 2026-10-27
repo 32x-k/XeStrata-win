@@ -1219,7 +1219,7 @@ server の起動からの合計（`totals`）も示します。
 | `tools` | `function` のツール、`namespace` のツール（モデルには `namespace.name` に見え、呼び出しは `namespace` と `name` で返ります）、`custom` のツール（自由な文字列の `input` 1 つ）。ホストのツール（`web_search`、`file_search` など）はモデルが動かせないので外します |
 | `tool_choice` | `"none"` はツールを隠します。ほかはモデルが選びます（強制はできません） |
 | `reasoning.effort` | `none`/`minimal`、`low`、`medium`、`high`/`xhigh`。なければ設定の `reasoning_effort`、それもなければモデルの既定（high） |
-| `max_output_tokens` | 出力の上限（思考を含む）。使い切ると応答は `incomplete`（`max_output_tokens`）で終わります |
+| `max_output_tokens` | 出力の上限（思考を含む）。使い切ると応答は `incomplete`（`max_output_tokens`）で終わります。`0` と `-1`（と、書かないこと）は `max_tokens` と同じく上限なし、`-1` より小さい値は 400 です |
 | `text.format` | `json_schema` と `json_object` は [JSON の応答の形式](#json-の応答の形式) を使います（確かめるだけで、出力を縛りません） |
 | `temperature`、`top_p`、`reasoning_budget_tokens` など | チャットの経路と同じ |
 
