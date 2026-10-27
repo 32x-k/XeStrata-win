@@ -59,6 +59,13 @@ bool qi_sdpa(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int6
 /// qi_sdpa can take a causal attention on the stream's GPU (a kernel for it in the build and the GPU's runtime).
 bool qi_sdpa_causal(void* stream);
 
+/// qi_attention's int8 kernel (src/image/qi_attn.cpp) alone: query rows r0 .. T - 1, which see all T keys (no mask), to
+/// out16 [rows from `first`][heads * 128]; false where it is not built for the GPU or its buffers do not fit.
+bool qi_attention_i8(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
+                     int64_t r0, int64_t first, uint16_t* out16, void* stream);
+/// The keys of qi_attention_i8's chunks: P in int8 at 127 steps of a row's largest in each chunk (from key 0).
+int qi_attention_i8_chunk();
+
 /// The text encoder's q and k ([T][q_heads * head_dim], [T][kv_heads * head_dim]): each head RMS-normed (wq, wk; eps
 /// 1e-6), then rotated as NEOX does (pair (j, j + head_dim / 2) by a position times theta^(-2j / head_dim)); FP16 out,
 /// v as v16.  The position: t, or with pos3 (three [T] rows: time, row, column) Qwen3-VL's interleaved M-RoPE, pair j
