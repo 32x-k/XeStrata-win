@@ -34,10 +34,14 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
+#include <map>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <utility>
 
 namespace strata::image {
 
@@ -760,6 +764,10 @@ const char* qi_attention_path() {
     return p < 0 ? "plain (FP32)" : names[p];
 }
 
+namespace {
+thread_local bool g_no_i8 = false;   // the 16-bit path's run while the int8 one is timed against it
+}
+
 bool qi_attention_i8(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
                      int64_t r0, int64_t first, uint16_t* out16, void* stream) {
     if (T <= r0) return true;
@@ -773,15 +781,77 @@ int qi_attention_i8_chunk() { return i8::CH; }
 
 void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
                   int64_t head_dim, int64_t n_text, uint16_t* out16, float* scratch, void* stream,
-                  const int32_t* key_lim, int64_t first) {
+                  const int32_t* key_lim, int64_t first, bool int8) {
     if (T <= first) return;
     if (head_dim != D) throw std::invalid_argument("qi_attention: head_dim 128");
-    // the image rows (they see every key) through the GPU maker's kernel where there is one; the prefix's own rows, a
-    // few dozen, by the kernel below
+    // the image rows (they see every key) through the int8 kernel where it is the faster, else the GPU maker's kernel
+    // where there is one; the prefix's own rows, a few dozen, by the kernel below
     int64_t row_end = T;
     const int64_t r0 = std::max(first, n_text);
-    if (T - r0 >= 256 && qi_sdpa(q16, k16, v16, r0, T, T, heads, head_dim, out16 + (r0 - first) * heads * head_dim,
-                                 stream)) {
+    // the int8 kernel: STRATA_IMAGE_ATTN_I8=1 always, 0 never; else the image rows timed in it and in the 16-bit kernel
+    // that would take them (the GPU maker's, else the engine's own), once a GPU and a shape (the rows and the keys, in
+    // steps of 1024: a generation's and an edit's differ), from 2048 image rows on (fewer: not taken)
+    bool i8_done = false;
+    if (int8 && T - r0 >= 256) {
+        sycl::queue& qq = core::Runtime::get().stream(stream);
+        static const int forced = [] {
+            const char* v = std::getenv("STRATA_IMAGE_ATTN_I8");
+            return v == nullptr || *v == 0 ? -1 : (int) (std::strtol(v, nullptr, 10) != 0);
+        }();
+        struct Choices {
+            std::mutex mu;
+            std::map<std::pair<int64_t, int64_t>, bool> of;   // (image rows, keys) / 1024 -> int8
+        };
+        static core::PerDevice<std::shared_ptr<Choices>> choices_of;
+        Choices& ch = *choices_of.get(qq.get_device(), [] { return std::make_shared<Choices>(); });
+        const auto key = std::make_pair((T - r0 + 1023) / 1024, (T + 1023) / 1024);
+        auto run_i8 = [&] { return i8::run(qq, q16, k16, v16, T, heads, r0, first, T, out16); };
+        int use = forced;
+        if (use < 0) {
+            std::lock_guard<std::mutex> lock(ch.mu);
+            const auto it = ch.of.find(key);
+            if (it != ch.of.end()) use = it->second;
+            else if (T - r0 >= 2048 && strata::kernels::xe::amd_wmma(qq.get_device())) {
+                auto timed = [&](const std::function<bool()>& f) {
+                    if (!f()) return -1.0;
+                    qq.wait();
+                    const auto t0 = std::chrono::steady_clock::now();
+                    f();
+                    qq.wait();
+                    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                };
+                const double i8ms = timed(run_i8);
+                double f16ms = timed([&] {   // the maker's kernel on the image rows, else the engine's on all asked
+                    return qi_sdpa(q16, k16, v16, r0, T, T, heads, head_dim, out16 + (r0 - first) * heads * head_dim,
+                                   stream);
+                });
+                if (f16ms < 0.0) {
+                    g_no_i8 = true;
+                    f16ms = timed([&] {
+                        qi_attention(q16, k16, v16, T, heads, head_dim, n_text, out16, scratch, stream, key_lim, first);
+                        return true;
+                    });
+                    g_no_i8 = false;
+                }
+                use = i8ms > 0.0 && i8ms < f16ms;
+                ch.of[key] = use;
+                std::fprintf(stderr, "strata-image: the attention's image rows %s at %lld rows of %lld keys (int8 "
+                                     "%.2f ms, 16-bit %.2f ms)\n", use ? "in int8" : "in 16 bits", (long long) (T - r0),
+                             (long long) T, i8ms, f16ms);
+            } else {
+                use = 0;
+            }
+        }
+        if (use == 1 && !g_no_i8) i8_done = run_i8();
+    }
+    if (i8_done) {
+        if (first >= n_text) {
+            if (!stream) core::Runtime::get().stream(stream).wait();
+            return;
+        }
+        row_end = n_text;
+    } else if (T - r0 >= 256 && qi_sdpa(q16, k16, v16, r0, T, T, heads, head_dim, out16 + (r0 - first) * heads * head_dim,
+                                        stream)) {
         if (first >= n_text) {
             if (!stream) core::Runtime::get().stream(stream).wait();
             return;

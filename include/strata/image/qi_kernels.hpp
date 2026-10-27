@@ -42,10 +42,12 @@ constexpr int64_t qi_attn_rows(int64_t T) { return (T + 127) / 128 * 128; }
 
 /// The same attention on the GPU's matrix engines where it has them (src/image/qi_attn.cpp), FP16 out16
 /// [T - first][heads * head_dim]: the query rows from `first` on (the rows before it, a cached prefix's, are not
-/// asked); else qi_attention_plain through `scratch` (FP32 [T][heads * head_dim]).
+/// asked); else qi_attention_plain through `scratch` (FP32 [T][heads * head_dim]).  `int8`: the rows that see every key
+/// may take the int8 kernel where it is the faster (qi_attention_i8: a model whose images it keeps, Qwen-Image's; not
+/// Mage-Flow's, whose image stream's outlier channels int8's row scales lose).
 void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
                   int64_t head_dim, int64_t n_text, uint16_t* out16, float* scratch, void* stream,
-                  const int32_t* key_lim = nullptr, int64_t first = 0);
+                  const int32_t* key_lim = nullptr, int64_t first = 0, bool int8 = false);
 
 /// The path qi_attention takes on the current GPU, for the report.
 const char* qi_attention_path();
@@ -61,6 +63,7 @@ bool qi_sdpa_causal(void* stream);
 
 /// qi_attention's int8 kernel (src/image/qi_attn.cpp) alone: query rows r0 .. T - 1, which see all T keys (no mask), to
 /// out16 [rows from `first`][heads * 128]; false where it is not built for the GPU or its buffers do not fit.
+/// qi_attention takes it, where it is the faster, for Qwen-Image's image rows (STRATA_IMAGE_ATTN_I8).
 bool qi_attention_i8(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t T, int64_t heads,
                      int64_t r0, int64_t first, uint16_t* out16, void* stream);
 /// The keys of qi_attention_i8's chunks: P in int8 at 127 steps of a row's largest in each chunk (from key 0).
