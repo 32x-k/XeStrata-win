@@ -20,7 +20,7 @@ struct MossText::Source : core::PlainModel::BlockSource {
 };
 
 MossText::MossText() = default;
-MossText::~MossText() = default;
+MossText::~MossText() { close(); }
 
 bool MossText::open(const std::string& gguf, int64_t max_tokens, std::string& err, uint64_t layer_budget) {
     close();
@@ -64,10 +64,11 @@ bool MossText::open(const std::string& gguf, int64_t max_tokens, std::string& er
     return true;
 }
 
+// the layer stream first: it waits for the model's stream (its compute stream), which the model destroys with itself
 void MossText::close() {
-    model_.reset();
-    source_.reset();
     layers_.reset();
+    source_.reset();
+    model_.reset();
 }
 
 void MossText::set_layer_budget(uint64_t bytes) {
