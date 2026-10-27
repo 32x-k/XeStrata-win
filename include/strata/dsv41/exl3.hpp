@@ -152,6 +152,8 @@ struct SetArgs {
     const int* bounds = nullptr;
     int row0 = 0;
     int max_rows = 0;   // the most rows one expert of the set has
+    const int* hbounds = nullptr;   // (Metal) the same bounds on the host: [n_exp + 1], absolute rows
+    int total_rows = 0;             // (Metal) the set's rows in all
     int n_embd = 4096, n_ff = 2048;
     float limit = 0.0f;
     // gate / up: the caller's F16 copy of the activations (row_idx picks the rows).  The tiles round F32 to F16 for

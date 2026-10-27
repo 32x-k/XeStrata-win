@@ -478,3 +478,87 @@ def options(cards: list[dict], ram_gb: float | None, vendor: str | None = None, 
     opts[0]["recommended"] = True
     out["options"], out["recommended"] = opts, "all"
     return out
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Apple Silicon: one pool of unified memory, the routed experts are file-backed and stay resident up to the engine's cap.
+# The numbers are the three GSQ-RCO packs (the research plan's table, measured from the public allocations) and the
+# engine's own cap rule (src/dsv41/ds4_model.cu metal_expert_cap, metal/src/engine/arena_budget.h).
+
+MAC_PACKS: dict[str, dict[str, Any]] = {
+    "IQ1_M": {"name": "1.75 bpw (IQ1_M)", "routed_gb": 114.56, "backbone_gb": 120.72, "bpw": 1.75},
+    "IQ2_XXS": {"name": "2.00 bpw (IQ2_XXS), the default for most users", "routed_gb": 132.07, "backbone_gb": 138.24, "bpw": 2.00},
+    "IQ2_XS": {"name": "2.25 bpw (IQ2_XS), the quality one", "routed_gb": 149.06, "backbone_gb": 155.23, "bpw": 2.25},
+}
+MAC_ENGRAM_GB = 110.60          # the same Engram table for all three, read row by row off the SSD
+MAC_ENGINE_FOOTPRINT_GB = 10.0  # the process' anonymous memory after the load (Metal buffers, host buffers, the KV cache)
+MAC_DEVICE_SHARE = 0.75         # recommendedMaxWorkingSetSize as a share of the RAM (107.5 of 128 GB on the M5 Max)
+MAC_FILECACHE_FLOOR_GB = 37.2   # vm.vm_page_filecache_min on the 128 GB M5 Max
+MAC_HEADROOM_GB = 12.0          # beside that floor: macOS itself and one more program
+MAC_MEASURED = ("M5 Max, 128 GB, 2.25 bpw, 2026-10-25: 14.4-15.8 tokens/s for an answer (12.4-12.6 on agent "
+                "work), a 3,000-token prompt at 380-382 tokens/s, 32,000 at 306; the engine kept 71.4 GB of the "
+                "experts resident and read 93.4 MB a token from the SSD")
+
+
+def mac_expert_cap_gb(ram_gb: float) -> float:
+    """The expert budget the engine will pick on a Mac of `ram_gb` (GiB, as the rest of the app reports memory), in
+    decimal GB: the RAM less what macOS keeps, less the process' own footprint.  Mirrors metal_expert_cap() with its
+    big-Mac rule (>= 64 GB: 40% left, at least the file-cache floor + 12 GB).  128 GiB gives the 71.4 GB measured on
+    the M5 Max."""
+    gib = 1.073741824
+    p = float(ram_gb) * gib
+    if p <= 0:
+        return 0.0
+    keep = max(7.0, 0.15 * p)
+    leave = max(keep, 0.40 * p, MAC_FILECACHE_FLOOR_GB + MAC_HEADROOM_GB) if p >= 64.0 else keep
+    cap = min(p - leave, MAC_DEVICE_SHARE * p)
+    return max(0.0, cap - MAC_ENGINE_FOOTPRINT_GB - 1.0)
+
+
+def mac_plan(ram_gb: float, quant: str = "IQ2_XS", disk_free_gb: float | None = None) -> dict[str, Any]:
+    """Where the DeepSeek pack goes on an Apple Silicon Mac.  Keys: quant, name, routed_gb, dense_gb, resident_gb,
+    streaming_gb, engram_gb, disk_need_gb, disk_ok, ram_gb, verdict (fits / streams / tight / small), lines, warnings,
+    words, measured.  `fits` means every routed expert stays in memory; `streams` is the normal case and is still
+    allowed (the engine reads the rest from the SSD in place)."""
+    if quant not in MAC_PACKS:
+        raise ValueError(f"unknown Mac pack {quant!r}; one of {sorted(MAC_PACKS)}")
+    pack = MAC_PACKS[quant]
+    routed = float(pack["routed_gb"])
+    dense = round(float(pack["backbone_gb"]) - routed, 2)
+    cap = mac_expert_cap_gb(ram_gb or 0.0)
+    resident = min(routed, cap)
+    streaming = max(0.0, routed - resident)
+    disk_need = float(pack["backbone_gb"]) + MAC_ENGRAM_GB + 6.0     # the shards, the Engram table, the pack folder
+    out: dict[str, Any] = {"quant": quant, "name": pack["name"], "routed_gb": round(routed, 1), "dense_gb": dense,
+                           "resident_gb": round(resident, 1), "streaming_gb": round(streaming, 1),
+                           "engram_gb": MAC_ENGRAM_GB, "disk_need_gb": round(disk_need, 1),
+                           "disk_ok": None if disk_free_gb is None else float(disk_free_gb) >= disk_need,
+                           "ram_gb": ram_gb, "measured": MAC_MEASURED, "lines": [], "warnings": []}
+    lines, warns = out["lines"], out["warnings"]
+    lines.append(f"DeepSeek-V4.1-Flash {pack['name']}: {routed:.0f} GB of routed experts and {dense:.1f} GB of dense "
+                 "weights, plus a 111 GB Engram table that stays on the SSD and is read a few rows for each word.")
+    if ram_gb and ram_gb >= 96:
+        lines.append(f"This Mac ({ram_gb:.0f} GB): the engine will keep about {resident:.0f} GB of the experts in memory "
+                     f"and read the other {streaming:.0f} GB from the SSD while it answers.")
+    elif ram_gb:
+        lines.append(f"This Mac ({ram_gb:.0f} GB) can hold about {resident:.0f} GB of the experts; the other "
+                     f"{streaming:.0f} GB stream from the SSD, which is slow on a small Mac.")
+    if cap <= 0:
+        out["verdict"] = "small"
+        warns.append("Too little memory to hold a useful part of the model: 64 GB or more is wanted.")
+    elif streaming == 0:
+        out["verdict"] = "fits"
+        lines.append("Every routed expert stays in memory: the fastest case.")
+    elif resident < 0.25 * routed:
+        out["verdict"] = "small"
+        warns.append(f"Only about {resident:.0f} GB of {routed:.0f} GB of experts fit in memory (under a quarter): "
+                     "most of the model is read from the SSD for every word. Expect seconds a word rather than tokens a second.")
+    else:
+        out["verdict"] = "streams"
+        lines.append("The model streams: answers are slower than on a machine that holds all the experts, and they still "
+                     "work. An NVMe SSD is wanted, not a USB or network drive.")
+    if disk_free_gb is not None and disk_free_gb < disk_need:
+        warns.append(f"The files need about {disk_need:.0f} GB of free disk space and {disk_free_gb:.0f} GB are free.")
+    lines.append("Measured on " + MAC_MEASURED + ".")
+    out["words"] = " ".join(lines)
+    return out

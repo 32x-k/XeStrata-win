@@ -94,6 +94,8 @@ struct SetArgs {
     float* y = nullptr;
     int ldo = 0;
     int tg = 0, td = 0;
+    const int* hbounds = nullptr;   // (Metal) the bounds on the host: [n_exp + 1], absolute rows
+    int total_rows = 0;             // (Metal) the set's rows in all
     int skip_le = 0;   // (the tiles) the experts of at most this many rows are left out: the light kernels took them
 };
 bool set_gate_up(const SetArgs& a, cudaStream_t s);
