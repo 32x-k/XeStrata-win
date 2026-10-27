@@ -397,6 +397,8 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
     return !draft || conversation_kv_validate(image.kv.back(), *draft, g, upto, false, error);
 }
 
+bool conversation_copy_stream_ready(int device) { return conversation_detail::copy_stream_ready(device); }
+
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& ss,
                                                    const ModelGeometry& g, const QsaState* draft, std::string& error) {
     if (!conversation_snapshot_validate(image, ss, g, draft, error)) return ConversationRestore::invalid;

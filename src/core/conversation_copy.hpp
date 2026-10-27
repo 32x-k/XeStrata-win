@@ -97,6 +97,17 @@ inline cudaError_t private_stream(cudaStream_t& s) {
     return cudaSuccess;
 }
 
+/// #2409: true when a copy on `dev` from this thread needs no new stream: the thread has one, or a thread that ended left
+/// one in the pool. false: the next copy creates one (a small device allocation, which can fail on a full card).
+inline bool copy_stream_ready(int dev) {
+    if (dev < 0) dev = 0;
+    const std::vector<cudaStream_t>& streams = thread_copy_handles().streams;
+    if ((size_t) dev < streams.size() && streams[(size_t) dev]) return true;
+    CopyHandlePool& p = copy_handle_pool();
+    std::lock_guard<std::mutex> lk(p.mu);
+    return (size_t) dev < p.streams.size() && !p.streams[(size_t) dev].empty();
+}
+
 /// STRATA_TEST_COPY_FAIL_AT=N (tests only, #3350): the N-th snapshot / checkpoint copy of the process fails with
 /// cudaErrorMemoryAllocation, as when a card has no memory left for the copy.  Unset: nothing.
 inline long test_copy_fail_at() {

@@ -106,6 +106,10 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
                                    const ModelGeometry& g, const QsaState& draft, std::string& error);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error);
+/// #2409: true when a restore (or a copy) on CUDA device `device` from the calling thread creates no copy stream: this
+/// thread has one for the card or a finished thread left one in the pool. A restore writes into buffers that exist
+/// already; a new stream is the one thing it can allocate (see program/conv_cache.hpp restore_fits).
+bool conversation_copy_stream_ready(int device);
 enum class ConversationRestore { restored, invalid, transfer_failed };
 // Invalid images are rejected before any CUDA call/write. Transfer failure may
 // leave partial state: caller MUST NOT continue inference from that session.

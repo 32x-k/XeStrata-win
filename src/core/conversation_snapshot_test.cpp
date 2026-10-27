@@ -194,6 +194,21 @@ void full_session(int fmt, int mode, int experts) {
           equal(restored.kv[0],a.kv[0]) && equal(restored.kv[1],a.kv[1]),"whole-session A/B/A exactness including spare key");
     check(ss.ple_prev[0]==64 && ss.ple_prev[1]==65,"PLE token window reconstructed");
     {
+        // #2409: a restore writes into the session's own buffers. After the copy stream exists (the restores above made
+        // it) a restore of either image allocates nothing on the card: free memory does not move (2 MiB allocation
+        // granules; 4 MiB of slack for a desktop card's other programs).
+        check(conversation_copy_stream_ready(0),"this thread has its copy stream after the first restore");
+        cudaDeviceSynchronize();
+        size_t before=0,after=0,total=0;
+        check(cudaMemGetInfo(&before,&total)==cudaSuccess,"free memory before the repeated restores");
+        for(int i=0;i<6;++i)
+            check(conversation_snapshot_restore(i%2?b:a,ss,g,draft.state,err)==ConversationRestore::restored,"repeated restore");
+        cudaDeviceSynchronize();
+        check(cudaMemGetInfo(&after,&total)==cudaSuccess,"free memory after the repeated restores");
+        check((long long)after+(4ll<<20)>=(long long)before,"six more restores allocate nothing on the card");
+        check(conversation_snapshot_restore(a,ss,g,draft.state,err)==ConversationRestore::restored,"A is back");
+    }
+    {
         // a borrowed prefix (ConversationCache::borrows): the K/V of A's first tokens and A's checkpoint there, A
         // untouched - the same bytes as restoring A whole and rewinding to that checkpoint
         const int64_t at = (int64_t) a.checkpoints[0].ids.size();

@@ -12963,6 +12963,47 @@ int main(int argc, char** argv) {
                 incoming.reset();
                 err.clear();
             }
+            // #2409: a restore writes into buffers that exist already. The one thing it can still allocate on a card is
+            // this thread's private copy stream for it (a pooled one is reused), and an out-of-memory there is fatal
+            // for the process (a failed restore must not be decoded from). So a card that would have to create one and
+            // has less than kRestoreFirstUseMib free gets no restore: the snapshot goes back to the cache and this
+            // prompt is read again. A card that already has its stream is never refused, however full it is.
+            if (incoming) {
+                std::vector<int> restore_devs{-1};
+                for (const auto& stp : stages) restore_devs.push_back(stp->dev);
+                std::vector<uint64_t> restore_free;
+                std::vector<uint8_t> restore_ready;
+                int tight = -1;
+                bool sampled = true;
+                for (const int rd : restore_devs) {
+                    const strata::core::OnDevice on(rd);
+                    int cur = 0;
+                    size_t fb = 0, tb = 0;
+                    if (cudaGetDevice(&cur) != cudaSuccess || cudaMemGetInfo(&fb, &tb) != cudaSuccess) {
+                        (void) cudaGetLastError();
+                        sampled = false;   // no sample: the restore goes ahead as it always did
+                        break;
+                    }
+                    restore_free.push_back((uint64_t) fb);
+                    restore_ready.push_back(strata::core::conversation_copy_stream_ready(cur) ? 1 : 0);
+                }
+                if (sampled &&
+                    !strata::program::conv_cache::restore_fits(restore_free.data(), restore_ready.data(), restore_free.size(),
+                                                               strata::program::conv_cache::kRestoreFirstUseMib << 20)) {
+                    for (size_t k = 0; k < restore_free.size(); ++k)
+                        if (!restore_ready[k] && restore_free[k] < (strata::program::conv_cache::kRestoreFirstUseMib << 20)) tight = (int) k;
+                    std::fprintf(stderr, "strata serve: conversation cache: skip restore (%s has %lld MiB free and no copy stream "
+                                         "yet, which needs up to %lld MiB); rereading the prompt\n",
+                                 tight <= 0 ? "CUDA0" : ("stage " + std::to_string(tight)).c_str(),
+                                 (long long) (tight >= 0 ? restore_free[(size_t) tight] >> 20 : 0),
+                                 (long long) strata::program::conv_cache::kRestoreFirstUseMib);
+                    auto retry = std::move(*incoming);
+                    incoming.reset();
+                    if (!conversations.put(std::move(retry)))
+                        std::fprintf(stderr, "strata serve: conversation cache: could not return the skipped snapshot\n");
+                    err.clear();
+                }
+            }
             if (borrow) {
                 const strata::core::SavedConversation* donor = conversations.find(parked.serial);
                 if (donor == nullptr ||
