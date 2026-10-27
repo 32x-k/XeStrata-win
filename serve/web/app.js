@@ -3,7 +3,9 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // serve/web/app.js - the Strata web app: Chat, Monitor, About. No framework, no network beyond this server.
 // The Monitor tab rebuilds PR #22's dashboard idea (code-martin) on the server's own /metrics.
-/* global tr, StrataI18n, StrataMath, StrataPreview */   // serve/web/i18n.js, math.js, preview.js, loaded before this file
+/* global tr, StrataI18n, StrataMath, StrataPreview, node, panel, msgActions, saveChat, stillWriting, initChats, setChatList,
+          clearUndo, syncActions, closePanel, renderSidebar, renderParent, renderUndoBar */
+// serve/web/i18n.js, math.js, preview.js and chats-ui.js, loaded before this file
 "use strict";
 
 const $ = (id) => document.getElementById(id);
@@ -964,7 +966,7 @@ function markdown(text) {
 // 0.7 / 0.8 / 20 with a presence penalty). Before 0.1.45 the page sent 0.6 itself; a stored 0.6 with the other two
 // values untouched counts as "not set" too.
 const DEFAULTS = {thinking: "", temperature: 1.0, top_p: 0.95, top_k: 20, min_p: "", max: "", seed: "", show: true, esp: true,
-                  mcp: true, math: false};
+                  mcp: true, math: false, chatList: false, chatEdit: false, whileBusy: "wait"};
 const OLD_DEFAULT_TEMPERATURE = 0.6;
 function samplingUntouched(s) {
   const t = +s.temperature;
@@ -974,14 +976,10 @@ let settings = {...DEFAULTS, ...store.get("sampling", {})};
 // before the model's own levels (thinking_v 2) "high" was every model's default and saved as it: the default again
 if (settings.thinking_v !== 2 && settings.thinking === "high") settings.thinking = "";
 if (samplingUntouched(settings)) settings.temperature = DEFAULTS.temperature;
-let messages = store.get("chat", []);
+let messages = store.get("chat", []);   // the open chat's messages (chats-ui.js: with the saved-chats list on, also that chat's own)
 let attachments = [];                 // {name, url}
-let busy = null;                      // {controller, msg}
-
-function saveChat() {
-  store.set("chat", messages.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name})),
-                                           files: (m.files || []).map((f) => ({name: f.name}))})));
-}
+let busy = null;                      // {controller, msg, cut, cutAfterTool}
+let pending = null;                   // a message parked while an answer is written: {text, images, files, mode}
 function timeStr(t) { return new Date(t).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}); }
 
 function msgEl(m, i) {
@@ -1025,6 +1023,8 @@ function msgEl(m, i) {
       `<button class="st-btn st-btn--icon" data-msg-copy aria-label="Copy the answer" title="Copy">${icon("copy")}</button></div>`;
     updateAssistant(el, m, false);
   }
+  const actions = msgActions(m, i);                 // edit / regenerate / rewind (chats-ui.js), when switched on
+  if (actions) el.appendChild(actions);
   return el;
 }
 // One MCP tool call in the answer: a compact block (name, state, a one-line preview) that opens to the arguments and
@@ -1115,6 +1115,9 @@ function renderChat() {
   chat.querySelectorAll(".st-msg").forEach((e) => e.remove());
   $("chat-empty").hidden = messages.length > 0;
   messages.forEach((m, i) => chat.appendChild(msgEl(m, i)));
+  renderSidebar();
+  renderParent();
+  renderUndoBar();
   scrollDown(true);
 }
 function nearBottom() { const s = $("chat-scroll"); return s.scrollHeight - s.scrollTop - s.clientHeight < 120; }
@@ -1206,27 +1209,122 @@ function assistantMessages(m) {
   return out;
 }
 
+function busyHint() {
+  const mode = settings.whileBusy;
+  return mode === "queue" ? tr("composer.hintQueue", "Enter sends when the answer is done")
+       : mode === "interject" ? tr("composer.hintInterject", "Enter stops the answer here and sends now") : "";
+}
+// While an answer is written, Send is off ("wait", as always) or parks the message ("queue", "interject": Chat settings)
+const parksWhileBusy = () => settings.whileBusy === "queue" || settings.whileBusy === "interject";
 function setBusy(on) {
   $("stop-btn").hidden = !on;
-  $("send-btn").disabled = on;
-  $("composer-hint").textContent = on ? "" : "Shift+Enter: new line";
+  $("send-btn").disabled = (on && !parksWhileBusy()) || !!panel;
+  $("input").disabled = !!panel;
+  $("composer-hint").textContent = panel ? tr("composer.finishOpen", "Save or cancel what is open above to continue")
+                                         : on ? busyHint() : tr("composer.newline", "Shift+Enter: new line");
+  if (settings.chatEdit) syncActions();                 // the buttons follow the state: none under the answer being written
+  $("s-list").disabled = $("s-edit").disabled = !!busy || !!panel;      // they change the messages on the screen
+  renderUndoBar();
+  renderPending();
 }
 
-async function send() {
-  const text = $("input").value.trim();
-  if ((!text && !attachments.length) || busy) return;
-  messages.push({role: "user", text, images: attachments.filter((a) => a.kind !== "file"),
-                 files: attachments.filter((a) => a.kind === "file"), time: Date.now()});
-  attachments = [];
-  renderAttachments();
-  $("input").value = "";
-  autosize();
+// A message sent while an answer is being written (#4004). "queue": it waits and goes when the answer is done. "interject": the
+// answer stops where it is (what is written stays, marked interrupted) and the message goes at once; if a tool is running, the
+// tool finishes first. Only one message waits. Off by default: with "wait" the page does nothing, as before.
+function park(p, own) {
+  if (!parksWhileBusy()) return;
+  if (pending) { toast("warn", tr("pending.one", "A message is already waiting"), tr("pending.oneText", "Take it back or wait until it is sent.")); return; }
+  pending = {...p, mode: settings.whileBusy};
+  if (own) { attachments = []; renderAttachments(); $("input").value = ""; autosize(); }
+  if (pending.mode === "interject") requestCut();
+  setBusy(!!busy);
+}
+function requestCut() {
+  if (!busy || busy.cut) return;
+  if ((busy.msg.tools || []).some((t) => t.state === "running")) { busy.cutAfterTool = true; return; }   // let the tool finish
+  busy.cut = true;
+  busy.controller.abort();
+}
+function renderPending() {
+  let el = $("pending");
+  if (!pending) { if (el) el.remove(); return; }
+  if (!el) {
+    el = node("div", "pending");
+    el.id = "pending";
+    el.setAttribute("role", "status");
+    el.innerHTML = "<span class=\"pending__text\"></span><span class=\"pending__actions\"><button type=\"button\" class=\"st-btn st-btn--secondary\" data-pending-now></button>" +
+      "<button type=\"button\" class=\"st-btn st-btn--secondary\" data-pending-back></button></span>";
+    el.querySelector("[data-pending-now]").onclick = pendingNow;
+    el.querySelector("[data-pending-back]").onclick = releasePending;
+    $("composer").before(el);
+  }
+  const quote = (pending.text || (pending.files[0] || pending.images[0] || {}).name || "").replace(/\s+/g, " ").slice(0, 70);
+  const text = !busy ? tr("pending.ready", "Not sent yet: “{text}”", {text: quote})
+    : pending.mode === "queue" ? tr("pending.queued", "Sends when this answer is done: “{text}”", {text: quote})
+    : busy.cutAfterTool ? tr("pending.afterTool", "Waiting for the tool to finish, then sending: “{text}”", {text: quote})
+    : tr("pending.cutting", "Stopping the answer, then sending: “{text}”", {text: quote});
+  el.querySelector(".pending__text").textContent = text;
+  const now = el.querySelector("[data-pending-now]");
+  now.textContent = busy ? tr("pending.sendNow", "Send now") : tr("pending.send", "Send");
+  now.hidden = !!busy && pending.mode === "interject";            // already on its way
+  el.querySelector("[data-pending-back]").textContent = tr("pending.takeBack", "Take back");
+}
+function pendingNow() {
+  if (!pending) return;
+  if (busy) { pending.mode = "interject"; requestCut(); setBusy(true); return; }
+  const p = pending;
+  pending = null;
+  setBusy(false);
+  send(p);
+}
+// the waiting message goes back into the message box (a chat switch or a new chat must not lose it)
+function releasePending() {
+  if (!pending) return;
+  const p = pending;
+  pending = null;
+  if (!$("input").value.trim()) $("input").value = p.text;
+  else $("input").value = `${p.text}\n\n${$("input").value}`;
+  attachments = [...p.images, ...p.files, ...attachments];
+  renderAttachments(); autosize();
+  setBusy(!!busy);
+}
+// after an answer: an interrupted one sends an interjection, a finished one sends a queued message
+function settlePending(cut, finished) {
+  if (!pending) return;
+  if ((pending.mode === "interject" && cut) || (pending.mode === "queue" && finished)) {
+    const p = pending;
+    pending = null;
+    setBusy(false);
+    send(p);
+  }
+}
+
+// the message box (or a parked message, `payload`) becomes a user turn and a reply is asked for
+async function send(payload) {
+  const own = !payload;
+  const p = payload || {text: $("input").value.trim(), images: attachments.filter((a) => a.kind !== "file"),
+                        files: attachments.filter((a) => a.kind === "file")};
+  if (!p.text && !p.images.length && !p.files.length) return;
+  if (panel) return;                                  // something is open above (an edit): finish it first
+  if (busy) { park(p, own); return; }
+  clearUndo();
+  messages.push({role: "user", text: p.text, images: p.images, files: p.files, time: Date.now()});
+  if (own) {
+    attachments = [];
+    renderAttachments();
+    $("input").value = "";
+    autosize();
+  }
+  return generateReply();
+}
+// an answer for the messages as they are: the last one is a user turn
+async function generateReply() {
   const m = {role: "assistant", text: "", reasoning: "", time: Date.now()};
   messages.push(m);
   renderChat();
   const el = $("chat").lastElementChild;
   const controller = new AbortController();
-  busy = {controller, msg: m};
+  busy = {controller, msg: m, cut: false, cutAfterTool: false};
   setBusy(true);
   paintLive();
 
@@ -1255,7 +1353,7 @@ async function send() {
     if (!r.ok) {
       let msg = `HTTP ${r.status}`;
       try { msg = (await r.json()).error.message || msg; } catch (e) { /* not json */ }
-      if (r.status === 401) msg = "This server needs an API key: add it under About > Settings.";
+      if (r.status === 401) msg = tr("toast.keyNeeded", "This server needs an API key: add it under About > Settings.");
       throw new Error(msg);
     }
     const reader = r.body.getReader(), dec = new TextDecoder();
@@ -1273,9 +1371,13 @@ async function send() {
         if (data === "[DONE]") continue;
         let j;
         try { j = JSON.parse(data); } catch (e) { continue; }
-        if (j.error) throw new Error(j.error.message || "the engine reported an error");
+        if (j.error) throw new Error(j.error.message || tr("toast.engineError", "the engine reported an error"));
         if (j.usage) usage = j.usage;
-        if (j.strata_mcp) onTool(m, j.strata_mcp);
+        if (j.strata_mcp) {
+          onTool(m, j.strata_mcp);
+          // an interjection waited for a running tool: it has its result now, so the answer can stop
+          if (busy.cutAfterTool && !busy.cut && !(m.tools || []).some((t) => t.state === "running")) { busy.cut = true; controller.abort(); }
+        }
         const d = (j.choices && j.choices[0] && j.choices[0].delta) || {};
         const lastTool = m.tools && m.tools.length ? m.tools[m.tools.length - 1] : null;   // a new round after a tool
         if (d.reasoning_content) {
@@ -1295,21 +1397,24 @@ async function send() {
     }
   } catch (e) {
     if (e.name === "AbortError") m.stopped = true;
-    else { m.error = e.message || String(e); toast("error", "The request failed", m.error, 6000); }
+    else { m.error = e.message || String(e); toast("error", tr("toast.requestFailed", "The request failed"), m.error, 6000); }
   }
+  const cut = busy.cut;                                      // an interjection ended it: kept as written, marked interrupted
+  if (cut) m.interrupted = true;
   if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
   const n = usage ? usage.completion_tokens : null;
+  const ended = cut ? tr("chat.interruptedLower", "interrupted") : tr("chat.stoppedLower", "stopped");
   if (n && firstAt) {
     const secs = (performance.now() - firstAt) / 1000;
-    m.meta = `${fmt(n)} tokens${secs > 0.25 ? ` · ${fmt(n / secs, 1)} tok/s` : ""}${m.stopped ? " · stopped" : ""}` +
-             (projectionLoaded() ? (settings.esp ? " · projection on" : " · projection off") : "");
+    m.meta = tr("chat.tokens", "{n} tokens", {n: fmt(n)}) + (secs > 0.25 ? ` · ${fmt(n / secs, 1)} tok/s` : "") + (m.stopped ? ` · ${ended}` : "") +
+             (projectionLoaded() ? (settings.esp ? ` · ${tr("chat.projectionOn", "projection on")}` : ` · ${tr("chat.projectionOff", "projection off")}`) : "");
   } else if (m.stopped) {
-    m.meta = "Stopped";
+    m.meta = cut ? tr("chat.interrupted", "Interrupted") : tr("chat.stopped", "Stopped");
   }
   for (const t of m.tools || []) if (t.state === "writing" || t.state === "running") { t.state = "skipped"; t.ms = null; }
   const ran = (m.tools || []).filter((t) => t.state === "done" || t.state === "error").length;
-  if (ran) m.meta = `${m.meta ? `${m.meta} · ` : ""}${ran} tool call${ran > 1 ? "s" : ""}`;
-  if (m.limit) m.meta = `${m.meta || ""} · stopped at the limit of ${m.limit} tool rounds (mcp.max_rounds)`;
+  if (ran) m.meta = `${m.meta ? `${m.meta} · ` : ""}${tr("chat.toolCalls", {one: "{n} tool call", other: "{n} tool calls"}, {n: ran})}`;
+  if (m.limit) m.meta = `${m.meta || ""} · ${tr("chat.toolLimit", "stopped at the limit of {n} tool rounds (mcp.max_rounds)", {n: m.limit})}`;
   busy = null;
   setBusy(false);
   paintLive();
@@ -1317,6 +1422,7 @@ async function send() {
   updateAssistant(el, m, false);
   saveChat();
   scrollDown();
+  settlePending(cut, !m.stopped && !m.error);
 }
 
 $("composer").onsubmit = (e) => { e.preventDefault(); send(); };
@@ -1327,14 +1433,21 @@ $("input").addEventListener("keydown", (e) => {
 function autosize() { const t = $("input"); t.style.height = "auto"; t.style.height = `${Math.min(t.scrollHeight, innerHeight * 0.4)}px`; }
 $("input").addEventListener("input", autosize);
 
+// one chat, as before: New chat clears it, with an Undo (with the saved-chats list on, its own New chat button does this job)
 $("new-btn").onclick = () => {
-  if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
+  if (busy) { stillWriting(); return; }
+  if (panel) { closePanel(); }
+  clearUndo();
+  releasePending();
   if (!messages.length) return;
   const backup = messages;
   messages = [];
   saveChat();
   renderChat();
-  toast("info", "New chat", "The last one was cleared.", 6000, {label: "Undo", run: () => { messages = backup; saveChat(); renderChat(); }});
+  toast("info", tr("chat.newToast", "New chat"), tr("chat.clearedToast", "The last one was cleared."), 6000, {label: tr("undo", "Undo"), run: () => {
+    if (busy || messages.length) return;                         // a new question since: the cleared chat is not put back over it
+    messages = backup; saveChat(); renderChat();
+  }});
 };
 $("export-btn").onclick = () => {
   if (!messages.length) { toast("info", "Nothing to save yet"); return; }
@@ -1431,13 +1544,15 @@ $("input").addEventListener("paste", (e) => {
   if (files.length) { e.preventDefault(); addFiles(files); }
 });
 
-// ------------------------------------------------------------------ the sampling drawer
+// ------------------------------------------------------------------ the chat settings drawer
 function openDrawer(open) {
   $("drawer").dataset.open = String(open);
   $("drawer").setAttribute("aria-hidden", String(!open));
   $("scrim").hidden = !open;
   if (open) { loadDrawer(); loadShared(); loadMcp(); }
 }
+const checked = (id) => $(id).getAttribute("aria-checked") === "true";
+const segValue = (id) => { const b = [...$(id).children].find((x) => x.getAttribute("aria-checked") === "true"); return b ? b.dataset.v : null; };
 function loadDrawer(s = settings) {
   const level = thinkingChosen(s);
   for (const b of $("s-thinking").children) b.setAttribute("aria-checked", String(b.dataset.v === level));
@@ -1449,6 +1564,9 @@ function loadDrawer(s = settings) {
   $("esp-row").hidden = !projectionLoaded();
   $("s-mcp").setAttribute("aria-checked", String(s.mcp !== false));
   $("s-share").setAttribute("aria-checked", String(sharedOn));
+  $("s-list").setAttribute("aria-checked", String(!!s.chatList));
+  $("s-edit").setAttribute("aria-checked", String(!!s.chatEdit));
+  for (const b of $("s-busy").children) b.setAttribute("aria-checked", String(b.dataset.v === (s.whileBusy || "wait")));
   outputs();
 }
 // "Use for other apps too": the server keeps these settings as every client's defaults (GET/POST /settings)
@@ -1516,51 +1634,59 @@ function thinkingButtons() {
 }
 function outputs() {
   const t = +$("s-temp").value;
-  $("o-temp").textContent = t === 0 ? "0 · greedy" : t.toFixed(2);
+  $("o-temp").textContent = t === 0 ? tr("drawer.greedy", "0 · greedy") : t.toFixed(2);
   $("o-topp").textContent = (+$("s-topp").value).toFixed(2);
   $("o-topk").textContent = $("s-topk").value;
-  const sel = [...$("s-thinking").children].find((b) => b.getAttribute("aria-checked") === "true");
+  const sel = segValue("s-thinking");
   const what = {none: "answers right away", low: "short", medium: "medium", high: "thorough", max: "the most thorough",
                 on: "thinks first"};
-  $("o-thinking").textContent = sel ? what[sel.dataset.v] + (sel.dataset.v === thinkingInfo().default ? " (default)" : "")
-                                    : "";
+  $("o-thinking").textContent = sel ? what[sel] + (sel === thinkingInfo().default ? " (default)" : "") : "";
+  const busyMode = segValue("s-busy");
+  $("o-busy").textContent = {wait: tr("drawer.busyWaitNote", "Send is off until the answer is done, as before."),
+    queue: tr("drawer.busyQueueNote", "Your message waits and goes as soon as the answer is done."),
+    interject: tr("drawer.busyInterjectNote", "The answer stops where it is (what is written stays) and your message goes at once. A tool that is running finishes first.")}[busyMode] || "";
   for (const id of ["s-topp", "s-topk", "s-minp"]) $(id).disabled = t === 0;
 }
+for (const b of $("s-busy").children) b.onclick = () => { for (const x of $("s-busy").children) x.setAttribute("aria-checked", String(x === b)); outputs(); };
 for (const id of ["s-temp", "s-topp", "s-topk"]) $(id).oninput = outputs;
-$("s-math").onclick = () => $("s-math").setAttribute("aria-checked", String($("s-math").getAttribute("aria-checked") !== "true"));
-$("s-show").onclick = () => $("s-show").setAttribute("aria-checked", String($("s-show").getAttribute("aria-checked") !== "true"));
-$("s-esp").onclick = () => $("s-esp").setAttribute("aria-checked", String($("s-esp").getAttribute("aria-checked") !== "true"));
-$("s-mcp").onclick = () => $("s-mcp").setAttribute("aria-checked", String($("s-mcp").getAttribute("aria-checked") !== "true"));
-$("s-share").onclick = () => $("s-share").setAttribute("aria-checked", String($("s-share").getAttribute("aria-checked") !== "true"));
+for (const id of ["s-math", "s-show", "s-esp", "s-mcp", "s-share", "s-list", "s-edit"]) {
+  $(id).onclick = () => $(id).setAttribute("aria-checked", String($(id).getAttribute("aria-checked") !== "true"));
+}
 $("s-reset").onclick = () => loadDrawer(DEFAULTS);
 $("s-apply").onclick = async () => {
-  const sel = [...$("s-thinking").children].find((b) => b.getAttribute("aria-checked") === "true");
-  settings = {thinking: sel && sel.dataset.v !== thinkingInfo().default ? sel.dataset.v : "", thinking_v: 2, temperature: +$("s-temp").value, top_p: +$("s-topp").value,
+  const prev = settings;
+  // the list and the edit controls change the messages on the screen: not while an answer is written or something is open
+  const locked = !!busy || !!panel;
+  const sel = segValue("s-thinking");
+  settings = {thinking: sel && sel !== thinkingInfo().default ? sel : "", thinking_v: 2, temperature: +$("s-temp").value, top_p: +$("s-topp").value,
               top_k: +$("s-topk").value, min_p: $("s-minp").value.trim(), max: $("s-max").value.trim(),
               seed: $("s-seed").value.trim(),
-              math: $("s-math").getAttribute("aria-checked") === "true",
-              show: $("s-show").getAttribute("aria-checked") === "true",
-              esp: $("s-esp").getAttribute("aria-checked") === "true",
-              mcp: $("s-mcp").getAttribute("aria-checked") === "true"};
+              math: checked("s-math"), show: checked("s-show"), esp: checked("s-esp"), mcp: checked("s-mcp"),
+              chatList: locked ? !!prev.chatList : checked("s-list"), chatEdit: locked ? !!prev.chatEdit : checked("s-edit"),
+              whileBusy: segValue("s-busy") || "wait"};
   store.set("sampling", settings);
   StrataMath.reset();                                  // math on or off: every answer is drawn again
+  if (settings.chatList !== !!prev.chatList) await setChatList(settings.chatList, true);
+  if (settings.chatEdit !== !!prev.chatEdit) { clearUndo(); syncActions(); }
+  if (settings.whileBusy === "wait" && pending) releasePending();    // "wait" parks nothing: a waiting message goes back to the box
+  setBusy(!!busy);
   for (const el of $("chat").querySelectorAll(".st-msg--assistant")) {
     const m = messages[+el.dataset.i];
     updateAssistant(el, m, !!busy && busy.msg === m);  // the element send() holds stays the same while an answer streams
   }
-  const share = $("s-share").getAttribute("aria-checked") === "true";
+  const share = checked("s-share");
   openDrawer(false);
   if (share || sharedOn) {
     try {
       await saveShared(share, settings);
-      toast("success", "Sampling saved", share ? "Other apps (omp, API clients) use these settings from their next request."
-                                               : "Other apps use their own settings again.");
+      toast("success", tr("drawer.saved", "Chat settings saved"), share ? tr("drawer.savedShared", "Other apps (omp, API clients) use these settings from their next request.")
+                                                                         : tr("drawer.savedOwn", "Other apps use their own settings again."));
     } catch (e) {
-      toast("error", "Saved here, but not for other apps", e.message, 6000);
+      toast("error", tr("drawer.savedHere", "Saved here, but not for other apps"), e.message, 6000);
     }
     return;
   }
-  toast("success", "Sampling saved", settings.temperature === 0 ? "Greedy: the same question gives the same answer." : "");
+  toast("success", tr("drawer.saved", "Chat settings saved"), settings.temperature === 0 ? tr("drawer.savedGreedy", "Greedy: the same question gives the same answer.") : "");
 };
 $("sampling-btn").onclick = () => openDrawer(true);
 $("drawer-close").onclick = () => openDrawer(false);
@@ -1587,6 +1713,8 @@ $("lang").onchange = async () => {
 async function start() {
   await StrataI18n.setLanguage(urlLang || store.get("lang", "en"));
   $("lang").value = StrataI18n.lang;
+  initChats();
+  if (settings.chatList) await setChatList(true, false);       // the saved-chats list is read before the first draw
   setBusy(false);
   renderChat();
   const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)

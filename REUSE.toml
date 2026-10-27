@@ -13,13 +13,19 @@ SPDX-License-Identifier = "LGPL-3.0-or-later AND MIT"
 
 # upstream Strata's files without a comment of their own, unchanged (AGENTS.md, Licenses)
 [[annotations]]
-path = ["data/draft_vocab*.bin", "data/expert-profile.bin", "data/expert-profile-coder.bin", "data/quant_quality/v1/**", "docs/paper/**", "serve/fixtures/rcall_specimens.json", "serve/web/favicon.svg", "serve/web/sprite.svg", "tests/data/native_experts/**"]
+path = ["data/draft_vocab*.bin", "data/expert-profile.bin", "data/expert-profile-coder.bin", "data/quant_quality/v1/**", "docs/paper/**", "serve/fixtures/rcall_specimens.json", "serve/web/favicon.svg", "tests/data/native_experts/**"]
 SPDX-FileCopyrightText = "2026 Niko1221 and the Strata contributors"
 SPDX-License-Identifier = "MIT"
 
 # upstream Strata's files without a comment of their own, changed by XeStrata
 [[annotations]]
 path = ["data/gguf_fingerprints.json"]
+SPDX-FileCopyrightText = ["2026 Niko1221 and the Strata contributors", "2026 MistVVK and the XeStrata contributors"]
+SPDX-License-Identifier = "LGPL-3.0-or-later AND MIT"
+
+# the icon sprite: upstream's, with the icons of later upstream versions that XeStrata has taken in
+[[annotations]]
+path = ["serve/web/sprite.svg"]
 SPDX-FileCopyrightText = ["2026 Niko1221 and the Strata contributors", "2026 MistVVK and the XeStrata contributors"]
 SPDX-License-Identifier = "LGPL-3.0-or-later AND MIT"
 

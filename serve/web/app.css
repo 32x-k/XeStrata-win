@@ -16,7 +16,6 @@ main { flex: 1; min-height: 0; display: flex; }
 .st-header .st-tabs { margin-left: var(--st-s-4); }
 #unload-btn { flex: none; height: 32px; padding: 0 12px; min-width: 7.75rem; }
 .st-header--clip #pill-text { display: none; }
-#drawer-close .st-icon { transform: rotate(-90deg); }
 
 /* ---------------------------------------------------------------- chat */
 .chat-scroll { flex: 1; min-height: 0; overflow-y: auto; }
@@ -26,7 +25,8 @@ main { flex: 1; min-height: 0; display: flex; }
 .chat-empty__title { font-weight: var(--st-fw-black); font-size: var(--st-fs-display); line-height: var(--st-lh-tight);
                      letter-spacing: -.02em; }
 .chat-empty__sub { overflow-wrap: anywhere; margin-top: var(--st-s-3); color: var(--st-ink-muted); }
-.st-msg { width: 100%; min-width: 0; }
+/* a message may use the room a wide window gives the chat column (#3176 widened the column; the kit's 720px kept the messages narrow in it) */
+.st-msg { width: 100%; min-width: 0; max-width: min(100%, 900px); }
 .st-msg--assistant { align-self: flex-start; }
 .st-msg--assistant .st-bubble { width: 100%; overflow-wrap: anywhere; }
 .st-msg--user .st-bubble { white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -127,10 +127,6 @@ main { flex: 1; min-height: 0; display: flex; }
   white-space: nowrap;
   padding-inline: 8px;
 }
-/* an image job's row: its size, references and stages (or its error) across the token columns, wrapped */
-#req-wrap .st-table td.req-image { white-space: normal; min-width: 14em; overflow-wrap: anywhere; }
-#req-wrap .st-table td.req-image--error,
-#req-wrap .st-table td.req-image--error .muted { color: var(--st-danger-text); }
 .req-head { display: flex; align-items: center; justify-content: space-between; gap: var(--st-s-2); }
 .table-wrap.all { max-height: 420px; overflow-y: auto; }
 .req-totals { margin: 0; font-size: var(--st-fs-sm); }
@@ -287,3 +283,85 @@ main { flex: 1; min-height: 0; display: flex; }
 .st-code[data-preview="true"] [data-preview-scripts] { display: inline-flex; }
 .st-code .st-btn--icon[data-preview-scripts][aria-pressed="true"] { background: var(--st-warn-tint); color: var(--st-warn-text); }
 .st-code__preview iframe { display: block; width: 100%; height: 100%; border: 0; background: transparent; }
+
+/* ---------------------------------------------------------------- chat history (chats-ui.js)
+   The saved-chats list (PR #1787 by Scotty-Hudson), edit / regenerate / rewind (PR #2615 by uppet) and the Chat settings button. */
+.view--chat { flex-direction: row; }
+.chat-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.chat-sidebar { flex: none; width: 260px; display: flex; flex-direction: column; gap: var(--st-s-3);
+                padding: var(--st-s-4); background: var(--st-surface); border-right: 1px solid var(--st-line); }
+.sidebar-head { display: flex; align-items: center; gap: var(--st-s-2); }
+.sidebar-head .card-title { flex: 1; }
+.chat-sidebar[data-open="false"] { width: 60px; }
+.chat-sidebar[data-open="false"] .sidebar-head { flex-direction: column; }
+.sidebar-search { height: 36px; font-size: var(--st-fs-sm); }
+.sidebar-list { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; }
+.sidebar-group { margin: 0; padding: var(--st-s-3) 8px var(--st-s-1); font-size: var(--st-fs-xs);
+                 font-weight: var(--st-fw-bold); letter-spacing: .04em; text-transform: uppercase; color: var(--st-ink-muted); }
+.chat-item { display: flex; align-items: center; gap: 2px; border-radius: var(--st-r-md); }
+.chat-item.on { background: var(--st-surface-2); }
+.chat-item__title { flex: 1; min-width: 0; border: 0; background: transparent; cursor: pointer; text-align: left;
+                    padding: 8px; color: var(--st-ink-soft); font: 500 var(--st-fs-sm)/1.35 var(--st-font);
+                    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.chat-item:hover .chat-item__title { color: var(--st-ink); }
+.chat-item.on .chat-item__title { color: var(--st-ink); font-weight: var(--st-fw-bold); }
+.chat-item__actions { display: flex; gap: 2px; flex: none; opacity: 0; }          /* the buttons come up on hover or focus */
+.chat-item:hover .chat-item__actions, .chat-item:focus-within .chat-item__actions { opacity: 1; }
+.chat-item__actions .st-btn--icon { width: 30px; height: 30px; }
+.chat-item__actions .st-btn--icon .st-icon { width: 16px; height: 16px; }
+.chat-item__input { flex: 1; min-width: 0; height: 34px; font-size: var(--st-fs-sm); }
+.sidebar-empty { margin: 0; padding: var(--st-s-2) 8px; }
+.sidebar-foot { margin: 0; }
+.chat-sidebar[data-open="false"] .sidebar-title, .chat-sidebar[data-open="false"] .sidebar-search,
+.chat-sidebar[data-open="false"] .sidebar-list, .chat-sidebar[data-open="false"] .sidebar-foot { display: none; }
+.chat-parent { display: flex; align-items: center; justify-content: center; gap: var(--st-s-3); flex-wrap: wrap; padding: var(--st-s-2) var(--st-s-4);
+               border-bottom: 1px solid var(--st-line-soft); font-size: var(--st-fs-sm); }
+.chat-parent .st-btn { height: 30px; padding: 0 12px; font-size: var(--st-fs-xs); }
+
+/* the buttons under a message, the open panel / editor, and the bars above the box (Undo, a waiting message) */
+.history-actions, .history-editor__actions, .history-undo, .pending { display: flex; flex-wrap: wrap; gap: var(--st-s-2); align-items: center; }
+.history-actions .st-btn, .history-undo .st-btn, .pending .st-btn, .history-panel .st-btn { height: 30px; padding: 0 10px; font-size: var(--st-fs-xs); }
+.history-actions { margin-top: var(--st-s-1); }
+.st-msg--user .history-actions { justify-content: flex-end; }
+.history-panel, .history-editor { width: 100%; display: flex; flex-direction: column; gap: var(--st-s-2); padding: var(--st-s-3);
+                                  border: 1px solid var(--st-line); border-radius: var(--st-r-md); background: var(--st-surface-2); }
+.history-choice { display: flex; align-items: center; gap: var(--st-s-3); flex-wrap: wrap; }
+.history-choice > .muted { flex: 1 1 14rem; min-width: 0; }
+.history-panel > .st-btn { align-self: flex-start; }
+.history-editor textarea { width: 100%; min-height: 140px; max-height: 50vh; resize: vertical; font: inherit; height: auto; padding: 10px 14px; }
+.history-editor p, .history-panel p { margin: 0; }
+.st-msg[data-editing="true"] > .st-bubble { display: none; }
+.history-undo, .pending { max-width: min(100%, 1100px); margin: 0 auto var(--st-s-2); color: var(--st-ink-muted); font-size: var(--st-fs-sm); }
+.pending { justify-content: space-between; padding: 6px 10px; border: 1px solid var(--st-line); border-radius: var(--st-r-md); background: var(--st-surface); }
+.pending__text { flex: 1 1 12rem; min-width: 0; overflow-wrap: anywhere; color: var(--st-ink-soft); }
+.pending__actions { display: flex; gap: var(--st-s-2); }
+
+/* Chat settings: the button says what it is, and the drawer groups the chat switches */
+.chat-settings-button { height: 36px; padding: 0 10px; gap: 6px; white-space: nowrap; font-size: var(--st-fs-sm); }
+.chat-settings-short { display: none; }
+.drawer-group { display: flex; flex-direction: column; gap: var(--st-s-4); padding-top: var(--st-s-4); border-top: 1px solid var(--st-line); }
+.drawer-group__title { margin: 0; font-size: var(--st-fs-base); font-weight: var(--st-fw-bold); color: var(--st-ink); }
+.seg--3 { grid-template-columns: repeat(3, 1fr); }
+.seg--3 button { padding: 0 4px; }
+#lang { width: 100%; }
+#drawer-close .st-icon { transform: rotate(-90deg); }
+#sidebar-toggle .st-icon { transform: rotate(90deg); transition: transform var(--st-dur) var(--st-ease); }
+.chat-sidebar[data-open="false"] #sidebar-toggle .st-icon { transform: rotate(-90deg); }
+/* an image job's row in the Monitor's request table: its size, references and stages (or its error) across the token
+   columns, wrapped (after the chat history's less specific .muted rule) */
+#req-wrap .st-table td.req-image { white-space: normal; min-width: 14em; overflow-wrap: anywhere; }
+#req-wrap .st-table td.req-image--error,
+#req-wrap .st-table td.req-image--error .muted { color: var(--st-danger-text); }
+@media (max-width: 640px) {
+  .chat-settings-label, .composer-hint { display: none; }
+  .chat-settings-short { display: inline; }
+  .st-btn--send { margin-left: auto; }
+}
+@media (max-width: 760px) {
+  /* the list is an overlay here: the chat keeps the whole width when it is closed to its rail */
+  .view--chat { position: relative; }
+  .chat-sidebar[data-open="true"] { position: absolute; top: 0; left: 0; bottom: 0; z-index: 30; box-shadow: var(--st-sh-pop); }
+  .chat-sidebar { padding: var(--st-s-3); }
+}
+
+.st-toast .st-btn { white-space: nowrap; }
