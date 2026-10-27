@@ -1,38 +1,54 @@
 #!/bin/bash
-# Build the DeepSeek-V4.1-Flash engine component for Apple Silicon (strata_ds4, backend metal).
+# Build the DeepSeek-V4.1-Flash engine component for Apple Silicon (strata-dsv41, backend metal).
 #
-#   bash packaging/mac/build_dsv41_engine.sh [--version 0.2.7] [--build DIR] [--out DIR]
+#   bash packaging/mac/build_dsv41_engine.sh [--version 0.1.53] [--build DIR] [--out DIR] [--build-id ID]
 #
-# Run it in the source tree on the Mac, after `ninja -C <build> strata_ds4` (the script builds it too when the
-# binary is missing). It stages the binary and the kernel sources the engine compiles at start-up, packages them with
-# packaging/package_engine.py and verifies every hash. It does NOT sign: the feed key stays offline, and a package
-# made here is unsigned and loads (see packaging/ENGINE-COMPONENT.md, Signature).
+# Run it in the source tree on the Mac. It configures and builds the `strata_ds4` target (metal/CMakeLists.txt) when the binary is
+# missing, stages it as `strata-dsv41` beside the kernel sources the engine compiles at start-up, packages them with
+# packaging/package_engine.py and verifies every hash. It does NOT sign: the feed key stays offline, and a package made here is
+# unsigned and loads (see packaging/ENGINE-COMPONENT.md, Signature).
 #
-# Layout (strata_ds4 finds these beside its own executable, metal/src/resource_path.h):
+# Needs: Xcode Command Line Tools, cmake + ninja (a pip venv is enough: python3 -m venv v && v/bin/pip install cmake ninja), Apple's
+# metal-cpp (METAL_CPP_DIR) and the llama.cpp tree setup pins (STRATA_GGML_DIR). Defaults: ~/strata-mac/metal-cpp, ~/strata-mac/llamacpp.
+#
+# Layout (strata-dsv41 finds these beside its own executable, metal/src/resource_path.h):
 #   <exe>/metal/kernels/*.metal         the shared Qwen kernels the DeepSeek host also compiles
 #   <exe>/metal/src/engine/msl/*.metal  ds4_init, ds4_iq, ds4_mm, ds4_quant, mtp, mtp_chain, ple
 #   <exe>/metal/ggml-common.h
 set -u
 ROOT=$(cd "$(dirname "$0")/../.." && pwd)
-VERSION=0.2.7
+VERSION=0.1.53
 BUILD="$ROOT/build-metal"
 OUT="$ROOT/pkg/engine"
+BUILD_ID=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --version) VERSION="$2"; shift 2;;
     --build) BUILD="$2"; shift 2;;
     --out) OUT="$2"; shift 2;;
-    *) echo "usage: $0 [--version V] [--build DIR] [--out DIR]"; exit 2;;
+    --build-id) BUILD_ID="$2"; shift 2;;
+    *) echo "usage: $0 [--version V] [--build DIR] [--out DIR] [--build-id ID]"; exit 2;;
   esac
 done
-NINJA=${NINJA:-$HOME/strata-mac/tools/bin/ninja}
+CMAKE=${CMAKE:-$(command -v cmake || echo "$HOME/strata-mac/tools/bin/cmake")}
+NINJA=${NINJA:-$(command -v ninja || echo "$HOME/strata-mac/tools/bin/ninja")}
+METAL_CPP_DIR=${METAL_CPP_DIR:-$HOME/strata-mac/metal-cpp}
+STRATA_GGML_DIR=${STRATA_GGML_DIR:-$HOME/strata-mac/llamacpp}
+if [ -z "$BUILD_ID" ]; then   # the commit the binary is built from: the tree's own git, else a BUILD_ID file beside the sources
+  BUILD_ID=$(git -C "$ROOT" rev-parse --short=12 HEAD 2>/dev/null || head -1 "$ROOT/BUILD_ID" 2>/dev/null || echo unknown)
+fi
 EXE="$BUILD/strata_ds4"
-[ -x "$EXE" ] || "$NINJA" -C "$BUILD" strata_ds4 || exit 1
+if [ ! -x "$EXE" ]; then
+  "$CMAKE" -S "$ROOT/metal" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_MAKE_PROGRAM="$NINJA" \
+    -DMETAL_CPP_DIR="$METAL_CPP_DIR" -DSTRATA_GGML_DIR="$STRATA_GGML_DIR" -DSTRATA_BUILD_ID="$BUILD_ID" \
+    -DSTRATA_DS4_VERSION="$VERSION-metal" || exit 1
+  "$NINJA" -C "$BUILD" strata_ds4 || exit 1
+fi
 
 STAGE="$ROOT/pkg/dsv41-stage"
 rm -rf "$STAGE"
 mkdir -p "$STAGE/metal/kernels" "$STAGE/metal/src/engine/msl"
-cp "$EXE" "$STAGE/"; chmod +x "$STAGE/strata_ds4"
+cp "$EXE" "$STAGE/strata-dsv41"; chmod +x "$STAGE/strata-dsv41"
 cp "$ROOT"/metal/kernels/*.metal "$STAGE/metal/kernels/"
 for f in ds4_init ds4_iq ds4_mm ds4_quant mtp mtp_chain ple; do
   cp "$ROOT/metal/src/engine/msl/$f.metal" "$STAGE/metal/src/engine/msl/" || exit 1
@@ -40,7 +56,7 @@ done
 cp "$ROOT/third_party/ggml/ggml-common.h" "$STAGE/metal/"
 
 python3 "$ROOT/packaging/package_engine.py" --src "$STAGE" --backend metal --version "$VERSION" \
-  --platform macos-arm64 --arch apple-gpu --entrypoint strata_ds4 --include 'metal/**' --out "$OUT" || exit 1
+  --platform macos-arm64 --arch apple-gpu --entrypoint strata-dsv41 --build-id "$BUILD_ID" --include 'metal/**' --out "$OUT" || exit 1
 DIR="$OUT/$VERSION-macos-arm64-metal"
 python3 "$ROOT/packaging/package_engine.py" --verify "$DIR" || exit 1
 
@@ -50,7 +66,7 @@ if [ ! -d "$PACK" ]; then echo "== no pack at $PACK: package built, smoke test s
 echo "== self-containment test (source kernels hidden, run from /tmp)"
 mv "$ROOT/metal/kernels" "$ROOT/metal/kernels.hidden"
 mv "$ROOT/metal/src/engine/msl" "$ROOT/metal/src/engine/msl.hidden"
-( cd /tmp && "$DIR/strata_ds4" --pack "$PACK" --ids 0 --n 1 \
+( cd /tmp && "$DIR/strata-dsv41" --pack "$PACK" --ids 0 --n 1 \
     --expert-profile none --vision off --dspark off --cpu-threads 4 --threads off --tp 1 2>&1 | grep -a -E 'prompt:|decode:|cannot read|failed' | head -3 )
 rc=$?
 mv "$ROOT/metal/kernels.hidden" "$ROOT/metal/kernels"

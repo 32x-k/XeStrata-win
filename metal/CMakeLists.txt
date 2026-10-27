@@ -150,3 +150,19 @@ target_include_directories(strata_ds4 PRIVATE
 target_compile_definitions(strata_ds4 PRIVATE STRATA_METAL=1)   # the real host CPU lane (ds4_gg_cpu.cpp)
 target_compile_options(strata_ds4 PRIVATE -Wno-unused-parameter -Wno-deprecated-declarations -Wno-implicit-function-declaration)
 target_link_libraries(strata_ds4 PRIVATE strata_metal_kernels strata_metal_host)
+# The commit the binary was built from, readable with --version (the root CMakeLists does the same for the CUDA and HIP builds):
+# -DSTRATA_BUILD_ID=..., else BUILD_ID beside the sources (a git archive has no .git), else git, else "unknown".
+if(NOT STRATA_BUILD_ID AND EXISTS ${STRATA_ROOT}/BUILD_ID)
+  file(STRINGS ${STRATA_ROOT}/BUILD_ID STRATA_BUILD_ID LIMIT_COUNT 1)
+endif()
+if(NOT STRATA_BUILD_ID)
+  execute_process(COMMAND git -C ${STRATA_ROOT} rev-parse --short=9 HEAD OUTPUT_VARIABLE STRATA_BUILD_ID OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+endif()
+if(NOT STRATA_BUILD_ID)
+  set(STRATA_BUILD_ID unknown)
+endif()
+set_source_files_properties(${DS4}/ds4_main.cpp PROPERTIES COMPILE_DEFINITIONS "DS4_BUILD_ID=\"${STRATA_BUILD_ID}\"")
+# -DSTRATA_DS4_VERSION=0.1.53-metal: the version this DeepSeek engine reports, when its package is released apart from the Qwen engine's
+if(STRATA_DS4_VERSION)
+  set_source_files_properties(${DS4}/ds4_main.cpp PROPERTIES COMPILE_OPTIONS "-USTRATA_VERSION;-DSTRATA_VERSION=\"${STRATA_DS4_VERSION}\"")
+endif()
