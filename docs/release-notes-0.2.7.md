@@ -1,131 +1,88 @@
-# Strata 0.2.7 (draft): a faster Qwen3.8 on NVIDIA
+# Strata 0.2.7: faster 12 GB NVIDIA cards, DeepSeek on Ryzen AI Max, a bigger web chat page, French
 
-> **DRAFT for the owner.** Written by the CUDA speed work on branch `f-027-cuda`; no engine version is claimed here
-> because the owner decides what else 0.2.7 carries. Every number below was measured on the borrowed boxes named in
-> each line, same day, against the same build with the new default turned off.
+The app and the Terminal are 0.2.7. Control and every engine package (Qwen and DeepSeek) are 0.1.52, because both engines changed.
 
-## What is faster, by default
+DRAFT of 27 October. Text in square brackets that starts with "pending" or "TO CONFIRM" is work that was not merged or checked when this was written. `phaseA-tests\rel027\check_notes027.py` lists them and removes the ones that landed. None of them may be left in the published text.
 
-- **The hyper-connection read on RTX 50 and RTX PRO Blackwell cards (compute capability 12.0).** The model's
-  hyper-connection mixing runs 96 small projections per token; its "up" half now runs one warp per row instead of
-  eight rows per warp, which fills a modern card's SMs instead of 160 blocks on 192 of them. Measured on an RTX PRO
-  5000 Blackwell 72 GB (Qwen3.8-Flash-Next IQ3_S, every expert in VRAM), five interleaved pairs of fresh engines:
-  **story 197.6 -> 201.3 tokens/s (+1.9%), code 243.5 -> 245.1 (+0.7%)**. The answers are unchanged - the new
-  kernel does the same arithmetic in the same order, the produced tokens were identical in all six pairs and the
-  engine's own kernel check is bitwise.
-  - Off switch: `STRATA_GR_UP_WIDE=0`. `STRATA_SM120_PERF=0` still turns off the whole Blackwell set.
-  - Other cards are untouched: the old kernel runs everywhere else.
+## What you will notice
 
-- **Two more kernel switches are on by default where they were measured.** Both sum in another order (about 1e-7), so a
-  tie between two near-equal words can flip and a reply can differ from 0.2.6 here and there.
-  - The prompt attention on int8 tensor cores (NVIDIA Ampere and newer): **+1.6% / +1.8% prompt at 8K / 16K on the RTX PRO 5000
-    and +1.1% / +1.3% on 2x RTX A4000**, decode unchanged, five pairs each. Off switch: `STRATA_PROMPT_ATTN_IMMA=0`.
-  - The hyper-connection read split over two kernels (a discrete RTX 50 / RTX PRO Blackwell card with more than 13 GiB): **+1.2%
-    decode on the RTX PRO 5000 with identical tokens**, about +1.5% together with the switch above. On 2x RTX A4000 and the
-    RTX 3060 it was slower, so those cards keep the old read. Off switch: `STRATA_GR_V3=0`.
-  - RTX 40 cards (Ada, compute capability 8.9): new decode row tables for the interleaved matrix kernels, on by default. The output is the
-    same bit for bit; only how many rows a warp takes changes. **We have not measured them on an RTX 40 card**: the tables come from two
-    community runs (an RTX 4070 and an RTX 4080), and the report with the 4090 saw no change in decode speed. If you have an RTX 40
-    card, please try 0.2.7 and post your decode numbers on issue 3453. Off switch: `STRATA_MMVQ_IL_89=0`.
-  - NVIDIA A100 / A30 / CMP 170HX class cards (compute capability 8.0): the wide dense dequantizer and decode row tables of PR 3779, on by default,
-    same output bit for bit, measured only on a CMP 170HX by the contributor. Off switches: `STRATA_DEQUANT_WIDE=0`, `STRATA_MMVQ_IL_SM80=0`.
+- **NVIDIA cards with 12 GB or less answer faster.** The router now prefers experts that are already on the card, which saves page-ins from RAM. On an RTX 3060 12 GB (Qwen3.8-Flash-Next IQ3_XXS, five paired runs against the same build with the setting off), a story answer went from 46.2 to 53.1 tok/s (+15%) and a code answer from 45.7 to 62.5 tok/s (+37%). It picks a slightly different set of experts, so the wording of answers changes. We checked the quality of the answers with 61 test tasks on that card. Retrieval (12 of 12), JSON (3 of 3) and unanswerable questions (9 of 9) were all right, and extraction found the same facts as with the setting off; we found no copy, code-constant or spelling defect. It did give two long-winded answers: one rambling paragraph in an agent task and one code answer that was cut off in the middle of a comment. Runs with the setting off show two or three such cases each too. The automatic grader passed 49 of the 61 tasks against 54 with the setting off; we read all five tasks it lost: three were grader flags (a name in a summary, a product name in a summary and a non-breaking hyphen in an agent task) and two were the long-winded answers above. A stronger setting (2.0) did show copy and code defects, so the default is 1.5. It applies to a discrete NVIDIA card of 13 GiB or less; larger cards, Radeon and Strix Halo are not changed. Off: "Faster answers on 12 GB NVIDIA cards" in the model's settings, or `STRATA_ROUTE_PRIOR=0`.
+- **Radeon RX 9000 and AI PRO R9700: faster Qwen.** Two changes: the large per-token lookup table stays in RAM when the PC has room for it, and the decode split between card and processor starts at a better value. One R9700 (32 GB) with 125 GB of RAM on Linux, Qwen IQ3_S, medians of three runs:
+
+  | Context | Prompt before | Prompt now | Decode before | Decode now |
+  |---|---|---|---|---|
+  | 8K | 2,047 tok/s | 2,505 tok/s (+22%) | 82.9 tok/s | 94.6 tok/s (+14%) |
+  | 32K | 2,491 tok/s | 2,802 tok/s (+12%) | 64.9 tok/s | 85.1 tok/s (+31%) |
+
+  Answers can differ in wording because the work is split differently; 30 test tasks passed in every arm with no invented fact. Off: "Faster answers on Radeon RX 9000 / AI PRO R9700".
+- **DeepSeek-V4.1-Flash runs on Ryzen AI Max (Strix Halo) PCs with Windows.** It has its own engine package for the gfx1151 chip, and the app or `strata launch` downloads it with the model. The new guide [docs/STRIX_HALO_WINDOWS.md](STRIX_HALO_WINDOWS.md) has the numbers and the traps, measured on a GMKtec EVO-X2 (Ryzen AI Max+ 395, 128 GB shared memory, Adrenalin 26.10.1). DeepSeek 2.00 answers a short chat at 12 to 14 tok/s and reads a 4K prompt at 214 to 226 tok/s, a 16K prompt at 326 and a 32K prompt at 342 tok/s. Qwen IQ3_S on the same PC: chat 44 tok/s, 4K prompt 755, 32K prompt 792 tok/s. [TO CONFIRM: re-measure the DeepSeek and Qwen rows on the final build if strix is lent before the release] The shared-expert stream is off by default on Windows there, because it is slower: 43.6 to 46.6 tok/s decode (+6.9%, three paired starts), same token ids. Only the 128 GB machine was tested. You need Adrenalin 26.10.1 or newer.
+- **DeepSeek reads prompts faster on most PCs.** The engine no longer re-reads a batch of experts from the SSD after every prompt, picks the attention buffer size by itself and fills the RAM store more cleverly. On an RTX 5070 (12 GB, 64 GB RAM, 2.25 set, three paired runs against an earlier 0.2.7 candidate): 4K prompt 116 to 170 tok/s (+47%), 8K prompt 202 to 268 tok/s (+33%). On one R9700 with the 2.25 set: 32K prompt 382 to 444 tok/s (+16%), 8K prompt 200 to 286 tok/s (+43%, but that prompt is limited by SSD reads and varies a lot between runs). The cost: the first words after a long prompt can come slower, because the store is no longer pre-filled. On the RTX 5070 a long answer still finished 8.7% sooner overall (137.5 s against 150.6 s); on one R9700 a 300-token answer after an 8K prompt took 51.9 s without the pre-fill and 48.6 s with it. `DS4_SETTLE_STORE=1` brings the pre-fill back. The speed-up switch "DeepSeek speed-ups" turns the new behaviour off in one step.
+- **Four Radeon AI PRO R9700 cards run DeepSeek faster, with five experts per word by default.** With the launcher's own settings, DeepSeek 2.25: an 8K prompt 342 to 399 tok/s on the first read and 967 to 1,350 once warm (+17%, +40%), a 32K prompt 1,127 to 1,604 first and 1,183 to 1,697 warm (+42%, +43%), decode on code 88.9 to 95.0 tok/s (+7%) and on an agent task 73.5 to 79.7 (+8%). Loading takes 58 to 60 s instead of 51 s. The default is now "Faster" (5 of 6 experts per word); the quality run passed 19 of 19 tasks against 18 of 19 with six experts, and the distance to the reference model is the same (0.1102 against 0.1102). Choose Full quality in the app, or `--experts 6`, to use six.
+- **DeepSeek can use 512K and 1M contexts.** Setup, the Terminal and the app offer them up to the limit of the model files, with a plain "not tested yet" note past 256K. The default stays 8K, and the app now loads a DeepSeek model with the context you chose. On an RTX 5070 a 1M context loaded in 18 s and cost about 1 GB of graphics memory, which pushed 136 experts off the card. We did not test long prompts at these sizes. The idea comes from Project Maya v1.1.28 (#442, by @needmorevram).
+- **More cards get small gains from kernel changes that were measured.** On an RTX PRO 5000 (72 GB, Qwen IQ3_S, five paired runs): story answers 195.9 to 211.8 tok/s (+8.1%), code 240.6 to 244.7 (+1.7%), prompts +1.2% at 4K, +1.5% at 8K, +1.6% at 16K. On two RTX A4000: story +2.2%, code +0.5%. These switches sum numbers in another order, so a reply can differ from 0.2.6 at a near-tie. RTX 40 cards (compute capability 8.9) use measured speed tables for the quantised matrix products; they are bit for bit the same as before and we have no Ada card, so the reporter's measurements are the only ones. Off: `STRATA_MMVQ_IL_89=0`. A100-class cards (sm_80) get the bitwise-identical defaults of #3779 (wider dequantisation, tuned tables, measured only on a CMP 170HX by the contributor); its many opt-ins stay off, and the reporters are asked to test. Off: `STRATA_DEQUANT_WIDE=0`, `STRATA_MMVQ_IL_SM80=0`.
+- **Long prompts on two NVIDIA cards read much faster.** On a layer split over two CUDA cards the prompt is now read layer by layer in large pieces, so each layer's experts are read once per piece instead of once per 8,192 tokens. On two RTX A4000 (Qwen IQ3_XXS, experts streamed, five paired runs): first token after a 32K prompt 141.8 s to 27.7 s (5.1x), after a 20K prompt 98.8 s to 17.5 s (5.7x), after an 8K prompt 41.8 s to 15.2 s (2.8x); the answer speed is the same (38.6 against 38.4 tok/s), the 12 needle questions at 16K and 32K were all found, and the 19-task quick suite passed 18 of 19 with and without it (13 answers byte-identical, the 6 others differ in wording only). The numbers differ slightly from the old path because the experts' results are added in another order: the first-token KL against the old path is at the level of the difference between two prompt chunk sizes, and the most likely token matched on every prompt. One card, Radeon and the approximate-read mode keep the old path. Off: `STRATA_PREFILL_LAYER_MAJOR=0`, or `STRATA_DEFAULTS=026`. From PR 3976 (@Norhiro, building on @vizdatom's #1670).
+- **MTP drafts in the pipelined batch groups (opt-in).** `STRATA_PIPED_MTP=1` with `--batch-mtp` lets each slot of a pipelined layer split bring its own draft tokens: on two RTX A6000 with two concurrent streams +12 to +15% total tokens per second, four streams +0 to +5%, one stream unchanged, and every slot decodes exactly the tokens it decodes alone. From PR 4121 (@wannagoxuf).
+- **The served web chat page gets a large update.** Wide windows use the width and narrow screens fit (#3176). Saved chats with search, rename and delete, editing a question, rewinding to an earlier turn and branching a new chat from it, sending a message while the answer is still coming (wait, send after, or interrupt), math written in LaTeX rendered with KaTeX, a sandboxed preview of HTML and SVG the model writes, and Load and Unload buttons in the header. The chat view is translated into the same languages as the app, French included. The history features are off until you switch them on in Chat settings: with them off the page sends the same requests as before. Monitor, Images and About are still English.
+- **The desktop app.** French is the ninth language. Settings now has: a sound when a task finishes (on request), a desktop notification when Manual mode needs your approval, minimise to the system tray, a fixed port so API clients keep working across updates (with a warning when the port is busy), and an interface size up to 200%. The Monitor has a readings strip: power draw, an electricity price you set (in your local currency, found from the system region), disk temperature where Windows or Linux can report it. The DeepSeek card says how much free disk the set needs. Not tried inside the real packaged app on screen yet: tray icon, the native notification and the busy-port warning. [TO CONFIRM: run once in the release e2e]
+- **Speed switches.** In Models, Native engine settings, Speed (and in the Terminal's Advanced table): "Faster long prompts" (off by default), "Faster answers on 12 GB NVIDIA cards", "Faster answers on Radeon RX 9000 / AI PRO R9700", "DeepSeek speed-ups". The Terminal also has "Qwen: 0.2.6 behaviour" for troubleshooting.
 
 ## Going back to 0.2.6
 
-Two switches bring back every default that 0.2.7 changed, in one step, for a test or for a PC where something looks wrong. The app's
-"off" for its speed switches sends them.
+Two switches bring back every default that 0.2.7 changed, in one step, for a test or for a PC where something looks wrong.
 
-- **`DS4_DEFAULTS=026`** (DeepSeek): the staging ring, the prompt chunk rule, the attention slab (its base and its growth), the pinned
-  copy and the huge-page arena, the matrix-core attention, the drafter's cumulative cut, the 5-experts default on several Radeon cards,
-  the RAM store's spare slots and put and its settle after a prompt, the dense dequantizer, the F16 gate/up operand, the drafter's
-  markov head and the head's column count, and the RDNA3 dense GEMM all go back to what 0.2.6 did.
-- **`STRATA_DEFAULTS=026`** (Qwen): the residency-biased routing, the wide and the stream-split hyper-connection reads, the int8
-  prompt attention, the RTX 40 (sm_89) and sm_80 decode tables and sm_80 dense dequantizer, the four gfx12 decode switches, the PLE residency policy and the gfx12 decode split of 0.15 (back to 0.55).
-  Long prompts on the approximate read (`STRATA_KVA`) are off by default and stay as `STRATA_KVA` says.
+- **`DS4_DEFAULTS=026`** (DeepSeek): the staging ring, the prompt chunk rule, the attention buffer, the pinned copy and the huge-page arena, the matrix-core attention, the drafter's cut, the five-experts default, the RAM store's spare slots and its pre-fill after a prompt, the dense dequantiser, the head and gate/up operand formats and the RDNA3 dense GEMM go back to what 0.2.6 did.
+- **`STRATA_DEFAULTS=026`** (Qwen): residency-biased routing, the wide and split hyper-connection reads, the int8 prompt attention, the four gfx12 decode switches, the PLE residency policy, the gfx12 decode split (back to 0.55), the RTX 40 (sm_89) tables, the sm_80 defaults and the layer-major prefill of a two-card CUDA split.
 
-A variable or flag you set yourself (`DS4_ATTN_SLAB=N`, `STRATA_ROUTE_PRIOR=2`, `--experts 5`, `--prefill-chunk N`, `--pcie-frac`,
-`--ple-io`) still wins over the switch. The older single switches (`DS4_FAST_ATTN=0`, `DS4_ATTN_SLAB=0`, `DS4_COPY_PIN=0`,
-`DS4_COPY_HUGETLB=0`, `DS4_STORE_SPARE=0`, `DS4_STORE_PUT=0`, `STRATA_ROUTE_PRIOR=0`, ...) work as before.
+A variable or flag you set yourself still wins over the switch, and the older single switches work as before. In the app, "DeepSeek speed-ups" off sends `DS4_DEFAULTS=026`.
 
-- **Strix Halo (`gfx1151`) on Windows: the shared expert no longer runs on its own stream.** `STRATA_SH_STREAM` was on by default on
-  `gfx1151`; on a Windows PC it is slower. Qwen3.8-Flash-Next IQ3_S, three interleaved pairs: chat decode **43.6 -> 46.6 tokens/s (+6.9%)**
-  with it off, prompts unchanged. The answers are the same: five fixed greedy prompts (up to 16,383 tokens) gave identical token ids with
-  the switch on and off, in four runs. Linux `gfx1151` keeps it on, other cards are untouched. Turn it back on with
-  `STRATA_SH_STREAM=1`; `STRATA_DEFAULTS=026` restores the 0.2.6 behaviour. Details and the other numbers of that PC:
-  [docs/STRIX_HALO_WINDOWS.md](STRIX_HALO_WINDOWS.md).
+## Off unless you turn it on
 
-## What is faster if your PC is set up for it
+- **Faster long prompts** (`STRATA_KVA=1`, or the switch in Models, Native engine settings, Speed). Reads the last 12 layers of a very long prompt in an approximate way, for Qwen3.8-Flash-Next on one NVIDIA or AMD card, on the first read of a prompt of 4,096 tokens or more. On an RTX 5070 with IQ3_S it was 11% faster at 14K and 18% faster at 30K. It stays off because earlier, more aggressive settings dropped records from long lists and failed agent tasks. The setting that ships when you turn it on (layers 36 to 47 approximate, the last 2,048 tokens exact) found the same 585 of 606 facts as the exact read and finished 6 of 10 agent tasks where the exact read finished 4 and 7 in two runs. It can still lose details.
+- **Prefill on one card, decode on another** (`--split-serve P,D`, or `split_serve` in the run config; #4000, first version). The idea, the hand-made setup (an RTX 3070 reading the prompt, two MI50 cards making the answer) and the first measurements are by @MarcoTool. One engine reads the prompt and hands the finished state to a second engine that answers. The words are the same as with one engine, token for token (checked at 4,096 and 16,384 tokens, with equal state fingerprints). On two RTX A6000 (3 rounds, 6 values per cell, whole-request time) it was slower than the normal layer split on every workload: an 8K prompt took 16% longer, a 32K prompt 48% longer, a 3-turn chat 30% and 4% longer. So we do not recommend it on two alike cards. It can only pay with two different cards, one good at reading prompts and one good at making answers; we have not measured such a pair. `docs/SPLIT_SERVE.md` has the numbers and the limits.
+- **Pipelined drafts** (`STRATA_PIPED_MTP`, #4121 by @wannagoxuf): the draft model also runs for batch slots. On two RTX A6000 cards with a batch of slots, two streams +15.4% (five of five pairs), four streams +4.7%, one stream +0.1%. [pending: f-027-gh-eng-pm2]
+- **Layer-major prefill on a CUDA layer split** (#3976, ports of two contributors). [pending: f-027-gh-eng-lm - state whether it is on or off and give the measured prompt gain, or delete the bullet]
+- **Huge pages for DeepSeek on Linux.** If you reserve 2 MB huge pages (`vm.nr_hugepages`) big enough for the expert copy, the engine uses them and copies prompt data in place: an 8K prompt on the 2.25 set read 651 tok/s without and 694 with (R9700 limited to 12 GB; that run also set two buffers by hand). Without a reserved pool nothing changes. Not run with a reserved pool on the release package.
+- **Settings that help if your PC fits them, no engine change:** `--ple-io ram` (the 28.8 GB table in RAM; on the 72 GB card prompts +16.5% at 1K, +30.6% at 4K, +16.8% at 8K), `--mtp-draft-vocab draft_vocab_en.bin` (+2.7 to +3.1% decode for English text), `--slots 2` for two conversations at once (+10% to +12% aggregate throughput on RTX PRO 5000 and RTX 3060), `--prefill-pipe` on a two-card layer split (+15% at 4K, +23% at 8K prompts on two RTX A4000). `--kv q4_0` on a 12 GB card did not reproduce a gain, so it is a choice, not a default.
 
-These need no engine change; they are settings. Each was measured on the same boxes.
+## Fixed, from your reports
 
-- **`--ple-io ram`** - the 28.8 GB n-gram table in RAM instead of read from the SSD row by row. On the 72 GB card
-  (251 GB RAM): prompt **+16.5% at 1K, +30.6% at 4K, +16.8% at 8K**, -2.6% at 16K. Setup chooses it on a Linux PC
-  with RAM to spare - check `setup --plan` on yours before trusting that.
-- **`--mtp-draft-vocab draft_vocab_en.bin`** - the helper that guesses the next words considers 162 KB of the
-  vocabulary instead of 425 KB, so it reads less per guess: **+2.7..3.1% story and +2.2..3.0% code** decode on both
-  big boxes. The big model checks every guess, so the answers are unchanged (identical tokens in every run where
-  the machine is deterministic). A CJK or Cyrillic user should keep the wider subset.
-- **`--slots 2`** - when the engine serves more than one conversation at a time (an agent with several sessions), decoding two
-  requests together returns **+10% aggregate throughput on the RTX PRO 5000 and +12% on the RTX 3060**, for a slightly higher
-  latency per token. Three and four slots add nothing measurable (+8.4% and +11.7%): the gain is all in the second slot, and
-  more slots cost KV memory. A single conversation gains nothing from it.
-- **`--prefill-pipe <R>`** - on a two-card layer split, plan the prompt's chunks for the pipeline: **+15.4% at 4K,
-  +22.5% at 8K, +2.7% at 16K** prompt on 2x RTX A4000 (5 interleaved pairs). `R` is the PC's own ratio; `setup --calibrate` measures it
-  (1,500 on that box).
-- **`--kv q4_0` on a 12 GB card** - the KV cache at 4 bits leaves room for ~1,000 more experts. On the RTX 3060
-  12 GB (IQ3_XXS) the gain did **not** reproduce: +12.0% story over three pairs, -2.9% over five, with that box's
-  own baseline moving 41.6 -> 49.0 tok/s between sessions, so no speed claim is made for it. It costs KV precision
-  on long documents (document perplexity +8% at 1K, +12% at 8K in `bench/results/2026-09-27-kv-q4`), so it is a
-  choice, not a default.
+Each issue number gets its own reply.
 
-## The 12 GB default: residency-biased routing
+- Chat: scrolling up while an answer streams works (#4014); a request that timed out shows a badge (#3991).
+- The Monitor asks the NVIDIA tool only while it is open or a model runs, which stops the Windows stutter (#4066). The app no longer insists on CUDA when you have a HIP card on Windows (#3892), and the source-checkout host starts an engine with an empty API key (#3851). Deleting a model in the app removes all files of a multi-file model and leaves your own files (#3716).
+- The Terminal: `strata launch --set dspark=on` works (#3959); `launch --show-key` knows the config setup wrote (#3570); a model on disk in a differently cased folder is found on Linux instead of being offered for download again (#3996); `--spec 5` can be saved with a warning (#3844) [pending: f-027-gh-eng-d].
+- Manual mode: read-only commands that have write or execute options now ask first (#3975).
+- Engine [pending: f-027-gh-eng]: a conversation cache no longer reuses another conversation's keys and values (#1503); a short draft-vocabulary row can't be written past (#3911); a checkpoint save that runs out of memory no longer exits the engine (#3350); a hand build for RTX 50 no longer ends up as sm_75 (#4029, #4023); the DeepSeek CUDA packages now include RTX 40 cards (sm_89, #3935); an undeclared tool call returned as text is recovered, declared-only kept (#3796).
+- Engine, audit fixes [pending: f-027-gh-eng-d]: a failed read in the per-layer table reader no longer leaves the next request waiting for ever (#3602); a conversation restore that would have to create a new copy stream on a card with almost no free memory goes back to the cache instead of failing (#2409); an engine that cannot allocate on a layer split now says how much memory it planned to keep free and how much is free (#3638, #3702); `--spec 5` and other values outside the tuner's range can be saved with a warning (#3844).
+- Setup and Docker: setup accepts engines that come from the update feed (#4027); a silent re-download in Docker fails loudly (#3421); the Docker image stage carries the scripts the Terminal needs (#3974, #3644); images are tagged 0.2.7.
+- Docs: TROUBLESHOOTING is back with every entry that the 0.2.5 rewrite dropped, updated for 0.2.7; the Strix Halo Windows guide (#3029, first written by @HaiYunChuang, measured again here); a Polish README (#3355, by @j-luwierski, the 8th README).
+- A graphics card that went through GPU resets can hang engine starts until the PC is rebooted. We saw it on a 4 x R9700 box; 40 loads after a fresh boot had no stall.
 
-**On by default at 1.5 on a discrete NVIDIA card with 13 GiB of memory or less** (`STRATA_ROUTE_PRIOR=0` turns it off, an explicit value wins;
-not a default on a Radeon, a Strix Halo or any integrated GPU, where it was not measured). The router prefers
-experts that are already resident, so a window stops waiting on a page-in that the next window would need again. The first
-0.2.7 candidates used a bonus of 2.0, and the table below was measured at 2.0 on the RTX 3060 12 GB (IQ3_XXS), five interleaved
-pairs of fresh engines. The default was lowered to 1.5 by the owner on 26 October after the copy and code check on that card
-(IQ3_XXS) found real defects in the answers at 2.0 and **no defect in 19 tasks at 1.5** (or at 1.0). 1.5 keeps most of the speed:
-story **+15%** and code **+37%** against the routing off. That is 19 tasks, not a proof; a longer 61-task check of 0, 1.5 and 2.0
-is still running, and if it shows defects at 1.5 the default falls back to 1.0. The 2.0 measurements:
+Names stay on the commits: 35 contributors' pull requests were ported with their authorship.
 
-| axis | before | after |
-|---|---|---|
-| decode story | 45.9 | **61.6 (+34.1%)** |
-| decode code | 43.6 | **73.1 (+67.6%)** |
-| prompt | **not claimed** - this box's prompt read swings between 218 and 466 tok/s across runs, and a repeat of the same five-pair A/B read +254% and -20.5% where the first read +35% and +17% |
-| decode behind a 4K document | 45.1 | **62.2 (+37.9%)** |
+## What we did not test
 
-It holds where it matters most: with **two conversations in flight** the whole recipe reads **31.2 -> 62.0 tok/s aggregate
-(+99%)** on that card and +22% on the 2x A4000, both answers arriving in half the wall time on the 12 GB box, and the routing
-default alone is **+67% aggregate** there (59.7 against 35.6 tok/s) -
-and on content the tuning was never fitted to it **+29.0%** (43.5 -> 55.0 tok/s on a
-document prompt), and the whole recipe - routing, a workload-fitted expert profile, `--adapt-every 0`, `--vram-reserve-mib
-896` and the English draft vocabulary - gives **+26.5%** there and **+80%** on code in a sustained 80-request session.
-
-It works by choosing a slightly different set of experts, so replies change: the owner approved that trade for 12 GB cards.
-**Do not raise the bonus to 2.0 or more.** 2.0 showed defects in the copy and code check; 3.0 measures +17.7% / +24.0% on the test
-prompts but **-4.5% on held-out content**, and 4.0 breaks outright. `STRATA_ROUTE_PRIOR=2` still works if you want the old value.
-
-## What was tried and did not make it
-
-Recorded so nobody repeats it: deeper or wider MTP windows, `STRATA_QFUSE`, `STRATA_STAGE_TRIM`, `STRATA_HC_Q8`,
-DFlash2 as the drafter, 4-bit draft copies, `pcie_frac` changes on the 3060, `--pipeline-windows` on a two-card
-split, the K-split and the shared-memory-free variants of the hyper-connection down projection, `--prefill` chunks
-above 8K, and every Blackwell default switch turned off one at a time. The numbers are in
-`CUDA Plan/RESULTS.md` outside this repository.
+- Prompts longer than a few thousand tokens at 512K or 1M DeepSeek contexts.
+- RTX 40 cards (no Ada card here), A100-class cards, RX 6000 on Windows (#3895) and a two-GPU PC with a slow CPU (#3930): shipped from the reporters' measurements; please tell us.
+- Whether the new summation orders (RTX PRO and Ampere-class cards) change answers: a 61-task check on the RTX PRO 5000 passed 54 against 55 with the switches off, and its differences stayed inside the spread between two identical runs; it is a small sample.
+- The huge-page path with a reserved pool on the release package.
+- The DeepSeek Strix Halo package on a 64 GB or 32 GB machine, and the 2.25 set on it.
+- The route prior on the owner's RTX 5070: it applies there, and the quality check ran on the RTX 3060.
+- The in-app updater from 0.2.6 to 0.2.7 (its files and signatures are checked; we run it after publishing).
+- Any Mac beyond the signed build; Metal and SYCL got no 0.2.7 speed change.
 
 ## Updating
 
-- The engine package that carries this is chosen by the owner; the app and the Terminal keep their own versions.
-- From 0.2.6: the usual update path for the part that changed.
+- **App:** the in-app updater installs the new installer. The app then offers the 0.1.52 engine. [TO CONFIRM with the update test]
+- **Terminal:** run `strata update`. It fetches Control 0.1.52 and the newer engine. [TO CONFIRM with the update test]
+- **DeepSeek engine:** updates itself on the next `strata launch`.
+
+## Downloads
+
+Three installers, the three Control packages (0.1.52), 13 Qwen engine packages and 4 DeepSeek engine packages (all 0.1.52: Windows CUDA 13, Windows AMD for Ryzen AI Max, Linux CUDA 13, Linux AMD rx9070), plus `strata-feed.json` with its signature, `latest.json`, `install-manifest.txt`, `install.sh`, `install.ps1` and `SHA256SUMS.txt`. The DeepSeek CUDA packages are built for sm_86, sm_89 and sm_120. [pending: f-027-gh-eng]
 
 ---
 
 Strata is free and open source. If it runs well on your PC, a coffee keeps the work on it going:
 
 <a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a>
-
-
-
-
