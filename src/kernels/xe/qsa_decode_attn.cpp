@@ -71,6 +71,22 @@ inline float reduce12(const sycl::sub_group& sg, const float (&part)[16], int la
     const float r1 = (hi2 ? r2[1] : r2[0]) + sycl::permute_group_by_xor(sg, hi2 ? r2[0] : r2[1], 2);
     return r1 + sycl::permute_group_by_xor(sg, r1, 1);
 }
+// reduce12 for G <= 4 heads: the same pairing order (xor 16, 8, 4, 2, 1), so the same sums bit for bit, in 6 shuffles
+// instead of 16.  Lane l ends holding head head_of_lane4(l); the 8 lanes l & ~7 .. l | 7 agree.
+inline float reduce4(const sycl::sub_group& sg, const float (&part)[4], int lane) {
+    float r2[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const bool hi = (lane & 16) != 0;
+        r2[i] = (hi ? part[i + 2] : part[i]) + sycl::permute_group_by_xor(sg, hi ? part[i] : part[i + 2], 16);
+    }
+    const bool hi8 = (lane & 8) != 0;
+    float r = (hi8 ? r2[1] : r2[0]) + sycl::permute_group_by_xor(sg, hi8 ? r2[0] : r2[1], 8);
+    r += sycl::permute_group_by_xor(sg, r, 4);
+    r += sycl::permute_group_by_xor(sg, r, 2);
+    return r + sycl::permute_group_by_xor(sg, r, 1);
+}
+inline int head_of_lane4(int lane) { return ((lane >> 4) & 1) * 2 + ((lane >> 3) & 1); }
 inline int head_of_lane(int lane) {
     return ((lane >> 4) & 1) * 8 + ((lane >> 3) & 1) * 4 + ((lane >> 2) & 1) * 2 + ((lane >> 1) & 1);
 }
@@ -214,7 +230,8 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                     if (all_ok) {
                         float kk[NC][N];
                         for (int j = 0; j < NC; ++j) loadn<HD, KV_MODE>(p, false, srow[cc[j]], lane * N, kk[j]);
-                        float pp[NC][16];
+                        constexpr int HP = G <= 4 ? 4 : 16;   // the heads reduce4 or reduce12 sums
+                        float pp[NC][HP];
     #pragma unroll
                         for (int h = 0; h < G; ++h) {
                             const float* qa = &sq[h * HD + lane * N];
@@ -223,9 +240,15 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                         }
     #pragma unroll
                         for (int j = 0; j < NC; ++j) {
-                            for (int h = G; h < 16; ++h) pp[j][h] = 0.0f;
-                            const float sj = reduce12(sg, pp[j], lane);
-                            if ((lane & 1) == 0 && hd_lane < G) sp[hd_lane * CHUNK + cc[j]] = sj * scale;
+                            for (int h = G; h < HP; ++h) pp[j][h] = 0.0f;
+                            if constexpr (G <= 4) {
+                                const float sj = reduce4(sg, pp[j], lane);
+                                if ((lane & 7) == 0 && head_of_lane4(lane) < G)
+                                    sp[head_of_lane4(lane) * CHUNK + cc[j]] = sj * scale;
+                            } else {
+                                const float sj = reduce12(sg, pp[j], lane);
+                                if ((lane & 1) == 0 && hd_lane < G) sp[hd_lane * CHUNK + cc[j]] = sj * scale;
+                            }
                         }
                     } else {
                         // a masked or out-of-range cell in the step: one cell at a time
@@ -237,25 +260,39 @@ sycl::event launch_chunk(sycl::queue& queue, const float* q_all, const QsaAttnPo
                             }
                             float kn[N];
                             loadn<HD, KV_MODE>(p, false, srow[c], lane * N, kn);
-                            float part[16];
+                            constexpr int HP = G <= 4 ? 4 : 16;
+                            float part[HP];
                             for (int h = 0; h < G; ++h) part[h] = dotn<N>(kn, &sq[h * HD + lane * N]);
-                            for (int h = G; h < 16; ++h) part[h] = 0.0f;
-                            const float sc = reduce12(sg, part, lane);
-                            if ((lane & 1) == 0 && hd_lane < G) sp[hd_lane * CHUNK + c] = sc * scale;
+                            for (int h = G; h < HP; ++h) part[h] = 0.0f;
+                            if constexpr (G <= 4) {
+                                const float sc = reduce4(sg, part, lane);
+                                if ((lane & 7) == 0 && head_of_lane4(lane) < G)
+                                    sp[head_of_lane4(lane) * CHUNK + c] = sc * scale;
+                            } else {
+                                const float sc = reduce12(sg, part, lane);
+                                if ((lane & 1) == 0 && hd_lane < G) sp[hd_lane * CHUNK + c] = sc * scale;
+                            }
                         }
                     }
                 }
                 sycl::group_barrier(grp);
                 // per-head chunk max and exp-sum: sub-group w handles heads w, w+WARPS, ...
                 for (int h = warp; h < G; h += WARPS) {
-                    const float a = sp[h * CHUNK + lane], b = sp[h * CHUNK + lane + 32];
-                    const float m = warp_max(sg, sycl::fmax(a, b));
-                    const float ea = (lane < n_here && srow[lane] >= 0) ? sycl::exp(a - m) : 0.0f;
-                    const float eb = (lane + 32 < n_here && srow[lane + 32] >= 0) ? sycl::exp(b - m) : 0.0f;
+                    constexpr int PER = CHUNK / WARP;   // the cells a lane takes
+                    float mx = -FLT_MAX;
+    #pragma unroll
+                    for (int k = 0; k < PER; ++k) mx = sycl::fmax(mx, sp[h * CHUNK + lane + WARP * k]);
+                    const float m = warp_max(sg, mx);
                     float* pt = reinterpret_cast<float*>(&spt[0]);
-                    pt[lane * GP + h] = ea;
-                    pt[(lane + 32) * GP + h] = eb;
-                    const float l = warp_sum(sg, ea + eb);
+                    float sum = 0.0f;
+    #pragma unroll
+                    for (int k = 0; k < PER; ++k) {
+                        const int c = lane + WARP * k;
+                        const float e = (c < n_here && srow[c] >= 0) ? sycl::exp(sp[h * CHUNK + c] - m) : 0.0f;
+                        pt[c * GP + h] = e;
+                        sum += e;
+                    }
+                    const float l = warp_sum(sg, sum);
                     if (lane == 0) { sml[h] = m; sml[G + h] = l; }
                 }
                 sycl::group_barrier(grp);
