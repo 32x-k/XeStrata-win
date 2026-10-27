@@ -66,6 +66,22 @@ At a 32K context that is 4 slots from a 24 GB card; a smaller card stays at one 
   A new conversation takes an empty slot, else the one used longest ago.
 - A client that disconnects stops its slot (`BSTOP`); the others go on.
 
+### Long prompts that move from solo to a batch slot
+
+A request that moves from the solo path into a slot is not read again because the engine's prompt cache reuses the live session.
+With `--prompt-cache 0` the moved request reads its whole prompt again.
+To trim the cache for RAM and still keep that reuse, set the model config's `args` like this (the other arguments unchanged):
+
+```text
+"args": [ ..., "--prompt-cache", "1", "--prompt-cache-every", "0",
+          "--prompt-cache-root", "0", "--conversation-cache-mib", "0" ]
+```
+
+`--prompt-cache 1` keeps one checkpoint, `--prompt-cache-every 0` takes no checkpoint every 16K tokens and `--prompt-cache-root 0` none at the end of the system prompt.
+`--conversation-cache-mib 0` only stops parking finished conversations in RAM: the checkpoint and the sessions the slots hold stay.
+If you already park conversations, keep that budget as it is: it is separate from the reuse on a move.
+This does not make new long prompts read at the same time: they are admitted one at a time.
+
 ## The VRAM expert tier keeps adapting in batch windows
 
 Batch windows count which experts they route to as well (upstream e989c671).
