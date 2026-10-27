@@ -228,7 +228,7 @@ class Serve(unittest.TestCase):
         self.start(pictures=False)
         code, out = self.post(self.picture_body())
         self.assertEqual(code, 400)
-        self.assertIn("without the vision encoder", json.dumps(out))
+        self.assertIn("without pictures for DeepSeek", json.dumps(out))
 
     def test_a_follow_up_with_the_picture_in_history_works(self):
         self.start()
