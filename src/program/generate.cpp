@@ -5513,6 +5513,25 @@ int main(int argc, char** argv) {
     if (o.expert_cache > 0) {
         std::fprintf(stderr, "strata generate: expert cache %lld slots, %.2f GiB of VRAM; policy is\n",
                      (long long) xcache.slots(), xcache.gib());
+        // Residency-biased routing (STRATA_ROUTE_PRIOR, upstream c30656aaf / 0afaaa399: the top-10 picked again with a
+        // bonus for the experts in this cache; it changes which experts run) on by itself at upstream's 1.5 when the
+        // cache holds less than 35% of the model's expert pairs, on one GPU; an explicit STRATA_ROUTE_PRIOR wins (0:
+        // off).  Measured 2026-10-28 (IQ3_XXS, decode against off): RTX 4070 15% of the pairs +50% / +40% (1K / 32K),
+        // RX 9060 XT 25% +31% / +30%, the B70 limited to 11% / 21% / 31% +43% / +27..32% / +18..21%, and at 41% and
+        // 60% (unlimited) -3..-5% at 1K and +2..4% at 32K.  upstream checked the quality of 1.5 on a 12 GB card with an
+        // 80-task check (no copy or code errors); the user chose this automatic switch over the card-size rule.
+        if (std::getenv("STRATA_ROUTE_PRIOR") == nullptr && o.layer_split.empty() && g.n_layers > 0 && g.n_expert > 0 &&
+            (double) xcache.slots() < 0.35 * (double) (g.n_layers * g.n_expert)) {
+#if defined(_WIN32)
+            _putenv_s("STRATA_ROUTE_PRIOR", "1.5");
+#else
+            setenv("STRATA_ROUTE_PRIOR", "1.5", 0);
+#endif
+            std::fprintf(stderr, "strata generate: the expert cache holds %.0f%% of the expert pairs: residency-biased "
+                                 "routing on (STRATA_ROUTE_PRIOR=1.5; it changes which experts run, "
+                                 "STRATA_ROUTE_PRIOR=0 turns it off)\n",
+                         100.0 * (double) xcache.slots() / (double) (g.n_layers * g.n_expert));
+        }
         mem_mark("opening the expert cache");
         xcache.set_per_layer_admission(o.expert_cache_per_layer);
         // Round 328 warned here that the GPU hit path was wrong (tokens diverged from a cache-off run from

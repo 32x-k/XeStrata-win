@@ -91,7 +91,8 @@ decode の速さは文章によっても変わります。
 | serve の decode（なし → あり、1K と 32K、greedy と温度 0.7） | −1.0〜+12.7% | +7.5〜+24.5% | +6.3〜+55.4% |
 
 `STRATA_ROUTE_RESIDENT=<margin>`（upstream 5df35dcb、実験的、opt-in）は、検証の窓で上位 10 のうち順位 6〜9 の VRAM にないエキスパートを、ロジットの差が margin 以内なら VRAM にあるエキスパートに入れ替えます（`STRATA_ROUTE_RESIDENT_RANKS=lo-hi`）。
-`STRATA_ROUTE_PRIOR=<lambda>`（upstream 2de9ae06、opt-in）は、VRAM にあるエキスパートのロジットに lambda を足して選び直します（重みはルーターのもの）。
+`STRATA_ROUTE_PRIOR=<lambda>`（upstream 2de9ae06）は、VRAM にあるエキスパートのロジットに lambda を足して選び直します（重みはルーターのもの）。
+GPU が 1 枚で、エキスパートのキャッシュに載る枠がモデルのエキスパートの 35% に満たないときは、自分で 1.5 にします（起動のログにそう出ます）。キャッシュの小さい GPU では decode が 3〜5 割速くなり、多くが載る GPU では速くならないためです。`STRATA_ROUTE_PRIOR=0` で切れ、ほかの値を書けばそれを使います。
 どちらも答えが変わります。
 
 ### 小さい GPU と XMX のない GPU

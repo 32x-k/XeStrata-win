@@ -99,8 +99,11 @@ Measured (IQ3_XXS):
 
 `STRATA_ROUTE_RESIDENT=<margin>` (upstream 5df35dcb, experimental, opt-in) swaps a verify window's missed experts at
 ranks 6-9 of the top 10 for resident ones whose logit is within the margin (`STRATA_ROUTE_RESIDENT_RANKS=lo-hi`).
-`STRATA_ROUTE_PRIOR=<lambda>` (upstream 2de9ae06, opt-in) picks the top 10 again with lambda added to the resident
-experts' logits (the weights stay the router's). Both change the answers.
+`STRATA_ROUTE_PRIOR=<lambda>` (upstream 2de9ae06) picks the top 10 again with lambda added to the resident
+experts' logits (the weights stay the router's).
+On one GPU whose expert cache holds less than 35% of the model's experts it is set to 1.5 by itself (the start log says
+so): there decode runs 30-50% faster, and on a GPU that holds most of them it does not.
+`STRATA_ROUTE_PRIOR=0` turns it off, and any other value is used as given. Both change the answers.
 
 ### Small cards and GPUs without XMX
 

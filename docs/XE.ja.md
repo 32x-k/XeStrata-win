@@ -294,7 +294,7 @@ upstream の Strata 0.1.40.2 から 0.1.42（`61b3fb5d`）までの変更（0.1.
 移したものの主なものは次のとおりです。
 
 - serve の decode で、外れのエキスパートを順位 7 以下で選んだトークンではその寄与を 0 にし（窓ではなくトークンごとに決める）、検証の窓のどのトークンもその順位でしか選ばないものは読まず計算もしない `STRATA_ROUTE_TAIL_SKIP=7`（既定）。upstream は HIP では切っていますが、XeStrata は 3 社の GPU で KL・タスクの確認・速さを測り直し、全機種で既定にしました。
-- 検証の窓で VRAM にあるエキスパートに寄せる `STRATA_ROUTE_RESIDENT` と `STRATA_ROUTE_PRIOR`（どちらも opt-in、答えが変わる）。
+- 検証の窓で VRAM にあるエキスパートに寄せる `STRATA_ROUTE_RESIDENT`（opt-in）と `STRATA_ROUTE_PRIOR`（キャッシュに載るエキスパートが 35% 未満の GPU 1 枚では自分で 1.5）。どちらも答えが変わる。
 - prefill の CPU 分担の拡張（ページ固定でない RAM のエキスパートも渡す）と、全エキスパートが VRAM にあるときやメモリが足りないときに既定で使わない規則。
 - `--aux-cpus`（opt-in）、PLE の `--ple-io direct` が遅いときの mmap への切り替え、stager の RAM 向けの読み方、埋め込みのバッファの使い回し。
 - メモリの見張り（cgroup の上限と `--memory-limit-mib`）、会話キャッシュの `--conversation-cache-min-tokens`、`--session-save-reclaim`、`logit_bias`、`strata --version`。
