@@ -2152,9 +2152,23 @@ int main(int argc, char **argv) try {
         };
         split_auto = o.layer_split == "auto";
         bool ok = o.serve && (split_auto || ints(o.layer_split, split_at));
+        // SYCL port: a stage is a GPU of the PRIMARY device's backend.  Everything else that the runtime lists is
+        // not a stage: the batch slots load the OpenCL adapter as well, so on a two-card `xe` box
+        // dpct::device_count() then reports the CPU and the OpenCL view of the same two cards (5 devices), and an
+        // automatic split tried to put a stage on the CPU ("layer split, CUDA2 weights: the weight arena does not
+        // fit ... 0 MiB of 160876 MiB free on that card") instead of working.
+        const auto stage_dev = [](int d) -> bool {
+            try {
+                const sycl::device dev = dpct::get_device(d);
+                return dev.is_gpu() && dev.get_backend() == dpct::get_device(0).get_backend();
+            } catch (...) {
+                return false;
+            }
+        };
         if (ok && !o.split_device.empty()) ok = ints(o.split_device, split_devs);
         else if (ok)
-            for (int d = 1; d < n_dev && (split_auto || split_devs.size() < split_at.size()); ++d) split_devs.push_back(d);
+            for (int d = 1; d < n_dev && (split_auto || split_devs.size() < split_at.size()); ++d)
+                if (!split_auto || stage_dev(d)) split_devs.push_back(d);
         if (ok && !split_auto && split_devs.empty() && split_at.size() == 1) split_devs.push_back(0);   // one GPU
         split_same = ok && split_devs.size() == 1 && split_devs[0] == 0 && !split_auto;
         if (split_same && o.conversation_cache_mib > 0 && o.conversation_cache_slots > 0 && o.prompt_cache > 0) {
