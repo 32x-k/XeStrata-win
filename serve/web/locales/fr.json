@@ -211,6 +211,7 @@
   "rewind.noList": "Pour plutôt ouvrir une nouvelle conversation à partir d’ici, activez Conversations enregistrées dans les réglages de la conversation.",
   "rewind.title": "Revenir ici",
   "settings.language": "Langue",
+  "settings.languageAuto": "Automatique (langue du navigateur)",
   "settings.languageNote": "La conversation, ses réglages et les boutons ci-dessus sont traduits. Les vues Moniteur, Images et À propos sont encore en anglais.",
   "sidebar.collapse": "Réduire la liste des conversations",
   "sidebar.delete": "Supprimer cette conversation",

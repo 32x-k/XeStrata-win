@@ -199,6 +199,7 @@
   "rewind.noList": "대신 여기서 새 채팅을 시작하려면 채팅 설정에서 저장된 채팅 목록을 켜세요.",
   "rewind.title": "여기로 되감기",
   "settings.language": "언어",
+  "settings.languageAuto": "자동 (브라우저 언어)",
   "settings.languageNote": "채팅과 채팅 설정, 위의 버튼은 번역되어 있습니다. 모니터, 이미지, 정보 화면은 아직 영어입니다.",
   "sidebar.collapse": "채팅 목록 접기",
   "sidebar.delete": "이 채팅 삭제",

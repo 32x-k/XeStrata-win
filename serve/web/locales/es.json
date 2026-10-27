@@ -199,6 +199,7 @@
   "rewind.noList": "Para empezar en su lugar un chat nuevo desde aquí, activa la lista de chats guardados en los ajustes del chat.",
   "rewind.title": "Volver hasta aquí",
   "settings.language": "Idioma",
+  "settings.languageAuto": "Automático (idioma del navegador)",
   "settings.languageNote": "El chat, sus ajustes y los botones de arriba están traducidos. Las vistas Monitor, Imágenes y Acerca de siguen en inglés.",
   "sidebar.collapse": "Contraer la lista de chats",
   "sidebar.delete": "Eliminar este chat",

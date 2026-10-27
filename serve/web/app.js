@@ -21,6 +21,7 @@ const gb = (b, d = 1) => (b == null ? "–" : fmt(b / 1073741824, d));   // memo
 const store = {
   get(k, d) { try { const v = localStorage.getItem("xestrata." + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
   set(k, v) { try { localStorage.setItem("xestrata." + k, JSON.stringify(v)); return true; } catch (e) { return false; } },
+  del(k) { try { localStorage.removeItem("xestrata." + k); } catch (e) { /* ignore */ } },
 };
 
 // ------------------------------------------------------------------ toasts
@@ -1777,11 +1778,22 @@ $("scrim").onclick = () => openDrawer(false);
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && $("drawer").dataset.open === "true") openDrawer(false); });
 
 // ------------------------------------------------------------------ language (serve/web/i18n.js)
-// The user's own choice, kept in this browser: English until they pick another. /?lang=de shows one for this visit only.
+// The user's own choice, kept in this browser; without one ("Automatic"), the browser's language where the page has it,
+// else English. /?lang=de shows one for this visit only.
 const urlLang = new URLSearchParams(location.search).get("lang");
-$("lang").innerHTML = StrataI18n.LANGUAGES.map(([code, name]) => `<option value="${esc(code)}">${esc(name)}</option>`).join("");
+function browserLanguage() {
+  return StrataI18n.choose(urlLang, store.get("lang", ""), navigator.languages || [navigator.language]);
+}
+// the choices: Automatic first (in the language of the moment), then each language in its own name
+function languageChoices() {
+  $("lang").innerHTML = `<option value="auto">${esc(tr("settings.languageAuto", "Automatic (browser language)"))}</option>` +
+    StrataI18n.LANGUAGES.map(([code, name]) => `<option value="${esc(code)}">${esc(name)}</option>`).join("");
+  const saved = store.get("lang", "");
+  $("lang").value = urlLang && urlLang === StrataI18n.lang ? StrataI18n.lang
+                  : StrataI18n.LANGUAGES.some((l) => l[0] === saved) ? saved : "auto";
+}
 function showLanguage() {
-  $("lang").value = StrataI18n.lang;
+  languageChoices();
   renderEmptyChat();
   setSidebar(sidebarOpen, false);
   thinkingButtons();   // the level buttons are built in the code, in the language of the moment
@@ -1790,15 +1802,16 @@ function showLanguage() {
   if (lastMetrics) render(lastMetrics);
 }
 $("lang").onchange = async () => {
-  store.set("lang", $("lang").value);
-  await StrataI18n.setLanguage($("lang").value);
+  const v = $("lang").value;
+  if (v === "auto") store.del("lang"); else store.set("lang", v);   // Automatic forgets the choice
+  await StrataI18n.setLanguage(v === "auto" ? StrataI18n.choose(null, null, navigator.languages || [navigator.language]) : v);
   showLanguage();
 };
 
 // ------------------------------------------------------------------ start
 async function start() {
-  await StrataI18n.setLanguage(urlLang || store.get("lang", "en"));
-  $("lang").value = StrataI18n.lang;
+  await StrataI18n.setLanguage(browserLanguage());
+  languageChoices();
   renderEmptyChat();
   initChats();
   if (settings.chatList) await setChatList(true, false);       // the saved-chats list is read before the first draw

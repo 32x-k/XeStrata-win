@@ -199,6 +199,7 @@
   "rewind.noList": "代わりにここから新しいチャットを始めるには、チャット設定で「保存したチャットの一覧」をオンにしてください。",
   "rewind.title": "ここまで戻す",
   "settings.language": "言語",
+  "settings.languageAuto": "自動（ブラウザーの言語）",
   "settings.languageNote": "チャットとその設定、上のボタンは翻訳されています。モニター、画像、情報の画面はまだ英語です。",
   "sidebar.collapse": "チャット一覧を閉じる",
   "sidebar.delete": "このチャットを削除",

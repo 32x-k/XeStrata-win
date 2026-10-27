@@ -211,6 +211,7 @@
   "rewind.noList": "To start a new chat from here instead, turn on Saved chats in Chat settings.",
   "rewind.title": "Rewind to here",
   "settings.language": "Language",
+  "settings.languageAuto": "Automatic (browser language)",
   "settings.languageNote": "Chat, its settings and the buttons above are translated. The Monitor, Images and About views are still in English.",
   "sidebar.collapse": "Collapse the chat list",
   "sidebar.delete": "Delete this chat",

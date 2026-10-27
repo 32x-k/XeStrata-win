@@ -199,6 +199,7 @@
   "rewind.noList": "想改为从这里开始新聊天，请在聊天设置中打开“已保存聊天列表”。",
   "rewind.title": "回退到此处",
   "settings.language": "语言",
+  "settings.languageAuto": "自动（浏览器语言）",
   "settings.languageNote": "聊天、聊天设置和上方的按钮已翻译。监控、图片和关于页面仍是英文。",
   "sidebar.collapse": "收起聊天列表",
   "sidebar.delete": "删除此聊天",

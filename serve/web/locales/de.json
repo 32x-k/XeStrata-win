@@ -199,6 +199,7 @@
   "rewind.noList": "Um stattdessen von hier einen neuen Chat zu starten, schalten Sie in den Chat-Einstellungen die Liste gespeicherter Chats ein.",
   "rewind.title": "Bis hier zurückgehen",
   "settings.language": "Sprache",
+  "settings.languageAuto": "Automatisch (Sprache des Browsers)",
   "settings.languageNote": "Chat, seine Einstellungen und die Schaltflächen oben sind übersetzt. Die Ansichten Monitor, Bilder und Info sind noch auf Englisch.",
   "sidebar.collapse": "Die Chatliste einklappen",
   "sidebar.delete": "Diesen Chat löschen",
