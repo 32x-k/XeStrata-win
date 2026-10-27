@@ -5815,6 +5815,7 @@ def make_handler(svc: Service):
                                  "image_note": svc.images.note() if svc.images is not None else None,
                                  "image_defaults": svc.images.default.defaults() if svc.images is not None else None,
                                  "image_models": svc.images.models() if svc.images is not None else None,
+                                 "thinking": getattr(svc.template, "thinking", None),
                                  "loaded": svc.loaded(), "service": "strata"})
             elif path == "/update":                         # whether a newer release is out (About > Updates)
                 if not self._authorized():
@@ -7052,8 +7053,8 @@ def clean_shared_defaults(d) -> dict:
             continue
         number = isinstance(value, (int, float)) and not isinstance(value, bool)
         if key == "reasoning_effort":
-            if value not in ("none", "low", "medium", "high"):
-                raise ValueError("reasoning_effort: none, low, medium or high")
+            if value not in ("none", "low", "medium", "high", "xhigh", "max"):
+                raise ValueError("reasoning_effort: none, low, medium, high or max")
         elif key == "temperature":
             if not number or not 0 <= value <= 2:
                 raise ValueError("temperature: 0..2")

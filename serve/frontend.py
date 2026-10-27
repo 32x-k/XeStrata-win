@@ -70,6 +70,22 @@ class ChatTemplate:
         # </tool_call>`, read through GlmCallRewriter; the thinking always opened, its effort low, high or max
         self.call_form = "glm" if "<arg_key>" in self.source else "qwen"
         self.caps = self._detect_caps()
+        self.thinking = self._thinking_levels()
+
+    def _thinking_levels(self) -> dict:
+        """The thinking levels this template takes, by their own names, and the one a request that names none gets
+        (/health's "thinking", the web page's buttons): GLM-5.3-Flash's low, high and max; Harmony's (llm-jp-4.1's)
+        low, medium and high, medium its default; Qwen3.8-Flash-Next's low, medium and high (xhigh); a template that
+        only turns its thinking on and off, on; none at all, no levels."""
+        if self.call_form == "glm":
+            return {"levels": ["none", "low", "high", "max"], "default": "max"}
+        if self.harmony:
+            return {"levels": ["none", "low", "medium", "high"], "default": "medium"}
+        if "reasoning_effort" in self.source:
+            return {"levels": ["none", "low", "medium", "high"], "default": "high"}
+        if "enable_thinking" in self.source:
+            return {"levels": ["none", "on"], "default": "on"}
+        return {"levels": [], "default": None}
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
