@@ -770,6 +770,7 @@ server は `http://127.0.0.1:8095` で待ち受けます（setup の `--port`、
 | モデルがいま何をしているか | `GET /status`、`GET /slots`（スロットは 1 つで、busy か idle） |
 | Monitor のタブが示すすべて（エンジン、いまの状態、最近の要求、ハードウェア） | `GET /metrics` |
 | 同じものを Prometheus の形で（vLLM の名前、`Accept: text/plain` か `?format=prometheus`） | `GET /metrics` |
+| 合計といま動いているものを Prometheus の形で（llama-server の名前） | `GET /metrics/prometheus` |
 | MCP サーバーとその状態とツール（[下](#mcp-サーバーのツールを使う)） | `GET /mcp` |
 
 `/models` と `/v1/models` は、読み込んだモデルだけを、文脈の上限と入力の種類とともに示します。
@@ -1278,6 +1279,7 @@ server がネットワークから届くなら、この履歴は機密として�
 server の起動からの合計（`totals`）も示します。
 `hit_rate` は、答えを書く間に引いたエキスパートのうち VRAM にあったものの割合です。GPU が PCIe 越しに読むエキスパート（`--pcie-frac`）は入らないので、`--pcie-frac` を上げると、decode が遅くなっても上がります。
 `pcie_share` は、それらが割り振られたエキスパート全体に占める割合で、server のログと Monitor のタブがヒット率の横に示します（upstream #588）。
+Monitor のタブの最近の要求の一覧は、prefill の速さ（`Prefill t/s`）も示します。キャッシュにあった分は読み直さないので、新しく読んだトークン（`prompt_tokens` から `reused` を引いた数）を prefill の時間（`prompt_ms`）で割った値で、新しいトークンを読まなかった要求には数を出しません。
 
 ---
 

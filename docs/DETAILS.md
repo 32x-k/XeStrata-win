@@ -805,6 +805,7 @@ To switch between it and other model servers behind one address, see [LLAMA_SWAP
 | What the model is doing right now | `GET /status`, `GET /slots` (a single slot, busy or idle) |
 | Everything the Monitor tab shows (engine, live state, last requests, hardware) | `GET /metrics` |
 | The same for Prometheus, with vLLM's metric names (`Accept: text/plain` or `?format=prometheus`) | `GET /metrics` |
+| The totals and what is running, for Prometheus with llama-server's metric names | `GET /metrics/prometheus` |
 | The MCP servers, their state and tools ([below](#tools-from-mcp-servers)) | `GET /mcp` |
 
 `/models` and `/v1/models` list only the loaded model, with its context limit and input modalities.
@@ -1308,6 +1309,7 @@ Treat the history as sensitive when the server is reachable from a network: set 
 and their sums since the server started in `totals`.
 Its `hit_rate` is the VRAM share of the experts looked up while answering: experts the GPU reads over PCIe (`--pcie-frac`) are not in it, so a higher `--pcie-frac` raises it even when decoding gets slower.
 `pcie_share` is their share of all routed experts; the server log and the Monitor tab show it beside the hit rate (upstream #588).
+The Monitor tab's list of recent requests also shows the prefill speed (`Prefill t/s`): what the cache already held is not read again, so it is the fresh tokens (`prompt_tokens` minus `reused`) over the prefill time (`prompt_ms`), and a request that read no new token shows no number.
 
 ---
 
