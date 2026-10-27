@@ -8,6 +8,7 @@
 # packaging/package_engine.py and verifies every hash. It does NOT sign: the feed key stays offline, and a package made here is
 # unsigned and loads (see packaging/ENGINE-COMPONENT.md, Signature).
 #
+# The package is text-only on purpose (--no-picture-reader): DeepSeek reads pictures with its own tower, which the Metal engine has not run.
 # Needs: Xcode Command Line Tools, cmake + ninja (a pip venv is enough: python3 -m venv v && v/bin/pip install cmake ninja), Apple's
 # metal-cpp (METAL_CPP_DIR) and the llama.cpp tree setup pins (STRATA_GGML_DIR). Defaults: ~/strata-mac/metal-cpp, ~/strata-mac/llamacpp.
 #
@@ -56,7 +57,7 @@ done
 cp "$ROOT/third_party/ggml/ggml-common.h" "$STAGE/metal/"
 
 python3 "$ROOT/packaging/package_engine.py" --src "$STAGE" --backend metal --version "$VERSION" \
-  --platform macos-arm64 --arch apple-gpu --entrypoint strata-dsv41 --build-id "$BUILD_ID" --include 'metal/**' --out "$OUT" || exit 1
+  --platform macos-arm64 --arch apple-gpu --entrypoint strata-dsv41 --build-id "$BUILD_ID" --no-picture-reader --include 'metal/**' --out "$OUT" || exit 1
 DIR="$OUT/$VERSION-macos-arm64-metal"
 python3 "$ROOT/packaging/package_engine.py" --verify "$DIR" || exit 1
 
