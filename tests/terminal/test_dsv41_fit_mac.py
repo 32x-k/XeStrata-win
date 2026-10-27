@@ -68,5 +68,46 @@ class MacPlan(unittest.TestCase):
             self.assertGreater(p["disk_need_gb"], F.MAC_ENGRAM_GB)
 
 
+class MacInThePlan(unittest.TestCase):
+    """plan() answers for an Apple Silicon Mac in the shape the catalog, `strata launch` and the app read (0.2.7.1)."""
+
+    def card(self, ram):
+        return [{"index": 0, "name": "Apple M5 Max", "vendor": "apple", "vram_gb": 0.0, "unified_gb": float(ram), "usable": True}]
+
+    def test_the_m5_max_streams_and_says_what_was_measured(self):
+        p = F.plan(self.card(128), 128, 900.0, 8192, model="IST-DAS-2.00bpw")
+        self.assertTrue(p["mac"])
+        self.assertEqual(p["mac_verdict"], "streams")
+        self.assertAlmostEqual(p["vram_experts_gb"], 71.5, delta=0.5)
+        self.assertAlmostEqual(p["streamed_gb"], p["experts_gb"] - p["vram_experts_gb"], delta=0.2)
+        self.assertEqual(p["tp"], 1)
+        self.assertEqual(p["args"], [])
+        self.assertIn("M5 Max", p["words"])
+        self.assertTrue(p["disk_ok"])
+        for key in ("cards", "experts_total", "experts_in_vram", "cpu_experts_gb", "ram_needed_gb", "spill_gb", "engram_gb", "download_gb", "measured"):
+            self.assertIn(key, p)                     # the keys the catalog and the Terminal read
+
+    def test_a_small_mac_gets_a_plain_warning_not_a_refusal(self):
+        p = F.plan(self.card(32), 32, 900.0, 8192, model="IST-DAS-2.25bpw")
+        self.assertEqual(p["mac_verdict"], "small")
+        self.assertEqual(p["verdict"], "spills")
+        self.assertTrue(any("much slower" in w for w in p["warnings"]))
+        self.assertFalse(any("refuse" in w.lower() for w in p["warnings"]))
+
+    def test_the_file_cache_floor_grows_with_the_memory(self):
+        self.assertAlmostEqual(F.mac_expert_cap_gb(128), 71.4, delta=0.3)          # the measured M5 Max
+        self.assertGreater(F.mac_expert_cap_gb(64), 20.0)                          # a 64 GB Mac is not told it keeps nothing
+        self.assertLess(F.mac_expert_cap_gb(64), F.mac_expert_cap_gb(96))
+
+    def test_a_pc_is_unchanged(self):
+        pc = [{"index": 0, "name": "RTX 5070", "vram_gb": 12.0, "vendor": "nvidia"}]
+        p = F.plan(pc, 64, 900.0, 8192, model="IST-DAS-2.00bpw")
+        self.assertNotIn("mac", p)
+
+    def test_the_175_set_is_not_a_mac_set(self):
+        p = F.plan(self.card(128), 128, 900.0, 8192, model="IST-DAS-1.75bpw")
+        self.assertNotIn("mac", p)                    # never run on a Mac: falls through to the PC rules (no usable card)
+
+
 if __name__ == "__main__":
     unittest.main()
