@@ -32,8 +32,11 @@ public:
     void bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
               bool accumulate = false);
 
-    /// Y = X . W^T with both in FP16 (bits).
-    void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0);
+    /// Y = X . W^T with both in FP16 (bits).  `half_sums`: the sums in FP16 where oneMath takes the product (its
+    /// half GEMM, then widened into Y), for products whose sums stay in FP16's range (inputs after a norm); else, and
+    /// in XeStrata's own kernels, in FP32.
+    void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
+             bool half_sums = false);
 
     /// The experts' groups (FP16), one product each through oneMath: rows bounds[e] .. bounds[e + 1] (host values) of
     /// X and Y (row stride N) by W + e * w_stride, e < G.  False when oneMath does not take FP16 products on `stream`'s
@@ -47,9 +50,10 @@ public:
     /// where i8_usable says yes.
     static void i8(const int8_t* X, const int8_t* W, int32_t* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                    void* stream);
-    /// W given as native GGUF blocks of `ggml_type`, dequantized to FP16 in the scratch, X in FP16.
+    /// W given as native GGUF blocks of `ggml_type`, dequantized to FP16 in the scratch, X in FP16; `half_sums` as
+    /// f16's.
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
-                int64_t ldy = 0);
+                int64_t ldy = 0, bool half_sums = false);
 
     /// Loads the products' library ahead of the first prompt (oneMath's backend for the current GPU), on a thread of
     /// its own: call once for each GPU at startup.
