@@ -1505,6 +1505,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(ple_reader_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   add_test(NAME ple_reader_selftest COMMAND ple_reader_test --selftest)
 
+  # #3602: the same reader under load - several clients, a tiny row cache, one in-flight slot, injected delays, rows on
+  # every page phase, late-writer checks, the reader after a failed read. CPU and a temp file only; 77 = no direct reads here.
+  add_executable(ple_reader_stress_test src/ngram/ple_reader_stress_test.cpp)
+  target_include_directories(ple_reader_stress_test PRIVATE ${_strata_gpu_include_directories})
+  target_link_libraries(ple_reader_stress_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+  add_test(NAME ple_reader_stress COMMAND ple_reader_stress_test)
+  set_tests_properties(ple_reader_stress PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+
   # 0.2.7: the PLE residency rule (table + expert arena + headroom); header-only, needs nothing
   add_executable(ple_residency_test src/core/ple_residency_test.cpp)
   target_include_directories(ple_residency_test PRIVATE include)
