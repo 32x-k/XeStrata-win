@@ -99,7 +99,7 @@ set(STRATA_METAL_HOST_SOURCES
   ${S}/spec/suffix_drafter.cpp ${S}/spec/controller.cpp ${S}/spec/draft_policy.cpp ${S}/spec/draft_source.cpp
   ${S}/kernels/cpu/pool.cpp ${S}/kernels/cpu/expert_layout.cpp ${S}/kernels/cpu/native_expert.cpp
   ${S}/kernels/cpu/hadamard.cpp ${S}/kernels/cpu/tq_cpu.cpp)   # Gyro: the Hadamard rotation, the scalar trellis rows
-set_source_files_properties(${S}/core/device.cu ${S}/core/pinned.cu ${DS4}/ds4_vision.cu ${DS4}/vendor/exl3.cu ${DS4}${DS4}/vendor/moe_win.cu ${DS4}/vendor/sampler.cu
+set_source_files_properties(${S}/core/device.cu ${S}/core/pinned.cu ${DS4}/ds4_vision.cu ${DS4}/vendor/exl3.cu ${DS4}/vendor/moe_win.cu ${DS4}/vendor/sampler.cu
                             PROPERTIES LANGUAGE CXX)
 
 # The kernel library: Metal implementations (src/engine/*.cpp) and, for every entry point not ported yet, a stub
@@ -134,7 +134,7 @@ set(STRATA_DS4_SOURCES
   ${DS4}/ds4_main.cpp ${CMAKE_CURRENT_SOURCE_DIR}/src/engine/ds4_finish.cpp ${DS4}/ds4_model.cu ${DS4}/ds4_gguf.cu ${DS4}/ds4_iq.cu ${DS4}/ds4_kernels.cu ${DS4}/ds4_tq.cu
   ${DS4}/ds4_vision.cu
   ${DS4}/vendor/exl3.cu ${DS4}/vendor/exl3_cpu.cpp ${DS4}/vendor/moe_win.cu ${DS4}/vendor/sampler.cu
-  ${STRATA_ROOT}/src/kernels/cpu/iq256_portable.cpp ${DS4}/ds4_gg_cpu.cpp ${DS4}/ds4_gguf_cpu.cpp ${DS4}/ds4_iq_cpu.cpp ${DS4}/ds4_tq_cpu.cpp ${DS4}/ds4_packinfo.cpp)
+  ${DS4}/ds4_gg_cpu.cpp ${DS4}/ds4_gguf_cpu.cpp ${DS4}/ds4_iq_cpu.cpp ${DS4}/ds4_tq_cpu.cpp ${DS4}/ds4_packinfo.cpp)
 set_source_files_properties(
   ${DS4}/ds4_model.cu ${DS4}/ds4_gguf.cu ${DS4}/ds4_iq.cu ${DS4}/ds4_kernels.cu ${DS4}/ds4_tq.cu ${DS4}/ds4_vision.cu
   ${DS4}/vendor/exl3.cu ${DS4}/vendor/moe_win.cu ${DS4}/vendor/sampler.cu
