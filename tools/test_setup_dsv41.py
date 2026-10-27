@@ -194,6 +194,7 @@ class Install(unittest.TestCase):
             self.exe.write_text("x")
         cards = cards or FOUR
         kw.setdefault("model", "UD-Q8_K_XL")
+        kw.setdefault("vision", "no")            # the older tests are about the files of the model; pictures-on has its own tests (PicturesByDefault)
         gpu = {"index": 0, "count": len(cards), "vram_gb": 32.0, "name": "R9700", "cards": cards}
         return run(setup.install_dsv41, args(models_dir=str(self.root / "models"), **kw), "deepseek41", gpu, True, [], 13, [], 8080, ram,
                    None, cards)
@@ -220,7 +221,7 @@ class Install(unittest.TestCase):
         self.assertEqual(self.cfg["engine_ready_s"], 3600)
         self.assertEqual(self.cfg["backend"], "hip")
         self.assertTrue(self.cfg["tokenizer"].endswith("tokenizer"))
-        self.assertEqual(a[a.index("--vision") + 1], "on")      # 0.2.7: the engine reads pictures with its own tower
+        self.assertEqual(a[a.index("--vision") + 1], "off")     # (this test asks for no pictures: they are on by default, see PicturesByDefault)
         self.assertNotIn("--mtp", a)
         self.assertIn("4 cards, one block of layers on each", out)
         self.assertIn("n-gram table", out)
@@ -676,7 +677,7 @@ class InstallOfficial(Install):
         self.assertEqual(rc, 0, out)
         a = self.cfg["args"]
         self.assertEqual(a[a.index("--dspark") + 1], "auto")                    # never "off": that still loads the drafter and takes the VRAM
-        self.assertNotIn("off", a)
+        self.assertNotEqual(a[a.index("--dspark") + 1], "off")
         self.assertNotIn("--prefill-chunk", a)                                  # the engine's own default is the layer-major prompt path
         self.assertEqual(a[a.index("--dspark-conf") + 1], "0.65")                # never a floor below 0.3             # the layer-major prompt path
         self.assertNotIn("--ssd-cache", a)                                      # the store sizes itself
@@ -731,3 +732,52 @@ class InstallSmallest(InstallOfficial):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PicturesByDefault(Install):
+    """0.2.7: DeepSeek reads pictures with its own engine's tower, on by default: setup fetches the tower's weights (mmproj-BF16.gguf, a shared file),
+    packs them with the model and writes --vision on; --vision no leaves all three out."""
+
+    def test_default_fetches_the_tower_packs_it_and_says_on(self):
+        rc, out = self.install(vision=None)
+        self.assertEqual(rc, 0, out)
+        got = [c[2].name for c in self.calls if c[0] == "get"]
+        self.assertIn(setup.DSV41_MMPROJ, got)
+        self.assertEqual(got[-1], setup.DSV41_MMPROJ)
+        pack = [c for c in self.calls if c[0] == "run"][-1][1]
+        self.assertIn("--mmproj", pack)
+        self.assertTrue(str(pack[pack.index("--mmproj") + 1]).endswith(setup.DSV41_MMPROJ))
+        a = self.cfg["args"]
+        self.assertEqual(a[a.index("--vision") + 1], "on")
+        self.assertNotIn("cannot read pictures", out)
+
+    def test_vision_no_leaves_the_tower_out(self):
+        rc, out = self.install(vision="no")
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn(setup.DSV41_MMPROJ, [c[2].name for c in self.calls if c[0] == "get"])
+        pack = [c for c in self.calls if c[0] == "run"][-1][1]
+        self.assertNotIn("--mmproj", pack)
+        a = self.cfg["args"]
+        self.assertEqual(a[a.index("--vision") + 1], "off")
+
+    def test_gpu_and_cpu_are_taken_as_yes_with_a_note(self):
+        rc, out = self.install(vision="cpu")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("own tower", out)
+        a = self.cfg["args"]
+        self.assertEqual(a[a.index("--vision") + 1], "on")
+
+    def test_a_pack_without_the_tower_is_made_again_with_it(self):
+        pack = self.root / "data" / "packs" / "deepseek-v4.1-flash-ud-q8_k_xl"
+        (pack / "tokenizer").mkdir(parents=True)
+        (pack / "tokenizer" / "vocab.json").write_text("{}")
+        (pack / "tensors.txt").write_text("x")
+        (pack / "ds4.txt").write_text("hidden_size 5120\n")
+        self.assertFalse(setup.dsv41_pack_has_tower(pack))
+        rc, out = self.install(vision=None)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("made without the picture reader", out)
+        self.assertTrue([c for c in self.calls if c[0] == "run" and "--mmproj" in c[1]])
+        pack.mkdir(parents=True, exist_ok=True)
+        (pack / "ds4.txt").write_text("vision.num_hidden_layers 32\nimage_token_id 129264\n")
+        self.assertTrue(setup.dsv41_pack_has_tower(pack))
