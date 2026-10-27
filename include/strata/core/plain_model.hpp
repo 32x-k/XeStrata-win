@@ -324,6 +324,7 @@ private:
     /// qwen35's in place of open_experts: no tiers, the prompt's buffers beside the weights
     bool open_dense(std::string& err);
     bool record(int T, bool mtp, std::string& err);
+    bool run_window(int T, bool mtp, std::string& err);
     /// The window's inputs (embeddings, steps, positions) for `tokens` at pos .. pos + T - 1 into the mapped staging;
     /// `emb` false: no embeddings (a later stage's window, which reads the rows handed on).
     bool stage(const int32_t* tokens, int T, int64_t pos, std::string& err, bool emb = true);
@@ -561,6 +562,7 @@ private:
     bool has_gate_ = false;          ///< the attention's output gate: [q | gate] per head (qwen35moe)
     bool has_shared_ = false;        ///< the gated shared expert (qwen35moe)
     bool dense_ = false;             ///< a dense FFN in every block and no experts (qwen35)
+    bool eager_ = false;             ///< STRATA_PLAIN_EAGER=1, a dense model's windows run without a graph (profiling)
     int emb_type_ = -1;
     const uint8_t* emb_ = nullptr;   ///< token_embd in the GGUF mapping (rows dequantized on the host)
     const std::vector<const float*>* emb_rows_ = nullptr;   ///< set_embeddings'

@@ -480,6 +480,9 @@ bool PlainModel::load_qwen(std::string& err) {
     }
     const bool q35 = s.arch == ModelArch::Qwen35Moe || s.arch == ModelArch::Qwen35;
     dense_ = s.arch == ModelArch::Qwen35;
+    // a dense model's windows straight onto the stream, not recorded in graphs: a profiler that cannot take the graphs
+    // (rocprofv3 stops at the first, 2026-10-27) sees the decode's kernels; slower, for measuring only
+    if (const char* e = std::getenv("STRATA_PLAIN_EAGER")) eager_ = dense_ && e[0] == '1';
     has_gate_ = q35;
     has_shared_ = q35 && !dense_;
     bool shape_ok = s.key_length == s.value_length && (s.key_length == 128 || s.key_length == 256) &&
@@ -2115,6 +2118,7 @@ void PlainModel::setup_int2() {
 
 // The graph of a window of T rows, the trunk's or (`mtp`) the MTP layer's, recorded once.
 bool PlainModel::record(int T, bool mtp, std::string& err) {
+    if (eager_) return true;   // run by run_window each time
     strata::gpu::Graph*& exec = (mtp ? mexec_ : exec_)[(size_t) T];
     std::vector<strata::gpu::Graph*>& segs = (mtp ? msegs_ : segs_)[(size_t) T];
     if (exec != nullptr || !segs.empty()) return true;
@@ -2142,6 +2146,16 @@ bool PlainModel::record(int T, bool mtp, std::string& err) {
     if (win_.segmented()) segs.push_back(g);
     else exec = g;
     return true;
+}
+
+// STRATA_PLAIN_EAGER's window: what record() would have put in the graph, onto the stream as it is
+bool PlainModel::run_window(int T, bool mtp, std::string& err) {
+    try {
+        return mtp ? (glm_ ? record_mtp_glm5(T, cs_, err) : record_mtp(T, cs_, err)) : record_window(T, cs_, err);
+    } catch (const std::exception& e) {
+        err = std::string("plain model: the window: ") + e.what();
+        return false;
+    }
 }
 
 // The window's inputs in the mapped staging: the tokens' embedding rows, their step records and rotary positions.
@@ -2213,7 +2227,9 @@ bool PlainModel::stage_forward(const int32_t* tokens, int T, int64_t pos, const 
     pcie_probe_before();
     const double pool0 = disp_.ms_plan + disp_.ms_actq + disp_.ms_jobs + disp_.ms_run;
     const auto t0 = std::chrono::steady_clock::now();
-    if (!launch_serve(exec_[(size_t) T], segs_[(size_t) T], moe_trunk_, moe_local_.data(), T, err)) return false;
+    if (!(eager_ ? run_window(T, false, err)
+                 : launch_serve(exec_[(size_t) T], segs_[(size_t) T], moe_trunk_, moe_local_.data(), T, err)))
+        return false;
     if (last()) {
         k::SamplerParams sp = sampler_;
         sp.counter = (uint64_t) pos;   // row t's draw: position pos + t
@@ -2331,7 +2347,8 @@ void PlainModel::pcie_probe_after(double ms, int T) {
 bool PlainModel::mtp_run(int T, const int32_t* tokens, int64_t pos, int32_t* draft, std::string& err) {
     if (!record(T, true, err) || !stage(tokens, T, pos, err)) return false;   // the swaps: settle_window
     const int64_t ml = n_moe_ - 1;
-    if (!launch_serve(mexec_[(size_t) T], msegs_[(size_t) T], 1, &ml, T, err)) return false;
+    if (!(eager_ ? run_window(T, true, err) : launch_serve(mexec_[(size_t) T], msegs_[(size_t) T], 1, &ml, T, err)))
+        return false;
     k::SamplerParams sp;   // the drafts are greedy
     sp.greedy = true;
     sp.temperature = 0.0f;
