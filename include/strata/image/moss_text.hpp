@@ -3,9 +3,13 @@
 // include/strata/image/moss_text.hpp - MOSS-Image's text encoder: Qwen3.5-9B (its GGUF: the official one by Unsloth or
 // HauhauCS's) through the chat engine's dense model (core::PlainModel, opened as an encoder), the prompt's token ids in
 // MOSS-Image's chat form (`<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n<think>\n`, one prompt at a time, no
-// padding) to every token's state after the final norm, the DiT's context.  Its weights are all in VRAM while it is
-// open (no streamed layers): the pipeline opens it for the text and closes it before the DiT where the two do not fit.
+// padding) to every token's state after the final norm, the DiT's context.  Its blocks' matrices go through a
+// LayerStream: those that fit the budget stay in VRAM, the rest are copied from the mapped file as the prompt reaches
+// them.  When the chat's engine reads the same GGUF, the server asks it instead (its ENCODE command), and the states
+// come in a file (read_states).
 #pragma once
+
+#include "strata/image/qi_stream.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -25,8 +29,9 @@ public:
     MossText(const MossText&) = delete;
     MossText& operator=(const MossText&) = delete;
 
-    /// Opens the GGUF for prompts of up to `max_tokens` tokens (MOSS-Image's 4096 at most).
-    bool open(const std::string& gguf, int64_t max_tokens, std::string& err);
+    /// Opens the GGUF for prompts of up to `max_tokens` tokens (MOSS-Image's 4096 at most), its blocks within
+    /// `layer_budget` bytes of VRAM (all of them by default).
+    bool open(const std::string& gguf, int64_t max_tokens, std::string& err, uint64_t layer_budget = UINT64_MAX);
     bool is_open() const { return model_ != nullptr; }
     /// Frees the weights and the buffers (open again for the next text).
     void close();
@@ -34,7 +39,23 @@ public:
     std::vector<float> encode(const std::vector<int32_t>& ids, std::string& err);
     int64_t hidden() const;
 
+    /// The blocks' bytes (in the file) and the two slots a streamed walk takes at least.
+    uint64_t layer_bytes() const { return layers_ != nullptr ? layers_->total() : 0; }
+    uint64_t layer_min() const { return layers_ != nullptr ? layers_->min_budget() : 0; }
+    /// The VRAM the blocks may take (LayerStream: those that fit stay, the rest are streamed).
+    void set_layer_budget(uint64_t bytes);
+    int resident_layers() const { return layers_ != nullptr ? layers_->resident() : 0; }
+    uint64_t layers_vram() const { return layers_ != nullptr ? layers_->vram() : 0; }
+
+    /// The chat engine's ENCODE file (plain_generate.cpp): int32 'STE1', the rows n and their width, then n rows of
+    /// floats.  False with the reason when it is not one.
+    static bool read_states(const std::string& path, std::vector<float>& rows, int64_t& n, int64_t& width,
+                            std::string& err);
+
 private:
+    struct Source;
+    std::unique_ptr<LayerStream> layers_;
+    std::unique_ptr<Source> source_;
     std::unique_ptr<core::PlainModel> model_;
 };
 
