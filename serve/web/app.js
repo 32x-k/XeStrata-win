@@ -530,7 +530,8 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept) {
     body.innerHTML = `<tr><td colspan="9" class="muted">No requests yet</td></tr>`;
   } else {
     const badge = {stop: ["", "Done"], length: ["", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
-                   disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"]};
+                   disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"],
+                   timeout: ["st-badge--queued", "Timeout"]};
     body.innerHTML = requests.slice(0, reqShowAll ? requests.length : 12).map((r) => {
       const [cls, text] = badge[r.finish] || ["", r.finish || "–"];
       const t = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
@@ -870,6 +871,38 @@ function toolHtml(t, k) {
     `<span class="st-badge ${cls}">${esc(label)}</span>${t.ms != null && t.state !== "skipped" ? `<span class="muted small">${fmt(t.ms / 1000, 1)} s</span>` : ""}` +
     `${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body">${body}</div></details>`;
 }
+// Raster tool results are same-origin cached files; credentials stay in request headers.
+const mediaBlobs = new Map();
+let mediaEpoch = 0;
+function clearToolMedia() {
+  mediaEpoch++;
+  for (const pending of mediaBlobs.values()) pending.then((url) => URL.revokeObjectURL(url), () => {});
+  mediaBlobs.clear();
+}
+window.addEventListener("pagehide", clearToolMedia);
+window.addEventListener("pageshow", (event) => { if (event.persisted) hydrateToolImages(document); });
+function safeToolMedia(url) { return typeof url === "string" && /^tool-media\/[0-9a-f]{64}\.(png|jpg|webp)$/.test(url); }
+function toolImages(t) {
+  return (t.images || []).filter((im) => safeToolMedia(im.url)).map((im) =>
+    `<figure class="tool-image"><img data-tool-image="${esc(im.url)}" alt="Tool image" loading="lazy">` +
+    `<figcaption><a class="st-btn" data-tool-download="${esc(im.url)}" download="${esc(im.name || "generated-image.png")}">Download image</a></figcaption></figure>`).join("");
+}
+function hydrateToolImages(root) {
+  root.querySelectorAll("[data-tool-image]").forEach((img) => {
+    const url = img.dataset.toolImage, epoch = mediaEpoch;
+    if (!safeToolMedia(url)) return;
+    if (!mediaBlobs.has(url)) mediaBlobs.set(url, fetch(url, {headers: headers()}).then((r) => {
+      if (!r.ok) throw new Error("Image unavailable");
+      return r.blob();
+    }).then((b) => URL.createObjectURL(b)).catch((e) => {if (epoch === mediaEpoch) mediaBlobs.delete(url); throw e;}));
+    mediaBlobs.get(url).then((blob) => {
+      if (epoch !== mediaEpoch || !img.isConnected) return;
+      img.src = blob;
+      const a = img.closest("figure").querySelector("[data-tool-download]");
+      a.href = blob;
+    }).catch(() => { img.alt = "Image unavailable; try refreshing"; });
+  });
+}
 // the answer's text with the tool blocks where the model called them
 // math (opt-in, serve/web/math.js): formulas become placeholders before the Markdown runs and are drawn after it
 function answerMarkdown(text) {
@@ -882,7 +915,7 @@ function answerHtml(m) {
     const at = Math.min(Math.max(t.at || 0, pos), m.text.length);
     if (at > pos) html += answerMarkdown(m.text.slice(pos, at));
     pos = at;
-    html += toolHtml(t, k);
+    html += toolHtml(t, k) + toolImages(t);
   });
   return html + answerMarkdown(m.text.slice(pos));
 }
@@ -895,7 +928,7 @@ function onTool(m, x) {
   if (x.event === "call") {
     Object.assign(t, {name: x.name, server: x.server, tool: x.tool, arguments: x.arguments, round: x.round, state: "running"});
   } else if (x.event === "result") {
-    Object.assign(t, {result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms,
+    Object.assign(t, {result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms, images: x.images || [], vision: x.vision === true,
                       state: x.skipped ? "skipped" : x.ok ? "done" : "error"});
   }
 }
@@ -921,6 +954,7 @@ function updateAssistant(el, m, streaming) {
     bubble.innerHTML = m.reasoning ? `<span class="muted cursor">Writing</span>` : `<span class="cursor"></span>`;
   } else {
     bubble.innerHTML = answerHtml(m);
+    hydrateToolImages(bubble);
     if (settings.math) StrataMath.hydrate(bubble);
     if (streaming) bubble.classList.add("cursor"); else bubble.classList.remove("cursor");
   }
@@ -937,8 +971,36 @@ function renderChat() {
   renderUndoBar();
   scrollDown(true);
 }
-function nearBottom() { const s = $("chat-scroll"); return s.scrollHeight - s.scrollTop - s.clientHeight < 120; }
-function scrollDown(force) { const s = $("chat-scroll"); if (force || nearBottom()) s.scrollTop = s.scrollHeight; }
+// Follow the answer while the reader has not left (#4014). Asking "am I within 120 px of the bottom?" on every frame pulled
+// the view back after every wheel notch (a notch is about 100 px), so scrolling up during a long answer only worked by
+// dragging the scrollbar. Now the reader's own input lets go (wheel up, a finger or a key moving up, the scrollbar), and a
+// scroll back to the bottom follows again.
+let stickToBottom = true, lastReaderInput = 0;
+const FOLLOW_SLACK = 24, FAR_AWAY = 400, INPUT_WINDOW_MS = 400;
+function followAfterScroll(distance, wasFollowing, msSinceInput) {
+  if (distance <= FOLLOW_SLACK) return true;
+  if (msSinceInput <= INPUT_WINDOW_MS || distance > FAR_AWAY) return false;
+  return wasFollowing;
+}
+function scrollDown(force) {
+  const s = $("chat-scroll");
+  if (force) stickToBottom = true;
+  if (stickToBottom) s.scrollTop = s.scrollHeight;
+}
+(function watchReader() {
+  const s = $("chat-scroll");
+  const touch = () => { lastReaderInput = Date.now(); };
+  s.addEventListener("wheel", (e) => { touch(); if (e.deltaY < 0 && s.scrollTop > 0) stickToBottom = false; }, {passive: true});
+  s.addEventListener("touchmove", touch, {passive: true});
+  s.addEventListener("pointerdown", touch, {passive: true});
+  s.addEventListener("keydown", (e) => {
+    touch();
+    if (["PageUp", "ArrowUp", "Home"].includes(e.key) && e.target === s && s.scrollTop > 0) stickToBottom = false;
+  });
+  s.addEventListener("scroll", () => {
+    stickToBottom = followAfterScroll(s.scrollHeight - s.scrollTop - s.clientHeight, stickToBottom, Date.now() - lastReaderInput);
+  }, {passive: true});
+})();
 
 $("chat").addEventListener("click", (e) => {
   const cc = e.target.closest("[data-code-copy]");
@@ -1018,7 +1080,12 @@ function assistantMessages(m) {
     const at = Math.min(Math.max(pos, calls[0].at || 0), m.text.length);
     out.push({role: "assistant", content: m.text.slice(pos, at).trim(),
               tool_calls: calls.map((t) => ({id: t.id, type: "function", function: {name: t.name, arguments: JSON.stringify(t.arguments || {})}}))});
-    for (const t of calls) out.push({role: "tool", tool_call_id: t.id, content: t.result});
+    for (const t of calls) {
+      const pictures = t.vision ? (t.images || []).filter((im) => safeToolMedia(im.url)) : [];
+      const content = pictures.length ? [{type: "text", text: t.result}, ...pictures.map((im) =>
+        ({type: "image_url", image_url: {url: "strata-tool-media:" + im.url.split("/").pop()}}))] : t.result;
+      out.push({role: "tool", tool_call_id: t.id, content});
+    }
     pos = at;
   }
   const rest = m.text.slice(pos).trim();
@@ -1253,6 +1320,7 @@ $("new-btn").onclick = () => {
   releasePending();
   if (!messages.length) return;
   const backup = messages;
+  clearToolMedia();
   messages = [];
   saveChat();
   renderChat();

@@ -77,5 +77,9 @@
  "fx76": "Activé (recommandé)",
  "fx77": "C’est un très gros modèle. Le téléchargement fait {0} Go et il faut à peu près autant d’espace disque libre. Il tourne sur les cartes NVIDIA RTX 30, 40 et 50, sur une Radeon AI PRO R9700 (Linux) ou sur un PC Ryzen AI Max / Strix Halo (Windows) ; sa vitesse dépend de la mémoire et de la carte (la ligne ci-dessous indique à quoi s’attendre sur cet ordinateur). Ce qui ne tient pas en mémoire est lu depuis votre SSD, un disque NVMe compte donc beaucoup.",
  "fx78": "Pas encore testé. Un contexte aussi long prend de la mémoire graphique au modèle et lit lentement les longs prompts.",
- "fx79": "Désactivé (recommandé)"
+ "fx79": "Désactivé (recommandé)",
+ "fx80": "Il faut environ {0} Go d’espace disque libre. Ce qui ne tient pas en mémoire est lu depuis votre SSD.",
+ "fx81": "{0} de RAM + VRAM, plus environ {1} Go de disque",
+ "fx82": "Réponses plus rapides sur les cartes NVIDIA de 12 Go",
+ "fx83": "Privilégie les parties du modèle déjà présentes sur la carte graphique, ce qui accélère nettement les réponses sur les cartes de 12 Go. Désactivez-le si les réponses semblent moins bonnes qu’avant."
 }

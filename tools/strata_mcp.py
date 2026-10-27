@@ -705,6 +705,23 @@ class Strata:
         return once, once_d
 
     @staticmethod
+    def with_shards(files: list) -> list:
+        """The files plus the other parts of every multi-part GGUF among them (name-00001-of-00004.gguf: the config names only the
+        first), so deleting a model takes all its parts and never leaves 100 GB behind (#3716)."""
+        out, seen = [], set()
+        for f in files:
+            names = [Path(f)]
+            m = SHARD_NAME.match(str(f))
+            if m:
+                names += [Path(f"{m.group(1)}-{i:05d}-of-{m.group(3)}.gguf") for i in range(1, int(m.group(3)) + 1)]
+            for n in names:
+                key = norm(n)
+                if key not in seen:
+                    seen.add(key)
+                    out.append(n)
+        return out
+
+    @staticmethod
     def tree_bytes(path: Path) -> int:
         if path.is_file():
             try:
@@ -791,11 +808,13 @@ class Strata:
         (the shared MTP draft, a shared PLE shard) is kept; so is anything outside Strata's own folders."""
         cfg = self.read_config(config)
         files, dirs = self.model_paths(cfg)
+        files = self.with_shards(files)
         used_files, used_dirs = set(), set()
         for other in self.configs():
             if norm(other) == norm(config):
                 continue
             f, d = self.model_paths(self.read_config(other))
+            f = self.with_shards(f)
             used_files |= {norm(x) for x in f}
             used_dirs |= {norm(x) for x in d}
         remove, keep = [], []
@@ -1268,6 +1287,9 @@ class Strata:
                               # RAM + VRAM the weights need together, WITHOUT the n-gram table (that stays on the SSD): Gyro states it
                               # (mem_total), for the rest the experts plus ~1 GB for the dense part (Swift IQ2_XS: 35.5 + 1 = 36.5)
                               "mem_total": bool(d.get("mem_total")), "multi_file": bool(own and own.get("multi_file")),
+                              # DeepSeek only: the free disk the set needs, from the set itself (the download: model files, n-gram table, drafter and
+                              # metadata, plus the pack folder and room to work, strata_control/dsv41_fit.DISK_HEADROOM_GB): 2.00 and 2.25 differ
+                              "disk_gb": self.dsv41_disk_gb(d) if own and own.get("multi_file") else None,
                               # the first engine that reads this size's files (setup.py "engine"); the app says "needs a newer engine"
                               # with the update step when the installed one is older. None: any engine that setup accepts.
                               "engine_min": ".".join(map(str, d["engine"])) if d.get("engine") else None,
@@ -1282,6 +1304,12 @@ class Strata:
                         "images": any(x["images"] for x in sizes) if sizes else fd.get("vision", True) is not False,
                         "sizes": sizes})
         return out
+
+    @staticmethod
+    def dsv41_disk_gb(d: dict) -> float:
+        """The free disk a DeepSeek set needs: its whole download plus the pack and room to work (the card text says "about")."""
+        from strata_control import dsv41_fit
+        return round(float(d["download_gb"]) + dsv41_fit.DISK_HEADROOM_GB, 1)
 
     def dsv41_plan(self, hw, disk_free=None, only=None, model=None) -> dict:
         """strata_control/dsv41_fit.plan for this computer; `only`: the card numbers a launch names (else every card that counts)."""

@@ -47,6 +47,13 @@ A variable or flag you set yourself (`DS4_ATTN_SLAB=N`, `STRATA_ROUTE_PRIOR=2`, 
 `--ple-io`) still wins over the switch. The older single switches (`DS4_FAST_ATTN=0`, `DS4_ATTN_SLAB=0`, `DS4_COPY_PIN=0`,
 `DS4_COPY_HUGETLB=0`, `DS4_STORE_SPARE=0`, `DS4_STORE_PUT=0`, `STRATA_ROUTE_PRIOR=0`, ...) work as before.
 
+- **Strix Halo (`gfx1151`) on Windows: the shared expert no longer runs on its own stream.** `STRATA_SH_STREAM` was on by default on
+  `gfx1151`; on a Windows PC it is slower. Qwen3.8-Flash-Next IQ3_S, three interleaved pairs: chat decode **43.6 -> 46.6 tokens/s (+6.9%)**
+  with it off, prompts unchanged. The answers are the same: five fixed greedy prompts (up to 16,383 tokens) gave identical token ids with
+  the switch on and off, in four runs. Linux `gfx1151` keeps it on, other cards are untouched. Turn it back on with
+  `STRATA_SH_STREAM=1`; `STRATA_DEFAULTS=026` restores the 0.2.6 behaviour. Details and the other numbers of that PC:
+  [docs/STRIX_HALO_WINDOWS.md](STRIX_HALO_WINDOWS.md).
+
 ## What is faster if your PC is set up for it
 
 These need no engine change; they are settings. Each was measured on the same boxes.
@@ -73,10 +80,14 @@ These need no engine change; they are settings. Each was measured on the same bo
 
 ## The 12 GB default: residency-biased routing
 
-**On by default at 2.0 on a discrete NVIDIA card with 13 GiB of memory or less** (`STRATA_ROUTE_PRIOR=0` turns it off;
+**On by default at 1.5 on a discrete NVIDIA card with 13 GiB of memory or less** (`STRATA_ROUTE_PRIOR=0` turns it off, an explicit value wins;
 not a default on a Radeon, a Strix Halo or any integrated GPU, where it was not measured). The router prefers
-experts that are already resident, so a window stops waiting on a page-in that the next window would need again. Measured
-on the RTX 3060 12 GB (IQ3_XXS), five interleaved pairs of fresh engines:
+experts that are already resident, so a window stops waiting on a page-in that the next window would need again. The first
+0.2.7 candidates used a bonus of 2.0, and the table below was measured at 2.0 on the RTX 3060 12 GB (IQ3_XXS), five interleaved
+pairs of fresh engines. The default was lowered to 1.5 by the owner on 26 October after the copy and code check on that card
+(IQ3_XXS) found real defects in the answers at 2.0 and **no defect in 19 tasks at 1.5** (or at 1.0). 1.5 keeps most of the speed:
+story **+15%** and code **+37%** against the routing off. That is 19 tasks, not a proof; a longer 61-task check of 0, 1.5 and 2.0
+is still running, and if it shows defects at 1.5 the default falls back to 1.0. The 2.0 measurements:
 
 | axis | before | after |
 |---|---|---|
@@ -93,8 +104,8 @@ document prompt), and the whole recipe - routing, a workload-fitted expert profi
 896` and the English draft vocabulary - gives **+26.5%** there and **+80%** on code in a sustained 80-request session.
 
 It works by choosing a slightly different set of experts, so replies change: the owner approved that trade for 12 GB cards.
-**Do not raise the bonus beyond 2.0.** 3.0 measures +17.7% / +24.0% on the test prompts but **-4.5% on held-out content**,
-and 4.0 breaks outright - 2.0 is the setting that generalises.
+**Do not raise the bonus to 2.0 or more.** 2.0 showed defects in the copy and code check; 3.0 measures +17.7% / +24.0% on the test
+prompts but **-4.5% on held-out content**, and 4.0 breaks outright. `STRATA_ROUTE_PRIOR=2` still works if you want the old value.
 
 ## What was tried and did not make it
 

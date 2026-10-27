@@ -15,6 +15,14 @@ std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gc
 }
 
 std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gcn_arch, bool defaults026) {
+#if defined(_WIN32)
+    return arch_default_env(gcn_arch, defaults026, true);
+#else
+    return arch_default_env(gcn_arch, defaults026, false);
+#endif
+}
+
+std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gcn_arch, bool defaults026, bool windows) {
     std::vector<std::pair<std::string, std::string>> t;
     if (strata::kernels::gfx_arch_is_gfx12(gcn_arch)) {
         // gfx1200 / gfx1201 (RDNA4): the PROMPT half of the gfx1151 table (reported exact on an R9700 in #1478, re-checked
@@ -71,6 +79,15 @@ std::vector<std::pair<std::string, std::string>> arch_default_env(const char* gc
         {"STRATA_PLE_BATCH", "1"},       // the verify window's PLE key / value projections at once (S25)
         {"STRATA_SH_STREAM", "1"},       // the shared expert on its own stream: decode +1.8% / +6.7% (UD-Q4_K_XL) (140-m)
     };
+    // 0.2.7: Windows gfx1151 leaves the shared-expert fork off (the HIP default).  Interleaved A/B on a Strix Halo Windows PC (Qwen
+    // IQ3_S, engine 0.1.51, 9 chat answers each, 4K prompt): decode 43.9 / 43.6 / 43.2 tok/s with it, 48.3 / 46.0 / 46.6 without
+    // (+6.9% median), prompts unchanged, the token ids identical either way (docs/STRIX_HALO_WINDOWS.md).  Linux gfx1151 keeps the
+    // fork on until it is measured there.  STRATA_SH_STREAM=1 turns it back on; STRATA_DEFAULTS=026 keeps v0.2.6's table.
+    if (windows && !defaults026) {
+        for (auto it = t.begin(); it != t.end(); ++it) {
+            if (it->first == "STRATA_SH_STREAM") { t.erase(it); break; }
+        }
+    }
     return t;
 }
 
