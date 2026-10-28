@@ -30,6 +30,7 @@ import json
 import time
 import uuid
 from typing import Any
+from urllib.parse import unquote
 
 from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs, file_item
 from serve.structured import jsonschema_modules
@@ -347,20 +348,99 @@ def _order_tool_results(messages):
 
 
 def strict_compatible(schema) -> bool:
-    """A function's parameters strict mode takes as they are, by OpenAI's two rules: every object has
-    additionalProperties false, and every one of its properties is required."""
-    def ok(node) -> bool:
-        if isinstance(node, list):
-            return all(ok(x) for x in node)
-        if not isinstance(node, dict):
+    """A syntactic check of strict mode's two object rules, without rewriting parameters: every declared object
+    has additionalProperties false, and all its properties are required. This is not a schema validator or a check of
+    OpenAI's whole schema subset. Same-resource JSON-pointer references are checked as schemas too; unresolved or
+    cyclic references fall back to non-strict (explicit strict still uses the normal validator). Boolean children
+    keep the existing behaviour: no object declaration. Only schema positions are visited: a schema map's keys are
+    names, and default/enum/examples etc. are JSON data.
+    """
+    maps = ("properties", "patternProperties", "$defs", "definitions", "dependentSchemas")
+    singles = ("additionalProperties", "unevaluatedProperties", "propertyNames", "additionalItems", "contains",
+               "unevaluatedItems", "not", "if", "then", "else", "contentSchema")
+    arrays = ("allOf", "anyOf", "oneOf", "prefixItems")
+
+    memo: dict[int, bool] = {}
+    active: set[int] = set()
+
+    def ok(node, depth=0) -> bool:
+        if depth > 64:
+            return False
+        if isinstance(node, bool):
             return True
+        if not isinstance(node, dict) or id(node) in active:
+            return False
+        key = id(node)
+        if key not in memo:
+            active.add(key)
+            try:
+                memo[key] = check(node, depth)
+            finally:
+                active.remove(key)
+        return memo[key]                     # shared reference targets are checked once, not expanded per path
+
+    def check(node, depth) -> bool:
+        if "$dynamicRef" in node or "$recursiveRef" in node or "$id" in node and node is not schema:
+            return False                            # no dynamic-scope or nested base-URI inference here
+
+        def visit(child):
+            return ok(child, depth + 1)
+
+        if "$ref" in node:
+            ref = node["$ref"]
+            if not isinstance(ref, str) or not (ref == "#" or ref.startswith("#/")):
+                return False
+            target = schema
+            for part in unquote(ref[2:]).split("/") if ref != "#" else ():
+                part = part.replace("~1", "/").replace("~0", "~")
+                if isinstance(target, dict) and (target is schema or not isinstance(target.get("$id"), str)) \
+                        and part in target:
+                    target = target[part]
+                elif isinstance(target, list) and len(part) <= len(str(len(target))) and part.isdecimal() and \
+                        str(int(part)) == part and int(part) < len(target):
+                    target = target[int(part)]
+                else:
+                    return False
+            if not ok(target, depth + 1):
+                return False
         props = node.get("properties")
-        if node.get("type") == "object" or isinstance(props, dict):
+        kind = node.get("type")
+        if kind == "object" or isinstance(kind, list) and "object" in kind or "properties" in node:
             if node.get("additionalProperties") is not False:
                 return False
-            if isinstance(props, dict) and not set(props) <= set(node.get("required") or []):
+            required = node.get("required", [])
+            if not isinstance(required, list) or not all(isinstance(x, str) for x in required):
                 return False
-        return all(ok(v) for v in node.values() if isinstance(v, (dict, list)))
+            if props is not None and (not isinstance(props, dict) or not set(props) <= set(required)):
+                return False
+        for key in maps:
+            if key in node:
+                value = node[key]
+                if not isinstance(value, dict) or not all(visit(child) for child in value.values()):
+                    return False
+        for key in singles:
+            if key in node and not visit(node[key]):
+                return False
+        for key in arrays:
+            if key in node:
+                value = node[key]
+                if not isinstance(value, list) or not all(visit(child) for child in value):
+                    return False
+        if "items" in node:                         # schema today; schema array in older drafts
+            items = node["items"]
+            if not (all(visit(child) for child in items) if isinstance(items, list) else visit(items)):
+                return False
+        if "dependencies" in node:                  # older drafts mix property-name arrays and schemas
+            deps = node["dependencies"]
+            if not isinstance(deps, dict):
+                return False
+            for value in deps.values():
+                if isinstance(value, list):
+                    if not all(isinstance(x, str) for x in value):
+                        return False
+                elif not visit(value):
+                    return False
+        return True
     return isinstance(schema, dict) and ok(schema)
 
 
