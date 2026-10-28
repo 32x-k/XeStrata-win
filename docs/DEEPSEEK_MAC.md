@@ -38,13 +38,13 @@ Speeds are from the packaged engine with the shipped defaults, one fresh process
 
 | | 2.00 bpw | 2.25 bpw |
 |---|---|---|
-| Short answer, code prompt | 16.6 to 17.9 tokens/s | 13.4 to 15.0 |
-| Short answer, agent prompt | 15.1 to 16.6 | 13.1 to 14.9 |
+| Short answer, code prompt | 15.2 to 17.9 tokens/s | 12.7 to 15.7 |
+| Short answer, agent prompt | 14.9 to 16.6 | 12.5 to 14.9 |
 | After a 3,000-token prompt | 13.1 to 14.8 | 11.2 to 12.5 |
-| After a 14,000-token prompt | 14.9 to 15.4 | 10.3 to 12.1 |
-| 3,000-token prompt | 270 to 275 tokens/s | 275 to 308 |
-| 14,000-token prompt | 536 to 549 | 569 to 632 |
-| 32,000-token prompt | about 600 to 630 | about 720 |
+| After a 14,000-token prompt | 14.3 to 15.4 | 10.3 to 12.1 |
+| 3,000-token prompt | 270 to 275 tokens/s | 267 to 309 |
+| 14,000-token prompt | 536 to 549 | 564 to 637 |
+| 32,000-token prompt | 600 to 630 | 720 to 742 |
 | Read from the SSD per word | 48 MB | 111 MB |
 | Quality against the original model (KL, 4,995 positions) | 0.170 | 0.111 |
 
