@@ -5731,6 +5731,30 @@ def anthropic_structured(events, validator):
 
 
 # ------------------------------------------------------------------------------------------------ HTTP
+# Anthropic's error types by HTTP status (its "errors" page); a 5xx without its own is an api_error
+ANTHROPIC_ERROR_TYPES = {400: "invalid_request_error", 401: "authentication_error", 403: "permission_error",
+                         404: "not_found_error", 413: "request_too_large", 429: "rate_limit_error",
+                         529: "overloaded_error"}
+
+
+def api_error_body(path: str, status: int, obj):
+    """An error body in the shape of the API its path belongs to: Anthropic's routes (/v1/messages...) answer
+    {"type": "error", "error": {"type", "message"}}, the other /v1/ routes OpenAI's {"error": {"message", "type",
+    "param", "code"}} (param and code null when the error has none).  Anything else is left as it is."""
+    err = obj.get("error") if isinstance(obj, dict) else None
+    if status < 400 or not isinstance(err, dict) or not path.startswith("/v1/"):
+        return obj
+    message = str(err.get("message") or "")
+    if path.startswith("/v1/messages"):
+        if obj.get("type") == "error":
+            return obj
+        kind = ANTHROPIC_ERROR_TYPES.get(status, "api_error" if status >= 500 else "invalid_request_error")
+        return {"type": "error", "error": {"type": kind, "message": message}}
+    kind = err.get("type") or ("server_error" if status >= 500 else "invalid_request_error")
+    return {**obj, "error": {**err, "message": message, "type": kind, "param": err.get("param"),
+                             "code": err.get("code")}}
+
+
 CHUNKED_BODY_MAX = 256 << 20                # #893: the most a Transfer-Encoding: chunked body may hold (in memory)
 
 
@@ -6008,6 +6032,7 @@ def make_handler(svc: Service):
             self.end_headers()
 
         def _json(self, code, obj, headers=None):
+            obj = api_error_body(self.path.split("?")[0].rstrip("/"), code, obj)
             if self.record is not None:
                 with svc.status_lock:
                     self.record["http_status"] = code
@@ -6259,7 +6284,7 @@ def make_handler(svc: Service):
                 if self._authorized():
                     self._json(200, svc.v1_status())
             else:
-                self._json(404, {"error": {"message": "not found"}})
+                self._json(404, {"error": {"message": f"Invalid URL (GET {path})", "type": "invalid_request_error"}})
 
         def do_POST(self):
             try:
@@ -6391,7 +6416,8 @@ def make_handler(svc: Service):
                 elif path == "/v1/images/generations":
                     self._images(req)
                 else:
-                    self._json(404, {"error": {"message": "not found"}})
+                    self._json(404, {"error": {"message": f"Invalid URL (POST {path})",
+                                               "type": "invalid_request_error"}})
             except EngineNonFinite as e:                    # #879, twice: not the request's fault
                 print(f"[strata] 503: {e}", flush=True)
                 self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"
@@ -6402,14 +6428,20 @@ def make_handler(svc: Service):
                     self._json(400, responses_error_body(str(e)))
                 else:
                     self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
-            except ModelBusy as e:
-                self._json(409, {"error": {"type": "model_busy", "message": str(e)}})
+            except ModelBusy as e:                           # the control routes (/v1/load, /v1/vram, ...): 409
+                generation = path in ("/v1/chat/completions", "/v1/messages", "/v1/images/generations")
+                self._json(529 if path == "/v1/messages" else 429 if generation else 409,
+                           {"error": {"type": "rate_limit_exceeded" if generation else "model_busy",
+                                      "code": "rate_limit_exceeded" if generation else "model_busy",
+                                      "message": str(e)}}, headers={"Retry-After": 1} if generation else None)
             except StructuredOutputError as e:
                 self._json(502, {"error": {"type": "structured_output_failed", "code": "structured_output_failed",
                                            "message": str(e)}})
             except (GpuBusy, EngineStarting) as e:
                 ra = getattr(e, "retry_after", None)       # #1997 / #1994: a refusal that is worth retrying
-                self._json(503, {"error": {"type": "server_error", "message": str(e)}},
+                # Anthropic's clients (Claude Code) retry its 529 overloaded_error
+                self._json(529 if path.startswith("/v1/messages") else 503,
+                           {"error": {"type": "server_error", "message": str(e)}},
                            headers={"Retry-After": int(ra)} if ra else None)
             except (TypeError, KeyError, AttributeError, IndexError, UnicodeError) as e:
                 # a body that is JSON but the wrong shape ("messages": 5, a content part that is a number): a 400 that
@@ -6857,7 +6889,8 @@ def make_handler(svc: Service):
             except ResponsesError as e:
                 return self._json(e.status, e.body())
             except ModelBusy as e:
-                return self._json(409, responses_error_body(str(e), "server_error", code="model_busy"))
+                return self._json(429, responses_error_body(str(e), "rate_limit_exceeded", code="rate_limit_exceeded"),
+                                  headers={"Retry-After": 1})
             except (GpuBusy, EngineStarting, EngineStuck, EngineDied) as e:
                 return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
 

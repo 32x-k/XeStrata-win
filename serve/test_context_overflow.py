@@ -85,8 +85,10 @@ class ContextOverflow(unittest.TestCase):
                         if path == "/v1/responses":
                             self.assertEqual(error["code"], "context_length_exceeded")
                             self.assertEqual(error["param"], "input")
-                        else:
+                        elif path == "/v1/messages":
                             self.assertEqual(set(error), {"type", "message"})
+                        else:                    # OpenAI's error: param and code are null when there is none
+                            self.assertEqual(error, {**error, "param": None, "code": None})
 
     def test_default_service_shortens_an_overshooting_budget_in_every_dialect(self):
         # the Service default (fit_max_tokens on): a prompt that fits is answered, streaming or not; the prompt that

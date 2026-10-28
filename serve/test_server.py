@@ -367,7 +367,8 @@ class VisionTempFiles(unittest.TestCase):
             try:
                 paths = ("/v1/chat/completions", "/v1/messages")
                 for path in paths:
-                    self.assertEqual(post(path), 503)                # the engine is starting (#344); clients retry
+                    # the engine is starting (#344); clients retry (Anthropic's: its 529 overloaded_error)
+                    self.assertEqual(post(path), 529 if path == "/v1/messages" else 503)
                 engine.max_context = 48
                 for path in paths:
                     self.assertEqual(post(path), 400)                # no room to answer
@@ -4413,7 +4414,7 @@ class RestartWindow(unittest.TestCase):
                 with self.assertRaises(urllib.error.HTTPError) as cm:
                     urllib.request.urlopen(req, timeout=30)
                 with cm.exception as e:
-                    self.assertEqual(e.code, 503, path)
+                    self.assertEqual(e.code, 529 if path == "/v1/messages" else 503, path)
                     text = e.read().decode()
                 self.assertIn("starting", text)
                 self.assertNotIn("leaves no room", text)
