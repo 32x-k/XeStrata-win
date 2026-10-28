@@ -135,7 +135,7 @@ OrcaRouter の Flash-Next Uncensored IQ3_XXS は setup のメニューにはな�
 
 ### 画像の生成（任意）
 
-`xestrata --setup --images qwen-image-turbo` で、文章のモデルとは別に画像を作るモデル（Qwen-Image-2.1、Mage-Flow、MageTrail、Tencent の HunyuanImage 3.0）を入れられます。
+`xestrata --setup --images qwen-image-turbo` で、文章のモデルとは別に画像を作るモデル（Qwen-Image-2.1、Mage-Flow、MageTrail、Tencent の HunyuanImage 3.0、OpenMOSS の MOSS-Image）を入れられます。
 画像のモデルには、文章のモデルとは別に 16〜20 GB の RAM が要ります（HunyuanImage 3.0 は約 50 GB）。
 選び方、使い方、API は [docs/IMAGE.ja.md](docs/IMAGE.ja.md) にあります。
 
@@ -365,7 +365,7 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
    - Ornith AI の [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)（GSQ-RCO は pfeifferj）、LLM-jp の [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)、
      Qwen の [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)、Z.ai の [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)（どちらも GGUF は Unsloth）。
    - Qwen の [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)（GGUF は Unsloth）と、HauhauCS による拒否を外した版の [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive)。
-   - 画像の生成: Qwen の Qwen-Image-2.1、Microsoft の Mage-Flow、RicemanT の MageTrail と Black Forest Labs の Flux2 VAE、Tencent の HunyuanImage 3.0、文の読み手の Qwen3-VL（[IMAGE](docs/IMAGE.ja.md#ライセンス)）。
+   - 画像の生成: Qwen の Qwen-Image-2.1、Microsoft の Mage-Flow、RicemanT の MageTrail と Black Forest Labs の Flux2 VAE、Tencent の HunyuanImage 3.0、OpenMOSS の MOSS-Image、文の読み手の Qwen3-VL と Qwen3.5-9B（[IMAGE](docs/IMAGE.ja.md#ライセンス)）。
 
   モデルのファイルには、それぞれのライセンスが適用されます。
 - **使っている部品**:
