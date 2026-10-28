@@ -160,6 +160,49 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
           </div>
           <div class="img-mask-stage"><img id="img-mask-img" src="data:," alt="The image to edit"><canvas id="img-mask-paint" aria-label="Paint the mask" data-i18n-label="img.paint"></canvas></div>
         </div>
+        <div class="img-moss" id="img-moss" hidden>
+          <div class="img-row">
+            <label class="st-field" id="img-enhance-f"><span data-i18n="img.enhance">Write the prompt out</span>
+              <select class="st-input" id="img-enhance" title="The chat's model writes the short prompt out before the image is made" data-i18n-title="img.enhanceTitle">
+                <option value="" data-i18n="img.enhanceOff">Off</option>
+                <option value="caption" data-i18n="img.enhanceCaption">As a detailed description</option>
+                <option value="layout" data-i18n="img.enhanceLayout">As a layout of boxes</option></select></label>
+            <label class="st-field img-check" id="img-layout-on-f">
+              <input type="checkbox" id="img-layout-on"> <span data-i18n="img.layoutOn">Place things with boxes</span></label>
+          </div>
+          <details class="st-collapse img-moss-more"><summary><span data-i18n="img.more">More settings</span></summary>
+            <div class="st-collapse__body img-row">
+              <label class="st-field"><span data-i18n="img.shift">Shift</span>
+                <input class="st-input" id="img-shift" type="number" min="0.01" max="20" step="0.5"></label>
+              <label class="st-field" title="The blocks the negative prompt's pass skips: block numbers, or none" data-i18n-title="img.uncondSkipTitle"><span data-i18n="img.uncondSkip">Blocks the negative pass skips</span>
+                <input class="st-input" id="img-uskip" type="text"></label>
+              <label class="st-field" title="Skip-layer guidance: a third pass with these blocks skipped" data-i18n-title="img.slgTitle"><span data-i18n="img.slgLayers">Skip-layer guidance blocks</span>
+                <input class="st-input" id="img-slg" type="text" placeholder="none" data-i18n-placeholder="img.noBlocks"></label>
+              <label class="st-field"><span data-i18n="img.slgScale">Skip-layer guidance scale</span>
+                <input class="st-input" id="img-slg-scale" type="number" min="0" max="30" step="0.5"></label>
+              <label class="st-field" title="The share of the steps the skips start and stop at, 0 to 1" data-i18n-title="img.slgWindowTitle"><span data-i18n="img.slgWindow">Skips from &ndash; to</span>
+                <span class="img-wh"><input class="st-input" id="img-slg-start" type="number" min="0" max="1" step="0.05" aria-label="Skips start" data-i18n-label="img.slgStart">
+                <input class="st-input" id="img-slg-stop" type="number" min="0" max="1" step="0.05" aria-label="Skips stop" data-i18n-label="img.slgStop"></span></label>
+            </div>
+          </details>
+          <div class="img-layout" id="img-layout" hidden>
+            <span class="img-mask-title" data-i18n="img.layoutHint">Drag on the canvas to draw a box; drag a box to move it, its corner to change its size. Select a box to say what goes in it.</span>
+            <div class="img-layout-stage" id="img-layout-stage" role="application" aria-label="The image's layout: draw boxes" data-i18n-label="img.layoutStage"></div>
+            <div class="img-row" id="img-layout-item" hidden>
+              <label class="st-field"><span data-i18n="img.boxKind">Kind</span>
+                <select class="st-input" id="img-box-label">
+                  <option value="object" data-i18n="img.boxObject">Object</option>
+                  <option value="character" data-i18n="img.boxCharacter">Character</option>
+                  <option value="text" data-i18n="img.boxText">Text</option></select></label>
+              <label class="st-field img-box-wide"><span data-i18n="img.boxCaption">What it looks like</span>
+                <input class="st-input" id="img-box-caption" type="text"></label>
+              <label class="st-field img-box-wide" id="img-box-text-f"><span data-i18n="img.boxWords">The exact words</span>
+                <input class="st-input" id="img-box-text" type="text"></label>
+              <button type="button" class="st-btn" id="img-box-delete" data-i18n="img.boxDelete">Delete the box</button>
+            </div>
+            <div class="img-mask-tools"><button type="button" class="st-btn" id="img-layout-clear" data-i18n="img.layoutClear">Delete every box</button></div>
+          </div>
+        </div>
         <span class="composer-hint" id="img-hint" data-i18n="img.hint">One image at a time; a chat request waits for it (and the other way round).</span>
         <span class="composer-hint" id="img-note" hidden></span>
       </form>

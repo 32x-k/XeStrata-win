@@ -1062,12 +1062,15 @@ function toolHtml(t, k) {
     `${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body">${body}</div></details>` +
     // the images an image tool made, under its block (the server keeps them: /v1/images/files/). Their addresses are
     // strings; an MCP server's picture ({url: "tool-media/..."}, mcp.image_results) is drawn by toolImages below
-    imageToolHtml(t);
+    imageToolHtml(t, k);
 }
-function imageToolHtml(t) {
+// a generate_image call with a layout (MOSS-Image's boxes) also gets a button that opens it in the Images tab
+function imageToolHtml(t, k) {
   const urls = (t.images || []).filter((u) => typeof u === "string");
-  return urls.length ? `<div class="msg-images tool-images">${urls.map((u) =>
-    `<a href="${esc(u.replace(/^\//, ""))}" target="_blank" rel="noopener"><img src="${esc(u.replace(/^\//, ""))}" alt="${esc(t.tool || "image")}"></a>`).join("")}</div>` : "";
+  const a = t.arguments, layout = t.tool === "generate_image" && a && (typeof a === "string" ? a.includes('"layout"') : a.layout);
+  const open = layout && t.state === "done" ? `<button type="button" class="st-btn" data-tool-layout="${k}">${esc(tr("img.layoutToImages", "Open the layout in Images"))}</button>` : "";
+  return urls.length || open ? `<div class="msg-images tool-images">${urls.map((u) =>
+    `<a href="${esc(u.replace(/^\//, ""))}" target="_blank" rel="noopener"><img src="${esc(u.replace(/^\//, ""))}" alt="${esc(t.tool || "image")}"></a>`).join("")}${open}</div>` : "";
 }
 // Raster tool results are same-origin cached files; credentials stay in request headers.
 const mediaBlobs = new Map();
@@ -1226,6 +1229,12 @@ $("chat").addEventListener("click", (e) => {
   }
   const mc = e.target.closest("[data-msg-copy]");
   if (mc) { const i = +mc.closest(".st-msg").dataset.i; copyText(messages[i].text, mc); return; }
+  const tl = e.target.closest("[data-tool-layout]");
+  if (tl) {
+    const m = messages[+tl.closest(".st-msg").dataset.i], t = m && m.tools && m.tools[+tl.dataset.toolLayout];
+    if (t) imgLayoutFromTool(t);
+    return;
+  }
   // a tool block: its open state lives in the message (the answer is rebuilt while it streams), so the click sets it
   const sum = e.target.closest(".tool-call > summary");
   if (sum) {
@@ -1898,6 +1907,7 @@ function imgDefaults() {
   imgCount();
   imgFormat();
   imgNegHint();
+  imgMossSetup();
 }
 // the count: up to max_n, and as many as take budget_s at the speed the server measured (its rates; before it has
 // made an image, 4), with the time the images chosen take (the server refuses more, ImageGen.check_n)
@@ -1976,10 +1986,10 @@ function imgMaskSetup() {
   if (imgMaskURL) URL.revokeObjectURL(imgMaskURL);
   imgMaskURL = null;
   $("img-mask").hidden = !(f && d.mask);
-  if ($("img-mask").hidden) return;
+  if ($("img-mask").hidden) { imgLayoutDraw(); return; }
   imgMaskURL = URL.createObjectURL(f);
   const img = $("img-mask-img"), c = $("img-mask-paint");
-  img.onload = () => { c.width = img.naturalWidth; c.height = img.naturalHeight; };
+  img.onload = () => { c.width = img.naturalWidth; c.height = img.naturalHeight; imgLayoutDraw(); };
   img.src = imgMaskURL;
 }
 (() => {
@@ -2021,6 +2031,225 @@ function imgMask() {
   g.globalCompositeOperation = "destination-out";
   g.drawImage(c, 0, 0);
   return m.toDataURL("image/png");
+}
+// MOSS-Image's own fields, shown where /health's defaults have a layout: the prompt written out by the chat's model
+// (enhance), the schedule's shift, the blocks guidance's negative pass skips, skip-layer guidance, and a layout of
+// boxes drawn over the image.  A box is kept in shares of the image's sides, so a change of size keeps it in place;
+// it goes as the API's layout, [x_min, y_min, x_max, y_max] in the image's pixels from its top-left corner.
+const imgLayout = {boxes: [], sel: -1};
+const clamp01 = (v) => Math.min(1, Math.max(0, v));
+// the size the boxes are counted in: the size chosen; "auto" is 1024 x 1024, or the starting image's shape at about
+// as many pixels (sent as that size, so that the boxes and the image agree)
+function imgLayoutWH() {
+  const v = $("img-size").value;
+  if (v === "custom") return [+$("img-w").value || 1024, +$("img-h").value || 1024];
+  if (v !== "auto") return v.split("x").map(Number);
+  const im = $("img-mask-img");
+  if (!imgMaskURL || !im.naturalWidth) return [1024, 1024];
+  const s = Math.sqrt(1024 * 1024 / (im.naturalWidth * im.naturalHeight));
+  return [Math.max(256, Math.round(im.naturalWidth * s / 16) * 16), Math.max(256, Math.round(im.naturalHeight * s / 16) * 16)];
+}
+function imgMossSetup() {
+  const d = imgModel().defaults || {};
+  $("img-moss").hidden = !d.layout;
+  if (!d.layout) return;
+  const boxes = $("img-layout-on").checked;
+  $("img-enhance-f").hidden = !d.enhance || boxes;   // the layout is the prompt already: nothing to write out
+  $("img-shift").placeholder = String(d.shift);
+  $("img-uskip").placeholder = (d.uncond_skip_layers || []).join(", ") || tr("img.noBlocks", "none");
+  $("img-slg-scale").placeholder = String(d.slg_scale || 0);
+  $("img-slg-start").placeholder = String(d.slg_start || 0);
+  $("img-slg-stop").placeholder = String(d.slg_stop == null ? 1 : d.slg_stop);
+  $("img-layout").hidden = !boxes;
+  imgLayoutDraw();
+  imgLayoutFields();
+}
+function imgBoxName(label) {
+  return label === "text" ? tr("img.boxText", "Text") : label === "character" ? tr("img.boxCharacter", "Character") : tr("img.boxObject", "Object");
+}
+function imgLayoutDraw() {
+  if ($("img-layout").hidden) return;
+  const st = $("img-layout-stage"), [w, h] = imgLayoutWH();
+  st.style.aspectRatio = `${w} / ${h}`;
+  st.style.backgroundImage = imgMaskURL ? `url("${imgMaskURL}")` : "none";
+  st.replaceChildren(...imgLayout.boxes.map((b, i) => {
+    const e = document.createElement("div"), hd = document.createElement("span");
+    e.className = "img-box";
+    e.dataset.i = String(i);
+    e.dataset.label = b.label;
+    e.setAttribute("aria-selected", String(i === imgLayout.sel));
+    Object.assign(e.style, {left: `${b.x0 * 100}%`, top: `${b.y0 * 100}%`, width: `${(b.x1 - b.x0) * 100}%`, height: `${(b.y1 - b.y0) * 100}%`,
+                            zIndex: String(1 + Math.round((1 - (b.x1 - b.x0) * (b.y1 - b.y0)) * 1000))});   // a smaller box over a larger one
+    e.textContent = b.label === "text" && b.text ? `"${b.text}"` : b.caption || imgBoxName(b.label);
+    hd.className = "img-box__handle";
+    e.append(hd);
+    return e;
+  }));
+}
+// the selected box's fields (set when the selection changes, not while they are typed in)
+function imgLayoutFields() {
+  const b = imgLayout.boxes[imgLayout.sel];
+  $("img-layout-item").hidden = !b;
+  if (!b) return;
+  $("img-box-label").value = b.label;
+  $("img-box-caption").value = b.caption;
+  $("img-box-text").value = b.text;
+  $("img-box-text-f").hidden = b.label !== "text";
+}
+(() => {
+  const st = $("img-layout-stage"), least = 0.02;
+  let drag = null;   // {i, mode: "new" | "move" | "size", p: where it began, b: the box as it was}
+  st.tabIndex = 0;
+  const at = (ev) => {
+    const r = st.getBoundingClientRect();
+    return [clamp01((ev.clientX - r.left) / r.width), clamp01((ev.clientY - r.top) / r.height)];
+  };
+  st.onpointerdown = (ev) => {
+    const p = at(ev), el = ev.target.closest(".img-box");
+    st.setPointerCapture(ev.pointerId);
+    if (el) {
+      const i = +el.dataset.i;
+      drag = {i, mode: ev.target.classList.contains("img-box__handle") ? "size" : "move", p, b: {...imgLayout.boxes[i]}};
+    } else {
+      imgLayout.boxes.push({x0: p[0], y0: p[1], x1: p[0], y1: p[1], label: "object", caption: "", text: ""});
+      drag = {i: imgLayout.boxes.length - 1, mode: "new", p, b: null};
+    }
+    imgLayout.sel = drag.i;
+    imgLayoutDraw();
+    imgLayoutFields();
+  };
+  st.onpointermove = (ev) => {
+    if (!drag) return;
+    const p = at(ev), b = imgLayout.boxes[drag.i];
+    if (drag.mode === "new") {
+      [b.x0, b.x1] = [Math.min(drag.p[0], p[0]), Math.max(drag.p[0], p[0])];
+      [b.y0, b.y1] = [Math.min(drag.p[1], p[1]), Math.max(drag.p[1], p[1])];
+    } else if (drag.mode === "move") {   // kept inside the image
+      const o = drag.b, dx = Math.min(1 - o.x1, Math.max(-o.x0, p[0] - drag.p[0])), dy = Math.min(1 - o.y1, Math.max(-o.y0, p[1] - drag.p[1]));
+      Object.assign(b, {x0: o.x0 + dx, x1: o.x1 + dx, y0: o.y0 + dy, y1: o.y1 + dy});
+    } else {
+      b.x1 = Math.max(b.x0 + least, p[0]);
+      b.y1 = Math.max(b.y0 + least, p[1]);
+    }
+    imgLayoutDraw();
+  };
+  st.onpointerup = st.onpointercancel = () => {
+    if (!drag) return;
+    const b = imgLayout.boxes[drag.i], made = drag.mode === "new";
+    if (made && (b.x1 - b.x0 < least || b.y1 - b.y0 < least)) {   // a tap, not a box: nothing selected
+      imgLayout.boxes.splice(drag.i, 1);
+      imgLayout.sel = -1;
+    }
+    drag = null;
+    imgLayoutDraw();
+    imgLayoutFields();
+    if (made && imgLayout.sel >= 0) $("img-box-caption").focus();
+  };
+  st.onkeydown = (ev) => {
+    if ((ev.key === "Delete" || ev.key === "Backspace") && imgLayout.sel >= 0) { ev.preventDefault(); $("img-box-delete").click(); }
+  };
+})();
+const imgBox = () => imgLayout.boxes[imgLayout.sel];
+$("img-box-label").onchange = () => { const b = imgBox(); if (!b) return; b.label = $("img-box-label").value; imgLayoutFields(); imgLayoutDraw(); };
+$("img-box-caption").oninput = () => { const b = imgBox(); if (b) { b.caption = $("img-box-caption").value; imgLayoutDraw(); } };
+$("img-box-text").oninput = () => { const b = imgBox(); if (b) { b.text = $("img-box-text").value; imgLayoutDraw(); } };
+$("img-box-delete").onclick = () => {
+  if (imgLayout.sel < 0) return;
+  imgLayout.boxes.splice(imgLayout.sel, 1);
+  imgLayout.sel = -1;
+  imgLayoutDraw();
+  imgLayoutFields();
+};
+$("img-layout-clear").onclick = () => { imgLayout.boxes = []; imgLayout.sel = -1; imgLayoutDraw(); imgLayoutFields(); };
+$("img-layout-on").onchange = imgMossSetup;
+for (const id of ["img-size", "img-w", "img-h"]) $(id).addEventListener("input", imgLayoutDraw);
+$("img-size").addEventListener("change", imgLayoutDraw);
+// a layout made elsewhere (the prompt enhancer's, a chat's generate_image) into the boxes, at the size it was made
+// for: that size chosen, and the boxes on, for a change and another image
+function imgLayoutLoad(layout, size, prompt) {
+  const [w, h] = String(size || "").split("x").map(Number);
+  if (!(w > 0 && h > 0) || !layout || !Array.isArray(layout.items)) return;
+  const sel = $("img-size");
+  if ([...sel.options].some(o => o.value === `${w}x${h}`)) sel.value = `${w}x${h}`;
+  else { sel.value = "custom"; $("img-w").value = String(w); $("img-h").value = String(h); }
+  $("img-custom").hidden = sel.value !== "custom";
+  imgLayout.boxes = layout.items.filter(it => Array.isArray(it.bbox) && it.bbox.length === 4).map(it => {
+    const [x0, y0, x1, y1] = it.bbox.map(Number);
+    return {x0: clamp01(Math.min(x0, x1) / w), y0: clamp01(Math.min(y0, y1) / h), x1: clamp01(Math.max(x0, x1) / w), y1: clamp01(Math.max(y0, y1) / h),
+            label: ["object", "character", "text"].includes(it.label) ? it.label : "object", caption: String(it.caption || ""), text: String(it.text || "")};
+  });
+  imgLayout.sel = -1;
+  if (prompt != null) $("img-prompt").value = prompt;
+  $("img-layout-on").checked = true;
+  $("img-enhance").value = "";
+  imgCount();
+  imgMossSetup();
+  $("img-layout").scrollIntoView({block: "nearest"});
+}
+// a chat's generate_image call with a layout (MOSS-Image's): its prompt, model, size and boxes in the Images tab
+function imgLayoutFromTool(t) {
+  let a = t.arguments;
+  if (typeof a === "string") { try { a = JSON.parse(a); } catch (e) { return; } }
+  if (!a || !a.layout) return;
+  const ms = health.image_models || [];
+  const m = ms.find(x => x.id === a.model && (x.defaults || {}).layout) || ms.find(x => (x.defaults || {}).layout);
+  if (!m) return;
+  $("img-model").value = m.id;
+  imgDefaults();
+  const size = /^\d+x\d+$/.test(a.size || "") ? a.size : (String(t.result || "").match(/\((\d+x\d+),/) || [])[1] || "1024x1024";
+  showTab("images");
+  imgLayoutLoad(a.layout, size, typeof a.prompt === "string" ? a.prompt : null);
+}
+// MOSS-Image's fields into a request's body: an error's text when a box cannot go (a text box without its words)
+function imgMossBody(body) {
+  if ($("img-moss").hidden) return null;
+  const num = (id, key) => { if ($(id).value !== "") body[key] = Number($(id).value); };
+  num("img-shift", "shift");
+  num("img-slg-scale", "slg_scale");
+  num("img-slg-start", "slg_start");
+  num("img-slg-stop", "slg_stop");
+  const blocks = (id, key) => {
+    const v = $(id).value.trim();
+    if (v) body[key] = /^(none|-)$/i.test(v) ? [] : v.split(/[\s,]+/).filter(Boolean).map(Number);
+  };
+  blocks("img-uskip", "uncond_skip_layers");
+  blocks("img-slg", "slg_layers");
+  if ($("img-layout-on").checked && imgLayout.boxes.length) {
+    const [w, h] = imgLayoutWH(), items = [];
+    for (const b of imgLayout.boxes) {
+      const words = b.text.trim(), text = b.label === "text";
+      if (text && !words) return tr("img.boxNeedsWords", "A text box needs its words.");
+      items.push({label: b.label, caption: b.caption.trim() || (text ? words : imgBoxName(b.label)),
+                  ...(text ? {text: words} : {}),
+                  bbox: [Math.round(b.x0 * w), Math.round(b.y0 * h), Math.round(b.x1 * w), Math.round(b.y1 * h)]});
+    }
+    body.layout = {items};
+    if (body.size === "auto") body.size = `${w}x${h}`;
+  } else if ($("img-enhance").value && !$("img-enhance-f").hidden) {
+    body.enhance = $("img-enhance").value;
+  }
+  return null;
+}
+// what the prompt enhancer did (the response's strata.enhance), under the image: the prompt it wrote, or its layout
+// with a button that loads it into the boxes, or why it gave nothing
+function imgEnhanced(j, item) {
+  const e = j.strata && j.strata.enhance;
+  if (!e) return null;
+  const div = document.createElement("div"), p = document.createElement("span");
+  div.className = "img-enhanced";
+  if (e.error) p.textContent = tr("img.enhanceFailed", "The chat's model gave nothing usable ({error}); the prompt was used as it was.", {error: e.error});
+  else if (e.made === "layout") p.textContent = tr("img.enhancedLayout", {one: "The chat's model laid the image out in {n} box.", other: "The chat's model laid the image out in {n} boxes."}, {n: (e.layout.items || []).length});
+  else p.textContent = tr("img.enhancedCaption", "The chat's model wrote the prompt: {prompt}", {prompt: (item && item.revised_prompt) || e.prompt || ""});
+  div.append(p);
+  if (!e.error && e.made === "layout" && e.layout) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "st-btn";
+    b.textContent = tr("img.layoutEdit", "Edit this layout");
+    b.onclick = () => imgLayoutLoad(e.layout, j.size, null);
+    div.append(b);
+  }
+  return div;
 }
 // whether this browser shows JPEG XL (a 1 x 1 image, decoded); older browsers do not
 const imgJxl = new Promise(ok => {
@@ -2114,6 +2343,8 @@ $("img-form").onsubmit = async (ev) => {
   if (+$("img-n").value > 1) body.n = +$("img-n").value;
   body.output_format = $("img-fmt").value;
   if (body.output_format !== "png") body.output_compression = Math.max(0, Math.min(100, +$("img-q").value || 0));
+  const bad = imgMossBody(body);
+  if (bad) { toast("error", tr("img.none", "No image"), bad, 8000); return; }
   const partial = $("img-partial").checked;
   if (partial) Object.assign(body, {stream: true, partial_images: 2});
   imageBusy = true;
@@ -2142,6 +2373,8 @@ $("img-form").onsubmit = async (ev) => {
       const by = $("img-model-f").hidden ? "" : `${j.model}, `;
       cap.textContent = `${by}${j.size}${made}, ${tr("img.capSeed", "seed {seed}", {seed: d.seed})}, ${((performance.now() - t0) / 1000).toFixed(0)} s: ${prompt}`;
       fig.append(img, cap);
+      const note = imgEnhanced(j, d);
+      if (note) fig.append(note);
       $("img-results").prepend(fig);
     }
     $("img-hint").textContent = tr("img.done", "Done. Right-click an image to save it.");
