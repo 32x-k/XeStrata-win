@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """Chat history normalization before rendering the model's prompt."""
 import copy
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -121,6 +122,24 @@ class UnreadContentParts(unittest.TestCase):
                     {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
                     {"role": "user", "content": [{"type": "text", "text": "go"}]}]})
                 self.assertEqual(got, want)
+
+    def test_parameter_types_that_allow_a_string(self):
+        # a parameter whose schema allows a string keeps what the model wrote when reading it as JSON gives a type the
+        # schema does not allow: ["string", "null"]'s and anyOf's "1" stays "1", as do a string enum's and const's
+        from serve.frontend import OutputParser, parse_tool_call
+        body = "<function=f>\n<parameter=x>\n1\n</parameter>\n</function>"
+        nullable = {"anyOf": [{"type": "string"}, {"type": "null"}]}
+        for schema, want in (({"type": ["string", "null"]}, "1"), (nullable, "1"), ({"enum": ["1", "2"]}, "1"),
+                             ({"const": "1"}, "1"), ({"type": "string"}, "1"), ({"type": ["integer", "null"]}, 1),
+                             ({"type": ["string", "integer"]}, 1), (True, 1)):
+            tool = {"name": "f", "parameters": {"type": "object", "properties": {"x": schema}}}
+            with self.subTest(schema=schema):
+                self.assertEqual(parse_tool_call(body, tool).arguments, {"x": want})
+                p = OutputParser(thinking=False, tools=[tool], stream_tools=True)
+                evs = p.feed("<tool_call>\n" + body + "\n</tool_call>") + p.finish()
+                self.assertEqual([e.call.arguments for e in evs if e.kind == "tool_call"], [{"x": want}])
+                streamed = "".join(e.text for e in evs if e.kind == "tool_args")    # the arguments as they stream
+                self.assertEqual(json.loads(streamed), {"x": want})
 
     def test_function_call_none_or_null_without_functions(self):
         # a null is no field, and function_call "none" without functions is OpenAI's default: an ordinary request
