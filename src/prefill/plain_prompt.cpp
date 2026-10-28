@@ -353,7 +353,8 @@ bool PlainModel::prompt_dense_int8(const W& w, const float* x, int64_t ldx, floa
 // a + b rows from 16 rows and the chunk's (the best of three, after one), and dense_native_rows_ is where they cross.
 // The RX 9060 XT, Qwen3.5-9B Q4_K_M (2026-10-27): int8 faster at 16 and 23 tokens, FP16 at 128 and above (2289 tok/s
 // at 1K against 843).  Gemm::native is timed with its sums in FP32 and in FP16 too: the RTX 4070 takes FP16's (1K
-// 2842 -> 3572 tok/s warm, 32K 1524 -> 1681), the B70 FP32's (oneMKL's half GEMM is slower there: 3476 against 3304).
+// 2842 -> 3572 tok/s warm, 32K 1524 -> 1681); on the B70 the two are close (FP32's ahead at 1K, 3476 against 3304, and
+// behind at the chunk's rows by the 2026-10-29 timing), where FP16's are kept (below).
 void PlainModel::prompt_dense_calibrate() {
     PromptBufs& P = pb_;
     if (blocks_.empty() || P.T < 32) return;
@@ -399,12 +400,17 @@ void PlainModel::prompt_dense_calibrate() {
             q[i] = best([&] { prompt_dense_int8(w, P.hn, w.n_in, P.sh_gate, T, 0); });
             if (n[i] < 0 || h[i] < 0 || q[i] < 0) return;
         }
-        dense_half_sums_ = h[1] < n[1];
+        // FP16's sums unless FP32's are clearly the faster: the two form different values (the GDN blocks' ssm_out
+        // takes them at every length), and a near tie (the B70, 2026-10-29: FP16's 0.80 ms at 512 rows, FP32's 0.83 in
+        // one start of five, 0.89 and more in the others) picked one or the other from start to start, the same
+        // prompt's states, and an image made from them, changing with it
+        dense_half_sums_ = h[1] < n[1] * 1.1;
         if (dense_half_sums_) { n[0] = h[0]; n[1] = h[1]; }
-        // native - int8 = d0 + d1 (T - lo): FP16 from where it turns negative
+        // native - int8 = d0 + d1 (T - lo): FP16 from where it turns negative, at a multiple of 64 rows, so that the
+        // timings' noise (the B70: 304 to 322 rows from start to start) leaves a prompt of a given length on one side
         const double d0 = n[0] - q[0], d1 = ((n[1] - q[1]) - d0) / (double) (hi - lo);
         if (d0 <= 0) dense_native_rows_ = 0;
-        else if (d1 < 0) dense_native_rows_ = lo + (int64_t) std::ceil(d0 / -d1);
+        else if (d1 < 0) dense_native_rows_ = std::max<int64_t>(64, (lo + (int64_t) std::ceil(d0 / -d1) + 32) / 64 * 64);
         std::fprintf(stderr, "strata plain: dense products in FP16 (the products' library, %s sums) from %s rows, in "
                              "int8 below (%.2f / %.2f ms at %lld rows, %.2f / %.2f at %lld)\n",
                      dense_half_sums_ ? "FP16" : "FP32",
