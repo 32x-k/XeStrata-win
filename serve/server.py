@@ -5218,54 +5218,94 @@ FILE_MAX = 32 << 20               # a file a request sends: 32 MiB, as OpenAI's 
 PDF_PAGES_MAX = 100               # a PDF's pages, as Anthropic's limit
 PDF_PAGE_SIDE = 1024              # a PDF page's picture: its longer side, in pixels (the reader shrinks it further
 #                                   to its own image-token limit)
+PDF_TOOL_S = 120                  # how long pdftotext or pdftoppm may take on one PDF
 TEXT_TYPES = ("application/json", "application/xml", "application/x-yaml", "application/yaml",
               "application/javascript", "application/x-sh", "application/sql", "application/toml")
 
 
+def _pdf_poppler(data: bytes, label: str, vision: bool) -> tuple[list, list]:
+    """A PDF read with poppler's programs (Linux's poppler-utils, run as programs, not linked): pdftotext's text,
+    one page per form feed, and pdftoppm's pages, their longer side PDF_PAGE_SIDE -> (texts, PNG data: URLs or
+    None)."""
+    with tempfile.TemporaryDirectory() as d:
+        src = Path(d) / "in.pdf"
+        src.write_bytes(data)
+        # one page past the limit, to know a PDF that has more
+        r = subprocess.run(["pdftotext", "-enc", "UTF-8", "-l", str(PDF_PAGES_MAX + 1), str(src), "-"],
+                           capture_output=True, timeout=PDF_TOOL_S)
+        if r.returncode != 0:
+            why = r.stderr.decode(errors="replace").strip().splitlines()
+            raise ValueError(f"{label}: the PDF could not be read ({why[-1] if why else 'pdftotext failed'})")
+        pages = r.stdout.decode("utf-8", errors="replace").split("\f")[:-1]
+        if len(pages) > PDF_PAGES_MAX:
+            raise ValueError(f"{label}: the PDF has more than {PDF_PAGES_MAX} pages; at most {PDF_PAGES_MAX} are read")
+        pictures: list = [None] * len(pages)
+        if vision and pages:
+            r = subprocess.run(["pdftoppm", "-png", "-scale-to", str(PDF_PAGE_SIDE), "-l", str(len(pages)), str(src),
+                                str(Path(d) / "p")], capture_output=True, timeout=PDF_TOOL_S)
+            drawn = sorted(Path(d).glob("p-*.png"), key=lambda f: int(f.stem.rsplit("-", 1)[1]))
+            if r.returncode != 0 or len(drawn) != len(pages):
+                raise ValueError(f"{label}: the PDF's pages could not be drawn (pdftoppm)")
+            pictures = ["data:image/png;base64," + base64.b64encode(f.read_bytes()).decode("ascii") for f in drawn]
+    return pages, pictures
+
+
+def _pdf_python(data: bytes, label: str, vision: bool) -> tuple[list, list]:
+    """A PDF read with the Python packages (Windows' 7z carries them): pypdf's text page by page and pypdfium2's
+    pages, their longer side PDF_PAGE_SIDE -> (texts, PNG data: URLs or None)."""
+    try:
+        import pypdf
+    except ImportError:
+        raise ValueError("reading a PDF needs poppler's pdftotext and pdftoppm (Linux: poppler-utils) or the "
+                         "Python packages pypdf and pypdfium2") from None
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(data))
+        if reader.is_encrypted and not reader.decrypt(""):
+            raise ValueError(f"{label}: the PDF is encrypted")
+        pages = [page.extract_text() or "" for page in reader.pages]
+    except ValueError:
+        raise
+    except Exception as e:  # noqa: BLE001 - pypdf's errors are many: a PDF it cannot read is the request's fault
+        raise ValueError(f"{label}: the PDF could not be read ({type(e).__name__}: {e})") from None
+    if len(pages) > PDF_PAGES_MAX:
+        raise ValueError(f"{label}: the PDF has {len(pages)} pages; at most {PDF_PAGES_MAX} are read")
+    pictures: list = [None] * len(pages)
+    try:
+        import pypdfium2
+    except ImportError:                  # pypdf alone: the text alone
+        if vision and not getattr(read_file, "said", False):
+            read_file.said = True        # type: ignore[attr-defined]
+            print("[strata] a PDF's pages are read as text only: drawing them as pictures needs poppler's pdftoppm "
+                  "(Linux: poppler-utils) or the Python package pypdfium2", flush=True)
+        vision = False
+    if vision:
+        try:
+            pdf = pypdfium2.PdfDocument(data)
+            for k in range(len(pdf)):
+                page = pdf[k]
+                image = page.render(scale=PDF_PAGE_SIDE / max(page.get_size())).to_pil()
+                png = io.BytesIO()
+                image.save(png, "PNG")
+                pictures[k] = "data:image/png;base64," + base64.b64encode(png.getvalue()).decode("ascii")
+            pdf.close()
+        except Exception as e:  # noqa: BLE001 - as above
+            raise ValueError(f"{label}: the PDF's pages could not be drawn ({type(e).__name__}: {e})") from None
+    return pages, pictures
+
+
 def read_file(data: bytes, mime: str | None, name: str, vision: bool) -> list[dict]:
-    """A file -> the template's content items.  A PDF: its text page by page (pypdf) and, when the model reads
-    pictures, each page as one (pypdfium2), in page order - as OpenAI and Anthropic give a PDF to their models.  A
-    text file (text/*, JSON, XML, YAML, ...; or no type and UTF-8): its text.  Anything else, an encrypted or broken
-    PDF, or more than PDF_PAGES_MAX pages is a ValueError (a 400)."""
+    """A file -> the template's content items.  A PDF: its text page by page and, when the model reads pictures,
+    each page as one, in page order - as OpenAI and Anthropic give a PDF to their models; read with poppler's
+    programs when they are there (Linux), else with the Python packages (Windows).  A text file (text/*, JSON, XML,
+    YAML, ...; or no type and UTF-8): its text.  Anything else, an encrypted or broken PDF, or more than
+    PDF_PAGES_MAX pages is a ValueError (a 400)."""
     label = f"File: {name}" if name else "File"
     if data[:5] == b"%PDF-" or mime == "application/pdf":
+        poppler = shutil.which("pdftotext") is not None and shutil.which("pdftoppm") is not None
         try:
-            import pypdf
-        except ImportError:
-            raise ValueError("reading a PDF needs the Python package pypdf (setup installs it; the distribution's "
-                             "is python3-pypdf)") from None
-        try:
-            reader = pypdf.PdfReader(io.BytesIO(data))
-            if reader.is_encrypted and not reader.decrypt(""):
-                raise ValueError(f"{label}: the PDF is encrypted")
-            pages = [page.extract_text() or "" for page in reader.pages]
-        except ValueError:
-            raise
-        except Exception as e:  # noqa: BLE001 - pypdf's errors are many: a PDF it cannot read is the request's fault
-            raise ValueError(f"{label}: the PDF could not be read ({type(e).__name__}: {e})") from None
-        if len(pages) > PDF_PAGES_MAX:
-            raise ValueError(f"{label}: the PDF has {len(pages)} pages; at most {PDF_PAGES_MAX} are read")
-        pictures: list = [None] * len(pages)
-        try:
-            import pypdfium2
-        except ImportError:                  # a distribution's package (none has pypdfium2): the text alone
-            if vision and not getattr(read_file, "said", False):
-                read_file.said = True        # type: ignore[attr-defined]
-                print("[strata] a PDF's pages are read as text only: drawing them as pictures needs the Python "
-                      "package pypdfium2 (setup installs it)", flush=True)
-            vision = False
-        if vision:
-            try:
-                pdf = pypdfium2.PdfDocument(data)
-                for k in range(len(pdf)):
-                    page = pdf[k]
-                    image = page.render(scale=PDF_PAGE_SIDE / max(page.get_size())).to_pil()
-                    png = io.BytesIO()
-                    image.save(png, "PNG")
-                    pictures[k] = "data:image/png;base64," + base64.b64encode(png.getvalue()).decode("ascii")
-                pdf.close()
-            except Exception as e:  # noqa: BLE001 - as above
-                raise ValueError(f"{label}: the PDF's pages could not be drawn ({type(e).__name__}: {e})") from None
+            pages, pictures = (_pdf_poppler if poppler else _pdf_python)(data, label, vision)
+        except subprocess.TimeoutExpired:
+            raise ValueError(f"{label}: reading the PDF took more than {PDF_TOOL_S} s") from None
         items: list = [{"type": "text", "text": f"{label} ({len(pages)} pages)\n"}]
         for k, (text, picture) in enumerate(zip(pages, pictures)):
             items.append({"type": "text", "text": f"\n--- page {k + 1} ---\n{text.strip()}\n"})
