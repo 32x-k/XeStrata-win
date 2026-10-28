@@ -550,7 +550,7 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
     std::vector<float> tokens((size_t) N);
     for (int64_t c = 0; c < Cl; ++c)
         for (int64_t q = 0; q < h * w; ++q) tokens[(size_t) (q * Cl + c)] = noise[(size_t) (c * h * w + q)];
-    float *x = nullptr, *rgba = nullptr;
+    float *x = nullptr, *rgba = nullptr, *x0 = nullptr;
     if (!gpu::alloc_device(&x, (size_t) N * 4) || !gpu::alloc_device(&rgba, (size_t) (4 * HW) * 4)) {
         gpu::free(x);
         throw std::runtime_error(std::string("image engine: GPU memory: ") + gpu::last_error());
@@ -565,7 +565,29 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
         gpu::copy(x, tokens.data(), (size_t) N * 4);
         if (r.strength < 1.0) ls.start(x, sigmas[0], s_);   // img2img: from the base image's latent at that time
         if (stage) stage("sampling");
-        d.sample(x, h, w, sigmas, g, first, total, step, ls.after(s_));
+        // partial images (r.preview): the step's x0 decoded in the room the VAE has beside the DiT now, nothing given
+        // up for it; a step whose decode does not fit there is left out
+        int shown = 0;
+        auto peek = [&](int done, const std::function<void(float*)>& make) {
+            if (!r.on_preview || std::find(r.preview.begin(), r.preview.end(), done) == r.preview.end()) return;
+            const uint64_t room = p.vae > p.activations ? p.vae - p.activations : 0;
+            if (x0 == nullptr && !gpu::alloc_device(&x0, (size_t) N * 4)) return;
+            make(x0);
+            try {
+                vae_->decode(x0, h, w, rgba, room);
+            } catch (const std::exception&) {
+                vae_->drop_scratch();
+                return;
+            }
+            vae_->drop_scratch();
+            gpu::copy(out.data(), rgba, out.size() * 4);
+            std::vector<uint8_t> img = rgba8(out, HW);
+            if (mask) keep_pixels(img, resize_nearest(*base, r.width, r.height), mask_px);
+            r.on_preview(shown++, done, img);
+        };
+        d.sample(x, h, w, sigmas, g, first, total, step, ls.after(s_), peek);
+        gpu::free(x0);
+        x0 = nullptr;
         const auto t2 = clock::now();
         if (stage) stage("decode");
         // the VAE beside the DiT's activations when it fits there; else they give way to it, then the encoder's layers
@@ -591,17 +613,14 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
         }
     } catch (...) {
         gpu::free(x);
+        gpu::free(x0);
         gpu::free(rgba);
         throw;
     }
     gpu::free(x);
     gpu::free(rgba);
     if (plan_out != nullptr) *plan_out = p;
-    std::vector<uint8_t> img((size_t) (4 * HW));
-    for (int64_t q = 0; q < HW; ++q)
-        for (int c = 0; c < 4; ++c)
-            img[(size_t) (q * 4 + c)] =
-                (uint8_t) std::lround(std::clamp(out[(size_t) (c * HW + q)], 0.0f, 1.0f) * 255.0f);
+    std::vector<uint8_t> img = rgba8(out, HW);
     // a mask's kept part is the base image's own pixels (not through the VAE), blended by the mask's alpha
     if (mask) keep_pixels(img, resize_nearest(*base, r.width, r.height), mask_px);
     return img;

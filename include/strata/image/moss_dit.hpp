@@ -76,9 +76,11 @@ public:
     /// Euler steps over sigmas (n steps and the terminal 0) from x [h w][128] (device FP32, in place), each at the
     /// timestep sigma times 1000.  first, total: the schedule's steps before sigmas' first and in all (the shares the
     /// guide's window is in).  step: the progress, false to stop (QiStopped); after: at each step's next sigma (a mask's
-    /// blend).
+    /// blend); peek (if set) is given each step's count from 1 and a writer of the sampler's prediction of the finished
+    /// latent (x - sigma * v) into a buffer of x's size: a partial image's latent, the sampling itself not changed.
     void sample(float* x, int64_t h, int64_t w, const std::vector<float>& sigmas, const Guide& g, int first, int total,
-                const std::function<bool(int, int)>& step = {}, const std::function<void(float*, float)>& after = {});
+                const std::function<bool(int, int)>& step = {}, const std::function<void(float*, float)>& after = {},
+                const std::function<void(int, const std::function<void(float*)>&)>& peek = {});
 
     /// The velocity [n][h w][128] (device FP32) of the latent tokens x [h w][128] (device FP32) at `timestep` (sigma
     /// times 1000, as the reference pipeline gives it), for the contexts 0 .. n - 1 (n 1 or 2).

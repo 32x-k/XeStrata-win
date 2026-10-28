@@ -842,11 +842,24 @@ void moss_euler(float* x, const float* c, const float* u, const float* k, int64_
     });
 }
 
+// x0 = x - sigma * v, the step's prediction of the finished latent (a partial image's), v as moss_euler's
+void moss_predicted(float* x0, const float* x, const float* c, const float* u, const float* k, int64_t n, float cfg,
+                    float slg, float sigma, void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const size_t i = id[0];
+        const float ci = c[i];
+        float p = u != nullptr ? u[i] + cfg * (ci - u[i]) : ci;
+        if (k != nullptr) p = (u != nullptr ? p : k[i]) + slg * (ci - k[i]);
+        x0[i] = x[i] - sigma * p;
+    });
+}
+
 }  // namespace
 
 void MossDit::sample(float* x, int64_t h, int64_t w, const std::vector<float>& sigmas, const Guide& g, int first,
                      int total, const std::function<bool(int, int)>& step,
-                     const std::function<void(float*, float)>& after) {
+                     const std::function<void(float*, float)>& after,
+                     const std::function<void(int, const std::function<void(float*)>&)>& peek) {
     const int n = g.cfg != 1.f && ctx_[1].rows > 0 ? 2 : 1;
     const bool slg = !g.slg.empty() && g.slg_scale > 0.f;
     const int64_t HW = h * w, N = HW * in_ch_;
@@ -871,6 +884,12 @@ void MossDit::sample(float* x, int64_t h, int64_t w, const std::vector<float>& s
             moss_euler(x, out, n == 2 ? out + N : nullptr, k, N, g.cfg, g.slg_scale,
                        sigmas[(size_t) i + 1] - sigmas[(size_t) i], s_);
             if (after) after(x, sigmas[(size_t) i + 1]);
+            if (peek) {
+                const float s_next = sigmas[(size_t) i + 1];
+                peek(i + 1, [&](float* x0) {
+                    moss_predicted(x0, x, out, n == 2 ? out + N : nullptr, k, N, g.cfg, g.slg_scale, s_next, s_);
+                });
+            }
             if (step && !step(i + 1, steps)) throw QiStopped();
         }
     } catch (...) {
