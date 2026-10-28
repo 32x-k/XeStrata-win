@@ -1717,6 +1717,21 @@ class ImageTools:
         p = (self.models or self.gen).file(name)
         return p.read_bytes() if p is not None else None
 
+    def has_image(self) -> bool:
+        """Is there an image an edit could take (one this request made, a picture in the conversation, or a link to a
+        kept one)?  Nothing is read."""
+        if self.made:
+            return True
+        for msg in self.messages:
+            content = msg.get("content")
+            for item in content if isinstance(content, list) else [content]:
+                if isinstance(item, dict) and item.get("type") == "image" and item.get("source"):
+                    return True
+                text = item if isinstance(item, str) else item.get("text") if isinstance(item, dict) else None
+                if FILE_REF.search(text or ""):
+                    return True
+        return False
+
     def _image(self, which: str) -> bytes | None:
         """The image an edit takes: a /v1/images/files/ link (or its file name), else the conversation's last."""
         m = FILE_REF.search(which or "") or re.fullmatch(r"([0-9a-f]{32}\.(?:png|jpeg|webp|jxl))", which or "")

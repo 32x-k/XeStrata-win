@@ -66,8 +66,8 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.sh) as well as a module
 SETUP_CMD = "xestrata" if (ROOT / "PACKAGED").is_file() else "./setup.sh"   # a deb or rpm package's command (setup.py)
 from serve.frontend import (THINK_END, ChatTemplate, Event, GlmOutputParser, HarmonyParser,  # noqa: E402
-                            OutputParser, ToolCall, anthropic_format, anthropic_to_messages, custom_tool_names,
-                            forced_call, images_of, literal_tags,
+                            OutputParser, ToolCall, allowed_tools, anthropic_format, anthropic_to_messages,
+                            custom_tool_names, forced_call, images_of, literal_tags,
                             mark_think_literals,
                             openai_to_messages, require_messages, tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, McpHub, hub_from_config  # noqa: E402
@@ -4448,6 +4448,11 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
+        # parallel_tool_calls: false (OpenAI) / tool_choice.disable_parallel_tool_use (Anthropic): the reply ends with
+        # its first call, a whole one (finish "stop", so the call is the reply's tool_calls / tool_use)
+        choice = (sampling or {}).get("tool_choice")
+        one_call = (sampling or {}).get("parallel_tool_calls") is False or \
+            isinstance(choice, dict) and choice.get("disable_parallel_tool_use") is True
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         # the Harmony format writes its reasoning in a channel: the budget's and the loop recovery's closing text is
         # Qwen's <think> form, so neither applies to it
@@ -4504,6 +4509,7 @@ class Service:
         if force and not thinking:                      # the parser reads it as if the model had written it
             opening, force = parser.feed(force), None
         tail = ""                                       # the last characters written (the newlines before a call)
+        one_done = False                                # one_call: the reply's one call has been written
         answered, close_retried = False, False          # #1053: content or a call came out; the thinking was closed
         nf_retried = False                              # #879: the request was sent again after non-finite logits
         timings, before = None, None                    # this request's timings; the engine's `last` before it
@@ -4651,7 +4657,8 @@ class Service:
                                 elif time.perf_counter() - last_out >= KEEPALIVE_S:
                                     last_out = time.perf_counter()
                                     yield "ping", None
-                                if stops is not None and stops.hit is not None:
+                                one_done = one_done or one_call and any(ev.kind == "tool_call" for ev in evs)
+                                if stops is not None and stops.hit is not None or one_done:
                                     finish = "stop"         # gen.close() below STOPs the engine, as for a stop token
                                     break
                                 if (self.reasoning_loop_recovery and not harmony and not recovery_count
@@ -4900,6 +4907,10 @@ class Service:
             if emb:
                 Path(emb).unlink(missing_ok=True)
         for ev in cut(parser.finish(finish)):
+            if one_call and ev.kind in ("tool_start", "tool_args", "tool_call"):
+                if one_done:
+                    continue                            # calls read from the thinking at the end: the first only
+                one_done = ev.kind == "tool_call"
             yield "event", ev
         if parser.rescued or parser.refused:
             self.totals["tool_calls_from_reasoning"] = self.totals.get("tool_calls_from_reasoning", 0) + parser.rescued
@@ -6832,7 +6843,8 @@ def make_handler(svc: Service):
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
                 tools = None
-            force = forced_call(req.get("tool_choice"), tools,      # a bad value is a 400 before anything is sent
+            tools, choice = allowed_tools(req.get("tool_choice"), tools)   # the tools it lists, and its mode
+            force = forced_call(choice, tools,                      # a bad value is a 400 before anything is sent
                                 getattr(svc.template, "call_form", "qwen"))
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
@@ -7077,11 +7089,37 @@ def make_handler(svc: Service):
                 self.image_tools = images_api.ImageTools(svc, svc.images, messages, Vision.load,
                                                          lambda d: Vision.normalize(d, keep_alpha=True),
                                                          spec, model=fixed, mask=mask)
-                tools = (tools or []) + self.image_tools.template_tools(exclude={t["name"] for t in tools or []})
+                offered = self.image_tools.template_tools(exclude={t["name"] for t in tools or []})
+                # the tool's action: "generate" offers generate_image alone, "edit" edit_image alone
+                action = spec.get("action", "auto")
+                if action not in ("auto", "generate", "edit"):
+                    raise ResponsesError('the image_generation tool\'s action is "auto", "generate" or "edit"',
+                                         "tools")
+                if action != "auto":
+                    keep = "generate_image" if action == "generate" else "edit_image"
+                    offered = [t for t in offered if t["name"] == keep]
+                    if not offered or action == "edit" and not self.image_tools.has_image():
+                        raise ResponsesError(f'the image_generation tool\'s action "{action}" cannot be done here'
+                                             + (": there is no image in the conversation to edit"
+                                                if action == "edit" and offered else ""), "tools")
+                image_names = [t["name"] for t in offered]
+                tools = (tools or []) + offered
                 skipped = [k for k in skipped if k != "image_generation"]
+            else:
+                image_names = []
             kw = responses_api.template_kwargs(req, {"reasoning_effort": svc.effort_default()})
             # "required" or a named tool: the reply opens that call (forced_call), as on the chat route
-            force = forced_call(responses_api.forced_choice(req), tools, getattr(svc.template, "call_form", "qwen"))
+            choice = responses_api.forced_choice(req)
+            try:
+                if isinstance(choice, dict) and choice.get("type") == "image_generation":
+                    if not image_names:
+                        raise ValueError("tool_choice image_generation: the request has no image_generation tool "
+                                         "this server can run")
+                    tools, choice = [t for t in tools or [] if t["name"] in image_names], "required"
+                tools, choice = allowed_tools(choice, tools, {"image_generation": image_names})
+                force = forced_call(choice, tools, getattr(svc.template, "call_form", "qwen"))
+            except ValueError as e:
+                raise ResponsesError(str(e), "tool_choice") from None
             try:
                 self._no_local_images(messages)              # as on the chat route: no file read for a foreign page
             except ValueError as e:

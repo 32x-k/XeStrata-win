@@ -1004,12 +1004,45 @@ def tool_choice_of(tool_choice) -> tuple[str, str | None]:
     return "unknown", None
 
 
+def allowed_tools(tool_choice, tools: list[dict] | None, more: dict | None = None):
+    """OpenAI's {"type": "allowed_tools"} tool_choice (Chat: {"allowed_tools": {"mode", "tools"}}; Responses: "mode"
+    and "tools" beside the type) -> (the tools the model is offered: those it lists, the tool_choice to apply:
+    "auto" or "required").  Any other tool_choice comes back as it is, with all the tools.  `more`: a listed tool
+    type's template names (Responses' {"type": "image_generation"}: the image tools).  A list naming a tool the
+    request does not have, or an unknown mode, is a ValueError (a 400)."""
+    if not (isinstance(tool_choice, dict) and tool_choice.get("type") == "allowed_tools"):
+        return tools, tool_choice
+    spec = tool_choice["allowed_tools"] if isinstance(tool_choice.get("allowed_tools"), dict) else tool_choice
+    mode, listed = spec.get("mode", "auto"), spec.get("tools")
+    if mode not in ("auto", "required"):
+        raise ValueError('tool_choice.allowed_tools: mode must be "auto" or "required"')
+    if not isinstance(listed, list) or not listed:
+        raise ValueError("tool_choice.allowed_tools: tools must be a non-empty list of the request's tools")
+    names: set = set()
+    for t in listed:
+        if not isinstance(t, dict):
+            raise ValueError("tool_choice.allowed_tools: each tool is an object")
+        if t.get("type") in (more or {}):
+            names |= set((more or {})[t["type"]])
+            continue
+        fn = t.get("function") or t.get("custom") or t
+        name = fn.get("name") if isinstance(fn, dict) else None
+        if not isinstance(name, str) or not name:
+            raise ValueError("tool_choice.allowed_tools: each tool names a tool of the request")
+        names.add(f"{t['namespace']}.{name}" if t.get("namespace") else name)
+    have = {t.get("name") for t in tools or [] if isinstance(t, dict)}
+    unknown = sorted(names - have)
+    if unknown:
+        raise ValueError(f"tool_choice.allowed_tools names tools the request does not have: {', '.join(unknown)}")
+    return [t for t in tools or [] if t.get("name") in names], mode
+
+
 def forced_call(tool_choice, tools: list[dict] | None, form: str = "qwen") -> str | None:
     """`tool_choice` -> the text that opens the call the reply must make, or None (the model decides).
     There is no grammar here: the server writes this opening itself, so the model can only go on with a call.
-    "required" / Anthropic "any": any of the tools; a named function: that one.  A value it cannot honour (an
-    unknown shape, a name that is not one of the tools, "required" with no tools) is logged and acts as "auto",
-    not a 400: a client's odd choice must not stop its request.  "none" is handled by the caller (no tools)."""
+    "required" / Anthropic "any": any of the tools; a named function: that one.  "none" is handled by the caller
+    (no tools).  A value it cannot honour (an unknown shape, a name that is not one of the tools, "required" with no
+    tools) is a ValueError - a 400, as OpenAI and Anthropic answer it - not a request that runs as "auto"."""
     kind, name = tool_choice_of(tool_choice)
     names = {t.get("name") for t in tools or [] if isinstance(t, dict)}
     if kind in ("auto", "none"):
@@ -1020,9 +1053,11 @@ def forced_call(tool_choice, tools: list[dict] | None, form: str = "qwen") -> st
         return CALL_START if form == "glm" else CALL_START + "\n<function="
     if kind == "named" and name in names:
         return CALL_START + str(name) if form == "glm" else CALL_START + f"\n<function={name}>\n"
-    print(f"[strata] tool_choice {json.dumps(tool_choice)[:200]} is not supported here (or names no tool of the "
-          "request): the model decides, as with \"auto\"", flush=True)
-    return None
+    if kind == "named":
+        raise ValueError(f"tool_choice names {name!r}, which is not one of the request's tools")
+    if kind == "required":
+        raise ValueError("tool_choice asks for a tool call, but the request has no tools")
+    raise ValueError(f"tool_choice {json.dumps(tool_choice)[:200]} is not a tool_choice this server takes")
 
 
 PARAM_START = "<parameter="

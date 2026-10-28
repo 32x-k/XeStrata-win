@@ -4212,17 +4212,18 @@ class ForcedToolChoice(unittest.TestCase):
         finish, calls, _ = self.call_of(code, b, False)
         self.assertEqual((finish, calls), ("length", []))
 
-    def test_values_it_cannot_honour_act_as_auto(self):
-        """Not a 400: an odd tool_choice is logged and the model decides."""
+    def test_values_it_cannot_honour_are_a_400(self):
+        """An odd tool_choice (an unknown shape, a name that is not a tool, "required" with no tools) is a 400 before
+        the model runs, as OpenAI and Anthropic answer it."""
         named = lambda n: {"type": "function", "function": {"name": n}}  # noqa: E731
         for choice, tools in ((named("nope"), self.TOOLS), ({"type": "function"}, self.TOOLS),
                               ("required", None), ({"type": "banana"}, self.TOOLS), ("sometimes", self.TOOLS)):
             with self.subTest(choice=choice, tools=bool(tools)):
                 self.engine.prompts = []
                 code, b = self.openai(tool_choice=choice, tools=tools)
-                self.assertEqual(code, 200, b)
-                self.assertEqual(b["choices"][0]["message"]["content"], CallingEngine.ANSWER)
-                self.assertEqual(len(self.engine.prompts), 1)
+                self.assertEqual(code, 400, b)
+                self.assertIn("tool_choice", b["error"]["message"])
+                self.assertEqual(self.engine.prompts, [])
 
     def test_the_flat_shape_names_a_function(self):
         code, b = self.openai(tool_choice={"type": "function", "name": "search"})
@@ -4235,7 +4236,7 @@ class ForcedToolChoice(unittest.TestCase):
                 "type": "object", "properties": {}}}]
         for choice, want in (({"type": "any"}, "tool_use"), ({"type": "tool", "name": "search"}, "tool_use"),
                              ({"type": "auto"}, "end_turn"), ({"type": "none"}, "end_turn"),
-                             ({"type": "tool", "name": "nope"}, "end_turn")):
+                             ({"type": "tool", "name": "nope"}, 400)):
             for stream in (False, True):
                 with self.subTest(choice=choice, stream=stream):
                     self.engine.prompts = []
@@ -4243,6 +4244,14 @@ class ForcedToolChoice(unittest.TestCase):
                             "messages": [{"role": "user", "content": "2+2?"}]}
                     req = urllib.request.Request(self.base + "/v1/messages", data=json.dumps(body).encode(), headers={
                         "Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+                    if want == 400:                 # a name that is not one of the tools: Anthropic's 400
+                        with self.assertRaises(urllib.error.HTTPError) as cm:
+                            urllib.request.urlopen(req, timeout=30)
+                        with cm.exception as e:
+                            self.assertEqual((e.code, json.loads(e.read())["error"]["type"]),
+                                             (400, "invalid_request_error"))
+                        self.assertEqual(self.engine.prompts, [])
+                        continue
                     with urllib.request.urlopen(req, timeout=30) as r:
                         raw = r.read().decode()
                     if stream:
