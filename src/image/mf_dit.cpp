@@ -240,7 +240,8 @@ MfDit::~MfDit() {
     for (void* p : allocs_) gpu::free(p);
 }
 
-bool MfDit::open(const std::string& path, void* stream, std::string& err, bool dry, bool q8) {
+bool MfDit::open(const std::string& path, void* stream, std::string& err, bool dry, bool q8,
+                 std::vector<std::vector<uint8_t>>* reuse) {
     try {
         s_ = stream;
         dry_ = dry;
@@ -379,7 +380,13 @@ bool MfDit::open(const std::string& path, void* stream, std::string& err, bool d
             for (const auto& [off, name] : norms) vbytes += (uint64_t) tensor(p + name).elements() * 4;
             std::vector<LayerStream::Span> spans;
             std::vector<uint8_t> host;
-            if (!dry_) host.resize((size_t) (qbytes + vbytes));
+            // an earlier open's bytes of this block, in the same form (their size says it: W8A8's rows and Q8_0's
+            // differ), else the file's quantized again
+            const size_t bi = host_.size();
+            const bool reused = !dry_ && q8_ && reuse != nullptr && bi < reuse->size() &&
+                                (*reuse)[bi].size() == qbytes + vbytes;
+            if (reused) host = std::move((*reuse)[bi]);
+            else if (!dry_) host.resize((size_t) (qbytes + vbytes));
             uint64_t at = 0;
             std::vector<size_t> wspan(items.size()), bspan(items.size()), nspan(norms.size());
             for (size_t j = 0; j < items.size(); ++j) {
@@ -387,11 +394,11 @@ bool MfDit::open(const std::string& path, void* stream, std::string& err, bool d
                 const W& w = *items[j].w;
                 const uint64_t bytes = w.row_bytes * (uint64_t) w.n + (w.type == kTypeW8 ? (uint64_t) w.n * 4 : 0);
                 if (q8_ && w.type == kTypeF32) {
-                    if (!dry_) std::memcpy(host.data() + at, data + t.begin, bytes);
+                    if (!dry_ && !reused) std::memcpy(host.data() + at, data + t.begin, bytes);
                     spans.push_back({host.data() + at, bytes, 0});
                     at += bytes;
                 } else if (q8_) {
-                    if (!dry_)
+                    if (!dry_ && !reused)
                         quantize_matrix(reinterpret_cast<const uint16_t*>(data + t.begin), w.n, w.k, host.data() + at,
                                         w.type == kTypeW8);
                     spans.push_back({host.data() + at, bytes, 0});
@@ -404,8 +411,8 @@ bool MfDit::open(const std::string& path, void* stream, std::string& err, bool d
             auto vec = [&](const std::string& name, size_t* span) {
                 const SafeTensor* t = st.find(name);   // bf16, or F32 (the low-rank modulations' biases)
                 if (t == nullptr) throw std::runtime_error("image engine (Mage-Flow DiT): no " + name);
-                const auto v = dry_ ? std::vector<float>((size_t) t->elements()) : st.f32(name);
-                if (!dry_) std::memcpy(host.data() + at, v.data(), v.size() * 4);
+                const auto v = dry_ || reused ? std::vector<float>((size_t) t->elements()) : st.f32(name);
+                if (!dry_ && !reused) std::memcpy(host.data() + at, v.data(), v.size() * 4);
                 spans.push_back({host.data() + at, v.size() * 4, 0});
                 at += v.size() * 4;
                 *span = spans.size() - 1;
@@ -418,7 +425,7 @@ bool MfDit::open(const std::string& path, void* stream, std::string& err, bool d
                 *items[j].bias = blocks_stream_.offset(layer, (int) bspan[j]);
             }
             for (size_t j = 0; j < norms.size(); ++j) *norms[j].first = blocks_stream_.offset(layer, (int) nspan[j]);
-            if (q8_ && !dry_) {   // the block's bf16 pages: read once, not kept in the page cache
+            if (q8_ && !dry_ && !reused) {   // the block's bf16 pages: read once, not kept in the page cache
                 uint64_t lo = UINT64_MAX, hi = 0;
                 for (const Item& it : items) {
                     const SafeTensor& t = *st.find(p + it.name + ".weight");

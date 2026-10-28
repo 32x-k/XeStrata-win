@@ -80,8 +80,13 @@ public:
     MfDit& operator=(const MfDit&) = delete;
 
     /// `q8`: the blocks as Q8_0 (the default), else FP16 on the GPU from the file's bf16.  `dry`: read for its sizes
-    /// only.
-    bool open(const std::string& path, void* stream, std::string& err, bool dry = false, bool q8 = true);
+    /// only.  `reuse`: the blocks' host bytes an earlier open of the same file in the same form left (take_host),
+    /// taken instead of quantizing the file again.
+    bool open(const std::string& path, void* stream, std::string& err, bool dry = false, bool q8 = true,
+              std::vector<std::vector<uint8_t>>* reuse = nullptr);
+    /// The blocks' host bytes (8 bits: their quantized weights and FP32 vectors), handed over for a later open's
+    /// `reuse`: the part is closed afterwards.
+    std::vector<std::vector<uint8_t>> take_host() { return std::move(host_); }
 
     /// Context i (0: the prompt, 1: the negative prompt) from the text encoder's states [rows][2560] (host FP32, the
     /// rows after the system turn): their norm and input projection, kept on the GPU.

@@ -86,6 +86,8 @@ private:
     bool base_encoder_ = false;   // the VAE's file has the encoder a base image takes (img2img, a mask)
     std::unique_ptr<QiText> te_;
     std::unique_ptr<MfDit> dit_, edit_dit_;
+    // the closed DiTs' blocks in 8 bits (release(true)), for their next open
+    std::vector<std::vector<uint8_t>> dit_host_, edit_host_;
     std::unique_ptr<QiVision> vision_;        // the edits' vision encoder, while the budget has room for it
     std::unique_ptr<QiVision> vision_size_;
     std::unique_ptr<MfVae> vae_;

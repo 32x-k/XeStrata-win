@@ -231,8 +231,12 @@ MfDit& MfPipeline::use_dit(bool edit, bool q8) {
     edit_active_ = edit;
     if (!want) {
         std::string err;
+        std::vector<std::vector<uint8_t>>& host = edit ? edit_host_ : dit_host_;
+        if (!q8) host.clear();   // FP16 reads the file in place
         auto d = std::make_unique<MfDit>();
-        if (!d->open(edit ? edit_path_ : dit_path_, s_, err, false, q8)) throw std::runtime_error(err);
+        const bool ok = d->open(edit ? edit_path_ : dit_path_, s_, err, false, q8, &host);
+        host.clear();
+        if (!ok) throw std::runtime_error(err);
         want = std::move(d);
     }
     want->set_block_budget(want->block_min());
@@ -314,6 +318,10 @@ void MfPipeline::release(bool all) {
     vision_.reset();
     if (all) {
         te_.reset();
+        // the RAM setup counts for them: their blocks kept quantized for the next open (the other DiT's only with keep_,
+        // which is when it is still open)
+        if (dit_ && dit_->q8()) dit_host_ = dit_->take_host();
+        if (edit_dit_ && edit_dit_->q8()) edit_host_ = edit_dit_->take_host();
         dit_.reset();
         edit_dit_.reset();
         vae_.reset();
