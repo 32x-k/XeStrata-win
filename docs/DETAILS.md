@@ -1253,7 +1253,10 @@ Local `#` references work; remote references are refused.
 `json_schema` is checked with the Python package `jsonschema` when it is installed (`python -m pip install "jsonschema>=4.23,<5"`; setup does not add it).
 Without it the answer is only checked to be one JSON object, and the server says so once.
 
-This is **schema prompting followed by server validation**, not grammar-constrained decoding.
+When the engine can constrain its decoding (not with continuous batching, not the plain models' engine), **the answer is written under the schema's grammar** and checked after it as well.
+The thinking is not constrained: only the JSON answer after it.
+Otherwise the schema is in the prompt and the server checks the answer; `STRATA_GRAMMAR=0` in the environment turns the constraint off too.
+A tool's `strict: true` (Chat Completions, Responses, Messages) and a `custom` tool's regex grammar constrain the call's arguments the same way (models with Qwen's call form); text and the other tools' calls are not constrained.
 One generation is made per request, with no hidden retry.
 Successful responses contain a validated JSON object.
 Malformed JSON, duplicate keys, non-finite numbers, schema violations and incomplete generations return **502** with `error.code: structured_output_failed`;
@@ -1351,7 +1354,7 @@ On Linux a PDF is read with poppler's `pdftotext` and `pdftoppm`, on Windows wit
 
 **Chat Completions**:
 
-- A `custom` tool in `tools` is shown to the model as a tool that takes one `input` string; its calls come back as `{"type": "custom", "custom": {"name", "input"}}`. Its grammar (`format`) is only described to the model; the output is not constrained.
+- A `custom` tool in `tools` is shown to the model as a tool that takes one `input` string; its calls come back as `{"type": "custom", "custom": {"name", "input"}}`. A regex grammar (`format`) [constrains](#json-response-formats) its argument; a Lark grammar is only described to the model.
 - `tool_choice` takes `none`, `auto`, `required`, a named tool and `allowed_tools` (the tools shown are those it lists; `mode: required` forces a call). A name that is not one of the tools, or an unknown shape, is a 400.
 - With `parallel_tool_calls: false` the reply ends when its first call is complete, and that call is returned.
 - `n` (1 to 128) generates each choice in its own run; with a `seed`, choice k gets `seed + k`.
@@ -1366,7 +1369,7 @@ On Linux a PDF is read with poppler's `pdftotext` and `pdftoppm`, on Windows wit
 
 - `max_tokens` is required, a whole number of 1 or more.
 - Tool results are paired with their calls by `tool_use_id`; returned `tool_use` ids start with `toolu_`. `disable_parallel_tool_use` allows one call at most. A `tool_choice` name that is not one of the tools, or an unknown shape, is a 400.
-- `output_config.format` (and `output_format`) `json_schema` checks the answer against the schema before it is returned, as the [JSON response formats](#json-response-formats) do (the output is not constrained); an answer that does not match is a 502 (an error event in a stream).
+- `output_config.format` (and `output_format`) `json_schema` checks the answer against the schema before it is returned, constrained and checked as the [JSON response formats](#json-response-formats) are; an answer that does not match is a 502 (an error event in a stream).
 - A `tool_result` with `is_error: true` reaches the model with `Error:` before it.
 - A text `document` (`source` `text` or `content`) and a `search_result` are read as text with their titles. `citations.enabled: true` is a 400.
 - Thinking blocks carry a `signature` (`signature_delta` in a stream): the thinking's text in base64; thinking sent back that differs from it is a 400. A `redacted_thinking` block XeStrata made is read, others are dropped.
@@ -1398,7 +1401,7 @@ are refused with an error that says so.
 | `include` `message.output_text.logprobs`, `top_logprobs` | `output_text` carries `logprobs` |
 | `reasoning.effort` | `none`/`minimal`, `low`, `medium`, `high`/`xhigh`; without it the config's `reasoning_effort`, else the model's default (high) |
 | `max_output_tokens` | The output cap (thinking included). Running out ends the response `incomplete` (`max_output_tokens`). `0` and `-1` (or leaving it out) mean no cap, as for `max_tokens`; anything below `-1` is a 400 |
-| `text.format` | `json_schema` and `json_object` use the [JSON response formats](#json-response-formats) (checked, not constrained) |
+| `text.format` | `json_schema` and `json_object` use the [JSON response formats](#json-response-formats) (constrained and checked) |
 | `temperature`, `top_p`, `reasoning_budget_tokens`, ... | As on the chat path |
 
 The final event (`response.completed` or `response.incomplete`) and a non-streaming reply carry the same top-level `timings` object as `/v1/chat/completions`.
