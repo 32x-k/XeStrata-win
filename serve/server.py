@@ -5169,9 +5169,14 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                     box["cancelled"] = True
             worker = threading.Thread(target=work, daemon=True)
             worker.start()
+            partials = getattr(hub, "partials", None)   # an image tool's partial images (ImageTools.stream_partials)
             try:
                 while worker.is_alive():
                     worker.join(1.0)
+                    while partials is not None and not partials.empty():
+                        index, data = partials.get()
+                        yield "mcp", {"event": "partial", "id": c.id, "index": index,
+                                      "b64": base64.b64encode(data).decode("ascii")}
                     if worker.is_alive():
                         yield "ping", None
             except GeneratorExit:
@@ -7413,6 +7418,8 @@ def make_handler(svc: Service):
                 self.image_tools = images_api.ImageTools(svc, svc.images, messages, Vision.load,
                                                          lambda d: Vision.normalize(d, keep_alpha=True),
                                                          spec, model=fixed, mask=mask)
+                if req.get("stream") is True:            # the tool's partial_images, sent as the image is made
+                    self.image_tools.stream_partials(spec.get("partial_images"))
                 offered = self.image_tools.template_tools(exclude={t["name"] for t in tools or []})
                 # the tool's action: "generate" offers generate_image alone, "edit" edit_image alone
                 action = spec.get("action", "auto")

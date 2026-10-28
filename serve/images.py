@@ -1705,6 +1705,15 @@ class ImageTools:
         self.max_calls: int | None = None  # a Responses request's max_tool_calls: the calls that run, at most
         self.calls = 0
         self.mask = mask                   # an edit's mask (Responses' input_image_mask), over the image it edits
+        # a streamed Responses request's partial_images (the tool's, 1..3): each call's partial images, put here as
+        # (index, the image in the tool's output_format) for run_with_mcp to send while the call runs
+        self.partials: queue.Queue | None = None
+        self.partial_images = 0
+
+    def stream_partials(self, k) -> None:
+        """A streamed request whose image_generation tool asks for partial_images k (1..3): make them."""
+        if isinstance(k, int) and not isinstance(k, bool) and 1 <= k <= 3:
+            self.partial_images, self.partials = k, queue.Queue()
 
     def _gens(self, edits: bool = False) -> list[ImageGen]:
         """The image models the tools offer, the default first; for edit_image those that edit first (every model
@@ -1800,7 +1809,13 @@ class ImageTools:
                 job = parse_edit_request(req, [self.normalize(data)], gen.cfg, self.mask)
             else:
                 raise ImageRequestError(f"there is no tool named {name!r}")
-            images, figures, _ = make_images(self.svc, gen, job, cancel)
+            preview = None
+            if self.partials is not None:
+                job["partial_images"] = self.partial_images
+                fmt, comp, opaque = job["output_format"], job["output_compression"], job["background"] == "opaque"
+                q = self.partials
+                preview = lambda _i, index, png: q.put((index, encode_image(png, fmt, comp, opaque)))  # noqa: E731
+            images, figures, _ = make_images(self.svc, gen, job, cancel, preview)
             fmt = job["output_format"]
             names = [gen.store(encode_image(png, fmt, job["output_compression"], job["background"] == "opaque"),
                                fmt) for png in images]
