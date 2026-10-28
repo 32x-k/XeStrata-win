@@ -509,14 +509,14 @@ MAC_DEVICE_SHARE = 0.75         # recommendedMaxWorkingSetSize as a share of the
 MAC_FILECACHE_FLOOR_GB = 37.2   # vm.vm_page_filecache_min on the 128 GB M5 Max
 MAC_HEADROOM_GB = 12.0          # beside that floor: macOS itself and one more program
 MAC_MEASURED = ("M5 Max, 128 GB, 2.25 bpw: 13-15 tokens/s for a short answer (10-12 after a long prompt), a 3,000-token "
-                "prompt at about 310 tokens/s, 32,000 at about 720; the engine kept about 68 GB of the experts resident "
+                "prompt at about 295 tokens/s, 32,000 at about 720; the engine kept about 68 GB of the experts resident "
                 "and read about 110 MB a token from the SSD")
 
 
 # What each pack did on that Mac (measured on the 0.2.7.1 build, 2026-10-27, product flags, frozen placement).
 MAC_MEASURED_PACK = {
-    "IQ2_XXS": ("M5 Max, 128 GB, 2.00 bpw: 15-18 tokens/s for a short answer (14-15 after a long prompt), a 3,000-token prompt at about 270 "
-                "tokens/s, 32,000 at about 630; the engine kept about 69 GB of the experts resident and read about 48 MB a token from the SSD"),
+    "IQ2_XXS": ("M5 Max, 128 GB, 2.00 bpw: 15-16 tokens/s for a short answer (14-15 after a long prompt), a 3,000-token prompt at about 240 "
+                "tokens/s, 32,000 at about 610; the engine kept about 69 GB of the experts resident and read about 48 MB a token from the SSD"),
     "IQ2_XS": MAC_MEASURED,
 }
 
