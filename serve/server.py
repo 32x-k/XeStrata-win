@@ -68,8 +68,8 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.sh) as well as a 
 SETUP_CMD = "xestrata" if (ROOT / "PACKAGED").is_file() else "./setup.sh"   # a deb or rpm package's command (setup.py)
 from serve.frontend import (THINK_END, ChatTemplate, Event, GlmOutputParser, HarmonyParser,  # noqa: E402
                             OutputParser, ToolCall, allowed_tools, anthropic_format, anthropic_to_messages,
-                            custom_tool_names, forced_call, images_of, literal_tags, thinking_signature,
-                            mark_think_literals,
+                            custom_tool_names, forced_call, images_of, legacy_function_call, legacy_functions,
+                            literal_tags, thinking_signature, mark_think_literals,
                             openai_to_messages, require_messages, tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, McpHub, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
@@ -5556,6 +5556,18 @@ def prompt_progress(svc: Service):
             "time_ms": int(getattr(engine, "progress_ms", 0) or 0)}
 
 
+def legacy_chunks(chunks):
+    """A stream's chunks for a `functions` request (frontend.legacy_functions): each choice's call as the old
+    function_call (legacy_function_call).  Closing it closes the stream it reads."""
+    try:
+        for c in chunks:
+            for choice in (c or {}).get("choices") or ():
+                legacy_function_call(choice)
+            yield c
+    finally:
+        chunks.close()
+
+
 def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None, force=None):
     """With `logprobs` asked (upstream's Intel port 4ba35fd), each chunk carries the log-probabilities of the tokens
     the engine wrote since the last one (the model's, before sampling, temperature and penalties; the stop token is
@@ -7176,6 +7188,17 @@ def make_handler(svc: Service):
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
+            legacy = legacy_functions(req)                    # the old functions / function_call, as tools
+            req = legacy or req
+            modalities = req.get("modalities")
+            if req.get("audio") is not None or modalities is not None and (
+                    not isinstance(modalities, list) or any(m != "text" for m in modalities)):
+                raise ValueError("modalities: this server answers in text only (no audio output)")
+            for key in ("max_completion_tokens", "max_tokens"):   # OpenAI's integers: 2.9 is a 400, not 2
+                v = req.get(key)
+                if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))
+                                      or isinstance(v, float) and not v.is_integer()):
+                    raise ValueError(f"{key} must be a whole number")
             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
             messages, tools, kw = openai_to_messages(req)
             require_messages(messages)   # an empty conversation is a 400, as OpenAI answers it, not a reply to nothing
@@ -7265,7 +7288,12 @@ def make_handler(svc: Service):
                     chunks = structured_chunks(chunks, validator)
             chunks = self._capture(chunks, "openai")
             if not req.get("stream"):
-                return self._json(200, openai_collect_choices(chunks) if n > 1 else openai_collect(chunks))
+                body = openai_collect_choices(chunks) if n > 1 else openai_collect(chunks)
+                for c in body["choices"] if legacy else ():
+                    legacy_function_call(c)
+                return self._json(200, body)
+            if legacy:
+                chunks = legacy_chunks(chunks)
             self._sse()
             options = req.get("stream_options")
             last = None

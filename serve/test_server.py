@@ -1625,6 +1625,49 @@ class ClientShapes(unittest.TestCase):
         self.assertIn("<parameter=arguments>\n{malformed_json", rendered)
 
 
+class UnsupportedOrOld(unittest.TestCase):
+    """Chat Completions' old functions / function_call are answered in their own shape; what the server cannot do
+    (audio output) or a max_tokens that is no whole number is a 400, not a 200 that ignores it."""
+
+    def test_functions_audio_and_max_tokens(self):
+        tok = ByteTokenizer()
+        call = "</think>\n\n<tool_call>\n<function=f>\n<parameter=x>\n1\n</parameter>\n</function>\n</tool_call>"
+        svc = Service(MockEngine(tok, call, max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions"
+
+        def post(**kw):
+            body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], **kw}
+            req = urllib.request.Request(base, data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    return r.status, r.read().decode()
+            except urllib.error.HTTPError as e:
+                with e:
+                    return e.code, e.read().decode()
+        try:
+            params = {"type": "object", "properties": {"x": {"type": "string"}}}
+            fns = {"functions": [{"name": "f", "parameters": params}], "function_call": "auto"}
+            status, text = post(**fns)
+            self.assertEqual(status, 200, text)
+            choice = json.loads(text)["choices"][0]
+            self.assertEqual(choice["finish_reason"], "function_call")
+            self.assertEqual(choice["message"]["function_call"], {"name": "f", "arguments": '{"x":"1"}'})
+            self.assertNotIn("tool_calls", choice["message"])
+            status, text = post(stream=True, **fns)
+            deltas = [c["choices"][0]["delta"] for c in (json.loads(line[6:]) for line in text.splitlines()
+                                                         if line.startswith("data: {")) if c.get("choices")]
+            self.assertEqual("".join(d.get("function_call", {}).get("arguments", "") for d in deltas), '{"x":"1"}')
+            self.assertFalse(any("tool_calls" in d for d in deltas))
+            self.assertEqual(post(modalities=["text", "audio"], audio={"voice": "alloy", "format": "wav"})[0], 400)
+            self.assertEqual(post(max_tokens=2.9)[0], 400)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
 class ToolArguments(unittest.TestCase):
     """#510: one helper for both frontends; a history whose arguments are not a JSON object is kept, not a 500."""
 

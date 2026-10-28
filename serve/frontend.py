@@ -1158,6 +1158,45 @@ def allowed_tools(tool_choice, tools: list[dict] | None, more: dict | None = Non
     return [t for t in tools or [] if t.get("name") in names], mode
 
 
+def legacy_functions(req: dict) -> dict | None:
+    """OpenAI's deprecated `functions` and `function_call` (before tools) -> the request with `tools` and `tool_choice`
+    in their place and one call at a time (the old shape answers with one), or None when it has neither.  Mixed with
+    tools or tool_choice, or a function_call without functions, it is a 400."""
+    if "functions" not in req and "function_call" not in req:
+        return None
+    if req.get("tools") is not None or req.get("tool_choice") is not None:
+        raise ValueError("functions and function_call cannot be used with tools or tool_choice")
+    fns = req.get("functions")
+    if not isinstance(fns, list) or not fns or not all(isinstance(f, dict) for f in fns):
+        raise ValueError("functions must be a non-empty array of function objects")
+    choice = req.get("function_call")
+    if isinstance(choice, dict) and isinstance(choice.get("name"), str):
+        choice = {"type": "function", "function": {"name": choice["name"]}}
+    elif choice not in (None, "none", "auto"):
+        raise ValueError('function_call must be "none", "auto" or {"name": ...}')
+    out = {k: v for k, v in req.items() if k not in ("functions", "function_call")}
+    out.update(tools=[{"type": "function", "function": f} for f in fns], parallel_tool_calls=False)
+    if choice is not None:
+        out["tool_choice"] = choice
+    return out
+
+
+def legacy_function_call(choice: dict) -> dict:
+    """A reply's choice (a message or a stream's delta) for a `functions` request: its call as the old function_call
+    and finish_reason "function_call", as OpenAI answers one."""
+    for key in ("message", "delta"):
+        m = choice.get(key)
+        if not isinstance(m, dict):
+            continue
+        calls = m.pop("tool_calls", None)
+        if calls:
+            fn = calls[0].get("function") or {}
+            m["function_call"] = {k: fn[k] for k in ("name", "arguments") if k in fn}
+    if choice.get("finish_reason") == "tool_calls":
+        choice["finish_reason"] = "function_call"
+    return choice
+
+
 def forced_call(tool_choice, tools: list[dict] | None, form: str = "qwen") -> str | None:
     """`tool_choice` -> the text that opens the call the reply must make, or None (the model decides).
     There is no grammar here: the server writes this opening itself, so the model can only go on with a call.
