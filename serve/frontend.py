@@ -22,6 +22,7 @@ import base64
 import datetime
 import json
 import logging
+import mimetypes
 import os
 import re
 import threading
@@ -225,8 +226,34 @@ def budget_effort(tokens) -> dict:
     return {"reasoning_effort": "low" if n < 2048 else "medium" if n < 8192 else "xhigh"}
 
 
+# A file a request sends (Chat's "file", Responses' "input_file", an Anthropic PDF document as converted by
+# _anthropic_documents): a "file" item of the template's content until Service.expand_files reads it into text and
+# page images
+FILE_PARTS = ("file", "input_file")
+
+
 def _has_image(content) -> bool:
-    return isinstance(content, list) and any(isinstance(p, dict) and p.get("type") in IMAGE_PARTS for p in content)
+    """Content that must stay a list of parts: a picture in it (or a file, which becomes text and pictures)."""
+    return isinstance(content, list) and any(isinstance(p, dict) and p.get("type") in IMAGE_PARTS + FILE_PARTS
+                                             for p in content)
+
+
+def file_item(part: dict, path: str) -> dict:
+    """A file part -> {"type": "file", "data": a data: URL or None, "url": an http(s) URL or None, "name", "mime"}.
+    A file_id (OpenAI's and Anthropic's Files APIs) is a ValueError: this server keeps no files."""
+    inner = part.get("file")
+    src: dict = inner if part.get("type") == "file" and isinstance(inner, dict) else part
+    if src.get("file_id"):
+        raise ValueError(f"{path}: a file_id needs a Files API, which this server does not have: send the file "
+                         "itself (file_data)")
+    data, url, name = src.get("file_data"), src.get("file_url"), str(src.get("filename") or "")
+    if not (isinstance(data, str) and data) and not (isinstance(url, str) and url):
+        raise ValueError(f"{path}: a file needs file_data (a data: URL or base64) or file_url")
+    if isinstance(data, str) and data and not data.startswith("data:"):
+        guess = mimetypes.guess_type(name)[0] or "application/octet-stream"   # bare base64: the name's type
+        data = f"data:{guess};base64,{data}"
+    mime = data[5:data.find(";")] if isinstance(data, str) and data and ";" in data else None
+    return {"type": "file", "data": data or None, "url": None if data else url, "name": name, "mime": mime}
 
 
 def _image_source(part: dict) -> str:
@@ -254,7 +281,9 @@ def _parts_of(content):
     for part in content:
         if not isinstance(part, dict):
             continue
-        if part.get("type") in IMAGE_PARTS:
+        if part.get("type") in FILE_PARTS:
+            items.append(file_item(part, "content"))
+        elif part.get("type") in IMAGE_PARTS:
             item = {"type": "image", "source": _image_source(part)}
             url = part.get("image_url")
             if (url.get("detail") if isinstance(url, dict) else part.get("detail")) == "low":
@@ -269,7 +298,7 @@ def _parts_of(content):
 # redacted_thinking is allowed only to be dropped without an error: another server's encrypted reasoning, which
 # carries nothing this server can read - the same reason responses.py's _reasoning_text gives for another server's
 # encrypted_content.
-ANTHROPIC_BLOCKS = ("text",) + IMAGE_PARTS + ("thinking", "tool_use", "tool_result", "redacted_thinking")
+ANTHROPIC_BLOCKS = ("text",) + IMAGE_PARTS + FILE_PARTS + ("thinking", "tool_use", "tool_result", "redacted_thinking")
 
 
 def _check_parts(content, path: str, kinds):
@@ -666,10 +695,13 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
             if isinstance(part, dict) and part.get("type") == "input_audio":
                 raise ValueError(f"messages[{i}].content[{j}]: input_audio is not supported: this model does not "
                                  "read audio")
-        # an image is read in a user, tool or assistant message; the system prompt takes text only, as _text_of reads
+            if isinstance(part, dict) and part.get("type") == "file":
+                file_item(part, f"messages[{i}].content[{j}]")   # a file_id or no data is a 400 here
+        # an image (or a file) is read in a user, tool or assistant message; the system prompt takes text only, as
+        # _text_of reads
         images = role in ("user", "tool", "assistant")
         content = _check_parts(m.get("content"), f"messages[{i}].content",
-                               TEXT_PARTS + IMAGE_PARTS if images else TEXT_PARTS)
+                               TEXT_PARTS + IMAGE_PARTS + FILE_PARTS if images else TEXT_PARTS)
         if role == "assistant" and content in (None, "") and isinstance(m.get("refusal"), str):
             content = m["refusal"]                   # a refusal the client sends back is what the model said
         out = {"role": role, "content": _parts_of(content) if images else _text_of(content)}
@@ -800,6 +832,18 @@ def _anthropic_documents(content, path: str):
             if text is not None:
                 head = [x for x in (block.get("title"), block.get("context")) if isinstance(x, str) and x]
                 text = "\n".join(["Document: " + head[0]] + head[1:] + ["", text]) if head else text
+            elif src.get("type") in ("base64", "url", "file"):   # a PDF: read by Service.expand_files
+                name = str(block.get("title") or "")
+                part: dict = {"type": "input_file", "filename": name}
+                if src.get("type") == "base64":
+                    part["file_data"] = f"data:{src.get('media_type') or 'application/pdf'};base64,{src.get('data')}"
+                elif src.get("type") == "url":
+                    part["file_url"] = str(src.get("url") or "")
+                else:
+                    part["file_id"] = src.get("file_id") or "?"
+                file_item(part, f"{path}[{j}]")     # a file_id is a 400 here
+                out.append(part)
+                continue
         elif kind == "search_result":
             body = "\n\n".join(b.get("text") or "" for b in block.get("content") or []
                                if isinstance(b, dict) and b.get("type") == "text")
@@ -834,7 +878,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
             if kind == "text":
                 text.append(block.get("text", ""))
                 parts.append(block)
-            elif kind in IMAGE_PARTS:
+            elif kind in IMAGE_PARTS + FILE_PARTS:
                 parts.append(block)
             elif kind == "thinking":
                 said = block.get("thinking", "")
@@ -855,7 +899,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
                 # puts it beside its call (_order_chat_tool_results): parallel results may come in any order.
                 where = f"messages[{i}].content[{j}].content"
                 result = _parts_of(_check_parts(_anthropic_documents(block.get("content"), where), where,
-                                                TEXT_PARTS + IMAGE_PARTS))
+                                                TEXT_PARTS + IMAGE_PARTS + FILE_PARTS))
                 if block.get("is_error") is True:   # the tool failed: the model is told so, not only its text
                     result = "Error: " + result if isinstance(result, str) else \
                         [{"type": "text", "text": "Error: "}] + list(result or [])

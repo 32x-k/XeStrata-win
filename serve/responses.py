@@ -31,7 +31,7 @@ import time
 import uuid
 from typing import Any
 
-from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs
+from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs, file_item
 
 ENCRYPTED_PREFIX = "strata.r1:"                   # our own reasoning replay strings; others' are ignored
 HOSTED_TOOLS = ("web_search", "web_search_preview", "file_search", "computer_use_preview", "computer_use",
@@ -83,8 +83,14 @@ def _content(content, param):
                 raise ResponsesError("only images given as image_url (a data: or http(s) URL) are supported; "
                                      "this server keeps no files", f"{param}[{j}]", "unsupported_parameter")
             parts.append({"type": "input_image", "image_url": part["image_url"]})
+        elif kind == "input_file":                   # read into text and page images by Service.expand_files
+            try:
+                file_item(part, f"{param}[{j}]")
+            except ValueError as e:
+                raise ResponsesError(str(e), f"{param}[{j}]", "unsupported_parameter") from None
+            parts.append(part)
         else:
-            raise ResponsesError(f"content parts of type {kind!r} are not supported (text and images are)",
+            raise ResponsesError(f"content parts of type {kind!r} are not supported (text, images and files are)",
                                  f"{param}[{j}].type", "unsupported_parameter")
     return _parts_of(parts)
 

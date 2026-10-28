@@ -37,6 +37,7 @@ import collections
 import base64
 import hashlib
 import hmac
+import io
 import codecs
 import json
 import math
@@ -4189,12 +4190,48 @@ class Service:
         if self.prompts is not None:
             self.prompts.forget(ids)
 
+    def expand_files(self, messages, cancel=None):
+        """The files of a request (frontend's "file" items) read into the content: a text file's text, a PDF's text
+        page by page and, with the vision encoder, each page as a picture (read_file).  A file read once is kept for
+        the next request (the client sends the conversation again).  The messages without files are returned as
+        they are."""
+        if not any(isinstance(m.get("content"), list) and any(isinstance(p, dict) and p.get("type") == "file"
+                                                              for p in m["content"]) for m in messages):
+            return messages
+        cache = self.__dict__.setdefault("file_cache", collections.OrderedDict())
+        out = []
+        for m in messages:
+            content = m.get("content")
+            if not isinstance(content, list):
+                out.append(m)
+                continue
+            items: list = []
+            for part in content:
+                if not (isinstance(part, dict) and part.get("type") == "file"):
+                    items.append(part)
+                    continue
+                if cancel is not None and cancel.is_set():
+                    raise ClientGone()
+                data = Vision.load(part["data"]) if part.get("data") else self.download(part["url"])
+                if len(data) > FILE_MAX:
+                    raise ValueError(f"the file {part.get('name') or ''} is over {FILE_MAX >> 20} MiB")
+                key = (hashlib.sha256(data).hexdigest(), self.vision is not None, part.get("name"))
+                if key not in cache:
+                    cache[key] = read_file(data, part.get("mime"), part.get("name") or "", self.vision is not None)
+                    while len(cache) > 8:
+                        cache.popitem(last=False)
+                cache.move_to_end(key)
+                items += cache[key]
+            out.append({**m, "content": items})
+        return out
+
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
         prompt; with thinking, Service.run writes it once the thinking is over."""
         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
         # between pictures and raise ClientGone
+        messages = self.expand_files(messages, cancel)
         # Cached tool images are references in browser history, never arbitrary file paths or huge base64 strings.
         for message in messages:
             for part in message.get("content", []) if isinstance(message.get("content"), list) else []:
@@ -5177,6 +5214,73 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
 
 
 # ------------------------------------------------------------------------------------------------ OpenAI
+FILE_MAX = 32 << 20               # a file a request sends: 32 MiB, as OpenAI's and Anthropic's PDF inputs
+PDF_PAGES_MAX = 100               # a PDF's pages, as Anthropic's limit
+PDF_PAGE_SIDE = 1024              # a PDF page's picture: its longer side, in pixels (the reader shrinks it further
+#                                   to its own image-token limit)
+TEXT_TYPES = ("application/json", "application/xml", "application/x-yaml", "application/yaml",
+              "application/javascript", "application/x-sh", "application/sql", "application/toml")
+
+
+def read_file(data: bytes, mime: str | None, name: str, vision: bool) -> list[dict]:
+    """A file -> the template's content items.  A PDF: its text page by page (pypdf) and, when the model reads
+    pictures, each page as one (pypdfium2), in page order - as OpenAI and Anthropic give a PDF to their models.  A
+    text file (text/*, JSON, XML, YAML, ...; or no type and UTF-8): its text.  Anything else, an encrypted or broken
+    PDF, or more than PDF_PAGES_MAX pages is a ValueError (a 400)."""
+    label = f"File: {name}" if name else "File"
+    if data[:5] == b"%PDF-" or mime == "application/pdf":
+        try:
+            import pypdf
+        except ImportError:
+            raise ValueError("reading a PDF needs the Python package pypdf (setup installs it; the distribution's "
+                             "is python3-pypdf)") from None
+        try:
+            reader = pypdf.PdfReader(io.BytesIO(data))
+            if reader.is_encrypted and not reader.decrypt(""):
+                raise ValueError(f"{label}: the PDF is encrypted")
+            pages = [page.extract_text() or "" for page in reader.pages]
+        except ValueError:
+            raise
+        except Exception as e:  # noqa: BLE001 - pypdf's errors are many: a PDF it cannot read is the request's fault
+            raise ValueError(f"{label}: the PDF could not be read ({type(e).__name__}: {e})") from None
+        if len(pages) > PDF_PAGES_MAX:
+            raise ValueError(f"{label}: the PDF has {len(pages)} pages; at most {PDF_PAGES_MAX} are read")
+        pictures: list = [None] * len(pages)
+        try:
+            import pypdfium2
+        except ImportError:                  # a distribution's package (none has pypdfium2): the text alone
+            if vision and not getattr(read_file, "said", False):
+                read_file.said = True        # type: ignore[attr-defined]
+                print("[strata] a PDF's pages are read as text only: drawing them as pictures needs the Python "
+                      "package pypdfium2 (setup installs it)", flush=True)
+            vision = False
+        if vision:
+            try:
+                pdf = pypdfium2.PdfDocument(data)
+                for k in range(len(pdf)):
+                    page = pdf[k]
+                    image = page.render(scale=PDF_PAGE_SIDE / max(page.get_size())).to_pil()
+                    png = io.BytesIO()
+                    image.save(png, "PNG")
+                    pictures[k] = "data:image/png;base64," + base64.b64encode(png.getvalue()).decode("ascii")
+                pdf.close()
+            except Exception as e:  # noqa: BLE001 - as above
+                raise ValueError(f"{label}: the PDF's pages could not be drawn ({type(e).__name__}: {e})") from None
+        items: list = [{"type": "text", "text": f"{label} ({len(pages)} pages)\n"}]
+        for k, (text, picture) in enumerate(zip(pages, pictures)):
+            items.append({"type": "text", "text": f"\n--- page {k + 1} ---\n{text.strip()}\n"})
+            if picture is not None:
+                items.append({"type": "image", "source": picture})
+        return items
+    if mime and not (mime.startswith("text/") or mime in TEXT_TYPES):
+        raise ValueError(f"{label}: files of type {mime} are not read (text files and PDFs are)")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError(f"{label}: the file is not UTF-8 text (text files and PDFs are read)") from None
+    return [{"type": "text", "text": f"{label}\n\n{text}\n"}]
+
+
 LOW_DETAIL_SIDE = 512             # OpenAI's image_url detail "low": the picture is read at 512 x 512 at most
 
 
@@ -7319,6 +7423,7 @@ def make_handler(svc: Service):
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the request itself: no tools offered
                 tools = None
             messages, _ = anthropic_prepare_format(req, messages, tools)   # its instruction is part of the prompt
+            messages = svc.expand_files(messages)            # a document's text and pages, as the request reads it
             stop_strings(req)                                 # the same 400 as the request itself would get
             check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw, store=False))})
