@@ -171,7 +171,12 @@ int main(int argc, char** argv) {
             sync("timing loop");
             const double ms =
                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-            return ms / iters;
+            // SYCL port: the printout below and the GB/s it derives both assume MICROseconds ("all %7.1f us",
+            // bytes / us / 1e3), but this returned milliseconds - so every published number was 1000x too small in
+            // time and 1000x too large in bandwidth (0.1 "us" and 148,713 GB/s for a launch that takes ~100 us and
+            // moves 19.7 MB at ~198 GB/s).  The wall clock always agreed with the real work: 200 iterations 618 ms,
+            // 2,000 iterations 3,566 ms.  Return microseconds.
+            return ms * 1e3 / iters;
         };
         const double gu_b = (double) G * 2 * f.up_off, d_b = (double) G * dsz;
         double us[2][3] = {{1e30, 1e30, 1e30}, {1e30, 1e30, 1e30}};
