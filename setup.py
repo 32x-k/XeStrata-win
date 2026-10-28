@@ -1388,11 +1388,11 @@ PACKAGES = {
 # The packages of the tools setup does not install itself, for its messages, by distro_family()
 TOOL_PACKAGES = {
     "ubuntu": {"g++": "build-essential", "glslc": "glslc", "vulkan": "libvulkan-dev", "spirv": "spirv-headers",
-               "pdf": "poppler-utils"},
+               "pdf": "poppler-utils", "jsonschema": "python3-jsonschema"},
     "fedora": {"g++": "gcc-c++", "glslc": "glslc", "vulkan": "vulkan-loader-devel", "spirv": "spirv-headers-devel",
-               "pdf": "poppler-utils"},
+               "pdf": "poppler-utils", "jsonschema": "python3-jsonschema"},
     "arch": {"g++": "base-devel", "glslc": "shaderc", "vulkan": "vulkan-headers", "spirv": "spirv-headers",
-             "pdf": "poppler"},
+             "pdf": "poppler", "jsonschema": "python-jsonschema"},
 }
 
 # The command that installs distribution packages on this PC, by distro_family()
@@ -1901,6 +1901,7 @@ def check_runtime(makers: set, gfx: set, data: Path, yes: bool = False, explicit
     check_level_zero(makers, yes, explicit)
     linux_nvidia_libs(makers, data, (packaged_engine().get("runtime") or {}).get("nvidia_pip") or [])
     check_pdf()
+    check_jsonschema()
     need, fast, repos = runtime_missing(makers)
     if not need and not fast:
         return
@@ -1921,6 +1922,18 @@ def check_pdf() -> None:
         return
     warn("a PDF a request sends is read with poppler's pdftotext and pdftoppm (without them it is refused):")
     say(f"  {install_cmd([tool_pkg('pdf')])}")
+
+
+def check_jsonschema() -> None:
+    """Linux: response_format json_schema and strict tools are checked with the Python package jsonschema - pip
+    installs it into .venv, and the deb and rpm packages recommend the distribution's.  Without it only that an answer
+    is one JSON object is checked: said, with the command that installs it, never a stop."""
+    import importlib.util
+    if importlib.util.find_spec("jsonschema") is not None:
+        return
+    warn("json_schema answers and strict tool calls are checked with the Python package jsonschema (without it "
+         "only that an answer is one JSON object):")
+    say(f"  {install_cmd([tool_pkg('jsonschema')])}")
 
 
 def rocm_missing() -> list:
@@ -5285,7 +5298,7 @@ def update_install(have: list) -> int:
         return 0
     if not PACKAGED:
         pip_install(requirement_lines() if REQUIREMENTS.exists() else PY_PACKAGES,
-                    "numpy, jinja2, regex, pyyaml, tqdm, requests, pillow, psutil")
+                    "numpy, jinja2, regex, pyyaml, tqdm, requests, pillow, psutil, jsonschema")
     update_installed_engine()
     mtp_done: set = set()
     for cfg_path in have:
@@ -5814,7 +5827,7 @@ def prepare_engine(a, gpu: dict, vision: str) -> tuple[Path, Path, str, list]:
         ok("the distribution's Python packages (installed with XeStrata's package)")
     else:
         pip_install(requirement_lines() if REQUIREMENTS.exists() else PY_PACKAGES,
-                    "numpy, jinja2, regex, pyyaml, tqdm, requests, pillow, psutil")
+                    "numpy, jinja2, regex, pyyaml, tqdm, requests, pillow, psutil, jsonschema")
 
     # ---- 4. the engine
     step(4, "the Strata engine")

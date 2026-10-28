@@ -122,6 +122,15 @@ class UnreadContentParts(unittest.TestCase):
                     {"role": "user", "content": [{"type": "text", "text": "go"}]}]})
                 self.assertEqual(got, want)
 
+    def test_messages_document_images_are_read(self):
+        # a "content" document's images reach the model as the message's own images do, after its text
+        img = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA"}}
+        doc = {"type": "document", "title": "T",
+               "source": {"type": "content", "content": [img, {"type": "text", "text": "body"}]}}
+        got = anthropic_to_messages({"messages": [{"role": "user", "content": [doc]}]})[0]
+        self.assertEqual(got[0]["content"], [{"type": "text", "text": "Document: T\n\nbody"},
+                                             {"type": "image", "source": "data:image/png;base64,AA"}])
+
     def test_messages_tool_reference_in_a_tool_result_is_left_out(self):
         def run(extra):
             return anthropic_to_messages({"messages": [

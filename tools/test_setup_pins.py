@@ -198,10 +198,13 @@ class Requirements(unittest.TestCase):
         lines = setup.requirement_lines()
         legacy = sorted(setup.PY_PACKAGES) + ["nvidia-cublas==13.0.2.14"]
         deps = {"markupsafe", "certifi", "charset-normalizer", "idna", "urllib3", "colorama"}
-        self.assertEqual(self.pip(legacy, lines, installed=deps)[0], [])
+        # jsonschema came after the pins (json_schema's and strict tools' checks): it and what it takes are installed
+        added = {"jsonschema", "attrs", "jsonschema-specifications", "referencing", "rpds-py", "typing-extensions"}
+        newer = [x for x in lines if setup.req_name(x) in added]
+        self.assertEqual(self.pip(legacy, lines, installed=deps)[0], newer)
         missing = [p for p in legacy if p != "psutil"]                         # an older list without psutil
         ran, _ = self.pip(missing, lines, installed=deps)
-        self.assertEqual(ran, ["psutil==7.2.2"])
+        self.assertEqual([x for x in ran if x not in newer], ["psutil==7.2.2"])
 
     def test_a_changed_pin_is_installed(self):
         lines = setup.requirement_lines()

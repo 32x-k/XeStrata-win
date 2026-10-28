@@ -208,6 +208,35 @@ class Structured(unittest.TestCase):
                     self.assertIn("only JSON objects", reply["error"]["message"])
             load.assert_not_called()
 
+    @unittest.skipUnless(HAVE_JSONSCHEMA, "jsonschema is not installed")
+    def test_strict_tool_calls_are_checked(self):
+        # a strict tool's call is checked against its parameters before it is sent, with no grammar on the engine (the
+        # mock has none, as another call form or an engine without grammars); a Responses namespace's and
+        # additional_tools' strict tools are found under the names the template has
+        tool = {"type": "function", "function": {"name": "f", "strict": True, "parameters": object_schema(
+            {"days": {"type": "integer"}})}}
+
+        def call(days):
+            return f"<tool_call>\n<function=f>\n<parameter=days>\n{days}\n</parameter>\n</function>\n</tool_call>"
+        req = {"messages": [{"role": "user", "content": "plan"}], "tools": [tool], "reasoning_effort": "none"}
+        self.engine = self.svc.engine = MockEngine(self.tok, call(3), max_context=16384)
+        code, reply = self.request("/v1/chat/completions", req)
+        self.assertEqual(code, 200, reply)
+        self.assertEqual(json.loads(reply["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]),
+                         {"days": 3})
+        self.engine = self.svc.engine = MockEngine(self.tok, call("three"), max_context=16384)
+        code, reply = self.request("/v1/chat/completions", req)
+        self.assertEqual(code, 502)
+        self.assertEqual(reply["error"]["code"], "structured_output_failed")
+        _, raw = self.request("/v1/chat/completions", {**req, "stream": True})
+        self.assertIn('"structured_output_failed"', raw)
+        self.assertNotIn('"tool_calls"', raw)
+        from serve.responses import given_tools
+        member = {"name": "g", "strict": True, "parameters": {"type": "object"}}
+        ns = {"model": "m", "tools": [{"type": "namespace", "name": "ns", "tools": [member]}],
+              "input": [{"type": "additional_tools", "tools": [{"type": "function", **member, "name": "h"}]}]}
+        self.assertEqual(structured.constrained_tools(given_tools(ns))[0], {"ns.g", "h"})
+
     def test_the_server_does_not_import_jsonschema_at_start(self):
         import subprocess
         import sys

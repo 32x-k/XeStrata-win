@@ -68,16 +68,16 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.sh) as well as a 
 SETUP_CMD = "xestrata" if (ROOT / "PACKAGED").is_file() else "./setup.sh"   # a deb or rpm package's command (setup.py)
 from serve.frontend import (THINK_END, ChatTemplate, Event, GlmOutputParser, HarmonyParser,  # noqa: E402
                             OutputParser, ToolCall, allowed_tools, anthropic_format, anthropic_to_messages,
-                            custom_tool_names, forced_call, images_of, literal_tags, thinking_signature,
-                            mark_think_literals,
+                            custom_tool_names, forced_call, images_of, legacy_function_call, legacy_functions,
+                            literal_tags, thinking_signature, mark_think_literals,
                             openai_to_messages, require_messages, tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, McpHub, hub_from_config  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve import release_check  # noqa: E402
-from serve.structured import (StructuredOutputError, answer_grammar, constrained_tools,  # noqa: E402
-                              extract_json, prepare_format, tool_grammar, validated_json)
+from serve.structured import (StructuredOutputError, answer_grammar, checked_calls, constrained_tools,  # noqa: E402
+                              extract_json, prepare_format, strict_schemas, tool_grammar, validated_json)
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
@@ -3516,6 +3516,13 @@ class Service:
         req["strata_grammar"] = {**grammar, "vocab": self.tokenizer_dir, "prefix": ""}
         return True
 
+    def check_strict(self, req: dict, tools, strict: set) -> None:
+        """The request's strict tools (`strict`: constrained_tools' names) have their calls checked against their
+        parameters before they are sent (structured.checked_calls, in run), whether or not a grammar wrote them."""
+        schemas = strict_schemas(tools, strict)
+        if schemas:
+            req["strata_strict_tools"] = schemas
+
     def reasoning_budget(self, req) -> int | None:
         """#123: the most tokens this request may think, or None: the request's `reasoning_budget_tokens` (or, as
         llama.cpp reads it, `thinking_budget_tokens`), else the config's.  0 (or less) means no budget, so a request can
@@ -4243,6 +4250,12 @@ class Service:
             out.append({**m, "content": items})
         return out
 
+    def forced_ids(self, force, kwargs) -> list[int]:
+        """The tokens of a forced call's opening (forced_call) that end the prompt: without thinking the reply starts
+        with it (see run); with thinking it is written after the thinking, as part of the reply."""
+        return self.tok.encode(force, parse_special=True) if force and kwargs.get("enable_thinking", True) is False \
+            else []
+
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
@@ -4272,8 +4285,7 @@ class Service:
                         part["source"] = str(image)
         fetched = self._note_unreadable_tool_images(messages, cancel)
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
-        if force and kwargs.get("enable_thinking", True) is False:
-            ids = ids + self.tok.encode(force, parse_special=True)
+        ids = ids + self.forced_ids(force, kwargs)
         self.embeddings.path = None
         self.embeddings.keys = None
         images = images_of(messages)
@@ -4497,6 +4509,12 @@ class Service:
             declared_only=False) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
+        strict = (sampling or {}).get("strata_strict_tools")
+        if strict:                     # the strict tools' calls, checked before they are sent (check_strict)
+            rest = {k: v for k, v in sampling.items() if k != "strata_strict_tools"}
+            yield from checked_calls(self.run(ids, thinking, tools, max_new, rest, cancel, force, declared_only),
+                                     strict)
+            return
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
         # apps; the request's own fields win over all of them
         defaults = {**model_card_sampling(self.model_arch, thinking), **self.sampling_defaults, **self.shared}
@@ -5551,6 +5569,18 @@ def prompt_progress(svc: Service):
             "time_ms": int(getattr(engine, "progress_ms", 0) or 0)}
 
 
+def legacy_chunks(chunks):
+    """A stream's chunks for a `functions` request (frontend.legacy_functions): each choice's call as the old
+    function_call (legacy_function_call).  Closing it closes the stream it reads."""
+    try:
+        for c in chunks:
+            for choice in (c or {}).get("choices") or ():
+                legacy_function_call(choice)
+            yield c
+    finally:
+        chunks.close()
+
+
 def openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, run=None, force=None):
     """With `logprobs` asked (upstream's Intel port 4ba35fd), each chunk carries the log-probabilities of the tokens
     the engine wrote since the last one (the model's, before sampling, temperature and penalties; the stop token is
@@ -6086,8 +6116,8 @@ def body_limit() -> int:
 
 def parse_multipart(ctype: str, body: bytes) -> tuple[dict, list[bytes]]:
     """A multipart/form-data body (OpenAI's /v1/images/edits) -> (its text fields, the bytes of its image or image[]
-    files in order); whole numbers in the fields (n, seed, steps, output_compression) as ints, the mask file's bytes
-    as "mask"."""
+    files in order); whole numbers in the fields (n, seed, steps, output_compression, partial_images) as ints, stream's
+    true or false (as OpenAI's SDK writes a boolean in a form) as a bool, the mask file's bytes as "mask"."""
     from email.parser import BytesParser
     from email.policy import HTTP
     msg = BytesParser(policy=HTTP).parsebytes(b"Content-Type: " + ctype.encode("latin-1") + b"\r\n\r\n" + body)
@@ -6105,8 +6135,11 @@ def parse_multipart(ctype: str, body: bytes) -> tuple[dict, list[bytes]]:
             fields["mask"] = data
         elif isinstance(name, str) and name:
             value = data.decode("utf-8", "replace")
-            whole = name in ("n", "seed", "steps", "output_compression") and value.strip().isdigit()
-            fields[name] = int(value) if whole else value
+            whole = name in ("n", "seed", "steps", "output_compression", "partial_images") and value.strip().isdigit()
+            if name == "stream" and value.strip().lower() in ("true", "false"):
+                fields[name] = value.strip().lower() == "true"
+            else:
+                fields[name] = int(value) if whole else value
     return fields, files
 
 
@@ -7168,6 +7201,17 @@ def make_handler(svc: Service):
 
         def _openai(self, req):
             req = svc.with_shared(req, "openai")
+            legacy = legacy_functions(req)                    # the old functions / function_call, as tools
+            req = legacy or req
+            modalities = req.get("modalities")
+            if req.get("audio") is not None or modalities is not None and (
+                    not isinstance(modalities, list) or any(m != "text" for m in modalities)):
+                raise ValueError("modalities: this server answers in text only (no audio output)")
+            for key in ("max_completion_tokens", "max_tokens"):   # OpenAI's integers: 2.9 is a 400, not 2
+                v = req.get(key)
+                if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float))
+                                      or isinstance(v, float) and not v.is_integer()):
+                    raise ValueError(f"{key} must be a whole number")
             bias_api.normalize(req.get("logit_bias"), len(getattr(svc.tok, "tokens", ())) or None)
             messages, tools, kw = openai_to_messages(req)
             require_messages(messages)   # an empty conversation is a 400, as OpenAI answers it, not a reply to nothing
@@ -7234,8 +7278,10 @@ def make_handler(svc: Service):
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             form = getattr(svc.template, "call_form", "qwen")
             # the engine writes the answer, or a strict tool's call, under its schema when it can (structured.py)
+            strict, patterns = constrained_tools(req.get("tools"))
             svc.attach_grammar(req, answer_grammar(req.get("response_format"), thinking) if validator is not None
-                               else tool_grammar(tools, *constrained_tools(req.get("tools")), thinking, form))
+                               else tool_grammar(tools, strict, patterns, thinking, form))
+            svc.check_strict(req, tools, strict)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             run = run_with_mcp(svc, hubs[0] if len(hubs) == 1 else ToolHubs(hubs), messages, tools, kw, ids,
                                thinking, max_new, max_req, req, cancel, {t["name"] for t in extra}) if use_mcp else None
@@ -7257,7 +7303,12 @@ def make_handler(svc: Service):
                     chunks = structured_chunks(chunks, validator)
             chunks = self._capture(chunks, "openai")
             if not req.get("stream"):
-                return self._json(200, openai_collect_choices(chunks) if n > 1 else openai_collect(chunks))
+                body = openai_collect_choices(chunks) if n > 1 else openai_collect(chunks)
+                for c in body["choices"] if legacy else ():
+                    legacy_function_call(c)
+                return self._json(200, body)
+            if legacy:
+                chunks = legacy_chunks(chunks)
             self._sse()
             options = req.get("stream_options")
             last = None
@@ -7413,10 +7464,13 @@ def make_handler(svc: Service):
                 self._responses_failed(asm, str(e), "server_error", send)
 
         def _responses_failed(self, asm, message, code, send):
+            # OpenAI's order: the error event, then response.failed - made in that order, as the sequence numbers
+            # count as the events are made
+            err = asm.error(message, code)
             e = asm.failed(message, code)
             self._note(error=e["response"]["error"])
             try:
-                send(asm.error(message, code))               # OpenAI's order: the error event, then response.failed
+                send(err)
                 send(e)
                 self.wfile.flush()
             except OSError:
@@ -7550,10 +7604,12 @@ def make_handler(svc: Service):
             if svc.codex_compaction_cache:
                 responses_api.prompt_made(req, shown)
             req = dict(req)
+            strict, patterns = constrained_tools(responses_api.given_tools(req))   # namespaces' and additional_tools'
             svc.attach_grammar(req, answer_grammar(responses_api.text_format(req), thinking)
                                if validator is not None and not tools
-                               else tool_grammar(tools, *constrained_tools(req.get("tools")), thinking,
+                               else tool_grammar(tools, strict, patterns, thinking,
                                                  getattr(svc.template, "call_form", "qwen")))
+            svc.check_strict(req, tools, strict)
             _debug_req("responses", req, messages, tools, max_new, thinking, len(ids))
             asm = responses_api.Assembler(req, svc.model_for(req), len(ids), names,
                                           "reasoning.encrypted_content" in include, validator is not None)
@@ -7568,11 +7624,13 @@ def make_handler(svc: Service):
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the request itself: no tools offered
                 tools = None
+            force = forced_call(req.get("tool_choice"), tools, getattr(svc.template, "call_form", "qwen"))
             messages, _ = anthropic_prepare_format(req, messages, tools)   # its instruction is part of the prompt
             messages = svc.expand_files(messages)            # a document's text and pages, as the request reads it
             stop_strings(req)                                 # the same 400 as the request itself would get
             check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
-            self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw, store=False))})
+            ids = svc.encode_prompt(messages, tools, kw, store=False) + svc.forced_ids(force, kw)   # as prepare()
+            self._json(200, {"input_tokens": len(ids)})
 
         def _anthropic(self, req):
             asked = req.get("max_tokens")                     # Anthropic's required field (the shared settings' own
@@ -7594,9 +7652,11 @@ def make_handler(svc: Service):
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            strict, patterns = constrained_tools(req.get("tools"))
             svc.attach_grammar(req, answer_grammar(anthropic_format(req), thinking) if validator is not None
-                               else tool_grammar(tools, *constrained_tools(req.get("tools")), thinking,
+                               else tool_grammar(tools, strict, patterns, thinking,
                                                  getattr(svc.template, "call_form", "qwen")))
+            svc.check_strict(req, tools, strict)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
             if validator is not None:

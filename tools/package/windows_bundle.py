@@ -48,8 +48,8 @@ FORBIDDEN = ("vcruntime*.dll", "msvcp*.dll", "concrt*.dll", "ucrtbase*.dll", "ap
 # the Python packages the 7z carries (requirements.txt, and colorama, which tqdm takes on
 # Windows): a wheel not named here stops the script
 WHEELS = ("numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "pillow", "psutil", "pypdf", "pypdfium2",
-          "markupsafe", "certifi", "charset-normalizer", "charset_normalizer", "idna", "urllib3", "typing_extensions",
-          "colorama", "pip")
+          "jsonschema", "markupsafe", "certifi", "charset-normalizer", "charset_normalizer", "idna", "urllib3",
+          "typing_extensions", "attrs", "jsonschema_specifications", "referencing", "rpds_py", "colorama", "pip")
 
 # name, version (a key of `versions`, or the text), license, source, license texts (paths relative to `roots`' keys, or
 # URLs), the files in the folder it covers (globs relative to its top)

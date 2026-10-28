@@ -808,9 +808,9 @@ def _signed_thinking(signature, where: str) -> str | None:
 
 def _anthropic_documents(content, path: str):
     """Anthropic's text documents and search results -> text blocks the template reads: a document's text
-    (source "text", or "content" blocks) under its title and context, a search result's text under its title and
-    source.  A PDF document is left as it is (not read yet).  citations.enabled: true is a 400: no citations are
-    made."""
+    (source "text", or "content" blocks) under its title and context, a "content" document's images after it as image
+    blocks of their own, a search result's text under its title and source.  A PDF document is left as it is (not
+    read yet).  citations.enabled: true is a 400: no citations are made."""
     if not isinstance(content, list):
         return content
     out = []
@@ -820,7 +820,7 @@ def _anthropic_documents(content, path: str):
             cite = block.get("citations")
             if isinstance(cite, dict) and cite.get("enabled") is True:
                 raise ValueError(f"{path}[{j}].citations: citations are not supported by this server")
-        text = None
+        text, images = None, []
         if kind == "document":
             src = block.get("source") if isinstance(block.get("source"), dict) else {}
             if src.get("type") == "text":
@@ -829,6 +829,8 @@ def _anthropic_documents(content, path: str):
                 inner = src.get("content")
                 text = inner if isinstance(inner, str) else "\n\n".join(
                     b.get("text") or "" for b in inner or [] if isinstance(b, dict) and b.get("type") == "text")
+                images = [] if isinstance(inner, str) else [
+                    b for b in inner or [] if isinstance(b, dict) and b.get("type") == "image"]
             if text is not None:
                 head = [x for x in (block.get("title"), block.get("context")) if isinstance(x, str) and x]
                 text = "\n".join(["Document: " + head[0]] + head[1:] + ["", text]) if head else text
@@ -849,6 +851,7 @@ def _anthropic_documents(content, path: str):
                                if isinstance(b, dict) and b.get("type") == "text")
             text = f"Search result: {block.get('title') or ''} ({block.get('source') or ''})\n\n{body}"
         out.append({"type": "text", "text": text} if text is not None else block)
+        out += images
     return out
 
 
@@ -1153,6 +1156,45 @@ def allowed_tools(tool_choice, tools: list[dict] | None, more: dict | None = Non
     if unknown:
         raise ValueError(f"tool_choice.allowed_tools names tools the request does not have: {', '.join(unknown)}")
     return [t for t in tools or [] if t.get("name") in names], mode
+
+
+def legacy_functions(req: dict) -> dict | None:
+    """OpenAI's deprecated `functions` and `function_call` (before tools) -> the request with `tools` and `tool_choice`
+    in their place and one call at a time (the old shape answers with one), or None when it has neither.  Mixed with
+    tools or tool_choice, or a function_call without functions, it is a 400."""
+    if "functions" not in req and "function_call" not in req:
+        return None
+    if req.get("tools") is not None or req.get("tool_choice") is not None:
+        raise ValueError("functions and function_call cannot be used with tools or tool_choice")
+    fns = req.get("functions")
+    if not isinstance(fns, list) or not fns or not all(isinstance(f, dict) for f in fns):
+        raise ValueError("functions must be a non-empty array of function objects")
+    choice = req.get("function_call")
+    if isinstance(choice, dict) and isinstance(choice.get("name"), str):
+        choice = {"type": "function", "function": {"name": choice["name"]}}
+    elif choice not in (None, "none", "auto"):
+        raise ValueError('function_call must be "none", "auto" or {"name": ...}')
+    out = {k: v for k, v in req.items() if k not in ("functions", "function_call")}
+    out.update(tools=[{"type": "function", "function": f} for f in fns], parallel_tool_calls=False)
+    if choice is not None:
+        out["tool_choice"] = choice
+    return out
+
+
+def legacy_function_call(choice: dict) -> dict:
+    """A reply's choice (a message or a stream's delta) for a `functions` request: its call as the old function_call
+    and finish_reason "function_call", as OpenAI answers one."""
+    for key in ("message", "delta"):
+        m = choice.get(key)
+        if not isinstance(m, dict):
+            continue
+        calls = m.pop("tool_calls", None)
+        if calls:
+            fn = calls[0].get("function") or {}
+            m["function_call"] = {k: fn[k] for k in ("name", "arguments") if k in fn}
+    if choice.get("finish_reason") == "tool_calls":
+        choice["finish_reason"] = "function_call"
+    return choice
 
 
 def forced_call(tool_choice, tools: list[dict] | None, form: str = "qwen") -> str | None:

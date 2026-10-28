@@ -338,9 +338,8 @@ def _order_tool_results(messages):
             c.pop("_call_id", None)
 
 
-def request_tools(req: dict):
-    """-> (template tools or None, {template name: (namespace, name, kind)}, names of hosted tools left out)."""
-    tools, names, skipped = [], {}, []
+def given_tools(req: dict) -> list:
+    """The request's tools as sent, with those of its `additional_tools` input items after them."""
     given = req.get("tools") or []
     if not isinstance(given, list):
         raise ResponsesError("tools must be an array", "tools")
@@ -350,7 +349,13 @@ def request_tools(req: dict):
     extra = [t for item in (items if isinstance(items, list) else [])
              if isinstance(item, dict) and item.get("type") == "additional_tools"
              and isinstance(item.get("tools"), list) for t in item["tools"]]
-    given = list(given) + extra
+    return list(given) + extra
+
+
+def request_tools(req: dict):
+    """-> (template tools or None, {template name: (namespace, name, kind)}, names of hosted tools left out)."""
+    tools, names, skipped = [], {}, []
+    given = given_tools(req)
 
     def add(tool, param, namespace=None, ns_description=""):
         kind = tool.get("type")
