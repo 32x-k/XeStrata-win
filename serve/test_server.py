@@ -1695,6 +1695,61 @@ class UnsupportedOrOld(unittest.TestCase):
             httpd.server_close()
 
 
+class NamedToolChoice(unittest.TestCase):
+    """A tool_choice that names tool a: the reply's one call is a's, on every API - a call of b written in the
+    thinking, or after the forced call, is not returned as a call."""
+
+    def run_api(self, script, path, body):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, script, max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}{path}",
+                                         data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.read().decode()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_only_the_named_tool_is_called(self):
+        params = {"type": "object", "properties": {"x": {"type": "string"}}}
+
+        def call(name):
+            return f"<tool_call>\n<function={name}>\n<parameter=x>\n1\n</parameter>\n</function>\n</tool_call>"
+        in_thinking = call("b") + "</think>\n\n"
+        after = "<parameter=x>\n1\n</parameter>\n</function>\n</tool_call>\n" + call("b")   # after the forced opening
+        user = [{"role": "user", "content": "go"}]
+        chat = {"model": "m", "messages": user, "max_tokens": 400,
+                "tools": [{"type": "function", "function": {"name": n, "parameters": params}} for n in "ab"],
+                "tool_choice": {"type": "function", "function": {"name": "a"}}}
+        anthropic = {"model": "m", "messages": user, "max_tokens": 400,
+                     "tools": [{"name": n, "input_schema": params} for n in "ab"],
+                     "tool_choice": {"type": "tool", "name": "a"}}
+        responses = {"model": "m", "input": "go",
+                     "tools": [{"type": "function", "name": n, "parameters": params} for n in "ab"],
+                     "tool_choice": {"type": "function", "name": "a"}}
+        for name, script, path, body in (
+                ("chat, thinking", in_thinking, "/v1/chat/completions", chat),
+                ("chat, no thinking", after, "/v1/chat/completions",
+                 {**chat, "chat_template_kwargs": {"enable_thinking": False}}),
+                ("anthropic, thinking", in_thinking, "/v1/messages",
+                 {**anthropic, "max_tokens": 4000, "thinking": {"type": "enabled", "budget_tokens": 1024}}),
+                ("anthropic, no thinking", after, "/v1/messages", anthropic),
+                ("responses, thinking", in_thinking, "/v1/responses", responses)):
+            with self.subTest(name):
+                out = json.loads(self.run_api(script, path, body))
+                if path == "/v1/chat/completions":
+                    names = [c["function"]["name"] for c in out["choices"][0]["message"].get("tool_calls") or []]
+                elif path == "/v1/messages":
+                    names = [b["name"] for b in out["content"] if b["type"] == "tool_use"]
+                else:
+                    names = [o["name"] for o in out["output"] if o["type"] == "function_call"]
+                self.assertNotIn("b", names)
+                self.assertLessEqual(len(names), 1)
+
+
 class ToolArguments(unittest.TestCase):
     """#510: one helper for both frontends; a history whose arguments are not a JSON object is kept, not a 500."""
 

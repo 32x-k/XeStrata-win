@@ -4538,6 +4538,14 @@ class Service:
         choice = (sampling or {}).get("tool_choice")
         one_call = (sampling or {}).get("parallel_tool_calls") is False or \
             isinstance(choice, dict) and choice.get("disable_parallel_tool_use") is True
+        # a tool_choice that names a tool (its opening forced): the reply's one call is that tool's - a call of another
+        # (one written in the thinking, or after the forced one) stays text, as an undeclared tool's does
+        kind, only = tool_choice_of(choice)
+        if force and kind == "named":
+            if isinstance(choice, dict) and isinstance(choice.get("namespace"), str):   # Responses' namespace.name
+                only = f"{choice['namespace']}.{only}"
+            tools = [t for t in tools or [] if isinstance(t, dict) and t.get("name") == only]
+            declared_only = one_call = True
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         # the Harmony format writes its reasoning in a channel: the budget's and the loop recovery's closing text is
         # Qwen's <think> form, so neither applies to it
