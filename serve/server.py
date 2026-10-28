@@ -59,7 +59,7 @@ from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterator, Protocol, cast
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -5486,6 +5486,48 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
             yield last
 
 
+def openai_choices(n: int, choice):
+    """The chunks of n choices (`choice(k)`: choice k's chunks), one choice after another, each chunk under its
+    choice's index.  The usage is the request's: the prompt once, every choice's completion tokens, on the last
+    choice's finishing chunk.  A choice that fails ends the whole request."""
+    total: dict | None = None
+    for k in range(n):
+        chunks = choice(k)
+        try:
+            for c in chunks:
+                if c is None or not c.get("choices"):
+                    yield c
+                    continue
+                c["choices"][0]["index"] = k
+                if "usage" in c:
+                    u = c.pop("usage")
+                    if total is None:
+                        total = u
+                    else:
+                        done = total["completion_tokens"] + u["completion_tokens"]
+                        thought = sum((x.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0
+                                      for x in (total, u))
+                        total = {**total, "completion_tokens": done, "total_tokens": total["prompt_tokens"] + done,
+                                 "completion_tokens_details": {"reasoning_tokens": thought}}
+                    if k == n - 1:
+                        c["usage"] = total
+                yield c
+        finally:
+            chunks.close()
+
+
+def openai_collect_choices(chunks) -> dict:
+    """openai_collect for n choices: each choice's chunks collected on their own, then one response."""
+    groups: dict = {}
+    for c in chunks:
+        if c is not None:
+            groups.setdefault(c["choices"][0]["index"], []).append(c)
+    outs = [openai_collect(groups[k]) for k in sorted(groups)]
+    out = outs[-1]
+    out["choices"] = [{**o["choices"][0], "index": k} for k, o in zip(sorted(groups), outs)]
+    return out
+
+
 def _is_json(text: str) -> bool:
     try:
         json.loads(text)
@@ -5534,7 +5576,7 @@ def openai_collect(chunks) -> dict:
     out = {"id": last["id"], "object": "chat.completion", "created": last["created"], "model": last["model"],
            **({"system_fingerprint": last["system_fingerprint"]} if "system_fingerprint" in last else {}),
            "choices": [{"index": 0, "message": msg, "finish_reason": last["choices"][0]["finish_reason"]}],
-           "usage": last["usage"]}
+           "usage": last.get("usage")}
     if last.get("timings"):
         out["timings"] = last["timings"]
     if last.get("strata_rejected_tool_calls"):
@@ -6314,24 +6356,17 @@ def make_handler(svc: Service):
                 self._json(200, s)
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
-                    loaded = svc.loaded()
-                    model = {"id": svc.model, "object": "model", "status": {"value": "loaded"},
-                             "meta": {"n_ctx": svc.reported_ctx()},
-                             "architecture": {"input_modalities": (["text", "image"] if svc.vision is not None
-                                                                   else ["text"]),
-                                              "output_modalities": ["text"]}}
-                    if not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
-                        model["status"] = {"value": "unloaded"}   # like llama-server's router: listed, loads on use
-                        loaded = True
-                    if svc.aliases:                       # #297: the aliases, and each one listed under its own id
-                        model["aliases"] = list(svc.aliases)
-                    data = [model, *({**model, "id": x, "alias_of": svc.model} for x in svc.aliases)]
-                    data = data if loaded else []
-                    if svc.images is not None:            # the image models: POST /v1/images/generations
-                        data += [{"id": m["id"], "object": "model", "status": {"value": "loaded"},
-                                  "architecture": {"input_modalities": ["text"], "output_modalities": ["image"]}}
-                                 for m in svc.images.models()]
-                    self._json(200, {"object": "list", "data": data})
+                    self._json(200, {"object": "list", "data": self._models()})
+            elif path.startswith("/v1/models/"):         # OpenAI's retrieve: one model by its id
+                if self._authorized():
+                    want = unquote(path[len("/v1/models/"):])
+                    found = next((m for m in self._models() if m["id"] == want), None)
+                    if found is None:
+                        self._json(404, {"error": {"message": f"The model '{want}' does not exist",
+                                                   "type": "invalid_request_error", "param": "model",
+                                                   "code": "model_not_found"}})
+                    else:
+                        self._json(200, found)
             elif path == "/props":
                 if self._authorized():
                     self._props()
@@ -6359,6 +6394,26 @@ def make_handler(svc: Service):
                     self._json(200, svc.v1_status())
             else:
                 self._json(404, {"error": {"message": f"Invalid URL (GET {path})", "type": "invalid_request_error"}})
+
+        def _models(self) -> list[dict]:
+            """GET /v1/models' list: the text model (its status: loaded, loading, or unloaded and loaded on use, as
+            llama-server's router lists them), each alias under its own id (#297), and the image models.  OpenAI's
+            created and owned_by: the server's start and "xestrata"."""
+            status = "loaded" if svc.loaded() else "unloaded" \
+                if svc.idle_unload_s or getattr(svc.engine, "unloaded", False) else "loading"
+            common = {"object": "model", "created": int(svc.started_at), "owned_by": "xestrata"}
+            model = {"id": svc.model, **common, "status": {"value": status},
+                     "meta": {"n_ctx": svc.reported_ctx()},
+                     "architecture": {"input_modalities": (["text", "image"] if svc.vision is not None else ["text"]),
+                                      "output_modalities": ["text"]}}
+            if svc.aliases:
+                model["aliases"] = list(svc.aliases)
+            data = [model, *({**model, "id": x, "alias_of": svc.model} for x in svc.aliases)]
+            if svc.images is not None:                    # the image models: POST /v1/images/generations
+                data += [{"id": m["id"], **common, "status": {"value": "loaded"},
+                          "architecture": {"input_modalities": ["text"], "output_modalities": ["image"]}}
+                         for m in svc.images.models()]
+            return data
 
         def do_POST(self):
             try:
@@ -6893,18 +6948,36 @@ def make_handler(svc: Service):
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
             check_logprobs(req)                               # ... and top_logprobs out of 0..20
+            n = 1 if req.get("n") is None else req["n"]
+            if isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= 128:
+                raise ValueError("n must be a whole number from 1 to 128")
+            if n > 1 and use_mcp:
+                raise ValueError("n above 1 with MCP or image tools is not supported")
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             run = run_with_mcp(svc, hubs[0] if len(hubs) == 1 else ToolHubs(hubs), messages, tools, kw, ids,
                                thinking, max_new, max_req, req, cancel, {t["name"] for t in extra}) if use_mcp else None
-            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
-            if validator is not None:
-                chunks = structured_chunks(chunks, validator)
+            if n > 1:
+                first = (ids, thinking, max_new)
+
+                def choice(k):
+                    # each choice its own run of the same prompt (the conversation cache holds it after the first);
+                    # a request's seed gives each choice its own, seed + k
+                    sub = {**req, "seed": req["seed"] + k} if k and type(req.get("seed")) is int else req
+                    got = first if k == 0 else svc.prepare(messages, tools, kw, max_req, force=force, req=sub,
+                                                           cancel=cancel)
+                    c = openai_chunks(svc, sub, *got[:2], tools, got[2], cancel, force=force)
+                    return structured_chunks(c, validator) if validator is not None else c
+                chunks = openai_choices(n, choice)
+            else:
+                chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
+                if validator is not None:
+                    chunks = structured_chunks(chunks, validator)
             chunks = self._capture(chunks, "openai")
             if not req.get("stream"):
-                return self._json(200, openai_collect(chunks))
+                return self._json(200, openai_collect_choices(chunks) if n > 1 else openai_collect(chunks))
             self._sse()
             options = req.get("stream_options")
             last = None
