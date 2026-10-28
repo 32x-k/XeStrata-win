@@ -11771,6 +11771,31 @@ int main(int argc, char **argv) try {
                     return 1;
                 }
                 // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
+                // STRATA_PIPELINE_DUMP=<file>: the serial half of the pipelined window's state diff (see the same block
+                // in the pipelined loop): the first stage's GDN state after every committed window.
+                {
+                    static const char* sd = std::getenv("STRATA_PIPELINE_DUMP");
+                    if (sd != nullptr) {
+                        const int64_t gf = g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+                                           g.ssm_conv_channels * (g.ssm_d_conv - 1);
+                        const size_t n = (size_t) ss.gdn_alloc * (size_t) gf;
+                        std::vector<float> h(n);
+                        (void) DPCT_CHECK_ERROR(ver.stream()->memcpy(h.data(), ss.gdn_state, n * sizeof(float)).wait());
+                        uint64_t hs = 1469598103934665603ull;
+                        double sum = 0.0;
+                        for (size_t i = 0; i < n; ++i) {
+                            uint64_t bb = 0;
+                            std::memcpy(&bb, &h[i], sizeof(float));
+                            hs = (hs ^ bb) * 1099511628211ull;
+                            sum += (double) h[i];
+                        }
+                        if (std::FILE* df = std::fopen(sd, "a")) {
+                            std::fprintf(df, "pos %lld serial gdn %zu sum %.9g hash %016llx\n", (long long) (p + a + 1), n,
+                                         sum, (unsigned long long) hs);
+                            std::fclose(df);
+                        }
+                    }
+                }
                 for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
                 draft_offered += T - 1;
                 draft_accepted += a;

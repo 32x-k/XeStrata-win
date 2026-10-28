@@ -3998,6 +3998,23 @@ bool Verifier::pl_commit_async(int n_keep, std::string &err) try {
           return false;
         }
     }
+    // A one-token window advanced the GDN state itself (record_window), so the serial path's commit() skips the
+    // commit graph for it.  The pipelined path ran the graph anyway and advanced the state twice per
+    // single-token window; the first decode window is always one token, so the two paths' GDN states were
+    // equal after the prompt and different after that window (STRATA_PIPELINE_DUMP), and the tokens diverged
+    // at the fourth.  With this skip the pipelined windows are token-identical to the serial path.
+    if (last_t_ == 1 && one_token_self_commit()) {
+        h_commit_[0] = n_keep;
+        h_commit_[1] = n_keep - 1;
+        for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
+        if (ple_stage())
+            for (int t = 0; t < n_keep; ++t) {
+                ss_->ple_prev[0] = ss_->ple_prev[1];
+                ss_->ple_prev[1] = last_tokens_[t];
+            }
+        ms_commit += ms_since(t0);
+        return true;
+    }
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
