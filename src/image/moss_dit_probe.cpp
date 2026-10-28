@@ -11,7 +11,7 @@
 // reference's sigmas.npy, timesteps.npy and noise-short.npy.  Then prints each velocity's cosine to the reference's, its relative error (L1: sum |got - want| / sum |want|; L2), and
 // the time of a step (both contexts, then the prompt's alone).  MOSS_BLOCK_BUDGET_MIB: the blocks' VRAM (the rest
 // streamed); without it, what the GPU has free beside the working buffers and 512 MiB.  MOSS_PROBE_RUNS: the timed
-// steps (3).
+// steps (3).  MOSS_MLP_ROWS: the MLP's rows a band (MossDit::set_mlp_rows; without it, all).
 
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
@@ -165,6 +165,7 @@ int run(const std::string& path, const std::string& dir, bool q8) {
         std::printf("blocks: %d of %d resident (budget %.2f GiB)\n", d.resident_blocks(), d.blocks(),
                     (double) budget / 1073741824.0);
     }
+    if (const char* e = std::getenv("MOSS_MLP_ROWS")) d.set_mlp_rows(std::strtoll(e, nullptr, 10));
     std::vector<float> xt((size_t) (HW * Cl));   // the noise as tokens [h w][128]
     for (int64_t c = 0; c < Cl; ++c)
         for (int64_t p = 0; p < HW; ++p) xt[(size_t) (p * Cl + c)] = noise[(size_t) (c * HW + p)];
