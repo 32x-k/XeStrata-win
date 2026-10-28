@@ -34,7 +34,9 @@ Files you already have: `--model-path DIR`.
 
 ## What it did (M5 Max, 128 GB, 0.2.7.1 build)
 
-Speeds are from the packaged engine with the shipped defaults, one fresh process per run, two runs each.
+Speeds are from the packaged engine with the shipped defaults, one fresh process per run, two or three runs each. They were
+measured while another person's Qwen server (a 60 GB model, loaded and idle) was running on the same Mac, so the file cache that
+serves the streamed experts was shared with it. A Mac with nothing else running may be faster; that was not measured.
 
 | | 2.00 bpw | 2.25 bpw |
 |---|---|---|
@@ -52,7 +54,8 @@ The 2.25 set is the better of the two (about 8% above the original model's perpl
 faster and smaller. The quality numbers come from the engine's scoring run with a fixed expert placement
 (`--profile-readonly`); a run that learns the placement as it goes moves the last digits.
 
-How the memory is used: the engine keeps about 68 GB of the experts in memory on a 128 GB Mac. The rest of the memory goes to
+How the memory is used: the engine keeps about 68 GB of the experts in memory on a 128 GB Mac. That share follows from the
+Mac's memory (the RAM less 40% and the engine's own footprint), not from what happens to be free at the start. The rest of the memory goes to
 macOS and its file cache, and a Mac with less memory keeps fewer experts. The remaining experts are read from the SSD in place.
 A decode token is limited by those SSD reads and by a CPU lane that computes the experts the GPU does not hold, not by the GPU.
 If another program already holds a lot of memory (a browser, another model's server), the engine keeps fewer experts so that
