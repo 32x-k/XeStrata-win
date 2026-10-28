@@ -2766,7 +2766,12 @@ class Vision:
             if self.proc is None or self.proc.stdin is None:   # an elastic encoder not started yet, or one unloaded
                 raise ValueError("the picture reader is not running")
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
-            img.write_bytes(data)
+            try:
+                img.write_bytes(data)
+            except OSError:                         # a file error of the server's (a full disk): no half-written file
+                with contextlib.suppress(OSError):  # left; the request's handler answers it (a 500)
+                    img.unlink(missing_ok=True)
+                raise
             try:
                 if self.proc is None or self.proc.stdin is None:
                     raise OSError("the vision encoder is not running")
@@ -4206,7 +4211,8 @@ class Service:
                             self._vision_up()         # an elastic encoder is not running until a picture needs it
                             self.vision.encode(src)
                     except (ValueError, OSError, RuntimeError) as e:    # RuntimeError: the encoder did not start
-                        why = str(e)
+                        # a file error's sentence without its path: the note goes into the model's prompt
+                        why = (e.strerror or type(e).__name__) if isinstance(e, OSError) else str(e)
                 if why is not None:
                     print(f"[strata] a picture a tool returned was left out of the prompt: {why}", flush=True)
                     content[n] = {"type": "text", "text": f"[image omitted: {why}]"}
@@ -6870,9 +6876,17 @@ def make_handler(svc: Service):
 
             except ClientGone:                               # #1999: the client left while the request was prepared
                 self._note(outcome="disconnected")
-            except OSError:
-                self._note(outcome="disconnected")
-                raise                                        # as before #332: the server's own handling
+            except OSError as e:
+                # the client's socket gone (or anything once the answer began): a disconnect, as before #332.  Before
+                # it began, another one is a file of the server's own (a picture's work file, a full disk): a 500 that
+                # says so, with the traceback in the log - not a dropped connection, and without the file's path
+                if isinstance(e, (ConnectionError, TimeoutError)) or getattr(self, "answer_started", False):
+                    self._note(outcome="disconnected")
+                    raise                                    # the server's own handling
+                import traceback
+                print(f"[strata] 500: a file error ({type(e).__name__}: {e}):\n" + traceback.format_exc(), flush=True)
+                self._json(500, {"error": {"type": "server_error", "message": "the server could not read or write a "
+                                           f"file of its own: {e.strerror or type(e).__name__}"}})
             finally:
                 svc.drop_embeddings()                        # the images' file of a request that never got to run()
                 if self.watch_done is not None:

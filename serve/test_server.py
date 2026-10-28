@@ -455,6 +455,50 @@ class ImageMarkers(unittest.TestCase):
                 httpd.shutdown()
                 httpd.server_close()
 
+    def test_a_file_error_is_a_500_without_its_path(self):
+        """A file error of the server's own while a picture is read (its work file, a full disk) is a 500 that says
+        so - not a dropped connection - and neither it nor a tool picture's note shows the file's path."""
+        import tempfile
+        tok = ByteTokenizer()
+        img = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+
+        class FullDisk(self.FakeVision):
+            def encode(self, source, keep=()):
+                raise IsADirectoryError(21, "Is a directory", "/secret/work/abc.img")
+
+        with tempfile.TemporaryDirectory() as d:
+            svc = Service(RecordingPrompt(tok, "</think>\n\nok", max_context=CTX), tok, ChatTemplate(TEMPLATE),
+                          vision=FullDisk(d))
+            httpd = serve(svc, port=0)
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            try:
+                body = {"model": "m", "max_tokens": 4, "messages": [{"role": "user", "content": [img]}]}
+                for path in ("/v1/messages", "/v1/messages/count_tokens"):
+                    with self.subTest(path):
+                        req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+                                                     headers={"Content-Type": "application/json"})
+                        with self.assertRaises(urllib.error.HTTPError) as caught:
+                            urllib.request.urlopen(req, timeout=30)
+                        with caught.exception as e:
+                            self.assertEqual(e.code, 500)
+                            text = e.read().decode()
+                        self.assertIn("Is a directory", text)
+                        self.assertNotIn("/secret", text)
+                call = {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]}
+                tool_body = {"model": "m", "max_tokens": 4, "messages": [
+                    {"role": "user", "content": "look"}, call,
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [img]}]}]}
+                req = urllib.request.Request(base + "/v1/messages", data=json.dumps(tool_body).encode(),
+                                             headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    self.assertEqual(r.status, 200)
+                prompt = tok.decode(svc.engine.last_ids)
+                self.assertIn("[image omitted: Is a directory]", prompt)
+                self.assertNotIn("/secret", prompt)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
     def test_anthropic_tool_result_image(self):
         """Claude Code's Read of a picture returns it inside a tool_result: it reaches the encoder, in place."""
         import tempfile
