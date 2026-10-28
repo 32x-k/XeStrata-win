@@ -107,9 +107,9 @@ class UnreadContentParts(unittest.TestCase):
                 self.assertEqual(got, want)
 
     def test_messages_blocks_real_clients_send_are_left_out(self):
-        # tool_reference (Claude Code's tool search), documents, search results, server tool blocks, signed thinking
+        # tool_reference (Claude Code's tool search), PDF documents, server tool blocks, signed thinking (text
+        # documents and search results are read: _anthropic_documents)
         extra = [{"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "AA"}},
-                 {"type": "search_result", "source": "s", "title": "t", "content": [{"type": "text", "text": "x"}]},
                  {"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {}},
                  {"type": "web_search_tool_result", "tool_use_id": "s1", "content": []},
                  {"type": "container_upload", "file_id": "f"}]

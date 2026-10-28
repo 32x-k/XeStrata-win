@@ -62,6 +62,8 @@ class ContextOverflow(unittest.TestCase):
         for path, key in APIS:
             for stream in (False, True):
                 for prompt, budget, fit, detail in cases:
+                    if budget is None and path == "/v1/messages":
+                        continue                    # Anthropic's max_tokens is required: no request without it
                     with self.subTest(path=path, stream=stream, prompt=prompt, budget=budget, fit=fit):
                         self.svc.fit_max_tokens = fit
                         with mock.patch.object(self.engine, "generate") as generate:

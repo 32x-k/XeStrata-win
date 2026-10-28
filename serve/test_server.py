@@ -130,16 +130,19 @@ class MaxTokens(unittest.TestCase):
                          ("98179", "0", "17565", "699.6", "0"))
 
     def test_unset_budget_is_the_rest_of_the_context(self):
-        cases = {"openai": [{"max_tokens": -1}, {"max_tokens": 0}, {}, {"max_tokens": None},
-                            {"max_completion_tokens": -1}, {"max_completion_tokens": None, "max_tokens": None}],
-                 "anthropic": [{"max_tokens": -1}, {"max_tokens": 0}, {}, {"max_tokens": None}]}
-        for api, budgets in cases.items():
-            for budget in budgets:
-                with self.subTest(api=api, budget=budget):
-                    s, b, pt, ct = self.call(api, **budget)
-                    self.assertEqual(s, 200, b)
-                    self.assertEqual(self.engine.last_max_new, CTX - CTX_SLACK - pt)
-                    self.assertGreater(ct, 1024)          # the whole answer, not cut at the old 1024 fallback
+        for budget in ({"max_tokens": -1}, {"max_tokens": 0}, {}, {"max_tokens": None},
+                       {"max_completion_tokens": -1}, {"max_completion_tokens": None, "max_tokens": None}):
+            with self.subTest(api="openai", budget=budget):
+                s, b, pt, ct = self.call("openai", **budget)
+                self.assertEqual(s, 200, b)
+                self.assertEqual(self.engine.last_max_new, CTX - CTX_SLACK - pt)
+                self.assertGreater(ct, 1024)          # the whole answer, not cut at the old 1024 fallback
+        # Anthropic's max_tokens is required, a whole number of 1 or more: anything else is its 400
+        for budget in ({"max_tokens": -1}, {"max_tokens": 0}, {}, {"max_tokens": None}):
+            with self.subTest(api="anthropic", budget=budget):
+                s, b, _, _ = self.call("anthropic", **budget)
+                self.assertEqual(s, 400, b)
+                self.assertIn("max_tokens", b["error"]["message"])
 
     def test_explicit_budget_is_honoured(self):
         for api, budget in [("openai", {"max_tokens": 50}), ("openai", {"max_completion_tokens": 50}),
@@ -235,7 +238,7 @@ class MaxTokens(unittest.TestCase):
     def test_unset_budget_with_a_near_full_prompt(self):
         _, _, pt0, _ = self.call("openai", max_tokens=1)
         overhead = pt0 - len("hi")                  # the template's tokens around the user text
-        for api in ("openai", "anthropic"):
+        for api in ("openai",):                     # (Anthropic's max_tokens is required: no unset budget there)
             _, _, pa, _ = self.call(api, max_tokens=1)
             over = pa - pt0                          # the Anthropic template may differ slightly
             with self.subTest(api=api, room=5):     # a few tokens left: the budget is exactly those
@@ -255,7 +258,7 @@ class MaxTokens(unittest.TestCase):
         import io
         os.environ["STRATA_DEBUG"] = "1"
         try:
-            for api in ("openai", "anthropic"):
+            for api in ("openai",):                 # (Anthropic's max_tokens is required: no unset budget there)
                 with self.subTest(api=api):
                     out = io.StringIO()
                     with contextlib.redirect_stdout(out):
@@ -1867,7 +1870,8 @@ class IncrementalPrompts(unittest.TestCase):
             other = self.conversation(n)
             status, b = self.post("/v1/messages/count_tokens", {"model": "m", "messages": other})
             self.assertEqual(status, 200, b)
-            self.assertEqual(b["input_tokens"], len(full.encode_prompt(other, None, {})))
+            # (an Anthropic request that asks for no thinking is read without it)
+            self.assertEqual(b["input_tokens"], len(full.encode_prompt(other, None, {"enable_thinking": False})))
         self.assertTrue(svc.prompts.entries == before, "the count wrote into the kept prompts")
         main.append({"role": "assistant", "content": "ok"})
         main.append({"role": "user", "content": "and then?"})
@@ -3926,6 +3930,7 @@ class ThinkingBudget(unittest.TestCase):
         from serve.server import REASONING_WRAP_UP
         self.svc.reasoning_budget_tokens = 20
         code, raw = self.post("/v1/messages", {"model": "m", "max_tokens": 3000, "stream": True,
+                                               "thinking": {"type": "adaptive"},   # it thinks only when asked
                                                "messages": [{"role": "user", "content": "2+2?"}]})
         self.assertEqual(code, 200)
         evs = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")]
@@ -5020,7 +5025,8 @@ class StopStrings(unittest.TestCase):
         """-> (status, text, finish or stop_reason, stop_sequence, the streamed text pieces)"""
         path = "/v1/chat/completions" if api == "openai" else "/v1/messages"
         body = {"model": "x", "max_tokens": 200, "stream": stream, "messages": [{"role": "user", "content": "hi"}],
-                **extra}
+                # the mock ends a thinking: Anthropic's requests ask for it (they think only when asked)
+                **({"thinking": {"type": "adaptive"}} if api == "anthropic" else {}), **extra}
         req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(), headers={
             "Content-Type": "application/json", "anthropic-version": "2023-06-01"})
         try:

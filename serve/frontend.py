@@ -18,6 +18,7 @@ and the formats change often; the engine boundary is token ids in, text deltas o
 """
 from __future__ import annotations
 
+import base64
 import datetime
 import json
 import logging
@@ -753,17 +754,73 @@ def pin_billing_stamp(system: str) -> str:
     return "".join(s)
 
 
+# Anthropic's thinking signature, and the data of a redacted_thinking block: the thinking's text in the form of
+# responses.py's encrypted_content (base64, not encrypted: the client already holds the text), so a block this
+# server wrote can be read back and checked against its text.  Another server's signature is opaque and ignored.
+THINKING_PREFIX = "strata.r1:"
+
+
+def thinking_signature(text: str) -> str:
+    return THINKING_PREFIX + base64.b64encode(json.dumps({"text": text}, ensure_ascii=False).encode()).decode("ascii")
+
+
+def _signed_thinking(signature, where: str) -> str | None:
+    """The text a signature of this server's carries; None for another server's (or none)."""
+    if not isinstance(signature, str) or not signature.startswith(THINKING_PREFIX):
+        return None
+    try:
+        return str(json.loads(base64.b64decode(signature[len(THINKING_PREFIX):], validate=True).decode())["text"])
+    except (ValueError, KeyError, TypeError, UnicodeError):
+        raise ValueError(f"{where}: the thinking's signature is damaged") from None
+
+
+def _anthropic_documents(content, path: str):
+    """Anthropic's text documents and search results -> text blocks the template reads: a document's text
+    (source "text", or "content" blocks) under its title and context, a search result's text under its title and
+    source.  A PDF document is left as it is (not read yet).  citations.enabled: true is a 400: no citations are
+    made."""
+    if not isinstance(content, list):
+        return content
+    out = []
+    for j, block in enumerate(content):
+        kind = block.get("type") if isinstance(block, dict) else None
+        if kind in ("document", "search_result"):
+            cite = block.get("citations")
+            if isinstance(cite, dict) and cite.get("enabled") is True:
+                raise ValueError(f"{path}[{j}].citations: citations are not supported by this server")
+        text = None
+        if kind == "document":
+            src = block.get("source") if isinstance(block.get("source"), dict) else {}
+            if src.get("type") == "text":
+                text = str(src.get("data") or "")
+            elif src.get("type") == "content":
+                inner = src.get("content")
+                text = inner if isinstance(inner, str) else "\n\n".join(
+                    b.get("text") or "" for b in inner or [] if isinstance(b, dict) and b.get("type") == "text")
+            if text is not None:
+                head = [x for x in (block.get("title"), block.get("context")) if isinstance(x, str) and x]
+                text = "\n".join(["Document: " + head[0]] + head[1:] + ["", text]) if head else text
+        elif kind == "search_result":
+            body = "\n\n".join(b.get("text") or "" for b in block.get("content") or []
+                               if isinstance(b, dict) and b.get("type") == "text")
+            text = f"Search result: {block.get('title') or ''} ({block.get('source') or ''})\n\n{body}"
+        out.append({"type": "text", "text": text} if text is not None else block)
+    return out
+
+
 def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[dict], list[dict] | None, dict]:
     """Anthropic Messages -> (template messages, template tools, template kwargs).  `think_unasked`: a request
-    without "thinking", an effort or a budget gets the template's default (it thinks), as through 0.1.31; False
-    renders it without thinking (#278, the config's "anthropic_thinking": "on_request")."""
+    without "thinking", an effort or a budget gets the template's default (it thinks), as through 0.1.31 (the
+    config's "anthropic_thinking": "model"); False renders it without thinking, Anthropic's rule (#278, the server's
+    default "on_request")."""
     messages = []
     system = req.get("system")
     if system:
         messages.append({"role": "system",
                          "content": pin_billing_stamp(_text_of(_check_parts(system, "system", TEXT_PARTS)))})
     for i, m in enumerate(_object_list(req.get("messages"), "messages")):
-        content = _check_parts(m.get("content"), f"messages[{i}].content", ANTHROPIC_BLOCKS)
+        content = _check_parts(_anthropic_documents(m.get("content"), f"messages[{i}].content"),
+                               f"messages[{i}].content", ANTHROPIC_BLOCKS)
         if isinstance(content, str):
             messages.append({"role": m["role"], "content": content})
             continue
@@ -780,7 +837,15 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
             elif kind in IMAGE_PARTS:
                 parts.append(block)
             elif kind == "thinking":
-                reasoning.append(block.get("thinking", ""))
+                said = block.get("thinking", "")
+                signed = _signed_thinking(block.get("signature"), f"messages[{i}].content[{j}]")
+                if signed is not None and signed != said:
+                    raise ValueError(f"messages[{i}].content[{j}]: the thinking does not match its signature")
+                reasoning.append(said)
+            elif kind == "redacted_thinking":     # one of this server's is read; another server's carries nothing
+                signed = _signed_thinking(block.get("data"), f"messages[{i}].content[{j}]")
+                if signed is not None:
+                    reasoning.append(signed)
             elif kind == "tool_use":
                 calls.append({"function": {"name": block.get("name"), "arguments": tool_arguments(block.get("input"))},
                               "_call_id": block.get("id")})
@@ -788,9 +853,13 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
                 # A tool's image (Claude Code's Read of a picture) reaches the encoder like a user's, as the OpenAI
                 # path's tool messages already do; a text-only result is one string, as before.  Its tool_use_id
                 # puts it beside its call (_order_chat_tool_results): parallel results may come in any order.
-                messages.append({"role": "tool", "content": _parts_of(_check_parts(
-                    block.get("content"), f"messages[{i}].content[{j}].content", TEXT_PARTS + IMAGE_PARTS)),
-                    "_call_id": block.get("tool_use_id")})
+                where = f"messages[{i}].content[{j}].content"
+                result = _parts_of(_check_parts(_anthropic_documents(block.get("content"), where), where,
+                                                TEXT_PARTS + IMAGE_PARTS))
+                if block.get("is_error") is True:   # the tool failed: the model is told so, not only its text
+                    result = "Error: " + result if isinstance(result, str) else \
+                        [{"type": "text", "text": "Error: "}] + list(result or [])
+                messages.append({"role": "tool", "content": result, "_call_id": block.get("tool_use_id")})
         if text or calls or reasoning or parts:
             # an image sent beside tool results stays in this turn instead of being dropped
             out = {"role": m["role"], "content": _parts_of(parts) if _has_image(parts) else "".join(text)}
@@ -806,6 +875,11 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     # Anthropic: "thinking": {"type": "disabled"} or {"type": "enabled", "budget_tokens": N};
     # "output_config": {"effort": "low" | "medium" | "high"}
     thinking = req.get("thinking")
+    if thinking is not None and (not isinstance(thinking, dict)
+                                 or thinking.get("type") not in ("enabled", "disabled", "adaptive")):
+        raise ValueError('thinking must be {"type": "enabled", "budget_tokens": N}, {"type": "adaptive"} or '
+                         '{"type": "disabled"}')
+    # "adaptive": the model decides how much to think (the template's default, an effort if output_config has one)
     effort = (req.get("output_config") or {}).get("effort") if isinstance(req.get("output_config"), dict) else None
     # 0.1.45: Anthropic's budget_tokens is a real budget, not only a level: the thinking is closed (wrap-up, </think>,
     # the answer) after that many tokens.  A reasoning_budget_tokens of the request's own wins.
@@ -819,9 +893,9 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     elif isinstance(thinking, dict) and thinking.get("budget_tokens"):
         kwargs.update(budget_effort(thinking["budget_tokens"]))
     elif thinking is None and not req.get("reasoning_budget_tokens") and not think_unasked:
-        # Opt-in (the config's "anthropic_thinking": "on_request"; the default thinks as 0.1.31 did, since a
-        # client that never asks would otherwise lose the thinking on every turn).  Anthropic's thinking is
-        # opt-in there. Claude Code's helper calls (a session title, a topic check) ask for none
+        # The server's default (the config's "anthropic_thinking": "on_request"; "model" thinks as 0.1.31 did, for
+        # a client that never asks).  Anthropic's thinking is opt-in. Claude Code's helper calls (a session title,
+        # a topic check) ask for none
         # and allow a few dozen tokens, which the model otherwise spent thinking and answered with no text at all.
         # A config's reasoning_effort still applies: Service.with_shared sets output_config before this runs.  A
         # request that gives its own reasoning_budget_tokens (#123) asks for thinking, so it thinks as before.

@@ -67,7 +67,7 @@ sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.sh) as well as a 
 SETUP_CMD = "xestrata" if (ROOT / "PACKAGED").is_file() else "./setup.sh"   # a deb or rpm package's command (setup.py)
 from serve.frontend import (THINK_END, ChatTemplate, Event, GlmOutputParser, HarmonyParser,  # noqa: E402
                             OutputParser, ToolCall, allowed_tools, anthropic_format, anthropic_to_messages,
-                            custom_tool_names, forced_call, images_of, literal_tags,
+                            custom_tool_names, forced_call, images_of, literal_tags, thinking_signature,
                             mark_think_literals,
                             openai_to_messages, require_messages, tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, McpHub, hub_from_config  # noqa: E402
@@ -3369,7 +3369,7 @@ class Service:
         self.reasoning_loop_recovery = False
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply
-        self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
+        self.anthropic_think_unasked = False              # #278: "anthropic_thinking": "model" -> True
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.images: Any = None                           # serve/images.py's ImageModels when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
@@ -5681,21 +5681,45 @@ def structured_chunks(chunks, validator):
 
 
 # ------------------------------------------------------------------------------------------------ Anthropic
+def anthropic_usage(ids, reused, output_tokens: int) -> dict:
+    """Anthropic's usage of a prompt the conversation cache held `reused` tokens of: those are cache reads, the rest
+    a cache write (it stays for the next request); input_tokens keeps the last token, as 0 makes Claude Code count
+    the prompt twice (#1013)."""
+    reused = max(0, min(reused or 0, len(ids) - 1))
+    return {"input_tokens": 1, "cache_creation_input_tokens": len(ids) - reused - 1,
+            "cache_read_input_tokens": reused, "output_tokens": output_tokens}
+
+
 def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None):
     mid = "msg_" + uuid.uuid4().hex[:24]
-    yield "message_start", {"type": "message_start", "message": {
-        "id": mid, "type": "message", "role": "assistant", "model": svc.model_for(req), "content": [],
-        "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": len(ids), "output_tokens": 0}}}
-    index, open_kind, used_tool = -1, None, False
 
-    def close():
-        return ("content_block_stop", {"type": "content_block_stop", "index": index})
+    def start(reused):
+        # sent with the reply's first piece, once the engine has said how much of the prompt its cache held (its
+        # RESUME line), so message_start's usage names the cache reads and writes as message_delta's does; until
+        # then the heartbeats go out as pings
+        return "message_start", {"type": "message_start", "message": {
+            "id": mid, "type": "message", "role": "assistant", "model": svc.model_for(req), "content": [],
+            "stop_reason": None, "stop_sequence": None, "usage": anthropic_usage(ids, reused, 0)}}
+    started = False
+    index, open_kind, used_tool = -1, None, False
+    thought: list[str] = []                        # the open thinking block's text: its signature at its end
+
+    def closing():
+        if open_kind == "thinking":
+            yield "content_block_delta", {"type": "content_block_delta", "index": index, "delta": {
+                "type": "signature_delta", "signature": thinking_signature("".join(thought))}}
+            thought.clear()
+        yield "content_block_stop", {"type": "content_block_stop", "index": index}
 
     streamed, finished = set(), set()              # calls sent piece by piece; those whose final tool_call came (#211)
     for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force, declared_only=True):
         if kind == "ping":
             yield None
             continue
+        if not started:
+            started = True
+            yield start(cast(dict, x).get("reused") if kind == "done" else
+                        0 if getattr(svc.engine, "batch", 0) else getattr(svc.engine, "reused", 0))
         if kind == "event":
             ev = cast(Event, x)
             call = cast(ToolCall, ev.call)          # (None but for the tool_* events)
@@ -5715,7 +5739,7 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
                 used_tool = True
             if open_kind != want or want == "tool_use":
                 if open_kind is not None:
-                    yield close()
+                    yield from closing()
                 index += 1
                 open_kind = want
                 block = {"thinking": {"type": "thinking", "thinking": "", "signature": ""},
@@ -5726,6 +5750,7 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
                                       ev.call.name if ev.call else "", "input": {}}}[want]
                 yield "content_block_start", {"type": "content_block_start", "index": index, "content_block": block}
             if want == "thinking":
+                thought.append(ev.text)
                 yield "content_block_delta", {"type": "content_block_delta", "index": index,
                                               "delta": {"type": "thinking_delta", "thinking": ev.text}}
             elif want == "text":
@@ -5739,20 +5764,18 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
                     "type": "input_json_delta", "partial_json": json.dumps(call.arguments, ensure_ascii=False)}}
         else:
             if open_kind is not None:
-                yield close()
+                yield from closing()
             assert isinstance(x, dict)                  # the run's last item: the DONE figures
+            asked = req.get("max_tokens")
             stop = "stop_sequence" if x.get("stop_sequence") is not None else \
                 "tool_use" if used_tool and streamed <= finished and x["finish"] == "stop" else \
+                "model_context_window_exceeded" if x["finish"] == "length" and isinstance(asked, int) \
+                and x["completion_tokens"] < asked else \
                 {"stop": "end_turn", "length": "max_tokens", "cancel": "end_turn"}[x["finish"]]
-            # the final counts (message_start could only say the whole prompt): what was read now stays for the next
-            # request, a cache write; input_tokens keeps the last token, as 0 makes Claude Code count the prompt twice
-            # (#1013)
-            reused = max(0, min(x.get("reused") or 0, len(ids) - 1))
-            read_now = len(ids) - reused
+            # the final counts: the engine's own figure of the prompt its cache held
             delta_event = {"type": "message_delta",
                            "delta": {"stop_reason": stop, "stop_sequence": x.get("stop_sequence")},
-                           "usage": {"input_tokens": 1, "cache_creation_input_tokens": read_now - 1,
-                                     "cache_read_input_tokens": reused, "output_tokens": x["completion_tokens"]}}
+                           "usage": anthropic_usage(ids, x.get("reused"), x["completion_tokens"])}
             if x.get("rejected_tool_calls"):
                 delta_event["strata_rejected_tool_calls"] = x["rejected_tool_calls"]     # #3796
             yield "message_delta", delta_event
@@ -5775,14 +5798,17 @@ def anthropic_collect(events) -> dict:
                 b["text"] += d["text"]
             elif d["type"] == "thinking_delta":
                 b["thinking"] += d["thinking"]
+            elif d["type"] == "signature_delta":
+                b["signature"] = d["signature"]
             else:                                  # input_json_delta pieces: parsed when complete
                 b["_json"] = b.get("_json", "") + d["partial_json"]
         elif name == "content_block_stop" and blocks and "_json" in blocks[-1]:
             b = blocks[-1]
+            raw = b.pop("_json") or "{}"
             try:
-                b["input"] = json.loads(b.pop("_json") or "{}")
-            except ValueError:                     # a call the output ended inside (#211): it has no input to give
-                blocks.pop()
+                b["input"] = json.loads(raw)
+            except ValueError:                     # a call the output ended inside (#211): what it wrote, as text
+                blocks[-1] = {"type": "text", "text": raw}
         elif name == "message_delta":
             assert msg is not None
             msg["stop_reason"] = e["delta"]["stop_reason"]
@@ -7290,12 +7316,17 @@ def make_handler(svc: Service):
             read for the same request, rendered and tokenized - the model does not run."""
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
+            if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the request itself: no tools offered
+                tools = None
             messages, _ = anthropic_prepare_format(req, messages, tools)   # its instruction is part of the prompt
             stop_strings(req)                                 # the same 400 as the request itself would get
             check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw, store=False))})
 
         def _anthropic(self, req):
+            asked = req.get("max_tokens")                     # Anthropic's required field (the shared settings' own
+            if isinstance(asked, bool) or not isinstance(asked, int) or asked < 1:   # default does not stand in)
+                raise ValueError("max_tokens: a whole number of 1 or more is required")
             svc.load()
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
@@ -7323,10 +7354,17 @@ def make_handler(svc: Service):
                 except StructuredOutputError as exc:
                     return self._json(502, {"type": "error", "error": {"type": "api_error", "message": str(exc)}})
             self._sse()
+            pinged = 0.0
             try:
                 for item in events:
                     if item is None:
-                        self.wfile.write(b": keep-alive\n\n")
+                        # Anthropic's keep-alive is a ping event; one a second at most (a prompt being read sends a
+                        # heartbeat per chunk), SSE comments between them
+                        if time.monotonic() - pinged >= 1:
+                            pinged = time.monotonic()
+                            self.wfile.write(b'event: ping\ndata: {"type": "ping"}\n\n')
+                        else:
+                            self.wfile.write(b": keep-alive\n\n")
                     else:
                         name, e = item
                         self.wfile.write(f"event: {name}\n".encode() + b"data: " +
@@ -8352,7 +8390,7 @@ def main() -> int:
             raise SystemExit(f"[strata] {e}")
         print(f"[strata] slot save/restore on: {svc.slot_save_path} (session files are kept until deleted: "
               "about 1.2 GB per 63K-token conversation; restore only files this server wrote)", flush=True)
-    mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
+    mode = str(cfg.get("anthropic_thinking") or "on_request")   # #278: "model" thinks unasked too
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
     svc.anthropic_think_unasked = mode == "model"
