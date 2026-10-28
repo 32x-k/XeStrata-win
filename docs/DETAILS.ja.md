@@ -863,7 +863,7 @@ print(r.choices[0].message.content)
 - **思考を求めない Anthropic の要求**: `"thinking"`、深さ、上限のどれもない `/v1/messages` の要求は、Anthropic 自身の規則どおり思考なしで処理します。
   Claude Code の短い補助の呼び出し（数十トークンで会話の題を付けるものなど）に要ります。
   `xestrata-<model>.json` に `"anthropic_thinking": "model"` を書くと、そうした要求もモデルのテンプレートどおりに考えます。
-  `POST /v1/messages/count_tokens` は、要求を `/v1/messages` と同じに組み立ててトークンに分け、モデルは動かしません。画像は読むときと同じ数の画像のトークンとして数えるので、まだ読んでいない画像は画像のエンコーダーで読みます（一度読んだ画像は覚えていて、後の要求でも使います）。
+  `POST /v1/messages/count_tokens` は、要求を `/v1/messages` と同じに組み立ててトークンに分け、モデルは動かしません。画像は読むときと同じ数の画像のトークンとして数えるので、まだ読んでいない画像は画像のエンコーダーで読みます（一度読んだ画像は覚えていて、後の要求でも使います。アイドルで止まったエンコーダーは、要求と同じくモデルの読み込みで戻します）。
 
 ### ストリーミングと接続
 
@@ -873,7 +873,7 @@ print(r.choices[0].message.content)
   server のウィンドウは 15 秒ごとに進み具合を出し、`GET /status` は何をしているか（`reading the prompt`、`answering`、そこまでのトークン数）を返します。
   接続を閉じるか、アプリで止めると、モデルも本当に止まるので、次の要求はすぐに始まります。
 - **呼び出しとして返すツールの呼び出し**: 呼び出しになるのは、要求が宣言したツールの名前のものだけです。
-  別の名前の呼び出しや、ツールを宣言していない Chat Completions・Anthropic の要求の呼び出しは、書かれたままの文として返すので、クライアントが差し出していないツールを動かすことはありません（Responses は Codex のまとめの要求のために前のままです）。
+  別の名前の呼び出しや、ツールを宣言していない Chat Completions・Anthropic の要求の呼び出しは、書かれたままの文として返すので、クライアントが差し出していないツールを動かすことはありません（Responses も同じです。Codex のまとめ（compaction）の要求だけは、プロンプトに会話のツールを見せるので、前のまま呼び出しを返します）。
   名前空間のツール（`mcp__filesystem.write_file`）は、モデルが `mcp__filesystem__write_file`、`mcp__filesystem=write_file`、`mcp__filesystem_write_file` と書いたときと、そのメンバーを持つツールが宣言の中に 1 つだけのときにメンバーだけ（`write_file`）を書いたときも、その呼び出しになります。
   `__` を含む名前（`mcp__playwright__browser_navigate`）は、モデルが `__` を全部 `_` と書いたとき（`mcp_playwright_browser_navigate`）も、宣言した 2 つのツールが同じ綴りにつぶれない限り、その呼び出しになります。
   名前は推し量りません: `bash` は `shell` ではなく、順の入れ替わった名前（`label_values_mcp_server1` に対する `server1_label_values`）は宣言した名前になりません。
@@ -1223,6 +1223,7 @@ B70 の IQ2_XS で、4,996 トークンの会話（INT8 の KV）のファイル
 エンジンが文法で縛れるとき（連続バッチと密なモデルのエンジンを除く）は、**答えをスキーマの文法で縛って書かせ**、書いた後にも確かめます。
 思考は縛らず、思考の後の答えの JSON だけを縛ります。
 縛れないときは、スキーマをプロンプトで伝え、server が確かめるだけです。環境変数 `STRATA_GRAMMAR=0` でも縛りません。
+`strict` は true、false、null（書かないのと同じ）のどれかで、ほかの型は 400 です。
 道具の `strict: true`（Chat Completions・Responses・Messages。Responses の namespace と `additional_tools` の道具も）と、`custom` の道具の regex の文法も、呼び出しの引数を同じように縛ります（Qwen の呼び出しの形のモデル）。文と、ほかの道具の呼び出しは縛りません。
 `strict: true` の道具の呼び出しは、縛ったかどうかにかかわらず、送る前に引数をスキーマで確かめます。そのため書いている途中には送らず、書き終わった呼び出しをまとめて送ります。合わないとき、JSON に書けない数（NaN、Infinity、大きすぎる数）があるときは、答えと同じく `structured_output_failed` です。
 1 つの要求に 1 回だけ生成し、隠れたやり直しはしません。
@@ -1324,9 +1325,9 @@ PDF は、Linux では poppler の `pdftotext` と `pdftoppm` で、Windows で�
 **Chat Completions**:
 
 - `tools` の `custom` のツールは、文字列の `input` を 1 つ取るツールとしてモデルに見せ、呼び出しは `{"type": "custom", "custom": {"name", "input"}}` で返します。文法（`format`）が regex なら、その引数を[文法で縛ります](#json-の応答の形式)。Lark の文法はモデルへの説明に書くだけです。
-- `tool_choice` は `none`、`auto`、`required`、名前を指定したツール、`allowed_tools`（見せるツールをその組に絞り、`mode: required` なら呼び出しを強制）です。道具にない名前や知らない形は 400 です。
+- `tool_choice` は `none`、`auto`、`required`、名前を指定したツール、`allowed_tools`（見せるツールをその組に絞り、`mode: required` なら呼び出しを強制）です。道具にない名前や知らない形は 400 です。名前を指定したときは、そのツールの呼び出しを 1 つだけ返し、思考の中や後に書かれたほかのツールの呼び出しは文のまま残します（Messages と Responses も同じ）。
 - `parallel_tool_calls: false` では、最初の呼び出しが閉じたところで生成を止め、その 1 つを返します。
-- `n`（1〜128）は、choice ごとに 1 回ずつ生成します。`seed` があれば choice ごとに `seed + k` です。
+- `n`（1〜128）は、choice ごとに 1 回ずつ生成します。`seed` があれば choice ごとに `seed + k` です。ストリームでは、全部のチャンクが同じ `id` を持ちます。
 - `stream_options.include_usage` では、`choices: []` の usage の区切りも送ります。終わりの区切りの usage（llama.cpp と同じ）も残ります。
 - usage には `completion_tokens_details.reasoning_tokens` が入り、応答には `system_fingerprint`（エンジンの版とモデルから作る値）が入ります。
 - 古い形の `role: function` と assistant の `function_call` は、道具の結果と呼び出しとして読みます。古い形の `functions` と `function_call` の要求は `tools` と `tool_choice` として読み（呼び出しは 1 つずつ）、答えも古い形（`function_call`、終わりの理由 `function_call`）で返します。`tools` や `tool_choice` と一緒には使えません。null の項目と、`functions` なしの `function_call: "none"` は、何も指定していないものとして読みます。
@@ -1360,7 +1361,7 @@ PDF は、Linux では poppler の `pdftotext` と `pdftoppm` で、Windows で�
 | --- | --- |
 | `input` が文字列か項目の並び | `message` の項目（`user`、`assistant`、`system`、`developer`。文字と画像）、`reasoning`、`function_call`、`function_call_output`、`custom_tool_call(_output)`、`input_file`（[上](#chat-completions-と-messages-の項目) のファイル）、前の回の `image_generation_call`（画像を保存し、続く `edit_image` が直せます）。ホストのツールの項目（`web_search_call`、`mcp_call` など）は文として会話に入れます |
 | `instructions` | システムメッセージ（先頭の `developer` のメッセージも含む。後のものはチャットの経路と同じくユーザーのメッセージになります） |
-| `tools` | `function` のツール、`namespace` のツール（モデルには `namespace.name` に見え、呼び出しは `namespace` と `name` で返ります）、`custom` のツール（自由な文字列の `input` 1 つ）。ホストのツール（`web_search`、`file_search` など）はモデルが動かせないので外します |
+| `tools` | `function` のツール、`namespace` のツール（モデルには `namespace.name` に見え、呼び出しは `namespace` と `name` で返ります）、`custom` のツール（自由な文字列の `input` 1 つ）。ホストのツール（`web_search`、`file_search` など）はモデルが動かせないので外します。`strict` を書かない（null の）`function` のツールは、パラメーターがそのまま strict モードの条件（すべてのオブジェクトが `additionalProperties: false`、すべてのプロパティが `required`）を満たし jsonschema があれば strict、そうでなければ非 strict で、応答の `tools` にどちらかを示します（OpenAI の Responses と同じ既定）。 |
 | `tool_choice` | `"none"` はツールを隠します。`required`、名前を指定したツール（`custom`、`namespace` も）、`allowed_tools` は Chat Completions と同じです。`{"type": "image_generation"}` は画像の道具の呼び出しを強制します。道具にない名前や知らない形は 400 です |
 | `parallel_tool_calls: false` | 最初の呼び出しが閉じたところで生成を止めます |
 | `max_tool_calls` | ホストのツール（ここでは画像の道具）の呼び出しの上限。超えた呼び出しは動かしません。`function` のツールには当てません |
@@ -1619,7 +1620,7 @@ HunyuanImage 3.0 の重みは Tencent Hunyuan Community License Agreement で、
 `output_format` は `png`（既定）、`jpeg`、`webp`、`jxl` で、`output_compression`（0〜100、既定 100）が jpeg、webp、jxl の画質になります（jxl の 100 は可逆）。`jxl`（JPEG XL）は libjxl の cjxl（BSD-3-Clause）があるときだけ使え、`/health` の `image_defaults` の `formats` に出ます。deb と rpm は推奨のパッケージ（Ubuntu の libjxl-tools、Fedora の libjxl-utils）で入り、Podman のイメージと Windows の 7z には入っています。ソースから動かすときは、そのパッケージを入れます。可逆は cjxl の effort 3、ほかは既定の 7 で書きます。
 `n` は `max_n`（既定 16）までで、サーバーが測った速さ（大きさごとの 1 ステップの秒数と、それ以外の秒数。測った最大の大きさより大きい画像は 1 ステップの時間を画素数の 1.5 乗で伸ばします）で見積もった時間が `budget_s`（既定 600 秒）を超える数は、見積もりを添えてエラー（400）で断ります。まだ 1 枚も作っていないときは 4 枚までです。何枚も作る途中で別の要求が GPU の順番を待っていると、1 枚ごとに順番を譲ります（`unload` のときは譲りません）。`quality` は Qwen-Image-2.1 でステップ数を決めます（`low` 20、`medium` と `standard` 30、`high`・`hd`・`xhigh`・`max`・`auto` は既定の 40。`steps` を付けたときはそちら）。Turbo では 8 ステップのままで、Mage-Flow では使いません。応答の `usage` は画像のエンジンのトークンで数えます（プロンプトのトークンと、参照画像と作った画像の 16×16 画素で 1 つのトークン）。
 `background` を `transparent` にすると、Qwen の推奨する形でプロンプトを包み、透明な背景の画像（アルファ付きの PNG、webp、jxl）を作ります（jpeg とは組み合わせられません）。`opaque` はアルファを白の上に重ねて消し、`auto`（既定）はモデルの作ったままにします。編集の参照画像のアルファも、そのまま画像のモデルに渡します。
-`stream: true` を付けると、OpenAI と同じく SSE で返します。`partial_images`（0〜3、既定 0）を付けると、サンプリングの途中で予測した仕上がり（x0 = x − σ v）を VAE で画像に戻し、`image_generation.partial_image`（編集は `image_edit.partial_image`）で 1 枚あたり最大その枚数だけ送ります（最後のステップの後には作らないので、ステップが少ないと減ります）。最後に画像ごとに `image_generation.completed`（`b64_json`・`usage`、ほかに `seed` と `strata` の数字）を送ります。ノイズは最初に 1 回だけ引くので、途中の画像を作っても最後の画像は変わりません。途中の画像の分だけ VAE の時間が増えます。HunyuanImage 3.0 は途中の画像を作らず、最後の画像だけを送ります。`stream` のない要求は `partial_images` を無視します。Web のページは、「途中の画像を表示」（既定はオフ）で `partial_images: 2` を送ります。
+`stream: true` を付けると、OpenAI と同じく SSE で返します。`partial_images`（0〜3、既定 0）を付けると、サンプリングの途中で予測した仕上がり（x0 = x − σ v）を VAE で画像に戻し、`image_generation.partial_image`（編集は `image_edit.partial_image`）で 1 枚あたり最大その枚数だけ送ります（最後のステップの後には作らないので、ステップが少ないと減ります）。最後に画像ごとに `image_generation.completed`（`b64_json`・`usage`、ほかに `seed` と `strata` の数字）を送ります。イベントの `size` は、モデルが選んだ大きさ（`size: auto`）も含めて、作った画像の大きさです。multipart の編集の数の項目（`n`、`seed`、`steps`、`num_inference_steps`、`output_compression`、`partial_images`、`guidance_scale`、`true_cfg_scale`）と `stream` は、JSON の要求と同じく数と真偽値として読みます。ノイズは最初に 1 回だけ引くので、途中の画像を作っても最後の画像は変わりません。途中の画像の分だけ VAE の時間が増えます。HunyuanImage 3.0 は途中の画像を作らず、最後の画像だけを送ります。`stream` のない要求は `partial_images` を無視します。Web のページは、「途中の画像を表示」（既定はオフ）で `partial_images: 2` を送ります。
 `POST /v1/images/edits`（OpenAI の形の multipart で `image` か `image[]`、または JSON の `images: [{"image_url": ...}]`）は、参照画像（10 枚まで。PNG・JPEG・GIF・BMP はそのまま、WebP などほかの形式は PNG に変えて読みます）を元に画像を作ります。`mask`（OpenAI と同じく、1 枚目の画像と同じ大きさのアルファ付き PNG）を付けると、その透明な部分だけを描き直し、残りは 1 枚目の画像の画素のまま残します（各ステップでマスクの外の潜在を元の画像のものに戻し、最後に元の画素と合成します）。参照画像は、出力の大きさにかかわらず 1 枚ずつ縦横比を保った約 1024×1024 画素で読みます（diffusers の Qwen-Image-2.1 と同じ。Mage-Flow では、画像の読み手が長い辺 384 ピクセル以下で、VAE が出力の大きさで読みます）。参照画像が多いほど時間とメモリがかかります（B70 の 1024×1024 で 3 枚は約 46 秒、10 枚は約 4 分）。参照画像のトークンの K と V のキャッシュ（1024×1024 の 1 枚で約 2 GB）は、VRAM に入らない分をピン留めした RAM に置いて毎ステップ運びます。それでも VRAM か RAM が足りない画像は、作り始める前にエラー（400）で断ります。参照画像を書き換えたり、その中の人や物を主題にしたりできます。`size` を `auto` にすると、参照画像の縦横比で約 1024×1024 画素にします。Web のページでも、Images のタブで画像を添付すると編集になります。
 マスクと `strength`（0 より大きく 1 以下）はどのモデルでも受けます（`src/image/img_start.hpp`）。strength は diffusers の img2img と同じく、n ステップの表の先頭 floor(n (1 − strength)) を飛ばし、残りの最初の sigma s で元の画像の潜在 z0 とシードのノイズを (1 − s) z0 + s noise に混ぜて始めます（strength 1 は今までの生成や編集と同じ）。飛ばす数はサーバーの Python とエンジンの C++ がどちらも double で数えるので一致します。元の画像は、編集のあるモデルでは 1 枚目の参照画像、編集のないモデル（MageTrail、編集のモデルを入れていない Mage-Flow）では要求の 1 枚の画像（img2img、strength の既定は ComfyUI の公式の img2img の例の denoise の 0.87（1 − 1/ステップ数 を超えない）、マスクだけなら ComfyUI の KSampler の既定の 1）で、VAE のエンコーダで事後分布の平均の潜在にします（MageTrail は Flux2 VAE のエンコーダ）。
 会話からも画像を作れます。`/v1/chat/completions` に `"strata_images": true` を付けると（Web のページは付けます）、モデルに `generate_image` と `edit_image` の道具を渡し、モデルが呼ぶとサーバーが画像を作ってその場に出します。`edit_image` は、会話の最後の画像（添付したものか、会話で作ったもの）を直します。画像のモデルがいくつもあるときは、道具に `model`（入っているモデルの名前と、それぞれの向いていることの説明）が付き、モデルがユーザーの言葉に合うものを選びます（なしは既定のモデル。`edit_image` は編集のできるモデルが先で、編集のないモデルでは img2img になり、`strength` も受けます）。`"strata_images": {"model": "<名前>"}` なら、道具はそのモデルだけを使います。Web のページは、入力欄の下の「Images」でこれを選びます。`/v1/responses` では OpenAI の組み込みの `image_generation` の道具を付けると同じことをし、作った画像を `image_generation_call` の項目（`result` に画像の base64、`size`・`quality`・`background`・`output_format`・`revised_prompt` も）で返します。道具の `size`・`quality`・`output_format`・`output_compression`・`background` は、その道具で作る画像に使います（`size` が `auto` ならモデルの指定した大きさ）。道具の `model` が入っている画像のモデルの名前なら、そのモデルだけを使います（OpenAI の `gpt-image-1` などは既定のモデルか、言葉で選ぶもの）。`input_image_mask`（`image_url` に data: か http(s) の URL。`file_id` は受けません）は、その道具の編集のマスクです（`/v1/images/edits` の `mask` と同じ形）。`stream` の要求で道具の `partial_images`（1〜3）があると、途中の画像を `response.image_generation_call.partial_image`（`partial_image_b64`・`partial_image_index`）で送ります。`moderation`・`input_fidelity` は受けて無視します。
