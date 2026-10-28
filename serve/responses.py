@@ -318,8 +318,10 @@ def drop_oldest(messages: list[dict]) -> list[dict] | None:
 
 def _order_tool_results(messages):
     """The template places tool results by position: each run of tool messages is put in the order of the calls of
-    the assistant turn before it (a client may send the results in the order they finished), then the private call
-    ids are dropped."""
+    the model's turn before it (a client may send the results in the order they finished), then the private call
+    ids are dropped.  The turn is every assistant message right before the run: a reasoning or a message between two
+    calls starts a new one.  As on Chat (_order_chat_tool_results), only a run whose results all name one of those
+    calls, each once, is reordered; anything else keeps the order received."""
     i = 0
     while i < len(messages):
         if messages[i]["role"] != "tool":
@@ -328,10 +330,15 @@ def _order_tool_results(messages):
         j = i
         while j < len(messages) and messages[j]["role"] == "tool":
             j += 1
-        prev = messages[i - 1] if i else {}
-        order = [c.get("_call_id") for c in prev.get("tool_calls") or []]
-        rank = {cid: k for k, cid in enumerate(order) if cid}
-        messages[i:j] = sorted(messages[i:j], key=lambda m: rank.get(m.get("_call_id"), len(order)))
+        calls: list = []
+        k = i - 1
+        while k >= 0 and messages[k]["role"] == "assistant":
+            calls[:0] = [c.get("_call_id") for c in messages[k].get("tool_calls") or []]
+            k -= 1
+        rank = {cid: n for n, cid in enumerate(calls) if cid}
+        results = [m.get("_call_id") for m in messages[i:j]]
+        if all(cid in rank for cid in results) and len(set(results)) == len(results):
+            messages[i:j] = sorted(messages[i:j], key=lambda m: rank[m["_call_id"]])
         i = j
     for m in messages:
         m.pop("_call_id", None)

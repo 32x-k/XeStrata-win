@@ -141,6 +141,19 @@ class UnreadContentParts(unittest.TestCase):
                 streamed = "".join(e.text for e in evs if e.kind == "tool_args")    # the arguments as they stream
                 self.assertEqual(json.loads(streamed), {"x": want})
 
+    def test_responses_results_follow_calls_split_by_reasoning(self):
+        # Responses: a reasoning or a message between two calls makes two assistant messages; the results, sent in the
+        # order they finished, still follow the calls (the template pairs them by position)
+        from serve.responses import input_messages
+        call = [{"type": "function_call", "call_id": f"c{n}", "name": n, "arguments": "{}"} for n in "ab"]
+        between = ({"type": "reasoning", "summary": [], "content": [{"type": "reasoning_text", "text": "then b"}]},
+                   {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "and b"}]})
+        results = [{"type": "function_call_output", "call_id": f"c{n}", "output": f"RESULT-{n}"} for n in "ba"]
+        for item in between:
+            with self.subTest(item["type"]):
+                got = input_messages({"input": [{"role": "user", "content": "go"}, call[0], item, call[1], *results]})
+                self.assertEqual([m["content"] for m in got if m["role"] == "tool"], ["RESULT-a", "RESULT-b"])
+
     def test_function_call_none_or_null_without_functions(self):
         # a null is no field, and function_call "none" without functions is OpenAI's default: an ordinary request
         for req in ({"function_call": "none"}, {"functions": None, "function_call": None}, {"functions": None}):
