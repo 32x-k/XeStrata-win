@@ -2362,7 +2362,7 @@ def enhance_prompt(svc, gen: ImageGen, job: dict, cancel: threading.Event | None
             info.update(made="layout", layout=layout)
         elif isinstance(draft.get("caption"), str) and draft["caption"].strip() and mode != "layout":
             job["enhanced_prompt"] = draft["caption"].strip()
-            info["made"] = "caption"
+            info.update(made="caption", prompt=job["enhanced_prompt"])   # a stream's events carry no revised_prompt
         else:
             raise ValueError(f"the answer is not a {'layout' if mode == 'layout' else 'caption'}")
     except (ValueError, KeyError, TypeError, RuntimeError, OSError) as e:

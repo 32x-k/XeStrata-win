@@ -218,7 +218,7 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
 #### プロンプトの書き広げ（`enhance`）
 
 `enhance` を付けると、まずチャットのモデル（読み込んでいる文章のモデル）が、プロンプトを MOSS-Image 向けの詳しい説明か配置に書き広げ、それで画像を作ります。書き広げ方は、MOSS-Image の公式のプロンプトの書き手（skills/moss-image-prompt-enhancer）にならっています。
-応答の `revised_prompt` がモデルの読んだプロンプトで、`strata.enhance` に、作ったもの（`made`: `caption` か `layout`、配置ならその下書き）とかかった秒数が入ります。書き広げに失敗したとき（読めない答え、チャットのモデルがない）は、元のプロンプトのまま作り、`strata.enhance.error` に理由を書きます。
+応答の `revised_prompt` がモデルの読んだプロンプトで、`strata.enhance` に、作ったもの（`made`: `caption` か `layout`、書いたプロンプト（`prompt`）か配置の下書き）とかかった秒数が入ります。書き広げに失敗したとき（読めない答え、チャットのモデルがない）は、元のプロンプトのまま作り、`strata.enhance.error` に理由を書きます。
 
 ### 画像を直す（`POST /v1/images/edits`）
 
