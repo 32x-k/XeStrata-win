@@ -1165,10 +1165,12 @@ def legacy_functions(req: dict) -> dict | None:
     is no field, and function_call "none" without functions is the default).  Mixed with tools or tool_choice, or a
     function_call "auto" or name without functions, it is a 400."""
     fns, choice = req.get("functions"), req.get("function_call")
-    if fns is None and choice in (None, "none"):
+    if fns is None and choice is None:
         return None
     if req.get("tools") is not None or req.get("tool_choice") is not None:
         raise ValueError("functions and function_call cannot be used with tools or tool_choice")
+    if fns is None and choice == "none":
+        return None
     if not isinstance(fns, list) or not fns or not all(isinstance(f, dict) for f in fns):
         raise ValueError("functions must be a non-empty array of function objects")
     if isinstance(choice, dict) and isinstance(choice.get("name"), str):
@@ -1281,6 +1283,63 @@ def json_tool_call(body: str, schemas: dict) -> ToolCall | None:
     return ToolCall(name=obj["name"], arguments=args) if isinstance(args, dict) else None
 
 
+def _json_type(value) -> str:
+    return ("null" if value is None else "boolean" if isinstance(value, bool) else "integer" if isinstance(value, int)
+            else "number" if isinstance(value, float) else "string" if isinstance(value, str)
+            else "array" if isinstance(value, list) else "object")
+
+
+def _schema_types(schema, depth: int = 0) -> set | None:
+    """The JSON types a parameter's schema allows: its type (a name or a list), its anyOf / oneOf branches', or its
+    enum / const values' types; None when it does not say (no type, a $ref, a boolean schema, a branch that allows
+    anything)."""
+    if not isinstance(schema, dict) or depth > 8:
+        return None
+    t = schema.get("type")
+    types = {t} if isinstance(t, str) else {x for x in t if isinstance(x, str)} if isinstance(t, list) else set()
+    for key in ("anyOf", "oneOf"):
+        branches = schema.get(key)
+        for b in branches if isinstance(branches, list) else ():
+            more = _schema_types(b, depth + 1)
+            if more is None:
+                return None
+            types |= more
+    values = schema.get("enum") if isinstance(schema.get("enum"), list) else \
+        [schema["const"]] if "const" in schema else None
+    if values and not types:
+        types = {_json_type(v) for v in values}
+    return types or None
+
+
+def _text_only(schema) -> bool:
+    """A parameter whose value is always a string: what the model writes is the value, as it is."""
+    return _schema_types(schema) == {"string"}
+
+
+def param_value(text: str, schema):
+    """A call's parameter as the model wrote it -> its value by the parameter's schema: a string-only parameter is the
+    text as it is; otherwise the text read as JSON, unless that gives a type the schema does not allow while it allows
+    a string (["string", "null"]'s "1" stays "1"); text that is not JSON stays text."""
+    types = _schema_types(schema)
+    if types == {"string"}:
+        return text
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return text
+    kind = _json_type(value)
+    if types is not None and "string" in types and kind not in types and not (kind == "integer" and "number" in types):
+        return text
+    return value
+
+
+def _properties(schema) -> dict:
+    """A tool's parameters' properties, {} where the schema has none or is not an object (a boolean schema)."""
+    params = schema.get("parameters") if isinstance(schema, dict) else None
+    props = params.get("properties") if isinstance(params, dict) else None
+    return props if isinstance(props, dict) else {}
+
+
 def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     """`<function=NAME>\\n<parameter=P>\\nVALUE\\n</parameter>...</function>` -> ToolCall. Values are JSON-decoded
     when the tool's schema says the parameter is not a string (or, without a schema, when they parse as JSON
@@ -1290,7 +1349,7 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
         raise ValueError("malformed tool call: " + body[:80])
     name = body[len("<function="):body.index(">")].strip()      # `<function= capture>`: the model's stray space
     rest = body[body.index(">") + 1:]
-    props = ((schema or {}).get("parameters") or {}).get("properties") or {}
+    props = _properties(schema)
     args = {}
     while "<parameter=" in rest:
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
@@ -1303,14 +1362,7 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
             value = value[1:]
         if value.endswith("\n"):
             value = value[:-1]
-        declared = (props.get(pname) or {}).get("type")
-        if declared == "string":
-            args[pname] = value
-        else:
-            try:
-                args[pname] = json.loads(value)
-            except ValueError:
-                args[pname] = value
+        args[pname] = param_value(value, props.get(pname))
     return ToolCall(name=name, arguments=args)
 
 
@@ -1447,8 +1499,8 @@ class OutputParser:
         # #804/#3075: in the answer too, a call counts only for a tool the request declared.  With tools declared a
         # call for another name stays text (the Responses spelling `namespace__tool` of a `namespace.tool` counts as
         # that tool); `declared_only` extends the rule to a request that declared none (Chat Completions, Anthropic:
-        # the client has no tool to run).  The Responses route leaves it off: a Codex compaction request keeps its
-        # conversation's tools in the prompt only, and its calls come back as before.
+        # the client has no tool to run; Responses but for a Codex compaction request, which keeps its conversation's
+        # tools in the prompt only, and whose calls come back as before).
         self.declared_only = declared_only
         # A declared namespace.member tool is also accepted as namespace__member (PR #3556), namespace=member (Qwen
         # writes the <function= tag's equals sign into the name), namespace_member (one underscore dropped) and the
@@ -1662,7 +1714,8 @@ class OutputParser:
         self.scall = None            # the ToolCall being streamed (its id is reused by the final event)
         self.sfirst = True
         self.sval_started = False
-        self.sdeclared = {}
+        self.sprops = {}             # the streamed call's parameters' schemas
+        self.spname = ""             # the parameter being streamed
 
     def _wrapped_call_end(self) -> int:
         # Without a closing tag the structural walk cannot finish. Search only
@@ -1698,8 +1751,7 @@ class OutputParser:
                 if raw_name != raw_name.strip() and name not in self.schemas:
                     return out
                 self.scall = ToolCall(name=name, arguments={})
-                props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
-                self.sdeclared = {k: (v or {}).get("type") for k, v in props.items()}
+                self.sprops = _properties(self.schemas.get(name))
                 out.append(Event("tool_start", call=self.scall))
                 args("{")
                 self.sp += b + 1
@@ -1711,11 +1763,11 @@ class OutputParser:
                     b = stripped.find(">")
                     if b < 0:
                         return out
-                    pname = stripped[11:b]
+                    pname = self.spname = stripped[11:b]
                     args(("" if self.sfirst else ",") + json.dumps(pname) + ":")
                     self.sfirst = False
                     self.sp += b + 1
-                    if self.sdeclared.get(pname) == "string":
+                    if _text_only(self.sprops.get(pname)):
                         args('"')
                         self.ss, self.sval_started = "str", False
                     else:
@@ -1759,11 +1811,7 @@ class OutputParser:
                     value = value[1:]
                 if value.endswith("\n"):
                     value = value[:-1]
-                try:
-                    v = json.loads(value)
-                except ValueError:
-                    v = value
-                args(json.dumps(v, ensure_ascii=False))
+                args(json.dumps(param_value(value, self.sprops.get(self.spname)), ensure_ascii=False))
                 self.sp += end + len(PARAM_END)
                 self.ss = "between"
             else:

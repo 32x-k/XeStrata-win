@@ -455,6 +455,111 @@ class ImageMarkers(unittest.TestCase):
                 httpd.shutdown()
                 httpd.server_close()
 
+    def test_count_tokens_wakes_a_stopped_encoder(self):
+        """An idle unload stops the engine and a non-elastic encoder; count_tokens with a picture loads them back, as
+        /v1/messages does, and counts what that request reads (it was a 400: the picture reader is not running)."""
+        import tempfile
+
+        class Stoppable(self.FakeVision):
+            elastic, running = False, True
+
+            def alive(self):
+                return self.running
+
+            def unload(self):
+                self.running = False
+
+            def restart(self):
+                self.running = True
+
+            def encode(self, source, keep=()):
+                if not self.running:
+                    raise ValueError("the picture reader is not running")
+                return self.rows, 3
+
+        class Unloadable(MockEngine):
+            running = True
+
+            def alive(self):
+                return self.running
+
+            def unload(self):
+                self.running = False
+
+            def restart(self):
+                self.running = True
+
+        tok = ByteTokenizer()
+        img = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+        body = {"model": "m", "max_tokens": 4, "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this?"}, img]}]}
+        with tempfile.TemporaryDirectory() as d:
+            vision = Stoppable(d)
+            svc = Service(Unloadable(tok, "</think>\n\nok", max_context=CTX), tok, ChatTemplate(TEMPLATE),
+                          vision=vision)
+            httpd = serve(svc, port=0)
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            try:
+                def post(path):
+                    req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+                                                 headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=30) as r:
+                        return json.loads(r.read())
+                svc.unload()
+                self.assertFalse(vision.alive())
+                counted = post("/v1/messages/count_tokens")["input_tokens"]
+                self.assertTrue(vision.alive())
+                usage = post("/v1/messages")["usage"]
+                keys = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+                self.assertEqual(counted, sum(usage.get(k) or 0 for k in keys))
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
+    def test_a_file_error_is_a_500_without_its_path(self):
+        """A file error of the server's own while a picture is read (its work file, a full disk) is a 500 that says
+        so - not a dropped connection - and neither it nor a tool picture's note shows the file's path."""
+        import tempfile
+        tok = ByteTokenizer()
+        img = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+
+        class FullDisk(self.FakeVision):
+            def encode(self, source, keep=()):
+                raise IsADirectoryError(21, "Is a directory", "/secret/work/abc.img")
+
+        with tempfile.TemporaryDirectory() as d:
+            svc = Service(RecordingPrompt(tok, "</think>\n\nok", max_context=CTX), tok, ChatTemplate(TEMPLATE),
+                          vision=FullDisk(d))
+            httpd = serve(svc, port=0)
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            try:
+                body = {"model": "m", "max_tokens": 4, "messages": [{"role": "user", "content": [img]}]}
+                for path in ("/v1/messages", "/v1/messages/count_tokens"):
+                    with self.subTest(path):
+                        req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+                                                     headers={"Content-Type": "application/json"})
+                        with self.assertRaises(urllib.error.HTTPError) as caught:
+                            urllib.request.urlopen(req, timeout=30)
+                        with caught.exception as e:
+                            self.assertEqual(e.code, 500)
+                            text = e.read().decode()
+                        self.assertIn("Is a directory", text)
+                        self.assertNotIn("/secret", text)
+                call = {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]}
+                tool_body = {"model": "m", "max_tokens": 4, "messages": [
+                    {"role": "user", "content": "look"}, call,
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [img]}]}]}
+                req = urllib.request.Request(base + "/v1/messages", data=json.dumps(tool_body).encode(),
+                                             headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    self.assertEqual(r.status, 200)
+                prompt = tok.decode(svc.engine.last_ids)
+                self.assertIn("[image omitted: Is a directory]", prompt)
+                self.assertNotIn("/secret", prompt)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
     def test_anthropic_tool_result_image(self):
         """Claude Code's Read of a picture returns it inside a tool_result: it reaches the encoder, in place."""
         import tempfile
@@ -1695,6 +1800,76 @@ class UnsupportedOrOld(unittest.TestCase):
             httpd.server_close()
 
 
+class NamedToolChoice(unittest.TestCase):
+    """Which calls count: with a tool_choice that names tool a, the reply's one call is a's, on every API (a call of b
+    written in the thinking, or after the forced call, is not returned as a call); on Responses, a declared tool's."""
+
+    def run_api(self, script, path, body):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, script, max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}{path}",
+                                         data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.read().decode()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_only_the_named_tool_is_called(self):
+        params = {"type": "object", "properties": {"x": {"type": "string"}}}
+
+        def call(name):
+            return f"<tool_call>\n<function={name}>\n<parameter=x>\n1\n</parameter>\n</function>\n</tool_call>"
+        in_thinking = call("b") + "</think>\n\n"
+        after = "<parameter=x>\n1\n</parameter>\n</function>\n</tool_call>\n" + call("b")   # after the forced opening
+        user = [{"role": "user", "content": "go"}]
+        chat = {"model": "m", "messages": user, "max_tokens": 400,
+                "tools": [{"type": "function", "function": {"name": n, "parameters": params}} for n in "ab"],
+                "tool_choice": {"type": "function", "function": {"name": "a"}}}
+        anthropic = {"model": "m", "messages": user, "max_tokens": 400,
+                     "tools": [{"name": n, "input_schema": params} for n in "ab"],
+                     "tool_choice": {"type": "tool", "name": "a"}}
+        responses = {"model": "m", "input": "go",
+                     "tools": [{"type": "function", "name": n, "parameters": params} for n in "ab"],
+                     "tool_choice": {"type": "function", "name": "a"}}
+        for name, script, path, body in (
+                ("chat, thinking", in_thinking, "/v1/chat/completions", chat),
+                ("chat, no thinking", after, "/v1/chat/completions",
+                 {**chat, "chat_template_kwargs": {"enable_thinking": False}}),
+                ("anthropic, thinking", in_thinking, "/v1/messages",
+                 {**anthropic, "max_tokens": 4000, "thinking": {"type": "enabled", "budget_tokens": 1024}}),
+                ("anthropic, no thinking", after, "/v1/messages", anthropic),
+                ("responses, thinking", in_thinking, "/v1/responses", responses)):
+            with self.subTest(name):
+                out = json.loads(self.run_api(script, path, body))
+                if path == "/v1/chat/completions":
+                    names = [c["function"]["name"] for c in out["choices"][0]["message"].get("tool_calls") or []]
+                elif path == "/v1/messages":
+                    names = [b["name"] for b in out["content"] if b["type"] == "tool_use"]
+                else:
+                    names = [o["name"] for o in out["output"] if o["type"] == "function_call"]
+                self.assertNotIn("b", names)
+                self.assertLessEqual(len(names), 1)
+
+    def test_responses_counts_declared_calls_only(self):
+        # Responses' tool_choice none, or no tools at all: a call the model writes stays text, as on Chat and
+        # Anthropic; a Codex compaction request (no tools declared, its conversation's in the prompt) keeps its calls
+        script = ("</think>\n\n<tool_call>\n<function=a>\n<parameter=x>\n1\n</parameter>\n</function>\n"
+                  "</tool_call>")
+        params = {"type": "object", "properties": {"x": {"type": "string"}}}
+        tool = {"type": "function", "name": "a", "parameters": params}
+        turn = {"request_kind": "compaction", "session_id": "s", "thread_id": "t"}
+        meta = {"x-codex-turn-metadata": json.dumps(turn)}
+        for name, body, want in (("none", {"tools": [tool], "tool_choice": "none"}, 0), ("no tools", {}, 0),
+                                 ("compaction", {"client_metadata": meta}, 1)):
+            with self.subTest(name):
+                out = json.loads(self.run_api(script, "/v1/responses", {"model": "m", "input": "go", **body}))
+                self.assertEqual(len([o for o in out["output"] if o["type"] == "function_call"]), want)
+
+
 class ToolArguments(unittest.TestCase):
     """#510: one helper for both frontends; a history whose arguments are not a JSON object is kept, not a 500."""
 
@@ -2123,6 +2298,46 @@ class EngineDeath(unittest.TestCase):
                 self.assertIn("illegal memory access", text, path)
                 self.assertNotIn("HTTP/1", text, path)
                 self.assertEqual(svc.metrics()["requests"][0]["finish"], "error")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_an_unexpected_error_mid_stream_is_said(self):
+        """A bug after a stream started (no handler expects it) reaches the client as each API's error, not as a stream
+        that only stops (an empty answer); a boolean schema (parameters: true, a property true) is no such bug."""
+        class BuggyEngine(MockEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                yield None                                  # a prompt-progress heartbeat: the stream has started
+                raise RuntimeError("a bug")
+
+        tok = ByteTokenizer()
+        svc = Service(BuggyEngine(tok, ANSWER, max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+
+        def post(path, body):
+            req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.read().decode()
+        try:
+            user = [{"role": "user", "content": "hi"}]
+            for path, body, said in (("/v1/chat/completions", {"model": "m", "messages": user}, "data: [DONE]"),
+                                     ("/v1/messages", {"model": "m", "messages": user, "max_tokens": 20},
+                                      "event: error"),
+                                     ("/v1/responses", {"model": "m", "input": "hi"}, "response.failed")):
+                with self.subTest(path):
+                    text = post(path, {**body, "stream": True})
+                    self.assertIn("internal error (RuntimeError: a bug)", text)
+                    self.assertIn(said, text)
+            svc.engine = MockEngine(tok, "</think>\n\n<tool_call>\n<function=a>\n<parameter=x>\n1\n</parameter>\n"
+                                         "</function>\n</tool_call>", max_context=CTX)
+            for params in (True, {"type": "object", "properties": {"x": True}}):
+                tool = {"type": "function", "name": "a", "parameters": params}
+                out = json.loads(post("/v1/responses", {"model": "m", "input": "go", "tools": [tool]}))
+                self.assertEqual([json.loads(o["arguments"]) for o in out["output"] if o["type"] == "function_call"],
+                                 [{"x": 1}])
         finally:
             httpd.shutdown()
             httpd.server_close()
@@ -5853,6 +6068,44 @@ except ImportError:
     openai = None
 
 
+class ImageStream(unittest.TestCase):
+    def test_streamed_size_is_the_one_made(self):
+        # size "auto": the model chooses the size once the job runs (HunyuanImage 3.0's buckets); the streamed events
+        # carry the size it made, as the JSON answer does
+        import io
+        from PIL import Image
+        from serve import images as images_api
+        buf = io.BytesIO()
+        Image.new("RGB", (64, 36)).save(buf, format="PNG")
+        png = buf.getvalue()
+
+        def make_images(svc, gen, job, cancel=None, preview=None):
+            job.update(width=1280, height=720)                       # as _choose_size does
+            if preview is not None:
+                preview(0, 0, png)
+            return [png], {"seconds": 1.0}, "keep"
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, ANSWER, max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
+        gen = SimpleNamespace(cfg={}, model="m")
+        svc.images = SimpleNamespace(pick=lambda name: gen)
+        httpd = serve(svc, port=0)
+        try:
+            with mock.patch.object(images_api, "make_images", make_images):
+                req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/images/generations",
+                                             data=json.dumps({"prompt": "p", "stream": True, "partial_images": 1,
+                                                              "response_format": "b64_json"}).encode(),
+                                             headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    events = [json.loads(line[6:]) for line in r.read().decode().splitlines()
+                              if line.startswith("data: ")]
+            self.assertEqual([(e["type"], e["size"]) for e in events], [("image_generation.partial_image", "1280x720"),
+                                                                        ("image_generation.completed", "1280x720")])
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
 @unittest.skipUnless(openai is not None, "the openai package is not installed")
 class ImageEditForm(unittest.TestCase):
     """OpenAI's SDK sends /v1/images/edits as a multipart form, its booleans and numbers as text: parse_multipart
@@ -5875,3 +6128,10 @@ class ImageEditForm(unittest.TestCase):
         self.assertIs(fields["stream"], True)
         self.assertEqual(fields["partial_images"], 2)
         self.assertIs(self.form(stream=False)["stream"], False)
+
+    def test_vllm_omni_numbers(self):
+        # vLLM-Omni's fields (extra_body in the SDK) come as numbers, as in a JSON request
+        fields = self.form(extra_body={"num_inference_steps": 4, "guidance_scale": 2.5, "true_cfg_scale": 2.5})
+        self.assertEqual((fields["num_inference_steps"], fields["guidance_scale"], fields["true_cfg_scale"]),
+                         (4, 2.5, 2.5))
+        self.assertIsInstance(fields["guidance_scale"], float)

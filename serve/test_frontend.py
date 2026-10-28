@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """Chat history normalization before rendering the model's prompt."""
 import copy
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -122,12 +123,49 @@ class UnreadContentParts(unittest.TestCase):
                     {"role": "user", "content": [{"type": "text", "text": "go"}]}]})
                 self.assertEqual(got, want)
 
+    def test_parameter_types_that_allow_a_string(self):
+        # a parameter whose schema allows a string keeps what the model wrote when reading it as JSON gives a type the
+        # schema does not allow: ["string", "null"]'s and anyOf's "1" stays "1", as do a string enum's and const's
+        from serve.frontend import OutputParser, parse_tool_call
+        body = "<function=f>\n<parameter=x>\n1\n</parameter>\n</function>"
+        nullable = {"anyOf": [{"type": "string"}, {"type": "null"}]}
+        for schema, want in (({"type": ["string", "null"]}, "1"), (nullable, "1"), ({"enum": ["1", "2"]}, "1"),
+                             ({"const": "1"}, "1"), ({"type": "string"}, "1"), ({"type": ["integer", "null"]}, 1),
+                             ({"type": ["string", "integer"]}, 1), (True, 1)):
+            tool = {"name": "f", "parameters": {"type": "object", "properties": {"x": schema}}}
+            with self.subTest(schema=schema):
+                self.assertEqual(parse_tool_call(body, tool).arguments, {"x": want})
+                p = OutputParser(thinking=False, tools=[tool], stream_tools=True)
+                evs = p.feed("<tool_call>\n" + body + "\n</tool_call>") + p.finish()
+                self.assertEqual([e.call.arguments for e in evs if e.kind == "tool_call"], [{"x": want}])
+                streamed = "".join(e.text for e in evs if e.kind == "tool_args")    # the arguments as they stream
+                self.assertEqual(json.loads(streamed), {"x": want})
+
+    def test_responses_results_follow_calls_split_by_reasoning(self):
+        # Responses: a reasoning or a message between two calls makes two assistant messages; the results, sent in the
+        # order they finished, still follow the calls (the template pairs them by position)
+        from serve.responses import input_messages
+        call = [{"type": "function_call", "call_id": f"c{n}", "name": n, "arguments": "{}"} for n in "ab"]
+        between = ({"type": "reasoning", "summary": [], "content": [{"type": "reasoning_text", "text": "then b"}]},
+                   {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "and b"}]})
+        results = [{"type": "function_call_output", "call_id": f"c{n}", "output": f"RESULT-{n}"} for n in "ba"]
+        for item in between:
+            with self.subTest(item["type"]):
+                got = input_messages({"input": [{"role": "user", "content": "go"}, call[0], item, call[1], *results]})
+                self.assertEqual([m["content"] for m in got if m["role"] == "tool"], ["RESULT-a", "RESULT-b"])
+
     def test_function_call_none_or_null_without_functions(self):
         # a null is no field, and function_call "none" without functions is OpenAI's default: an ordinary request
         for req in ({"function_call": "none"}, {"functions": None, "function_call": None}, {"functions": None}):
             self.assertIsNone(legacy_functions({"messages": [], **req}), req)
         with self.assertRaisesRegex(ValueError, "functions must be"):
             legacy_functions({"function_call": "auto"})
+        # "none" beside the new tools is the old and the new shape mixed: a 400, as any other mix
+        tool = {"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}
+        for req in ({"function_call": "none", "tools": [tool]}, {"function_call": "none", "tool_choice": "auto"}):
+            with self.assertRaisesRegex(ValueError, "cannot be used with tools"):
+                legacy_functions(req)
+        self.assertIsNone(legacy_functions({"functions": None, "function_call": None, "tools": [tool]}))
 
     def test_messages_document_images_are_read(self):
         # a "content" document's images reach the model as the message's own images do, after its text

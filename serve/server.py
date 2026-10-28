@@ -2766,7 +2766,12 @@ class Vision:
             if self.proc is None or self.proc.stdin is None:   # an elastic encoder not started yet, or one unloaded
                 raise ValueError("the picture reader is not running")
             img, out = self.dir / f"{key}.img", self.dir / f"{key}.sve"
-            img.write_bytes(data)
+            try:
+                img.write_bytes(data)
+            except OSError:                         # a file error of the server's (a full disk): no half-written file
+                with contextlib.suppress(OSError):  # left; the request's handler answers it (a 500)
+                    img.unlink(missing_ok=True)
+                raise
             try:
                 if self.proc is None or self.proc.stdin is None:
                     raise OSError("the vision encoder is not running")
@@ -4206,7 +4211,8 @@ class Service:
                             self._vision_up()         # an elastic encoder is not running until a picture needs it
                             self.vision.encode(src)
                     except (ValueError, OSError, RuntimeError) as e:    # RuntimeError: the encoder did not start
-                        why = str(e)
+                        # a file error's sentence without its path: the note goes into the model's prompt
+                        why = (e.strerror or type(e).__name__) if isinstance(e, OSError) else str(e)
                 if why is not None:
                     print(f"[strata] a picture a tool returned was left out of the prompt: {why}", flush=True)
                     content[n] = {"type": "text", "text": f"[image omitted: {why}]"}
@@ -4257,12 +4263,13 @@ class Service:
         return self.tok.encode(force, parse_special=True) if force and kwargs.get("enable_thinking", True) is False \
             else []
 
-    def prompt_ids(self, messages, tools, kwargs, force=None, cancel=None, store=True):
+    def prompt_ids(self, messages, tools, kwargs, force=None, cancel=None, store=True, wake=False):
         """The prompt the engine reads for these messages, as prepare() and Anthropic's count_tokens make it -> (the
         messages as read: files expanded, tool pictures resolved; the prompt's ids, each picture's marker expanded to
         its image tokens and the forced call's opening (forced_ids) at the end; the rendered text's ids; each
         picture's (embeddings file, tokens)).  The pictures are encoded here (in the FIFO's turn; one encoded before
-        comes from the cache).  `store`: keep the rendering for the next request (encode_prompt)."""
+        comes from the cache).  `store`: keep the rendering for the next request (encode_prompt).  `wake`: an encoder
+        that is down (an idle unload's) is brought back by load(), as a request's own load does before prepare()."""
         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
         # between pictures and raise ClientGone
         messages = self.expand_files(messages, cancel)
@@ -4292,6 +4299,8 @@ class Service:
         encoded: list = []
         images = images_of(messages)
         if images:
+            if wake and self._vision_down():
+                self.load()             # its admission (before_load, the free VRAM) and the encoder's restart
             if self.vision is None:
                 if self.vision_error:
                     raise ValueError("images are unavailable: " + self.vision_error)
@@ -4538,6 +4547,14 @@ class Service:
         choice = (sampling or {}).get("tool_choice")
         one_call = (sampling or {}).get("parallel_tool_calls") is False or \
             isinstance(choice, dict) and choice.get("disable_parallel_tool_use") is True
+        # a tool_choice that names a tool (its opening forced): the reply's one call is that tool's - a call of another
+        # (one written in the thinking, or after the forced one) stays text, as an undeclared tool's does
+        kind, only = tool_choice_of(choice)
+        if force and kind == "named":
+            if isinstance(choice, dict) and isinstance(choice.get("namespace"), str):   # Responses' namespace.name
+                only = f"{choice['namespace']}.{only}"
+            tools = [t for t in tools or [] if isinstance(t, dict) and t.get("name") == only]
+            declared_only = one_call = True
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         # the Harmony format writes its reasoning in a channel: the budget's and the loop recovery's closing text is
         # Qwen's <think> form, so neither applies to it
@@ -5708,12 +5725,18 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
 def openai_choices(n: int, choice):
     """The chunks of n choices (`choice(k)`: choice k's chunks), one choice after another, each chunk under its
     choice's index.  The usage is the request's: the prompt once, every choice's completion tokens, on the last
-    choice's finishing chunk.  A choice that fails ends the whole request."""
+    choice's finishing chunk.  Every chunk carries the first choice's id and created, as OpenAI's chunks of one
+    completion do.  A choice that fails ends the whole request."""
     total: dict | None = None
+    first: tuple | None = None
     for k in range(n):
         chunks = choice(k)
         try:
             for c in chunks:
+                if c is not None and "id" in c:
+                    if first is None:
+                        first = c["id"], c.get("created")
+                    c["id"], c["created"] = first
                 if c is None or not c.get("choices"):
                     yield c
                     continue
@@ -6132,8 +6155,9 @@ def body_limit() -> int:
 
 def parse_multipart(ctype: str, body: bytes) -> tuple[dict, list[bytes]]:
     """A multipart/form-data body (OpenAI's /v1/images/edits) -> (its text fields, the bytes of its image or image[]
-    files in order); whole numbers in the fields (n, seed, steps, output_compression, partial_images) as ints, stream's
-    true or false (as OpenAI's SDK writes a boolean in a form) as a bool, the mask file's bytes as "mask"."""
+    files in order); the numbers the JSON request takes as numbers (n, seed, steps, num_inference_steps,
+    output_compression, partial_images whole; vLLM-Omni's guidance_scale and true_cfg_scale) as numbers, stream's true
+    or false (as OpenAI's SDK writes a boolean in a form) as a bool, the mask file's bytes as "mask"."""
     from email.parser import BytesParser
     from email.policy import HTTP
     msg = BytesParser(policy=HTTP).parsebytes(b"Content-Type: " + ctype.encode("latin-1") + b"\r\n\r\n" + body)
@@ -6151,9 +6175,15 @@ def parse_multipart(ctype: str, body: bytes) -> tuple[dict, list[bytes]]:
             fields["mask"] = data
         elif isinstance(name, str) and name:
             value = data.decode("utf-8", "replace")
-            whole = name in ("n", "seed", "steps", "output_compression", "partial_images") and value.strip().isdigit()
+            whole = name in ("n", "seed", "steps", "num_inference_steps", "output_compression", "partial_images") \
+                and value.strip().isdigit()
             if name == "stream" and value.strip().lower() in ("true", "false"):
                 fields[name] = value.strip().lower() == "true"
+            elif name in ("guidance_scale", "true_cfg_scale"):
+                try:
+                    fields[name] = float(value)          # out of range or not finite: the request's own 400
+                except ValueError:
+                    fields[name] = value
             else:
                 fields[name] = int(value) if whole else value
     return fields, files
@@ -6849,9 +6879,17 @@ def make_handler(svc: Service):
 
             except ClientGone:                               # #1999: the client left while the request was prepared
                 self._note(outcome="disconnected")
-            except OSError:
-                self._note(outcome="disconnected")
-                raise                                        # as before #332: the server's own handling
+            except OSError as e:
+                # the client's socket gone (or anything once the answer began): a disconnect, as before #332.  Before
+                # it began, another one is a file of the server's own (a picture's work file, a full disk): a 500 that
+                # says so, with the traceback in the log - not a dropped connection, and without the file's path
+                if isinstance(e, (ConnectionError, TimeoutError)) or getattr(self, "answer_started", False):
+                    self._note(outcome="disconnected")
+                    raise                                    # the server's own handling
+                import traceback
+                print(f"[strata] 500: a file error ({type(e).__name__}: {e}):\n" + traceback.format_exc(), flush=True)
+                self._json(500, {"error": {"type": "server_error", "message": "the server could not read or write a "
+                                           f"file of its own: {e.strerror or type(e).__name__}"}})
             finally:
                 svc.drop_embeddings()                        # the images' file of a request that never got to run()
                 if self.watch_done is not None:
@@ -6953,8 +6991,11 @@ def make_handler(svc: Service):
             started is an error event."""
             kind = "image_edit" if edit else "image_generation"
             fmt, opaque = job["output_format"], job["background"] == "opaque"
-            common = {"size": f"{job['width']}x{job['height']}", "quality": job["quality"],
-                      "background": job["background"], "output_format": fmt}
+
+            def common():
+                # read at each event: a size "auto" is the model's choice once it has made it (the job's, by then)
+                return {"size": f"{job['width']}x{job['height']}", "quality": job["quality"],
+                        "background": job["background"], "output_format": fmt}
             events: queue.Queue = queue.Queue()
             result: dict = {}
 
@@ -6992,7 +7033,7 @@ def make_handler(svc: Service):
                         break
                     _, index, data = item
                     send(f"{kind}.partial_image", {"b64_json": base64.b64encode(data).decode("ascii"),
-                                                   "created_at": int(time.time()), **common,
+                                                   "created_at": int(time.time()), **common(),
                                                    "partial_image_index": index})
                 if "error" in result:
                     err = {"type": "server_error", "code": "image_generation_failed", "message": str(result["error"])}
@@ -7002,7 +7043,7 @@ def make_handler(svc: Service):
                 for i, png in enumerate(result["images"]):
                     data = images_api.encode_image(png, fmt, job["output_compression"], opaque)
                     send(f"{kind}.completed", {"b64_json": base64.b64encode(data).decode("ascii"),
-                                               "created_at": int(time.time()), **common,
+                                               "created_at": int(time.time()), **common(),
                                                "usage": images_api.usage(job), "model": gen.model,
                                                "seed": job["seed"] + i, "strata": result["figures"]})
             except OSError:
@@ -7360,6 +7401,10 @@ def make_handler(svc: Service):
                 err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+            except Exception as e:  # noqa: BLE001 - a bug after the stream started: said, and the stream ends
+                err = {"error": {"type": "server_error", "message": self._stream_bug(e)}}
+                self._note(error=err["error"])
+                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
 
         def _responses_ready(self, req, events):
             """Send a finished Responses result that did not run on the engine."""
@@ -7384,6 +7429,7 @@ def make_handler(svc: Service):
                 return self._json(e.status, e.body())
             if title is not None:
                 return self._responses_ready(req, title)
+            req = responses_api.with_strict_defaults(req)    # a function tool without strict: strict where possible
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             try:
@@ -7420,7 +7466,10 @@ def make_handler(svc: Service):
                                           int(req.get("max_output_tokens") or 0), req, cancel,
                                           set(image_tools.routes()), force=force)
                 else:
-                    source = svc.run(ids, thinking, tools, max_new, req, cancel, force=force)
+                    # a call counts only for a tool the request declared (tool_choice none: none), as on the
+                    # other routes - but for a Codex compaction, whose calls come back as they did
+                    source = svc.run(ids, thinking, tools, max_new, req, cancel, force=force,
+                                     declared_only=not responses_api.codex_compaction(req))
                 for kind, x in source:
                     if kind == "ping":
                         yield None
@@ -7478,6 +7527,8 @@ def make_handler(svc: Service):
                 self._responses_failed(asm, str(e), "structured_output_failed", send)
             except ValueError as e:                          # the engine's ERR after the stream started
                 self._responses_failed(asm, str(e), "server_error", send)
+            except Exception as e:  # noqa: BLE001 - a bug after the stream started: response.failed, as above
+                self._responses_failed(asm, self._stream_bug(e), "server_error", send)
 
         def _responses_failed(self, asm, message, code, send):
             # OpenAI's order: the error event, then response.failed - made in that order, as the sequence numbers
@@ -7641,6 +7692,7 @@ def make_handler(svc: Service):
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the request itself: no tools offered
                 tools = None
             force = forced_call(req.get("tool_choice"), tools, getattr(svc.template, "call_form", "qwen"))
+            constrained_tools(req.get("tools"))               # a tool's strict of another type: the same 400
             messages, _ = anthropic_prepare_format(req, messages, tools)   # its instruction is part of the prompt
             self._no_local_images(messages)                   # the same 400s as the request itself would get
             stop_strings(req)
@@ -7648,8 +7700,9 @@ def make_handler(svc: Service):
             cancel = threading.Event()
             self._watch_client(cancel)
             # the prompt /v1/messages would read: a document's text and pages, each picture's image tokens (encoded
-            # here, in the FIFO's turn, unless the cache has it) and a forced call's opening
-            _, ids, _, _ = svc.prompt_ids(messages, tools, kw, force, cancel, store=False)
+            # here, in the FIFO's turn, unless the cache has it; an encoder an idle unload stopped is loaded back, as
+            # the request would) and a forced call's opening
+            _, ids, _, _ = svc.prompt_ids(messages, tools, kw, force, cancel, store=False, wake=True)
             self._json(200, {"input_tokens": len(ids)})
 
         def _anthropic(self, req):
@@ -7720,6 +7773,17 @@ def make_handler(svc: Service):
                 err = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
                 self._note(error=err["error"])
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+            except Exception as e:  # noqa: BLE001 - a bug after the stream started: the error event, as above
+                err = {"type": "error", "error": {"type": "api_error", "message": self._stream_bug(e)}}
+                self._note(error=err["error"])
+                self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+
+        def _stream_bug(self, e: Exception) -> str:
+            """An error no other handler expects, raised after a stream's headers went out (a bug): its traceback to
+            the log, and the sentence its error event carries - a stream that only stopped read as an empty answer."""
+            import traceback
+            print(f"[strata] error in a stream ({type(e).__name__}: {e}):\n" + traceback.format_exc(), flush=True)
+            return f"internal error ({type(e).__name__}: {e}); the server's log has the details"
 
     return Handler
 

@@ -68,6 +68,11 @@ class OpenAIChat(unittest.TestCase):
                                                         max_tokens=64, n=2)
         self.assertEqual([(ch.index, ch.message.content) for ch in r.choices], [(0, "Hello there."),
                                                                                 (1, "Hello there.")])
+        # streamed, every chunk of the one completion has its id (OpenAI's ChatCompletionChunk.id)
+        chunks = list(self.client(ANSWER).chat.completions.create(
+            model="m", messages=[{"role": "user", "content": "hi"}], max_tokens=64, n=2, stream=True))
+        self.assertEqual({ch.choices[0].index for ch in chunks if ch.choices}, {0, 1})
+        self.assertEqual(len({ch.id for ch in chunks}), 1)
 
     def test_structured_output(self):
         r = self.client('</think>\n\n{"a": 1}').chat.completions.create(
