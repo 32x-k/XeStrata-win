@@ -3,8 +3,9 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """JSON response formats at the HTTP boundary: prompt once, validate before delivery.
 
-The native engine has no grammar decoder. Failed generations are errors, never
-silently retried or returned as successful structured output.
+An engine with grammar-constrained decoding (its INFO grammar=1) writes the answer under the schema
+(answer_grammar, tool_grammar below); either way the answer is checked before delivery.  Failed generations are
+errors, never silently retried or returned as successful structured output.
 
 `jsonschema` is optional (no new hard dependency of the server): json_object needs only the standard library, and
 json_schema is checked against its schema when the package is installed - without it, only that the answer is one
@@ -274,3 +275,79 @@ def validated_json(text, validator, finish):
         path = "/" + "/".join(str(part) for part in error.absolute_path)
         raise StructuredOutputError(f"model output failed the JSON Schema at {path}: {error.message}")
     return canonical
+
+
+# ---- grammar-constrained decoding (the engine's grammar=, src/core/grammar.cpp; xgrammar's structural tags)
+# The thinking (up to </think>) is never constrained: a request that thinks gets the grammar after it.
+_THINKING = {"type": "tag", "begin": "", "content": {"type": "any_text"}, "end": "</think>"}
+
+
+def _structural(fmt: dict) -> dict:
+    return {"kind": "structural_tag", "text": json.dumps({"type": "structural_tag", "format": fmt}, ensure_ascii=False)}
+
+
+def answer_grammar(response_format, thinking: bool):
+    """A json_schema / json_object response_format (prepare_format's checks done) -> the engine's grammar for the
+    answer, or None for text.  After the thinking, the template's blank line, then the JSON."""
+    kind = response_format.get("type") if isinstance(response_format, dict) else None
+    if kind == "json_object":
+        schema = {"type": "object"}
+    elif kind == "json_schema":
+        schema = response_format["json_schema"]["schema"]
+    else:
+        return None
+    if not thinking:
+        return {"kind": "json_schema", "text": json.dumps(schema, ensure_ascii=False)}
+    return _structural({"type": "sequence", "elements": [_THINKING, {"type": "const_string", "value": "\n\n"},
+                                                         {"type": "json_schema", "json_schema": schema}]})
+
+
+def tool_grammar(tools, strict: set, patterns: dict, thinking: bool, form: str):
+    """The calls of a request with strict tools (`strict`: their names) or custom tools with a regex (`patterns`:
+    name -> pattern), in Qwen's call form (<tool_call><function=NAME><parameter=..>): a call opened with one of the
+    tools' names must follow that tool's parameters; text and the other tools' calls stay free.  None without such a
+    tool, or for another call form (GLM's, Harmony's), which is checked after the reply as before."""
+    if form != "qwen" or not (strict or patterns):
+        return None
+    tags = []
+    for t in tools or []:
+        name = t.get("name")
+        if name in strict:
+            content = {"type": "json_schema", "json_schema": t.get("parameters") or {"type": "object"},
+                       "style": "qwen_xml"}
+        elif name in patterns:
+            content = {"type": "sequence", "elements": [{"type": "const_string", "value": "<parameter=input>\n"},
+                                                        {"type": "regex", "pattern": patterns[name]},
+                                                        {"type": "const_string", "value": "\n</parameter>"}]}
+        else:
+            content = {"type": "any_text"}
+        tags.append({"type": "tag", "begin": f"<tool_call>\n<function={name}>\n", "content": content,
+                     "end": "\n</function>\n</tool_call>"})
+    calls = {"type": "triggered_tags", "triggers": ["<tool_call>\n<function="], "tags": tags, "excludes": [],
+             "at_least_one": False, "stop_after_first": False}
+    return _structural({"type": "sequence", "elements": [_THINKING, calls]} if thinking else calls)
+
+
+def constrained_tools(tools) -> tuple[set, dict]:
+    """A request's tools as sent (Chat's, Responses', Anthropic's shapes) -> (the names of those with "strict": true,
+    {name: pattern} of the custom tools whose format is a regex grammar) for tool_grammar.  A Lark grammar is not
+    constrained (it is described to the model, as before)."""
+    strict, patterns = set(), {}
+    for t in tools if isinstance(tools, list) else []:
+        if not isinstance(t, dict):
+            continue
+        inner = t.get("function")
+        fn: dict = inner if isinstance(inner, dict) else t
+        if fn.get("strict") is True and isinstance(fn.get("name"), str):
+            strict.add(fn["name"])
+        inner = t.get("custom")
+        custom: dict = inner if isinstance(inner, dict) else t if t.get("type") == "custom" else {}
+        inner = custom.get("format")
+        fmt: dict = inner if isinstance(inner, dict) else {}
+        inner = fmt.get("grammar")
+        g: dict = inner if isinstance(inner, dict) else fmt
+        name = custom.get("name")
+        if fmt.get("type") == "grammar" and g.get("syntax") == "regex" and isinstance(g.get("definition"), str) \
+                and isinstance(name, str):
+            patterns[name] = g["definition"]
+    return strict, patterns

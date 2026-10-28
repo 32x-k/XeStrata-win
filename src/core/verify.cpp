@@ -366,6 +366,7 @@ Verifier::~Verifier() {
     if (dc_arena_) strata::gpu::free(dc_arena_);
     if (h_commitd_) strata::gpu::free(h_commitd_);
     if (logit_bias_device_) strata::gpu::free(logit_bias_device_);
+    if (allowed_device_) strata::gpu::free(allowed_device_);
     if (cs_ && cs_ != ext_stream_) strata::gpu::stream_destroy(cs_);   // set_stream: the stage's stream, shared
     if (ev_done_) strata::gpu::event_destroy(ev_done_);
     if (ev_commit_) strata::gpu::event_destroy(ev_commit_);
@@ -411,6 +412,23 @@ bool Verifier::set_logit_bias(const std::vector<float>& bias, std::string& err) 
     }
     logit_bias_host_ = bias;
     sampling_.logit_bias = bias.empty() ? nullptr : logit_bias_device_;
+    return true;
+}
+
+bool Verifier::set_allowed(const uint32_t* rows, int T, std::string& err) {
+    if (next_ && !next_->set_allowed(rows, T, err)) return false;
+    if (le_ < g_->n_layers) return true;
+    allowed_on_ = rows != nullptr;
+    if (rows != nullptr) {
+        if (T < 1 || T > strata::kernels::kVerifyMaxT) { err = "grammar mask: window rows out of range"; return false; }
+        const OnDevice on_device(device_);
+        const size_t row = (size_t) ((n_vocab_ + 31) / 32) * sizeof(uint32_t);
+        if ((!allowed_device_ && !strata::gpu::alloc_device(&allowed_device_, row * strata::kernels::kVerifyMaxT)) ||
+            !strata::gpu::copy(allowed_device_, rows, row * (size_t) T)) {
+            err = "cannot upload the grammar's token masks"; return false;
+        }
+    }
+    sampling_.allowed = allowed_on_ ? allowed_device_ : nullptr;
     return true;
 }
 
@@ -1993,7 +2011,8 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         return next_->run(T, tokens, pos0, pool, out, err);
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
-    if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {
+    if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr ||
+                           sampling_.allowed != nullptr)) {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) pos0;
         sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
@@ -3277,7 +3296,8 @@ bool Verifier::pl_finish(int32_t* out, std::string& err) {
         return true;
     }
     const bool sampled = !sampling_.greedy && sampling_.temperature > 0.0f;
-    if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr)) {   // run()'s host-side sampling, Philox(seed, pos0 + t)
+    if (head_sampling_ && (sampled || hist_d_ != nullptr || sampling_.logit_bias != nullptr ||
+                           sampling_.allowed != nullptr)) {   // run()'s host-side sampling, Philox(seed, pos0 + t)
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) last_pos0_;
         sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
@@ -3366,6 +3386,9 @@ void InProcessStage::set_slot_sampling(int slot, const strata::kernels::SamplerP
 void InProcessStage::set_head_sampling(bool on) { next_->set_head_sampling(on); }
 bool InProcessStage::set_logit_bias(const std::vector<float>& bias, std::string& err) {
     return next_->set_logit_bias(bias, err);
+}
+bool InProcessStage::set_allowed(const uint32_t* rows, int T, std::string& err) {
+    return next_->set_allowed(rows, T, err);
 }
 void InProcessStage::set_history(const int32_t* history, int history_len) { next_->set_history(history, history_len); }
 bool InProcessStage::read_logits(int rows, float* host, std::string& err) const {

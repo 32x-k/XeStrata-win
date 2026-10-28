@@ -83,6 +83,9 @@ public:
     virtual void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) = 0;
     virtual void set_head_sampling(bool on) = 0;
     virtual bool set_logit_bias(const std::vector<float>& bias, std::string& err) = 0;
+    /// The grammar's allowed tokens for the next window's T rows (host bitmask rows), uploaded on the last stage's
+    /// device; null clears them.
+    virtual bool set_allowed(const uint32_t* rows, int T, std::string& err) = 0;
     /// Same process: the penalty rows the last stage's head reads, a buffer the engine fills before every window.
     virtual void set_history(const int32_t* history, int history_len) = 0;
     virtual bool read_logits(int rows, float* host, std::string& err) const = 0;
@@ -115,6 +118,7 @@ public:
     void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) override;
     void set_head_sampling(bool on) override;
     bool set_logit_bias(const std::vector<float>& bias, std::string& err) override;
+    bool set_allowed(const uint32_t* rows, int T, std::string& err) override;
     void set_history(const int32_t* history, int history_len) override;
     bool read_logits(int rows, float* host, std::string& err) const override;
     bool copy_logits(int t, float* host) const override;
@@ -166,10 +170,15 @@ public:
     void set_sampling(const strata::kernels::SamplerParams& sp) {
         sampling_ = sp;   // row t of a window at pos0 draws Philox(seed, pos0 + t): see run()
         sampling_.logit_bias = logit_bias_host_.empty() ? nullptr : logit_bias_device_;
+        sampling_.allowed = allowed_on_ ? allowed_device_ : nullptr;
         if (next_) next_->set_sampling(sp);
     }
     // One request's fixed vocabulary bias. Empty clears it; copied only when changed, on the final stage's device.
     bool set_logit_bias(const std::vector<float>& bias, std::string& err);
+    // Grammar-constrained decoding (src/core/grammar.cpp): row t's allowed tokens for the next window, T rows of
+    // (n_vocab + 31) / 32 words from the host, copied before every window to the final stage's device.  Null clears
+    // them; set, the head samples outside the captured graph as for a logit_bias.
+    bool set_allowed(const uint32_t* rows, int T, std::string& err);
 
     /// The penalty histories for `sampling_.penalty_last_n`: ONE ROW PER WINDOW ROW, T rows of `history_len`
     /// int32 slots at that stride (`strata::kernels::penalty_rows` builds them), most recent token LAST, unused
@@ -405,6 +414,8 @@ private:
     bool head_sampling_ = true;          ///< set_head_sampling
     std::vector<float> logit_bias_host_;
     float* logit_bias_device_ = nullptr;
+    uint32_t* allowed_device_ = nullptr;   ///< kVerifyMaxT rows of the grammar's mask (set_allowed)
+    bool allowed_on_ = false;
     int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it (layer split)
     unsigned long long* rr_stats_ = nullptr;   ///< STRATA_ROUTE_RESIDENT: this GPU's counters (nullptr: none)
     bool device_plan_ = false;            ///< E-6: resident-only layers planned on the device (STRATA_VERIFY_DEVICE_PLAN)

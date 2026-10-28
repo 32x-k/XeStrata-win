@@ -1220,7 +1220,10 @@ B70 の IQ2_XS で、4,996 トークンの会話（INT8 の KV）のファイル
 `json_schema` は、Python のパッケージ `jsonschema` があればそれで確かめます（`python -m pip install "jsonschema>=4.23,<5"`。setup は入れません）。
 なければ、答えが 1 つの JSON のオブジェクトであることだけを確かめ、server はそのことを一度だけ伝えます。
 
-これは**スキーマをプロンプトで伝え、server が確かめる**方式で、文法で生成を縛るものではありません。
+エンジンが文法で縛れるとき（連続バッチと密なモデルのエンジンを除く）は、**答えをスキーマの文法で縛って書かせ**、書いた後にも確かめます。
+思考は縛らず、思考の後の答えの JSON だけを縛ります。
+縛れないときは、スキーマをプロンプトで伝え、server が確かめるだけです。環境変数 `STRATA_GRAMMAR=0` でも縛りません。
+道具の `strict: true`（Chat Completions・Responses・Messages）と、`custom` の道具の regex の文法も、呼び出しの引数を同じように縛ります（Qwen の呼び出しの形のモデル）。文と、ほかの道具の呼び出しは縛りません。
 1 つの要求に 1 回だけ生成し、隠れたやり直しはしません。
 成功した応答には、確かめた JSON のオブジェクトが入ります。
 壊れた JSON、重複したキー、有限でない数、スキーマの違反、途中で終わった生成には、`error.code: structured_output_failed` で **502** を返します。
@@ -1319,7 +1322,7 @@ PDF は、Linux では poppler の `pdftotext` と `pdftoppm` で、Windows で�
 
 **Chat Completions**:
 
-- `tools` の `custom` のツールは、文字列の `input` を 1 つ取るツールとしてモデルに見せ、呼び出しは `{"type": "custom", "custom": {"name", "input"}}` で返します。文法（`format`）はモデルへの説明に書くだけで、出力を縛りません。
+- `tools` の `custom` のツールは、文字列の `input` を 1 つ取るツールとしてモデルに見せ、呼び出しは `{"type": "custom", "custom": {"name", "input"}}` で返します。文法（`format`）が regex なら、その引数を[文法で縛ります](#json-の応答の形式)。Lark の文法はモデルへの説明に書くだけです。
 - `tool_choice` は `none`、`auto`、`required`、名前を指定したツール、`allowed_tools`（見せるツールをその組に絞り、`mode: required` なら呼び出しを強制）です。道具にない名前や知らない形は 400 です。
 - `parallel_tool_calls: false` では、最初の呼び出しが閉じたところで生成を止め、その 1 つを返します。
 - `n`（1〜128）は、choice ごとに 1 回ずつ生成します。`seed` があれば choice ごとに `seed + k` です。
@@ -1334,7 +1337,7 @@ PDF は、Linux では poppler の `pdftotext` と `pdftoppm` で、Windows で�
 
 - `max_tokens` は必須で、1 以上の整数です。
 - 道具の結果は `tool_use_id` でその呼び出しに結び付けます。返す `tool_use` の id は `toolu_` で始まります。`disable_parallel_tool_use` では呼び出しを 1 つまでにします。`tool_choice` の道具にない名前や知らない形は 400 です。
-- `output_config.format`（と `output_format`）の `json_schema` は、[JSON の応答の形式](#json-の応答の形式) と同じく、答えをスキーマで確かめてから返します（出力を縛りません）。合わなければ 502（ストリームでは error のイベント）です。
+- `output_config.format`（と `output_format`）の `json_schema` は、[JSON の応答の形式](#json-の応答の形式) と同じく、答えを縛り、スキーマで確かめてから返します。合わなければ 502（ストリームでは error のイベント）です。
 - `tool_result` の `is_error: true` は、結果の前に `Error:` と書いてモデルに伝えます。
 - 文の `document`（`source` が `text` か `content`）と `search_result` は、題と一緒に文として読みます。`citations.enabled: true` は 400 です。
 - 思考のブロックには `signature` が付きます（ストリームでは `signature_delta`）。思考の文を base64 にしたもので、送り返された思考がそれと違えば 400 です。XeStrata が付けた `redacted_thinking` は読み、ほかのものは落とします。
@@ -1364,7 +1367,7 @@ PDF は、Linux では poppler の `pdftotext` と `pdftoppm` で、Windows で�
 | `include` の `message.output_text.logprobs`、`top_logprobs` | `output_text` に `logprobs` を入れます |
 | `reasoning.effort` | `none`/`minimal`、`low`、`medium`、`high`/`xhigh`。なければ設定の `reasoning_effort`、それもなければモデルの既定（high） |
 | `max_output_tokens` | 出力の上限（思考を含む）。使い切ると応答は `incomplete`（`max_output_tokens`）で終わります。`0` と `-1`（と、書かないこと）は `max_tokens` と同じく上限なし、`-1` より小さい値は 400 です |
-| `text.format` | `json_schema` と `json_object` は [JSON の応答の形式](#json-の応答の形式) を使います（確かめるだけで、出力を縛りません） |
+| `text.format` | `json_schema` と `json_object` は [JSON の応答の形式](#json-の応答の形式) を使います（縛って、確かめます） |
 | `temperature`、`top_p`、`reasoning_budget_tokens` など | チャットの経路と同じ |
 
 最後のイベント（`response.completed` か `response.incomplete`）とストリームでない返事は、`/v1/chat/completions` と同じ `timings` を一番上に持ちます。

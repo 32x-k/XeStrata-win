@@ -29,6 +29,10 @@ struct SamplerParams {
     uint64_t counter = 0;        // absolute draw index of row 0; advance across decode calls
     bool greedy = false;
     const float* logit_bias = nullptr; // optional device array [n_vocab], added BEFORE penalties/filters; -inf bans
+    // optional device bitmask, one row of (n_vocab + 31) / 32 words per token row: a token whose bit is 0 is banned
+    // (-inf) before penalties and filters.  Grammar-constrained decoding (src/core/grammar.cpp): row t's allowed tokens
+    // after the window's tokens 0..t
+    const uint32_t* allowed = nullptr;
     bool gumbel = false;         // STRATA_SPEC_GUMBEL=1: Gumbel-max pick keyed by (seed, counter, token id) - see sampler.cpp
 };
 

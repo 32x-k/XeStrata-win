@@ -139,6 +139,16 @@ install(FILES third_party/main/rocm-device-libs/LICENSE.TXT
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME LICENSE.rocm-device-libs)
 install(FILES third_party/main/stb/LICENSE   # stb_image, compiled into strata-image
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME LICENSE.stb)
+if(TARGET strata_xgrammar)   # XGrammar, picojson and DLPack, compiled into the engine (grammar-constrained decoding)
+  install(FILES third_party/main/xgrammar/LICENSE DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME}
+          RENAME LICENSE.xgrammar)
+  install(FILES third_party/main/xgrammar/NOTICE DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME}
+          RENAME NOTICE.xgrammar)
+  install(FILES third_party/main/picojson/LICENSE DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME}
+          RENAME LICENSE.picojson)
+  install(FILES third_party/main/dlpack/LICENSE DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME}
+          RENAME LICENSE.dlpack)
+endif()
 if(TARGET onemath)
   install(FILES third_party/main/oneMath/LICENSE DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME}
           RENAME LICENSE.oneMath)

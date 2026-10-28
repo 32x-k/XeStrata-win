@@ -134,3 +134,18 @@ SPDX-License-Identifier = "MIT"
 path = ["third_party/nonfree/qwen3.8-flash-next/**", "third_party/nonfree/experimental-speed-projection/**"]
 SPDX-FileCopyrightText = "2026 Qwen"
 SPDX-License-Identifier = "LicenseRef-Qwen-Community-License-1.0"
+
+[[annotations]]
+path = ["third_party/main/xgrammar/LICENSE", "third_party/main/xgrammar/NOTICE"]
+SPDX-FileCopyrightText = "2024 XGrammar Contributors"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = ["third_party/main/picojson/LICENSE"]
+SPDX-FileCopyrightText = ["2009-2010 Cybozu Labs, Inc.", "2011-2014 Kazuho Oku"]
+SPDX-License-Identifier = "BSD-2-Clause"
+
+[[annotations]]
+path = ["third_party/main/dlpack/LICENSE"]
+SPDX-FileCopyrightText = "The DLPack contributors"
+SPDX-License-Identifier = "Apache-2.0"
