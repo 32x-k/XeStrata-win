@@ -1,8 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-"""serve/images.py - image generation (Qwen-Image-2.1-Turbo, Qwen-Image-2.1, Mage-Flow, HunyuanImage 3.0) through
-XeStrata's own image engine, strata-image.
+"""serve/images.py - image generation (Qwen-Image-2.1-Turbo, Qwen-Image-2.1, Mage-Flow, HunyuanImage 3.0, MOSS-Image)
+through XeStrata's own image engine, strata-image.
 
 POST /v1/images/generations takes OpenAI's request shape (prompt, size, n, response_format b64_json|url) plus Strata's
 own field seed; POST /v1/images/edits the same with reference images (OpenAI's multipart form, image or image[]; or JSON
@@ -47,6 +47,14 @@ model's vision file ("vision": the bf16 shard with vision_model.*, which setup d
 none of.  Its weights are under the Tencent Hunyuan Community
 License Agreement, which does not apply in the European Union, the United Kingdom or South Korea:
 https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE
+
+MOSS-Image ("family": "moss-image", "schedule": "moss"): its prompt in its pipeline's chat form (MOSS_PROMPT_HEAD,
+all of it the DiT's, at most MOSS_MAX_IDS ids), the steps asked for (default 50) on its static shift (shift, default
+5; the engine builds the sigmas), guidance at any scale but 1 (default 3) with negative_prompt (default empty), the
+blocks its negative pass skips (uncond_skip_layers, default [22]) and skip-layer guidance (slg_layers, slg_scale,
+slg_start, slg_stop), by its pipeline's names (moss_request).  A layout of boxes (layout: its prompt enhancer's draft,
+boxes in the image's pixels) becomes its JSON prompt (moss_layout_prompt).  It has no edits: an image is img2img's.
+Its text encoder is Qwen3.5-9B, read by the chat's engine when that reads the same file (text_states).
 
 The GPU is shared with the text engine one job at a time: an image job takes the service's turn (the FIFO every chat
 request takes), so no chat turn runs on the GPU meanwhile.  The image engine works in the VRAM it is given: what it
@@ -162,6 +170,23 @@ HUNYUANIMAGE3_GUIDANCE = 2.5       # its guidance token's default (diff_guidance
 HUNYUANIMAGE3_MAX_REFS = 3         # its edits' reference images at most (each about 5,000 tokens at 1024x1024)
 HUNYUANIMAGE3_VIT_PATCH = 16       # SigLIP2's patch, and the slots a reference's features take (its processor's)
 HUNYUANIMAGE3_VIT_SLOTS = 1024
+# MOSS-Image's prompt (its pipeline's encode_prompt: the chat template with thinking on, the user's turn alone), all of
+# it the DiT's (no system turn to drop), at most its max_sequence_length
+MOSS_PROMPT_HEAD = "<|im_start|>user\n"
+MOSS_PROMPT_TAIL = "<|im_end|>\n<|im_start|>assistant\n<think>\n"
+MOSS_MAX_IDS = 4096
+MOSS_STEPS = 50                    # its pipeline's defaults: 50 steps, guidance 3, shift 5, an empty negative prompt,
+MOSS_CFG = 3.0                     # block 22 skipped by the negative pass, no skip-layer guidance (slg_scale 0)
+MOSS_SHIFT = 5.0
+MOSS_NEG = ""
+MOSS_UNCOND_SKIP = [22]
+MOSS_BLOCKS = 42                   # its DiT's blocks (the skip lists' range)
+MOSS_SHIFT_MAX = 20.0
+# a layout (the prompt as MOSS-Image's JSON of boxes): its summary's fields and an item's
+MOSS_SUMMARY_KEYS = ("caption", "meta", "canvas", "palette")
+MOSS_ITEM_KEYS = ("label", "caption", "text", "bbox", "tags", "palette")
+MOSS_LABELS = ("object", "character", "text")
+MOSS_CANVASES = ("single", "multi_panel", "collage")
 # an edit's reference image in the prompt: one pad, which the engine widens to the image's tokens
 REF_PROMPT = "{sep}<image{i}><|vision_start|><|image_pad|><|vision_end|>"
 REF_MAX_BYTES = 32 << 20
@@ -212,15 +237,20 @@ def model_defaults(cfg: dict) -> dict:
     img2img's (a model without edits) with the strength it gets when a request gives none (strength: 1 for an
     edit).  HunyuanImage 3.0's guidance is one token
     rather than a second pass (guidance_token: no negative prompt, a guided step costs one), and its sizes are its
-    resolution buckets (buckets: [width, height] each; a request's size is made at the one whose shape is nearest)."""
+    resolution buckets (buckets: [width, height] each; a request's size is made at the one whose shape is nearest).
+    MOSS-Image's are its pipeline's: the shift, the blocks the negative pass skips, skip-layer guidance's fields, and
+    that it takes a layout of boxes."""
     mage = cfg.get("family") == "mage-flow"
     hunyuan = cfg.get("family") == "hunyuan-image-3"
+    moss = cfg.get("family") == "moss-image"
     if cfg.get("schedule") == "base":
         steps, least, fixed = int(cfg.get("steps") or 40), 2, False
     elif cfg.get("schedule") == "mage":
         steps, least, fixed = int(cfg.get("steps") or 4), 1, False
     elif cfg.get("schedule") == "hunyuanimage3":   # HunyuanImage 3.0: any count on the engine's own shift
         steps, least, fixed = int(cfg.get("steps") or HUNYUANIMAGE3_STEPS), 1, False
+    elif cfg.get("schedule") == "moss":   # MOSS-Image: any count on its static shift
+        steps, least, fixed = int(cfg.get("steps") or MOSS_STEPS), 1, False
     else:
         steps, least, fixed = TURBO_STEPS, TURBO_STEPS, True
     edit = int(cfg.get("edit_steps") or steps) if cfg.get("edit_model") else steps
@@ -229,12 +259,17 @@ def model_defaults(cfg: dict) -> dict:
            "max_n": int(cfg.get("max_n") or MAX_N), "budget_s": float(cfg.get("budget_s") or BUDGET_S),
            "formats": output_formats(),
            "guidance": (float(cfg.get("guidance") or HUNYUANIMAGE3_GUIDANCE) if hunyuan
-                        else float(cfg.get("cfg_scale") or 1.0) if mage else 1.0),
+                        else float(cfg.get("cfg_scale") or 1.0) if mage
+                        else float(cfg.get("cfg_scale") or MOSS_CFG) if moss else 1.0),
            "guidance_token": hunyuan,
-           "negative_prompt": MF_NEG if mage else None, "transparency": cfg.get("transparency") is not False,
+           "negative_prompt": MF_NEG if mage else MOSS_NEG if moss else None,
+           "transparency": cfg.get("transparency") is not False,
            "mask": True, "img2img": not can_edit(cfg), "strength": 1.0 if can_edit(cfg) else STRENGTH_IMG2IMG}
     if hunyuan:
         out["buckets"] = [[b["width"], b["height"]] for b in hunyuanimage3_buckets(cfg)]
+    if moss:
+        out.update(shift=float(cfg.get("shift") or MOSS_SHIFT), uncond_skip_layers=list(MOSS_UNCOND_SKIP),
+                   slg_layers=[], slg_scale=0.0, slg_start=0.0, slg_stop=1.0, blocks=MOSS_BLOCKS, layout=True)
     return out
 
 
@@ -311,7 +346,7 @@ def parse_request(req: dict, cfg: dict) -> dict:
         steps = _int_field(req, "steps", 2, MAX_STEPS, QUALITY_STEPS.get(quality or "auto") or dflt["steps"])
     elif cfg.get("schedule") == "mage":   # Mage-Flow: any count on its static shift, the config's by default
         steps = _int_field(req, "steps", 1, MAX_STEPS, dflt["steps"])
-    elif cfg.get("schedule") == "hunyuanimage3":   # HunyuanImage 3.0: the count on the engine's own sigmas
+    elif cfg.get("schedule") in ("hunyuanimage3", "moss"):   # the count on the engine's own sigmas (its shift)
         steps = _int_field(req, "steps", 1, MAX_STEPS, dflt["steps"])
     else:   # Turbo's own sigmas: steps asked for are ignored, as its diffusers pipeline (sample_sigmas) does
         _int_field(req, "steps", 1, MAX_STEPS, None)
@@ -324,9 +359,170 @@ def parse_request(req: dict, cfg: dict) -> dict:
     partial = _int_field(req, "partial_images", 0, 3, 0)
     if req.get("stream") is not None and not isinstance(req.get("stream"), bool):
         raise ImageRequestError("stream: true or false")
-    return {"prompt": prompt, "width": w, "height": h, "n": n, "steps": steps, "seed": seed, "partial_images": partial,
-            "quality": quality or "auto", "response_format": fmt, "output_format": out_fmt,
-            "output_compression": compression, "background": background, "bucket": bucket, **requested, **cfg_fields}
+    job = {"prompt": prompt, "width": w, "height": h, "n": n, "steps": steps, "seed": seed, "partial_images": partial,
+           "quality": quality or "auto", "response_format": fmt, "output_format": out_fmt,
+           "output_compression": compression, "background": background, "bucket": bucket, **requested, **cfg_fields}
+    if cfg.get("family") == "moss-image":
+        job.update(moss_request(req, cfg))
+        if req.get("layout") is not None:
+            job["layout"] = parse_layout(req["layout"])
+            job["layout_prompt"] = moss_layout_prompt(job["layout"], prompt, w, h)
+    else:
+        if req.get("layout") not in (None, False, "", "false", "off"):
+            raise ImageRequestError("layout: MOSS-Image's (this image model has none)")
+    return job
+
+
+def _number(req: dict, key: str, lo: float, hi: float, default: float) -> float:
+    """A number field (or a form field's text) from lo to hi, checked; `default` when none."""
+    v = req.get(key)
+    if v is None or v == "":
+        return default
+    if isinstance(v, str):
+        try:
+            v = float(v.strip())
+        except ValueError:
+            raise ImageRequestError(f"{key}: a number from {lo:g} to {hi:g}") from None
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or not lo <= v <= hi:
+        raise ImageRequestError(f"{key}: a number from {lo:g} to {hi:g}")
+    return float(v)
+
+
+def _blocks(req: dict, key: str, default: list[int]) -> list[int]:
+    """A list of MOSS-Image's DiT blocks (zero-based, below MOSS_BLOCKS), as its pipeline's skip lists take them: a
+    JSON list, or a form field's text ("22", "22,30", "[22]"); null, [] or "none": none; absent: `default`."""
+    if key not in req:
+        return list(default)
+    v = req[key]
+    if isinstance(v, str):
+        text = v.strip()
+        if text.lower() in ("", "none", "null", "[]"):
+            return []
+        try:
+            v = json.loads(text) if text.startswith("[") else [int(x) for x in text.split(",") if x.strip()]
+        except ValueError:
+            raise ImageRequestError(f"{key}: a list of block numbers from 0 to {MOSS_BLOCKS - 1}") from None
+    if v is None:
+        return []
+    if isinstance(v, int) and not isinstance(v, bool):
+        v = [v]
+    if not isinstance(v, list) or any(isinstance(b, bool) or not isinstance(b, int) or not 0 <= b < MOSS_BLOCKS
+                                      for b in v):
+        raise ImageRequestError(f"{key}: a list of block numbers from 0 to {MOSS_BLOCKS - 1}")
+    return sorted(set(v))
+
+
+def moss_request(req: dict, cfg: dict) -> dict:
+    """MOSS-Image's own fields, by its pipeline's names and defaults (model_defaults): shift (the schedule's static
+    shift), uncond_skip_layers (the blocks guidance's negative pass skips; null or [] none), skip-layer guidance's
+    slg_layers and slg_scale (a third pass of the prompt with those blocks skipped, slg_scale times the difference
+    added; 0 or no layers, none) and both skips' window slg_start .. slg_stop (shares of the steps)."""
+    dflt = model_defaults(cfg)
+    out: dict[str, Any] = {"shift": _number(req, "shift", 0.01, MOSS_SHIFT_MAX, dflt["shift"]),
+                           "uncond_skip": _blocks(req, "uncond_skip_layers", dflt["uncond_skip_layers"]),
+                           "slg_layers": _blocks(req, "slg_layers", []),
+                           "slg_scale": _number(req, "slg_scale", 0.0, CFG_MAX, 0.0),
+                           "slg_start": _number(req, "slg_start", 0.0, 1.0, 0.0),
+                           "slg_stop": _number(req, "slg_stop", 0.0, 1.0, 1.0)}
+    if out["slg_start"] > out["slg_stop"]:
+        raise ImageRequestError("slg_start: at most slg_stop")
+    return out
+
+
+def parse_layout(value) -> dict:
+    """A request's layout (MOSS-Image's boxes), checked: a JSON object (or its text, a form's field) with "items" and
+    optionally "summary", as the model's prompt enhancer drafts one: boxes [x_min, y_min, x_max, y_max] in the image's
+    pixels from its top-left corner ("bbox_coord_space" "abs" and "bbox_format" "xyxy", which may be given and are the
+    only ones taken); its "width" and "height", when given, must be the image's (moss_layout_prompt checks them)."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            raise ImageRequestError("layout: a JSON object") from None
+    if not isinstance(value, dict):
+        raise ImageRequestError('layout: an object with "items" (and "summary")')
+    unknown = set(value) - {"summary", "items", "width", "height", "bbox_coord_space", "bbox_format"}
+    if unknown:
+        raise ImageRequestError(f"layout: unknown fields {sorted(unknown)}")
+    if value.get("bbox_coord_space", "abs") != "abs" or value.get("bbox_format", "xyxy") != "xyxy":
+        raise ImageRequestError('layout: boxes in the image\'s pixels, [x_min, y_min, x_max, y_max] from its top-left '
+                                '(bbox_coord_space "abs", bbox_format "xyxy")')
+
+    def text(v, where: str) -> str:
+        if not isinstance(v, str) or not v.strip():
+            raise ImageRequestError(f"layout: {where}: a non-empty string")
+        return v
+
+    def strings(v, where: str) -> list:
+        if not isinstance(v, list):
+            raise ImageRequestError(f"layout: {where}: a list of strings")
+        return [text(x, f"{where}[{i}]") for i, x in enumerate(v)]
+
+    summary = value.get("summary")
+    if summary is not None:
+        if not isinstance(summary, dict):
+            raise ImageRequestError("layout: summary: an object")
+        unknown = set(summary) - set(MOSS_SUMMARY_KEYS)
+        if unknown:
+            raise ImageRequestError(f"layout: summary: unknown fields {sorted(unknown)}")
+        if "caption" in summary:
+            text(summary["caption"], "summary.caption")
+        if "canvas" in summary and summary["canvas"] not in MOSS_CANVASES:
+            raise ImageRequestError("layout: summary.canvas: " + ", ".join(MOSS_CANVASES))
+        for key in ("meta", "palette"):
+            if key in summary:
+                strings(summary[key], f"summary.{key}")
+    items = value.get("items")
+    if not isinstance(items, list) or not items:
+        raise ImageRequestError("layout: items: a non-empty list")
+    for i, item in enumerate(items):
+        where = f"items[{i}]"
+        if not isinstance(item, dict):
+            raise ImageRequestError(f"layout: {where}: an object")
+        unknown = set(item) - set(MOSS_ITEM_KEYS)
+        if unknown:
+            raise ImageRequestError(f"layout: {where}: unknown fields {sorted(unknown)}")
+        if item.get("label") not in MOSS_LABELS:
+            raise ImageRequestError(f"layout: {where}.label: " + ", ".join(MOSS_LABELS))
+        text(item.get("caption"), f"{where}.caption")
+        if item["label"] == "text" and "text" not in item:
+            raise ImageRequestError(f'layout: {where}: a text item needs its "text" (the exact words)')
+        if "text" in item:
+            text(item["text"], f"{where}.text")
+        for key in ("tags", "palette"):
+            if key in item:
+                strings(item[key], f"{where}.{key}")
+        box = item.get("bbox")
+        if (not isinstance(box, list) or len(box) != 4
+                or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in box)):
+            raise ImageRequestError(f"layout: {where}.bbox: [x_min, y_min, x_max, y_max], four numbers")
+    return value
+
+
+def moss_layout_prompt(layout: dict, prompt: str, width: int, height: int) -> str:
+    """A layout (parse_layout's) as MOSS-Image reads it, its prompt: the JSON of its model card (summary, items, then
+    "bbox_coord_space": "abs_centralized" and "bbox_format": "yxyx", as json.dumps writes it with ensure_ascii off),
+    each box [y_min, x_min, y_max, x_max] in pixels from the middle of the image the engine makes (made_size; the
+    image cut from it keeps the middle), its edges taken outward to whole pixels, as the model's prompt enhancer
+    compiles a draft.  The summary's caption is the request's prompt where the layout gives none."""
+    for key, side in (("width", width), ("height", height)):
+        if key in layout and layout[key] != side:
+            raise ImageRequestError(f"layout: {key} {layout[key]} is not the image's {side} (size)")
+    mw, mh = made_size({"width": width, "height": height})
+    dx, dy = (mw - width) // 2, (mh - height) // 2
+    summary = dict(layout.get("summary") or {})
+    summary.setdefault("caption", prompt)
+    items = []
+    for i, item in enumerate(layout["items"]):
+        x1, y1, x2, y2 = item["bbox"]
+        if not (0 <= x1 < x2 <= width and 0 <= y1 < y2 <= height):
+            raise ImageRequestError(f"layout: items[{i}].bbox {item['bbox']}: x from 0 to {width} and y from 0 to "
+                                    f"{height}, each min below its max")
+        box = [math.floor(round(y1, 9)) + dy - mh // 2, math.floor(round(x1, 9)) + dx - mw // 2,
+               math.ceil(round(y2, 9)) + dy - mh // 2, math.ceil(round(x2, 9)) + dx - mw // 2]
+        items.append({k: (box if k == "bbox" else v) for k, v in item.items()})
+    return json.dumps({"summary": summary, "items": items, "bbox_coord_space": "abs_centralized",
+                       "bbox_format": "yxyx"}, ensure_ascii=False)
 
 
 def cfg_request(req: dict, cfg: dict | None = None) -> dict:
@@ -334,7 +530,9 @@ def cfg_request(req: dict, cfg: dict | None = None) -> dict:
     classifier-free guidance from true_cfg_scale above 1 with a negative_prompt, as diffusers' QwenImage21Pipeline
     does (without one, or at 1, none: "cfg" stays out of the job); guidance_scale it has no use for, and ignores.
     Mage-Flow (cfg "family" mage-flow) has one scale: true_cfg_scale, else guidance_scale, else the config's
-    "cfg_scale"; above 1 it guides, with negative_prompt or its pipeline's " ".  HunyuanImage 3.0 has one scale as
+    "cfg_scale"; above 1 it guides, with negative_prompt or its pipeline's " ".  MOSS-Image's one scale is taken the
+    same way (its config's 3.0), and guides at any scale but 1 (its pipeline's u + scale (c - u)), with negative_prompt
+    or its pipeline's empty one.  HunyuanImage 3.0 has one scale as
     well, but as a token rather than a second pass: guidance_scale (true_cfg_scale as its other name), else the
     config's "guidance"; a negative prompt has nothing to steer there, so none is kept."""
     out: dict = {}
@@ -359,10 +557,10 @@ def cfg_request(req: dict, cfg: dict | None = None) -> dict:
             scale = float((cfg or {}).get("guidance") or HUNYUANIMAGE3_GUIDANCE)
         out["guidance"] = float(scale)
         return out
-    if (cfg or {}).get("family") == "mage-flow":
+    if (cfg or {}).get("family") in ("mage-flow", "moss-image"):
         dflt = model_defaults(cfg or {})
         scale = out.get("true_cfg_scale", out.get("guidance_scale", dflt["guidance"]))
-        if scale > 1:
+        if scale > 1 or (scale != 1 and (cfg or {}).get("family") == "moss-image"):
             out["cfg"] = scale
             out.setdefault("negative_prompt", dflt["negative_prompt"])
         return out
@@ -372,7 +570,10 @@ def cfg_request(req: dict, cfg: dict | None = None) -> dict:
 
 
 def model_prompt(job: dict) -> str:
-    """The prompt as the model reads it: a transparent image's in Qwen's form for one (TRANSPARENT_PROMPT)."""
+    """The prompt as the model reads it: a transparent image's in Qwen's form for one (TRANSPARENT_PROMPT); MOSS-Image's
+    layout as its JSON (moss_layout_prompt)."""
+    if job.get("layout_prompt"):
+        return job["layout_prompt"]
     if job.get("background") == "transparent":
         return TRANSPARENT_PROMPT.format(prompt=job["prompt"].strip().rstrip("."))
     return job["prompt"]
@@ -643,7 +844,13 @@ def prompt_ids(tok, prompt: str, refs: int = 0, family: str = "qwen-image") -> l
     """The prompt in the model's chat form, tokenized (Qwen3-VL's tokenizer): the user's text plain, so a special
     token spelled in it stays text; an edit's `refs` reference images before it, one pad each (stable-diffusion.cpp's
     prompt for Qwen-Image-2.1's edits, the pads widened by the engine).  Mage-Flow's in its own forms (MF_PROMPT_HEAD;
-    an edit's MF_EDIT_HEAD, each reference "Image j: <pad>" before the instruction)."""
+    an edit's MF_EDIT_HEAD, each reference "Image j: <pad>" before the instruction); MOSS-Image's in its pipeline's
+    (the user's turn and the assistant's opened with <think>, MOSS_PROMPT_HEAD and MOSS_PROMPT_TAIL; Qwen3.5-9B's
+    tokenizer)."""
+    if family == "moss-image":
+        text = MOSS_PROMPT_HEAD + prompt + MOSS_PROMPT_TAIL
+        at = len(MOSS_PROMPT_HEAD)
+        return tok.encode(text, parse_special=True, plain=[(at, at + len(prompt))])
     if family == "mage-flow":
         head = MF_EDIT_HEAD + "".join(MF_EDIT_REF.format(i=i + 1) for i in range(refs)) if refs else MF_PROMPT_HEAD
     else:
@@ -1086,7 +1293,8 @@ class ImageGen:
                              "uses (run setup with --images again)")
         self.policy, self.reload = policy, reload
         # the ids the DiT does not take: the leading system turn's (HunyuanImage 3.0's DiT reads all of its own)
-        self.drop = 0 if self.family == "hunyuan-image-3" else MF_DROP if self.family == "mage-flow" else DROP
+        self.drop = (0 if self.family in ("hunyuan-image-3", "moss-image") else MF_DROP if self.family == "mage-flow"
+                     else DROP)
         self.model = self.cfg.get("model_name") or MODEL_NAME
         self.log = log
         out = self.cfg.get("out_dir")
@@ -1137,10 +1345,13 @@ class ImageGen:
 
     @staticmethod
     def _work(job: dict) -> tuple[float, float]:
-        """One image's (steps, megapixels): the steps it runs (a strength's), a guided step two, the size the engine
-        makes."""
+        """One image's (steps, megapixels): the steps it runs (a strength's), a guided step two (MOSS-Image's
+        skip-layer guidance one more in its window), the size the engine makes."""
         mw, mh = made_size(job)
-        return job.get("steps_run", job["steps"]) * (2 if job.get("cfg") else 1), round(mw * mh / 1e6, 3)
+        passes = 2 if job.get("cfg") else 1
+        if job.get("slg_layers") and job.get("slg_scale"):
+            passes += job.get("slg_stop", 1.0) - job.get("slg_start", 0.0)
+        return job.get("steps_run", job["steps"]) * passes, round(mw * mh / 1e6, 3)
 
     def _measured(self, job: dict, r: dict) -> None:
         """One image's engine figures (its IMAGE line) into the rates of its size, a running mean that follows the
@@ -1248,10 +1459,18 @@ class ImageGen:
                 job["ids"] = hunyuanimage3_ids(self.tok, model_prompt(job), bucket, self._base_size(),
                                                self.system_text(), job["ref_buckets"])
             else:
-                job["ids"] = prompt_ids(self.tok, model_prompt(job), len(job.get("refs") or ()), self.family)
+                ids = prompt_ids(self.tok, model_prompt(job), len(job.get("refs") or ()), self.family)
+                neg = None
                 if job.get("cfg"):   # guidance's negative prompt, in the same form (its pads as the prompt's)
-                    job["neg_ids"] = prompt_ids(self.tok, job["negative_prompt"], len(job.get("refs") or ()),
-                                                self.family)
+                    neg = prompt_ids(self.tok, job["negative_prompt"], len(job.get("refs") or ()), self.family)
+                if self.family == "moss-image":   # its pipeline's max_sequence_length
+                    for what, x in (("prompt", ids), ("negative_prompt", neg or ())):
+                        if len(x) > MOSS_MAX_IDS:
+                            raise ImageRequestError(f"{what}: {len(x)} tokens in MOSS-Image's form, over its "
+                                                    f"{MOSS_MAX_IDS}")
+                job["ids"] = ids
+                if neg is not None:
+                    job["neg_ids"] = neg
         return job["ids"]
 
     def _choose_size(self, job: dict, timeout: float, cancel: threading.Event | None) -> None:
@@ -1280,6 +1499,18 @@ class ImageGen:
     def drop_of(self, job: dict) -> int:
         """The system turn's ids the DiT does not take: Mage-Flow's edit form has its own."""
         return MF_EDIT_DROP if self.family == "mage-flow" and job.get("refs") else self.drop
+
+    @staticmethod
+    def _moss_words(job: dict) -> str:
+        """MOSS-Image's words of IMG: its steps and shift (the engine makes its sigmas), the blocks the negative pass
+        skips, and skip-layer guidance's (moss_request)."""
+        words = (f" STEPS:{job['steps']} SHIFT:{job.get('shift', MOSS_SHIFT)!r}"
+                 f" USKIP:{','.join(str(b) for b in job.get('uncond_skip', MOSS_UNCOND_SKIP)) or 'none'}")
+        if job.get("slg_layers") and job.get("slg_scale"):
+            words += (f" SLG:{','.join(str(b) for b in job['slg_layers'])} SLGSCALE:{job['slg_scale']!r}")
+        if job.get("slg_start", 0.0) != 0.0 or job.get("slg_stop", 1.0) != 1.0:
+            words += f" SLGSTART:{job['slg_start']!r} SLGSTOP:{job['slg_stop']!r}"
+        return words
 
     @staticmethod
     def _cfg_words(job: dict) -> str:
@@ -1394,7 +1625,8 @@ class ImageGen:
                 sigmas = " SIGMAS:" + ",".join(f"{x:.7g}" for x in sig) if sig else ""
                 # HunyuanImage 3.0's sigmas are the engine's own (from the step count): its step count and the
                 # guidance token's scale go instead
-                guide = f" STEPS:{job['steps']} GUID:{job['guidance']:g}" if sched == "hunyuanimage3" else ""
+                guide = (f" STEPS:{job['steps']} GUID:{job['guidance']:g}" if sched == "hunyuanimage3" else
+                         self._moss_words(job) if self.family == "moss-image" else "")
                 for i in range(first, job["n"]):
                     if i > first and pause is not None and pause():
                         break
@@ -1456,7 +1688,8 @@ class ImageGen:
                    "vae_decode_s": round(sum(r.get("decode_s", 0) for r in parts), 2),
                    "plan": {k: v for k, v in parts[-1].items() if k not in ("text_s", "sampling_s", "decode_s")},
                    **({"guidance": job["guidance"], "ratio": job["bucket"]["ratio_index"]}
-                      if job.get("bucket") is not None else {})}
+                      if job.get("bucket") is not None else {}),
+                   **({"layout": True} if job.get("layout_prompt") else {})}
         if (mw, mh) != (job["width"], job["height"]):      # made larger and cut: the web page says so
             figures["made_size"] = f"{mw}x{mh}"
         if job.get("requested_size"):                      # made at the model's bucket instead: the web page says so
