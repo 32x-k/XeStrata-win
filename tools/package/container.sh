@@ -66,6 +66,7 @@ python3-requests, python3-pil, python3-psutil"
     vulkan_icd="mesa-vulkan-drivers"
     jxl="libjxl-tools"   # cjxl: the images' JPEG XL (serve/images.py)
     pdf="poppler-utils"  # a PDF a request sends: pdftotext and pdftoppm (serve/server.py read_file)
+    jsonschema="python3-jsonschema"   # json_schema answers and strict tool calls (serve/structured.py)
     if [ "$license" = contrib ]; then
       case "$cuda_ver" in
         12.4) apt-get install -y -q --no-install-recommends nvidia-cuda-toolkit
@@ -97,6 +98,7 @@ python3-requests, python3-pillow, python3-psutil"
     vulkan_icd="mesa-vulkan-drivers"
     jxl="libjxl-utils"
     pdf="poppler-utils"     # as on Ubuntu
+    jsonschema="python3-jsonschema"
     if [ "$license" = contrib ]; then
       dnf install -y -q dnf5-plugins   # config-manager
       dnf config-manager addrepo \
@@ -183,9 +185,9 @@ cmake --build /build/engine --target $targets -j "$jobs"
 # maker's driver and libraries are never required: the free package recommends Intel's Level Zero driver and AMD's
 # ROCm libraries (both free software, for the GPUs it runs), and the cuda ones, for a PC with GPUs of one maker or
 # more, only suggest every maker's, so that apt and dnf do not install the others'.  Every package recommends libjxl's
-# tools (the images' JPEG XL) and poppler's (a PDF a request sends).
+# tools (the images' JPEG XL), poppler's (a PDF a request sends) and jsonschema (json_schema answers, strict tools).
 depends=$python_deps
-recommends="$jxl, $pdf"
+recommends="$jxl, $pdf, $jsonschema"
 suggests=""
 # the packages of the libraries the HIP adapter and oneMath's rocBLAS backend open: ROCm's HIP runtime, rocBLAS and
 # hipBLASLt
