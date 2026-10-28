@@ -455,6 +455,67 @@ class ImageMarkers(unittest.TestCase):
                 httpd.shutdown()
                 httpd.server_close()
 
+    def test_count_tokens_wakes_a_stopped_encoder(self):
+        """An idle unload stops the engine and a non-elastic encoder; count_tokens with a picture loads them back, as
+        /v1/messages does, and counts what that request reads (it was a 400: the picture reader is not running)."""
+        import tempfile
+
+        class Stoppable(self.FakeVision):
+            elastic, running = False, True
+
+            def alive(self):
+                return self.running
+
+            def unload(self):
+                self.running = False
+
+            def restart(self):
+                self.running = True
+
+            def encode(self, source, keep=()):
+                if not self.running:
+                    raise ValueError("the picture reader is not running")
+                return self.rows, 3
+
+        class Unloadable(MockEngine):
+            running = True
+
+            def alive(self):
+                return self.running
+
+            def unload(self):
+                self.running = False
+
+            def restart(self):
+                self.running = True
+
+        tok = ByteTokenizer()
+        img = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+        body = {"model": "m", "max_tokens": 4, "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this?"}, img]}]}
+        with tempfile.TemporaryDirectory() as d:
+            vision = Stoppable(d)
+            svc = Service(Unloadable(tok, "</think>\n\nok", max_context=CTX), tok, ChatTemplate(TEMPLATE),
+                          vision=vision)
+            httpd = serve(svc, port=0)
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            try:
+                def post(path):
+                    req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+                                                 headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=30) as r:
+                        return json.loads(r.read())
+                svc.unload()
+                self.assertFalse(vision.alive())
+                counted = post("/v1/messages/count_tokens")["input_tokens"]
+                self.assertTrue(vision.alive())
+                usage = post("/v1/messages")["usage"]
+                keys = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+                self.assertEqual(counted, sum(usage.get(k) or 0 for k in keys))
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
     def test_a_file_error_is_a_500_without_its_path(self):
         """A file error of the server's own while a picture is read (its work file, a full disk) is a 500 that says
         so - not a dropped connection - and neither it nor a tool picture's note shows the file's path."""

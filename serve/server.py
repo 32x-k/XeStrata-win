@@ -4263,12 +4263,13 @@ class Service:
         return self.tok.encode(force, parse_special=True) if force and kwargs.get("enable_thinking", True) is False \
             else []
 
-    def prompt_ids(self, messages, tools, kwargs, force=None, cancel=None, store=True):
+    def prompt_ids(self, messages, tools, kwargs, force=None, cancel=None, store=True, wake=False):
         """The prompt the engine reads for these messages, as prepare() and Anthropic's count_tokens make it -> (the
         messages as read: files expanded, tool pictures resolved; the prompt's ids, each picture's marker expanded to
         its image tokens and the forced call's opening (forced_ids) at the end; the rendered text's ids; each
         picture's (embeddings file, tokens)).  The pictures are encoded here (in the FIFO's turn; one encoded before
-        comes from the cache).  `store`: keep the rendering for the next request (encode_prompt)."""
+        comes from the cache).  `store`: keep the rendering for the next request (encode_prompt).  `wake`: an encoder
+        that is down (an idle unload's) is brought back by load(), as a request's own load does before prepare()."""
         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
         # between pictures and raise ClientGone
         messages = self.expand_files(messages, cancel)
@@ -4298,6 +4299,8 @@ class Service:
         encoded: list = []
         images = images_of(messages)
         if images:
+            if wake and self._vision_down():
+                self.load()             # its admission (before_load, the free VRAM) and the encoder's restart
             if self.vision is None:
                 if self.vision_error:
                     raise ValueError("images are unavailable: " + self.vision_error)
@@ -7697,8 +7700,9 @@ def make_handler(svc: Service):
             cancel = threading.Event()
             self._watch_client(cancel)
             # the prompt /v1/messages would read: a document's text and pages, each picture's image tokens (encoded
-            # here, in the FIFO's turn, unless the cache has it) and a forced call's opening
-            _, ids, _, _ = svc.prompt_ids(messages, tools, kw, force, cancel, store=False)
+            # here, in the FIFO's turn, unless the cache has it; an encoder an idle unload stopped is loaded back, as
+            # the request would) and a forced call's opening
+            _, ids, _, _ = svc.prompt_ids(messages, tools, kw, force, cancel, store=False, wake=True)
             self._json(200, {"input_tokens": len(ids)})
 
         def _anthropic(self, req):
