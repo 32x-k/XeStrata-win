@@ -104,7 +104,8 @@ std::vector<float> torch_cpu_randn(uint64_t seed, uint64_t n) {
         for (int j = 0; j < 8; ++j) {
             const float u1 = 1.f - p[j], u2 = p[j + 8];
             const float radius = std::sqrt(-2.f * std::log(u1));
-            const float theta = 2.f * (float) M_PI * u2;
+            // pi written out: MSVC's <cmath> has no M_PI without a define
+            const float theta = 2.f * (float) 3.14159265358979323846 * u2;
             p[j] = radius * std::cos(theta);
             p[j + 8] = radius * std::sin(theta);
         }
