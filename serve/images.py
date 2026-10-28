@@ -136,7 +136,8 @@ FORMATS = {"png": "image/png", "jpeg": "image/jpeg", "webp": "image/webp", "jxl"
 TRANSPARENT_PROMPT = ("This is an RGBA image with transparency. {prompt}. The image has alpha channel and the "
                       "background is transparent.")
 # OpenAI's quality -> the base model's steps (None: the config's); Turbo keeps its 8 whatever it says
-QUALITY_STEPS = {"low": 20, "medium": 30, "standard": 30, "high": None, "hd": None, "auto": None}
+QUALITY_STEPS = {"low": 20, "medium": 30, "standard": 30, "high": None, "hd": None, "xhigh": None, "max": None,
+                 "auto": None}
 # the model's prompt (stable-diffusion.cpp's Qwen-Image template): the system turn, whose DROP leading ids' states the
 # DiT does not take, then the user's prompt as plain text
 PROMPT_HEAD = "<|im_start|>system\nComprehend and analyze the provided prompt.<|im_end|>\n<|im_start|>user\n"
@@ -282,7 +283,7 @@ def parse_request(req: dict, cfg: dict) -> dict:
     compression = _int_field(req, "output_compression", 0, 100, 100)
     quality = req.get("quality")
     if quality is not None and quality not in QUALITY_STEPS:
-        raise ImageRequestError("quality: low, medium, high or auto")
+        raise ImageRequestError("quality: " + ", ".join(QUALITY_STEPS))
     background = req.get("background") or "auto"
     if background not in ("auto", "opaque", "transparent"):
         raise ImageRequestError("background: auto, opaque or transparent")
