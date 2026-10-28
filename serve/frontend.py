@@ -808,9 +808,9 @@ def _signed_thinking(signature, where: str) -> str | None:
 
 def _anthropic_documents(content, path: str):
     """Anthropic's text documents and search results -> text blocks the template reads: a document's text
-    (source "text", or "content" blocks) under its title and context, a search result's text under its title and
-    source.  A PDF document is left as it is (not read yet).  citations.enabled: true is a 400: no citations are
-    made."""
+    (source "text", or "content" blocks) under its title and context, a "content" document's images after it as image
+    blocks of their own, a search result's text under its title and source.  A PDF document is left as it is (not
+    read yet).  citations.enabled: true is a 400: no citations are made."""
     if not isinstance(content, list):
         return content
     out = []
@@ -820,7 +820,7 @@ def _anthropic_documents(content, path: str):
             cite = block.get("citations")
             if isinstance(cite, dict) and cite.get("enabled") is True:
                 raise ValueError(f"{path}[{j}].citations: citations are not supported by this server")
-        text = None
+        text, images = None, []
         if kind == "document":
             src = block.get("source") if isinstance(block.get("source"), dict) else {}
             if src.get("type") == "text":
@@ -829,6 +829,8 @@ def _anthropic_documents(content, path: str):
                 inner = src.get("content")
                 text = inner if isinstance(inner, str) else "\n\n".join(
                     b.get("text") or "" for b in inner or [] if isinstance(b, dict) and b.get("type") == "text")
+                images = [] if isinstance(inner, str) else [
+                    b for b in inner or [] if isinstance(b, dict) and b.get("type") == "image"]
             if text is not None:
                 head = [x for x in (block.get("title"), block.get("context")) if isinstance(x, str) and x]
                 text = "\n".join(["Document: " + head[0]] + head[1:] + ["", text]) if head else text
@@ -849,6 +851,7 @@ def _anthropic_documents(content, path: str):
                                if isinstance(b, dict) and b.get("type") == "text")
             text = f"Search result: {block.get('title') or ''} ({block.get('source') or ''})\n\n{body}"
         out.append({"type": "text", "text": text} if text is not None else block)
+        out += images
     return out
 
 
