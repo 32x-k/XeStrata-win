@@ -3975,6 +3975,12 @@ catch (sycl::exception const &exc) {
 bool Verifier::pl_commit_async(int n_keep, std::string &err) try {
     const OnDevice on_device(device_);
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
+    // Debug: with a state dump requested, print what this commit is launched with, so a wrong count names
+    // itself next to the verdict log (STRATA_PIPELINE_LOG).
+    static const bool cdbg = std::getenv("STRATA_PIPELINE_DUMP") != nullptr;
+    if (cdbg)
+        std::fprintf(stderr, "strata commit: n_keep=%d T=%d pos0=%lld self_skip=%d\n", n_keep, (int) last_t_,
+                     (long long) last_pos0_, (last_t_ == 1 && one_token_self_commit()) ? 1 : 0);
     if (commit_exec_ == nullptr || ev_commit_ == nullptr) { err = "verify: pipelined commit not prepared"; return false; }
     const Clock::time_point t0 = Clock::now();
     if (commit_live_) {   // its graph reads the words below when it starts: the previous one has (a window ago)
