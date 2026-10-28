@@ -135,6 +135,23 @@ int main(int argc, char** argv) {
         if (!sync("reference window")) return 1;
 
         s->memcpy(ref.data(), dout, ref.size() * 4).wait();
+        // SYCL port: a launch that returns without enqueueing leaves the 0xff fill intact, and then the mode and the
+        // reference agree bitwise on an untouched buffer - a "0 differing" that measures nothing.  The fill is NaN as
+        // a float, so a reference window with no finite value anywhere did no work: say so instead of timing it.
+        {
+            size_t written = 0;
+            for (size_t i = 0; i < ref.size(); ++i) {
+                float v;
+                std::memcpy(&v, &ref[i], 4);
+                if (std::isfinite(v)) ++written;
+            }
+            if (written == 0) {
+                std::printf("layer %d: the expert launch wrote nothing (%zu outputs, none finite) - refusing to time it\n",
+                            (int) l, ref.size());
+                ++failures;
+                continue;
+            }
+        }
         s->memset(dout, 0xff, got.size() * 4).wait();
         run(mode, 0);
         if (!sync("mode window")) return 1;
