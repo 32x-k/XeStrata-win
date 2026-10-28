@@ -863,7 +863,7 @@ print(r.choices[0].message.content)
 - **思考を求めない Anthropic の要求**: `"thinking"`、深さ、上限のどれもない `/v1/messages` の要求は、Anthropic 自身の規則どおり思考なしで処理します。
   Claude Code の短い補助の呼び出し（数十トークンで会話の題を付けるものなど）に要ります。
   `xestrata-<model>.json` に `"anthropic_thinking": "model"` を書くと、そうした要求もモデルのテンプレートどおりに考えます。
-  `POST /v1/messages/count_tokens` は、要求を `/v1/messages` と同じに組み立ててトークンに分け、モデルは動かしません。画像は読むときと同じ数の画像のトークンとして数えるので、まだ読んでいない画像は画像のエンコーダーで読みます（一度読んだ画像は覚えていて、後の要求でも使います。アイドルで止まったエンコーダーは、要求と同じくモデルの読み込みで戻します）。
+  `POST /v1/messages/count_tokens` は、要求を `/v1/messages` と同じに組み立ててトークンに分け、出力のトークンは生成しません。画像は読むときと同じ数の画像のトークンとして数えるので、まだ読んでいない画像は画像のエンコーダーで読みます（一度読んだ画像は覚えていて、後の要求でも使います。アイドルで止まったエンコーダーは、要求と同じくモデルの読み込みで戻します）。ツールの結果の画像も、読めない画像として省略する前にエンコーダーを戻します。読み込み自体を断るときは、画像の省略ではなく要求のエラーです。
 
 ### ストリーミングと接続
 
@@ -873,7 +873,7 @@ print(r.choices[0].message.content)
   server のウィンドウは 15 秒ごとに進み具合を出し、`GET /status` は何をしているか（`reading the prompt`、`answering`、そこまでのトークン数）を返します。
   接続を閉じるか、アプリで止めると、モデルも本当に止まるので、次の要求はすぐに始まります。
 - **呼び出しとして返すツールの呼び出し**: 呼び出しになるのは、要求が宣言したツールの名前のものだけです。
-  別の名前の呼び出しや、ツールを宣言していない Chat Completions・Anthropic の要求の呼び出しは、書かれたままの文として返すので、クライアントが差し出していないツールを動かすことはありません（Responses も同じです。Codex のまとめ（compaction）の要求だけは、プロンプトに会話のツールを見せるので、前のまま呼び出しを返します）。
+  別の名前の呼び出しや、ツールを宣言していない Chat Completions・Anthropic の要求の呼び出しは、書かれたままの文として返すので、クライアントが差し出していないツールを動かすことはありません（Responses も同じです。Codex のまとめ（compaction）の要求だけは、プロンプトに会話のツールを見せるので、前のまま呼び出しを返します。ただし明示的な `tool_choice: "none"` は、この場合も呼び出しを禁止します）。
   名前空間のツール（`mcp__filesystem.write_file`）は、モデルが `mcp__filesystem__write_file`、`mcp__filesystem=write_file`、`mcp__filesystem_write_file` と書いたときと、そのメンバーを持つツールが宣言の中に 1 つだけのときにメンバーだけ（`write_file`）を書いたときも、その呼び出しになります。
   `__` を含む名前（`mcp__playwright__browser_navigate`）は、モデルが `__` を全部 `_` と書いたとき（`mcp_playwright_browser_navigate`）も、宣言した 2 つのツールが同じ綴りにつぶれない限り、その呼び出しになります。
   名前は推し量りません: `bash` は `shell` ではなく、順の入れ替わった名前（`label_values_mcp_server1` に対する `server1_label_values`）は宣言した名前になりません。
@@ -1226,6 +1226,8 @@ B70 の IQ2_XS で、4,996 トークンの会話（INT8 の KV）のファイル
 `strict` は true、false、null（書かないのと同じ）のどれかで、ほかの型は 400 です。
 道具の `strict: true`（Chat Completions・Responses・Messages。Responses の namespace と `additional_tools` の道具も）と、`custom` の道具の regex の文法も、呼び出しの引数を同じように縛ります（Qwen の呼び出しの形のモデル）。文と、ほかの道具の呼び出しは縛りません。
 `strict: true` の道具の呼び出しは、縛ったかどうかにかかわらず、送る前に引数をスキーマで確かめます。そのため書いている途中には送らず、書き終わった呼び出しをまとめて送ります。合わないとき、JSON に書けない数（NaN、Infinity、大きすぎる数）があるときは、答えと同じく `structured_output_failed` です。
+Qwen の呼び出しの形では、文字列のパラメーター本文はそのまま値です。型の読み取りは、同じ階層の制約と `allOf` を交差、`anyOf`・`oneOf` の枝を和集合として扱い、ローカル JSON Pointer の参照は道具の `parameters` 全体から解決します。これは値の型を戻すための手掛かりで、スキーマの検証の代わりではありません。
+文字列の `enum`・`const` では、本文が候補になく、JSON の引用符を外した文字列だけが候補にあるときに限り、引用符を外します。両方が候補なら元の本文を残します。この判定が必要なパラメーターは、ストリームでも値の終わりまでためます。
 1 つの要求に 1 回だけ生成し、隠れたやり直しはしません。
 成功した応答には、確かめた JSON のオブジェクトが入ります。
 壊れた JSON、重複したキー、有限でない数、スキーマの違反、途中で終わった生成には、`error.code: structured_output_failed` で **502** を返します。
@@ -1361,7 +1363,7 @@ PDF は、Linux では poppler の `pdftotext` と `pdftoppm` で、Windows で�
 | --- | --- |
 | `input` が文字列か項目の並び | `message` の項目（`user`、`assistant`、`system`、`developer`。文字と画像）、`reasoning`、`function_call`、`function_call_output`、`custom_tool_call(_output)`、`input_file`（[上](#chat-completions-と-messages-の項目) のファイル）、前の回の `image_generation_call`（画像を保存し、続く `edit_image` が直せます）。ホストのツールの項目（`web_search_call`、`mcp_call` など）は文として会話に入れます |
 | `instructions` | システムメッセージ（先頭の `developer` のメッセージも含む。後のものはチャットの経路と同じくユーザーのメッセージになります） |
-| `tools` | `function` のツール、`namespace` のツール（モデルには `namespace.name` に見え、呼び出しは `namespace` と `name` で返ります）、`custom` のツール（自由な文字列の `input` 1 つ）。ホストのツール（`web_search`、`file_search` など）はモデルが動かせないので外します。`strict` を書かない（null の）`function` のツールは、パラメーターがそのまま strict モードの条件（すべてのオブジェクトが `additionalProperties: false`、すべてのプロパティが `required`）を満たし jsonschema があれば strict、そうでなければ非 strict で、応答の `tools` にどちらかを示します（OpenAI の Responses と同じ既定）。 |
+| `tools` | `function` のツール、`namespace` のツール（モデルには `namespace.name` に見え、呼び出しは `namespace` と `name` で返ります）、`custom` のツール（自由な文字列の `input` 1 つ）。ホストのツール（`web_search`、`file_search` など）はモデルが動かせないので外します。`strict` を書かない（null の）`function` のツールは、パラメーターがそのまま strict モードの条件（すべてのオブジェクトが `additionalProperties: false`、すべてのプロパティが `required`）を満たし jsonschema があれば strict、そうでなければ非 strict で、応答の `tools` にどちらかを示します（OpenAI の Responses と同じ既定）。判定はスキーマの位置だけを辿り、`default`・`enum`・`examples` などの値をスキーマとは見なしません。解決できない参照は自動 strict の根拠にせず、明示的な `strict: true` の検証は別に行います。 |
 | `tool_choice` | `"none"` はツールを隠します。`required`、名前を指定したツール（`custom`、`namespace` も）、`allowed_tools` は Chat Completions と同じです。`{"type": "image_generation"}` は画像の道具の呼び出しを強制します。道具にない名前や知らない形は 400 です |
 | `parallel_tool_calls: false` | 最初の呼び出しが閉じたところで生成を止めます |
 | `max_tool_calls` | ホストのツール（ここでは画像の道具）の呼び出しの上限。超えた呼び出しは動かしません。`function` のツールには当てません |
