@@ -29,7 +29,7 @@ from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unma
 from serve.server import (ANSWER_RESERVE_MIN, CTX_SLACK, ByteTokenizer, EngineDied, EngineNonFinite,  # noqa: E402
                           MockEngine, PP_DONE_TAIL, Service,
                           StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, prompt_progress,
-                          prompt_tokens_seen, request_timings, serve, start_failure_hint)
+                          parse_multipart, prompt_tokens_seen, request_timings, serve, start_failure_hint)
 from types import SimpleNamespace  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -5741,3 +5741,34 @@ class PrepareCancelled(unittest.TestCase):
             ids, _, _ = svc.prepare(self.msgs(), None, {}, cancel=threading.Event())
             self.assertEqual(ids.count(ByteTokenizer().encode("<|image_pad|>", parse_special=True)[0]), 6)
             svc.embeddings.path.unlink(missing_ok=True)
+
+
+try:
+    import openai
+    import httpx2 as httpx                     # openai 3's HTTP client
+except ImportError:
+    openai = None
+
+
+@unittest.skipUnless(openai is not None, "the openai package is not installed")
+class ImageEditForm(unittest.TestCase):
+    """OpenAI's SDK sends /v1/images/edits as a multipart form, its booleans and numbers as text: parse_multipart
+    gives them back as the JSON request has them."""
+
+    def form(self, **kw):
+        sent = {}
+
+        def capture(request):
+            sent["ctype"], sent["body"] = request.headers["content-type"], request.read()
+            return httpx.Response(500)
+        client = openai.OpenAI(api_key="x", base_url="http://test/v1", max_retries=0,
+                               http_client=httpx.Client(transport=httpx.MockTransport(capture)))
+        with contextlib.suppress(openai.APIError):
+            client.images.edit(image=("a.png", b"png", "image/png"), prompt="p", **kw)
+        return parse_multipart(sent["ctype"], sent["body"])[0]
+
+    def test_stream_and_partial_images(self):
+        fields = self.form(stream=True, partial_images=2)
+        self.assertIs(fields["stream"], True)
+        self.assertEqual(fields["partial_images"], 2)
+        self.assertIs(self.form(stream=False)["stream"], False)
