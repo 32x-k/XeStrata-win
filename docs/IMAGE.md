@@ -150,12 +150,17 @@ HunyuanImage 3.0's `"images"` also has `steps` (8), `guidance` (2.5), `resolutio
 - With an image attached, the part of the first image to draw again can be painted on it (brush size, eraser, clear). Only the painted part is drawn again, and the rest keeps the image's pixels (the API's `mask`). Unpainted, it is the whole image.
 - With an image attached, the Strength field appears (the API's `strength`): the lower, the more of the image it keeps. Empty is the model's default: 1 for an edit (no start from the image's latent: the edits as before), 0.87 for img2img (lowered for a model of few steps, so that it skips one step at least).
 - Images are made one at a time. A chat request that comes while several are made runs after the image being made, and the rest follow it (under `unload`, which takes the text model off, the images are all made first).
+- MOSS-Image has more:
+   - "Write the prompt out" has the chat's model write the short prompt out (off, a detailed description, or a layout of boxes: the API's `enhance`). The prompt or layout it wrote is shown under the image, and a layout can be loaded into the boxes with "Edit this layout" and changed.
+   - "Place things with boxes" shows a canvas of the image's shape: drag on it to draw a box, drag a box to move it, drag its bottom-right corner to change its size. The box selected takes its kind (object, character, text), a description of how it looks, and a text box's exact words (the API's `layout`). The Delete key or the button deletes a box.
+   - "More settings" changes the shift, the blocks the negative prompt's pass skips, and skip-layer guidance's blocks, scale and window. Empty is the model's default.
 - The **Monitor** tab shows the stage, the step and the seconds a step takes.
 
 **The chat:** in the web page's chat the model can make and change images itself.
 Ask "draw a cat", and the model calls the image tools; the image appears in the conversation.
 Ask "make the background night", and it changes the conversation's last image (one attached or one made in the conversation).
 With several image models installed, ask in words ("draw it with MageTrail", "like a photograph") and the model picks the image model that fits (none asked for: the default; for a change, those that edit first, and img2img when one without edits is asked for).
+With MOSS-Image installed, the model may draft a layout of boxes for an image; "Open the layout in Images" under that tool call loads its prompt and layout into the Images tab for a change.
 "Images" under the message box chooses the chat's images: `auto` (as above), `off` (no images), or a model's name (the chat's images always with that model); the browser keeps the choice.
 
 ## API
