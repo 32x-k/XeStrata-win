@@ -125,6 +125,7 @@ public:
     int resident_blocks() const { return blocks_stream_.resident(); }
     uint64_t blocks_vram() const { return blocks_stream_.vram(); }
     void drop_blocks() { blocks_stream_.drop(); }
+    void drop_block_homes() { blocks_stream_.drop_homes(); }
     uint64_t weight_bytes() const { return weight_bytes_; }   // what stays on the GPU besides the blocks
     /// The working buffers n contexts of hw image rows (an edit's references' included) take (text rows up to
     /// max_text a context), with the MLP a band of mlp_rows image rows at a time (0: all).

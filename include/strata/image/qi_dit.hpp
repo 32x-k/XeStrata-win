@@ -96,6 +96,8 @@ public:
     uint64_t activations_held() const { return cap_T_ > 0 ? activation_bytes(cap_T_, mlp_rows_) : 0; }
     /// Frees the blocks' VRAM (they come back from the file on use).
     void drop_blocks() { blocks_stream_.drop(); }
+    /// Frees the streamed blocks' copies in RAM (LayerStream's homes).
+    void drop_block_homes() { blocks_stream_.drop_homes(); }
     /// Frees the activations (grown again on use).
     void drop_activations();
     /// The GPU memory the activations of a T-token sequence take, the MLP computed `mlp_rows` rows at a time (0: all).

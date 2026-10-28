@@ -121,6 +121,8 @@ public:
     /// as LayerStream does.  Set it before `set_sequence`.
     void set_bank_budget(uint64_t bytes);
     int resident_banks() const { return banks_.resident(); }
+    /// Frees the streamed banks' copies in RAM (LayerStream's homes).
+    void drop_bank_homes() { banks_.drop_homes(); }
     uint64_t bank_vram() const { return banks_.vram(); }
     /// What the part holds on the GPU now: the dense weights, the banks and the sequence's buffers.
     uint64_t held() const;

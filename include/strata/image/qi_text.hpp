@@ -57,6 +57,7 @@ public:
     int resident_layers() const { return layers_stream_.resident(); }
     uint64_t layers_vram() const { return layers_stream_.vram(); }
     void drop_layers() { layers_stream_.drop(); }
+    void drop_layer_homes() { layers_stream_.drop_homes(); }
     /// The working buffers an encode of T tokens takes; drop_activations frees them (grown again on use).
     uint64_t activation_bytes(int64_t T) const;
     void drop_activations();

@@ -171,6 +171,8 @@ void QiPipeline::release(bool all) {
     }
     dit_->drop_blocks();
     te_->drop_layers();
+    dit_->drop_block_homes();   // the RAM the streamed layers' copies hold, back for the other engines
+    te_->drop_layer_homes();
     dit_->drop_activations();
     vae_->drop_scratch();
     dit_set_ = te_set_ = 0;

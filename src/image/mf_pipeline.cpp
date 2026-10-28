@@ -322,9 +322,11 @@ void MfPipeline::release(bool all) {
     }
     if (MfDit* d = active()) {
         d->drop_blocks();
+        d->drop_block_homes();   // the RAM the streamed layers' copies hold, back for the other engines
         d->drop_activations();
     }
     te_->drop_layers();
+    te_->drop_layer_homes();
     vae_->drop_scratch();
     dit_set_ = te_set_ = 0;
     mlp_set_ = -1;

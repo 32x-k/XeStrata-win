@@ -172,6 +172,7 @@ void HunyuanImage3Pipeline::release(bool all) {
     if (around_) around_->drop_grid();
     if (vision_) vision_->drop_scratch();
     dit_->set_bank_budget(dit_->bank_min());   // the streamed regions stay, the resident prefix gives its VRAM back
+    dit_->drop_bank_homes();                   // and the streamed banks' copies their RAM
     banks_set_ = dit_->bank_min();
 }
 
