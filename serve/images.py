@@ -55,6 +55,7 @@ blocks its negative pass skips (uncond_skip_layers, default [22]) and skip-layer
 slg_start, slg_stop), by its pipeline's names (moss_request).  A layout of boxes (layout: its prompt enhancer's draft,
 boxes in the image's pixels) becomes its JSON prompt (moss_layout_prompt).  It has no edits: an image is img2img's.
 Its text encoder is Qwen3.5-9B, read by the chat's engine when that reads the same file (text_states).
+enhance has the chat's model write the prompt out first (enhance_prompt).
 
 The GPU is shared with the text engine one job at a time: an image job takes the service's turn (the FIFO every chat
 request takes), so no chat turn runs on the GPU meanwhile.  The image engine works in the VRAM it is given: what it
@@ -239,7 +240,7 @@ def model_defaults(cfg: dict) -> dict:
     rather than a second pass (guidance_token: no negative prompt, a guided step costs one), and its sizes are its
     resolution buckets (buckets: [width, height] each; a request's size is made at the one whose shape is nearest).
     MOSS-Image's are its pipeline's: the shift, the blocks the negative pass skips, skip-layer guidance's fields, and
-    that it takes a layout of boxes."""
+    that it takes a layout of boxes and a prompt enhanced by the chat's model."""
     mage = cfg.get("family") == "mage-flow"
     hunyuan = cfg.get("family") == "hunyuan-image-3"
     moss = cfg.get("family") == "moss-image"
@@ -269,7 +270,8 @@ def model_defaults(cfg: dict) -> dict:
         out["buckets"] = [[b["width"], b["height"]] for b in hunyuanimage3_buckets(cfg)]
     if moss:
         out.update(shift=float(cfg.get("shift") or MOSS_SHIFT), uncond_skip_layers=list(MOSS_UNCOND_SKIP),
-                   slg_layers=[], slg_scale=0.0, slg_start=0.0, slg_stop=1.0, blocks=MOSS_BLOCKS, layout=True)
+                   slg_layers=[], slg_scale=0.0, slg_start=0.0, slg_stop=1.0, blocks=MOSS_BLOCKS, layout=True,
+                   enhance=True)
     return out
 
 
@@ -368,8 +370,9 @@ def parse_request(req: dict, cfg: dict) -> dict:
             job["layout"] = parse_layout(req["layout"])
             job["layout_prompt"] = moss_layout_prompt(job["layout"], prompt, w, h)
     else:
-        if req.get("layout") not in (None, False, "", "false", "off"):
-            raise ImageRequestError("layout: MOSS-Image's (this image model has none)")
+        for key in ("layout", "enhance"):
+            if req.get(key) not in (None, False, "", "false", "off"):
+                raise ImageRequestError(f"{key}: MOSS-Image's (this image model has none)")
     return job
 
 
@@ -416,7 +419,8 @@ def moss_request(req: dict, cfg: dict) -> dict:
     """MOSS-Image's own fields, by its pipeline's names and defaults (model_defaults): shift (the schedule's static
     shift), uncond_skip_layers (the blocks guidance's negative pass skips; null or [] none), skip-layer guidance's
     slg_layers and slg_scale (a third pass of the prompt with those blocks skipped, slg_scale times the difference
-    added; 0 or no layers, none) and both skips' window slg_start .. slg_stop (shares of the steps)."""
+    added; 0 or no layers, none) and both skips' window slg_start .. slg_stop (shares of the steps), and enhance (the
+    prompt written out by the chat's model first: true, "caption" or "layout"; enhance_prompt)."""
     dflt = model_defaults(cfg)
     out: dict[str, Any] = {"shift": _number(req, "shift", 0.01, MOSS_SHIFT_MAX, dflt["shift"]),
                            "uncond_skip": _blocks(req, "uncond_skip_layers", dflt["uncond_skip_layers"]),
@@ -426,6 +430,16 @@ def moss_request(req: dict, cfg: dict) -> dict:
                            "slg_stop": _number(req, "slg_stop", 0.0, 1.0, 1.0)}
     if out["slg_start"] > out["slg_stop"]:
         raise ImageRequestError("slg_start: at most slg_stop")
+    enhance = req.get("enhance")
+    if isinstance(enhance, str):
+        word = enhance.strip().lower()
+        enhance = {"true": True, "on": True, "false": False, "off": False, "": False}.get(word, word)
+    if enhance not in (None, False, True, "auto", "caption", "layout"):
+        raise ImageRequestError('enhance: true (the model chooses), "caption", "layout" or false')
+    if enhance not in (None, False):
+        if req.get("layout") is not None:
+            raise ImageRequestError("enhance: not with a layout (the layout is the prompt already)")
+        out["enhance"] = "auto" if enhance is True else enhance
     return out
 
 
@@ -497,6 +511,50 @@ def parse_layout(value) -> dict:
                 or any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) for v in box)):
             raise ImageRequestError(f"layout: {where}.bbox: [x_min, y_min, x_max, y_max], four numbers")
     return value
+
+
+def tidy_layout(draft, width: int, height: int):
+    """A layout a chat model drafted (enhance_prompt's, generate_image's), into parse_layout's form where it can be
+    read so: the summary as text taken for its caption; an item's label from what it has ("text" with words, else
+    "object") and its caption from its description, its words or its label; its box kept on the width x height
+    image; the canvas' own fields and other fields left out.  Anything else (not an object) is left for parse_layout
+    to refuse."""
+    if not isinstance(draft, dict):
+        return draft
+    out: dict = {}
+    summary = draft.get("summary")
+    if isinstance(summary, str) and summary.strip():
+        out["summary"] = {"caption": summary}
+    elif isinstance(summary, dict):
+        out["summary"] = {k: v for k, v in summary.items() if k in MOSS_SUMMARY_KEYS}
+    items = []
+    listed = draft.get("items")
+    for item in listed if isinstance(listed, list) else ():
+        if not isinstance(item, dict):
+            continue
+        box = item.get("bbox")
+        if not (isinstance(box, list) and len(box) == 4 and all(isinstance(v, (int, float)) and
+                                                                not isinstance(v, bool) for v in box)):
+            continue
+        x1, y1, x2, y2 = (min(max(float(v), 0.0), float(side)) for v, side in zip(box, (width, height) * 2))
+        if not (x1 < x2 and y1 < y2):
+            continue
+        words = item.get("text") if isinstance(item.get("text"), str) and item["text"].strip() else None
+        label = item.get("label") if item.get("label") in MOSS_LABELS else "text" if words else "object"
+        caption = next((v for k in ("caption", "description", "object", "character", "content")
+                        if isinstance(v := item.get(k), str) and v.strip()), None) or words or label
+        tidy = {"label": label, "caption": caption}
+        if words:
+            tidy["text"] = words
+        elif label == "text":
+            tidy["label"] = "object"
+        tidy["bbox"] = [x1, y1, x2, y2]
+        for key in ("tags", "palette"):
+            if isinstance(item.get(key), list):
+                tidy[key] = [v for v in item[key] if isinstance(v, str) and v.strip()]
+        items.append(tidy)
+    out["items"] = items
+    return out
 
 
 def moss_layout_prompt(layout: dict, prompt: str, width: int, height: int) -> str:
@@ -571,9 +629,11 @@ def cfg_request(req: dict, cfg: dict | None = None) -> dict:
 
 def model_prompt(job: dict) -> str:
     """The prompt as the model reads it: a transparent image's in Qwen's form for one (TRANSPARENT_PROMPT); MOSS-Image's
-    layout as its JSON (moss_layout_prompt)."""
+    layout as its JSON (moss_layout_prompt), or the prompt its enhancer wrote (enhance_prompt)."""
     if job.get("layout_prompt"):
         return job["layout_prompt"]
+    if job.get("enhanced_prompt"):
+        return job["enhanced_prompt"]
     if job.get("background") == "transparent":
         return TRANSPARENT_PROMPT.format(prompt=job["prompt"].strip().rstrip("."))
     return job["prompt"]
@@ -1689,7 +1749,8 @@ class ImageGen:
                    "plan": {k: v for k, v in parts[-1].items() if k not in ("text_s", "sampling_s", "decode_s")},
                    **({"guidance": job["guidance"], "ratio": job["bucket"]["ratio_index"]}
                       if job.get("bucket") is not None else {}),
-                   **({"layout": True} if job.get("layout_prompt") else {})}
+                   **({"layout": True} if job.get("layout_prompt") else {}),
+                   **({"enhance": job["enhanced"]} if job.get("enhanced") else {})}
         if (mw, mh) != (job["width"], job["height"]):      # made larger and cut: the web page says so
             figures["made_size"] = f"{mw}x{mh}"
         if job.get("requested_size"):                      # made at the model's bucket instead: the web page says so
@@ -1919,7 +1980,8 @@ class ImageTools:
     result tells the model where it is.  With several image models (ImageModels) the tools take a "model" too,
     each model named and described in it, so the user's words choose one ("draw it with MageTrail", "an anime
     illustration"); none named is the default.  A request that names its image model (`model`) gets that one
-    alone; a Responses request's input_image_mask (`mask`) is the mask of its edits.  The hub run_with_mcp runs
+    alone; a Responses request's input_image_mask (`mask`) is the mask of its edits.  With MOSS-Image, generate_image
+    takes a layout too (its boxes, which the chat's model drafts; parse_layout).  The hub run_with_mcp runs
     (template_tools, routes, call, settings)."""
 
     def __init__(self, svc, images, messages: list, load, normalize, options: dict | None = None,
@@ -1965,6 +2027,27 @@ class ImageTools:
             if not gens or t["name"] in exclude:
                 continue
             t = dict(t)
+            moss = [g.model for g in gens if g.family == "moss-image"]
+            if t["name"] == "generate_image" and moss:   # MOSS-Image's layout of boxes, drafted by the chat's model
+                params = dict(t["parameters"])
+                only = "" if len(moss) == len(gens) else f" (only {', '.join(moss)} reads one)"
+                params["properties"] = {**params["properties"], "layout": {
+                    "type": "object",
+                    "description": "where things and text go, when that matters (a poster, a sign, several panels)"
+                                   + only + "; the prompt is then a short description of the whole image",
+                    "properties": {
+                        "summary": {"type": "object", "properties": {"caption": {
+                            "type": "string", "description": "the whole image: its scene, style and colours"}}},
+                        "items": {"type": "array", "items": {"type": "object", "properties": {
+                            "label": {"type": "string", "enum": list(MOSS_LABELS)},
+                            "caption": {"type": "string", "description": "how it looks"},
+                            "text": {"type": "string", "description": "a text item's exact words"},
+                            "bbox": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4,
+                                     "description": "[x_min, y_min, x_max, y_max] in the image's pixels from its "
+                                                    "top-left corner"}},
+                            "required": ["label", "caption", "bbox"]}}},
+                    "required": ["items"]}}
+                t["parameters"] = params
             if len(self._gens()) > 1:   # the model's choice: each one's name and what it is good for
                 about = _qimage().ABOUT
                 choice = {v[0]: k.removesuffix("-uncensored") for k, v in _qimage().IMAGE_MODELS.items()}
@@ -2030,6 +2113,15 @@ class ImageTools:
         urls: list[str] = []
         try:
             req = {**{k: args[k] for k in ("prompt", "size", "seed") if args.get(k) not in (None, "")}, **self.options}
+            if args.get("layout") not in (None, "", {}) and name == "generate_image":   # MOSS-Image's boxes
+                layout = args["layout"]
+                if isinstance(layout, str):
+                    try:
+                        layout = json.loads(layout)
+                    except ValueError:
+                        raise ImageRequestError("layout: a JSON object") from None
+                w, h = parse_size(req.get("size"), 2048)
+                req["layout"] = tidy_layout(layout, w, h)
             if name == "edit_image" and args.get("strength") not in (None, ""):
                 req["strength"] = args["strength"]
             gens = self._gens(name == "edit_image")
@@ -2200,12 +2292,99 @@ def text_states(svc, gen: ImageGen, job: dict) -> None:
     gen._say(f"image job: the prompt's states from the chat's engine ({tokens} tokens, {ms:.0f} ms)")
 
 
+# MOSS-Image's prompt enhancer: the chat's model writes the image out as a caption or as a layout of boxes.  Written
+# after the model's own enhancer (OpenMOSS/MOSS-Image skills/moss-image-prompt-enhancer, Apache-2.0): the same choice
+# and the same draft, its boxes in the canvas' pixels from the top-left, which moss_layout_prompt compiles.
+MOSS_ENHANCE_SYSTEM = """You turn an idea for an image into a prompt for MOSS-Image, a text-to-image model, for a \
+{width}x{height} pixel image. {choice}
+
+Keep everything the idea asks for: its subjects, their number and relations, the medium, the style, what must not \
+appear, and every word that must be visible, exactly as written (its language, capitals, punctuation and line \
+breaks). Settle the details it leaves open yourself: what the subject looks like and does, the setting, the framing, \
+the light, the materials, the colours and the mood. Describe only what is seen: no quality tags, no notes about the \
+prompt. Write the description in English unless the idea asks for another language; visible words stay as given.
+
+Answer with one JSON object and nothing else.
+A caption: {{"caption": "..."}} - flowing prose; positions in words; visible words in quotes.
+A layout: {{"summary": {{"caption": "the whole image: its scene, style and treatment", "meta": ["medium or genre"], \
+"canvas": "single"}}, "items": [{{"label": "object", "caption": "how it looks", \
+"bbox": [x_min, y_min, x_max, y_max]}}, {{"label": "text", "caption": "its lettering and surface", \
+"text": "the exact words", "bbox": [...]}}]}} - label is \
+object, character or text; a text item carries its exact words in "text" ("\\n" for a line break); each bbox is in \
+pixels from the image's top-left corner, x from 0 to {width} and y from 0 to {height}. A box marks where a thing is, \
+not a frame to draw. Give text a box large enough to be read at this size; items may overlap."""
+MOSS_ENHANCE_CHOICE = {
+    "auto": "Write a caption for an ordinary scene, photograph or illustration; write a layout when the placement of "
+            "text, a poster, several panels or the arrangement of several things matters.",
+    "caption": "Write a caption.",
+    "layout": "Write a layout."}
+MOSS_ENHANCE_TOKENS = 3072         # a layout of a dozen items with their captions fits
+
+
+def _json_object(text: str) -> dict:
+    """The first JSON object in a model's answer (a fenced block or bare), or ValueError."""
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end < start:
+        raise ValueError("the answer has no JSON object")
+    value = json.loads(text[start:end + 1])
+    if not isinstance(value, dict):
+        raise ValueError("the answer is not a JSON object")
+    return value
+
+
+def enhance_prompt(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = None) -> None:
+    """MOSS-Image's prompt enhancer (job["enhance"]: "auto", "caption" or "layout"): the chat's model, in its own turn
+    (Service.prepare and Service.run, thinking off), writes the prompt out - a caption becomes job["enhanced_prompt"],
+    a layout job["layout"] and its JSON job["layout_prompt"] (its boxes kept on the canvas).  job["enhanced"] says what
+    was made (the response's "strata" carries it; the image's revised_prompt is the prompt the model read).  An answer
+    that cannot be read, or no chat model, leaves the prompt as it was, and says why there."""
+    t0 = time.monotonic()
+    mode = job["enhance"]
+    info: dict = {"mode": mode}
+    text: list[str] = []
+    try:
+        if not hasattr(svc, "prepare") or getattr(svc, "engine", None) is None:
+            raise ValueError("no chat model is loaded")
+        system = MOSS_ENHANCE_SYSTEM.format(width=job["width"], height=job["height"], choice=MOSS_ENHANCE_CHOICE[mode])
+        messages = [{"role": "system", "content": system}, {"role": "user", "content": job["prompt"]}]
+        ids, thinking, max_new = svc.prepare(messages, None, {"enable_thinking": False}, MOSS_ENHANCE_TOKENS,
+                                             cancel=cancel)
+        for kind, x in svc.run(ids, thinking, None, max_new, {}, cancel or threading.Event()):
+            if kind == "event" and getattr(x, "kind", None) == "content":
+                text.append(x.text or "")
+        draft = _json_object("".join(text))
+        if isinstance(draft.get("layout"), dict):   # the layout under a name of its own
+            draft = draft["layout"]
+        if "items" in draft and mode != "caption":
+            layout = parse_layout(tidy_layout(draft, job["width"], job["height"]))
+            job["layout_prompt"] = moss_layout_prompt(layout, job["prompt"], job["width"], job["height"])
+            job["layout"] = layout
+            info.update(made="layout", layout=layout)
+        elif isinstance(draft.get("caption"), str) and draft["caption"].strip() and mode != "layout":
+            job["enhanced_prompt"] = draft["caption"].strip()
+            info["made"] = "caption"
+        else:
+            raise ValueError(f"the answer is not a {'layout' if mode == 'layout' else 'caption'}")
+    except (ValueError, KeyError, TypeError, RuntimeError, OSError) as e:
+        info["error"] = str(e)
+        if text:   # what the model wrote, to see why
+            info["answer"] = "".join(text)[:4000]
+        gen._say(f"image job: the prompt enhancer gave nothing usable ({e}); the prompt is used as it is")
+    info["seconds"] = round(time.monotonic() - t0, 2)
+    job["enhanced"] = info
+    job.pop("ids", None)
+    job.pop("neg_ids", None)
+
+
 def make_images(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = None,
                 preview=None) -> tuple[list[bytes], dict, str]:
     """`job`'s images in the GPU's turn (gpu_turn) -> (the PNG files' bytes, figures, the policy used).  When a request
     waits for the turn after an image, the turn is given to it and taken again for the rest, so a chat is not held up
     by a batch; not under unload (giving it would load the text model and unload it again for each image).  Too many
-    images for budget_s are refused first (ImageGen.check_n)."""
+    images for budget_s are refused first (ImageGen.check_n).  MOSS-Image's prompt enhancer (enhance_prompt) runs
+    first, in the chat model's turn."""
+    if job.get("enhance") and not job.get("enhanced"):
+        enhance_prompt(svc, gen, job, cancel)
     gen.check_n(job)
     images: list[bytes] = []
     parts: list[dict] = []
