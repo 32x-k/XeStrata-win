@@ -1004,8 +1004,10 @@ bool PlainModel::open_experts(std::string& err) {
                     beside += (uint64_t) t;
             }
             std::string why;
+            const uint64_t cma = strata::platform::cma_free_bytes();   // not for pinned pages (upstream #3698)
             if (detail::host_available_memory(hm) &&
-                !detail::resident_pin_fits(need, 0, beside, std::min(hm.available, hm.cgroup_limit), why)) {
+                !detail::resident_pin_fits(need, 0, beside, std::min(hm.available - std::min(hm.available, cma),
+                                                                     hm.cgroup_limit), why)) {
                 std::fprintf(stderr, "strata plain: the experts need %.1f GiB of RAM and %.1f GiB beside them, %.1f GiB "
                                      "is available: read in place\n",
                              (double) need / 1073741824.0, (double) beside / 1073741824.0,

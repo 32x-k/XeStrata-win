@@ -5031,7 +5031,8 @@ int main(int argc, char** argv) {
         const uint64_t need = lay.total + lay.max_blob;
         std::string why;
         if (!(keep != nullptr && std::strcmp(keep, "keep") == 0) && strata::core::detail::host_available_memory(hm) &&
-            !strata::core::detail::resident_pin_fits(need, 0, 8ull << 30, hm.available, why) &&
+            !strata::core::detail::resident_pin_fits(
+                need, 0, 8ull << 30, hm.available - std::min(hm.available, strata::platform::cma_free_bytes()), why) &&
             hm.cgroup_limit >= need) {
             std::fprintf(stderr, "strata generate: the expert arena needs %.2f GiB of RAM and %.0f GiB beside it, but "
                                  "%.2f GiB is available: starting as with --resident-experts (the experts the GPU does "

@@ -45,6 +45,11 @@ bool gpu_nonlocal_memory_budget(const std::string& pci, uint64_t& budget, uint64
 /// The machine's physical RAM in bytes (0 when unknown).
 uint64_t total_physical_memory();
 
+/// Linux: the free CMA memory (/proc/meminfo's CmaFree; 0 when there is none, and elsewhere).  MemAvailable counts it,
+/// but a page-locked allocation cannot use it: the kernel moves long-term pinned pages out of CMA (upstream #3698: a
+/// kernel 7.0 with KHO's ~17 GiB of scratch CMA passed the RAM checks, and the pinned memory froze the host).
+uint64_t cma_free_bytes();
+
 /// Linux under WSL 2 (Microsoft's kernel, "...-microsoft-standard-WSL2" in /proc/sys/kernel/osrelease): the GPU is
 /// Windows' own, behind /dev/dxg.  Always false elsewhere.
 bool under_wsl();

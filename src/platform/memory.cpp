@@ -215,6 +215,7 @@ void advise_willneed(const void*, uint64_t) {}
 void advise_willneed(int, uint64_t, uint64_t) {}
 void drop_file_cache(const std::string&) {}
 bool free_and_cached(uint64_t&, uint64_t&) { return false; }
+uint64_t cma_free_bytes() { return 0; }
 void make_free_ram(uint64_t) {}
 double settle_page_migration(double, double, double, double& peak) { peak = 0.0; return 0.0; }
 #else
@@ -308,6 +309,11 @@ bool meminfo(const char* key, uint64_t& bytes) {
 
 bool free_and_cached(uint64_t& free, uint64_t& cached) {
     return meminfo("MemFree:", free) && meminfo("Cached:", cached);
+}
+
+uint64_t cma_free_bytes() {
+    uint64_t b = 0;
+    return meminfo("CmaFree:", b) ? b : 0;
 }
 
 void make_free_ram(uint64_t bytes) {

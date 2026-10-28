@@ -1965,8 +1965,9 @@ bool FileExpertSource::pin_complement(
                     in_place += layer_blob_bytes_[(size_t) l];
             }
         if (physical == 0 && !available_memory_bytes(physical)) physical = 0;
+        const uint64_t cma = strata::platform::cma_free_bytes();   // not for pinned pages (upstream #3698)
         std::string why;
-        lock = detail::resident_pin_fits(bytes, in_place, headroom_bytes, physical, why);
+        lock = detail::resident_pin_fits(bytes, in_place, headroom_bytes, physical > cma ? physical - cma : 0, why);
         std::fprintf(stderr, "FileExpertSource: %s\n", why.c_str());
         std::string room_why;
         const uint64_t room = lock ? pin_room(-1, room_why) : UINT64_MAX;
@@ -2005,6 +2006,10 @@ bool FileExpertSource::pin_complement(
                      (double) bytes / 1073741824.0, lock ? "page-locked" : "pageable resident");
         std::fflush(stderr);
         if (lock) {
+            // #38, upstream #3681: page-locked memory the driver took while the kernel reclaimed the model files' page
+            // cache came slowly (a 71 GiB copy took 43 minutes after a few starts, 59 s after a reboot) and read slowly
+            // from the GPU; the reclaim done first, on ordinary memory, leaves the driver free pages
+            strata::platform::make_free_ram(bytes + (2ull << 30));
             const bool allocated = strata::gpu::alloc_host(&arena, (size_t) bytes);
             if (allocated == true) {
                 void* alias = nullptr;
