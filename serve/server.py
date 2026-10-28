@@ -7416,10 +7416,13 @@ def make_handler(svc: Service):
                 self._responses_failed(asm, str(e), "server_error", send)
 
         def _responses_failed(self, asm, message, code, send):
+            # OpenAI's order: the error event, then response.failed - made in that order, as the sequence numbers
+            # count as the events are made
+            err = asm.error(message, code)
             e = asm.failed(message, code)
             self._note(error=e["response"]["error"])
             try:
-                send(asm.error(message, code))               # OpenAI's order: the error event, then response.failed
+                send(err)
                 send(e)
                 self.wfile.flush()
             except OSError:

@@ -2046,6 +2046,26 @@ class EngineDeath(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
 
+    def test_responses_failed_in_order(self):
+        """/v1/responses failing mid-stream: the error event, then response.failed, their sequence numbers rising."""
+        tok = ByteTokenizer()
+        svc = Service(DyingEngine(tok, "</think>\n\n" + ANSWER, max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/responses",
+                                         data=json.dumps({"model": "m", "input": "hi", "stream": True}).encode(),
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                events = [json.loads(line[5:]) for line in r.read().decode().splitlines()
+                          if line.startswith("data:")]
+            self.assertEqual([e["type"] for e in events[-2:]], ["error", "response.failed"])
+            seq = [e["sequence_number"] for e in events]
+            self.assertEqual(seq, sorted(set(seq)))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
 
 class DoneLineEngine(MockEngine):
     """The mock engine whose `last` comes from a DONE line, parsed as StrataEngine parses it."""
