@@ -5160,7 +5160,10 @@ def prebuilt_bases(url_base) -> list[str]:
     base = url_base if url_base.endswith(("/", "\\")) else url_base + "/"
     if base != PREBUILT_URL:
         return [base]
-    return [PREBUILT_TAG_URL.format(version=source_version()), base]
+    version = source_version()
+    if version == "0":                                  # no source tree to name a release by (the packaged Terminal): the latest release
+        return [base]
+    return [PREBUILT_TAG_URL.format(version=version), base]
 
 
 PREVIOUS_ENGINE = ".previous"
@@ -6677,8 +6680,13 @@ def installed_configs():
 
 
 def source_version() -> str:
-    """The engine version the source tree builds (CMakeLists.txt's project version)."""
-    m = re.search(r"project\(strata VERSION ([\d.]+)", (ROOT / "CMakeLists.txt").read_text(encoding="utf-8"))
+    """The engine version the source tree builds (CMakeLists.txt's project version).  "0" when there is none to read: the packaged
+    Terminal carries no CMakeLists.txt (it ships VERSION and BUNDLE.json), and a missing file was a FileNotFoundError out of
+    prebuilt_bases() that ended the whole setup (#4188)."""
+    try:
+        m = re.search(r"project\(strata VERSION ([\d.]+)", (ROOT / "CMakeLists.txt").read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError):
+        return "0"
     return m.group(1) if m else "0"
 
 
@@ -6696,8 +6704,8 @@ def stale_binary(exe) -> bool:
     """#2054: the engine binary is of another version than this source tree builds.  A BUILD.json that carries the
     source's hash and version cannot be trusted alone: a build that stopped (a host compiler the toolkit rejects) can
     leave the old binary beside a stamp of the new source, and nothing would ever compile it again."""
-    v = binary_engine_version(exe)
-    return v is not None and v != source_version()
+    v, source = binary_engine_version(exe), source_version()
+    return v is not None and source != "0" and v != source      # "0": no source tree to compare with (the packaged Terminal)
 
 
 def engine_version(exe: Path) -> tuple:
