@@ -775,7 +775,7 @@ void QiDit::drop_activations() {
 
 void QiDit::sample(float* x, int64_t H, int64_t W, const std::vector<float>& sigmas,
                    const std::function<bool(int, int)>& step, const std::function<void(float*, float)>& after,
-                   float cfg) {
+                   float cfg, const std::function<void(int, const std::function<void(float*)>&)>& peek) {
     const int64_t n = in_ch_ * H * W;
     const bool guided = cfg > 1.0f && other_.n_text > 0;
     float* v = alloc<float>(allocs_, n);
@@ -808,6 +808,13 @@ void QiDit::sample(float* x, int64_t H, int64_t W, const std::vector<float>& sig
         }
         qi_axpy(x, v, sigmas[(size_t) i + 1] - sigmas[(size_t) i], n, s_);
         if (after) after(x, sigmas[(size_t) i + 1]);
+        if (peek) {
+            const float s_next = sigmas[(size_t) i + 1];
+            peek(i + 1, [&](float* x0) {   // x0 = x - sigma v (flow matching), into the caller's buffer
+                gpu::copy_async(x0, x, (size_t) n * 4, s_);
+                qi_axpy(x0, v, -s_next, n, s_);
+            });
+        }
         if (step) {
             gpu::stream_sync(s_);
             if (!step(i + 1, steps)) {

@@ -451,6 +451,15 @@ void bf16_to_f16_inplace(uint16_t* p, int64_t n, sycl::queue& q) {
     });
 }
 
+// x0 = x - sigma * v, the step's prediction of the finished latent (a partial image's), v as euler's
+void predicted(float* x0, const float* x, const float* out, int64_t n, int ctxs, float cfg, float sigma, void* s) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const float v = ctxs == 2 ? out[n + i] + cfg * (out[i] - out[n + i]) : out[i];
+        x0[i] = x[i] - sigma * v;
+    });
+}
+
 // x += ds * v, v the guided velocity: out[0] (the prompt's) alone, or out[1] + cfg (out[0] - out[1])
 void euler(float* x, const float* out, int64_t n, int ctxs, float cfg, float ds, void* s) {
     q_of(s).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
@@ -1088,7 +1097,8 @@ void MfDit::forward(const float* x, float sigma, int64_t h, int64_t w, int n, fl
 }
 
 void MfDit::sample(float* x, int64_t h, int64_t w, const std::vector<float>& sigmas, float cfg,
-                   const std::function<bool(int, int)>& step, const std::function<void(float*, float)>& after) {
+                   const std::function<bool(int, int)>& step, const std::function<void(float*, float)>& after,
+                   const std::function<void(int, const std::function<void(float*)>&)>& peek) {
     const int n = cfg > 1.f && ctx_[1].rows > 0 ? 2 : 1;
     const int64_t HW = h * w;
     float* out = alloc<float>(allocs_, n * HW * in_ch_);
@@ -1097,6 +1107,10 @@ void MfDit::sample(float* x, int64_t h, int64_t w, const std::vector<float>& sig
         forward(x, sigmas[(size_t) i], h, w, n, out);
         euler(x, out, HW * in_ch_, n, cfg, sigmas[(size_t) i + 1] - sigmas[(size_t) i], s_);
         if (after) after(x, sigmas[(size_t) i + 1]);
+        if (peek) {
+            const float s_next = sigmas[(size_t) i + 1];
+            peek(i + 1, [&](float* x0) { predicted(x0, x, out, HW * in_ch_, n, cfg, s_next, s_); });
+        }
         if (step && !step(i + 1, steps)) {
             gpu::stream_sync(s_);
             release(allocs_, out);

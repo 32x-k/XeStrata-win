@@ -217,6 +217,8 @@
   "img.strengthTitle": "Cuánto puede cambiar la imagen: más bajo conserva más",
   "img.title": "Crear una imagen",
   "img.transparent": "Fondo transparente",
+  "img.partial": "Mostrar imágenes parciales",
+  "img.partialCap": "Imagen parcial {n}…",
   "img.width": "Ancho",
   "img.widthHeight": "Ancho × alto",
   "math.source": "Código de la fórmula ({reason})",

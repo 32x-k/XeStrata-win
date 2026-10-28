@@ -5193,9 +5193,14 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
                     box["cancelled"] = True
             worker = threading.Thread(target=work, daemon=True)
             worker.start()
+            partials = getattr(hub, "partials", None)   # an image tool's partial images (ImageTools.stream_partials)
             try:
                 while worker.is_alive():
                     worker.join(1.0)
+                    while partials is not None and not partials.empty():
+                        index, data = partials.get()
+                        yield "mcp", {"event": "partial", "id": c.id, "index": index,
+                                      "b64": base64.b64encode(data).decode("ascii")}
                     if worker.is_alive():
                         yield "ping", None
             except GeneratorExit:
@@ -6818,7 +6823,7 @@ def make_handler(svc: Service):
                 return
             gen = svc.images.pick(req.get("model"))             # the image model it names, else the default
             job = images_api.parse_request(req, gen.cfg)        # ImageRequestError (a ValueError): 400
-            self._image_job(gen, job)
+            self._image_job(gen, job, req.get("stream") is True)
 
         def _images_edit(self):
             """POST /v1/images/edits (serve/images.py): reference images and a prompt in OpenAI's multipart form (image
@@ -6866,16 +6871,19 @@ def make_handler(svc: Service):
             gen = svc.images.pick_edit(req.get("model"), req.get("strength") is not None or mask is not None)
             job = images_api.parse_edit_request(req, [Vision.normalize(d, keep_alpha=True) for d in files], gen.cfg,
                                                 mask)
-            self._image_job(gen, job)
+            self._image_job(gen, job, req.get("stream") is True, edit=True)
 
-        def _image_job(self, gen, job):
-            """One image job (a generation or an edit) in the GPU's turn, answered as OpenAI's images API does."""
+        def _image_job(self, gen, job, stream=False, edit=False):
+            """One image job (a generation or an edit) in the GPU's turn, answered as OpenAI's images API does: one
+            JSON body, or with `stream` its events (_image_stream)."""
             svc.last_request_at = time.time()
             cancel = threading.Event()
             self._watch_client(cancel)
             print(f"[strata] image: {job['width']}x{job['height']}, n={job['n']}, {job['steps']} steps, "
                   f"seed {job['seed']}" + (f", {len(job['refs'])} reference image(s)" if job.get("refs") else ""),
                   flush=True)
+            if stream:
+                return self._image_stream(gen, job, cancel, edit)
             host = self.headers.get("Host") or f"{self.server.server_address[0]}:{self.server.server_address[1]}"
             scheme = "https" if (self.headers.get("X-Forwarded-Proto") or "").lower() == "https" else "http"
             try:
@@ -6888,6 +6896,69 @@ def make_handler(svc: Service):
                                            "message": str(e)}})
                 return
             self._json(200, body)
+
+        def _image_stream(self, gen, job, cancel, edit):
+            """OpenAI's streamed images: image_generation.partial_image events (image_edit.* for an edit) as the
+            engine makes the job's partial_images, then one .completed event an image (b64_json, with the usage on
+            each; and as the JSON body has, its seed and the "strata" figures), as SSE.  A failure after the stream
+            started is an error event."""
+            kind = "image_edit" if edit else "image_generation"
+            fmt, opaque = job["output_format"], job["background"] == "opaque"
+            common = {"size": f"{job['width']}x{job['height']}", "quality": job["quality"],
+                      "background": job["background"], "output_format": fmt}
+            events: queue.Queue = queue.Queue()
+            result: dict = {}
+
+            def preview(image, index, png):
+                events.put((image, index, images_api.encode_image(png, fmt, job["output_compression"], opaque)))
+
+            def work():
+                try:
+                    images, figures, policy = images_api.make_images(svc, gen, job, cancel,
+                                                                     preview if job.get("partial_images") else None)
+                    figures["gpu_policy"] = policy
+                    print(f"[strata] image done in {figures['seconds']:.1f} s ({policy}, stream)", flush=True)
+                    result["images"], result["figures"] = images, figures
+                except Exception as e:  # noqa: BLE001 - said in the stream: its status is sent already
+                    result["error"] = e
+                finally:
+                    events.put(None)
+            worker = threading.Thread(target=work, daemon=True)
+            worker.start()
+            self._sse()
+
+            def send(name, data):
+                self.wfile.write(f"event: {name}\n".encode() + b"data: " +
+                                 json.dumps({"type": name, **data}).encode() + b"\n\n")
+                self.wfile.flush()
+            try:
+                while True:
+                    try:
+                        item = events.get(timeout=15)
+                    except queue.Empty:
+                        self.wfile.write(b": keep-alive\n\n")
+                        self.wfile.flush()
+                        continue
+                    if item is None:
+                        break
+                    _, index, data = item
+                    send(f"{kind}.partial_image", {"b64_json": base64.b64encode(data).decode("ascii"),
+                                                   "created_at": int(time.time()), **common,
+                                                   "partial_image_index": index})
+                if "error" in result:
+                    err = {"type": "server_error", "code": "image_generation_failed", "message": str(result["error"])}
+                    self._note(error=err)
+                    send("error", {"error": err})
+                    return
+                for i, png in enumerate(result["images"]):
+                    data = images_api.encode_image(png, fmt, job["output_compression"], opaque)
+                    send(f"{kind}.completed", {"b64_json": base64.b64encode(data).decode("ascii"),
+                                               "created_at": int(time.time()), **common,
+                                               "usage": images_api.usage(job), "model": gen.model,
+                                               "seed": job["seed"] + i, "strata": result["figures"]})
+            except OSError:
+                self._note(outcome="disconnected")
+                cancel.set()
 
         def _props(self):
             model = parse_qs(urlsplit(self.path).query).get("model", [svc.model])[0]
@@ -7375,6 +7446,8 @@ def make_handler(svc: Service):
                 self.image_tools = images_api.ImageTools(svc, svc.images, messages, Vision.load,
                                                          lambda d: Vision.normalize(d, keep_alpha=True),
                                                          spec, model=fixed, mask=mask)
+                if req.get("stream") is True:            # the tool's partial_images, sent as the image is made
+                    self.image_tools.stream_partials(spec.get("partial_images"))
                 offered = self.image_tools.template_tools(exclude={t["name"] for t in tools or []})
                 # the tool's action: "generate" offers generate_image alone, "edit" edit_image alone
                 action = spec.get("action", "auto")

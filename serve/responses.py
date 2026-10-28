@@ -808,6 +808,10 @@ class Assembler:
                                   output_index=self.index))
             out.append(self.event("response.image_generation_call.generating", item_id=item["id"],
                                   output_index=self.index))
+        elif x.get("event") == "partial" and self.item is not None and self.item["type"] == "image_generation_call":
+            out.append(self.event("response.image_generation_call.partial_image", item_id=self.item["id"],
+                                  output_index=self.index, partial_image_index=x.get("index", 0),
+                                  partial_image_b64=x.get("b64")))
         elif x.get("event") == "result" and self.item is not None and self.item["type"] == "image_generation_call":
             urls = x.get("images") or []
             self.item["result"] = image_b64(urls[0]) if urls else None

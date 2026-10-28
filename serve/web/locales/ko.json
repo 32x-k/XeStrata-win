@@ -217,6 +217,8 @@
   "img.strengthTitle": "이미지를 얼마나 바꿀지: 낮을수록 원본을 더 많이 남깁니다",
   "img.title": "이미지 만들기",
   "img.transparent": "투명한 배경",
+  "img.partial": "중간 이미지 표시",
+  "img.partialCap": "중간 이미지 {n}…",
   "img.width": "너비",
   "img.widthHeight": "너비 × 높이",
   "math.source": "수식 원문 ({reason})",

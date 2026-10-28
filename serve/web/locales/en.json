@@ -235,6 +235,8 @@
   "img.strengthTitle": "How much of the image may change: lower keeps more of it",
   "img.title": "Make an image",
   "img.transparent": "Transparent background",
+  "img.partial": "Show partial images",
+  "img.partialCap": "Partial image {n}…",
   "img.width": "Width",
   "img.widthHeight": "Width × height",
   "math.source": "Math source ({reason})",

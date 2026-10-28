@@ -217,6 +217,8 @@
   "img.strengthTitle": "Wie viel sich am Bild ändern darf: weniger behält mehr davon",
   "img.title": "Ein Bild erzeugen",
   "img.transparent": "Transparenter Hintergrund",
+  "img.partial": "Zwischenbilder zeigen",
+  "img.partialCap": "Zwischenbild {n}…",
   "img.width": "Breite",
   "img.widthHeight": "Breite × Höhe",
   "math.source": "Formelquelltext ({reason})",

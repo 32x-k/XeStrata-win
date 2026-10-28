@@ -73,9 +73,13 @@ public:
     /// throws QiStopped).  `after` (if set) is given x and the step's new sigma first, on the sampler's stream (a mask:
     /// img_start.hpp's blend).  `cfg` above 1 (with a second context set): classifier-free guidance, the
     /// velocity neg + cfg * (cond - neg) of the two contexts' (diffusers' true_cfg_scale).
+    /// `peek` (if set) is called after each step with the steps done and a function that writes the step's x0, the
+    /// sampler's prediction of the finished latent (x - sigma * v), into a buffer of x's size: a partial image's
+    /// latent, on the sampler's stream; the sampling itself is not changed.
     void sample(float* x, int64_t H, int64_t W, const std::vector<float>& sigmas,
                 const std::function<bool(int, int)>& step = {},
-                const std::function<void(float*, float)>& after = {}, float cfg = 1.0f);
+                const std::function<void(float*, float)>& after = {}, float cfg = 1.0f,
+                const std::function<void(int, const std::function<void(float*)>&)>& peek = {});
 
     int64_t channels() const { return in_ch_; }
     int64_t hidden() const { return C_; }
