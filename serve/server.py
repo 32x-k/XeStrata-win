@@ -5716,12 +5716,18 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
 def openai_choices(n: int, choice):
     """The chunks of n choices (`choice(k)`: choice k's chunks), one choice after another, each chunk under its
     choice's index.  The usage is the request's: the prompt once, every choice's completion tokens, on the last
-    choice's finishing chunk.  A choice that fails ends the whole request."""
+    choice's finishing chunk.  Every chunk carries the first choice's id and created, as OpenAI's chunks of one
+    completion do.  A choice that fails ends the whole request."""
     total: dict | None = None
+    first: tuple | None = None
     for k in range(n):
         chunks = choice(k)
         try:
             for c in chunks:
+                if c is not None and "id" in c:
+                    if first is None:
+                        first = c["id"], c.get("created")
+                    c["id"], c["created"] = first
                 if c is None or not c.get("choices"):
                     yield c
                     continue
