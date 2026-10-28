@@ -7658,6 +7658,7 @@ def make_handler(svc: Service):
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the request itself: no tools offered
                 tools = None
             force = forced_call(req.get("tool_choice"), tools, getattr(svc.template, "call_form", "qwen"))
+            constrained_tools(req.get("tools"))               # a tool's strict of another type: the same 400
             messages, _ = anthropic_prepare_format(req, messages, tools)   # its instruction is part of the prompt
             self._no_local_images(messages)                   # the same 400s as the request itself would get
             stop_strings(req)

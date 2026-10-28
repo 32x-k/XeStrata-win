@@ -182,7 +182,7 @@ def prepare_format(response_format, messages, with_tools=False):
             raise ValueError("response_format.json_schema needs a schema object")
         if not isinstance(spec.get("name"), str) or not spec["name"]:
             raise ValueError("response_format.json_schema needs a name")
-        if "strict" in spec and not isinstance(spec["strict"], bool):
+        if spec.get("strict") is not None and not isinstance(spec["strict"], bool):   # null: not given (OpenAI's SDKs)
             raise ValueError("response_format.json_schema.strict must be boolean")
         schema = spec["schema"]
         if not _only_objects(schema, schema):
@@ -352,7 +352,7 @@ def constrained_tools(tools, namespace: str = "") -> tuple[set, dict]:
     """A request's tools as sent (Chat's, Responses', Anthropic's shapes; a Responses namespace's tools under
     "namespace.name", the name the template has) -> (the names of those with "strict": true, {name: pattern} of the
     custom tools whose format is a regex grammar) for tool_grammar and checked_calls.  A Lark grammar is not
-    constrained (it is described to the model, as before)."""
+    constrained (it is described to the model, as before).  A strict that is not true, false or null is a 400."""
     strict, patterns = set(), {}
     for t in tools if isinstance(tools, list) else []:
         if not isinstance(t, dict):
@@ -364,6 +364,8 @@ def constrained_tools(tools, namespace: str = "") -> tuple[set, dict]:
             continue
         inner = t.get("function")
         fn: dict = inner if isinstance(inner, dict) else t
+        if fn.get("strict") is not None and not isinstance(fn["strict"], bool):   # null: not given
+            raise ValueError(f"tool {fn.get('name')}: strict must be true, false or null")
         if fn.get("strict") is True and isinstance(fn.get("name"), str):
             strict.add(namespace + fn["name"])
         inner = t.get("custom")

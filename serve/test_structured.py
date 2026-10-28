@@ -261,6 +261,26 @@ class Structured(unittest.TestCase):
                 self.assertEqual(code, 502, reply)
                 self.assertIn("not finite", reply["error"]["message"])
 
+    def test_strict_of_another_type(self):
+        # a tool's strict that is not true, false or null is a 400 (count_tokens too), not a silent non-strict; null
+        # is not given, for a tool and for response_format (OpenAI's SDKs send it)
+        def tool(strict):
+            return {"type": "function", "function": {"name": "f", "strict": strict, "parameters": {"type": "object"}}}
+        user = [{"role": "user", "content": "go"}]
+        for strict in ("true", 1, {}, []):
+            with self.subTest(strict=strict):
+                code, reply = self.request("/v1/chat/completions", {"messages": user, "tools": [tool(strict)]})
+                self.assertEqual(code, 400, reply)
+                self.assertIn("strict must be", reply["error"]["message"])
+                code, _ = self.request("/v1/messages/count_tokens", {
+                    "model": "m", "messages": user,
+                    "tools": [{"name": "f", "strict": strict, "input_schema": {"type": "object"}}]})
+                self.assertEqual(code, 400)
+        self.assertEqual(self.request("/v1/chat/completions", {"messages": user, "tools": [tool(None)],
+                                                               "reasoning_effort": "none"})[0], 200)
+        fmt = {"type": "json_schema", "json_schema": {"name": "h3_story", "strict": None, "schema": STORY_SCHEMA}}
+        self.assertEqual(self.chat(response_format=fmt)[0], 200)
+
     def test_the_server_does_not_import_jsonschema_at_start(self):
         import subprocess
         import sys
