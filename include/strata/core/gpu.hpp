@@ -130,6 +130,9 @@ bool host_register_on(int device, void* p, size_t bytes);
 /// Whether engine device `a`'s kernels can access device `b`'s memory directly (sycl_ext_oneapi_peer_access: NVLink
 /// or PCIe peer-to-peer, one backend); false for devices of different backends or without the extension.
 bool peer_access(int a, int b);
+/// Whether engine devices `a` and `b` are run by the same backend (Level Zero, CUDA, HIP): one maker's runtime, whose
+/// host USM and registrations the other device's runtime may not take.
+bool same_backend(int a, int b);
 /// The device's name as the runtime reports it.
 std::string device_name(int device);
 void host_unregister_on(int device, void* p);

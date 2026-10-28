@@ -478,6 +478,11 @@ bool peer_access(int a, int b) {
 #endif
 }
 
+bool same_backend(int a, int b) {
+    try { return core::Runtime::at(a).device().get_backend() == core::Runtime::at(b).device().get_backend(); }
+    catch (const std::exception& e) { return fail("same_backend", e); }
+}
+
 std::string device_name(int device) {
     try { return core::Runtime::at(device).device().get_info<sycl::info::device::name>(); }
     catch (const std::exception& e) { fail("device_name", e); return {}; }
