@@ -319,7 +319,11 @@ def parse_request(req: dict, cfg: dict) -> dict:
     seed = _int_field(req, "seed", 0, 2**62, None)
     if seed is None:
         seed = random.SystemRandom().randrange(0, 2**31)
-    return {"prompt": prompt, "width": w, "height": h, "n": n, "steps": steps, "seed": seed,
+    # OpenAI's streamed partial images: made only for a stream (the server's), none by default
+    partial = _int_field(req, "partial_images", 0, 3, 0)
+    if req.get("stream") is not None and not isinstance(req.get("stream"), bool):
+        raise ImageRequestError("stream: true or false")
+    return {"prompt": prompt, "width": w, "height": h, "n": n, "steps": steps, "seed": seed, "partial_images": partial,
             "quality": quality or "auto", "response_format": fmt, "output_format": out_fmt,
             "output_compression": compression, "background": background, "bucket": bucket, **requested, **cfg_fields}
 
@@ -1018,9 +1022,10 @@ class ImageEngine:
             raise ImageJobFailed(f"the image engine is gone ({e}); its log: {self.log_path}") from e
 
     def ask(self, line: str, want: str, timeout: float, cancel: threading.Event | None = None, step=None,
-            stage=None) -> dict:
+            stage=None, preview=None) -> dict:
         """Send a request line and wait for its answer (the line starting with `want`) -> its fields; STEP lines go to
-        `step`, STAGE lines (refs, text, sampling, decode) to `stage`.  ImageJobFailed on ERROR."""
+        `step`, STAGE lines (refs, text, sampling, decode) to `stage`, PREVIEW lines (a partial image: its index, the
+        step, the file of its RGBA8 rows) to `preview`.  ImageJobFailed on ERROR."""
         self.send(line)
         t0 = time.monotonic()
         while True:
@@ -1032,6 +1037,10 @@ class ImageEngine:
             elif got.startswith("STAGE "):
                 if stage is not None:
                     stage(got[6:].strip())
+            elif got.startswith("PREVIEW "):
+                if preview is not None:
+                    index, done, path = got.split(maxsplit=3)[1:4]
+                    preview(int(index), int(done), path)
             elif got.startswith(want):
                 return _kv(got)
             elif got.startswith("ERROR"):
@@ -1358,10 +1367,11 @@ class ImageGen:
             self.engine.close(shutdown)
 
     def run(self, job: dict, cancel: threading.Event | None = None, first: int = 0,
-            pause=None) -> tuple[list[bytes], dict]:
+            pause=None, preview=None) -> tuple[list[bytes], dict]:
         """Make `job`'s images (parse_request's dict) from image `first` -> (the PNG files' bytes in order, figures).
         The caller holds the GPU turn; `pause()` true after an image ends the call there (make_images gives the turn
-        to the requests waiting for it).  ImageJobFailed when the engine fails, times out or the job is cancelled."""
+        to the requests waiting for it).  ImageJobFailed when the engine fails, times out or the job is cancelled.
+        `preview(image, index, png)`: the job's partial images (partial_images), as the engine makes them."""
         timeout = float(self.cfg.get("timeout_s") or 3600)
         t0 = time.monotonic()
         images, parts = [], []
@@ -1392,6 +1402,16 @@ class ImageGen:
                     self._live(image=i + 1, step=0, steps=run,
                                stage="refs" if job.get("refs") or job.get("init") else "text", sampling_at=None)
                     out = work / f"img_{i}.rgba"
+                    shows = partial_steps(run, job.get("partial_images") or 0) if preview is not None else []
+                    shown = " PREVIEW:" + ",".join(str(k) for k in shows) if shows else ""
+
+                    def peek(index, done, path, i=i):
+                        try:
+                            png = png_rgba(Path(path).read_bytes(), job["width"], job["height"], mw, mh)
+                            Path(path).unlink(missing_ok=True)
+                        except OSError:
+                            return
+                        preview(i, index, png)
 
                     def step(done, steps, i=i):
                         self.progress = (i * steps + done, job["n"] * steps)
@@ -1401,8 +1421,8 @@ class ImageGen:
                         self._live(stage=name, **({"sampling_at": time.monotonic()} if name == "sampling" else {}))
                     try:
                         r = self.engine.ask(f"IMG {mw} {mh} {job['seed'] + i} {self.drop_of(job)} {out} {ids}{sigmas}"
-                                            f"{guide}{self._refs_words(job)}{self._cfg_words(job)}", "IMAGE", timeout,
-                                            cancel, step, stage)
+                                            f"{guide}{self._refs_words(job)}{self._cfg_words(job)}{shown}", "IMAGE",
+                                            timeout, cancel, step, stage, **({"preview": peek} if shows else {}))
                     except ImageJobFailed as e:
                         self.totals["failed"] += 1
                         why = "cancelled (the client left)" if str(e) == "stopped" else str(e)
@@ -1861,8 +1881,16 @@ def ram_available_mib() -> int | None:
         return None
 
 
-def make_images(svc, gen: ImageGen, job: dict,
-                cancel: threading.Event | None = None) -> tuple[list[bytes], dict, str]:
+def partial_steps(steps: int, k: int) -> list[int]:
+    """The steps after which an image's k partial images (OpenAI's partial_images, 1..3) are made: spread evenly over
+    the sampling, never its last (the image itself)."""
+    if k <= 0 or steps < 2:
+        return []
+    return sorted({max(1, min(steps - 1, round(steps * (j + 1) / (k + 1)))) for j in range(k)})
+
+
+def make_images(svc, gen: ImageGen, job: dict, cancel: threading.Event | None = None,
+                preview=None) -> tuple[list[bytes], dict, str]:
     """`job`'s images in the GPU's turn (gpu_turn) -> (the PNG files' bytes, figures, the policy used).  When a request
     waits for the turn after an image, the turn is given to it and taken again for the rest, so a chat is not held up
     by a batch; not under unload (giving it would load the text model and unload it again for each image).  Too many
@@ -1878,7 +1906,7 @@ def make_images(svc, gen: ImageGen, job: dict,
             def pause() -> bool:
                 with svc.status_lock:
                     return used != "unload" and svc.status["queued"] > 0
-            made, figures = gen.run(job, cancel, len(images), pause)
+            made, figures = gen.run(job, cancel, len(images), pause, preview)
         images += made
         parts.append(figures)
         if len(images) < job["n"]:
