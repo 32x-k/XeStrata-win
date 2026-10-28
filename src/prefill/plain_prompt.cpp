@@ -357,8 +357,9 @@ bool PlainModel::prompt_dense_int8(const W& w, const float* x, int64_t ldx, floa
 // a + b rows from 16 rows and the chunk's (the best of three, after one), and dense_native_rows_ is where they cross.
 // The RX 9060 XT, Qwen3.5-9B Q4_K_M (2026-10-27): int8 faster at 16 and 23 tokens, FP16 at 128 and above (2289 tok/s
 // at 1K against 843).  Gemm::native is timed with its sums in FP32 and in FP16 too: the RTX 4070 takes FP16's (1K
-// 2842 -> 3572 tok/s warm, 32K 1524 -> 1681); on the B70 the two are close (FP32's ahead at 1K, 3476 against 3304, and
-// behind at the chunk's rows by the 2026-10-29 timing), where FP16's are kept (below).
+// 2842 -> 3572 tok/s warm, 32K 1524 -> 1681); on the B70 the two are close in the timing and FP32's ahead in the
+// prompt (1K 3476 against 3304; 2026-10-29: 1K 3125 against 2945, 32K 1276 against 1248), where FP32's are kept
+// (below).
 void PlainModel::prompt_dense_calibrate() {
     PromptBufs& P = pb_;
     if (blocks_.empty() || P.T < 32) return;
@@ -396,13 +397,18 @@ void PlainModel::prompt_dense_calibrate() {
     PromptGemm& pg = prompt_gemm();
     const int64_t lo = 16, hi = P.T;
     using Clock = std::chrono::steady_clock;
+    auto best1 = [&](const std::function<void()>& run) {   // one run's time
+        const auto t0 = Clock::now();
+        run();
+        if (!strata::gpu::stream_sync(cs_)) return -1.0;
+        return std::chrono::duration<double>(Clock::now() - t0).count();
+    };
     auto best = [&](const std::function<void()>& run) {
         double t = 1e30;
         for (int i = 0; i < 4; ++i) {
-            const auto t0 = Clock::now();
-            run();
-            if (!strata::gpu::stream_sync(cs_)) return -1.0;
-            if (i > 0) t = std::min(t, std::chrono::duration<double>(Clock::now() - t0).count());
+            const double r = best1(run);
+            if (r < 0) return -1.0;
+            if (i > 0) t = std::min(t, r);
         }
         return t;
     };
@@ -422,16 +428,29 @@ void PlainModel::prompt_dense_calibrate() {
             P.h_dense_bounds[0] = 0;
             P.h_dense_bounds[1] = (int32_t) T;
             if (!strata::gpu::copy_async(P.dense_bounds, P.h_dense_bounds, 2 * sizeof(int32_t), cs_)) return;
-            n[i] = best([&] { gm.native(P.x16, w.type, w.data, P.sh_gate, T, w.n_out, w.n_in, 0); });
-            h[i] = best([&] { gm.native(P.x16, w.type, w.data, P.sh_gate, T, w.n_out, w.n_in, 0, true); });
+            // the two sums timed in turn, so that the GPU's clocks rising over the timings favour neither (the B70,
+            // MOSS-Image's text encoder just opened, 2026-10-29: the products 2.4 times slower in one start of five,
+            // FP16's timed after FP32's and taken)
+            n[i] = h[i] = 1e30;
+            for (int k = 0; k < 4; ++k) {
+                const auto sums = [&](bool half) {
+                    return best1([&] { gm.native(P.x16, w.type, w.data, P.sh_gate, T, w.n_out, w.n_in, 0, half); });
+                };
+                const double a = sums(false), b = sums(true);
+                if (a < 0 || b < 0) return;
+                if (k > 0) {
+                    n[i] = std::min(n[i], a);
+                    h[i] = std::min(h[i], b);
+                }
+            }
             q[i] = best([&] { prompt_dense_int8(w, P.hn, w.n_in, P.sh_gate, T, 0); });
             if (n[i] < 0 || h[i] < 0 || q[i] < 0) return;
         }
-        // FP16's sums unless FP32's are clearly the faster: the two form different values (the GDN blocks' ssm_out
-        // takes them at every length), and a near tie (the B70, 2026-10-29: FP16's 0.80 ms at 512 rows, FP32's 0.83 in
-        // one start of five, 0.89 and more in the others) picked one or the other from start to start, the same
-        // prompt's states, and an image made from them, changing with it
-        dense_half_sums_ = h[1] < n[1] * 1.1;
+        // FP32's sums unless FP16's are clearly the faster (the GeForce's twice): the two form different values (the
+        // GDN blocks' ssm_out takes them at every length), and a near tie (the B70, 2026-10-29: FP16's 0.80 ms at 512
+        // rows, FP32's 0.83 in one start of five, 0.89 in the others) picked one or the other from start to start, the
+        // same prompt's states, and an image made from them, changing with it
+        dense_half_sums_ = h[1] * 1.2 < n[1];
         if (dense_half_sums_) { n[0] = h[0]; n[1] = h[1]; }
         // native - int8 = d0 + d1 (T - lo): FP16 from where it turns negative, at a multiple of 64 rows, so that the
         // timings' noise (the B70: 304 to 322 rows from start to start) leaves a prompt of a given length on one side
