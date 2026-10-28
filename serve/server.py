@@ -7428,7 +7428,10 @@ def make_handler(svc: Service):
                                           int(req.get("max_output_tokens") or 0), req, cancel,
                                           set(image_tools.routes()), force=force)
                 else:
-                    source = svc.run(ids, thinking, tools, max_new, req, cancel, force=force)
+                    # a call counts only for a tool the request declared (tool_choice none: none), as on the
+                    # other routes - but for a Codex compaction, whose calls come back as they did
+                    source = svc.run(ids, thinking, tools, max_new, req, cancel, force=force,
+                                     declared_only=not responses_api.codex_compaction(req))
                 for kind, x in source:
                     if kind == "ping":
                         yield None

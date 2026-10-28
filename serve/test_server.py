@@ -1696,8 +1696,8 @@ class UnsupportedOrOld(unittest.TestCase):
 
 
 class NamedToolChoice(unittest.TestCase):
-    """A tool_choice that names tool a: the reply's one call is a's, on every API - a call of b written in the
-    thinking, or after the forced call, is not returned as a call."""
+    """Which calls count: with a tool_choice that names tool a, the reply's one call is a's, on every API (a call of b
+    written in the thinking, or after the forced call, is not returned as a call); on Responses, a declared tool's."""
 
     def run_api(self, script, path, body):
         tok = ByteTokenizer()
@@ -1748,6 +1748,21 @@ class NamedToolChoice(unittest.TestCase):
                     names = [o["name"] for o in out["output"] if o["type"] == "function_call"]
                 self.assertNotIn("b", names)
                 self.assertLessEqual(len(names), 1)
+
+    def test_responses_counts_declared_calls_only(self):
+        # Responses' tool_choice none, or no tools at all: a call the model writes stays text, as on Chat and
+        # Anthropic; a Codex compaction request (no tools declared, its conversation's in the prompt) keeps its calls
+        script = ("</think>\n\n<tool_call>\n<function=a>\n<parameter=x>\n1\n</parameter>\n</function>\n"
+                  "</tool_call>")
+        params = {"type": "object", "properties": {"x": {"type": "string"}}}
+        tool = {"type": "function", "name": "a", "parameters": params}
+        turn = {"request_kind": "compaction", "session_id": "s", "thread_id": "t"}
+        meta = {"x-codex-turn-metadata": json.dumps(turn)}
+        for name, body, want in (("none", {"tools": [tool], "tool_choice": "none"}, 0), ("no tools", {}, 0),
+                                 ("compaction", {"client_metadata": meta}, 1)):
+            with self.subTest(name):
+                out = json.loads(self.run_api(script, "/v1/responses", {"model": "m", "input": "go", **body}))
+                self.assertEqual(len([o for o in out["output"] if o["type"] == "function_call"]), want)
 
 
 class ToolArguments(unittest.TestCase):

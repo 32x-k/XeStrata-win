@@ -506,6 +506,12 @@ def _codex_turn(req: dict):
     return turn.get("request_kind"), conversation if all(isinstance(x, str) and x for x in conversation) else None
 
 
+def codex_compaction(req: dict) -> bool:
+    """A Codex compaction request (its turn metadata's request_kind): it declares no tools, but its prompt can show
+    its conversation's (prompt_tools), and a call it writes comes back as one."""
+    return _codex_turn(req)[0] == "compaction"
+
+
 def prompt_tools(req: dict, tools):
     """-> the tools the prompt is rendered with: request_tools' `tools`, or for a Codex compaction request without
     tools the ones its own conversation's last prompt was rendered with (so its prompt starts as that one did)."""

@@ -1449,8 +1449,8 @@ class OutputParser:
         # #804/#3075: in the answer too, a call counts only for a tool the request declared.  With tools declared a
         # call for another name stays text (the Responses spelling `namespace__tool` of a `namespace.tool` counts as
         # that tool); `declared_only` extends the rule to a request that declared none (Chat Completions, Anthropic:
-        # the client has no tool to run).  The Responses route leaves it off: a Codex compaction request keeps its
-        # conversation's tools in the prompt only, and its calls come back as before.
+        # the client has no tool to run; Responses but for a Codex compaction request, which keeps its conversation's
+        # tools in the prompt only, and whose calls come back as before).
         self.declared_only = declared_only
         # A declared namespace.member tool is also accepted as namespace__member (PR #3556), namespace=member (Qwen
         # writes the <function= tag's equals sign into the name), namespace_member (one underscore dropped) and the
