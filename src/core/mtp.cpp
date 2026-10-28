@@ -572,11 +572,20 @@ void MtpDrafter::setup_int2() {
     const int64_t nv = sub ? n_dvocab_ : n_vocab_;
     const size_t rb = head_->row_bytes();
     const auto* rows = (const uint8_t*) (sub ? (const void*) dhead_ : head_->weights());
-    std::vector<uint8_t> host((size_t) nv * rb);
+    // the head comes back through pinned memory: into pageable memory the B70's Level Zero copied a whole head (Gyro-M's
+    // 675 MB Q5_K one) at under 1 MB/s, pinning and mapping it piece by piece (16 minutes of a start, 2026-10-28)
+    const size_t bytes = (size_t) nv * rb;
+    uint8_t* host = nullptr;
+    if (!strata::gpu::alloc_host(&host, bytes)) {
+        std::fprintf(stderr, "strata mtp: the drafts' head stays as it is (no pinned memory for its copy)\n");
+        return;
+    }
     std::string e;
     auto h = std::make_shared<DraftHeadInt2>();
-    if (!strata::gpu::copy(host.data(), rows, host.size()) ||
-        !h->build(head_->type(), nv, (int) N, [&](int64_t i) { return host.data() + (size_t) i * rb; }, rb, e)) {
+    const bool built = strata::gpu::copy(host, rows, bytes) &&
+                       h->build(head_->type(), nv, (int) N, [&](int64_t i) { return host + (size_t) i * rb; }, rb, e);
+    strata::gpu::free(host);
+    if (!built) {
         std::fprintf(stderr, "strata mtp: the drafts' head stays as it is (%s)\n", e.empty() ? "copy" : e.c_str());
         return;
     }
