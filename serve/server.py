@@ -76,7 +76,8 @@ from serve import runconfig  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve import release_check  # noqa: E402
-from serve.structured import StructuredOutputError, prepare_format, validated_json, extract_json  # noqa: E402
+from serve.structured import (StructuredOutputError, answer_grammar, constrained_tools,  # noqa: E402
+                              extract_json, prepare_format, tool_grammar, validated_json)
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
@@ -1348,6 +1349,10 @@ class StrataEngine:
             pn = prefix.get("tokens")
             if isinstance(pn, int) and not isinstance(pn, bool) and pn > 0:
                 keys += f" pin={pn}"
+        # "strata_grammar" (Service.attach_grammar): the reply follows this grammar (src/core/grammar.cpp)
+        grammar = sampling.get("strata_grammar")
+        if isinstance(grammar, dict):
+            keys += " grammar=" + base64.b64encode(json.dumps(grammar, ensure_ascii=False).encode()).decode("ascii")
         return keys + StrataEngine.projection_key(sampling) + bias_api.engine_key(sampling.get("logit_bias"))
 
     @staticmethod
@@ -3498,6 +3503,19 @@ class Service:
         prompt from it would send nothing, #351).  Reporting only: requests are checked in prepare()."""
         return int(getattr(self.engine, "max_context", 0) or getattr(self.engine, "known_ctx", 0) or 0)
 
+    tokenizer_dir: str | None = None     # the model's tokenizer folder (main): the engine's grammars read it
+
+    def attach_grammar(self, req: dict, grammar) -> bool:
+        """`grammar` (structured.answer_grammar / tool_grammar) into the request, for an engine that constrains its
+        decoding (INFO grammar=1: not with continuous batching, not the plain models' engine).  STRATA_GRAMMAR=0 keeps
+        every reply unconstrained (checked after it, as before).  -> whether it was attached."""
+        info = getattr(self.engine, "info", None) or {}
+        if grammar is None or str(info.get("grammar")) != "1" or not self.tokenizer_dir or \
+                os.environ.get("STRATA_GRAMMAR") == "0":
+            return False
+        req["strata_grammar"] = {**grammar, "vocab": self.tokenizer_dir, "prefix": ""}
+        return True
+
     def reasoning_budget(self, req) -> int | None:
         """#123: the most tokens this request may think, or None: the request's `reasoning_budget_tokens` (or, as
         llama.cpp reads it, `thinking_budget_tokens`), else the config's.  0 (or less) means no budget, so a request can
@@ -4542,8 +4560,9 @@ class Service:
                     out.append(Event("content", held))
                 out.append(ev)
             return out
-        opening = []                                    # without thinking the prompt ends with the forced opening:
+        opening, written = [], ""                       # without thinking the prompt ends with the forced opening:
         if force and not thinking:                      # the parser reads it as if the model had written it
+            written = force                             # (a grammar's prefix: the reply starts with it)
             opening, force = parser.feed(force), None
         tail = ""                                       # the last characters written (the newlines before a call)
         one_done = False                                # one_call: the reply's one call has been written
@@ -4552,7 +4571,7 @@ class Service:
         timings, before = None, None                    # this request's timings; the engine's `last` before it
         recovery_count, reasoning_text, repeat_coverage = 0, "", 0.0
         looped, next_loop_check = False, LOOP_CHECK_EVERY       # #728: reasoning that repeats whole passages
-        raw_ids = []                                    # every generated id (STRATA_DEBUG: dump raw model text)
+        raw_ids: list = []                              # every generated id (STRATA_DEBUG: dump raw model text)
         emb, self.embeddings.path = getattr(self.embeddings, "path", None), None   # this run's to delete now
         img_keys, self.embeddings.keys = getattr(self.embeddings, "keys", None), None
         if emb and img_keys:
@@ -4641,6 +4660,11 @@ class Service:
                     while True:
                         segment_before = getattr(self.engine, "last", None)
                         segments_before = len(segments)     # (#879: a pass sent again leaves no segment)
+                        if isinstance((sampling or {}).get("strata_grammar"), dict) and (raw_ids or written):
+                            # a pass that continues the reply (a budget's wrap-up, a forced call's opening, the
+                            # thinking closed): the grammar goes on from what the reply holds so far
+                            sampling = {**sampling, "strata_grammar": {
+                                **sampling["strata_grammar"], "prefix": written + self.tok.decode(raw_ids)}}
                         gen = self.engine.generate(prompt, max_new - n, sampling, cancel, embeddings=emb) if emb \
                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
                         recover_prompt = None
@@ -7137,6 +7161,10 @@ def make_handler(svc: Service):
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            form = getattr(svc.template, "call_form", "qwen")
+            # the engine writes the answer, or a strict tool's call, under its schema when it can (structured.py)
+            svc.attach_grammar(req, answer_grammar(req.get("response_format"), thinking) if validator is not None
+                               else tool_grammar(tools, *constrained_tools(req.get("tools")), thinking, form))
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             run = run_with_mcp(svc, hubs[0] if len(hubs) == 1 else ToolHubs(hubs), messages, tools, kw, ids,
                                thinking, max_new, max_req, req, cancel, {t["name"] for t in extra}) if use_mcp else None
@@ -7448,6 +7476,11 @@ def make_handler(svc: Service):
                     messages = fewer
             if svc.codex_compaction_cache:
                 responses_api.prompt_made(req, shown)
+            req = dict(req)
+            svc.attach_grammar(req, answer_grammar(responses_api.text_format(req), thinking)
+                               if validator is not None and not tools
+                               else tool_grammar(tools, *constrained_tools(req.get("tools")), thinking,
+                                                 getattr(svc.template, "call_form", "qwen")))
             _debug_req("responses", req, messages, tools, max_new, thinking, len(ids))
             asm = responses_api.Assembler(req, svc.model_for(req), len(ids), names,
                                           "reasoning.encrypted_content" in include, validator is not None)
@@ -7488,6 +7521,9 @@ def make_handler(svc: Service):
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            svc.attach_grammar(req, answer_grammar(anthropic_format(req), thinking) if validator is not None
+                               else tool_grammar(tools, *constrained_tools(req.get("tools")), thinking,
+                                                 getattr(svc.template, "call_form", "qwen")))
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
             if validator is not None:
@@ -8424,6 +8460,8 @@ def main() -> int:
                                                       and cfg.get("fit_max_tokens") is not False))
     svc.vision_error = vision_error
     svc.vision_fallback = vision_fallback
+    if (tpath / "vocab.json").exists():
+        svc.tokenizer_dir = str(tpath.resolve())
     svc.public_urls = True                             # #28: a request's image URL only from a public address
     if a.engine == "strata":                            # the model card's sampling when nothing else is said
         svc.model_arch = card_family(cfg)
