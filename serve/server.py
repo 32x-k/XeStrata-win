@@ -4243,6 +4243,12 @@ class Service:
             out.append({**m, "content": items})
         return out
 
+    def forced_ids(self, force, kwargs) -> list[int]:
+        """The tokens of a forced call's opening (forced_call) that end the prompt: without thinking the reply starts
+        with it (see run); with thinking it is written after the thinking, as part of the reply."""
+        return self.tok.encode(force, parse_special=True) if force and kwargs.get("enable_thinking", True) is False \
+            else []
+
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
@@ -4272,8 +4278,7 @@ class Service:
                         part["source"] = str(image)
         fetched = self._note_unreadable_tool_images(messages, cancel)
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
-        if force and kwargs.get("enable_thinking", True) is False:
-            ids = ids + self.tok.encode(force, parse_special=True)
+        ids = ids + self.forced_ids(force, kwargs)
         self.embeddings.path = None
         self.embeddings.keys = None
         images = images_of(messages)
@@ -7574,11 +7579,13 @@ def make_handler(svc: Service):
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the request itself: no tools offered
                 tools = None
+            force = forced_call(req.get("tool_choice"), tools, getattr(svc.template, "call_form", "qwen"))
             messages, _ = anthropic_prepare_format(req, messages, tools)   # its instruction is part of the prompt
             messages = svc.expand_files(messages)            # a document's text and pages, as the request reads it
             stop_strings(req)                                 # the same 400 as the request itself would get
             check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
-            self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw, store=False))})
+            ids = svc.encode_prompt(messages, tools, kw, store=False) + svc.forced_ids(force, kw)   # as prepare()
+            self._json(200, {"input_tokens": len(ids)})
 
         def _anthropic(self, req):
             asked = req.get("max_tokens")                     # Anthropic's required field (the shared settings' own

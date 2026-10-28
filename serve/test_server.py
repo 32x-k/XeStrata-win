@@ -114,6 +114,17 @@ class MaxTokens(unittest.TestCase):
         self.assertEqual(s2, 200)
         self.assertEqual(b["input_tokens"], n_in)
 
+    def test_count_tokens_with_a_forced_tool(self):
+        # a tool_choice that names a tool: the prompt ends with the call's opening, which the count includes too
+        tool = {"tool_choice": {"type": "tool", "name": "a"},
+                "tools": [{"name": "a", "input_schema": {"type": "object", "properties": {}}}]}
+        msgs = [{"role": "user", "content": "call it"}]
+        s, b = self.post("/v1/messages/count_tokens", {"model": "m", "messages": msgs, **tool})
+        self.assertEqual(s, 200)
+        s2, _, n_in, _ = self.call("anthropic", "call it", max_tokens=8, **tool)
+        self.assertEqual(s2, 200)
+        self.assertEqual(b["input_tokens"], n_in)
+
     def test_request_line_parses_the_engine_summary(self):
         line = ("strata serve: prompt 1200 tokens = 1000 reused + 200 read in 50 ms (4000.0 tok/s), 30 generated in "
                 "300 ms (100.0 tok/s), drafts accepted 20 of 28, 2 checkpoints")
