@@ -1968,6 +1968,14 @@ bool FileExpertSource::pin_complement(
         std::string why;
         lock = detail::resident_pin_fits(bytes, in_place, headroom_bytes, physical, why);
         std::fprintf(stderr, "FileExpertSource: %s\n", why.c_str());
+        std::string room_why;
+        const uint64_t room = lock ? pin_room(-1, room_why) : UINT64_MAX;
+        if (bytes > room) {   // Windows: past the GPU's shared-memory budget the driver refuses or pages (#36)
+            lock = false;
+            std::fprintf(stderr, "FileExpertSource: the RAM copy stays pageable after all: %.2f GiB does not fit in "
+                                 "%.2f GiB (%s)\n", (double) bytes / 1073741824.0, (double) room / 1073741824.0,
+                         room_why.c_str());
+        }
     }
 
     void* arena = nullptr;

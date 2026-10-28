@@ -4,9 +4,11 @@
 #include "strata/core/pinned.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/device.hpp"
+#include "strata/platform/memory.hpp"
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstddef>
@@ -53,8 +55,29 @@ constexpr uint64_t kHugePage = 2ull << 20;
 // piece may end at (a layer's start, so no expert crosses two registrations), or empty: every `limit`.
 namespace {
 std::vector<int> g_copy_devices;
-void register_pieces(uint8_t* base, uint64_t bytes, const std::vector<uint64_t>& cuts, std::vector<void*>& reg,
-                     std::vector<std::pair<void*, size_t>>& pieces) {
+std::atomic<uint64_t> g_registered{0};   // what the arenas hold registered on their first GPU (pin_room's fallback)
+
+// The arena's registration on its first GPU: at most what pin_room leaves there (Windows), or STRATA_ARENA_PIN_GIB
+// GiB (0: no cap).  The bytes, all of them where nothing caps it (Linux); `why` names the cap when there is one.
+uint64_t arena_pin_cap(uint64_t bytes, std::string& why) {
+    why.clear();
+#if defined(_WIN32)
+    if (const char* e = std::getenv("STRATA_ARENA_PIN_GIB"); e != nullptr && *e != '\0') {
+        const uint64_t gib = std::strtoull(e, nullptr, 10);
+        if (gib == 0) return bytes;
+        why = "STRATA_ARENA_PIN_GIB=" + std::to_string(gib);
+        return std::min(bytes, gib << 30);
+    }
+    return std::min(bytes, pin_room(-1, why));
+#else
+    return bytes;
+#endif
+}
+
+// Registers [base, base + bytes) for the current device's copies in pieces, those that end within `cap` bytes of
+// `base`; returns where the registered prefix ends (bytes when nothing capped it).
+uint64_t register_pieces(uint8_t* base, uint64_t bytes, const std::vector<uint64_t>& cuts, std::vector<void*>& reg,
+                         std::vector<std::pair<void*, size_t>>& pieces, uint64_t cap) {
     uint64_t limit = max_alloc_bytes();
     for (int d : g_copy_devices) {
         const uint64_t m = Runtime::at(d).device().get_info<sycl::info::device::max_mem_alloc_size>();
@@ -76,12 +99,27 @@ void register_pieces(uint8_t* base, uint64_t bytes, const std::vector<uint64_t>&
     }
     uint64_t start = 0;
     for (uint64_t end : ends) {
+        if (end > cap) break;
         sycl::ext::oneapi::experimental::prepare_for_device_copy(base + start, (size_t) (end - start),
                                                                  Runtime::get().context());
         reg.push_back(base + start);
         pieces.emplace_back(base + start, (size_t) (end - start));
+        g_registered += end - start;
         start = end;
     }
+    return start;
+}
+
+uint64_t piece_bytes(const std::vector<std::pair<void*, size_t>>& pieces) {
+    uint64_t n = 0;
+    for (const auto& p : pieces) n += p.second;
+    return n;
+}
+
+std::string gib_text(uint64_t b) {
+    char t[32];
+    std::snprintf(t, sizeof t, "%.1f GiB", (double) b / 1073741824.0);
+    return t;
 }
 
 // Upstream #771: with transparent huge pages "always" the kernel backs a mapping with huge pages where it can; an
@@ -151,6 +189,37 @@ std::string thp_request_skipped(uint64_t bytes) {
 
 void arena_copy_devices(const std::vector<int>& devices) { g_copy_devices = devices; }
 
+uint64_t pin_room(int device, std::string& why) {
+#if defined(_WIN32)
+    constexpr uint64_t kMargin = 4ull << 30;   // upstream #243's margin below the budget
+    std::string pci, dx_why = "the GPU reports no PCI address";
+    try {
+        const sycl::device d = (device < 0 ? Runtime::get() : Runtime::at(device)).device();
+        if (d.has(sycl::aspect::ext_intel_pci_address)) {
+            pci = d.get_info<sycl::ext::intel::info::device::pci_address>();
+            for (auto& c : pci) c = (char) std::tolower((unsigned char) c);
+        }
+    } catch (const std::exception& e) {
+        dx_why = e.what();
+    }
+    uint64_t budget = 0, usage = 0;
+    if (!pci.empty() && platform::gpu_nonlocal_memory_budget(pci, budget, usage, dx_why)) {
+        why = "Windows: the GPU's shared-memory budget " + gib_text(budget) + ", " + gib_text(usage) +
+              " of it in use, less 4 GiB";
+        return budget > usage + kMargin ? budget - usage - kMargin : 0;
+    }
+    // upstream's fallback where DXGI does not say: half the RAM less 8 GiB, less what the arenas hold already
+    const uint64_t ram = platform::total_physical_memory(), half = ram / 2 > (8ull << 30) ? ram / 2 - (8ull << 30) : 0;
+    const uint64_t held = g_registered.load();
+    why = "Windows: half the RAM less 8 GiB (" + dx_why + ")";
+    return half > held ? half - held : 0;
+#else
+    (void) device;
+    why.clear();
+    return UINT64_MAX;
+#endif
+}
+
 PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, slice, std::vector<uint64_t>{}) {}
 
 PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice, const std::vector<uint64_t>& cuts) : capacity(bytes) {
@@ -180,8 +249,9 @@ PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice, const std::vector<uint6
     const bool huge = thp_skip.empty() && madvise(base, (size_t) bytes, MADV_HUGEPAGE) == 0;
 #endif
     // Registered before the loader touches a page: the B70 run showed later writes reach the device intact.
+    std::string capped;
     try {
-        register_pieces((uint8_t*) base, bytes, cuts, reg_, pieces_);
+        registered_bytes = register_pieces((uint8_t*) base, bytes, cuts, reg_, pieces_, arena_pin_cap(bytes, capped));
     } catch (const std::exception& e) {
         for (void* r : reg_) sycl::ext::oneapi::experimental::release_from_device_copy(r, Runtime::get().context());
         reg_.clear();
@@ -190,11 +260,13 @@ PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice, const std::vector<uint6
         throw DeviceError(std::string("registering the expert arena for device copies failed: ") + e.what());
     }
     backing = huge ? PageBacking::LargePages : PageBacking::NormalPages;
-    registered_bytes = bytes;
     registered_slices = 1;
     slice_starts = {0};
     note = std::string("one mapping registered for device copies") +
            (reg_.size() > 1 ? " in " + std::to_string(reg_.size()) + " pieces (the GPU's largest allocation)" : "") +
+           (registered_bytes < bytes ? ", its first " + gib_text(registered_bytes) + " of " + gib_text(bytes) +
+                                           " (" + capped + "; the rest is copied unregistered, slower)"
+                                     : "") +
            "; " +
 #if defined(_WIN32)
            "4 KB pages; no VirtualLock";
@@ -376,10 +448,15 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, ui
         }
         const bool huge = thp_request_skipped(bytes).empty() && madvise(base, (size_t) bytes, MADV_HUGEPAGE) == 0;
 #endif
-        register_pieces((uint8_t*) base, bytes, cuts.empty() ? bounds : cuts, reg_, pieces_);
-        registered_bytes = bytes; registered_slices = 1; slice_starts = {0};
+        std::string capped;
+        registered_bytes = register_pieces((uint8_t*) base, bytes, cuts.empty() ? bounds : cuts, reg_, pieces_,
+                                           arena_pin_cap(bytes, capped));
+        registered_slices = 1; slice_starts = {0};
         backing = huge ? PageBacking::LargePages : PageBacking::NormalPages;
-        note = "shared file mapping registered in device-sized slices; no mlock";
+        note = "shared file mapping registered in device-sized slices" +
+               (registered_bytes < bytes ? ", its first " + gib_text(registered_bytes) + " of " + gib_text(bytes) +
+                                               " (" + capped + ")"
+                                         : std::string()) + "; no mlock";
         unlock(shared_fd_); shared_locked_ = false;
     } catch (...) {
         for (void* r : reg_) sycl::ext::oneapi::experimental::release_from_device_copy(r, Runtime::get().context());
@@ -427,6 +504,19 @@ bool PinnedArena::to_host_usm(uint64_t pad, std::string& err, const std::functio
     }
     auto& runtime = Runtime::get();
     namespace sx = sycl::ext::oneapi::experimental;
+    {
+        // Windows: host USM is charged to the GPU's shared-memory budget as the registration is; the whole arena
+        // moves or none of it (the PCIe share reads any expert)
+        const uint64_t want = bounds_.back() - bounds_.front() + pad * (bounds_.size() - 1);
+        std::string why;
+        const uint64_t room = pin_room(-1, why);
+        const uint64_t held = piece_bytes(pieces_);
+        if (room != UINT64_MAX && want > room + held) {
+            err = "host USM for the whole arena (" + gib_text(want) + ") does not fit: " + gib_text(room + held) +
+                  " (" + why + ")";
+            return false;
+        }
+    }
     try {   // no copy may read the mapping while it moves, and its registrations go
         runtime.finish();
         for (auto& o : other_reg_) {
@@ -437,6 +527,7 @@ bool PinnedArena::to_host_usm(uint64_t pad, std::string& err, const std::functio
         other_reg_.clear();
         for (void* r : reg_) sx::release_from_device_copy(r, runtime.context());
         reg_.clear();
+        g_registered -= std::min(g_registered.load(), piece_bytes(pieces_));
     } catch (const std::exception& e) {
         err = std::string("releasing the arena's registrations: ") + e.what();
         return false;
@@ -464,6 +555,7 @@ bool PinnedArena::to_host_usm(uint64_t pad, std::string& err, const std::functio
                 for (const auto& pc : pieces_) {
                     sx::prepare_for_device_copy(pc.first, pc.second, runtime.context());
                     reg_.push_back(pc.first);
+                    g_registered += pc.second;
                 }
             } catch (const std::exception& e) {
                 err = std::string("host USM refused at layer ") + std::to_string(l) + ", and the mapping's registration " +
@@ -498,6 +590,7 @@ bool PinnedArena::to_host_usm(uint64_t pad, std::string& err, const std::functio
     }
     base = layer_base[0];
     backing = PageBacking::NormalPages;
+    registered_bytes = capacity;   // all of it, also where the registration was a prefix (arena_pin_cap)
     slice_bytes = 1;
     registered_slices = (int) layers;
     note = "host USM, one block per layer (" + std::to_string(layers) +
@@ -515,6 +608,16 @@ uint8_t* PinnedArena::at(uint64_t off) const {
 bool PinnedArena::register_on(int device, std::string& err) {
     for (const auto& o : other_reg_)
         if (o.first == device) return true;
+    {
+        // Windows: that GPU's shared-memory budget is its own; past it the registration is left out (copies are
+        // correct without it, only slower), as when the driver refuses it
+        std::string why;
+        const uint64_t room = pin_room(device, why), want = piece_bytes(pieces_);
+        if (room != UINT64_MAX && want > room) {
+            err = "the registration (" + gib_text(want) + ") does not fit in " + gib_text(room) + " (" + why + ")";
+            return false;
+        }
+    }
     std::vector<void*> regs;
     try {
         const sycl::context ctx = Runtime::at(device).context();
@@ -594,6 +697,7 @@ PinnedArena::~PinnedArena() {
     try {
         runtime.finish();   // no copy may still read the mapping
         for (void* r : reg_) sycl::ext::oneapi::experimental::release_from_device_copy(r, runtime.context());
+        if (!reg_.empty()) g_registered -= std::min(g_registered.load(), piece_bytes(pieces_));
     } catch (const std::exception& e) {
         // as above: the driver can refuse the release in the state that refused the allocations - report it and
         // let the exit finish, the process's end reclaims the mapping

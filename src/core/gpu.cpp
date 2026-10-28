@@ -230,9 +230,7 @@ void pin_reserve_take() {
         mib = std::strtoull(e, nullptr, 10);
     } else {
 #if defined(_WIN32)
-        try {
-            if (rt().device().get_backend() == sycl::backend::ext_oneapi_cuda) mib = 640;
-        } catch (const std::exception&) { mib = 0; }
+        mib = 640;   // WDDM caps what a process pins for any GPU, Level Zero's and HIP's as CUDA's (#36)
 #endif
     }
     if (mib == 0) return;

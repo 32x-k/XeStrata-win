@@ -38,6 +38,10 @@ bool gpu_shared_memory_budget(const void* luid, uint64_t& budget, uint64_t& usag
 /// not possible - always elsewhere than Windows.
 bool gpu_local_memory_budget(const std::string& pci, uint64_t& budget, uint64_t& usage, std::string& why);
 
+/// Windows: the same for the GPU's shared (non-local) segment, where WDDM charges the host memory a process pins for
+/// that GPU (registered for its copies, or host USM): about half the RAM.  False (and `why`) as above.
+bool gpu_nonlocal_memory_budget(const std::string& pci, uint64_t& budget, uint64_t& usage, std::string& why);
+
 /// The machine's physical RAM in bytes (0 when unknown).
 uint64_t total_physical_memory();
 

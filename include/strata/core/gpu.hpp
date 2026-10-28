@@ -62,7 +62,7 @@ void* alloc_host(size_t bytes);
 /// Pinned memory as a budget (upstream 4f74de9cd): Windows (WDDM) lets a process page-lock about half the RAM, and the
 /// expert arena, pinned until the driver refuses, left nothing for the few MiB of pinned buffers allocated after it
 /// ("mapped staging allocation failed").  pin_reserve_take holds two reserves before the arena pins (by default on
-/// Windows with a CUDA GPU: 640 MiB and a quarter of it, at least 64 MiB; STRATA_PIN_RESERVE_MIB=N sets the first on
+/// Windows, any GPU: 640 MiB and a quarter of it, at least 64 MiB; STRATA_PIN_RESERVE_MIB=N sets the first on
 /// any system, 0 none), a reserve that cannot be had being halved or skipped; the soft one goes back once the arena is
 /// placed, the hard one at the first refused alloc_host or once the engine is up (pin_reserve_release).
 void pin_reserve_take();

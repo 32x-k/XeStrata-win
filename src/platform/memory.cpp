@@ -119,8 +119,9 @@ bool gpu_shared_memory_budget(const void* luid, uint64_t& budget, uint64_t& usag
     return ok;
 }
 
-bool gpu_local_memory_budget(const std::string& pci, uint64_t& budget, uint64_t& usage, std::string& why) {
-    budget = usage = 0;
+namespace {
+// The DXGI adapter at the PCI address `pci`, or null (and `why`).  Kept for the process's life.
+IDXGIAdapter3* adapter_at(const std::string& pci, std::string& why) {
     // the adapters found once, by their PCI addresses; dxgi.dll and gdi32.dll are loaded when first asked, not linked
     static std::mutex mu;
     static std::map<std::string, IDXGIAdapter3*> found;
@@ -174,15 +175,33 @@ bool gpu_local_memory_budget(const std::string& pci, uint64_t& budget, uint64_t&
         }
     }
     const auto it = found.find(pci);
-    if (it == found.end()) { why = list_why; return false; }
+    if (it == found.end()) { why = list_why; return nullptr; }
+    return it->second;
+}
+
+bool segment_budget(const std::string& pci, DXGI_MEMORY_SEGMENT_GROUP group, uint64_t& budget, uint64_t& usage,
+                    std::string& why) {
+    budget = usage = 0;
+    IDXGIAdapter3* a = adapter_at(pci, why);
+    if (a == nullptr) return false;
     DXGI_QUERY_VIDEO_MEMORY_INFO info{};
-    if (FAILED(it->second->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info)) || info.Budget == 0) {
-        why = "QueryVideoMemoryInfo gave no local budget";
+    if (FAILED(a->QueryVideoMemoryInfo(0, group, &info)) || info.Budget == 0) {
+        why = group == DXGI_MEMORY_SEGMENT_GROUP_LOCAL ? "QueryVideoMemoryInfo gave no local budget"
+                                                       : "QueryVideoMemoryInfo gave no non-local budget";
         return false;
     }
     budget = info.Budget;
     usage = info.CurrentUsage;
     return true;
+}
+}  // namespace
+
+bool gpu_local_memory_budget(const std::string& pci, uint64_t& budget, uint64_t& usage, std::string& why) {
+    return segment_budget(pci, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, budget, usage, why);
+}
+
+bool gpu_nonlocal_memory_budget(const std::string& pci, uint64_t& budget, uint64_t& usage, std::string& why) {
+    return segment_budget(pci, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, budget, usage, why);
 }
 
 uint64_t total_physical_memory() {
@@ -220,6 +239,12 @@ bool gpu_shared_memory_budget(const void*, uint64_t& budget, uint64_t& usage, st
 }
 
 bool gpu_local_memory_budget(const std::string&, uint64_t& budget, uint64_t& usage, std::string& why) {
+    budget = usage = 0;
+    why = "DXGI is Windows-only";
+    return false;
+}
+
+bool gpu_nonlocal_memory_budget(const std::string&, uint64_t& budget, uint64_t& usage, std::string& why) {
     budget = usage = 0;
     why = "DXGI is Windows-only";
     return false;
