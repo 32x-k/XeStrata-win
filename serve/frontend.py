@@ -18,9 +18,11 @@ and the formats change often; the engine boundary is token ids in, text deltas o
 """
 from __future__ import annotations
 
+import base64
 import datetime
 import json
 import logging
+import mimetypes
 import os
 import re
 import threading
@@ -224,8 +226,34 @@ def budget_effort(tokens) -> dict:
     return {"reasoning_effort": "low" if n < 2048 else "medium" if n < 8192 else "xhigh"}
 
 
+# A file a request sends (Chat's "file", Responses' "input_file", an Anthropic PDF document as converted by
+# _anthropic_documents): a "file" item of the template's content until Service.expand_files reads it into text and
+# page images
+FILE_PARTS = ("file", "input_file")
+
+
 def _has_image(content) -> bool:
-    return isinstance(content, list) and any(isinstance(p, dict) and p.get("type") in IMAGE_PARTS for p in content)
+    """Content that must stay a list of parts: a picture in it (or a file, which becomes text and pictures)."""
+    return isinstance(content, list) and any(isinstance(p, dict) and p.get("type") in IMAGE_PARTS + FILE_PARTS
+                                             for p in content)
+
+
+def file_item(part: dict, path: str) -> dict:
+    """A file part -> {"type": "file", "data": a data: URL or None, "url": an http(s) URL or None, "name", "mime"}.
+    A file_id (OpenAI's and Anthropic's Files APIs) is a ValueError: this server keeps no files."""
+    inner = part.get("file")
+    src: dict = inner if part.get("type") == "file" and isinstance(inner, dict) else part
+    if src.get("file_id"):
+        raise ValueError(f"{path}: a file_id needs a Files API, which this server does not have: send the file "
+                         "itself (file_data)")
+    data, url, name = src.get("file_data"), src.get("file_url"), str(src.get("filename") or "")
+    if not (isinstance(data, str) and data) and not (isinstance(url, str) and url):
+        raise ValueError(f"{path}: a file needs file_data (a data: URL or base64) or file_url")
+    if isinstance(data, str) and data and not data.startswith("data:"):
+        guess = mimetypes.guess_type(name)[0] or "application/octet-stream"   # bare base64: the name's type
+        data = f"data:{guess};base64,{data}"
+    mime = data[5:data.find(";")] if isinstance(data, str) and data and ";" in data else None
+    return {"type": "file", "data": data or None, "url": None if data else url, "name": name, "mime": mime}
 
 
 def _image_source(part: dict) -> str:
@@ -253,8 +281,14 @@ def _parts_of(content):
     for part in content:
         if not isinstance(part, dict):
             continue
-        if part.get("type") in IMAGE_PARTS:
-            items.append({"type": "image", "source": _image_source(part)})
+        if part.get("type") in FILE_PARTS:
+            items.append(file_item(part, "content"))
+        elif part.get("type") in IMAGE_PARTS:
+            item = {"type": "image", "source": _image_source(part)}
+            url = part.get("image_url")
+            if (url.get("detail") if isinstance(url, dict) else part.get("detail")) == "low":
+                item["detail"] = "low"               # OpenAI's low detail: read at a smaller size (Service.prepare)
+            items.append(item)
         elif part.get("type") in TEXT_PARTS and "text" in part:
             items.append({"type": "text", "text": part.get("text", "")})
     return items
@@ -264,7 +298,7 @@ def _parts_of(content):
 # redacted_thinking is allowed only to be dropped without an error: another server's encrypted reasoning, which
 # carries nothing this server can read - the same reason responses.py's _reasoning_text gives for another server's
 # encrypted_content.
-ANTHROPIC_BLOCKS = ("text",) + IMAGE_PARTS + ("thinking", "tool_use", "tool_result", "redacted_thinking")
+ANTHROPIC_BLOCKS = ("text",) + IMAGE_PARTS + FILE_PARTS + ("thinking", "tool_use", "tool_result", "redacted_thinking")
 
 
 def _check_parts(content, path: str, kinds):
@@ -493,29 +527,6 @@ def _late_system_to_user(messages: list[dict]) -> list[dict]:
     return [dict(m, role="user") if m.get("role") == "system" and i > 0 else m for i, m in enumerate(messages)]
 
 
-def _order_tool_results(messages):
-    """The template places tool results by position: each run of tool messages is put in the order of the calls of
-    the assistant turn before it (a client may send the results in the order they finished), then the private call
-    ids are dropped."""
-    i = 0
-    while i < len(messages):
-        if messages[i]["role"] != "tool":
-            i += 1
-            continue
-        j = i
-        while j < len(messages) and messages[j]["role"] == "tool":
-            j += 1
-        prev = messages[i - 1] if i else {}
-        order = [c.get("_call_id") for c in prev.get("tool_calls") or []]
-        rank = {cid: k for k, cid in enumerate(order) if cid}
-        messages[i:j] = sorted(messages[i:j], key=lambda m: rank.get(m.get("_call_id"), len(order)))
-        i = j
-    for m in messages:
-        m.pop("_call_id", None)
-        for c in m.get("tool_calls") or []:
-            c.pop("_call_id", None)
-
-
 def _object_list(value, name: str) -> list[dict]:
     """#460: a request's "messages" (or a message's "tool_calls") as a list of objects.  Some clients send the array
     double-encoded, as a JSON string, which used to be iterated character by character and crashed on m.get: such a
@@ -645,6 +656,31 @@ def _order_chat_tool_results(messages: list[dict]) -> None:
             call.pop("_call_id", None)
 
 
+def custom_tool_names(req: dict) -> set[str]:
+    """The names of a Chat Completions request's custom tools ({"type": "custom", "custom": {"name": ...}}): their
+    calls are answered as {"type": "custom", "custom": {"name", "input"}}."""
+    tools = req.get("tools")
+    return {t["custom"]["name"] for t in tools if isinstance(t, dict) and t.get("type") == "custom"
+            and isinstance(t.get("custom"), dict) and isinstance(t["custom"].get("name"), str)} \
+        if isinstance(tools, list) else set()
+
+
+def _chat_tool(t):
+    """A Chat Completions tool -> the template's.  A custom tool takes free text, maybe in a grammar the model reads
+    (it is not enforced: the text is checked by nothing), as /v1/responses' custom tools."""
+    if not isinstance(t, dict) or t.get("type") != "custom" or not isinstance(t.get("custom"), dict):
+        return t.get("function", t) if isinstance(t, dict) and t.get("type") == "function" else t
+    c = t["custom"]
+    description = c.get("description") or ""
+    fmt = c.get("format") if isinstance(c.get("format"), dict) else {}
+    grammar = fmt.get("grammar") if isinstance(fmt.get("grammar"), dict) else fmt
+    if fmt.get("type") == "grammar" and grammar.get("definition"):
+        description += f"\n\nThe input must follow this {grammar.get('syntax', '')} grammar:\n{grammar['definition']}"
+    return {"name": c.get("name"), "description": description,
+            "parameters": {"type": "object", "required": ["input"],
+                           "properties": {"input": {"type": "string", "description": "the raw input"}}}}
+
+
 def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     """OpenAI Chat Completions -> (template messages, template tools, template kwargs)."""
     messages = []
@@ -652,18 +688,44 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
         role = m.get("role")
         if role == "developer":
             role = "system"
-        # an image is read in a user, tool or assistant message; the system prompt takes text only, as _text_of reads
+        if role == "function":                       # the old shape of a tool's result: the call it answers by name
+            role = "tool"
+        raw_content = m.get("content")
+        for j, part in enumerate(raw_content if isinstance(raw_content, list) else []):
+            if isinstance(part, dict) and part.get("type") == "input_audio":
+                raise ValueError(f"messages[{i}].content[{j}]: input_audio is not supported: this model does not "
+                                 "read audio")
+            if isinstance(part, dict) and part.get("type") == "file":
+                file_item(part, f"messages[{i}].content[{j}]")   # a file_id or no data is a 400 here
+        # an image (or a file) is read in a user, tool or assistant message; the system prompt takes text only, as
+        # _text_of reads
         images = role in ("user", "tool", "assistant")
         content = _check_parts(m.get("content"), f"messages[{i}].content",
-                               TEXT_PARTS + IMAGE_PARTS if images else TEXT_PARTS)
+                               TEXT_PARTS + IMAGE_PARTS + FILE_PARTS if images else TEXT_PARTS)
+        if role == "assistant" and content in (None, "") and isinstance(m.get("refusal"), str):
+            content = m["refusal"]                   # a refusal the client sends back is what the model said
         out = {"role": role, "content": _parts_of(content) if images else _text_of(content)}
+        name = m.get("name")
+        if role in ("user", "system") and isinstance(name, str) and name:
+            # the speaker's name, which the template has no place for: written before what they said
+            said = out["content"]
+            out["content"] = f"{name}: {said}" if isinstance(said, str) else \
+                [{"type": "text", "text": f"{name}: "}] + list(said or [])
         if role == "tool":
             out["_call_id"] = m.get("tool_call_id")
         if m.get("reasoning_content"):
             out["reasoning_content"] = m["reasoning_content"]
-        if m.get("tool_calls"):
+        raw = m.get("tool_calls")
+        if not raw and isinstance(m.get("function_call"), dict):   # the old shape of one call
+            raw = [{"function": m["function_call"]}]
+        if raw:
             calls = []
-            for c in _object_list(m["tool_calls"], "tool_calls"):
+            for c in _object_list(raw, "tool_calls"):
+                if c.get("type") == "custom" and isinstance(c.get("custom"), dict):
+                    calls.append({"function": {"name": c["custom"].get("name"),
+                                               "arguments": {"input": str(c["custom"].get("input") or "")}},
+                                  "_call_id": c.get("id")})
+                    continue
                 fn = c.get("function", c)
                 if not isinstance(fn, dict):
                     raise ValueError("tool_calls must be a list of objects (each with a \"function\" object)")
@@ -672,8 +734,14 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
             out["tool_calls"] = calls
         messages.append(out)
     _order_chat_tool_results(messages)
-    tools = [t.get("function", t) if t.get("type") == "function" else t
-             for t in _tool_list(req.get("tools"), "function")] or None
+    given = req.get("tools")
+    plain = [t for t in given if not (isinstance(t, dict) and t.get("type") == "custom")] \
+        if isinstance(given, list) else given
+    listed = [_chat_tool(t) for t in _tool_list(plain, "function")]
+    if isinstance(given, list):                      # the custom tools, after the function tools
+        listed += [_chat_tool(t) for t in given if isinstance(t, dict) and t.get("type") == "custom"
+                   and isinstance(t.get("custom"), dict) and isinstance(t["custom"].get("name"), str)]
+    tools = listed or None
     kwargs = {}
     # OpenAI Chat Completions: "reasoning_effort"; Responses style: "reasoning": {"effort": ...}
     reasoning = req["reasoning"] if isinstance(req.get("reasoning"), dict) else {}
@@ -718,17 +786,85 @@ def pin_billing_stamp(system: str) -> str:
     return "".join(s)
 
 
+# Anthropic's thinking signature, and the data of a redacted_thinking block: the thinking's text in the form of
+# responses.py's encrypted_content (base64, not encrypted: the client already holds the text), so a block this
+# server wrote can be read back and checked against its text.  Another server's signature is opaque and ignored.
+THINKING_PREFIX = "strata.r1:"
+
+
+def thinking_signature(text: str) -> str:
+    return THINKING_PREFIX + base64.b64encode(json.dumps({"text": text}, ensure_ascii=False).encode()).decode("ascii")
+
+
+def _signed_thinking(signature, where: str) -> str | None:
+    """The text a signature of this server's carries; None for another server's (or none)."""
+    if not isinstance(signature, str) or not signature.startswith(THINKING_PREFIX):
+        return None
+    try:
+        return str(json.loads(base64.b64decode(signature[len(THINKING_PREFIX):], validate=True).decode())["text"])
+    except (ValueError, KeyError, TypeError, UnicodeError):
+        raise ValueError(f"{where}: the thinking's signature is damaged") from None
+
+
+def _anthropic_documents(content, path: str):
+    """Anthropic's text documents and search results -> text blocks the template reads: a document's text
+    (source "text", or "content" blocks) under its title and context, a search result's text under its title and
+    source.  A PDF document is left as it is (not read yet).  citations.enabled: true is a 400: no citations are
+    made."""
+    if not isinstance(content, list):
+        return content
+    out = []
+    for j, block in enumerate(content):
+        kind = block.get("type") if isinstance(block, dict) else None
+        if kind in ("document", "search_result"):
+            cite = block.get("citations")
+            if isinstance(cite, dict) and cite.get("enabled") is True:
+                raise ValueError(f"{path}[{j}].citations: citations are not supported by this server")
+        text = None
+        if kind == "document":
+            src = block.get("source") if isinstance(block.get("source"), dict) else {}
+            if src.get("type") == "text":
+                text = str(src.get("data") or "")
+            elif src.get("type") == "content":
+                inner = src.get("content")
+                text = inner if isinstance(inner, str) else "\n\n".join(
+                    b.get("text") or "" for b in inner or [] if isinstance(b, dict) and b.get("type") == "text")
+            if text is not None:
+                head = [x for x in (block.get("title"), block.get("context")) if isinstance(x, str) and x]
+                text = "\n".join(["Document: " + head[0]] + head[1:] + ["", text]) if head else text
+            elif src.get("type") in ("base64", "url", "file"):   # a PDF: read by Service.expand_files
+                name = str(block.get("title") or "")
+                part: dict = {"type": "input_file", "filename": name}
+                if src.get("type") == "base64":
+                    part["file_data"] = f"data:{src.get('media_type') or 'application/pdf'};base64,{src.get('data')}"
+                elif src.get("type") == "url":
+                    part["file_url"] = str(src.get("url") or "")
+                else:
+                    part["file_id"] = src.get("file_id") or "?"
+                file_item(part, f"{path}[{j}]")     # a file_id is a 400 here
+                out.append(part)
+                continue
+        elif kind == "search_result":
+            body = "\n\n".join(b.get("text") or "" for b in block.get("content") or []
+                               if isinstance(b, dict) and b.get("type") == "text")
+            text = f"Search result: {block.get('title') or ''} ({block.get('source') or ''})\n\n{body}"
+        out.append({"type": "text", "text": text} if text is not None else block)
+    return out
+
+
 def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[dict], list[dict] | None, dict]:
     """Anthropic Messages -> (template messages, template tools, template kwargs).  `think_unasked`: a request
-    without "thinking", an effort or a budget gets the template's default (it thinks), as through 0.1.31; False
-    renders it without thinking (#278, the config's "anthropic_thinking": "on_request")."""
+    without "thinking", an effort or a budget gets the template's default (it thinks), as through 0.1.31 (the
+    config's "anthropic_thinking": "model"); False renders it without thinking, Anthropic's rule (#278, the server's
+    default "on_request")."""
     messages = []
     system = req.get("system")
     if system:
         messages.append({"role": "system",
                          "content": pin_billing_stamp(_text_of(_check_parts(system, "system", TEXT_PARTS)))})
     for i, m in enumerate(_object_list(req.get("messages"), "messages")):
-        content = _check_parts(m.get("content"), f"messages[{i}].content", ANTHROPIC_BLOCKS)
+        content = _check_parts(_anthropic_documents(m.get("content"), f"messages[{i}].content"),
+                               f"messages[{i}].content", ANTHROPIC_BLOCKS)
         if isinstance(content, str):
             messages.append({"role": m["role"], "content": content})
             continue
@@ -742,20 +878,32 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
             if kind == "text":
                 text.append(block.get("text", ""))
                 parts.append(block)
-            elif kind in IMAGE_PARTS:
+            elif kind in IMAGE_PARTS + FILE_PARTS:
                 parts.append(block)
             elif kind == "thinking":
-                reasoning.append(block.get("thinking", ""))
+                said = block.get("thinking", "")
+                signed = _signed_thinking(block.get("signature"), f"messages[{i}].content[{j}]")
+                if signed is not None and signed != said:
+                    raise ValueError(f"messages[{i}].content[{j}]: the thinking does not match its signature")
+                reasoning.append(said)
+            elif kind == "redacted_thinking":     # one of this server's is read; another server's carries nothing
+                signed = _signed_thinking(block.get("data"), f"messages[{i}].content[{j}]")
+                if signed is not None:
+                    reasoning.append(signed)
             elif kind == "tool_use":
                 calls.append({"function": {"name": block.get("name"), "arguments": tool_arguments(block.get("input"))},
                               "_call_id": block.get("id")})
             elif kind == "tool_result":
                 # A tool's image (Claude Code's Read of a picture) reaches the encoder like a user's, as the OpenAI
                 # path's tool messages already do; a text-only result is one string, as before.  Its tool_use_id
-                # puts it beside its call (_order_tool_results): parallel results may come in any order.
-                messages.append({"role": "tool", "content": _parts_of(_check_parts(
-                    block.get("content"), f"messages[{i}].content[{j}].content", TEXT_PARTS + IMAGE_PARTS)),
-                    "_call_id": block.get("tool_use_id")})
+                # puts it beside its call (_order_chat_tool_results): parallel results may come in any order.
+                where = f"messages[{i}].content[{j}].content"
+                result = _parts_of(_check_parts(_anthropic_documents(block.get("content"), where), where,
+                                                TEXT_PARTS + IMAGE_PARTS + FILE_PARTS))
+                if block.get("is_error") is True:   # the tool failed: the model is told so, not only its text
+                    result = "Error: " + result if isinstance(result, str) else \
+                        [{"type": "text", "text": "Error: "}] + list(result or [])
+                messages.append({"role": "tool", "content": result, "_call_id": block.get("tool_use_id")})
         if text or calls or reasoning or parts:
             # an image sent beside tool results stays in this turn instead of being dropped
             out = {"role": m["role"], "content": _parts_of(parts) if _has_image(parts) else "".join(text)}
@@ -764,13 +912,18 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
             if calls:
                 out["tool_calls"] = calls
             messages.append(out)
-    _order_tool_results(messages)
+    _order_chat_tool_results(messages)
     tools = [{"name": t["name"], "description": t.get("description", ""), "parameters": t.get("input_schema", {})}
              for t in _tool_list(req.get("tools"), None)] or None
     kwargs = {}
     # Anthropic: "thinking": {"type": "disabled"} or {"type": "enabled", "budget_tokens": N};
     # "output_config": {"effort": "low" | "medium" | "high"}
     thinking = req.get("thinking")
+    if thinking is not None and (not isinstance(thinking, dict)
+                                 or thinking.get("type") not in ("enabled", "disabled", "adaptive")):
+        raise ValueError('thinking must be {"type": "enabled", "budget_tokens": N}, {"type": "adaptive"} or '
+                         '{"type": "disabled"}')
+    # "adaptive": the model decides how much to think (the template's default, an effort if output_config has one)
     effort = (req.get("output_config") or {}).get("effort") if isinstance(req.get("output_config"), dict) else None
     # 0.1.45: Anthropic's budget_tokens is a real budget, not only a level: the thinking is closed (wrap-up, </think>,
     # the answer) after that many tokens.  A reasoning_budget_tokens of the request's own wins.
@@ -784,9 +937,9 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     elif isinstance(thinking, dict) and thinking.get("budget_tokens"):
         kwargs.update(budget_effort(thinking["budget_tokens"]))
     elif thinking is None and not req.get("reasoning_budget_tokens") and not think_unasked:
-        # Opt-in (the config's "anthropic_thinking": "on_request"; the default thinks as 0.1.31 did, since a
-        # client that never asks would otherwise lose the thinking on every turn).  Anthropic's thinking is
-        # opt-in there. Claude Code's helper calls (a session title, a topic check) ask for none
+        # The server's default (the config's "anthropic_thinking": "on_request"; "model" thinks as 0.1.31 did, for
+        # a client that never asks).  Anthropic's thinking is opt-in. Claude Code's helper calls (a session title,
+        # a topic check) ask for none
         # and allow a few dozen tokens, which the model otherwise spent thinking and answered with no text at all.
         # A config's reasoning_effort still applies: Service.with_shared sets output_config before this runs.  A
         # request that gives its own reasoning_budget_tokens (#123) asks for thinking, so it thinks as before.
@@ -961,20 +1114,53 @@ def tool_choice_of(tool_choice) -> tuple[str, str | None]:
             return kind, None
         if kind in ("any", "required"):
             return "required", None
-        if kind in ("function", "tool"):
-            fn = tool_choice.get("function")
+        if kind in ("function", "tool", "custom"):
+            fn = tool_choice.get("function") or tool_choice.get("custom")
             name = (fn.get("name") if isinstance(fn, dict) else None) or tool_choice.get("name")
             if isinstance(name, str) and name:
                 return "named", name
     return "unknown", None
 
 
+def allowed_tools(tool_choice, tools: list[dict] | None, more: dict | None = None):
+    """OpenAI's {"type": "allowed_tools"} tool_choice (Chat: {"allowed_tools": {"mode", "tools"}}; Responses: "mode"
+    and "tools" beside the type) -> (the tools the model is offered: those it lists, the tool_choice to apply:
+    "auto" or "required").  Any other tool_choice comes back as it is, with all the tools.  `more`: a listed tool
+    type's template names (Responses' {"type": "image_generation"}: the image tools).  A list naming a tool the
+    request does not have, or an unknown mode, is a ValueError (a 400)."""
+    if not (isinstance(tool_choice, dict) and tool_choice.get("type") == "allowed_tools"):
+        return tools, tool_choice
+    spec = tool_choice["allowed_tools"] if isinstance(tool_choice.get("allowed_tools"), dict) else tool_choice
+    mode, listed = spec.get("mode", "auto"), spec.get("tools")
+    if mode not in ("auto", "required"):
+        raise ValueError('tool_choice.allowed_tools: mode must be "auto" or "required"')
+    if not isinstance(listed, list) or not listed:
+        raise ValueError("tool_choice.allowed_tools: tools must be a non-empty list of the request's tools")
+    names: set = set()
+    for t in listed:
+        if not isinstance(t, dict):
+            raise ValueError("tool_choice.allowed_tools: each tool is an object")
+        if t.get("type") in (more or {}):
+            names |= set((more or {})[t["type"]])
+            continue
+        fn = t.get("function") or t.get("custom") or t
+        name = fn.get("name") if isinstance(fn, dict) else None
+        if not isinstance(name, str) or not name:
+            raise ValueError("tool_choice.allowed_tools: each tool names a tool of the request")
+        names.add(f"{t['namespace']}.{name}" if t.get("namespace") else name)
+    have = {t.get("name") for t in tools or [] if isinstance(t, dict)}
+    unknown = sorted(names - have)
+    if unknown:
+        raise ValueError(f"tool_choice.allowed_tools names tools the request does not have: {', '.join(unknown)}")
+    return [t for t in tools or [] if t.get("name") in names], mode
+
+
 def forced_call(tool_choice, tools: list[dict] | None, form: str = "qwen") -> str | None:
     """`tool_choice` -> the text that opens the call the reply must make, or None (the model decides).
     There is no grammar here: the server writes this opening itself, so the model can only go on with a call.
-    "required" / Anthropic "any": any of the tools; a named function: that one.  A value it cannot honour (an
-    unknown shape, a name that is not one of the tools, "required" with no tools) is logged and acts as "auto",
-    not a 400: a client's odd choice must not stop its request.  "none" is handled by the caller (no tools)."""
+    "required" / Anthropic "any": any of the tools; a named function: that one.  "none" is handled by the caller
+    (no tools).  A value it cannot honour (an unknown shape, a name that is not one of the tools, "required" with no
+    tools) is a ValueError - a 400, as OpenAI and Anthropic answer it - not a request that runs as "auto"."""
     kind, name = tool_choice_of(tool_choice)
     names = {t.get("name") for t in tools or [] if isinstance(t, dict)}
     if kind in ("auto", "none"):
@@ -985,9 +1171,11 @@ def forced_call(tool_choice, tools: list[dict] | None, form: str = "qwen") -> st
         return CALL_START if form == "glm" else CALL_START + "\n<function="
     if kind == "named" and name in names:
         return CALL_START + str(name) if form == "glm" else CALL_START + f"\n<function={name}>\n"
-    print(f"[strata] tool_choice {json.dumps(tool_choice)[:200]} is not supported here (or names no tool of the "
-          "request): the model decides, as with \"auto\"", flush=True)
-    return None
+    if kind == "named":
+        raise ValueError(f"tool_choice names {name!r}, which is not one of the request's tools")
+    if kind == "required":
+        raise ValueError("tool_choice asks for a tool call, but the request has no tools")
+    raise ValueError(f"tool_choice {json.dumps(tool_choice)[:200]} is not a tool_choice this server takes")
 
 
 PARAM_START = "<parameter="

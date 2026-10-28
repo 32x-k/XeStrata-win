@@ -130,16 +130,19 @@ class MaxTokens(unittest.TestCase):
                          ("98179", "0", "17565", "699.6", "0"))
 
     def test_unset_budget_is_the_rest_of_the_context(self):
-        cases = {"openai": [{"max_tokens": -1}, {"max_tokens": 0}, {}, {"max_tokens": None},
-                            {"max_completion_tokens": -1}, {"max_completion_tokens": None, "max_tokens": None}],
-                 "anthropic": [{"max_tokens": -1}, {"max_tokens": 0}, {}, {"max_tokens": None}]}
-        for api, budgets in cases.items():
-            for budget in budgets:
-                with self.subTest(api=api, budget=budget):
-                    s, b, pt, ct = self.call(api, **budget)
-                    self.assertEqual(s, 200, b)
-                    self.assertEqual(self.engine.last_max_new, CTX - CTX_SLACK - pt)
-                    self.assertGreater(ct, 1024)          # the whole answer, not cut at the old 1024 fallback
+        for budget in ({"max_tokens": -1}, {"max_tokens": 0}, {}, {"max_tokens": None},
+                       {"max_completion_tokens": -1}, {"max_completion_tokens": None, "max_tokens": None}):
+            with self.subTest(api="openai", budget=budget):
+                s, b, pt, ct = self.call("openai", **budget)
+                self.assertEqual(s, 200, b)
+                self.assertEqual(self.engine.last_max_new, CTX - CTX_SLACK - pt)
+                self.assertGreater(ct, 1024)          # the whole answer, not cut at the old 1024 fallback
+        # Anthropic's max_tokens is required, a whole number of 1 or more: anything else is its 400
+        for budget in ({"max_tokens": -1}, {"max_tokens": 0}, {}, {"max_tokens": None}):
+            with self.subTest(api="anthropic", budget=budget):
+                s, b, _, _ = self.call("anthropic", **budget)
+                self.assertEqual(s, 400, b)
+                self.assertIn("max_tokens", b["error"]["message"])
 
     def test_explicit_budget_is_honoured(self):
         for api, budget in [("openai", {"max_tokens": 50}), ("openai", {"max_completion_tokens": 50}),
@@ -235,7 +238,7 @@ class MaxTokens(unittest.TestCase):
     def test_unset_budget_with_a_near_full_prompt(self):
         _, _, pt0, _ = self.call("openai", max_tokens=1)
         overhead = pt0 - len("hi")                  # the template's tokens around the user text
-        for api in ("openai", "anthropic"):
+        for api in ("openai",):                     # (Anthropic's max_tokens is required: no unset budget there)
             _, _, pa, _ = self.call(api, max_tokens=1)
             over = pa - pt0                          # the Anthropic template may differ slightly
             with self.subTest(api=api, room=5):     # a few tokens left: the budget is exactly those
@@ -255,7 +258,7 @@ class MaxTokens(unittest.TestCase):
         import io
         os.environ["STRATA_DEBUG"] = "1"
         try:
-            for api in ("openai", "anthropic"):
+            for api in ("openai",):                 # (Anthropic's max_tokens is required: no unset budget there)
                 with self.subTest(api=api):
                     out = io.StringIO()
                     with contextlib.redirect_stdout(out):
@@ -367,7 +370,8 @@ class VisionTempFiles(unittest.TestCase):
             try:
                 paths = ("/v1/chat/completions", "/v1/messages")
                 for path in paths:
-                    self.assertEqual(post(path), 503)                # the engine is starting (#344); clients retry
+                    # the engine is starting (#344); clients retry (Anthropic's: its 529 overloaded_error)
+                    self.assertEqual(post(path), 529 if path == "/v1/messages" else 503)
                 engine.max_context = 48
                 for path in paths:
                     self.assertEqual(post(path), 400)                # no room to answer
@@ -1866,7 +1870,8 @@ class IncrementalPrompts(unittest.TestCase):
             other = self.conversation(n)
             status, b = self.post("/v1/messages/count_tokens", {"model": "m", "messages": other})
             self.assertEqual(status, 200, b)
-            self.assertEqual(b["input_tokens"], len(full.encode_prompt(other, None, {})))
+            # (an Anthropic request that asks for no thinking is read without it)
+            self.assertEqual(b["input_tokens"], len(full.encode_prompt(other, None, {"enable_thinking": False})))
         self.assertTrue(svc.prompts.entries == before, "the count wrote into the kept prompts")
         main.append({"role": "assistant", "content": "ok"})
         main.append({"role": "user", "content": "and then?"})
@@ -3289,7 +3294,8 @@ class WebApp(unittest.TestCase):
             for path in ("/models", "/v1/models"):
                 code, _, body = self.get(path)
                 self.assertEqual(code, 200)
-                self.assertEqual(json.loads(body)["data"], [])
+                # listed (OpenAI's clients look the model up before a request), but not as loaded
+                self.assertEqual([m["status"]["value"] for m in json.loads(body)["data"]], ["loading"])
             self.assertEqual(self.get("/props")[0], 503)
             self.assertEqual(json.loads(self.get("/slots")[2]), [])
         finally:
@@ -3924,6 +3930,7 @@ class ThinkingBudget(unittest.TestCase):
         from serve.server import REASONING_WRAP_UP
         self.svc.reasoning_budget_tokens = 20
         code, raw = self.post("/v1/messages", {"model": "m", "max_tokens": 3000, "stream": True,
+                                               "thinking": {"type": "adaptive"},   # it thinks only when asked
                                                "messages": [{"role": "user", "content": "2+2?"}]})
         self.assertEqual(code, 200)
         evs = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")]
@@ -4211,17 +4218,18 @@ class ForcedToolChoice(unittest.TestCase):
         finish, calls, _ = self.call_of(code, b, False)
         self.assertEqual((finish, calls), ("length", []))
 
-    def test_values_it_cannot_honour_act_as_auto(self):
-        """Not a 400: an odd tool_choice is logged and the model decides."""
+    def test_values_it_cannot_honour_are_a_400(self):
+        """An odd tool_choice (an unknown shape, a name that is not a tool, "required" with no tools) is a 400 before
+        the model runs, as OpenAI and Anthropic answer it."""
         named = lambda n: {"type": "function", "function": {"name": n}}  # noqa: E731
         for choice, tools in ((named("nope"), self.TOOLS), ({"type": "function"}, self.TOOLS),
                               ("required", None), ({"type": "banana"}, self.TOOLS), ("sometimes", self.TOOLS)):
             with self.subTest(choice=choice, tools=bool(tools)):
                 self.engine.prompts = []
                 code, b = self.openai(tool_choice=choice, tools=tools)
-                self.assertEqual(code, 200, b)
-                self.assertEqual(b["choices"][0]["message"]["content"], CallingEngine.ANSWER)
-                self.assertEqual(len(self.engine.prompts), 1)
+                self.assertEqual(code, 400, b)
+                self.assertIn("tool_choice", b["error"]["message"])
+                self.assertEqual(self.engine.prompts, [])
 
     def test_the_flat_shape_names_a_function(self):
         code, b = self.openai(tool_choice={"type": "function", "name": "search"})
@@ -4234,7 +4242,7 @@ class ForcedToolChoice(unittest.TestCase):
                 "type": "object", "properties": {}}}]
         for choice, want in (({"type": "any"}, "tool_use"), ({"type": "tool", "name": "search"}, "tool_use"),
                              ({"type": "auto"}, "end_turn"), ({"type": "none"}, "end_turn"),
-                             ({"type": "tool", "name": "nope"}, "end_turn")):
+                             ({"type": "tool", "name": "nope"}, 400)):
             for stream in (False, True):
                 with self.subTest(choice=choice, stream=stream):
                     self.engine.prompts = []
@@ -4242,6 +4250,14 @@ class ForcedToolChoice(unittest.TestCase):
                             "messages": [{"role": "user", "content": "2+2?"}]}
                     req = urllib.request.Request(self.base + "/v1/messages", data=json.dumps(body).encode(), headers={
                         "Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+                    if want == 400:                 # a name that is not one of the tools: Anthropic's 400
+                        with self.assertRaises(urllib.error.HTTPError) as cm:
+                            urllib.request.urlopen(req, timeout=30)
+                        with cm.exception as e:
+                            self.assertEqual((e.code, json.loads(e.read())["error"]["type"]),
+                                             (400, "invalid_request_error"))
+                        self.assertEqual(self.engine.prompts, [])
+                        continue
                     with urllib.request.urlopen(req, timeout=30) as r:
                         raw = r.read().decode()
                     if stream:
@@ -4413,7 +4429,7 @@ class RestartWindow(unittest.TestCase):
                 with self.assertRaises(urllib.error.HTTPError) as cm:
                     urllib.request.urlopen(req, timeout=30)
                 with cm.exception as e:
-                    self.assertEqual(e.code, 503, path)
+                    self.assertEqual(e.code, 529 if path == "/v1/messages" else 503, path)
                     text = e.read().decode()
                 self.assertIn("starting", text)
                 self.assertNotIn("leaves no room", text)
@@ -5009,7 +5025,8 @@ class StopStrings(unittest.TestCase):
         """-> (status, text, finish or stop_reason, stop_sequence, the streamed text pieces)"""
         path = "/v1/chat/completions" if api == "openai" else "/v1/messages"
         body = {"model": "x", "max_tokens": 200, "stream": stream, "messages": [{"role": "user", "content": "hi"}],
-                **extra}
+                # the mock ends a thinking: Anthropic's requests ask for it (they think only when asked)
+                **({"thinking": {"type": "adaptive"}} if api == "anthropic" else {}), **extra}
         req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(), headers={
             "Content-Type": "application/json", "anthropic-version": "2023-06-01"})
         try:

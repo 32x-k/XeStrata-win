@@ -37,6 +37,7 @@ import collections
 import base64
 import hashlib
 import hmac
+import io
 import codecs
 import json
 import math
@@ -59,15 +60,15 @@ from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterator, Protocol, cast
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.sh) as well as a module
 SETUP_CMD = "xestrata" if (ROOT / "PACKAGED").is_file() else "./setup.sh"   # a deb or rpm package's command (setup.py)
 from serve.frontend import (THINK_END, ChatTemplate, Event, GlmOutputParser, HarmonyParser,  # noqa: E402
-                            OutputParser, ToolCall, anthropic_format, anthropic_to_messages, forced_call, images_of,
-                            literal_tags,
+                            OutputParser, ToolCall, allowed_tools, anthropic_format, anthropic_to_messages,
+                            custom_tool_names, forced_call, images_of, literal_tags, thinking_signature,
                             mark_think_literals,
                             openai_to_messages, require_messages, tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, McpHub, hub_from_config  # noqa: E402
@@ -3369,7 +3370,7 @@ class Service:
         self.reasoning_loop_recovery = False
         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply
-        self.anthropic_think_unasked = True               # #278: "anthropic_thinking": "on_request" -> False
+        self.anthropic_think_unasked = False              # #278: "anthropic_thinking": "model" -> True
         self.tool_call_recovery = False                   # opt-in: tool calls in forms next to the template's
         self.images: Any = None                           # serve/images.py's ImageModels when the config has "images"
         self.restore_after_load = None                    # a session file an image job saved before it unloaded
@@ -4189,12 +4190,48 @@ class Service:
         if self.prompts is not None:
             self.prompts.forget(ids)
 
+    def expand_files(self, messages, cancel=None):
+        """The files of a request (frontend's "file" items) read into the content: a text file's text, a PDF's text
+        page by page and, with the vision encoder, each page as a picture (read_file).  A file read once is kept for
+        the next request (the client sends the conversation again).  The messages without files are returned as
+        they are."""
+        if not any(isinstance(m.get("content"), list) and any(isinstance(p, dict) and p.get("type") == "file"
+                                                              for p in m["content"]) for m in messages):
+            return messages
+        cache = self.__dict__.setdefault("file_cache", collections.OrderedDict())
+        out = []
+        for m in messages:
+            content = m.get("content")
+            if not isinstance(content, list):
+                out.append(m)
+                continue
+            items: list = []
+            for part in content:
+                if not (isinstance(part, dict) and part.get("type") == "file"):
+                    items.append(part)
+                    continue
+                if cancel is not None and cancel.is_set():
+                    raise ClientGone()
+                data = Vision.load(part["data"]) if part.get("data") else self.download(part["url"])
+                if len(data) > FILE_MAX:
+                    raise ValueError(f"the file {part.get('name') or ''} is over {FILE_MAX >> 20} MiB")
+                key = (hashlib.sha256(data).hexdigest(), self.vision is not None, part.get("name"))
+                if key not in cache:
+                    cache[key] = read_file(data, part.get("mime"), part.get("name") or "", self.vision is not None)
+                    while len(cache) > 8:
+                        cache.popitem(last=False)
+                cache.move_to_end(key)
+                items += cache[key]
+            out.append({**m, "content": items})
+        return out
+
     def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
         prompt; with thinking, Service.run writes it once the thinking is over."""
         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
         # between pictures and raise ClientGone
+        messages = self.expand_files(messages, cancel)
         # Cached tool images are references in browser history, never arbitrary file paths or huge base64 strings.
         for message in messages:
             for part in message.get("content", []) if isinstance(message.get("content"), list) else []:
@@ -4238,7 +4275,9 @@ class Service:
                     raise ClientGone()
                 return fetched[src] if src in fetched else self.download(src) \
                     if src.startswith(("http://", "https://")) else src
-            images = [fetch(src) for src in images]
+            low = [item.get("detail") == "low" for m in messages if isinstance(m.get("content"), list)
+                   for item in m["content"] if item.get("type") == "image"]
+            images = [low_detail(fetch(src)) if is_low else fetch(src) for src, is_low in zip(images, low)]
             # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
@@ -4446,6 +4485,11 @@ class Service:
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
+        # parallel_tool_calls: false (OpenAI) / tool_choice.disable_parallel_tool_use (Anthropic): the reply ends with
+        # its first call, a whole one (finish "stop", so the call is the reply's tool_calls / tool_use)
+        choice = (sampling or {}).get("tool_choice")
+        one_call = (sampling or {}).get("parallel_tool_calls") is False or \
+            isinstance(choice, dict) and choice.get("disable_parallel_tool_use") is True
         # #123: read after the merge, so a budget shared through POST /settings is seen like the other keys
         # the Harmony format writes its reasoning in a channel: the budget's and the loop recovery's closing text is
         # Qwen's <think> form, so neither applies to it
@@ -4502,6 +4546,7 @@ class Service:
         if force and not thinking:                      # the parser reads it as if the model had written it
             opening, force = parser.feed(force), None
         tail = ""                                       # the last characters written (the newlines before a call)
+        one_done = False                                # one_call: the reply's one call has been written
         answered, close_retried = False, False          # #1053: content or a call came out; the thinking was closed
         nf_retried = False                              # #879: the request was sent again after non-finite logits
         timings, before = None, None                    # this request's timings; the engine's `last` before it
@@ -4649,7 +4694,8 @@ class Service:
                                 elif time.perf_counter() - last_out >= KEEPALIVE_S:
                                     last_out = time.perf_counter()
                                     yield "ping", None
-                                if stops is not None and stops.hit is not None:
+                                one_done = one_done or one_call and any(ev.kind == "tool_call" for ev in evs)
+                                if stops is not None and stops.hit is not None or one_done:
                                     finish = "stop"         # gen.close() below STOPs the engine, as for a stop token
                                     break
                                 if (self.reasoning_loop_recovery and not harmony and not recovery_count
@@ -4898,6 +4944,10 @@ class Service:
             if emb:
                 Path(emb).unlink(missing_ok=True)
         for ev in cut(parser.finish(finish)):
+            if one_call and ev.kind in ("tool_start", "tool_args", "tool_call"):
+                if one_done:
+                    continue                            # calls read from the thinking at the end: the first only
+                one_done = ev.kind == "tool_call"
             yield "event", ev
         if parser.rescued or parser.refused:
             self.totals["tool_calls_from_reasoning"] = self.totals.get("tool_calls_from_reasoning", 0) + parser.rescued
@@ -5164,6 +5214,154 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
 
 
 # ------------------------------------------------------------------------------------------------ OpenAI
+FILE_MAX = 32 << 20               # a file a request sends: 32 MiB, as OpenAI's and Anthropic's PDF inputs
+PDF_PAGES_MAX = 100               # a PDF's pages, as Anthropic's limit
+PDF_PAGE_SIDE = 1024              # a PDF page's picture: its longer side, in pixels (the reader shrinks it further
+#                                   to its own image-token limit)
+PDF_TOOL_S = 120                  # how long pdftotext or pdftoppm may take on one PDF
+TEXT_TYPES = ("application/json", "application/xml", "application/x-yaml", "application/yaml",
+              "application/javascript", "application/x-sh", "application/sql", "application/toml")
+
+
+def _pdf_poppler(data: bytes, label: str, vision: bool) -> tuple[list, list]:
+    """A PDF read with poppler's programs (Linux's poppler-utils, run as programs, not linked): pdftotext's text,
+    one page per form feed, and pdftoppm's pages, their longer side PDF_PAGE_SIDE -> (texts, PNG data: URLs or
+    None)."""
+    with tempfile.TemporaryDirectory() as d:
+        src = Path(d) / "in.pdf"
+        src.write_bytes(data)
+        # one page past the limit, to know a PDF that has more
+        r = subprocess.run(["pdftotext", "-enc", "UTF-8", "-l", str(PDF_PAGES_MAX + 1), str(src), "-"],
+                           capture_output=True, timeout=PDF_TOOL_S)
+        if r.returncode != 0:
+            why = r.stderr.decode(errors="replace").strip().splitlines()
+            raise ValueError(f"{label}: the PDF could not be read ({why[-1] if why else 'pdftotext failed'})")
+        pages = r.stdout.decode("utf-8", errors="replace").split("\f")[:-1]
+        if len(pages) > PDF_PAGES_MAX:
+            raise ValueError(f"{label}: the PDF has more than {PDF_PAGES_MAX} pages; at most {PDF_PAGES_MAX} are read")
+        pictures: list = [None] * len(pages)
+        if vision and pages:
+            r = subprocess.run(["pdftoppm", "-png", "-scale-to", str(PDF_PAGE_SIDE), "-l", str(len(pages)), str(src),
+                                str(Path(d) / "p")], capture_output=True, timeout=PDF_TOOL_S)
+            drawn = sorted(Path(d).glob("p-*.png"), key=lambda f: int(f.stem.rsplit("-", 1)[1]))
+            if r.returncode != 0 or len(drawn) != len(pages):
+                raise ValueError(f"{label}: the PDF's pages could not be drawn (pdftoppm)")
+            pictures = ["data:image/png;base64," + base64.b64encode(f.read_bytes()).decode("ascii") for f in drawn]
+    return pages, pictures
+
+
+def _pdf_python(data: bytes, label: str, vision: bool) -> tuple[list, list]:
+    """A PDF read with the Python packages (Windows' 7z carries them): pypdf's text page by page and pypdfium2's
+    pages, their longer side PDF_PAGE_SIDE -> (texts, PNG data: URLs or None)."""
+    try:
+        import pypdf
+    except ImportError:
+        raise ValueError("reading a PDF needs poppler's pdftotext and pdftoppm (Linux: poppler-utils) or the "
+                         "Python packages pypdf and pypdfium2") from None
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(data))
+        if reader.is_encrypted and not reader.decrypt(""):
+            raise ValueError(f"{label}: the PDF is encrypted")
+        pages = [page.extract_text() or "" for page in reader.pages]
+    except ValueError:
+        raise
+    except Exception as e:  # noqa: BLE001 - pypdf's errors are many: a PDF it cannot read is the request's fault
+        raise ValueError(f"{label}: the PDF could not be read ({type(e).__name__}: {e})") from None
+    if len(pages) > PDF_PAGES_MAX:
+        raise ValueError(f"{label}: the PDF has {len(pages)} pages; at most {PDF_PAGES_MAX} are read")
+    pictures: list = [None] * len(pages)
+    try:
+        import pypdfium2
+    except ImportError:                  # pypdf alone: the text alone
+        if vision and not getattr(read_file, "said", False):
+            read_file.said = True        # type: ignore[attr-defined]
+            print("[strata] a PDF's pages are read as text only: drawing them as pictures needs poppler's pdftoppm "
+                  "(Linux: poppler-utils) or the Python package pypdfium2", flush=True)
+        vision = False
+    if vision:
+        try:
+            pdf = pypdfium2.PdfDocument(data)
+            for k in range(len(pdf)):
+                page = pdf[k]
+                image = page.render(scale=PDF_PAGE_SIDE / max(page.get_size())).to_pil()
+                png = io.BytesIO()
+                image.save(png, "PNG")
+                pictures[k] = "data:image/png;base64," + base64.b64encode(png.getvalue()).decode("ascii")
+            pdf.close()
+        except Exception as e:  # noqa: BLE001 - as above
+            raise ValueError(f"{label}: the PDF's pages could not be drawn ({type(e).__name__}: {e})") from None
+    return pages, pictures
+
+
+def read_file(data: bytes, mime: str | None, name: str, vision: bool) -> list[dict]:
+    """A file -> the template's content items.  A PDF: its text page by page and, when the model reads pictures,
+    each page as one, in page order - as OpenAI and Anthropic give a PDF to their models; read with poppler's
+    programs when they are there (Linux), else with the Python packages (Windows).  A text file (text/*, JSON, XML,
+    YAML, ...; or no type and UTF-8): its text.  Anything else, an encrypted or broken PDF, or more than
+    PDF_PAGES_MAX pages is a ValueError (a 400)."""
+    label = f"File: {name}" if name else "File"
+    if data[:5] == b"%PDF-" or mime == "application/pdf":
+        poppler = shutil.which("pdftotext") is not None and shutil.which("pdftoppm") is not None
+        try:
+            pages, pictures = (_pdf_poppler if poppler else _pdf_python)(data, label, vision)
+        except subprocess.TimeoutExpired:
+            raise ValueError(f"{label}: reading the PDF took more than {PDF_TOOL_S} s") from None
+        items: list = [{"type": "text", "text": f"{label} ({len(pages)} pages)\n"}]
+        for k, (text, picture) in enumerate(zip(pages, pictures)):
+            items.append({"type": "text", "text": f"\n--- page {k + 1} ---\n{text.strip()}\n"})
+            if picture is not None:
+                items.append({"type": "image", "source": picture})
+        return items
+    if mime and not (mime.startswith("text/") or mime in TEXT_TYPES):
+        raise ValueError(f"{label}: files of type {mime} are not read (text files and PDFs are)")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise ValueError(f"{label}: the file is not UTF-8 text (text files and PDFs are read)") from None
+    return [{"type": "text", "text": f"{label}\n\n{text}\n"}]
+
+
+LOW_DETAIL_SIDE = 512             # OpenAI's image_url detail "low": the picture is read at 512 x 512 at most
+
+
+def low_detail(source) -> str | bytes:
+    """An image to read at OpenAI's low detail: its longer side brought down to LOW_DETAIL_SIDE (fewer image tokens),
+    as PNG.  Without Pillow, or for an image already that small, the image as it is."""
+    try:
+        import io
+        from PIL import Image
+    except ImportError:
+        return source
+    data = source if isinstance(source, bytes) else Vision.load(source)
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            if max(im.size) <= LOW_DETAIL_SIDE:
+                return data
+            im.thumbnail((LOW_DETAIL_SIDE, LOW_DETAIL_SIDE))
+            out = io.BytesIO()
+            im.convert("RGBA" if im.mode in ("RGBA", "LA", "P") else "RGB").save(out, "PNG")
+            return out.getvalue()
+    except (OSError, ValueError):            # not a picture Pillow reads: the reader says what is wrong with it
+        return data
+
+
+def check_logprobs(req: dict) -> None:
+    """OpenAI's limits on logprobs: top_logprobs a whole number 0..20, and only with logprobs: true."""
+    k = req.get("top_logprobs")
+    if k is None:
+        return
+    if isinstance(k, bool) or not isinstance(k, int) or not 0 <= k <= 20:
+        raise ValueError("top_logprobs must be a whole number from 0 to 20")
+    if req.get("logprobs") is not True:
+        raise ValueError("top_logprobs needs logprobs: true")
+
+
+def system_fingerprint(svc) -> str:
+    """OpenAI's system_fingerprint: names the engine's build and the model, so it changes when either does."""
+    version = (getattr(svc.engine, "info", None) or {}).get("version")
+    return "fp_" + hashlib.sha256(f"{version}|{svc.model}".encode()).hexdigest()[:12]
+
+
 def top_logprobs(req: dict):
     """The K of the engine's logprobs=K, or None when the request did not ask (OpenAI: logprobs=true, top_logprobs
     0..20; the legacy completions form, logprobs=N, is taken as N)."""
@@ -5357,9 +5555,12 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
     # llama.cpp's flag, and its default: a client that wants prompt progress asks for it, and nothing changes for one
     # that does not.  Strata already sends a keep-alive comment on every PP line, so this only fills that line in.
     want_progress = bool(req.get("return_progress"))
+    fingerprint = system_fingerprint(svc)
+    customs = custom_tool_names(req)              # their calls: {"type": "custom", "custom": {"name", "input"}}
 
     def chunk(delta, finish=None):
         return {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
+                "system_fingerprint": fingerprint,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
     yield chunk({"role": "assistant", "content": ""})
@@ -5381,9 +5582,19 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
             ev = cast(Event, x)
             call = cast(ToolCall, ev.call)          # (every tool_* event carries its call)
             if ev.kind == "reasoning" and ev.text:
-                yield chunk({"reasoning_content": ev.text})
+                # llama.cpp's reasoning_content and vLLM's reasoning: the same text, for a client that reads either
+                yield chunk({"reasoning_content": ev.text, "reasoning": ev.text})
             elif ev.kind == "content" and ev.text:
                 yield chunk({"content": ev.text})
+            elif ev.kind in ("tool_start", "tool_args") and call.name in customs:
+                pass                                # a custom tool's input is sent whole, with its tool_call
+            elif ev.kind == "tool_call" and call.name in customs:
+                given = call.arguments
+                text = given["input"] if isinstance(given, dict) and set(given) == {"input"} \
+                    and isinstance(given["input"], str) else json.dumps(given, ensure_ascii=False)
+                yield chunk({"tool_calls": [{"index": calls, "id": call.id, "type": "custom",
+                                             "custom": {"name": call.name, "input": text}}]})
+                calls += 1
             elif ev.kind == "tool_start":
                 streamed[call.id] = calls
                 calls += 1
@@ -5409,12 +5620,56 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
             last["usage"] = {"prompt_tokens": pt, "completion_tokens": fin["completion_tokens"],
                              "total_tokens": pt + fin["completion_tokens"],
                              # the part of the prompt the conversation cache already held (OpenAI's field)
-                             "prompt_tokens_details": {"cached_tokens": fin.get("reused") or 0}}
+                             "prompt_tokens_details": {"cached_tokens": fin.get("reused") or 0},
+                             # the thinking's share of completion_tokens
+                             "completion_tokens_details": {"reasoning_tokens": fin.get("reasoning_tokens") or 0}}
             if fin.get("timings"):
                 last["timings"] = fin["timings"]          # llama.cpp's field: the speed its clients show
             if fin.get("rejected_tool_calls"):          # #3796: only when a call was refused as undeclared
                 last["strata_rejected_tool_calls"] = fin["rejected_tool_calls"]
             yield last
+
+
+def openai_choices(n: int, choice):
+    """The chunks of n choices (`choice(k)`: choice k's chunks), one choice after another, each chunk under its
+    choice's index.  The usage is the request's: the prompt once, every choice's completion tokens, on the last
+    choice's finishing chunk.  A choice that fails ends the whole request."""
+    total: dict | None = None
+    for k in range(n):
+        chunks = choice(k)
+        try:
+            for c in chunks:
+                if c is None or not c.get("choices"):
+                    yield c
+                    continue
+                c["choices"][0]["index"] = k
+                if "usage" in c:
+                    u = c.pop("usage")
+                    if total is None:
+                        total = u
+                    else:
+                        done = total["completion_tokens"] + u["completion_tokens"]
+                        thought = sum((x.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0
+                                      for x in (total, u))
+                        total = {**total, "completion_tokens": done, "total_tokens": total["prompt_tokens"] + done,
+                                 "completion_tokens_details": {"reasoning_tokens": thought}}
+                    if k == n - 1:
+                        c["usage"] = total
+                yield c
+        finally:
+            chunks.close()
+
+
+def openai_collect_choices(chunks) -> dict:
+    """openai_collect for n choices: each choice's chunks collected on their own, then one response."""
+    groups: dict = {}
+    for c in chunks:
+        if c is not None:
+            groups.setdefault(c["choices"][0]["index"], []).append(c)
+    outs = [openai_collect(groups[k]) for k in sorted(groups)]
+    out = outs[-1]
+    out["choices"] = [{**o["choices"][0], "index": k} for k, o in zip(sorted(groups), outs)]
+    return out
 
 
 def _is_json(text: str) -> bool:
@@ -5440,6 +5695,9 @@ def openai_collect(chunks) -> dict:
         content.append(d.get("content") or "")
         reasoning.append(d.get("reasoning_content") or "")
         for tc in d.get("tool_calls") or []:       # streamed calls arrive in pieces: merge them by index
+            if tc.get("type") == "custom":         # a custom tool's call comes whole
+                by_index[tc.get("index", len(by_index))] = {k: v for k, v in tc.items() if k != "index"}
+                continue
             cur = by_index.setdefault(tc.get("index", len(by_index)),
                                       {"id": None, "type": "function", "function": {"name": "", "arguments": ""}})
             cur["id"] = tc.get("id") or cur["id"]
@@ -5450,17 +5708,19 @@ def openai_collect(chunks) -> dict:
     calls = [by_index[i] for i in sorted(by_index)]
     assert last is not None                         # openai_chunks always ends with the finishing chunk
     if last["choices"][0]["finish_reason"] != "tool_calls":
-        calls = [c for c in calls if _is_json(c["function"]["arguments"])]   # a call the output ended inside (#211)
+        calls = [c for c in calls if c.get("type") == "custom"
+                 or _is_json(c["function"]["arguments"])]   # a call the output ended inside (#211)
     msg: dict = {"role": "assistant", "content": "".join(content) or None}
     if "".join(reasoning):
-        msg["reasoning_content"] = "".join(reasoning)
+        msg["reasoning_content"] = msg["reasoning"] = "".join(reasoning)
     if calls:
         msg["tool_calls"] = calls
     if mcp:
         msg["strata_mcp"] = mcp
     out = {"id": last["id"], "object": "chat.completion", "created": last["created"], "model": last["model"],
+           **({"system_fingerprint": last["system_fingerprint"]} if "system_fingerprint" in last else {}),
            "choices": [{"index": 0, "message": msg, "finish_reason": last["choices"][0]["finish_reason"]}],
-           "usage": last["usage"]}
+           "usage": last.get("usage")}
     if last.get("timings"):
         out["timings"] = last["timings"]
     if last.get("strata_rejected_tool_calls"):
@@ -5551,7 +5811,7 @@ def structured_chunks(chunks, validator):
         yield buffered[0]
         delta = {"content": content}
         if choice["message"].get("reasoning_content"):
-            delta["reasoning_content"] = choice["message"]["reasoning_content"]
+            delta["reasoning_content"] = delta["reasoning"] = choice["message"]["reasoning_content"]
         piece = {"index": 0, "delta": delta, "finish_reason": None}
         if logprobs:
             piece["logprobs"] = logprobs
@@ -5565,21 +5825,45 @@ def structured_chunks(chunks, validator):
 
 
 # ------------------------------------------------------------------------------------------------ Anthropic
+def anthropic_usage(ids, reused, output_tokens: int) -> dict:
+    """Anthropic's usage of a prompt the conversation cache held `reused` tokens of: those are cache reads, the rest
+    a cache write (it stays for the next request); input_tokens keeps the last token, as 0 makes Claude Code count
+    the prompt twice (#1013)."""
+    reused = max(0, min(reused or 0, len(ids) - 1))
+    return {"input_tokens": 1, "cache_creation_input_tokens": len(ids) - reused - 1,
+            "cache_read_input_tokens": reused, "output_tokens": output_tokens}
+
+
 def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, cancel, force=None):
     mid = "msg_" + uuid.uuid4().hex[:24]
-    yield "message_start", {"type": "message_start", "message": {
-        "id": mid, "type": "message", "role": "assistant", "model": svc.model_for(req), "content": [],
-        "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": len(ids), "output_tokens": 0}}}
-    index, open_kind, used_tool = -1, None, False
 
-    def close():
-        return ("content_block_stop", {"type": "content_block_stop", "index": index})
+    def start(reused):
+        # sent with the reply's first piece, once the engine has said how much of the prompt its cache held (its
+        # RESUME line), so message_start's usage names the cache reads and writes as message_delta's does; until
+        # then the heartbeats go out as pings
+        return "message_start", {"type": "message_start", "message": {
+            "id": mid, "type": "message", "role": "assistant", "model": svc.model_for(req), "content": [],
+            "stop_reason": None, "stop_sequence": None, "usage": anthropic_usage(ids, reused, 0)}}
+    started = False
+    index, open_kind, used_tool = -1, None, False
+    thought: list[str] = []                        # the open thinking block's text: its signature at its end
+
+    def closing():
+        if open_kind == "thinking":
+            yield "content_block_delta", {"type": "content_block_delta", "index": index, "delta": {
+                "type": "signature_delta", "signature": thinking_signature("".join(thought))}}
+            thought.clear()
+        yield "content_block_stop", {"type": "content_block_stop", "index": index}
 
     streamed, finished = set(), set()              # calls sent piece by piece; those whose final tool_call came (#211)
     for kind, x in svc.run(ids, thinking, tools, max_new, req, cancel, force=force, declared_only=True):
         if kind == "ping":
             yield None
             continue
+        if not started:
+            started = True
+            yield start(cast(dict, x).get("reused") if kind == "done" else
+                        0 if getattr(svc.engine, "batch", 0) else getattr(svc.engine, "reused", 0))
         if kind == "event":
             ev = cast(Event, x)
             call = cast(ToolCall, ev.call)          # (None but for the tool_* events)
@@ -5599,7 +5883,7 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
                 used_tool = True
             if open_kind != want or want == "tool_use":
                 if open_kind is not None:
-                    yield close()
+                    yield from closing()
                 index += 1
                 open_kind = want
                 block = {"thinking": {"type": "thinking", "thinking": "", "signature": ""},
@@ -5610,6 +5894,7 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
                                       ev.call.name if ev.call else "", "input": {}}}[want]
                 yield "content_block_start", {"type": "content_block_start", "index": index, "content_block": block}
             if want == "thinking":
+                thought.append(ev.text)
                 yield "content_block_delta", {"type": "content_block_delta", "index": index,
                                               "delta": {"type": "thinking_delta", "thinking": ev.text}}
             elif want == "text":
@@ -5623,20 +5908,18 @@ def anthropic_events(svc: Service, req: dict, ids, thinking, tools, max_new, can
                     "type": "input_json_delta", "partial_json": json.dumps(call.arguments, ensure_ascii=False)}}
         else:
             if open_kind is not None:
-                yield close()
+                yield from closing()
             assert isinstance(x, dict)                  # the run's last item: the DONE figures
+            asked = req.get("max_tokens")
             stop = "stop_sequence" if x.get("stop_sequence") is not None else \
                 "tool_use" if used_tool and streamed <= finished and x["finish"] == "stop" else \
+                "model_context_window_exceeded" if x["finish"] == "length" and isinstance(asked, int) \
+                and x["completion_tokens"] < asked else \
                 {"stop": "end_turn", "length": "max_tokens", "cancel": "end_turn"}[x["finish"]]
-            # the final counts (message_start could only say the whole prompt): what was read now stays for the next
-            # request, a cache write; input_tokens keeps the last token, as 0 makes Claude Code count the prompt twice
-            # (#1013)
-            reused = max(0, min(x.get("reused") or 0, len(ids) - 1))
-            read_now = len(ids) - reused
+            # the final counts: the engine's own figure of the prompt its cache held
             delta_event = {"type": "message_delta",
                            "delta": {"stop_reason": stop, "stop_sequence": x.get("stop_sequence")},
-                           "usage": {"input_tokens": 1, "cache_creation_input_tokens": read_now - 1,
-                                     "cache_read_input_tokens": reused, "output_tokens": x["completion_tokens"]}}
+                           "usage": anthropic_usage(ids, x.get("reused"), x["completion_tokens"])}
             if x.get("rejected_tool_calls"):
                 delta_event["strata_rejected_tool_calls"] = x["rejected_tool_calls"]     # #3796
             yield "message_delta", delta_event
@@ -5659,14 +5942,17 @@ def anthropic_collect(events) -> dict:
                 b["text"] += d["text"]
             elif d["type"] == "thinking_delta":
                 b["thinking"] += d["thinking"]
+            elif d["type"] == "signature_delta":
+                b["signature"] = d["signature"]
             else:                                  # input_json_delta pieces: parsed when complete
                 b["_json"] = b.get("_json", "") + d["partial_json"]
         elif name == "content_block_stop" and blocks and "_json" in blocks[-1]:
             b = blocks[-1]
+            raw = b.pop("_json") or "{}"
             try:
-                b["input"] = json.loads(b.pop("_json") or "{}")
-            except ValueError:                     # a call the output ended inside (#211): it has no input to give
-                blocks.pop()
+                b["input"] = json.loads(raw)
+            except ValueError:                     # a call the output ended inside (#211): what it wrote, as text
+                blocks[-1] = {"type": "text", "text": raw}
         elif name == "message_delta":
             assert msg is not None
             msg["stop_reason"] = e["delta"]["stop_reason"]
@@ -5731,6 +6017,30 @@ def anthropic_structured(events, validator):
 
 
 # ------------------------------------------------------------------------------------------------ HTTP
+# Anthropic's error types by HTTP status (its "errors" page); a 5xx without its own is an api_error
+ANTHROPIC_ERROR_TYPES = {400: "invalid_request_error", 401: "authentication_error", 403: "permission_error",
+                         404: "not_found_error", 413: "request_too_large", 429: "rate_limit_error",
+                         529: "overloaded_error"}
+
+
+def api_error_body(path: str, status: int, obj):
+    """An error body in the shape of the API its path belongs to: Anthropic's routes (/v1/messages...) answer
+    {"type": "error", "error": {"type", "message"}}, the other /v1/ routes OpenAI's {"error": {"message", "type",
+    "param", "code"}} (param and code null when the error has none).  Anything else is left as it is."""
+    err = obj.get("error") if isinstance(obj, dict) else None
+    if status < 400 or not isinstance(err, dict) or not path.startswith("/v1/"):
+        return obj
+    message = str(err.get("message") or "")
+    if path.startswith("/v1/messages"):
+        if obj.get("type") == "error":
+            return obj
+        kind = ANTHROPIC_ERROR_TYPES.get(status, "api_error" if status >= 500 else "invalid_request_error")
+        return {"type": "error", "error": {"type": kind, "message": message}}
+    kind = err.get("type") or ("server_error" if status >= 500 else "invalid_request_error")
+    return {**obj, "error": {**err, "message": message, "type": kind, "param": err.get("param"),
+                             "code": err.get("code")}}
+
+
 CHUNKED_BODY_MAX = 256 << 20                # #893: the most a Transfer-Encoding: chunked body may hold (in memory)
 
 
@@ -6000,6 +6310,17 @@ def make_handler(svc: Service):
                              asked or "Authorization, Content-Type, x-api-key, anthropic-version, anthropic-beta")
             self.send_header("Access-Control-Max-Age", "600")
 
+        def do_DELETE(self):
+            """DELETE /v1/responses/{id}: nothing is stored, so there is nothing to delete - OpenAI's 404, in JSON."""
+            if not self._authorized():
+                return
+            path = self.path.split("?")[0].rstrip("/")
+            if path.startswith("/v1/responses/"):
+                self._json(404, responses_error_body("this server keeps no responses (stateless): there is nothing "
+                                                     "to delete", code="not_found"))
+            else:
+                self._json(404, {"error": {"message": f"Invalid URL (DELETE {path})", "type": "invalid_request_error"}})
+
         def do_OPTIONS(self):
             # a CORS preflight: no credentials come with it, so no API key; the headers only for cors_origins
             self.send_response(204)
@@ -6008,6 +6329,7 @@ def make_handler(svc: Service):
             self.end_headers()
 
         def _json(self, code, obj, headers=None):
+            obj = api_error_body(self.path.split("?")[0].rstrip("/"), code, obj)
             if self.record is not None:
                 with svc.status_lock:
                     self.record["http_status"] = code
@@ -6215,24 +6537,17 @@ def make_handler(svc: Service):
                 self._json(200, s)
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
-                    loaded = svc.loaded()
-                    model = {"id": svc.model, "object": "model", "status": {"value": "loaded"},
-                             "meta": {"n_ctx": svc.reported_ctx()},
-                             "architecture": {"input_modalities": (["text", "image"] if svc.vision is not None
-                                                                   else ["text"]),
-                                              "output_modalities": ["text"]}}
-                    if not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
-                        model["status"] = {"value": "unloaded"}   # like llama-server's router: listed, loads on use
-                        loaded = True
-                    if svc.aliases:                       # #297: the aliases, and each one listed under its own id
-                        model["aliases"] = list(svc.aliases)
-                    data = [model, *({**model, "id": x, "alias_of": svc.model} for x in svc.aliases)]
-                    data = data if loaded else []
-                    if svc.images is not None:            # the image models: POST /v1/images/generations
-                        data += [{"id": m["id"], "object": "model", "status": {"value": "loaded"},
-                                  "architecture": {"input_modalities": ["text"], "output_modalities": ["image"]}}
-                                 for m in svc.images.models()]
-                    self._json(200, {"object": "list", "data": data})
+                    self._json(200, {"object": "list", "data": self._models()})
+            elif path.startswith("/v1/models/"):         # OpenAI's retrieve: one model by its id
+                if self._authorized():
+                    want = unquote(path[len("/v1/models/"):])
+                    found = next((m for m in self._models() if m["id"] == want), None)
+                    if found is None:
+                        self._json(404, {"error": {"message": f"The model '{want}' does not exist",
+                                                   "type": "invalid_request_error", "param": "model",
+                                                   "code": "model_not_found"}})
+                    else:
+                        self._json(200, found)
             elif path == "/props":
                 if self._authorized():
                     self._props()
@@ -6259,7 +6574,27 @@ def make_handler(svc: Service):
                 if self._authorized():
                     self._json(200, svc.v1_status())
             else:
-                self._json(404, {"error": {"message": "not found"}})
+                self._json(404, {"error": {"message": f"Invalid URL (GET {path})", "type": "invalid_request_error"}})
+
+        def _models(self) -> list[dict]:
+            """GET /v1/models' list: the text model (its status: loaded, loading, or unloaded and loaded on use, as
+            llama-server's router lists them), each alias under its own id (#297), and the image models.  OpenAI's
+            created and owned_by: the server's start and "xestrata"."""
+            status = "loaded" if svc.loaded() else "unloaded" \
+                if svc.idle_unload_s or getattr(svc.engine, "unloaded", False) else "loading"
+            common = {"object": "model", "created": int(svc.started_at), "owned_by": "xestrata"}
+            model = {"id": svc.model, **common, "status": {"value": status},
+                     "meta": {"n_ctx": svc.reported_ctx()},
+                     "architecture": {"input_modalities": (["text", "image"] if svc.vision is not None else ["text"]),
+                                      "output_modalities": ["text"]}}
+            if svc.aliases:
+                model["aliases"] = list(svc.aliases)
+            data = [model, *({**model, "id": x, "alias_of": svc.model} for x in svc.aliases)]
+            if svc.images is not None:                    # the image models: POST /v1/images/generations
+                data += [{"id": m["id"], **common, "status": {"value": "loaded"},
+                          "architecture": {"input_modalities": ["text"], "output_modalities": ["image"]}}
+                         for m in svc.images.models()]
+            return data
 
         def do_POST(self):
             try:
@@ -6391,7 +6726,8 @@ def make_handler(svc: Service):
                 elif path == "/v1/images/generations":
                     self._images(req)
                 else:
-                    self._json(404, {"error": {"message": "not found"}})
+                    self._json(404, {"error": {"message": f"Invalid URL (POST {path})",
+                                               "type": "invalid_request_error"}})
             except EngineNonFinite as e:                    # #879, twice: not the request's fault
                 print(f"[strata] 503: {e}", flush=True)
                 self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"
@@ -6402,14 +6738,20 @@ def make_handler(svc: Service):
                     self._json(400, responses_error_body(str(e)))
                 else:
                     self._json(400, {"error": {"type": "invalid_request_error", "message": str(e)}})
-            except ModelBusy as e:
-                self._json(409, {"error": {"type": "model_busy", "message": str(e)}})
+            except ModelBusy as e:                           # the control routes (/v1/load, /v1/vram, ...): 409
+                generation = path in ("/v1/chat/completions", "/v1/messages", "/v1/images/generations")
+                self._json(529 if path == "/v1/messages" else 429 if generation else 409,
+                           {"error": {"type": "rate_limit_exceeded" if generation else "model_busy",
+                                      "code": "rate_limit_exceeded" if generation else "model_busy",
+                                      "message": str(e)}}, headers={"Retry-After": 1} if generation else None)
             except StructuredOutputError as e:
                 self._json(502, {"error": {"type": "structured_output_failed", "code": "structured_output_failed",
                                            "message": str(e)}})
             except (GpuBusy, EngineStarting) as e:
                 ra = getattr(e, "retry_after", None)       # #1997 / #1994: a refusal that is worth retrying
-                self._json(503, {"error": {"type": "server_error", "message": str(e)}},
+                # Anthropic's clients (Claude Code) retry its 529 overloaded_error
+                self._json(529 if path.startswith("/v1/messages") else 503,
+                           {"error": {"type": "server_error", "message": str(e)}},
                            headers={"Retry-After": int(ra)} if ra else None)
             except (TypeError, KeyError, AttributeError, IndexError, UnicodeError) as e:
                 # a body that is JSON but the wrong shape ("messages": 5, a content part that is a number): a 400 that
@@ -6737,7 +7079,8 @@ def make_handler(svc: Service):
             self._no_local_images(messages)
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the Responses route: no tools are offered
                 tools = None
-            force = forced_call(req.get("tool_choice"), tools,      # a bad value is a 400 before anything is sent
+            tools, choice = allowed_tools(req.get("tool_choice"), tools)   # the tools it lists, and its mode
+            force = forced_call(choice, tools,                      # a bad value is a 400 before anything is sent
                                 getattr(svc.template, "call_form", "qwen"))
             messages, validator = prepare_format(req.get("response_format"), messages)
             if validator is not None and (tools or req.get("strata_mcp")):
@@ -6785,26 +7128,54 @@ def make_handler(svc: Service):
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
+            check_logprobs(req)                               # ... and top_logprobs out of 0..20
+            n = 1 if req.get("n") is None else req["n"]
+            if isinstance(n, bool) or not isinstance(n, int) or not 1 <= n <= 128:
+                raise ValueError("n must be a whole number from 1 to 128")
+            if n > 1 and use_mcp:
+                raise ValueError("n above 1 with MCP or image tools is not supported")
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             run = run_with_mcp(svc, hubs[0] if len(hubs) == 1 else ToolHubs(hubs), messages, tools, kw, ids,
                                thinking, max_new, max_req, req, cancel, {t["name"] for t in extra}) if use_mcp else None
-            chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
-            if validator is not None:
-                chunks = structured_chunks(chunks, validator)
+            if n > 1:
+                first = (ids, thinking, max_new)
+
+                def choice(k):
+                    # each choice its own run of the same prompt (the conversation cache holds it after the first);
+                    # a request's seed gives each choice its own, seed + k
+                    sub = {**req, "seed": req["seed"] + k} if k and type(req.get("seed")) is int else req
+                    got = first if k == 0 else svc.prepare(messages, tools, kw, max_req, force=force, req=sub,
+                                                           cancel=cancel)
+                    c = openai_chunks(svc, sub, *got[:2], tools, got[2], cancel, force=force)
+                    return structured_chunks(c, validator) if validator is not None else c
+                chunks = openai_choices(n, choice)
+            else:
+                chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
+                if validator is not None:
+                    chunks = structured_chunks(chunks, validator)
             chunks = self._capture(chunks, "openai")
             if not req.get("stream"):
-                return self._json(200, openai_collect(chunks))
+                return self._json(200, openai_collect_choices(chunks) if n > 1 else openai_collect(chunks))
             self._sse()
+            options = req.get("stream_options")
+            last = None
             try:
                 for c in chunks:
                     if c is None:
                         self.wfile.write(b": keep-alive\n\n")      # an SSE comment: clients ignore it
                     else:
                         self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
+                        last = c
                     self.wfile.flush()
+                if isinstance(options, dict) and options.get("include_usage") and last and last.get("usage"):
+                    # OpenAI's usage chunk, after the finishing one (which also keeps its usage, as llama.cpp's)
+                    usage = {k: last[k] for k in ("id", "object", "created", "model", "system_fingerprint")
+                             if k in last}
+                    self.wfile.write(b"data: " + json.dumps({**usage, "choices": [], "usage": last["usage"]},
+                                                            ensure_ascii=False).encode() + b"\n\n")
                 self.wfile.write(b"data: [DONE]\n\n")
             except OSError:
                 self._note(outcome="disconnected")
@@ -6857,7 +7228,8 @@ def make_handler(svc: Service):
             except ResponsesError as e:
                 return self._json(e.status, e.body())
             except ModelBusy as e:
-                return self._json(409, responses_error_body(str(e), "server_error", code="model_busy"))
+                return self._json(429, responses_error_body(str(e), "rate_limit_exceeded", code="rate_limit_exceeded"),
+                                  headers={"Retry-After": 1})
             except (GpuBusy, EngineStarting, EngineStuck, EngineDied) as e:
                 return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
 
@@ -6871,6 +7243,9 @@ def make_handler(svc: Service):
                 return base64.b64encode(f.read_bytes()).decode("ascii") if f is not None else None
 
             def events():
+                if top_logprobs(req) is not None:          # include: message.output_text.logprobs
+                    lp = LogprobEntries(svc, allowed_ids(req), cancel)
+                    asm.spell = lambda text: lp.spell(svc.engine, text)
                 yield from asm.start()
                 done = None
                 if image_tools is not None:   # the image tools run here, each an image_generation_call item
@@ -6942,6 +7317,7 @@ def make_handler(svc: Service):
             e = asm.failed(message, code)
             self._note(error=e["response"]["error"])
             try:
+                send(asm.error(message, code))               # OpenAI's order: the error event, then response.failed
                 send(e)
                 self.wfile.flush()
             except OSError:
@@ -6971,11 +7347,52 @@ def make_handler(svc: Service):
                 self.image_tools = images_api.ImageTools(svc, svc.images, messages, Vision.load,
                                                          lambda d: Vision.normalize(d, keep_alpha=True),
                                                          spec, model=fixed, mask=mask)
-                tools = (tools or []) + self.image_tools.template_tools(exclude={t["name"] for t in tools or []})
+                offered = self.image_tools.template_tools(exclude={t["name"] for t in tools or []})
+                # the tool's action: "generate" offers generate_image alone, "edit" edit_image alone
+                action = spec.get("action", "auto")
+                if action not in ("auto", "generate", "edit"):
+                    raise ResponsesError('the image_generation tool\'s action is "auto", "generate" or "edit"',
+                                         "tools")
+                if action != "auto":
+                    keep = "generate_image" if action == "generate" else "edit_image"
+                    offered = [t for t in offered if t["name"] == keep]
+                    if not offered or action == "edit" and not self.image_tools.has_image():
+                        raise ResponsesError(f'the image_generation tool\'s action "{action}" cannot be done here'
+                                             + (": there is no image in the conversation to edit"
+                                                if action == "edit" and offered else ""), "tools")
+                image_names = [t["name"] for t in offered]
+                tools = (tools or []) + offered
                 skipped = [k for k in skipped if k != "image_generation"]
+            else:
+                image_names = []
             kw = responses_api.template_kwargs(req, {"reasoning_effort": svc.effort_default()})
+            messages = responses_api.verbosity_messages(req, messages)
+            if req.get("truncation") not in (None, "auto", "disabled"):
+                raise ResponsesError('truncation is "auto" or "disabled"', "truncation")
+            calls = req.get("max_tool_calls")
+            if calls is not None and (isinstance(calls, bool) or not isinstance(calls, int) or calls < 1):
+                raise ResponsesError("max_tool_calls must be a positive whole number", "max_tool_calls")
+            if self.image_tools is not None:              # the hosted tools this server runs: the image tools
+                self.image_tools.max_calls = calls
+            include = req.get("include") if isinstance(req.get("include"), list) else []
+            if "message.output_text.logprobs" in include:
+                req = {**req, "logprobs": True}           # the engine's LP lines, read into output_text's logprobs
+            try:
+                check_logprobs(req) if req.get("logprobs") else None
+            except ValueError as e:
+                raise ResponsesError(str(e), "top_logprobs") from None
             # "required" or a named tool: the reply opens that call (forced_call), as on the chat route
-            force = forced_call(responses_api.forced_choice(req), tools, getattr(svc.template, "call_form", "qwen"))
+            choice = responses_api.forced_choice(req)
+            try:
+                if isinstance(choice, dict) and choice.get("type") == "image_generation":
+                    if not image_names:
+                        raise ValueError("tool_choice image_generation: the request has no image_generation tool "
+                                         "this server can run")
+                    tools, choice = [t for t in tools or [] if t["name"] in image_names], "required"
+                tools, choice = allowed_tools(choice, tools, {"image_generation": image_names})
+                force = forced_call(choice, tools, getattr(svc.template, "call_form", "qwen"))
+            except ValueError as e:
+                raise ResponsesError(str(e), "tool_choice") from None
             try:
                 self._no_local_images(messages)              # as on the chat route: no file read for a foreign page
             except ValueError as e:
@@ -7007,25 +7424,31 @@ def make_handler(svc: Service):
             # #924 (opt-in): a Codex compaction request is rendered with its conversation's tools, so its prompt
             # starts as the cached one did; the parser and the response keep the request's own tools
             shown = responses_api.prompt_tools(req, tools) if svc.codex_compaction_cache else tools
-            try:
+            while True:
                 try:
-                    ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0,
-                                                         force=force, req=req, cancel=cancel)
-                except ValueError:
-                    if shown is tools:
-                        raise
-                    shown = tools                            # too long with the kept tools: the request as sent
-                    ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0,
-                                                         force=force, req=req, cancel=cancel)
-            except ResponsesError:
-                raise
-            except ValueError as e:                          # too long for the context, an image without vision
-                raise ResponsesError(str(e), "input", "context_length_exceeded" if "context" in str(e) else None) \
-                    from None
+                    try:
+                        ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0,
+                                                             force=force, req=req, cancel=cancel)
+                    except ValueError:
+                        if shown is tools:
+                            raise
+                        shown = tools                        # too long with the kept tools: the request as sent
+                        ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0,
+                                                             force=force, req=req, cancel=cancel)
+                    break
+                except ResponsesError:
+                    raise
+                except ValueError as e:                      # too long for the context, an image without vision
+                    # truncation "auto": the oldest items go (a call with its results), the instructions stay
+                    fewer = responses_api.drop_oldest(messages) \
+                        if req.get("truncation") == "auto" and "context" in str(e) else None
+                    if fewer is None:
+                        raise ResponsesError(str(e), "input",
+                                             "context_length_exceeded" if "context" in str(e) else None) from None
+                    messages = fewer
             if svc.codex_compaction_cache:
                 responses_api.prompt_made(req, shown)
             _debug_req("responses", req, messages, tools, max_new, thinking, len(ids))
-            include = req.get("include") if isinstance(req.get("include"), list) else []
             asm = responses_api.Assembler(req, svc.model_for(req), len(ids), names,
                                           "reasoning.encrypted_content" in include, validator is not None)
             self.prepared = (messages, kw)
@@ -7037,12 +7460,18 @@ def make_handler(svc: Service):
             read for the same request, rendered and tokenized - the model does not run."""
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
+            if tool_choice_of(req.get("tool_choice"))[0] == "none":   # as the request itself: no tools offered
+                tools = None
             messages, _ = anthropic_prepare_format(req, messages, tools)   # its instruction is part of the prompt
+            messages = svc.expand_files(messages)            # a document's text and pages, as the request reads it
             stop_strings(req)                                 # the same 400 as the request itself would get
             check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw, store=False))})
 
         def _anthropic(self, req):
+            asked = req.get("max_tokens")                     # Anthropic's required field (the shared settings' own
+            if isinstance(asked, bool) or not isinstance(asked, int) or asked < 1:   # default does not stand in)
+                raise ValueError("max_tokens: a whole number of 1 or more is required")
             svc.load()
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
@@ -7070,10 +7499,17 @@ def make_handler(svc: Service):
                 except StructuredOutputError as exc:
                     return self._json(502, {"type": "error", "error": {"type": "api_error", "message": str(exc)}})
             self._sse()
+            pinged = 0.0
             try:
                 for item in events:
                     if item is None:
-                        self.wfile.write(b": keep-alive\n\n")
+                        # Anthropic's keep-alive is a ping event; one a second at most (a prompt being read sends a
+                        # heartbeat per chunk), SSE comments between them
+                        if time.monotonic() - pinged >= 1:
+                            pinged = time.monotonic()
+                            self.wfile.write(b'event: ping\ndata: {"type": "ping"}\n\n')
+                        else:
+                            self.wfile.write(b": keep-alive\n\n")
                     else:
                         name, e = item
                         self.wfile.write(f"event: {name}\n".encode() + b"data: " +
@@ -8099,7 +8535,7 @@ def main() -> int:
             raise SystemExit(f"[strata] {e}")
         print(f"[strata] slot save/restore on: {svc.slot_save_path} (session files are kept until deleted: "
               "about 1.2 GB per 63K-token conversation; restore only files this server wrote)", flush=True)
-    mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
+    mode = str(cfg.get("anthropic_thinking") or "on_request")   # #278: "model" thinks unasked too
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
     svc.anthropic_think_unasked = mode == "model"

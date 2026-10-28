@@ -1682,6 +1682,8 @@ class ImageTools:
                         if k in OPTION_KEYS and v is not None and not (k == "size" and v == "auto")}
         self.settings = {"max_rounds": 4}
         self.made: list[str] = []          # the images this request made (file names)
+        self.max_calls: int | None = None  # a Responses request's max_tool_calls: the calls that run, at most
+        self.calls = 0
         self.mask = mask                   # an edit's mask (Responses' input_image_mask), over the image it edits
 
     def _gens(self, edits: bool = False) -> list[ImageGen]:
@@ -1717,6 +1719,21 @@ class ImageTools:
         p = (self.models or self.gen).file(name)
         return p.read_bytes() if p is not None else None
 
+    def has_image(self) -> bool:
+        """Is there an image an edit could take (one this request made, a picture in the conversation, or a link to a
+        kept one)?  Nothing is read."""
+        if self.made:
+            return True
+        for msg in self.messages:
+            content = msg.get("content")
+            for item in content if isinstance(content, list) else [content]:
+                if isinstance(item, dict) and item.get("type") == "image" and item.get("source"):
+                    return True
+                text = item if isinstance(item, str) else item.get("text") if isinstance(item, dict) else None
+                if FILE_REF.search(text or ""):
+                    return True
+        return False
+
     def _image(self, which: str) -> bytes | None:
         """The image an edit takes: a /v1/images/files/ link (or its file name), else the conversation's last."""
         m = FILE_REF.search(which or "") or re.fullmatch(r"([0-9a-f]{32}\.(?:png|jpeg|webp|jxl))", which or "")
@@ -1738,6 +1755,11 @@ class ImageTools:
 
     def call(self, name: str, arguments, cancel: threading.Event | None = None) -> dict:
         t0 = time.monotonic()
+        if self.max_calls is not None and self.calls >= self.max_calls:
+            text = f"error: not run: this response may make {self.max_calls} image tool call(s) (max_tool_calls)"
+            return {"ok": False, "text": text, "chars": len(text), "truncated": False, "ms": 0, "server": None,
+                    "tool": name, "images": []}
+        self.calls += 1
         args = arguments if isinstance(arguments, dict) else {}
         urls: list[str] = []
         try:

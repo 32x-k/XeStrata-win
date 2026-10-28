@@ -31,7 +31,7 @@ import time
 import uuid
 from typing import Any
 
-from serve.frontend import Event, _late_system_to_user, _order_tool_results, _parts_of, effort_kwargs
+from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs, file_item
 
 ENCRYPTED_PREFIX = "strata.r1:"                   # our own reasoning replay strings; others' are ignored
 HOSTED_TOOLS = ("web_search", "web_search_preview", "file_search", "computer_use_preview", "computer_use",
@@ -83,20 +83,31 @@ def _content(content, param):
                 raise ResponsesError("only images given as image_url (a data: or http(s) URL) are supported; "
                                      "this server keeps no files", f"{param}[{j}]", "unsupported_parameter")
             parts.append({"type": "input_image", "image_url": part["image_url"]})
+        elif kind == "input_file":                   # read into text and page images by Service.expand_files
+            try:
+                file_item(part, f"{param}[{j}]")
+            except ValueError as e:
+                raise ResponsesError(str(e), f"{param}[{j}]", "unsupported_parameter") from None
+            parts.append(part)
         else:
-            raise ResponsesError(f"content parts of type {kind!r} are not supported (text and images are)",
+            raise ResponsesError(f"content parts of type {kind!r} are not supported (text, images and files are)",
                                  f"{param}[{j}].type", "unsupported_parameter")
     return _parts_of(parts)
 
 
 def _reasoning_text(item, param) -> str:
-    """The thinking a reasoning item carries: its reasoning_text content, else our own encrypted_content.  A summary
-    alone, or another server's encrypted_content, carries none that can go back into the prompt."""
+    """The thinking a reasoning item carries: its reasoning_text content, else its summary (all that is known of it
+    when another server's encrypted_content, which this server cannot read, came with it), else our own
+    encrypted_content."""
     texts = [p.get("text") or "" for p in item.get("content") or [] if isinstance(p, dict)
              and p.get("type") in ("reasoning_text", "text")]
     if texts:
         return "".join(texts)
     enc = item.get("encrypted_content")
+    summary = [p.get("text") or "" for p in item.get("summary") or [] if isinstance(p, dict)
+               and p.get("type") == "summary_text"]
+    if summary and not (isinstance(enc, str) and enc.startswith(ENCRYPTED_PREFIX)):
+        return "\n\n".join(summary)                  # a summary alone: what is known of the thinking
     if isinstance(enc, str) and enc.startswith(ENCRYPTED_PREFIX):
         try:
             return json.loads(base64.b64decode(enc[len(ENCRYPTED_PREFIX):], validate=True).decode("utf-8"))["text"]
@@ -223,6 +234,17 @@ def input_messages(req: dict, keep_image=None) -> list[dict]:
             messages.append({"role": "tool", "content": text, "_call_id": item.get("id")})
             open_turn = None
             thinking.clear()
+        elif isinstance(kind, str) and kind in HOSTED_ITEMS:
+            # a hosted tool's call or result from an earlier answer (another server ran it): what it did and found,
+            # as text, so the conversation goes on (this server cannot run the tool again)
+            note = _hosted_note(item)
+            if HOSTED_ITEMS[kind] == "assistant":
+                target = open_turn if open_turn is not None and not thinking else turn()
+                target["content"] = (target["content"] + "\n\n" if target["content"] else "") + note
+            else:
+                open_turn = None
+                thinking.clear()
+                messages.append({"role": "user", "content": note})
         elif kind == "additional_tools":
             continue                                 # #782 (Codex): tools added as an input item; see request_tools
         elif kind == "item_reference":
@@ -240,6 +262,80 @@ def input_messages(req: dict, keep_image=None) -> list[dict]:
     if lead > 1:
         messages[:lead] = [{"role": "system", "content": "\n\n".join(m["content"] for m in messages[:lead])}]
     return _late_system_to_user(messages)
+
+
+# OpenAI's hosted tools' input items, read back as text: who said it (the model's calls; the results a client sends)
+HOSTED_ITEMS = {"web_search_call": "assistant", "file_search_call": "assistant", "code_interpreter_call": "assistant",
+                "computer_call": "assistant", "local_shell_call": "assistant", "mcp_call": "assistant",
+                "mcp_list_tools": "assistant", "mcp_approval_request": "assistant", "tool_search_call": "assistant",
+                "computer_call_output": "user", "local_shell_call_output": "user", "mcp_approval_response": "user",
+                "tool_search_output": "user"}
+
+
+def _hosted_note(item: dict) -> str:
+    """A hosted tool's item as one line of text: its type and its fields (not its id or status; a data: URL, a
+    screenshot, is named, not copied)."""
+    def short(v):
+        if isinstance(v, str) and v.startswith("data:"):
+            return "(" + v[5:v.find(";")] + " data)" if ";" in v else "(data)"
+        if isinstance(v, dict):
+            return {k: short(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [short(x) for x in v]
+        return v
+    fields = {k: short(v) for k, v in item.items() if k not in ("id", "type", "status")}
+    return f"[{item['type']}] " + json.dumps(fields, ensure_ascii=False)
+
+
+VERBOSITY = {"low": "Keep your answer brief and to the point.",
+             "high": "Give a thorough, detailed answer."}
+
+
+def verbosity_messages(req: dict, messages: list[dict]) -> list[dict]:
+    """text.verbosity "low" / "high": one sentence asking for it, after the system message's own text (what the
+    request says itself is kept as it is).  "medium" and none leave the messages as they are."""
+    text = req.get("text")
+    want = VERBOSITY.get(str(text.get("verbosity"))) if isinstance(text, dict) else None
+    if want is None:
+        return messages
+    if messages and messages[0]["role"] == "system" and isinstance(messages[0]["content"], str):
+        return [{**messages[0], "content": messages[0]["content"] + "\n\n" + want}] + messages[1:]
+    return [{"role": "system", "content": want}] + messages
+
+
+def drop_oldest(messages: list[dict]) -> list[dict] | None:
+    """truncation "auto": the conversation without its oldest item - after the system message (the instructions
+    stay), a turn that calls tools goes with its results - or None when only the last message is left."""
+    lead = 1 if messages and messages[0]["role"] == "system" else 0
+    if len(messages) - lead <= 1:
+        return None
+    out = messages[:lead] + messages[lead + 1:]
+    while len(out) - lead > 1 and out[lead]["role"] == "tool":
+        del out[lead]                                # the results of the call that went
+    return out
+
+
+def _order_tool_results(messages):
+    """The template places tool results by position: each run of tool messages is put in the order of the calls of
+    the assistant turn before it (a client may send the results in the order they finished), then the private call
+    ids are dropped."""
+    i = 0
+    while i < len(messages):
+        if messages[i]["role"] != "tool":
+            i += 1
+            continue
+        j = i
+        while j < len(messages) and messages[j]["role"] == "tool":
+            j += 1
+        prev = messages[i - 1] if i else {}
+        order = [c.get("_call_id") for c in prev.get("tool_calls") or []]
+        rank = {cid: k for k, cid in enumerate(order) if cid}
+        messages[i:j] = sorted(messages[i:j], key=lambda m: rank.get(m.get("_call_id"), len(order)))
+        i = j
+    for m in messages:
+        m.pop("_call_id", None)
+        for c in m.get("tool_calls") or []:
+            c.pop("_call_id", None)
 
 
 def request_tools(req: dict):
@@ -500,6 +596,10 @@ class Assembler:
         self.called = False                          # a tool call was made: this turn is not the final answer
         r = req.get("reasoning")
         reasoning: dict = r if isinstance(r, dict) else {}
+        # reasoning.summary asked: the thinking is also given as the reasoning item's summary (this model writes no
+        # separate summary), with the reasoning_summary_* events
+        self.summary = reasoning.get("summary") in ("auto", "concise", "detailed")
+        self.spell = None                            # text -> its tokens' logprobs entries (include asks for them)
         self.response = {
             "id": new_id("resp"), "object": "response", "created_at": int(time.time()), "status": "in_progress",
             "background": False, "error": None, "incomplete_details": None,
@@ -510,7 +610,8 @@ class Assembler:
             "store": False, "temperature": req.get("temperature"),
             "text": req.get("text") if isinstance(req.get("text"), dict) else {"format": {"type": "text"}},
             "tool_choice": req.get("tool_choice", "auto"), "tools": req.get("tools") or [],
-            "top_p": req.get("top_p"), "truncation": "disabled", "usage": None, "user": None,
+            "top_p": req.get("top_p"), "truncation": req.get("truncation") or "disabled", "usage": None, "user": None,
+            **({"max_tool_calls": req["max_tool_calls"]} if req.get("max_tool_calls") is not None else {}),
             "metadata": req.get("metadata") or {}}
 
     # --- events
@@ -539,6 +640,14 @@ class Assembler:
             item["content"].append(part)
             out.append(self.event("response.content_part.added", item_id=item["id"], output_index=self.index,
                                   content_index=0, part=copy.deepcopy(part)))
+        elif item["type"] == "reasoning":
+            out.append(self.event("response.content_part.added", item_id=item["id"], output_index=self.index,
+                                  content_index=0, part=copy.deepcopy(item["content"][0])))
+            if self.summary:
+                item["summary"].append({"type": "summary_text", "text": ""})
+                out.append(self.event("response.reasoning_summary_part.added", item_id=item["id"],
+                                      output_index=self.index, summary_index=0,
+                                      part={"type": "summary_text", "text": ""}))
         return out
 
     @property
@@ -555,13 +664,21 @@ class Assembler:
         if item["type"] == "message":
             part = item["content"][0]
             out += [self.event("response.output_text.done", item_id=item["id"], output_index=at, content_index=0,
-                               text=part["text"], logprobs=[]),
+                               text=part["text"], logprobs=part["logprobs"]),
                     self.event("response.content_part.done", item_id=item["id"], output_index=at, content_index=0,
                                part=copy.deepcopy(part))]
         elif item["type"] == "reasoning":
             text = item["content"][0]["text"]
             out.append(self.event("response.reasoning_text.done", item_id=item["id"], output_index=at,
                                   content_index=0, text=text))
+            out.append(self.event("response.content_part.done", item_id=item["id"], output_index=at, content_index=0,
+                                  part=copy.deepcopy(item["content"][0])))
+            if self.summary:
+                part = item["summary"][0]
+                out += [self.event("response.reasoning_summary_text.done", item_id=item["id"], output_index=at,
+                                   summary_index=0, text=part["text"]),
+                        self.event("response.reasoning_summary_part.done", item_id=item["id"], output_index=at,
+                                   summary_index=0, part=copy.deepcopy(part))]
             if self.encrypted:
                 item["encrypted_content"] = ENCRYPTED_PREFIX + base64.b64encode(
                     json.dumps({"text": text}, ensure_ascii=False).encode("utf-8")).decode("ascii")
@@ -585,8 +702,14 @@ class Assembler:
                 out += self._open({"id": new_id("rs"), "type": "reasoning", "status": "in_progress", "summary": [],
                                    "content": [{"type": "reasoning_text", "text": ""}]})
             self.item["content"][0]["text"] += ev.text
+            if self.spell is not None:
+                self.spell(ev.text)                  # the thinking's tokens: read past, not listed
             out.append(self.event("response.reasoning_text.delta", item_id=self.item["id"], output_index=self.index,
                                   content_index=0, delta=ev.text))
+            if self.summary:
+                self.item["summary"][0]["text"] += ev.text
+                out.append(self.event("response.reasoning_summary_text.delta", item_id=self.item["id"],
+                                      output_index=self.index, summary_index=0, delta=ev.text))
         elif kind == "content":
             if not ev.text:
                 return out
@@ -599,8 +722,10 @@ class Assembler:
                 out += self._open({"id": new_id("msg"), "type": "message", "status": "in_progress",
                                    "role": "assistant", "content": []})
             self.item["content"][0]["text"] += ev.text
+            lps: list = (self.spell(ev.text) or []) if self.spell is not None else []
+            self.item["content"][0]["logprobs"] += lps
             out.append(self.event("response.output_text.delta", item_id=self.item["id"], output_index=self.index,
-                                  content_index=0, delta=ev.text, logprobs=[]))
+                                  content_index=0, delta=ev.text, logprobs=lps))
         elif kind == "tool_start":
             out += self.close()
             out += self._call_started()
@@ -731,6 +856,10 @@ class Assembler:
         if done.get("timings"):
             event["timings"] = done["timings"]
         return event
+
+    def error(self, message: str, code: str = "server_error") -> dict:
+        """The error event that comes before response.failed in a stream that fails after it started."""
+        return self.event("error", code=code, message=message, param=None)
 
     def failed(self, message: str, code: str = "server_error") -> dict:
         """response.failed: an error after the stream started (the HTTP status is already sent)."""

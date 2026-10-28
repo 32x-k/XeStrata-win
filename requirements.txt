@@ -15,6 +15,10 @@ tqdm==4.70.1
 requests==2.34.2
 pillow==12.3.0
 psutil==7.2.2
+# a PDF a request sends, on Windows (Linux reads it with poppler-utils, a distribution package): its text
+# (BSD-3-Clause) and its pages as pictures (Apache-2.0 / BSD-3-Clause; PDFium's licenses are in the wheel)
+pypdf==6.20.1; sys_platform == "win32"
+pypdfium2==5.14.0; sys_platform == "win32"
 
 # their dependencies
 markupsafe==3.0.3
@@ -22,3 +26,4 @@ certifi==2026.10.19
 charset-normalizer==3.5.1
 idna==3.20
 urllib3==2.8.0
+typing_extensions==4.16.0; python_version < "3.11" and sys_platform == "win32"

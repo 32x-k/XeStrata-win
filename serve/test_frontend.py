@@ -91,24 +91,23 @@ class UnreadContentParts(unittest.TestCase):
         tok = ByteTokenizer()
         self.service = Service(MockEngine(tok, "ok"), tok, self.template)
 
-    def test_chat_file_and_audio_parts_are_left_out(self):
-        parts = ({"type": "file", "file": {"filename": "a.pdf", "file_data": "data:application/pdf;base64,AA"}},
-                 {"type": "input_audio", "input_audio": {"data": "AA", "format": "wav"}})
-        for part in parts:
-            with self.subTest(kind=part["type"]):
-                got = openai_to_messages({"messages": [
-                    {"role": "user", "content": "summarize"},
-                    {"role": "user", "content": [{"type": "text", "text": "this one"}, part]}]})
-                want = openai_to_messages({"messages": [
-                    {"role": "user", "content": "summarize"},
-                    {"role": "user", "content": [{"type": "text", "text": "this one"}]}]})
-                self.assertEqual(got, want)
+    def test_chat_file_part_is_kept_and_audio_refused(self):
+        audio = {"type": "input_audio", "input_audio": {"data": "AA", "format": "wav"}}
+        with self.assertRaisesRegex(ValueError, "input_audio"):   # the model reads no audio: a 400, as OpenAI's
+            openai_to_messages({"messages": [{"role": "user", "content": [{"type": "text", "text": "this"}, audio]}]})
+        # a file stays in the content as a "file" item, which Service.expand_files reads into text and pages
+        part = {"type": "file", "file": {"filename": "a.pdf", "file_data": "data:application/pdf;base64,AA"}}
+        got = openai_to_messages({"messages": [{"role": "user", "content": [{"type": "text", "text": "this"}, part]}]})
+        self.assertEqual(got[0][0]["content"][1], {"type": "file", "data": "data:application/pdf;base64,AA",
+                                                   "url": None, "name": "a.pdf", "mime": "application/pdf"})
+        with self.assertRaisesRegex(ValueError, "file_id"):       # no Files API here
+            only_id = {"type": "file", "file": {"file_id": "f"}}
+            openai_to_messages({"messages": [{"role": "user", "content": [only_id]}]})
 
     def test_messages_blocks_real_clients_send_are_left_out(self):
-        # tool_reference (Claude Code's tool search), documents, search results, server tool blocks, signed thinking
-        extra = [{"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "AA"}},
-                 {"type": "search_result", "source": "s", "title": "t", "content": [{"type": "text", "text": "x"}]},
-                 {"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {}},
+        # tool_reference (Claude Code's tool search), server tool blocks, signed thinking (documents and search
+        # results are read: _anthropic_documents)
+        extra = [{"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {}},
                  {"type": "web_search_tool_result", "tool_use_id": "s1", "content": []},
                  {"type": "container_upload", "file_id": "f"}]
         for block in extra:

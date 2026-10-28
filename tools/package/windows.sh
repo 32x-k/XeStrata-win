@@ -149,7 +149,10 @@ done
 # libraries xestrata --setup names (the embeddable distribution has neither pip nor ensurepip)
 curl -fsSL -o "/build/python-$python_ver-embed-amd64.zip" \
   "https://www.python.org/ftp/python/$python_ver/python-$python_ver-embed-amd64.zip"
-cp "$src/requirements.txt" /build/requirements.txt
+# the lines only Windows takes (pypdf, pypdfium2: a PDF a request sends) without their marker: pip evaluates markers
+# on this Linux, not on the --platform it downloads for
+sed -E 's/;[[:space:]]*sys_platform == "win32"$//; s/[[:space:]]+and sys_platform == "win32"$//' \
+  "$src/requirements.txt" > /build/requirements.txt
 printf 'colorama\npip\n' >> /build/requirements.txt
 pyver=$(echo "$python_ver" | cut -d. -f1-2)
 python3 -m pip download -q --only-binary=:all: --platform win_amd64 --python-version "$pyver" --implementation cp \
