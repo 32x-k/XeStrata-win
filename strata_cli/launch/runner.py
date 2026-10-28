@@ -1775,7 +1775,7 @@ class Runner:
             self.emit("start", f"Loading the model… {int(time.monotonic() - t0)} s", None)
         if "e" in box:
             self.end_failed_start()
-            raise LaunchError(f"The server could not start: {box['e']}", _log_hint(self.config_path), 6)
+            raise LaunchError(f"The server could not start: {box['e']}", _log_hint(self.config_path, box["e"]), 6)
         r = box["r"]
         if not r.get("ok"):
             text, nxt = explain_engine_exit(r, self.config_path, marks=self._marks, server_log=self.server_log_path())
@@ -2390,14 +2390,35 @@ def explain_engine_exit(result: dict, config: Path | None, marks: dict | None = 
     if not text.endswith((".", "!")):
         text += "."
     step = HSA_START_NEXT if hsa else next((words for pattern, words in KNOWN_CAUSES if pattern.search(" ".join([cause, str(why or "")]))), "Run it again; if it repeats, report the log.")
-    return text, step + (f" The engine's log: {log}" if log else " The engine's log has the reason (strata logs, or the log named in the run config).")
+    return text, step + _log_sentence(log)
 
 
-def _log_hint(config: Path | None) -> str:
+def _log_sentence(log: str | None) -> str:
+    """The sentence that points at the engine's log. A log that does not exist is not pointed at: a start that stopped before the engine
+    existed (a profile whose runtime is still live, a missing engine package) never wrote one (#3714)."""
+    if log and os.path.isfile(log):
+        return f" The engine's log: {log}"
+    if log:
+        return " The engine did not get as far as writing its log, so the reason is in the lines above (`strata logs` has the server's own)."
+    return " The engine's log has the reason (strata logs, or the log named in the run config)."
+
+
+#: what the runtime says when another host still owns the profile: the start never began, so there is no engine log to read.
+PROFILE_BUSY = re.compile(r"already has a live managed runtime", re.I)
+
+
+def _log_hint(config: Path | None, error: object = None) -> str:
+    if PROFILE_BUSY.search(str(error or "")):
+        return ("Another Strata server for this preset is still running or starting, so this start never began and there is no engine log for it. "
+                "Run the command again; if it repeats, `strata launch --stop` ends the other server first.")
     log = None
     if config:
         try:
             log = read_config(config).get("log")
         except (OSError, ValueError):
             log = None
-    return f"The engine's log has the reason: {log}" if log else "The engine's log has the reason (strata logs, or the log named in the run config)."
+    if log and os.path.isfile(log):
+        return f"The engine's log has the reason: {log}"
+    if log:
+        return "The engine did not get as far as writing its log, so the reason is the message above (`strata logs` has the server's own)."
+    return "The engine's log has the reason (strata logs, or the log named in the run config)."
