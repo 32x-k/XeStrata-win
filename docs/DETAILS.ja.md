@@ -1315,7 +1315,7 @@ Monitor のタブの最近の要求の一覧は、prefill の速さ（`Prefill t
 PDF は、ページごとの文と、モデルが画像を読めるとき（vision を入れた設定）は各ページの画像を、ページの順に入れます。
 文のファイル（`text/*`、JSON、XML、YAML など。UTF-8）は、その文を入れます。
 1 つのファイルは 32 MiB まで、PDF は 100 ページまでで、ほかの形式、暗号化された PDF、壊れた PDF、`file_id`（Files API）は 400 です。
-deb・rpm のパッケージでは、ディストリビューションに pypdfium2 がないので、PDF は文だけを読みます。
+PDF は、Linux では poppler の `pdftotext` と `pdftoppm` で、Windows では 7z に入っている pypdf と pypdfium2 で読みます。Linux で poppler がなければ PDF は 400 で、入れ方は `xestrata --setup` が示します。
 
 **Chat Completions**:
 

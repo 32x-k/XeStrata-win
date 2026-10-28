@@ -1347,7 +1347,7 @@ A refusal while the engine starts (and the like) is a 503 on OpenAI's routes and
 A PDF goes in as its text page by page and, when the model reads pictures (a setup with vision), each page as a picture, in page order.
 A text file (`text/*`, JSON, XML, YAML, ...; UTF-8) goes in as its text.
 A file is read up to 32 MiB and a PDF up to 100 pages; another format, an encrypted or broken PDF, and a `file_id` (the Files API) are a 400.
-The deb and rpm packages read a PDF's text only: the distributions have no pypdfium2.
+On Linux a PDF is read with poppler's `pdftotext` and `pdftoppm`, on Windows with pypdf and pypdfium2, which the 7z carries. On Linux without poppler a PDF is a 400; `xestrata --setup` says how to install it.
 
 **Chat Completions**:
 
