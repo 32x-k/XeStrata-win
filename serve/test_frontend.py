@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 from serve.frontend import (HARMONY_NO_THINKING, HARMONY_TURN, ChatTemplate, anthropic_to_messages, effort_kwargs,
-                            openai_to_messages, require_messages)
+                            legacy_functions, openai_to_messages, require_messages)
 from serve.server import ByteTokenizer, MockEngine, Service
 
 
@@ -121,6 +121,13 @@ class UnreadContentParts(unittest.TestCase):
                     {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
                     {"role": "user", "content": [{"type": "text", "text": "go"}]}]})
                 self.assertEqual(got, want)
+
+    def test_function_call_none_or_null_without_functions(self):
+        # a null is no field, and function_call "none" without functions is OpenAI's default: an ordinary request
+        for req in ({"function_call": "none"}, {"functions": None, "function_call": None}, {"functions": None}):
+            self.assertIsNone(legacy_functions({"messages": [], **req}), req)
+        with self.assertRaisesRegex(ValueError, "functions must be"):
+            legacy_functions({"function_call": "auto"})
 
     def test_messages_document_images_are_read(self):
         # a "content" document's images reach the model as the message's own images do, after its text

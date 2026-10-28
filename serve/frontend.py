@@ -1160,16 +1160,16 @@ def allowed_tools(tool_choice, tools: list[dict] | None, more: dict | None = Non
 
 def legacy_functions(req: dict) -> dict | None:
     """OpenAI's deprecated `functions` and `function_call` (before tools) -> the request with `tools` and `tool_choice`
-    in their place and one call at a time (the old shape answers with one), or None when it has neither.  Mixed with
-    tools or tool_choice, or a function_call without functions, it is a 400."""
-    if "functions" not in req and "function_call" not in req:
+    in their place and one call at a time (the old shape answers with one), or None when it asks for neither (a null
+    is no field, and function_call "none" without functions is the default).  Mixed with tools or tool_choice, or a
+    function_call "auto" or name without functions, it is a 400."""
+    fns, choice = req.get("functions"), req.get("function_call")
+    if fns is None and choice in (None, "none"):
         return None
     if req.get("tools") is not None or req.get("tool_choice") is not None:
         raise ValueError("functions and function_call cannot be used with tools or tool_choice")
-    fns = req.get("functions")
     if not isinstance(fns, list) or not fns or not all(isinstance(f, dict) for f in fns):
         raise ValueError("functions must be a non-empty array of function objects")
-    choice = req.get("function_call")
     if isinstance(choice, dict) and isinstance(choice.get("name"), str):
         choice = {"type": "function", "function": {"name": choice["name"]}}
     elif choice not in (None, "none", "auto"):
