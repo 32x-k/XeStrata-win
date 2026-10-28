@@ -10,7 +10,7 @@ This document records how XeStrata's engine runs on Intel GPUs and how that was 
 How to use it is in the [README](../README.md) and the [details](DETAILS.md); how to build it, what setup does and the packages it needs, in [BUILD](BUILD.md).
 The Japanese version ([XE.ja.md](XE.ja.md)) is the original; this is its translation.
 
-XeStrata xe0.2.7-1 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version is the upstream version it has integrated and the count of XeStrata's releases on it, from 1, joined by a hyphen (xe0.2.6-1; on an upstream pre-release such as the beta, the deb and rpm packages take "~" for its "-": xe0.2.0-beta-1 is 0.2.0~beta-1, a version before the release 0.2.0-1, which upgrades it; releases before 2026-10-13 added a number from the second one on: xe0.1.40.2.1).
+XeStrata xe0.2.7-1 runs Strata's engine on Intel GPUs through Level Zero and SYCL; its version is the upstream version it has integrated and the count of XeStrata's releases on it, from 1, joined by a hyphen (xe0.2.7-1; on an upstream pre-release such as the beta, the deb and rpm packages take "~" for its "-": xe0.2.0-beta-1 is 0.2.0~beta-1, a version before the release 0.2.0-1, which upgrades it; releases before 2026-10-13 added a number from the second one on: xe0.1.40.2.1).
 It is ported from Strata 0.1.24 (`3ce2523c2823687de5372be3af58534f56cbf286`) and carries part of the changes up to 0.1.39 (`6f32ec07`)
 ([Integration through Strata 0.1.38](#integration-through-strata-0138)).
 The same SYCL code is compiled with intel/llvm for NVIDIA GPUs as well (the contrib-llvm build, [Build and run](BUILD.md#build-and-run)).
@@ -29,6 +29,34 @@ A smaller card is checked by making the B70 look like one.
 `STRATA_VRAM_LIMIT_MIB` caps the VRAM the engine sees, `STRATA_MAX_ALLOC_MIB` the largest allocation it assumes, and
 `STRATA_NO_XMX=1` takes the paths without the matrix engines.
 The processor's own graphics (a UHD 770 on the development machine) is a second, real configuration for checks.
+
+## Integration through Strata 0.2.7
+
+The changes of upstream Strata 0.2.6 to 0.2.7 (`5e8a4cca`) are carried into Xe.
+Most of upstream's changes in this range are DeepSeek V4.1-Flash (left for later work), the app, the Terminal, Docker and the Mac, which are not taken.
+
+What is taken:
+
+- The conversation cache: retained K/V is reused only for the conversation it was read for; an idle batch slot's decoded conversation is parked before an admission overwrites it; a checkpoint whose copy runs out of memory is skipped and the request goes on.
+- Under `--serve`, when the link to the GPU probes below 12 GB/s, the conversation cache's copies move to background threads and VRAM stages (`STRATA_CKPT_ASYNC`, `STRATA_CKPT_GATHER`, `STRATA_PARK_ASYNC`; opt-in upstream). On the RTX 4070 (6.4 GB/s) a follow-up waits 201 ms instead of 226; on the B70 (28 GB/s) it is slower, so they stay off there.
+- Route prior: on one GPU whose expert cache holds less than 20% of the model's experts, `STRATA_ROUTE_PRIOR=1.5` is set by itself (it changes the answers; `STRATA_ROUTE_PRIOR=0` turns it off). Upstream made it the default on NVIDIA cards of 13 GiB or less; XeStrata decides by the share the cache holds. The serve path decodes 6-77% faster on the RTX 4070 (15%) and 15-80% on the B70 limited to 12 GiB (11%), and 2-18% slower on the RX 9060 XT (25%).
+- Serve: OpenAI `logprobs`, `top_logprobs` and `allowed_token_ids`; timings and `max_output_tokens` of 0 and -1 on `/v1/responses`; IPv6 bind addresses; tool results in the order of their calls; a call to an undeclared name named in the reply; Codex's namespace spellings; LaTeX-safe recovery of structured output (opt-in); 503 when the picture encoder cannot start; one final reply without tools at the MCP tool-round limit; MCP tool pictures (opt-in); split serving (prefill and decode on different GPUs, opt-in).
+- The web page: the chat history redone (saved chats, edit and rewind, branches, sending while answering), nine languages (the browser's language by default), KaTeX math (opt-in, `third_party/main/katex/`), svg and html previews, Load and Unload buttons, wide windows, a Timeout badge for the queue.
+- Setup and tools: the `--rope-scale` check, the published size when the download length cannot be probed, caps on the worker count and the picture encoder's threads, calibration dropping only a candidate whose engine died, bounded reads in `gguf_reader.py`, and NVIDIA GPUs older than Pascal told why they cannot be used.
+- Engine fixes: no hang after a failed PLE read, no per-part allocations after the prefill's region cannot be had, the `--adapt-decay` range, `STRATA_TRACE` times, and the decode timing line's parts.
+- Taken as opt-in (not faster on XeStrata's three makers' GPUs): the PLE table resident in RAM (`STRATA_PLE_AUTO_RAM=1`; on the B70 a 32K prompt no longer finished), swiglu fused with the q8 quantization (`STRATA_SWIGLU_QUANT=1`), the layer-major prefill (`STRATA_PREFILL_LAYER_MAJOR=1`), the DeltaNet recurrence on matrix units (`STRATA_GDN_TC=1`, changes the answers), KVA (`STRATA_KVA=1`, changes the answers, [KVA](KVA.md)), `STRATA_EMBED_VRAM`, `STRATA_PLE_COMPACT`, `STRATA_PLE_COPY_STREAM`, `STRATA_DEQUANT_SIDE`, the pipelined batch groups' `STRATA_PIPED_MTP` and `STRATA_PIPE_ADAPT_EVERY`, the `STRATA_RAM_ADAPT` change and GP100's `STRATA_DOWN_WS`.
+- Two NVIDIA cards run `--batch` in pipelined groups again (one serial group with `STRATA_BATCH_GROUPS_NV_SERIAL=1`).
+
+Compared with upstream v0.2.7 on the three makers' GPUs (the B70 and the RTX 4070: generate for every type, and the IQ3_XXS serve path and everyday use; the RX 9060 XT: IQ3_XXS and Gyro-M).
+On IQ3_XXS through generate, the B70 reads prompts 1.8 to 3.0 times and decodes 36 to 64% faster than upstream's `sycl/` port; on the other types at 32K, prompts 1.6 to 1.9 times and decode from 25% to 3.2 times faster (UD-Q4_K_XL's prompt was not measured right: the run came just after a start with the file out of the page cache).
+The RTX 4070 reads IQ3_XXS prompts 16 to 74% and decodes 0 to 23% faster, and on the other types at 32K prompts 8 to 43% and decode 1 to 24% faster. The RX 9060 XT reads IQ3_XXS prompts 2.6 to 2.8 times and decodes 3 to 20% faster.
+Through serve, prompts are read 1.8 to 2.9 times faster on the B70, 1.17 to 1.73 times on the RTX 4070 and 1.8 to 2.6 times on the RX 9060 XT. The serve decode is 33 to 64% faster on the B70, -4 to +12% on the RX 9060 XT and -14 to +41% on the RTX 4070 (the slower cells are one run each at temperature 0.7 and 32K). In everyday use (chat-ja, chat-en and the agent), all three GPUs are faster than upstream in the time to the first token, the prompt and the output.
+
+Not taken: DeepSeek V4.1-Flash, the app and the Terminal, Docker, the Mac, upstream's `sycl/`,
+gfx12's default decode miss split (`--pcie-frac 0.15`: prompts 4-30% slower on the RX 9060 XT, and XeStrata splits by the measured link),
+the gated speculative proposal (`STRATA_SPEC_PROB`: its probabilistic acceptance was not taken in 0.1.40),
+CUDA's per-architecture tables and fused kernels (the sm_80 and sm_89 MMVQ-IL tables, the wide hyper-connection read, the fused IQ prompt experts),
+GP100's weight-stationary MMQ and 4-bit expert format (experimental and large), and the hipBLASLt and `STRATA_SH_STREAM` entries.
 
 ## Integration through Strata 0.2.6
 
@@ -308,7 +336,7 @@ They were carried one by one by hand.
 The main ones:
 
 - On serve's decode, `STRATA_ROUTE_TAIL_SKIP=7` (default): a missed expert a token routes at rank 7 or lower contributes zero to that token (decided for each token, not for the window), and one that every token of a verify window routes that low is neither read nor computed. Upstream keeps it off on HIP; XeStrata measured the KL, a task check and the speed again on the three makers' GPUs and turned it on for all of them.
-- `STRATA_ROUTE_RESIDENT` (opt-in) and `STRATA_ROUTE_PRIOR` (1.5 by itself on one GPU whose cache holds less than 35% of the experts), which lean a verify window's routing towards the experts in VRAM; they change the answers.
+- `STRATA_ROUTE_RESIDENT` (opt-in) and `STRATA_ROUTE_PRIOR` (1.5 by itself on one GPU whose cache holds less than 20% of the experts), which lean a verify window's routing towards the experts in VRAM; they change the answers.
 - The prefill CPU share's extension (experts in RAM that is not page-locked as well) and the rule that leaves it off by default when every expert is in VRAM or memory is short.
 - `--aux-cpus` (opt-in), `--ple-io direct` falling back to mmap when it measures slow, the stager's RAM profile, the embedding buffer's reuse.
 - The memory guard (the cgroup limit and `--memory-limit-mib`), `--conversation-cache-min-tokens`, `--session-save-reclaim`, `logit_bias`, `strata --version`.

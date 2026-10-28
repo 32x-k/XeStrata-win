@@ -32,6 +32,34 @@ Qwen3.8 の prompt は、xmx_gemm が動く GPU では FP16 の経路のまま�
 `STRATA_NO_XMX=1` は XMX を使わない経路を選ばせます。
 CPU 内蔵のグラフィックス（開発機では UHD 770）は、確認用の 2 つ目の実機として使います。
 
+## Strata 0.2.7 の取り込み
+
+upstream の Strata 0.2.6 から 0.2.7（`5e8a4cca`）までの変更を Xe に移しています。
+この間の upstream の変更の多くは、DeepSeek V4.1-Flash への対応（後の作業に回しました）、アプリ・ターミナル・Docker・Mac のもので、移していません。
+
+移したものは次のとおりです。
+
+- 会話のキャッシュ: 残しておいた K/V を、それを読んだ会話にしか使わない。空いたバッチの枠が decode した会話を、受け入れで上書きする前に退避する。チェックポイントの写しがメモリ不足のときは、そのチェックポイントを飛ばして要求を続ける。
+- `--serve` で GPU とのリンクが 12 GB/s に満たないときは、会話のキャッシュの写しを裏のスレッドと VRAM の段に移す（`STRATA_CKPT_ASYNC`・`STRATA_CKPT_GATHER`・`STRATA_PARK_ASYNC`。upstream では opt-in）。RTX 4070（6.4 GB/s）では続きの要求の待ちが 226 → 201 ms になり、B70（28 GB/s）では遅くなるので入れません。
+- route prior: GPU 1 枚で、エキスパートのキャッシュに載る枠がモデルのエキスパートの 20% に満たないときは `STRATA_ROUTE_PRIOR=1.5` を自分で入れる（答えが変わる。`STRATA_ROUTE_PRIOR=0` で切れる）。upstream は 13 GiB 以下の NVIDIA のカードで既定にしましたが、XeStrata ではキャッシュに載る割合で決めます。serve の decode は RTX 4070（15%）で 6〜77%、VRAM を 12 GiB に絞った B70（11%）で 15〜80% 速く、RX 9060 XT（25%）では 2〜18% 遅くなります。
+- serve: OpenAI の `logprobs`・`top_logprobs`・`allowed_token_ids`、`/v1/responses` の timings と `max_output_tokens` の 0・−1、IPv6 で待ち受ける、ツールの結果を呼び出しの順に並べる、宣言のない名前の呼び出しを名指しする、Codex の名前空間の綴り、構造化出力の LaTeX の回復（opt-in）、画像のエンコーダーが起きないときの 503、MCP のツールの回数の上限で最後に 1 回答える、MCP のツールの画像（opt-in）、split serving（prefill と decode を別の GPU で、opt-in）。
+- Web ページ: 会話の履歴の作り直し（保存・編集と巻き戻し・枝分かれ・答えている間の送信）、9 言語の訳（既定はブラウザーの言語）、KaTeX の数式（opt-in、`third_party/main/katex/`）、svg・html のプレビュー、読み込み・解放のボタン、広い画面、待ち行列の Timeout の印。
+- setup と道具: `--rope-scale` の検査、ダウンロードの長さが取れないときの公開の大きさ、ワーカー数と画像のエンコーダーのスレッドの上限、calibrate で途中で死んだ候補だけを外す、`gguf_reader.py` の読みの上限、Maxwell 以前の NVIDIA の GPU に使えない理由を言う。
+- エンジンの修正: PLE の読みの失敗の後に止まらない、prefill の領域が取れないときに部分ごとに確保しに行かない、`--adapt-decay` の範囲、`STRATA_TRACE` の時刻、decode の時間の行の内訳。
+- opt-in のまま移したもの（XeStrata の 3 社の GPU で速くならなかったもの）: PLE の表を RAM に置く判定（`STRATA_PLE_AUTO_RAM=1`。B70 では 32K が完走しなくなった）、swiglu と q8 の量子化の融合（`STRATA_SWIGLU_QUANT=1`）、layer-major の prefill（`STRATA_PREFILL_LAYER_MAJOR=1`）、DeltaNet の再帰を行列ユニットで（`STRATA_GDN_TC=1`、答えが変わる）、KVA（`STRATA_KVA=1`、答えが変わる、[KVA](KVA.ja.md)）、`STRATA_EMBED_VRAM`・`STRATA_PLE_COMPACT`・`STRATA_PLE_COPY_STREAM`・`STRATA_DEQUANT_SIDE`、流れ作業のバッチの組の `STRATA_PIPED_MTP`・`STRATA_PIPE_ADAPT_EVERY`、`STRATA_RAM_ADAPT` の改良、GP100 の `STRATA_DOWN_WS`。
+- 2 枚の NVIDIA の `--batch` は、流れ作業の組に戻しました（直列の組は `STRATA_BATCH_GROUPS_NV_SERIAL=1`）。
+
+upstream v0.2.7 と 3 社の GPU で比べました（B70 は全部の型の generate と IQ3_XXS の serve・通常使用、RTX 4070 も同じ、RX 9060 XT は IQ3_XXS と Gyro-M）。
+IQ3_XXS の generate では、B70 は upstream の `sycl/` 版より prefill が 1.8〜3.0 倍、decode が 36〜64% 速いです。ほかの型の 32K では prefill が 1.6〜1.9 倍、decode が 25% から 3.2 倍まで速いです（UD-Q4_K_XL の prefill は、ファイルがページキャッシュに載っていない起動直後の回で測れていません）。
+RTX 4070 は IQ3_XXS の prefill が 16〜74%、decode が 0〜23% 速く、ほかの型の 32K では prefill が 8〜43%、decode が 1〜24% 速いです。RX 9060 XT は IQ3_XXS の prefill が 2.6〜2.8 倍、decode が 3〜20% 速いです。
+serve の prompt は B70 で 1.8〜2.9 倍、RTX 4070 で 1.17〜1.73 倍、RX 9060 XT で 1.8〜2.6 倍速いです。serve の decode は B70 で 33〜64%、RX 9060 XT で −4〜+12%、RTX 4070 で −14〜+41% です（遅いのはどちらも温度 0.7 の 32K の 1 回だけです）。通常使用（chat-ja、chat-en、エージェント）では、3 枚とも最初のトークンまで、prompt、出力のどれも upstream より速いです。
+
+移していないのは、DeepSeek V4.1-Flash への対応、アプリとターミナル、Docker、Mac、upstream の `sycl/`、
+gfx12 の decode の取りこぼしの分け方の既定（`--pcie-frac 0.15`。RX 9060 XT で prompt が 4〜30% 遅く、XeStrata はリンクを測って分けます）、
+推測の確からしさの門（`STRATA_SPEC_PROB`。前提の確率的な受理を 0.1.40 で取らなかったため）、
+CUDA の機種別の表と融合カーネル（sm_80・sm_89 の MMVQ-IL の表、hyper-connection の広い読み、prompt の融合した IQ のエキスパート）、
+GP100 の weight-stationary の MMQ と 4 ビットのエキスパートの形式（試験的で大きい）、hipBLASLt と `STRATA_SH_STREAM` の項目です。
+
 ## Strata 0.2.6 の取り込み
 
 upstream の Strata 0.2.2 から 0.2.6（`4b9e05a2`）までの変更を Xe に移しています。
@@ -294,7 +322,7 @@ upstream の Strata 0.1.40.2 から 0.1.42（`61b3fb5d`）までの変更（0.1.
 移したものの主なものは次のとおりです。
 
 - serve の decode で、外れのエキスパートを順位 7 以下で選んだトークンではその寄与を 0 にし（窓ではなくトークンごとに決める）、検証の窓のどのトークンもその順位でしか選ばないものは読まず計算もしない `STRATA_ROUTE_TAIL_SKIP=7`（既定）。upstream は HIP では切っていますが、XeStrata は 3 社の GPU で KL・タスクの確認・速さを測り直し、全機種で既定にしました。
-- 検証の窓で VRAM にあるエキスパートに寄せる `STRATA_ROUTE_RESIDENT`（opt-in）と `STRATA_ROUTE_PRIOR`（キャッシュに載るエキスパートが 35% 未満の GPU 1 枚では自分で 1.5）。どちらも答えが変わる。
+- 検証の窓で VRAM にあるエキスパートに寄せる `STRATA_ROUTE_RESIDENT`（opt-in）と `STRATA_ROUTE_PRIOR`（キャッシュに載るエキスパートが 20% 未満の GPU 1 枚では自分で 1.5）。どちらも答えが変わる。
 - prefill の CPU 分担の拡張（ページ固定でない RAM のエキスパートも渡す）と、全エキスパートが VRAM にあるときやメモリが足りないときに既定で使わない規則。
 - `--aux-cpus`（opt-in）、PLE の `--ple-io direct` が遅いときの mmap への切り替え、stager の RAM 向けの読み方、埋め込みのバッファの使い回し。
 - メモリの見張り（cgroup の上限と `--memory-limit-mib`）、会話キャッシュの `--conversation-cache-min-tokens`、`--session-save-reclaim`、`logit_bias`、`strata --version`。
