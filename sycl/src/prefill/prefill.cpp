@@ -1293,8 +1293,13 @@ bool Prefill::init(const core::WeightTable &wt, const core::ModelGeometry &g,
     m.ids_host.resize(T * K); m.slot_host.resize(T * K); m.src_host.resize(T * K); m.cnt.resize(m.g->n_expert); m.off.resize(m.g->n_expert + 1);
     {
         const size_t need = 3 * T * K + (size_t) (2 * (m.g->n_expert + m.g->n_expert / MMQ_GROUP + 2));
+        // SYCL port: the *copy* arm is the default.  On the mapped arm the GPU reads these tables straight out of
+        // mapped host memory, per layer; copying them first is measurably faster on a PCIe-attached pair and
+        // token-identical - 4,106 tokens 1,303 -> 1,335 tok/s, 16,380 tokens 1,622 -> 1,665, the 10,938-token chat
+        // prompt 1,576 -> 1,617, decode unchanged (round 46).  STRATA_GROUP_COPY=0 restores the mapped arm.
         const char* gc = std::getenv("STRATA_GROUP_COPY");
-        if (m.grp_n < need && !(gc && gc[0] == '1')) {
+        const bool group_copy = gc == nullptr || gc[0] != '0';
+        if (m.grp_n < need && !group_copy) {
             if (m.grp_host) sycl::free(m.grp_host, dpct::get_in_order_queue());
             m.grp_host = m.grp_dev = nullptr;
             m.grp_n = m.grp_tk = 0;
