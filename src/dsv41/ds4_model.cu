@@ -2757,6 +2757,12 @@ struct Model::Impl {
 #endif
             const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
             int nth = (int) std::min(16u, std::max(4u, hw / 2));
+#if defined(STRATA_METAL)
+            // A Mac reads the Engram rows with two threads: with more, a decode of the same prompt gave slightly different words run to run
+            // (3 to 9 runs of 16 differed from the serial reference, against none of 24 with one or two threads; the cause is not found yet).  DS4_ENGRAM_THREADS=N sets another number.
+            nth = 2;
+            if (std::getenv("DS4_ENGRAM_THREADS") == nullptr) std::fprintf(stderr, "ds4: Engram rows are read with 2 threads (DS4_ENGRAM_THREADS=N sets another number)\n");
+#endif
             if (const char* e = std::getenv("DS4_ENGRAM_THREADS")) nth = std::max(1, std::atoi(e));
             const uint64_t avail = ram_avail();
             uint64_t mb = avail == ~uint64_t{0} ? 64 : std::min<uint64_t>(256, std::max<uint64_t>(16, (avail >> 20) / 64));
@@ -6159,6 +6165,10 @@ struct Model::Impl {
                 for (size_t i = 0; i < b.reads.size(); ++i) {
                     const EgRead& r = b.reads[i];
                     if (!b.ok[i]) {   // (a failed read: zeros, its gate adds nothing; not kept)
+#if defined(STRATA_METAL)
+                        std::fprintf(stderr, "ds4: WARNING: an Engram row could not be read (file %d, offset %llu, %u bytes): it counts as zeros\n", r.file,
+                                     (unsigned long long) r.off, r.n);
+#endif
                         std::memset(r.dst, 0, (size_t) hd);
                         std::memset(r.scales, 0, (size_t) hd / 32);
                         continue;

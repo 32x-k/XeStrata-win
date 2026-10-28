@@ -76,6 +76,8 @@ Full quality. That is what was measured and scored.
 - Smaller Macs: nothing under 128 GB was run with DeepSeek. The plan screen shows how much of the model your Mac keeps in memory
   and warns when that is under a quarter of it. That estimate follows the engine's own rule and is not a measurement.
 - The 1.75 bpw set shares the 2.00 set's kernel but was not run on a Mac, so it is not offered there.
+- The Mac reads the Engram table with two threads. With more, the same prompt gave slightly different words from run to run
+  (in 3 to 9 of 16 runs); with one or two threads it did not. The cause is under study.
 - Two runs of the same prompt can differ in the last digits of a score, because the engine moves experts between memory and the
   SSD as it learns what the prompt needs. The answers stay equally good.
 
