@@ -16,6 +16,7 @@
 
 #include "strata/core/gpu.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -51,6 +52,9 @@
 #include <exception>
 #include <functional>
 #include <future>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <set>
 #include <tuple>
 #include <vector>
@@ -365,6 +369,29 @@ void PlainModel::prompt_dense_calibrate() {
     } unbind{this};
     const W& w = blocks_.front().sh_gate;   // the dense FFN's gate: the largest of the products a chunk takes
     if (!dense_int8_ok(w)) return;
+    // timed once a GPU and a shape: a model opened again in the same process (MOSS-Image's text encoder, after each
+    // image) takes what the first open chose, its timings beside the image engine's other work having moved the choice
+    // and the same prompt's states with it (the B70, 2026-10-29: FP16 from 320 rows at the first open, 2816 at the next)
+    struct Chosen {
+        int64_t rows;
+        bool half;
+    };
+    struct Chosens {
+        std::mutex mu;
+        std::map<std::tuple<int, int64_t, int64_t, int64_t>, Chosen> of;
+    };
+    static PerDevice<std::shared_ptr<Chosens>> chosen_of;
+    Chosens& chosen = *chosen_of.get(Runtime::get().stream(cs_).get_device(), [] { return std::make_shared<Chosens>(); });
+    const auto key = std::make_tuple((int) w.type, w.n_in, w.n_out, P.T);
+    {
+        std::lock_guard<std::mutex> lock(chosen.mu);
+        const auto it = chosen.of.find(key);
+        if (it != chosen.of.end()) {
+            dense_native_rows_ = it->second.rows;
+            dense_half_sums_ = it->second.half;
+            return;
+        }
+    }
     prefill::Gemm& gm = prompt_gemm().gemm;
     PromptGemm& pg = prompt_gemm();
     const int64_t lo = 16, hi = P.T;
@@ -416,6 +443,8 @@ void PlainModel::prompt_dense_calibrate() {
                      dense_half_sums_ ? "FP16" : "FP32",
                      dense_native_rows_ == INT64_MAX ? "no" : std::to_string(dense_native_rows_).c_str(), 1e3 * n[0],
                      1e3 * q[0], (long long) lo, 1e3 * n[1], 1e3 * q[1], (long long) hi);
+        std::lock_guard<std::mutex> lock(chosen.mu);
+        chosen.of[key] = {dense_native_rows_, dense_half_sums_};
     } catch (const std::exception& e) {
         std::fprintf(stderr, "strata plain: timing the dense products: %s (int8 kept)\n", e.what());
         dense_native_rows_ = INT64_MAX;
