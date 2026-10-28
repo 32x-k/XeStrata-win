@@ -1633,6 +1633,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(ple_residency_test PRIVATE include)
   add_test(NAME ple_residency_test COMMAND ple_residency_test)
 
+  # #4474: the automatic expert cache's slot rule (the late allocation priced); header-only, needs nothing
+  add_executable(auto_cache_test src/core/auto_cache_test.cpp)
+  target_include_directories(auto_cache_test PRIVATE include)
+  add_test(NAME auto_cache_test COMMAND auto_cache_test)
+
   # 0.2.7 (#3911): the qwen35 host sampler's penalties on a short (draft-vocab) logit row; header-only, CPU
   add_executable(qwen35_sampling_test src/qwen35/sampling_test.cpp)
   target_include_directories(qwen35_sampling_test PRIVATE include)
