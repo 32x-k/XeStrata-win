@@ -11540,6 +11540,31 @@ int main(int argc, char **argv) try {
                                      B.launched ? "launched" : B.ready ? "ready" : "none", on ? " ON" : "");
                     x = outp[(size_t) a];
                     p = A.p + a + 1;
+                    // STRATA_PIPELINE_DUMP=<file>: after every window, append a hash and the sum of the first stage's
+                    // sequence state (its GDN rows: the recurrence state plus the conv history).  Two arms that ran
+                    // the same tokens must agree here; the first position where they do not is the state that
+                    // escapes.  Debug only: it waits for the stage's stream, so it distorts the timing.
+                    static const char* pl_dump = std::getenv("STRATA_PIPELINE_DUMP");   // read once
+                    if (pl_dump != nullptr) {
+                        const int64_t gdn_floats = g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
+                                                   g.ssm_conv_channels * (g.ssm_d_conv - 1);
+                        const size_t n = (size_t) ss.gdn_alloc * (size_t) gdn_floats;
+                        std::vector<float> h(n);
+                        (void) DPCT_CHECK_ERROR(s0->memcpy(h.data(), ss.gdn_state, n * sizeof(float)).wait());
+                        uint64_t hs = 1469598103934665603ull;
+                        double sum = 0.0;
+                        for (size_t i = 0; i < n; ++i) {
+                            uint64_t b = 0;
+                            std::memcpy(&b, &h[i], sizeof(float));
+                            hs = (hs ^ b) * 1099511628211ull;
+                            sum += (double) h[i];
+                        }
+                        if (std::FILE* df = std::fopen(pl_dump, "a")) {
+                            std::fprintf(df, "pos %lld windows %lld gdn %zu sum %.9g hash %016llx\n", (long long) p,
+                                         (long long) dec_windows, n, sum, (unsigned long long) hs);
+                            std::fclose(df);
+                        }
+                    }
                     if (!last && !pl_adapt()) return die("an adaptive refill failed");
                     if (on && !last) {
                         ++pl_on;
