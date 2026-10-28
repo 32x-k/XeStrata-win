@@ -863,7 +863,7 @@ print(r.choices[0].message.content)
 - **思考を求めない Anthropic の要求**: `"thinking"`、深さ、上限のどれもない `/v1/messages` の要求は、Anthropic 自身の規則どおり思考なしで処理します。
   Claude Code の短い補助の呼び出し（数十トークンで会話の題を付けるものなど）に要ります。
   `xestrata-<model>.json` に `"anthropic_thinking": "model"` を書くと、そうした要求もモデルのテンプレートどおりに考えます。
-  `POST /v1/messages/count_tokens` は、要求を `/v1/messages` と同じに組み立ててトークンに分け、モデルは動かしません。
+  `POST /v1/messages/count_tokens` は、要求を `/v1/messages` と同じに組み立ててトークンに分け、モデルは動かしません。画像は読むときと同じ数の画像のトークンとして数えるので、まだ読んでいない画像は画像のエンコーダーで読みます（一度読んだ画像は覚えていて、後の要求でも使います）。
 
 ### ストリーミングと接続
 
@@ -1217,14 +1217,14 @@ B70 の IQ2_XS で、4,996 トークンの会話（INT8 の KV）のファイル
 `{"type":"json_schema","json_schema":{"name":"answer","strict":true,"schema":{"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"],"additionalProperties":false}}}` を受け付けます。
 スキーマの最上位はオブジェクトでなければなりません。
 `#` で始まるローカルの参照は使え、外部の参照は断ります。
-`json_schema` は、Python のパッケージ `jsonschema` で確かめます（setup が `.venv` に入れ、deb と rpm はディストリビューションの python3-jsonschema を推奨のパッケージにし、Windows の 7z には入っています）。
-なければ、答えが 1 つの JSON のオブジェクトであることだけを確かめ、server はそのことを一度だけ伝えます。入れ方は `xestrata --setup` が示します。
+`json_schema` は、Python のパッケージ `jsonschema` で確かめます（setup が `.venv` に入れ、deb と rpm はディストリビューションの python3-jsonschema に依存し、Windows の 7z には入っています）。
+なければ、`strict: true` の要求（`json_schema` の `strict: true`、Messages の `output_config.format`、`strict: true` の道具）は確かめられないので 400 で断り、ほかの `json_schema` は答えが 1 つの JSON のオブジェクトであることだけを確かめます。server はそのことを一度だけ伝え、入れ方は `xestrata --setup` が示します。
 
 エンジンが文法で縛れるとき（連続バッチと密なモデルのエンジンを除く）は、**答えをスキーマの文法で縛って書かせ**、書いた後にも確かめます。
 思考は縛らず、思考の後の答えの JSON だけを縛ります。
 縛れないときは、スキーマをプロンプトで伝え、server が確かめるだけです。環境変数 `STRATA_GRAMMAR=0` でも縛りません。
 道具の `strict: true`（Chat Completions・Responses・Messages。Responses の namespace と `additional_tools` の道具も）と、`custom` の道具の regex の文法も、呼び出しの引数を同じように縛ります（Qwen の呼び出しの形のモデル）。文と、ほかの道具の呼び出しは縛りません。
-`strict: true` の道具の呼び出しは、縛ったかどうかにかかわらず、送る前に引数をスキーマで確かめます。そのため書いている途中には送らず、書き終わった呼び出しをまとめて送ります。合わなければ、答えと同じく `structured_output_failed` です。
+`strict: true` の道具の呼び出しは、縛ったかどうかにかかわらず、送る前に引数をスキーマで確かめます。そのため書いている途中には送らず、書き終わった呼び出しをまとめて送ります。合わないとき、JSON に書けない数（NaN、Infinity、大きすぎる数）があるときは、答えと同じく `structured_output_failed` です。
 1 つの要求に 1 回だけ生成し、隠れたやり直しはしません。
 成功した応答には、確かめた JSON のオブジェクトが入ります。
 壊れた JSON、重複したキー、有限でない数、スキーマの違反、途中で終わった生成には、`error.code: structured_output_failed` で **502** を返します。
@@ -1329,7 +1329,7 @@ PDF は、Linux では poppler の `pdftotext` と `pdftoppm` で、Windows で�
 - `n`（1〜128）は、choice ごとに 1 回ずつ生成します。`seed` があれば choice ごとに `seed + k` です。
 - `stream_options.include_usage` では、`choices: []` の usage の区切りも送ります。終わりの区切りの usage（llama.cpp と同じ）も残ります。
 - usage には `completion_tokens_details.reasoning_tokens` が入り、応答には `system_fingerprint`（エンジンの版とモデルから作る値）が入ります。
-- 古い形の `role: function` と assistant の `function_call` は、道具の結果と呼び出しとして読みます。古い形の `functions` と `function_call` の要求は `tools` と `tool_choice` として読み（呼び出しは 1 つずつ）、答えも古い形（`function_call`、終わりの理由 `function_call`）で返します。`tools` や `tool_choice` と一緒には使えません。
+- 古い形の `role: function` と assistant の `function_call` は、道具の結果と呼び出しとして読みます。古い形の `functions` と `function_call` の要求は `tools` と `tool_choice` として読み（呼び出しは 1 つずつ）、答えも古い形（`function_call`、終わりの理由 `function_call`）で返します。`tools` や `tool_choice` と一緒には使えません。null の項目と、`functions` なしの `function_call: "none"` は、何も指定していないものとして読みます。
 - `user` と `system` の `name` は「名前: 」として発言の前に書きます。assistant の `refusal` は、本文がないときその発言の本文として読みます。
 - `image_url` の `detail: "low"` の画像は、長い辺を 512 に縮めて読みます。
 - `top_logprobs` は 0〜20 で、`logprobs: true` のときだけです。`input_audio` と、音声の出力（`modalities` の `audio`、`audio`）は 400 です（モデルは音声を読み書きできません）。
