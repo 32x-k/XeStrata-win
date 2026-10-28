@@ -6140,6 +6140,17 @@ def make_handler(svc: Service):
                              asked or "Authorization, Content-Type, x-api-key, anthropic-version, anthropic-beta")
             self.send_header("Access-Control-Max-Age", "600")
 
+        def do_DELETE(self):
+            """DELETE /v1/responses/{id}: nothing is stored, so there is nothing to delete - OpenAI's 404, in JSON."""
+            if not self._authorized():
+                return
+            path = self.path.split("?")[0].rstrip("/")
+            if path.startswith("/v1/responses/"):
+                self._json(404, responses_error_body("this server keeps no responses (stateless): there is nothing "
+                                                     "to delete", code="not_found"))
+            else:
+                self._json(404, {"error": {"message": f"Invalid URL (DELETE {path})", "type": "invalid_request_error"}})
+
         def do_OPTIONS(self):
             # a CORS preflight: no credentials come with it, so no API key; the headers only for cors_origins
             self.send_response(204)
@@ -7062,6 +7073,9 @@ def make_handler(svc: Service):
                 return base64.b64encode(f.read_bytes()).decode("ascii") if f is not None else None
 
             def events():
+                if top_logprobs(req) is not None:          # include: message.output_text.logprobs
+                    lp = LogprobEntries(svc, allowed_ids(req), cancel)
+                    asm.spell = lambda text: lp.spell(svc.engine, text)
                 yield from asm.start()
                 done = None
                 if image_tools is not None:   # the image tools run here, each an image_generation_call item
@@ -7133,6 +7147,7 @@ def make_handler(svc: Service):
             e = asm.failed(message, code)
             self._note(error=e["response"]["error"])
             try:
+                send(asm.error(message, code))               # OpenAI's order: the error event, then response.failed
                 send(e)
                 self.wfile.flush()
             except OSError:
@@ -7181,6 +7196,21 @@ def make_handler(svc: Service):
             else:
                 image_names = []
             kw = responses_api.template_kwargs(req, {"reasoning_effort": svc.effort_default()})
+            messages = responses_api.verbosity_messages(req, messages)
+            if req.get("truncation") not in (None, "auto", "disabled"):
+                raise ResponsesError('truncation is "auto" or "disabled"', "truncation")
+            calls = req.get("max_tool_calls")
+            if calls is not None and (isinstance(calls, bool) or not isinstance(calls, int) or calls < 1):
+                raise ResponsesError("max_tool_calls must be a positive whole number", "max_tool_calls")
+            if self.image_tools is not None:              # the hosted tools this server runs: the image tools
+                self.image_tools.max_calls = calls
+            include = req.get("include") if isinstance(req.get("include"), list) else []
+            if "message.output_text.logprobs" in include:
+                req = {**req, "logprobs": True}           # the engine's LP lines, read into output_text's logprobs
+            try:
+                check_logprobs(req) if req.get("logprobs") else None
+            except ValueError as e:
+                raise ResponsesError(str(e), "top_logprobs") from None
             # "required" or a named tool: the reply opens that call (forced_call), as on the chat route
             choice = responses_api.forced_choice(req)
             try:
@@ -7224,25 +7254,31 @@ def make_handler(svc: Service):
             # #924 (opt-in): a Codex compaction request is rendered with its conversation's tools, so its prompt
             # starts as the cached one did; the parser and the response keep the request's own tools
             shown = responses_api.prompt_tools(req, tools) if svc.codex_compaction_cache else tools
-            try:
+            while True:
                 try:
-                    ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0,
-                                                         force=force, req=req, cancel=cancel)
-                except ValueError:
-                    if shown is tools:
-                        raise
-                    shown = tools                            # too long with the kept tools: the request as sent
-                    ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0,
-                                                         force=force, req=req, cancel=cancel)
-            except ResponsesError:
-                raise
-            except ValueError as e:                          # too long for the context, an image without vision
-                raise ResponsesError(str(e), "input", "context_length_exceeded" if "context" in str(e) else None) \
-                    from None
+                    try:
+                        ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0,
+                                                             force=force, req=req, cancel=cancel)
+                    except ValueError:
+                        if shown is tools:
+                            raise
+                        shown = tools                        # too long with the kept tools: the request as sent
+                        ids, thinking, max_new = svc.prepare(messages, shown, kw, req.get("max_output_tokens") or 0,
+                                                             force=force, req=req, cancel=cancel)
+                    break
+                except ResponsesError:
+                    raise
+                except ValueError as e:                      # too long for the context, an image without vision
+                    # truncation "auto": the oldest items go (a call with its results), the instructions stay
+                    fewer = responses_api.drop_oldest(messages) \
+                        if req.get("truncation") == "auto" and "context" in str(e) else None
+                    if fewer is None:
+                        raise ResponsesError(str(e), "input",
+                                             "context_length_exceeded" if "context" in str(e) else None) from None
+                    messages = fewer
             if svc.codex_compaction_cache:
                 responses_api.prompt_made(req, shown)
             _debug_req("responses", req, messages, tools, max_new, thinking, len(ids))
-            include = req.get("include") if isinstance(req.get("include"), list) else []
             asm = responses_api.Assembler(req, svc.model_for(req), len(ids), names,
                                           "reasoning.encrypted_content" in include, validator is not None)
             self.prepared = (messages, kw)
