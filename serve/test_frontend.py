@@ -128,6 +128,12 @@ class UnreadContentParts(unittest.TestCase):
             self.assertIsNone(legacy_functions({"messages": [], **req}), req)
         with self.assertRaisesRegex(ValueError, "functions must be"):
             legacy_functions({"function_call": "auto"})
+        # "none" beside the new tools is the old and the new shape mixed: a 400, as any other mix
+        tool = {"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}
+        for req in ({"function_call": "none", "tools": [tool]}, {"function_call": "none", "tool_choice": "auto"}):
+            with self.assertRaisesRegex(ValueError, "cannot be used with tools"):
+                legacy_functions(req)
+        self.assertIsNone(legacy_functions({"functions": None, "function_call": None, "tools": [tool]}))
 
     def test_messages_document_images_are_read(self):
         # a "content" document's images reach the model as the message's own images do, after its text

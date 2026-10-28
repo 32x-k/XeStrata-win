@@ -1165,10 +1165,12 @@ def legacy_functions(req: dict) -> dict | None:
     is no field, and function_call "none" without functions is the default).  Mixed with tools or tool_choice, or a
     function_call "auto" or name without functions, it is a 400."""
     fns, choice = req.get("functions"), req.get("function_call")
-    if fns is None and choice in (None, "none"):
+    if fns is None and choice is None:
         return None
     if req.get("tools") is not None or req.get("tool_choice") is not None:
         raise ValueError("functions and function_call cannot be used with tools or tool_choice")
+    if fns is None and choice == "none":
+        return None
     if not isinstance(fns, list) or not fns or not all(isinstance(f, dict) for f in fns):
         raise ValueError("functions must be a non-empty array of function objects")
     if isinstance(choice, dict) and isinstance(choice.get("name"), str):
