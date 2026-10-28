@@ -239,7 +239,7 @@ LLAMA_CPP_TREE_SHA256 = "87b1443f593e9b9159a61fa933e0fd4a2bc29e95f5ad6da422789d1
 # KV bytes per context token and attention layer: 8-bit 1056 (the default), rotated 4-bit 576, hybrid K8V4 (8-bit K,
 # 4-bit V) 816, 16-bit 2112 (8K and less, and --kv fp16)
 KV_CELL_BYTES = {"q4_0": 576, "k8v4": 816, "fp16": 2112}
-PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "pillow", "psutil", "pypdf", "pypdfium2"]
+PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "pillow", "psutil"]
 REQUIREMENTS = ROOT / "requirements.txt"   # the same packages and their dependencies, pinned (upstream #214)
 # the build helpers, installed into .venv only when an engine or image-encoder build finds none (upstream a24253783)
 BUILD_PACKAGES = ["cmake", "ninja"]
@@ -1387,9 +1387,12 @@ PACKAGES = {
 
 # The packages of the tools setup does not install itself, for its messages, by distro_family()
 TOOL_PACKAGES = {
-    "ubuntu": {"g++": "build-essential", "glslc": "glslc", "vulkan": "libvulkan-dev", "spirv": "spirv-headers"},
-    "fedora": {"g++": "gcc-c++", "glslc": "glslc", "vulkan": "vulkan-loader-devel", "spirv": "spirv-headers-devel"},
-    "arch": {"g++": "base-devel", "glslc": "shaderc", "vulkan": "vulkan-headers", "spirv": "spirv-headers"},
+    "ubuntu": {"g++": "build-essential", "glslc": "glslc", "vulkan": "libvulkan-dev", "spirv": "spirv-headers",
+               "pdf": "poppler-utils"},
+    "fedora": {"g++": "gcc-c++", "glslc": "glslc", "vulkan": "vulkan-loader-devel", "spirv": "spirv-headers-devel",
+               "pdf": "poppler-utils"},
+    "arch": {"g++": "base-devel", "glslc": "shaderc", "vulkan": "vulkan-headers", "spirv": "spirv-headers",
+             "pdf": "poppler"},
 }
 
 # The command that installs distribution packages on this PC, by distro_family()
@@ -1897,6 +1900,7 @@ def check_runtime(makers: set, gfx: set, data: Path, yes: bool = False, explicit
     check_igc(makers)
     check_level_zero(makers, yes, explicit)
     linux_nvidia_libs(makers, data, (packaged_engine().get("runtime") or {}).get("nvidia_pip") or [])
+    check_pdf()
     need, fast, repos = runtime_missing(makers)
     if not need and not fast:
         return
@@ -1907,6 +1911,16 @@ def check_runtime(makers: set, gfx: set, data: Path, yes: bool = False, explicit
     warn("faster with " + ", ".join(fast) + " (without them XeStrata's own kernels do the work):")
     for line in lines:
         say(line)
+
+
+def check_pdf() -> None:
+    """Linux: a PDF a request sends is read with poppler's pdftotext and pdftoppm, run as programs (Windows' 7z carries
+    the Python packages instead).  Without them it is refused: said, with the command that installs them, never a
+    stop (no model needs them)."""
+    if shutil.which("pdftotext") and shutil.which("pdftoppm"):
+        return
+    warn("a PDF a request sends is read with poppler's pdftotext and pdftoppm (without them it is refused):")
+    say(f"  {install_cmd([tool_pkg('pdf')])}")
 
 
 def rocm_missing() -> list:
@@ -3257,13 +3271,27 @@ def req_name(line: str) -> str:
 
 
 def requirement_lines(path: Path | None = None) -> list[str]:
-    """A requirements file's requirements, comments and blank lines left out."""
+    """A requirements file's requirements, comments and blank lines left out, and those whose environment marker
+    this Python does not meet (Windows' alone, on Linux): pip would ignore them, and an install that has the rest
+    needs no pip run for them."""
     lines = []
     for raw in (path or REQUIREMENTS).read_text(encoding="utf-8").splitlines():
         line = raw.split("#", 1)[0].strip()
-        if line:
+        if line and _marker_met(line):
             lines.append(line)
     return lines
+
+
+def _marker_met(line: str) -> bool:
+    """A requirement line's environment marker ("; sys_platform == 'win32'") is met here; True without one, or
+    without pip's own copy of `packaging` to read it (pip then decides)."""
+    if ";" not in line:
+        return True
+    try:
+        from pip._vendor.packaging.markers import Marker
+    except ImportError:
+        return True
+    return Marker(line.split(";", 1)[1]).evaluate()
 
 
 def _installed(name: str) -> bool:
