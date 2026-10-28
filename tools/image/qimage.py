@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-"""tools/image/qimage.py - Qwen-Image-2.1-Turbo, Qwen-Image-2.1, Mage-Flow and HunyuanImage 3.0 for XeStrata's image
-endpoint: the models' files at pinned Hugging Face revisions, and the run config's "images" section for XeStrata's own
-image engine (strata-image, built with the text engine).
+"""tools/image/qimage.py - Qwen-Image-2.1-Turbo, Qwen-Image-2.1, Mage-Flow, HunyuanImage 3.0 and MOSS-Image for
+XeStrata's image endpoint: the models' files at pinned Hugging Face revisions, and the run config's "images" section
+for XeStrata's own image engine (strata-image, built with the text engine).
 
 setup.py (--images, IMAGE_MODELS) and tools/image/install.py use these pieces; serve/images.py runs the result.
 The two share the VAE, the text encoders and the vision encoder; only the DiT differs, the base model's (Turbo's
@@ -42,6 +42,14 @@ start with, is read out of the same repository's
 to, are computed from the model's base size and the four sizes its image processor adds (hunyuanimage3_buckets).
 Tencent publishes the model in bf16 only; the two quantized files and the VAE are pinned where they are published as
 single-file checkpoints (the SHA-256 of the copies this engine was measured on, 2026-10-25).
+
+MOSS-Image (OpenMOSS, Apache 2.0; moss-image, the SFT model, and moss-image-base): its DiT as diffusers has it (the
+transformer folder's three bf16 shards, which the engine keeps 16-bit or quantizes to 8 bits as it reads them, as
+Mage-Flow's: "dit_q8"), its Flux2 VAE with a narrower decoder (fixed, bf16), and Qwen3.5-9B as its text encoder: the
+chat model's own GGUFs, Unsloth's or, with -uncensored, HauhauCS's (MOSS_TEXT_QUANTS, Q8_0 lowered for the RAM like
+the others').  When the chat model is that same file, setup links it instead of fetching it again and the server has
+the chat engine encode the prompts (serve/images.py's text_states).  No reference edits: a picture is changed by
+img2img and masks.
 """
 from __future__ import annotations
 
@@ -66,6 +74,10 @@ REVISIONS = {                                       # the `sha` of https://huggi
     "noctrex/Huihui-Qwen3-VL-4B-Instruct-abliterated-GGUF": "0e204140ef43727fb4ee4d4bbd88c948c64719df",  # 2026-10-21
     "tencent/HunyuanImage-3.0-Instruct-Distil": "c8ffd07206f1b843697606968196e8f59f8ff38c",          # 2026-10-25
     "PedroMarinhoDev/HunyuanImage-3.0-Instruct-Distil-ComfyUI": _HY_C_SHA,                          # 2026-10-25
+    "OpenMOSS-Team/MOSS-Image-SFT": "f972bd4b4b9e3852133cc5da954d87bc32cd8fb9",                     # 2026-10-27
+    "OpenMOSS-Team/MOSS-Image-Base": "85975793d8b3d432f1b6e27f352abaa4c2a4c0d3",                    # 2026-10-27
+    "unsloth/Qwen3.5-9B-GGUF": "3885219b6810b007914f3a7950a8d1b469d598a5",                          # 2026-10-26
+    "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive": "0a41c68809d375475f954be12ba7c40efa56c2a9",  # 2026-10-26
 }
 _DIT = "unsloth/Qwen-Image-2.1-Turbo-GGUF"
 _BASE = "unsloth/Qwen-Image-2.1-GGUF"
@@ -78,6 +90,11 @@ _VL4 = "unsloth/Qwen3-VL-4B-Instruct-GGUF"
 _HH4 = "noctrex/Huihui-Qwen3-VL-4B-Instruct-abliterated-GGUF"
 _HY = "tencent/HunyuanImage-3.0-Instruct-Distil"          # the model itself: the tokenizer and the system prompt
 _HY_C = "PedroMarinhoDev/HunyuanImage-3.0-Instruct-Distil-ComfyUI"   # its quantized files, as single checkpoints
+_MS = "OpenMOSS-Team/MOSS-Image-SFT"
+_MB = "OpenMOSS-Team/MOSS-Image-Base"
+_Q35 = "unsloth/Qwen3.5-9B-GGUF"
+_Q35H = "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive"
+_Q35H_FILE = "Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-{}.gguf"
 # name -> (repo, path in the repo, bytes, sha256): the Hub's LFS pointers at the pinned revisions
 FILES = {
     # the DiTs, "<dit>-<QUANTS>"
@@ -169,9 +186,46 @@ FILES = {
     # the model's last bf16 shard: its SigLIP2 (vision_model.*), which an edit's reference images go through
     "hunyuanimage3-vision": (_HY, "model-0032-of-0032.safetensors", 3_316_299_512,
                              "65b72ec507661c7a146b3174fd0baaa2689a5c7e85a8736aa9778b1d146a4ec6"),
+    # MOSS-Image: its two DiTs as diffusers has them ("<dit>-<part>": the transformer folder's bf16 shards and its
+    # config.json), the Flux2 VAE with its narrower decoder (the same file in both repositories), and Qwen3.5-9B as
+    # its text encoder (the chat model's own GGUFs: "llm-moss-stock-<MOSS_TEXT_QUANTS>", Unsloth's, and
+    # "llm-moss-uncensored-", HauhauCS's)
+    "moss-sft-1": (_MS, "transformer/diffusion_pytorch_model-00001-of-00003.safetensors", 4_991_978_016,
+                   "e40d3444940a0b0fd7cd45ba7959a5bd3d5efd7ddf87aae5ce4d87ce8aa03d01"),
+    "moss-sft-2": (_MS, "transformer/diffusion_pytorch_model-00002-of-00003.safetensors", 4_983_137_016,
+                   "d106da790ec2924ffd8af04b4ffa8f8de281a974b58e55649c3ec596dc8ef033"),
+    "moss-sft-3": (_MS, "transformer/diffusion_pytorch_model-00003-of-00003.safetensors", 189_549_184,
+                   "11f637ab17c7093344a6110a1e87ffda8e56558dc55183d8e790222cfcdcf52d"),
+    "moss-sft-config": (_MS, "transformer/config.json", 240,
+                        "3291c3a1c7adc22b8182a0de25ca8ec97474d72715ce84adbab09cc0be24f666"),
+    "moss-base-1": (_MB, "transformer/diffusion_pytorch_model-00001-of-00003.safetensors", 4_991_978_016,
+                    "ae085fba123b6df67daf90aa9698fadee60c73e45bcaf3f3043d15f34e7a1804"),
+    "moss-base-2": (_MB, "transformer/diffusion_pytorch_model-00002-of-00003.safetensors", 4_983_137_016,
+                    "806e876d80c7fba560663a3a95580e6c7033da3f9ea3c52765245ef0e1818f75"),
+    "moss-base-3": (_MB, "transformer/diffusion_pytorch_model-00003-of-00003.safetensors", 189_549_184,
+                    "5f319b72c40324294007c270d78112425627b537fcd8769b3c00f9f070e506a9"),
+    "moss-base-config": (_MB, "transformer/config.json", 240,
+                         "3291c3a1c7adc22b8182a0de25ca8ec97474d72715ce84adbab09cc0be24f666"),
+    "moss-vae": (_MS, "vae/diffusion_pytorch_model.safetensors", 249_521_372,
+                 "c3bdf94dc67ec69b30ea9fe1fa8340085679cae64d019f7c7e4a9921f1a7f17a"),
+    "llm-moss-stock-Q4_K_M": (_Q35, "Qwen3.5-9B-Q4_K_M.gguf", 5_680_522_464,
+                              "03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8"),
+    "llm-moss-stock-Q6_K": (_Q35, "Qwen3.5-9B-Q6_K.gguf", 7_458_301_152,
+                            "91898433cf5ce0a8f45516a4cc3e9343b6e01d052d01f684309098c66a326c59"),
+    "llm-moss-stock-Q8_0": (_Q35, "Qwen3.5-9B-Q8_0.gguf", 9_527_502_048,
+                            "809626574d0cb43d4becfa56169980da2bb448f2299270f7be443cb89d0a6ae4"),
+    "llm-moss-uncensored-Q4_K_M": (_Q35H, _Q35H_FILE.format("Q4_K_M"), 5_627_044_224,
+                                   "2ca636d9e81d3d23ca9b60c234fe185d30ec082eeba69ce770fdb0c76559a4f5"),
+    "llm-moss-uncensored-Q6_K": (_Q35H, _Q35H_FILE.format("Q6_K"), 7_359_259_008,
+                                 "c0ba7beb68fd3fe47891bd549486d38dcf62d00817296ea314ad37017f5a4986"),
+    "llm-moss-uncensored-Q8_0": (_Q35H, _Q35H_FILE.format("Q8_0"), 9_527_501_184,
+                                 "99e7f2201c0046b05d2825e4d8be6a2efad2b87b071cd55d37bdd9fbe201a58b"),
 }
 QUANTS = ("Q4_K_M", "Q6_K", "Q8_0")
 TEXT_QUANTS = ("Q4_K", "Q5_K", "Q6_K", "Q8_0")      # the text encoder's, smallest first like QUANTS
+# MOSS-Image's text encoder, Qwen3.5-9B: the chat model's own sizes (setup's PLAIN_FAMILIES "qwen35"), so a chat model
+# of the same file encodes its prompts (serve/images.py's text_states)
+MOSS_TEXT_QUANTS = ("Q4_K_M", "Q6_K", "Q8_0")
 # HunyuanImage 3.0 comes in Tencent's two quantizations only, smallest first; w4a8 is the one to start with (43.7 GiB
 # against the int8's 76.2, about twice as fast a step) and the int8 the nearer the bf16 weights.
 HUNYUANIMAGE3_QUANTS = ("w4a8", "int8")
@@ -213,7 +267,13 @@ IMAGE_MODELS = {"qwen-image-turbo": ("qwen-image-2.1-turbo", "turbo", "stock"),
                 "magetrail": ("magetrail", "mf-trail", "mf-stock"),
                 "magetrail-uncensored": ("magetrail-uncensored", "mf-trail", "mf-uncensored"),
                 # HunyuanImage 3.0's distilled model: no text encoder (the DiT reads the prompt's ids itself)
-                "hunyuan-image-3-distil": ("hunyuan-image-3-distil", "hunyuanimage3", "")}
+                "hunyuan-image-3-distil": ("hunyuan-image-3-distil", "hunyuanimage3", ""),
+                # MOSS-Image: its SFT model (the recommended one) and its base model, with Qwen3.5-9B (Qwen's, or
+                # HauhauCS's with its refusals removed) as the text encoder
+                "moss-image": ("moss-image", "moss-sft", "moss-stock"),
+                "moss-image-uncensored": ("moss-image-uncensored", "moss-sft", "moss-uncensored"),
+                "moss-image-base": ("moss-image-base", "moss-base", "moss-stock"),
+                "moss-image-base-uncensored": ("moss-image-base-uncensored", "moss-base", "moss-uncensored")}
 DEFAULT_MODEL = "qwen-image-turbo"
 # what a front end (setup --describe, the Windows launcher) says of each choice without -uncensored
 ABOUT = {"qwen-image-turbo": "Everyday images and edits (recommended), 8 steps",
@@ -223,7 +283,10 @@ ABOUT = {"qwen-image-turbo": "Everyday images and edits (recommended), 8 steps",
          "mage-flow-base": "Mage-Flow's base model, 30 steps with guidance",
          "magetrail": "Mage-Flow tuned on Danbooru and e621 images, for illustrations from booru tags; no edits",
          "hunyuan-image-3-distil": "Tencent's large MoE model (80B), the most detailed and the slowest; reads its own "
-                                   "prompt, needs about 50 GB of RAM; edits with up to 3 reference images"}
+                                   "prompt, needs about 50 GB of RAM; edits with up to 3 reference images",
+         "moss-image": "OpenMOSS's 5B model: text in images and a layout of boxes in the prompt, 50 steps with "
+                       "guidance; changes a picture (img2img, masks), no reference edits",
+         "moss-image-base": "MOSS-Image's base model, before its fine-tuning, 50 steps with guidance"}
 # the DiT -> its name, its steps (Turbo's are its own 8 sigmas; the base model's, the default of its pipeline,
 # diffusers' QwenImage21Pipeline, sampled without guidance as Qwen meant it), its Hugging Face model
 DITS = {"turbo": ("Qwen-Image-2.1-Turbo", 8, "Qwen/Qwen-Image-2.1-Turbo"),
@@ -236,13 +299,21 @@ DITS = {"turbo": ("Qwen-Image-2.1-Turbo", 8, "Qwen/Qwen-Image-2.1-Turbo"),
         # MageTrail: its README's faster settings (30 steps, guidance 5; 50 and 8 at most)
         "mf-trail": ("MageTrail", 30, "RicemanT/MageTrail"),
         # HunyuanImage 3.0's distilled model: its 8 steps, the model's own sigmas (the engine's)
-        "hunyuanimage3": ("HunyuanImage 3.0 Instruct-Distil", 8, "tencent/HunyuanImage-3.0-Instruct-Distil")}
+        "hunyuanimage3": ("HunyuanImage 3.0 Instruct-Distil", 8, "tencent/HunyuanImage-3.0-Instruct-Distil"),
+        # MOSS-Image's two: its pipeline's defaults (50 steps, guidance 3 with the negative pass skipping block 22,
+        # shift 5), the same for both
+        "moss-sft": ("MOSS-Image", 50, "OpenMOSS-Team/MOSS-Image-SFT"),
+        "moss-base": ("MOSS-Image-Base", 50, "OpenMOSS-Team/MOSS-Image-Base")}
 MF_CFG = {"mf-turbo": 1.0, "mf-rl": 5.0, "mf-base": 5.0, "mf-trail": 5.0}   # Mage-Flow's guidance scale by DiT
 # each Mage-Flow DiT's edit model and its steps (its README: Edit-Turbo 4, Edit (RL) and Edit-Base 30)
 MF_EDIT = {"mf-turbo": ("mf-edit-turbo", 4), "mf-rl": ("mf-edit-rl", 30), "mf-base": ("mf-edit-base", 30)}
 MF_VAE = {"mf-trail": "mf-trail-vae"}   # a DiT's VAE where it is not Mage-VAE ("mf-vae")
-LOCAL_NAMES = {"mf-trail-vae": "flux2-klein-vae.safetensors"}   # files whose own name says too little
+# files whose own name says too little
+LOCAL_NAMES = {"mf-trail-vae": "flux2-klein-vae.safetensors", "moss-vae": "moss-image-vae.safetensors"}
 MF_DIR = "mage-flow"
+MOSS_DIR = "moss-image"
+MOSS_CFG = 3.0             # MOSS-Image's guidance scale and its schedule's shift (its pipeline's defaults)
+MOSS_SHIFT = 5.0
 MF_Q8_SHARE = 34 / 64      # Mage-Flow's DiT in RAM: its bf16 blocks quantized to Q8_0 (34 bytes a 32 values)
 # every model's files in one folder (named after the first one): they share all but the DiT
 MODEL_DIR = "qwen-image-2.1-turbo"
@@ -260,12 +331,27 @@ def is_hunyuanimage3(dit: str) -> bool:
     return dit.startswith("hunyuanimage3")
 
 
+def is_moss(dit: str) -> bool:
+    return dit.startswith("moss-")
+
+
+def engine_quantized(dit: str) -> bool:
+    """A DiT that comes in one bf16 size, which the engine keeps 16-bit or quantizes to 8 bits as it reads it
+    (Mage-Flow's, MOSS-Image's: --dit-q8)."""
+    return is_mage(dit) or is_moss(dit)
+
+
+def text_quants(dit: str) -> tuple[str, ...]:
+    """The text encoder's sizes for a DiT, smallest first: MOSS-Image's Qwen3.5-9B's, the others' TEXT_QUANTS."""
+    return MOSS_TEXT_QUANTS if is_moss(dit) else TEXT_QUANTS
+
+
 def dit_quants(dit: str) -> tuple[str, ...]:
     """The sizes a DiT comes in (smallest first): HunyuanImage 3.0's two quantizations, Mage-Flow's one bf16 file,
     Qwen-Image's QUANTS."""
     if is_hunyuanimage3(dit):
         return HUNYUANIMAGE3_QUANTS
-    return ("bf16",) if is_mage(dit) else QUANTS
+    return ("bf16",) if engine_quantized(dit) else QUANTS
 
 
 def default_quant(dit: str = "turbo") -> str:
@@ -275,16 +361,17 @@ def default_quant(dit: str = "turbo") -> str:
 
 
 def size_choices(dit: str) -> tuple[str, ...]:
-    """The sizes one can ask for after a model's name: Qwen-Image-2.1's files (QUANTS); Mage-Flow's one bf16 file
-    turned to 8 bits as the engine reads it (int8: always, as --image-dit-q8 on) or kept 16-bit (bf16: as off);
-    HunyuanImage 3.0's two quantizations."""
+    """The sizes one can ask for after a model's name: Qwen-Image-2.1's files (QUANTS); Mage-Flow's and MOSS-Image's
+    one bf16 file turned to 8 bits as the engine reads it (int8: always, as --image-dit-q8 on) or kept 16-bit (bf16:
+    as off); HunyuanImage 3.0's two quantizations."""
     if is_hunyuanimage3(dit):
         return HUNYUANIMAGE3_QUANTS
-    return ("int8", "bf16") if is_mage(dit) else QUANTS
+    return ("int8", "bf16") if engine_quantized(dit) else QUANTS
 
 
 def mage_q8(size: str | None) -> bool | None:
-    """A Mage-Flow model's 8 bits from its size after its name: True (int8), False (bf16), None (not said)."""
+    """A Mage-Flow or MOSS-Image model's 8 bits from its size after its name: True (int8), False (bf16), None (not
+    said)."""
     return {"int8": True, "bf16": False}.get(size or "")
 
 
@@ -314,6 +401,9 @@ def license_note(dit: str) -> str:
                 "European Union, the United Kingdom or South Korea: "
                 "https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE - read it and its Acceptable "
                 "Use Policy before you use the images")
+    if is_moss(dit):
+        return (f"{name} is under the Apache 2.0 license: https://huggingface.co/{repo}; its text encoder, Qwen3.5-9B, "
+                "too (HauhauCS's uncensored one, from it, as well)")
     if dit == "mf-trail":
         return (f"{name} (RicemanT's finetune of Mage-Flow on Danbooru and e621 images) is under the MIT license: "
                 f"https://huggingface.co/{repo}; its VAE, Black Forest Labs' Flux2 VAE from FLUX.2-klein-4B, under "
@@ -338,6 +428,8 @@ def file_names(quant: str, text_encoder: str = DEFAULT_TEXT_ENCODER, text_quant:
     if is_hunyuanimage3(dit):
         return (f"hunyuanimage3-{quant}", "hunyuanimage3-vae", "hunyuanimage3-tokenizer",
                 "hunyuanimage3-system-prompt", "hunyuanimage3-vision")
+    if is_moss(dit):
+        return (f"{dit}-1", f"{dit}-2", f"{dit}-3", f"{dit}-config", "moss-vae", text_file(text_encoder, text_quant))
     if is_mage(dit):
         vae, text = MF_VAE.get(dit, "mf-vae"), text_file(text_encoder, text_quant)
         if dit not in MF_EDIT:
@@ -349,9 +441,9 @@ def file_names(quant: str, text_encoder: str = DEFAULT_TEXT_ENCODER, text_quant:
 def ram_need_gb(quant: str, text_encoder: str = DEFAULT_TEXT_ENCODER, text_quant: str = DEFAULT_TEXT_QUANT,
                 dit: str = "turbo", keep: bool = True, q8: bool | None = None) -> float:
     """The RAM (GB) an image job keeps busy with that DiT at `quant` and that text encoder: the files, read through
-    the OS file cache (the engine maps them), and the engine's own; Mage-Flow's DiTs as the Q8_0 their blocks become
-    (the file's pages dropped once read) unless kept 16-bit (`q8` False: the whole file mapped), its edit model's
-    too with `keep` (else one DiT at a time)."""
+    the OS file cache (the engine maps them), and the engine's own; Mage-Flow's and MOSS-Image's DiTs as the 8 bits
+    their blocks become (the file's pages dropped once read) unless kept 16-bit (`q8` False: the whole file mapped),
+    Mage-Flow's edit model's too with `keep` (else one DiT at a time)."""
     share = 1.0 if q8 is False else MF_Q8_SHARE
     names = file_names(quant, text_encoder, text_quant, dit)
     if is_hunyuanimage3(dit):   # no text encoder: the files (of the vision shard, the read part) and the engine's own
@@ -359,6 +451,8 @@ def ram_need_gb(quant: str, text_encoder: str = DEFAULT_TEXT_ENCODER, text_quant
             + HOST_GB
     if is_mage(dit) and not keep and dit in MF_EDIT:
         names = tuple(k for k in names if k != f"{MF_EDIT[dit][0]}-bf16")
+    if is_moss(dit):   # its shards: the blocks' weights, all but a few hundred MB of them
+        return sum(FILES[k][2] * (share if k[-1].isdigit() else 1) for k in names) / 1e9 + HOST_GB
     return sum(FILES[k][2] * (share if k.endswith("-bf16") and is_mage(dit) else 1) for k in names) / 1e9 \
         + HOST_GB
 
@@ -369,8 +463,9 @@ def fit_ram(ram_left_gb: float, text_encoder: str = DEFAULT_TEXT_ENCODER, quant:
     """The DiT and text encoder quants whose files fit `ram_left_gb` (the RAM the text model leaves), from `quant`
     and `text_quant` down -> (quant, text_quant, fits): the encoder is lowered first and the DiT only when the
     smallest encoder does not fit, the encoder then the largest that fits beside that DiT.  The smallest of both, not
-    fitting, when nothing does.  Mage-Flow's DiT has one size: only its encoder is lowered.  HunyuanImage 3.0 has no
-    text encoder: its two quantizations are lowered (int8 to w4a8) and "" is the text quant returned."""
+    fitting, when nothing does.  Mage-Flow's and MOSS-Image's DiT has one size: only its encoder is lowered (its
+    text_quants).  HunyuanImage 3.0 has no text encoder: its two quantizations are lowered (int8 to w4a8) and "" is
+    the text quant returned."""
     quants = dit_quants(dit)
     if quant not in quants:
         quant = quants[-1] if not is_hunyuanimage3(dit) else quants[0]
@@ -379,11 +474,14 @@ def fit_ram(ram_left_gb: float, text_encoder: str = DEFAULT_TEXT_ENCODER, quant:
             if ram_need_gb(q, "", "", dit) <= ram_left_gb:
                 return q, "", True
         return quants[0], "", False
+    tq = text_quants(dit)
+    if text_quant not in tq:
+        text_quant = tq[-1]
     for q in reversed(quants[:quants.index(quant) + 1]):
-        for t in reversed(TEXT_QUANTS[:TEXT_QUANTS.index(text_quant) + 1]):
+        for t in reversed(tq[:tq.index(text_quant) + 1]):
             if ram_need_gb(q, text_encoder, t, dit, keep, q8) <= ram_left_gb:
                 return q, t, True
-    return quants[0], TEXT_QUANTS[0], False
+    return quants[0], tq[0], False
 
 
 def file_url(name: str, endpoint: str = "https://huggingface.co") -> str:
@@ -394,6 +492,10 @@ def file_url(name: str, endpoint: str = "https://huggingface.co") -> str:
 def local_path(models_dir: Path, name: str) -> Path:
     if name.startswith("hunyuanimage3-"):
         folder = HUNYUANIMAGE3_DIR
+    elif name.startswith("moss-sft-") or name.startswith("moss-base-"):   # a DiT's transformer folder, its own
+        return Path(models_dir) / MOSS_DIR / name.split("-")[1] / Path(FILES[name][1]).name
+    elif name.startswith(("moss-", "llm-moss-")):
+        folder = MOSS_DIR
     else:
         folder = MF_DIR if name.startswith(("mf-", "llm-mf-")) else MODEL_DIR
     return Path(models_dir) / folder / LOCAL_NAMES.get(name, Path(FILES[name][1]).name)
@@ -519,6 +621,14 @@ def image_config(quant: str, exe: Path, models_dir: Path, *, model: str = DEFAUL
                 "guidance": HUNYUANIMAGE3_GUIDANCE, "schedule": "hunyuanimage3",
                 "transparency": False, "resolutions": hunyuanimage3_resolutions(),
                 "gpu_policy": policy, "uma": bool(uma), "ssd_offload": bool(ssd_offload)}
+    if is_moss(dit):
+        q8 = {"dit_q8": bool(dit_q8)} if dit_q8 is not None else {}
+        return {**q8, "model_name": name, "family": "moss-image", "exe": str(exe), "quant": "bf16",
+                "diffusion_model": str(local_path(models_dir, f"{dit}-1").parent), "steps": DITS[dit][1],
+                "schedule": "moss", "cfg_scale": MOSS_CFG, "shift": MOSS_SHIFT, "transparency": False,
+                "vae": str(local_path(models_dir, "moss-vae")),
+                "llm": str(local_path(models_dir, text_file(text_encoder, text_quant))), "text_encoder": text_encoder,
+                "text_quant": text_quant, "gpu_policy": policy, "uma": bool(uma), "ssd_offload": bool(ssd_offload)}
     if is_mage(dit):
         q8 = {"dit_q8": bool(dit_q8)} if dit_q8 is not None else {}
         edit = {"edit_model": str(local_path(models_dir, f"{MF_EDIT[dit][0]}-bf16")), "edit_steps": MF_EDIT[dit][1],
