@@ -65,7 +65,8 @@
 //   BUDGET <MiB>             the VRAM the engine may take (0: the free VRAM at its start)      -> BUDGET budget_mib=...
 //   FIT <MiB>                the budget: what the engine holds and the free VRAM, less <MiB>  -> BUDGET budget_mib=...
 //   RELEASE [ALL]            frees the layers, activations and buffers (the cache); ALL also the parts' fixed weights
-//                            and scratch, the parts opened again on the next IMG                -> RELEASE ok
+//                            and scratch, the parts opened again on the next IMG (MOSS-Image's DiT keeps its blocks
+//                            quantized in RAM for that)                                         -> RELEASE ok
 //   STOP                     (while an IMG runs) ends it after the step it is in               -> ERROR stopped
 //   QUIT                     ends the engine
 // A request that fails answers ERROR <message> and the engine goes on.  Before the first line it makes a small image

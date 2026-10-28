@@ -233,7 +233,8 @@ MossDit::~MossDit() {
     for (void* p : text_allocs_) gpu::free(p);
 }
 
-bool MossDit::open(const std::string& path, void* stream, std::string& err, bool dry, bool q8) {
+bool MossDit::open(const std::string& path, void* stream, std::string& err, bool dry, bool q8,
+                   std::vector<std::vector<uint8_t>>* reuse) {
     try {
         s_ = stream;
         dry_ = dry;
@@ -288,7 +289,12 @@ bool MossDit::open(const std::string& path, void* stream, std::string& err, bool
             for (const auto& [off, name] : norms) vbytes += (uint64_t) f.bf16(p + name, nullptr).elements() * 4;
             std::vector<LayerStream::Span> spans;
             std::vector<uint8_t> host;
-            if (!dry_) host.resize((size_t) (qbytes + vbytes));
+            // an earlier open's bytes of this block, in the same form (their size says it: W8A8's rows and Q8_0's
+            // differ), else the file's quantized again
+            const bool reused = !dry_ && q8_ && reuse != nullptr && (size_t) i < reuse->size() &&
+                                (*reuse)[(size_t) i].size() == qbytes + vbytes;
+            if (reused) host = std::move((*reuse)[(size_t) i]);
+            else if (!dry_) host.resize((size_t) (qbytes + vbytes));
             uint64_t at = 0;
             std::vector<size_t> wspan, nspan;
             for (const auto& [w, name] : items) {
@@ -296,7 +302,7 @@ bool MossDit::open(const std::string& path, void* stream, std::string& err, bool
                 f.bf16(p + name + ".weight", &d);
                 const uint64_t bytes = w->row_bytes * (uint64_t) w->n + (w->type == kTypeW8 ? (uint64_t) w->n * 4 : 0);
                 if (q8_) {
-                    if (!dry_) {
+                    if (!dry_ && !reused) {
                         quantize_matrix(reinterpret_cast<const uint16_t*>(d), w->n, w->k, host.data() + at,
                                         w->type == kTypeW8);
                         f.drop_cache(p + name + ".weight");   // read once, not kept in the page cache
@@ -310,7 +316,7 @@ bool MossDit::open(const std::string& path, void* stream, std::string& err, bool
             }
             for (const auto& [off, name] : norms) {
                 const int64_t n = f.bf16(p + name, nullptr).elements();
-                if (!dry_) {
+                if (!dry_ && !reused) {
                     const auto v = f.f32(p + name);
                     std::memcpy(host.data() + at, v.data(), v.size() * 4);
                 }

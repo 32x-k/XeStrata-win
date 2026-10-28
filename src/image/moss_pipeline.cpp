@@ -195,6 +195,7 @@ void MossPipeline::ensure_open(bool q8) {
         gpu::stream_sync(s_);
         dit_.reset();
     }
+    if (!q8) dit_host_.clear();   // FP16 reads the file in place
     std::string err;
     if (!vae_) {
         auto v = std::make_unique<MfVae>();
@@ -203,7 +204,9 @@ void MossPipeline::ensure_open(bool q8) {
     }
     if (!dit_) {
         auto d = std::make_unique<MossDit>();
-        if (!d->open(dit_path_, s_, err, false, q8)) throw std::runtime_error(err);
+        const bool ok = d->open(dit_path_, s_, err, false, q8, &dit_host_);
+        dit_host_.clear();
+        if (!ok) throw std::runtime_error(err);
         d->set_block_budget(d->block_min());   // nothing resident until the request plans its budget
         d->set_skip(1, {kUncondSkip});
         dit_ = std::move(d);
@@ -291,6 +294,7 @@ void MossPipeline::release(bool all) {
     gpu::stream_sync(s_);
     if (all) {
         te_.reset();
+        if (dit_ && dit_->q8()) dit_host_ = dit_->take_host();   // the RAM setup counts for it: kept for the next open
         dit_.reset();
         vae_.reset();
         ctx_states_[0].clear();

@@ -21,6 +21,10 @@
 //
 // img2img and a mask (img_start.hpp) take the init image through the Flux2 VAE's encoder at the image's size (the
 // posterior's mean).
+//
+// release(true) closes the parts but keeps the DiT's blocks quantized in RAM (MossDit::take_host), which the next open
+// takes instead of quantizing the file again: 7.4 s of the first image after each release on the B70 (2026-10-28, its
+// 10 GB of bf16), the RAM setup counts for the model anyway (qimage.ram_need_gb).
 #pragma once
 
 #include "strata/image/img_start.hpp"
@@ -87,6 +91,7 @@ private:
     bool base_encoder_ = false, states_given_ = false;
     std::unique_ptr<MossText> te_;
     std::unique_ptr<MossDit> dit_, dit_size_, dit16_size_;
+    std::vector<std::vector<uint8_t>> dit_host_;   // the closed DiT's blocks in 8 bits (release(true)), for its next open
     std::unique_ptr<MfVae> vae_, vae_size_;
     // the text encoder's file: its blocks' bytes, the largest block's, the rest; its fixed VRAM as measured at its
     // first open and first encode (0: not yet; te_measure_ 0 neither, 1 the open, 2 both)
