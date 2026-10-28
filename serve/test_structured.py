@@ -154,12 +154,21 @@ class Structured(unittest.TestCase):
             load.assert_not_called()
 
     def test_without_jsonschema_an_object_is_still_required(self):
-        # jsonschema is optional: without it json_schema answers are checked to be one JSON object, json_object
-        # never needs it, and nothing is imported at server start
+        # without jsonschema a strict request (strict: true, a strict tool) is refused, as its reply could not be
+        # checked; another json_schema answer is checked to be one JSON object, and json_object never needs it
+        loose = {"type": "json_schema", "json_schema": {"name": "h3_story", "schema": STORY_SCHEMA}}
+        tool = {"type": "function", "function": {"name": "f", "strict": True, "parameters": {"type": "object"}}}
         with mock.patch.object(structured, "_jsonschema", False):
-            self.assertEqual(self.chat()[0], 200)
+            code, reply = self.chat()
+            self.assertEqual(code, 400)
+            self.assertIn("jsonschema", reply["error"]["message"])
+            code, reply = self.request("/v1/chat/completions", {"messages": [{"role": "user", "content": "go"}],
+                                                                "tools": [tool], "reasoning_effort": "none"})
+            self.assertEqual(code, 400)
+            self.assertIn("jsonschema", reply["error"]["message"])
+            self.assertEqual(self.chat(response_format=loose)[0], 200)
             for script in ("## Film Plan - Photobooth", "[1, 2]"):
-                code, reply = self.chat(script)
+                code, reply = self.chat(script, response_format=loose)
                 self.assertEqual(code, 502, script)
                 self.assertEqual(reply["error"]["code"], "structured_output_failed")
             self.assertEqual(self.chat('{"answer":4}', response_format={"type": "json_object"})[0], 200)

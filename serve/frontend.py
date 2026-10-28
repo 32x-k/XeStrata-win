@@ -964,7 +964,8 @@ def anthropic_format(req: dict):
         raise ValueError('output_config.format must be {"type": "json_schema", "schema": {...}}')
     if not isinstance(fmt.get("schema"), dict):
         raise ValueError("output_config.format needs a schema object")
-    return {"type": "json_schema", "json_schema": {"name": "output", "schema": fmt.get("schema")}}
+    # Anthropic's structured output always follows its schema: strict, as OpenAI's strict: true
+    return {"type": "json_schema", "json_schema": {"name": "output", "strict": True, "schema": fmt.get("schema")}}
 
 
 # ------------------------------------------------------------------------------------------------ output parser

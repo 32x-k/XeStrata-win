@@ -1926,13 +1926,13 @@ def check_pdf() -> None:
 
 def check_jsonschema() -> None:
     """Linux: response_format json_schema and strict tools are checked with the Python package jsonschema - pip
-    installs it into .venv, and the deb and rpm packages recommend the distribution's.  Without it only that an answer
-    is one JSON object is checked: said, with the command that installs it, never a stop."""
+    installs it into .venv, and the deb and rpm packages depend on the distribution's.  Without it a strict request is
+    refused (400): said, with the command that installs it, never a stop."""
     import importlib.util
     if importlib.util.find_spec("jsonschema") is not None:
         return
-    warn("json_schema answers and strict tool calls are checked with the Python package jsonschema (without it "
-         "only that an answer is one JSON object):")
+    warn("json_schema answers and strict tool calls are checked with the Python package jsonschema (without it a "
+         "strict request is refused):")
     say(f"  {install_cmd([tool_pkg('jsonschema')])}")
 
 
