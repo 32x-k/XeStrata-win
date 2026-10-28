@@ -66,8 +66,8 @@ sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))   # run as a script (run-<model>.sh) as well as a module
 SETUP_CMD = "xestrata" if (ROOT / "PACKAGED").is_file() else "./setup.sh"   # a deb or rpm package's command (setup.py)
 from serve.frontend import (THINK_END, ChatTemplate, Event, GlmOutputParser, HarmonyParser,  # noqa: E402
-                            OutputParser, ToolCall, anthropic_format, anthropic_to_messages, forced_call, images_of,
-                            literal_tags,
+                            OutputParser, ToolCall, anthropic_format, anthropic_to_messages, custom_tool_names,
+                            forced_call, images_of, literal_tags,
                             mark_think_literals,
                             openai_to_messages, require_messages, tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, McpHub, hub_from_config  # noqa: E402
@@ -4238,7 +4238,9 @@ class Service:
                     raise ClientGone()
                 return fetched[src] if src in fetched else self.download(src) \
                     if src.startswith(("http://", "https://")) else src
-            images = [fetch(src) for src in images]
+            low = [item.get("detail") == "low" for m in messages if isinstance(m.get("content"), list)
+                   for item in m["content"] if item.get("type") == "image"]
+            images = [low_detail(fetch(src)) if is_low else fetch(src) for src, is_low in zip(images, low)]
             # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
@@ -5164,6 +5166,47 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
 
 
 # ------------------------------------------------------------------------------------------------ OpenAI
+LOW_DETAIL_SIDE = 512             # OpenAI's image_url detail "low": the picture is read at 512 x 512 at most
+
+
+def low_detail(source) -> str | bytes:
+    """An image to read at OpenAI's low detail: its longer side brought down to LOW_DETAIL_SIDE (fewer image tokens),
+    as PNG.  Without Pillow, or for an image already that small, the image as it is."""
+    try:
+        import io
+        from PIL import Image
+    except ImportError:
+        return source
+    data = source if isinstance(source, bytes) else Vision.load(source)
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            if max(im.size) <= LOW_DETAIL_SIDE:
+                return data
+            im.thumbnail((LOW_DETAIL_SIDE, LOW_DETAIL_SIDE))
+            out = io.BytesIO()
+            im.convert("RGBA" if im.mode in ("RGBA", "LA", "P") else "RGB").save(out, "PNG")
+            return out.getvalue()
+    except (OSError, ValueError):            # not a picture Pillow reads: the reader says what is wrong with it
+        return data
+
+
+def check_logprobs(req: dict) -> None:
+    """OpenAI's limits on logprobs: top_logprobs a whole number 0..20, and only with logprobs: true."""
+    k = req.get("top_logprobs")
+    if k is None:
+        return
+    if isinstance(k, bool) or not isinstance(k, int) or not 0 <= k <= 20:
+        raise ValueError("top_logprobs must be a whole number from 0 to 20")
+    if req.get("logprobs") is not True:
+        raise ValueError("top_logprobs needs logprobs: true")
+
+
+def system_fingerprint(svc) -> str:
+    """OpenAI's system_fingerprint: names the engine's build and the model, so it changes when either does."""
+    version = (getattr(svc.engine, "info", None) or {}).get("version")
+    return "fp_" + hashlib.sha256(f"{version}|{svc.model}".encode()).hexdigest()[:12]
+
+
 def top_logprobs(req: dict):
     """The K of the engine's logprobs=K, or None when the request did not ask (OpenAI: logprobs=true, top_logprobs
     0..20; the legacy completions form, logprobs=N, is taken as N)."""
@@ -5357,9 +5400,12 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
     # llama.cpp's flag, and its default: a client that wants prompt progress asks for it, and nothing changes for one
     # that does not.  Strata already sends a keep-alive comment on every PP line, so this only fills that line in.
     want_progress = bool(req.get("return_progress"))
+    fingerprint = system_fingerprint(svc)
+    customs = custom_tool_names(req)              # their calls: {"type": "custom", "custom": {"name", "input"}}
 
     def chunk(delta, finish=None):
         return {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model,
+                "system_fingerprint": fingerprint,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
 
     yield chunk({"role": "assistant", "content": ""})
@@ -5381,9 +5427,19 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
             ev = cast(Event, x)
             call = cast(ToolCall, ev.call)          # (every tool_* event carries its call)
             if ev.kind == "reasoning" and ev.text:
-                yield chunk({"reasoning_content": ev.text})
+                # llama.cpp's reasoning_content and vLLM's reasoning: the same text, for a client that reads either
+                yield chunk({"reasoning_content": ev.text, "reasoning": ev.text})
             elif ev.kind == "content" and ev.text:
                 yield chunk({"content": ev.text})
+            elif ev.kind in ("tool_start", "tool_args") and call.name in customs:
+                pass                                # a custom tool's input is sent whole, with its tool_call
+            elif ev.kind == "tool_call" and call.name in customs:
+                given = call.arguments
+                text = given["input"] if isinstance(given, dict) and set(given) == {"input"} \
+                    and isinstance(given["input"], str) else json.dumps(given, ensure_ascii=False)
+                yield chunk({"tool_calls": [{"index": calls, "id": call.id, "type": "custom",
+                                             "custom": {"name": call.name, "input": text}}]})
+                calls += 1
             elif ev.kind == "tool_start":
                 streamed[call.id] = calls
                 calls += 1
@@ -5409,7 +5465,9 @@ def _openai_chunks(svc: Service, req: dict, ids, thinking, tools, max_new, cance
             last["usage"] = {"prompt_tokens": pt, "completion_tokens": fin["completion_tokens"],
                              "total_tokens": pt + fin["completion_tokens"],
                              # the part of the prompt the conversation cache already held (OpenAI's field)
-                             "prompt_tokens_details": {"cached_tokens": fin.get("reused") or 0}}
+                             "prompt_tokens_details": {"cached_tokens": fin.get("reused") or 0},
+                             # the thinking's share of completion_tokens
+                             "completion_tokens_details": {"reasoning_tokens": fin.get("reasoning_tokens") or 0}}
             if fin.get("timings"):
                 last["timings"] = fin["timings"]          # llama.cpp's field: the speed its clients show
             if fin.get("rejected_tool_calls"):          # #3796: only when a call was refused as undeclared
@@ -5440,6 +5498,9 @@ def openai_collect(chunks) -> dict:
         content.append(d.get("content") or "")
         reasoning.append(d.get("reasoning_content") or "")
         for tc in d.get("tool_calls") or []:       # streamed calls arrive in pieces: merge them by index
+            if tc.get("type") == "custom":         # a custom tool's call comes whole
+                by_index[tc.get("index", len(by_index))] = {k: v for k, v in tc.items() if k != "index"}
+                continue
             cur = by_index.setdefault(tc.get("index", len(by_index)),
                                       {"id": None, "type": "function", "function": {"name": "", "arguments": ""}})
             cur["id"] = tc.get("id") or cur["id"]
@@ -5450,15 +5511,17 @@ def openai_collect(chunks) -> dict:
     calls = [by_index[i] for i in sorted(by_index)]
     assert last is not None                         # openai_chunks always ends with the finishing chunk
     if last["choices"][0]["finish_reason"] != "tool_calls":
-        calls = [c for c in calls if _is_json(c["function"]["arguments"])]   # a call the output ended inside (#211)
+        calls = [c for c in calls if c.get("type") == "custom"
+                 or _is_json(c["function"]["arguments"])]   # a call the output ended inside (#211)
     msg: dict = {"role": "assistant", "content": "".join(content) or None}
     if "".join(reasoning):
-        msg["reasoning_content"] = "".join(reasoning)
+        msg["reasoning_content"] = msg["reasoning"] = "".join(reasoning)
     if calls:
         msg["tool_calls"] = calls
     if mcp:
         msg["strata_mcp"] = mcp
     out = {"id": last["id"], "object": "chat.completion", "created": last["created"], "model": last["model"],
+           **({"system_fingerprint": last["system_fingerprint"]} if "system_fingerprint" in last else {}),
            "choices": [{"index": 0, "message": msg, "finish_reason": last["choices"][0]["finish_reason"]}],
            "usage": last["usage"]}
     if last.get("timings"):
@@ -5551,7 +5614,7 @@ def structured_chunks(chunks, validator):
         yield buffered[0]
         delta = {"content": content}
         if choice["message"].get("reasoning_content"):
-            delta["reasoning_content"] = choice["message"]["reasoning_content"]
+            delta["reasoning_content"] = delta["reasoning"] = choice["message"]["reasoning_content"]
         piece = {"index": 0, "delta": delta, "finish_reason": None}
         if logprobs:
             piece["logprobs"] = logprobs
@@ -6817,6 +6880,7 @@ def make_handler(svc: Service):
             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
             check_request_sampling(req)                       # ... and a sampling field of the wrong type
+            check_logprobs(req)                               # ... and top_logprobs out of 0..20
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
@@ -6830,13 +6894,22 @@ def make_handler(svc: Service):
             if not req.get("stream"):
                 return self._json(200, openai_collect(chunks))
             self._sse()
+            options = req.get("stream_options")
+            last = None
             try:
                 for c in chunks:
                     if c is None:
                         self.wfile.write(b": keep-alive\n\n")      # an SSE comment: clients ignore it
                     else:
                         self.wfile.write(b"data: " + json.dumps(c, ensure_ascii=False).encode() + b"\n\n")
+                        last = c
                     self.wfile.flush()
+                if isinstance(options, dict) and options.get("include_usage") and last and last.get("usage"):
+                    # OpenAI's usage chunk, after the finishing one (which also keeps its usage, as llama.cpp's)
+                    usage = {k: last[k] for k in ("id", "object", "created", "model", "system_fingerprint")
+                             if k in last}
+                    self.wfile.write(b"data: " + json.dumps({**usage, "choices": [], "usage": last["usage"]},
+                                                            ensure_ascii=False).encode() + b"\n\n")
                 self.wfile.write(b"data: [DONE]\n\n")
             except OSError:
                 self._note(outcome="disconnected")

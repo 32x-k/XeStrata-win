@@ -254,7 +254,11 @@ def _parts_of(content):
         if not isinstance(part, dict):
             continue
         if part.get("type") in IMAGE_PARTS:
-            items.append({"type": "image", "source": _image_source(part)})
+            item = {"type": "image", "source": _image_source(part)}
+            url = part.get("image_url")
+            if (url.get("detail") if isinstance(url, dict) else part.get("detail")) == "low":
+                item["detail"] = "low"               # OpenAI's low detail: read at a smaller size (Service.prepare)
+            items.append(item)
         elif part.get("type") in TEXT_PARTS and "text" in part:
             items.append({"type": "text", "text": part.get("text", "")})
     return items
@@ -622,6 +626,31 @@ def _order_chat_tool_results(messages: list[dict]) -> None:
             call.pop("_call_id", None)
 
 
+def custom_tool_names(req: dict) -> set[str]:
+    """The names of a Chat Completions request's custom tools ({"type": "custom", "custom": {"name": ...}}): their
+    calls are answered as {"type": "custom", "custom": {"name", "input"}}."""
+    tools = req.get("tools")
+    return {t["custom"]["name"] for t in tools if isinstance(t, dict) and t.get("type") == "custom"
+            and isinstance(t.get("custom"), dict) and isinstance(t["custom"].get("name"), str)} \
+        if isinstance(tools, list) else set()
+
+
+def _chat_tool(t):
+    """A Chat Completions tool -> the template's.  A custom tool takes free text, maybe in a grammar the model reads
+    (it is not enforced: the text is checked by nothing), as /v1/responses' custom tools."""
+    if not isinstance(t, dict) or t.get("type") != "custom" or not isinstance(t.get("custom"), dict):
+        return t.get("function", t) if isinstance(t, dict) and t.get("type") == "function" else t
+    c = t["custom"]
+    description = c.get("description") or ""
+    fmt = c.get("format") if isinstance(c.get("format"), dict) else {}
+    grammar = fmt.get("grammar") if isinstance(fmt.get("grammar"), dict) else fmt
+    if fmt.get("type") == "grammar" and grammar.get("definition"):
+        description += f"\n\nThe input must follow this {grammar.get('syntax', '')} grammar:\n{grammar['definition']}"
+    return {"name": c.get("name"), "description": description,
+            "parameters": {"type": "object", "required": ["input"],
+                           "properties": {"input": {"type": "string", "description": "the raw input"}}}}
+
+
 def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     """OpenAI Chat Completions -> (template messages, template tools, template kwargs)."""
     messages = []
@@ -629,18 +658,41 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
         role = m.get("role")
         if role == "developer":
             role = "system"
+        if role == "function":                       # the old shape of a tool's result: the call it answers by name
+            role = "tool"
+        raw_content = m.get("content")
+        for j, part in enumerate(raw_content if isinstance(raw_content, list) else []):
+            if isinstance(part, dict) and part.get("type") == "input_audio":
+                raise ValueError(f"messages[{i}].content[{j}]: input_audio is not supported: this model does not "
+                                 "read audio")
         # an image is read in a user, tool or assistant message; the system prompt takes text only, as _text_of reads
         images = role in ("user", "tool", "assistant")
         content = _check_parts(m.get("content"), f"messages[{i}].content",
                                TEXT_PARTS + IMAGE_PARTS if images else TEXT_PARTS)
+        if role == "assistant" and content in (None, "") and isinstance(m.get("refusal"), str):
+            content = m["refusal"]                   # a refusal the client sends back is what the model said
         out = {"role": role, "content": _parts_of(content) if images else _text_of(content)}
+        name = m.get("name")
+        if role in ("user", "system") and isinstance(name, str) and name:
+            # the speaker's name, which the template has no place for: written before what they said
+            said = out["content"]
+            out["content"] = f"{name}: {said}" if isinstance(said, str) else \
+                [{"type": "text", "text": f"{name}: "}] + list(said or [])
         if role == "tool":
             out["_call_id"] = m.get("tool_call_id")
         if m.get("reasoning_content"):
             out["reasoning_content"] = m["reasoning_content"]
-        if m.get("tool_calls"):
+        raw = m.get("tool_calls")
+        if not raw and isinstance(m.get("function_call"), dict):   # the old shape of one call
+            raw = [{"function": m["function_call"]}]
+        if raw:
             calls = []
-            for c in _object_list(m["tool_calls"], "tool_calls"):
+            for c in _object_list(raw, "tool_calls"):
+                if c.get("type") == "custom" and isinstance(c.get("custom"), dict):
+                    calls.append({"function": {"name": c["custom"].get("name"),
+                                               "arguments": {"input": str(c["custom"].get("input") or "")}},
+                                  "_call_id": c.get("id")})
+                    continue
                 fn = c.get("function", c)
                 if not isinstance(fn, dict):
                     raise ValueError("tool_calls must be a list of objects (each with a \"function\" object)")
@@ -649,8 +701,14 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
             out["tool_calls"] = calls
         messages.append(out)
     _order_chat_tool_results(messages)
-    tools = [t.get("function", t) if t.get("type") == "function" else t
-             for t in _tool_list(req.get("tools"), "function")] or None
+    given = req.get("tools")
+    plain = [t for t in given if not (isinstance(t, dict) and t.get("type") == "custom")] \
+        if isinstance(given, list) else given
+    listed = [_chat_tool(t) for t in _tool_list(plain, "function")]
+    if isinstance(given, list):                      # the custom tools, after the function tools
+        listed += [_chat_tool(t) for t in given if isinstance(t, dict) and t.get("type") == "custom"
+                   and isinstance(t.get("custom"), dict) and isinstance(t["custom"].get("name"), str)]
+    tools = listed or None
     kwargs = {}
     # OpenAI Chat Completions: "reasoning_effort"; Responses style: "reasoning": {"effort": ...}
     reasoning = req["reasoning"] if isinstance(req.get("reasoning"), dict) else {}
@@ -938,8 +996,8 @@ def tool_choice_of(tool_choice) -> tuple[str, str | None]:
             return kind, None
         if kind in ("any", "required"):
             return "required", None
-        if kind in ("function", "tool"):
-            fn = tool_choice.get("function")
+        if kind in ("function", "tool", "custom"):
+            fn = tool_choice.get("function") or tool_choice.get("custom")
             name = (fn.get("name") if isinstance(fn, dict) else None) or tool_choice.get("name")
             if isinstance(name, str) and name:
                 return "named", name

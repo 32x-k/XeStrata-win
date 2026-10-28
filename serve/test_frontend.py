@@ -91,9 +91,11 @@ class UnreadContentParts(unittest.TestCase):
         tok = ByteTokenizer()
         self.service = Service(MockEngine(tok, "ok"), tok, self.template)
 
-    def test_chat_file_and_audio_parts_are_left_out(self):
-        parts = ({"type": "file", "file": {"filename": "a.pdf", "file_data": "data:application/pdf;base64,AA"}},
-                 {"type": "input_audio", "input_audio": {"data": "AA", "format": "wav"}})
+    def test_chat_file_part_is_left_out_and_audio_refused(self):
+        audio = {"type": "input_audio", "input_audio": {"data": "AA", "format": "wav"}}
+        with self.assertRaisesRegex(ValueError, "input_audio"):   # the model reads no audio: a 400, as OpenAI's
+            openai_to_messages({"messages": [{"role": "user", "content": [{"type": "text", "text": "this"}, audio]}]})
+        parts = ({"type": "file", "file": {"filename": "a.pdf", "file_data": "data:application/pdf;base64,AA"}},)
         for part in parts:
             with self.subTest(kind=part["type"]):
                 got = openai_to_messages({"messages": [
