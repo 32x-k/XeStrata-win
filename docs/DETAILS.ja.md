@@ -1217,13 +1217,14 @@ B70 の IQ2_XS で、4,996 トークンの会話（INT8 の KV）のファイル
 `{"type":"json_schema","json_schema":{"name":"answer","strict":true,"schema":{"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"],"additionalProperties":false}}}` を受け付けます。
 スキーマの最上位はオブジェクトでなければなりません。
 `#` で始まるローカルの参照は使え、外部の参照は断ります。
-`json_schema` は、Python のパッケージ `jsonschema` があればそれで確かめます（`python -m pip install "jsonschema>=4.23,<5"`。setup は入れません）。
-なければ、答えが 1 つの JSON のオブジェクトであることだけを確かめ、server はそのことを一度だけ伝えます。
+`json_schema` は、Python のパッケージ `jsonschema` で確かめます（setup が `.venv` に入れ、deb と rpm はディストリビューションの python3-jsonschema を推奨のパッケージにし、Windows の 7z には入っています）。
+なければ、答えが 1 つの JSON のオブジェクトであることだけを確かめ、server はそのことを一度だけ伝えます。入れ方は `xestrata --setup` が示します。
 
 エンジンが文法で縛れるとき（連続バッチと密なモデルのエンジンを除く）は、**答えをスキーマの文法で縛って書かせ**、書いた後にも確かめます。
 思考は縛らず、思考の後の答えの JSON だけを縛ります。
 縛れないときは、スキーマをプロンプトで伝え、server が確かめるだけです。環境変数 `STRATA_GRAMMAR=0` でも縛りません。
-道具の `strict: true`（Chat Completions・Responses・Messages）と、`custom` の道具の regex の文法も、呼び出しの引数を同じように縛ります（Qwen の呼び出しの形のモデル）。文と、ほかの道具の呼び出しは縛りません。
+道具の `strict: true`（Chat Completions・Responses・Messages。Responses の namespace と `additional_tools` の道具も）と、`custom` の道具の regex の文法も、呼び出しの引数を同じように縛ります（Qwen の呼び出しの形のモデル）。文と、ほかの道具の呼び出しは縛りません。
+`strict: true` の道具の呼び出しは、縛ったかどうかにかかわらず、送る前に引数をスキーマで確かめます。そのため書いている途中には送らず、書き終わった呼び出しをまとめて送ります。合わなければ、答えと同じく `structured_output_failed` です。
 1 つの要求に 1 回だけ生成し、隠れたやり直しはしません。
 成功した応答には、確かめた JSON のオブジェクトが入ります。
 壊れた JSON、重複したキー、有限でない数、スキーマの違反、途中で終わった生成には、`error.code: structured_output_failed` で **502** を返します。
@@ -1328,10 +1329,11 @@ PDF は、Linux では poppler の `pdftotext` と `pdftoppm` で、Windows で�
 - `n`（1〜128）は、choice ごとに 1 回ずつ生成します。`seed` があれば choice ごとに `seed + k` です。
 - `stream_options.include_usage` では、`choices: []` の usage の区切りも送ります。終わりの区切りの usage（llama.cpp と同じ）も残ります。
 - usage には `completion_tokens_details.reasoning_tokens` が入り、応答には `system_fingerprint`（エンジンの版とモデルから作る値）が入ります。
-- 古い形の `role: function` と assistant の `function_call` は、道具の結果と呼び出しとして読みます。
+- 古い形の `role: function` と assistant の `function_call` は、道具の結果と呼び出しとして読みます。古い形の `functions` と `function_call` の要求は `tools` と `tool_choice` として読み（呼び出しは 1 つずつ）、答えも古い形（`function_call`、終わりの理由 `function_call`）で返します。`tools` や `tool_choice` と一緒には使えません。
 - `user` と `system` の `name` は「名前: 」として発言の前に書きます。assistant の `refusal` は、本文がないときその発言の本文として読みます。
 - `image_url` の `detail: "low"` の画像は、長い辺を 512 に縮めて読みます。
-- `top_logprobs` は 0〜20 で、`logprobs: true` のときだけです。`input_audio` は 400 です（モデルが音声を読めません）。
+- `top_logprobs` は 0〜20 で、`logprobs: true` のときだけです。`input_audio` と、音声の出力（`modalities` の `audio`、`audio`）は 400 です（モデルは音声を読み書きできません）。
+- `max_tokens` と `max_completion_tokens` は整数です（2.9 は 400）。
 
 **Messages**:
 
@@ -1615,7 +1617,7 @@ HunyuanImage 3.0 の重みは Tencent Hunyuan Community License Agreement で、
 サーバーは `POST /v1/images/generations`（OpenAI の images API の形。`seed` と `steps` も受けます）で画像を作り、Web のページには「Images」のタブが出ます。
 画像の API は vLLM-Omni 互換（OpenAI 互換）で、vLLM-Omni の拡張の項目も受けます。`num_inference_steps` は `steps` と同じです（Turbo は 8 ステップのままで、ステップ数の指定は無視します）。`true_cfg_scale` を 1 より大きくして `negative_prompt` を付けると、Qwen-Image-2.1 と Turbo に CFG を掛けます（diffusers の Qwen-Image-2.1 と同じ式です。条件ありとネガティブの 2 つ分を計算するので、時間は 1024×1024 で約 2 倍、512×512 では約 1.5 倍です）。どちらかが欠けていればガイダンスなしで、`guidance_scale` は Qwen-Image-2.1 と Turbo では使いません。
 `output_format` は `png`（既定）、`jpeg`、`webp`、`jxl` で、`output_compression`（0〜100、既定 100）が jpeg、webp、jxl の画質になります（jxl の 100 は可逆）。`jxl`（JPEG XL）は libjxl の cjxl（BSD-3-Clause）があるときだけ使え、`/health` の `image_defaults` の `formats` に出ます。deb と rpm は推奨のパッケージ（Ubuntu の libjxl-tools、Fedora の libjxl-utils）で入り、Podman のイメージと Windows の 7z には入っています。ソースから動かすときは、そのパッケージを入れます。可逆は cjxl の effort 3、ほかは既定の 7 で書きます。
-`n` は `max_n`（既定 16）までで、サーバーが測った速さ（大きさごとの 1 ステップの秒数と、それ以外の秒数。測った最大の大きさより大きい画像は 1 ステップの時間を画素数の 1.5 乗で伸ばします）で見積もった時間が `budget_s`（既定 600 秒）を超える数は、見積もりを添えてエラー（400）で断ります。まだ 1 枚も作っていないときは 4 枚までです。何枚も作る途中で別の要求が GPU の順番を待っていると、1 枚ごとに順番を譲ります（`unload` のときは譲りません）。`quality` は Qwen-Image-2.1 でステップ数を決めます（`low` 20、`medium` と `standard` 30、`high`・`hd`・`auto` は既定の 40。`steps` を付けたときはそちら）。Turbo では 8 ステップのままで、Mage-Flow では使いません。応答の `usage` は画像のエンジンのトークンで数えます（プロンプトのトークンと、参照画像と作った画像の 16×16 画素で 1 つのトークン）。
+`n` は `max_n`（既定 16）までで、サーバーが測った速さ（大きさごとの 1 ステップの秒数と、それ以外の秒数。測った最大の大きさより大きい画像は 1 ステップの時間を画素数の 1.5 乗で伸ばします）で見積もった時間が `budget_s`（既定 600 秒）を超える数は、見積もりを添えてエラー（400）で断ります。まだ 1 枚も作っていないときは 4 枚までです。何枚も作る途中で別の要求が GPU の順番を待っていると、1 枚ごとに順番を譲ります（`unload` のときは譲りません）。`quality` は Qwen-Image-2.1 でステップ数を決めます（`low` 20、`medium` と `standard` 30、`high`・`hd`・`xhigh`・`max`・`auto` は既定の 40。`steps` を付けたときはそちら）。Turbo では 8 ステップのままで、Mage-Flow では使いません。応答の `usage` は画像のエンジンのトークンで数えます（プロンプトのトークンと、参照画像と作った画像の 16×16 画素で 1 つのトークン）。
 `background` を `transparent` にすると、Qwen の推奨する形でプロンプトを包み、透明な背景の画像（アルファ付きの PNG、webp、jxl）を作ります（jpeg とは組み合わせられません）。`opaque` はアルファを白の上に重ねて消し、`auto`（既定）はモデルの作ったままにします。編集の参照画像のアルファも、そのまま画像のモデルに渡します。
 `stream: true` を付けると、OpenAI と同じく SSE で返します。`partial_images`（0〜3、既定 0）を付けると、サンプリングの途中で予測した仕上がり（x0 = x − σ v）を VAE で画像に戻し、`image_generation.partial_image`（編集は `image_edit.partial_image`）で 1 枚あたり最大その枚数だけ送ります（最後のステップの後には作らないので、ステップが少ないと減ります）。最後に画像ごとに `image_generation.completed`（`b64_json`・`usage`、ほかに `seed` と `strata` の数字）を送ります。ノイズは最初に 1 回だけ引くので、途中の画像を作っても最後の画像は変わりません。途中の画像の分だけ VAE の時間が増えます。HunyuanImage 3.0 は途中の画像を作らず、最後の画像だけを送ります。`stream` のない要求は `partial_images` を無視します。Web のページは、「途中の画像を表示」（既定はオフ）で `partial_images: 2` を送ります。
 `POST /v1/images/edits`（OpenAI の形の multipart で `image` か `image[]`、または JSON の `images: [{"image_url": ...}]`）は、参照画像（10 枚まで。PNG・JPEG・GIF・BMP はそのまま、WebP などほかの形式は PNG に変えて読みます）を元に画像を作ります。`mask`（OpenAI と同じく、1 枚目の画像と同じ大きさのアルファ付き PNG）を付けると、その透明な部分だけを描き直し、残りは 1 枚目の画像の画素のまま残します（各ステップでマスクの外の潜在を元の画像のものに戻し、最後に元の画素と合成します）。参照画像は、出力の大きさにかかわらず 1 枚ずつ縦横比を保った約 1024×1024 画素で読みます（diffusers の Qwen-Image-2.1 と同じ。Mage-Flow では、画像の読み手が長い辺 384 ピクセル以下で、VAE が出力の大きさで読みます）。参照画像が多いほど時間とメモリがかかります（B70 の 1024×1024 で 3 枚は約 46 秒、10 枚は約 4 分）。参照画像のトークンの K と V のキャッシュ（1024×1024 の 1 枚で約 2 GB）は、VRAM に入らない分をピン留めした RAM に置いて毎ステップ運びます。それでも VRAM か RAM が足りない画像は、作り始める前にエラー（400）で断ります。参照画像を書き換えたり、その中の人や物を主題にしたりできます。`size` を `auto` にすると、参照画像の縦横比で約 1024×1024 画素にします。Web のページでも、Images のタブで画像を添付すると編集になります。
