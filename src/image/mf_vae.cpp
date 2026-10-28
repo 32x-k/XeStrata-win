@@ -1527,6 +1527,10 @@ void MfVae::open_flux2_encoder(SafeTensors& st) {
     f2_qc_ = Conv();
     if (st.find(nm(e + "quant_conv.weight")) != nullptr) f2_qc_ = conv_w(st, nm(e + "quant_conv"));
     f2_down_ = std::move(levels);
+    // scratch a decode left is sized by the decoder's widths (its attention's channels, the norms' stats), which
+    // MOSS-Image's encoder exceeds, and f2_grow keeps scratch whose sizes still fit: an img2img after a generation in
+    // the same engine read past them, its image black (B70, 2026-10-29).  Taken again at the next use.
+    if (f2_held_ > 0) drop_scratch();
 }
 
 // The encoder's stage sizes for an h x w latent's image (16 h x 16 w pixels), as f2_walk's
