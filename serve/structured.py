@@ -384,8 +384,9 @@ def strict_schemas(tools, strict: set) -> dict:
 
 def checked_calls(events, schemas: dict):
     """A run's ("event", Event) items with the calls of strict tools (`schemas`: strict_schemas) checked against
-    their parameters before any of them is sent: such a call is not announced while it is written (its tool_start
-    and tool_args are held back) and goes out whole with its tool_call, or is a StructuredOutputError.  This holds
+    their parameters, and for numbers JSON cannot hold, before any of them is sent: such a call is not announced while
+    it is written (its tool_start and tool_args are held back) and goes out whole with its tool_call, or is a
+    StructuredOutputError.  This holds
     whether the engine wrote the call under a grammar (tool_grammar) or not (another call form, an engine without
     grammars)."""
     modules = jsonschema_modules()
@@ -396,6 +397,11 @@ def checked_calls(events, schemas: dict):
             if x.kind in ("tool_start", "tool_args"):
                 continue
             if x.kind == "tool_call":
+                try:      # NaN or Infinity (1e999 reads as it): no JSON, and jsonschema's "number" takes them
+                    json.dumps(call.arguments, allow_nan=False)
+                except ValueError:
+                    raise StructuredOutputError(f"the call of strict tool {call.name} has a number that is not "
+                                                "finite (NaN or Infinity), which JSON cannot hold") from None
                 try:
                     error = next(checks[call.name].iter_errors(call.arguments), None)
                 except Exception as exc:

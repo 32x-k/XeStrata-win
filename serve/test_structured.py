@@ -237,6 +237,21 @@ class Structured(unittest.TestCase):
               "input": [{"type": "additional_tools", "tools": [{"type": "function", **member, "name": "h"}]}]}
         self.assertEqual(structured.constrained_tools(given_tools(ns))[0], {"ns.g", "h"})
 
+    def test_strict_tool_numbers_must_be_finite(self):
+        # NaN, Infinity and a number too large for a float (it reads as Infinity) are no JSON: a strict call with one
+        # is refused, though jsonschema's "number" takes them
+        tool = {"type": "function", "function": {"name": "f", "strict": True, "parameters": object_schema(
+            {"x": {"type": "number"}})}}
+        req = {"messages": [{"role": "user", "content": "go"}], "tools": [tool], "reasoning_effort": "none"}
+        for value in ("NaN", "Infinity", "1e999"):
+            with self.subTest(value=value):
+                self.engine = self.svc.engine = MockEngine(self.tok, "<tool_call>\n<function=f>\n<parameter=x>\n"
+                                                           f"{value}\n</parameter>\n</function>\n</tool_call>",
+                                                           max_context=16384)
+                code, reply = self.request("/v1/chat/completions", req)
+                self.assertEqual(code, 502, reply)
+                self.assertIn("not finite", reply["error"]["message"])
+
     def test_the_server_does_not_import_jsonschema_at_start(self):
         import subprocess
         import sys
