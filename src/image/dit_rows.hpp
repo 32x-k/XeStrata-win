@@ -17,10 +17,16 @@
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <stdexcept>
+#include <string>
 #include <thread>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace strata::image::dit_rows {
@@ -182,6 +188,210 @@ template<class Op> inline void rows16(const Op& op, int64_t T, int64_t C, uint16
 struct Stats {
     float mean = 0.f, inv = 1.f;
 };
+
+// A W8A8 product's int8 input straight from a row-wise op, rotated and quantized as qi_rows_i8 quantizes FP16 rows
+// (qi_kernels.cpp: kQiRotate values at a time through Sylvester's Hadamard butterflies, times 1 / 16, then one scale a
+// row), without the FP16 rows and their second pass between: on the RX 9060 XT those two passes were a fifth of
+// MOSS-Image's step (2026-10-29).  A work-group a row, a sub-group of 32 a group of kQiRotate values (8 a lane, in
+// registers), up to kMaxG groups each.  A lane holds its 8 values W side by side (value j at (j / W) 32 W + lane W +
+// j % W of the group): its butterflies within the lane over j's bits and across the lanes over lane's, Sylvester's
+// Hadamard matrix whatever W is, and the same int8 values.  Op: raw(t, c), the value before the row's statistic
+// (keep(t, c, v) writes it back where kKeep); where kRms, inv(sum of the squares) of the row; out(t, c, v, inv), the
+// value given it.
+template<class Op, int W> struct RowsI8Of {
+    static constexpr int SG = 32, V = kQiRotate / SG, kMaxG = 4;
+    static_assert(W == 1 || W == 4 || W == V);
+    Op op;
+    int64_t K, gpr, nsg;
+    int8_t* q;
+    float* s;
+    void operator()(sycl::nd_item<1> it) const {
+        const auto sg = it.get_sub_group();
+        const auto r = static_cast<int64_t>(it.get_group_linear_id());
+        const auto si = static_cast<int64_t>(sg.get_group_linear_id());
+        const int lane = static_cast<int>(sg.get_local_linear_id());
+        auto off = [](int j) { return (int64_t) (j / W) * SG * W + j % W; };   // value j past the lane's first
+        float v[kMaxG][V];
+        float ss = 0.f;
+        for (int c = 0; c < kMaxG; ++c) {
+            const int64_t g = si + c * nsg;
+            if (g >= gpr) break;   // the whole sub-group
+            const int64_t k0 = g * kQiRotate + (int64_t) lane * W;
+            for (int j = 0; j < V; ++j) {
+                v[c][j] = op.raw(r, k0 + off(j));
+                if constexpr (Op::kKeep) op.keep(r, k0 + off(j), v[c][j]);
+                if constexpr (Op::kRms) ss += v[c][j] * v[c][j];
+            }
+        }
+        float inv = 1.f;
+        if constexpr (Op::kRms) inv = op.inv(sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>()));
+        float amax = 0.f;
+        for (int c = 0; c < kMaxG; ++c) {
+            const int64_t g = si + c * nsg;
+            if (g >= gpr) break;
+            const int64_t k0 = g * kQiRotate + (int64_t) lane * W;
+            for (int j = 0; j < V; ++j) v[c][j] = op.out(r, k0 + off(j), v[c][j], inv);
+            for (int m = 1; m < V; m <<= 1)
+                for (int j = 0; j < V; ++j)
+                    if ((j & m) == 0) {
+                        const float a = v[c][j], b = v[c][j + m];
+                        v[c][j] = a + b;
+                        v[c][j + m] = a - b;
+                    }
+            for (int l = 1; l < SG; l <<= 1)
+                for (int j = 0; j < V; ++j) {
+                    const float o = sycl::permute_group_by_xor(sg, v[c][j], l);
+                    v[c][j] = (lane & l) != 0 ? o - v[c][j] : v[c][j] + o;
+                }
+            for (int j = 0; j < V; ++j) {
+                v[c][j] *= 1.f / 16.f;
+                amax = sycl::fmax(amax, sycl::fabs(v[c][j]));
+            }
+        }
+        amax = sycl::reduce_over_group(it.get_group(), amax, sycl::maximum<float>());
+        const float d = amax / 127.f, id = amax > 0.f ? 1.f / d : 0.f;
+        for (int c = 0; c < kMaxG; ++c) {
+            const int64_t g = si + c * nsg;
+            if (g >= gpr) break;
+            int8_t* qg = q + r * K + g * kQiRotate + (int64_t) lane * W;
+            for (int h = 0; h < V / W; ++h) {
+                sycl::vec<int8_t, W> o;
+                for (int p = 0; p < W; ++p) o[p] = (int8_t) (int) sycl::round(v[c][h * W + p] * id);
+                *reinterpret_cast<sycl::vec<int8_t, W>*>(qg + (int64_t) h * SG * W) = o;
+            }
+        }
+        if (si == 0 && lane == 0) s[r] = d;
+    }
+    auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<SG>}; }
+};
+
+template<class Op, int W>
+inline void rows_i8_as(const Op& op, int64_t T, int64_t K, int8_t* q, float* s, sycl::queue& qu) {
+    constexpr int64_t SG = RowsI8Of<Op, W>::SG, kMaxG = RowsI8Of<Op, W>::kMaxG;
+    const int64_t gpr = K / kQiRotate;
+    const auto max_sg =
+        static_cast<int64_t>(qu.get_device().get_info<sycl::info::device::max_work_group_size>()) / SG;
+    if (K % kQiRotate != 0 || gpr > max_sg * kMaxG)
+        throw std::runtime_error("image engine: a W8A8 product takes rows of a multiple of 256 values, up to " +
+                                 std::to_string(max_sg * kMaxG * kQiRotate));
+    // the fewest sub-groups a row: a work-group of 1024 items (SiTU's 8192 values a sub-group's group each) took
+    // MOSS-Image's SiTU 2.76 ms a block on the RX 9060 XT, a quarter of them with 4 groups each 1.83 ms (2026-10-29)
+    const int64_t nsg = (gpr + kMaxG - 1) / kMaxG;
+    qu.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (T * nsg * SG)), sycl::range<1>((size_t) (nsg * SG))),
+                    RowsI8Of<Op, W>{op, K, gpr, nsg, q, s});
+}
+
+// rows_i8's timing passes, as a block's: x[t] += gate y[t] (a product's int32 sums, scaled), written back, then
+// RMS-normed and modulated (gate_add into the MLP's input), over 4096 rows of 3072, twice; FP16 rows of 3072 (the
+// attention's output); an activation of two int32 sums side by side F apart (SiTU's hidden value and gate), over 1024
+// rows of F = 8192
+struct TimedI8 {
+    static constexpr bool kRms = true, kKeep = true;
+    float* x;
+    MfOut y;
+    const float* w;   // the norm's weights, then the modulation's scale and shift
+    int64_t C;
+    float raw(int64_t t, int64_t c) const { return x[t * C + c] + w[c] * y.at(t, c); }
+    void keep(int64_t t, int64_t c, float v) const { x[t * C + c] = v; }
+    float inv(float ss) const { return 1.f / sycl::sqrt(ss / (float) C + 1e-6f); }
+    float out(int64_t, int64_t c, float v, float inv) const { return v * inv * w[c] * (1.f + w[C + c]) + w[2 * C + c]; }
+};
+struct TimedHalfI8 {
+    static constexpr bool kRms = false, kKeep = false;
+    const uint16_t* h;
+    int64_t C;
+    float raw(int64_t t, int64_t c) const { return kernels::f32_from_f16(h[t * C + c]); }
+    void keep(int64_t, int64_t, float) const {}
+    float inv(float) const { return 1.f; }
+    float out(int64_t, int64_t, float v, float) const { return v; }
+};
+struct TimedPairI8 {
+    static constexpr bool kRms = false, kKeep = false;
+    MfOut y;
+    int64_t F;
+    float raw(int64_t t, int64_t c) const { return y.at(t, c) * sycl::tanh(y.at(t, c + F)); }
+    void keep(int64_t, int64_t, float) const {}
+    float inv(float) const { return 1.f; }
+    float out(int64_t, int64_t, float v, float) const { return v; }
+};
+
+// The values a lane holds side by side, the fastest of 8, 4 and 1 on the timing passes once a GPU.  MOSS-Image's step
+// (2026-10-29): the B70 754 ms with 1 (4: 781, 8: 848), the RTX 4070 874 with 4 (1: 876, 8: 979), the RX 9060 XT
+// 1474 with 4 (8: 1479, 1: 1497); the passes took 1, 4 and 8.  The int8 values are the same whichever it is.
+inline int rows_i8_width(sycl::queue& qu) {
+    static core::PerDevice<int> width;
+    return width.get(qu.get_device(), [&qu] {
+        constexpr int64_t T = 4096, C = 3072, TF = 1024, F = 8192;   // y: T x C or TF x 2F int32 sums
+        float* x = sycl::malloc_device<float>((size_t) (T * C), qu);
+        auto* y = sycl::malloc_device<int32_t>((size_t) (TF * 2 * F), qu);
+        float* sxw = sycl::malloc_device<float>((size_t) (T + 2 * F + 3 * C), qu);
+        int8_t* q = sycl::malloc_device<int8_t>((size_t) (T * C), qu);
+        float* s = sycl::malloc_device<float>((size_t) T, qu);
+        int best = 8;
+        if (x != nullptr && y != nullptr && sxw != nullptr && q != nullptr && s != nullptr) {
+            qu.fill(x, 1.f, (size_t) (T * C));
+            qu.fill(y, 1, (size_t) (TF * 2 * F));
+            qu.fill(sxw, 1e-3f, (size_t) (T + 2 * F + 3 * C)).wait();
+            MfOut yc, yf;
+            yc.i = yf.i = y;
+            yc.sx = yf.sx = sxw;
+            yc.sw = yf.sw = sxw + T;
+            yc.C = C;
+            yf.C = 2 * F;
+            const TimedI8 gate{x, yc, sxw + T + 2 * F, C};
+            const TimedHalfI8 half{reinterpret_cast<const uint16_t*>(y), C};
+            const TimedPairI8 pair{yf, F};
+            auto run = [&](auto w) {
+                rows_i8_as<TimedI8, decltype(w)::value>(gate, T, C, q, s, qu);
+                rows_i8_as<TimedI8, decltype(w)::value>(gate, T, C, q, s, qu);
+                rows_i8_as<TimedHalfI8, decltype(w)::value>(half, T, C, q, s, qu);
+                rows_i8_as<TimedPairI8, decltype(w)::value>(pair, TF, F, q, s, qu);
+            };
+            double best_ms = 1e30;
+            std::string said;
+            std::vector<std::pair<int, double>> took;
+            for (const int w : {8, 4, 1}) {
+                double ms = 1e30;
+                for (int i = 0; i < 4; ++i) {   // each time 4 passes, the first time to build the kernels
+                    const auto t0 = std::chrono::steady_clock::now();
+                    for (int k = 0; k < 4; ++k) {
+                        if (w == 1) run(std::integral_constant<int, 1>{});
+                        else if (w == 4) run(std::integral_constant<int, 4>{});
+                        else run(std::integral_constant<int, 8>{});
+                    }
+                    qu.wait();
+                    const auto t1 = std::chrono::steady_clock::now();
+                    if (i > 0) ms = std::min(ms, std::chrono::duration<double, std::milli>(t1 - t0).count());
+                }
+                said += (said.empty() ? "" : ", ") + std::to_string(w) + ": " + std::to_string(ms).substr(0, 5) + " ms";
+                took.emplace_back(w, ms);
+                best_ms = std::min(best_ms, ms);
+            }
+            // the first of 8, 4, 1 within 3% of the fastest: the RX 9060 XT's three within 2% took one or another
+            // from start to start
+            for (const auto& [w, ms] : took)
+                if (ms <= best_ms * 1.03) {
+                    best = w;
+                    break;
+                }
+            std::fprintf(stderr, "image engine: the W8A8 inputs' rows %d values side by side a lane (%s)\n", best,
+                         said.c_str());
+        }
+        for (void* p : {(void*) x, (void*) y, (void*) sxw, (void*) q, (void*) s})
+            if (p != nullptr) sycl::free(p, qu);
+        return best;
+    });
+}
+
+template<class Op> inline void rows_i8(const Op& op, int64_t T, int64_t K, int8_t* q, float* s, void* st) {
+    if (T <= 0) return;
+    sycl::queue& qu = q_of(st);
+    switch (rows_i8_width(qu)) {
+    case 1: rows_i8_as<Op, 1>(op, T, K, q, s, qu); break;
+    case 4: rows_i8_as<Op, 4>(op, T, K, q, s, qu); break;
+    default: rows_i8_as<Op, 8>(op, T, K, q, s, qu); break;
+    }
+}
 
 // the attention's output o16 [T][C] times its heads' scales hs (head_dim channels a head)
 struct Heads {
