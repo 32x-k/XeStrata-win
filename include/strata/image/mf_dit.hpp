@@ -102,9 +102,13 @@ public:
     /// Euler; with cfg > 1 and a negative context, the velocity neg + cfg (pos - neg).  step(i, n) after each step:
     /// false stops (QiStopped).  `after` (if set) is given x and the step's new sigma first, on the sampler's stream
     /// (a mask: img_start.hpp's blend).
+    /// `peek` (if set) is called after each step with the steps done and a function that writes the step's x0, the
+    /// sampler's prediction of the finished latent (x - sigma * v), into a buffer of x's size: a partial image's
+    /// latent, on the sampler's stream; the sampling itself is not changed.
     void sample(float* x, int64_t h, int64_t w, const std::vector<float>& sigmas, float cfg,
                 const std::function<bool(int, int)>& step = {},
-                const std::function<void(float*, float)>& after = {});
+                const std::function<void(float*, float)>& after = {},
+                const std::function<void(int, const std::function<void(float*)>&)>& peek = {});
 
     int64_t hidden() const { return C_; }
     /// The time of `rows` image rows through the MLP's first product (the hidden width to the MLP's, a block's largest)

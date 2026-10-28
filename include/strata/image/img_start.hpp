@@ -44,6 +44,9 @@ std::vector<uint8_t> resize_nearest(const QiRef& f, int64_t W, int64_t H);
 /// than opaque (the part that changes), 0 elsewhere, [H / patch][W / patch].  `px`: the mask at W x H (nearest).
 std::vector<float> latent_mask(const std::vector<uint8_t>& px, int64_t W, int64_t H, int64_t patch);
 
+/// The VAE's RGBA, planar floats [4][HW] in 0..1, as RGBA8 [HW][4] (the final image's and a partial image's).
+std::vector<uint8_t> rgba8(const std::vector<float>& planar, int64_t HW);
+
 /// The picture's kept part: img = (a base + (255 - a) img) / 255 by the mask's alpha a, all RGBA8 [H][W][4].
 void keep_pixels(std::vector<uint8_t>& img, const std::vector<uint8_t>& base, const std::vector<uint8_t>& mask);
 

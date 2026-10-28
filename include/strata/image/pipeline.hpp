@@ -43,6 +43,12 @@ struct QiRequest {
     float cfg = 1.0f;               // its scale (diffusers' true_cfg_scale): above 1 with neg_ids, guidance
     float guidance = 0.0f;          // HunyuanImage 3.0's: the scale its guidance token embeds (the model's own 2.5
                                     // when 0, the number the model sees being 1000 times it).  The other models leave it.
+    // partial images (OpenAI's partial_images): after these steps (counted from 1), the step's prediction of the
+    // finished image, decoded in the room the VAE has beside the sampling, goes to `on_preview` (its index from 0,
+    // the step, RGBA8 [height][width][4]).  A step whose decode does not fit there is left out; the final image is
+    // the same either way.  HunyuanImage 3.0 makes none (its VAE needs the room of the sampling's sequence).
+    std::vector<int> preview;
+    std::function<void(int, int, const std::vector<uint8_t>&)> on_preview;
 };
 
 struct QiTimes {

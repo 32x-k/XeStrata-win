@@ -43,7 +43,9 @@
 //                            edit's reference images; MASK:, INIT: and STRENGTH: as --mask, --init and --strength;
 //                            NEG:<ids, commas> and CFG:<scale> (above 1):
 //                            classifier-free guidance with that negative prompt (its pads as the prompt's); GUID:
-//                            <scale> is HunyuanImage 3.0's guidance token instead (it samples once: no NEG:, no CFG:)
+//                            <scale> is HunyuanImage 3.0's guidance token instead (it samples once: no NEG:, no CFG:);
+//                            PREVIEW:<steps, commas>: partial images after those steps, each a line PREVIEW <index>
+//                            <step> <path> before the next STEP, its RGBA8 rows at <out path>.p<index>
 //   NEED <width> <height> <n> [REF:<path>]... [MASK:<path>] [INIT:<path>] [NEG:<n>]  the VRAM an image of n prompt
 //                            ids needs (from the files); MASK: or INIT:, a base image (with a strength below 1 and
 //                            references, MASK:<their first>); NEG: guidance's negative prompt of n ids
@@ -126,6 +128,8 @@ std::vector<si::QiRef> read_refs(std::istringstream& ls, si::QiRequest& r) {
         else if (word.rfind("CFG:", 0) == 0) r.cfg = std::stof(word.substr(4));
         else if (word.rfind("GUID:", 0) == 0) r.guidance = std::stof(word.substr(5));
         else if (word.rfind("STEPS:", 0) == 0) r.steps = std::stoll(word.substr(6));
+        else if (word.rfind("PREVIEW:", 0) == 0)
+            for (const int64_t k : parse_ids(word.substr(8))) r.preview.push_back((int) k);
         else if (word.rfind("REF:", 0) == 0) refs.push_back(read_image(word.substr(4)));
         else throw std::invalid_argument("unknown word " + word);
     }
@@ -242,6 +246,12 @@ int serve(si::ImagePipeline& p) {
                 if (!ls || out.empty()) throw std::invalid_argument("IMG <width> <height> <seed> <drop> <out> <ids>");
                 r.ids = parse_ids(ids);
                 r.refs = read_refs(ls, r);
+                r.on_preview = [&out](int index, int done, const std::vector<uint8_t>& rgba) {
+                    const std::string path = out + ".p" + std::to_string(index);
+                    write_file(path, rgba);
+                    std::printf("PREVIEW %d %d %s\n", index, done, path.c_str());
+                    std::fflush(stdout);
+                };
                 in.stop = false;
                 si::QiTimes t;
                 si::QiPlan pl;

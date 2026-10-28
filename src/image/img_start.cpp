@@ -8,6 +8,7 @@
 #include "strata/image/qi_kernels.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
 #include <string>
 
@@ -66,6 +67,15 @@ std::vector<float> latent_mask(const std::vector<uint8_t>& px, int64_t W, int64_
         for (int64_t x = 0; x < W; ++x)
             if (px[(size_t) ((y * W + x) * 4 + 3)] < 255) m[(size_t) ((y / patch) * w + x / patch)] = 1.f;
     return m;
+}
+
+std::vector<uint8_t> rgba8(const std::vector<float>& planar, int64_t HW) {
+    std::vector<uint8_t> img((size_t) (4 * HW));
+    for (int64_t q = 0; q < HW; ++q)
+        for (int c = 0; c < 4; ++c)
+            img[(size_t) (q * 4 + c)] =
+                (uint8_t) std::lround(std::clamp(planar[(size_t) (c * HW + q)], 0.0f, 1.0f) * 255.0f);
+    return img;
 }
 
 void keep_pixels(std::vector<uint8_t>& img, const std::vector<uint8_t>& base, const std::vector<uint8_t>& mask) {
