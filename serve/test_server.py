@@ -428,6 +428,33 @@ class ImageMarkers(unittest.TestCase):
                     self.assertIn("<|image_pad|> marks" if "docs" in text else "plain", tok.decode(ids))
             svc.embeddings.path.unlink(missing_ok=True)
 
+    def test_count_tokens_counts_the_image_tokens(self):
+        """Anthropic's count_tokens counts a picture as the image tokens it becomes, as /v1/messages reads it."""
+        import tempfile
+        tok = ByteTokenizer()
+        img = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+        body = {"model": "m", "max_tokens": 4, "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this?"}, img]}]}
+        with tempfile.TemporaryDirectory() as d:
+            svc = Service(MockEngine(tok, "</think>\n\nok", max_context=CTX), tok, ChatTemplate(TEMPLATE),
+                          vision=self.FakeVision(d))
+            httpd = serve(svc, port=0)
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            try:
+                def post(path, body):
+                    req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+                                                 headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=30) as r:
+                        return json.loads(r.read())
+                counted = post("/v1/messages/count_tokens", body)["input_tokens"]
+                usage = post("/v1/messages", body)["usage"]
+                keys = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+                read = sum(usage.get(k) or 0 for k in keys)
+                self.assertEqual(counted, read)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
     def test_anthropic_tool_result_image(self):
         """Claude Code's Read of a picture returns it inside a tool_result: it reaches the encoder, in place."""
         import tempfile
