@@ -217,6 +217,8 @@
   "img.strengthTitle": "图片可以改变多少：越低保留得越多",
   "img.title": "生成图片",
   "img.transparent": "透明背景",
+  "img.partial": "显示中间图像",
+  "img.partialCap": "中间图像 {n}…",
   "img.width": "宽度",
   "img.widthHeight": "宽 × 高",
   "math.source": "公式源码 ({reason})",

@@ -217,6 +217,8 @@
   "img.strengthTitle": "画像をどれだけ変えてよいか。低いほど元を多く残します",
   "img.title": "画像を作る",
   "img.transparent": "透明な背景",
+  "img.partial": "途中の画像を表示",
+  "img.partialCap": "途中の画像 {n}…",
   "img.width": "幅",
   "img.widthHeight": "幅 × 高さ",
   "math.source": "数式のソース ({reason})",

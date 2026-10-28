@@ -229,6 +229,8 @@
   "img.strengthTitle": "Combien l’image peut changer : plus bas en garde davantage",
   "img.title": "Créer une image",
   "img.transparent": "Arrière-plan transparent",
+  "img.partial": "Afficher les images partielles",
+  "img.partialCap": "Image partielle {n}…",
   "img.width": "Largeur",
   "img.widthHeight": "Largeur × hauteur",
   "math.source": "Source mathématique ({reason})",

@@ -2052,6 +2052,46 @@ function imgFormat() {
 $("img-fmt").onchange = () => { store.set("img_fmt", $("img-fmt").value); imgFormat(); };
 $("img-q").onchange = () => store.set("img_q_" + $("img-fmt").value, +$("img-q").value);
 $("img-bg").onchange = imgFormat;
+$("img-partial").checked = store.get("img_partial", false);
+$("img-partial").onchange = () => store.set("img_partial", $("img-partial").checked);
+// a streamed job (the "show partial images" setting): one figure shows the engine's partial images as they come, and
+// the completed events become the body the plain request answers with
+async function imgStream(r, prompt) {
+  const fig = document.createElement("figure"), img = document.createElement("img"), cap = document.createElement("figcaption");
+  img.alt = prompt;
+  fig.append(img, cap);
+  const j = {data: []};
+  const reader = r.body.getReader(), dec = new TextDecoder();
+  let buf = "";
+  try {
+    for (;;) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {stream: true});
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line.startsWith("data:")) continue;              // event: lines and ": keep-alive" comments
+        let e;
+        try { e = JSON.parse(line.slice(5).trim()); } catch (err) { continue; }
+        if (e.type === "error") throw new Error((e.error && e.error.message) || tr("img.none", "No image"));
+        if (e.type.endsWith(".partial_image")) {
+          img.src = `data:image/${e.output_format || "png"};base64,` + e.b64_json;
+          cap.textContent = tr("img.partialCap", "Partial image {n}…", {n: e.partial_image_index + 1});
+          if (!fig.isConnected) $("img-results").prepend(fig);
+        } else if (e.type.endsWith(".completed")) {
+          Object.assign(j, {model: e.model, size: e.size, output_format: e.output_format, strata: e.strata});
+          j.data.push({b64_json: e.b64_json, seed: e.seed});
+        }
+      }
+    }
+  } finally {
+    fig.remove();
+  }
+  if (!j.data.length) throw new Error(tr("img.none", "No image"));
+  return j;
+}
 $("img-neg").oninput = () => { imgNegHint(); imgCount(); };
 $("img-cfg").addEventListener("input", imgNegHint);
 $("img-ref").onchange = () => { imgDefaults(); imgMaskSetup(); };
@@ -2074,6 +2114,8 @@ $("img-form").onsubmit = async (ev) => {
   if (+$("img-n").value > 1) body.n = +$("img-n").value;
   body.output_format = $("img-fmt").value;
   if (body.output_format !== "png") body.output_compression = Math.max(0, Math.min(100, +$("img-q").value || 0));
+  const partial = $("img-partial").checked;
+  if (partial) Object.assign(body, {stream: true, partial_images: 2});
   imageBusy = true;
   $("img-go").disabled = true;
   paintLive();
@@ -2087,7 +2129,7 @@ $("img-form").onsubmit = async (ev) => {
     if (mask) body.mask = {image_url: mask};
     const url = refs.length ? "v1/images/edits" : "v1/images/generations";
     const r = await fetch(url, {method: "POST", headers: headers(true), body: JSON.stringify(body)});
-    const j = await r.json();
+    const j = partial && r.ok ? await imgStream(r, prompt) : await r.json();
     if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
     for (const d of j.data) {
       const fig = document.createElement("figure");
