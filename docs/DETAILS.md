@@ -817,7 +817,7 @@ To switch between it and other model servers behind one address, see [LLAMA_SWAP
 | OpenAI Chat Completions (stream and non-stream, tools) | `POST /v1/chat/completions` |
 | Anthropic Messages (stream and non-stream, tools) | `POST /v1/messages` |
 | OpenAI Responses (stream and non-stream, tools; stateless, [below](#the-responses-api-and-codex-cli)) | `POST /v1/responses` |
-| Model list / health | `GET /v1/models`, `GET /models`, `GET /health` |
+| Model list / health | `GET /v1/models`, `GET /models`, `GET /v1/models/{id}`, `GET /health` |
 | Model properties | `GET /props` (also accepts `?model=<loaded-model-id>`) |
 | What the model is doing right now | `GET /status`, `GET /slots` (a single slot, busy or idle) |
 | Everything the Monitor tab shows (engine, live state, last requests, hardware) | `GET /metrics` |
@@ -825,7 +825,10 @@ To switch between it and other model servers behind one address, see [LLAMA_SWAP
 | The totals and what is running, for Prometheus with llama-server's metric names | `GET /metrics/prometheus` |
 | The MCP servers, their state and tools ([below](#tools-from-mcp-servers)) | `GET /mcp` |
 
-`/models` and `/v1/models` list only the loaded model, with its context limit and input modalities.
+`/models` and `/v1/models` list the model with its context limit and input modalities.
+It is listed before it is loaded and while it starts too, with `status` `loading` (`unloaded` when it was unloaded for idleness).
+OpenAI's `created` (the server's start time) and `owned_by` (`xestrata`) are included.
+`GET /v1/models/{id}` returns one model; an unknown id is a 404 (`model_not_found`).
 `/props` gives the original chat template, the context limit, the configured generation defaults (shared settings take precedence),
 the model path and the engine version where available.
 Context means the full engine context, not the resident KV window.
@@ -850,14 +853,14 @@ print(r.choices[0].message.content)
 ### Thinking levels
 
 The model thinks before it answers.
-The thinking is streamed as `reasoning_content` (Anthropic: `thinking` blocks).
+The thinking is streamed as `reasoning_content` and `reasoning` (the same text; Anthropic: `thinking` blocks).
 Choose how much per request, from none, low, medium and high:
 in the chat page (the "Thinking" menu), in `chat.py` (`/think low`), or over the API.
 
 | API | How |
 | --- | --- |
 | OpenAI | `"reasoning_effort": "none" \| "low" \| "medium" \| "high"` (also `"reasoning": {"effort": ...}`, or `"chat_template_kwargs": {"enable_thinking": false}`) |
-| Anthropic | `"output_config": {"effort": "low" \| "medium" \| "high"}`, `"thinking": {"type": "disabled"}`, or `"thinking": {"type": "enabled", "budget_tokens": N}` (under 2K = low, under 8K = medium, more = high) |
+| Anthropic | `"output_config": {"effort": "low" \| "medium" \| "high"}`, `"thinking": {"type": "disabled"}`, `"thinking": {"type": "enabled", "budget_tokens": N}` (under 2K = low, under 8K = medium, more = high), or `"thinking": {"type": "adaptive"}` (the model's default level, or `effort`) |
 
 Without a setting the model uses its own default, **high**.
 `"reasoning_effort": "low"` (or `none`, `medium`, `high`) in the run config sets the level of every request that names none (upstream #1641).
@@ -894,9 +897,9 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   When the flagged window was one that reads the prompt's short tail (the part after the last turn boundary, read through the windows, `--short-read`), the retry reads its whole prompt through the batched path instead (upstream #3465: a reporter's prompts failed in that tail every time and passed with `--short-read 0`); the engine prints a line saying so.
   The kernel only writes flags, so an answer without a NaN is the one the engine gives with `STRATA_NAN_GUARD=0` (no kernel recorded).
   Debug switch: `STRATA_NAN_INJECT=<n>[,<n>...]` reports the n-th window the engine checks as non-finite.
-- **Anthropic requests that don't ask for thinking (opt-in).** By default a `/v1/messages` request with no `"thinking"`, effort or budget thinks as the model's template does.
-  `"anthropic_thinking": "on_request"` in `xestrata-<model>.json` renders such a request without thinking.
-  That is Anthropic's own rule, and what Claude Code's short helper calls (a session title in a few dozen tokens) need.
+- **Anthropic requests that don't ask for thinking.** A `/v1/messages` request with no `"thinking"`, effort or budget is rendered without thinking, by Anthropic's own rule.
+  Claude Code's short helper calls (a session title in a few dozen tokens) need it.
+  `"anthropic_thinking": "model"` in `xestrata-<model>.json` makes such a request think as the model's template does.
   `POST /v1/messages/count_tokens` renders and tokenizes a request as `/v1/messages` would, without running the model.
 
 ### Streaming and connecting
@@ -1334,6 +1337,38 @@ The Monitor tab's list of recent requests also shows the prefill speed (`Prefill
 
 ---
 
+### Chat Completions and Messages fields
+
+Errors come in the API's own shape: on OpenAI's routes `{"error": {"message", "type", "param", "code"}}` (`param` and `code` `null` when there are none), on Anthropic's `{"type": "error", "error": {"type", "message"}}`.
+An unknown route is a 404 (`Invalid URL`).
+A refusal while the engine starts (and the like) is a 503 on OpenAI's routes and a 529 (`overloaded_error`) on Anthropic's, both with `Retry-After`.
+
+**Chat Completions**:
+
+- A `custom` tool in `tools` is shown to the model as a tool that takes one `input` string; its calls come back as `{"type": "custom", "custom": {"name", "input"}}`. Its grammar (`format`) is only described to the model; the output is not constrained.
+- `tool_choice` takes `none`, `auto`, `required`, a named tool and `allowed_tools` (the tools shown are those it lists; `mode: required` forces a call). A name that is not one of the tools, or an unknown shape, is a 400.
+- With `parallel_tool_calls: false` the reply ends when its first call is complete, and that call is returned.
+- `n` (1 to 128) generates each choice in its own run; with a `seed`, choice k gets `seed + k`.
+- `stream_options.include_usage` adds the usage chunk with `choices: []`; the finishing chunk keeps its usage too (as llama.cpp's does).
+- The usage has `completion_tokens_details.reasoning_tokens`, and responses carry a `system_fingerprint` (made from the engine's version and the model).
+- The old `role: function` and an assistant's `function_call` are read as a tool's result and call.
+- A `user` or `system` message's `name` is written before what it says, followed by a colon. An assistant's `refusal` is read as its text when it has no content.
+- An image with `image_url` `detail: "low"` is read with its longer side brought down to 512.
+- `top_logprobs` is 0 to 20 and only with `logprobs: true`. `input_audio` is a 400 (the model reads no audio).
+
+**Messages**:
+
+- `max_tokens` is required, a whole number of 1 or more.
+- Tool results are paired with their calls by `tool_use_id`; returned `tool_use` ids start with `toolu_`. `disable_parallel_tool_use` allows one call at most. A `tool_choice` name that is not one of the tools, or an unknown shape, is a 400.
+- `output_config.format` (and `output_format`) `json_schema` checks the answer against the schema before it is returned, as the [JSON response formats](#json-response-formats) do (the output is not constrained); an answer that does not match is a 502 (an error event in a stream).
+- A `tool_result` with `is_error: true` reaches the model with `Error:` before it.
+- A text `document` (`source` `text` or `content`) and a `search_result` are read as text with their titles. `citations.enabled: true` is a 400.
+- Thinking blocks carry a `signature` (`signature_delta` in a stream): the thinking's text in base64; thinking sent back that differs from it is a 400. A `redacted_thinking` block XeStrata made is read, others are dropped.
+- The stream's keep-alive is `event: ping`. `"thinking": {"type": "adaptive"}` leaves the level to the model.
+- The usage in both `message_start` and `message_delta` splits the prompt into `cache_read_input_tokens` (what the conversation cache held) and `cache_creation_input_tokens` (what was read). `cache_control` breakpoints do nothing: prefixes are cached on their own.
+- A reply stopped by the context limit has `stop_reason` `model_context_window_exceeded`; one stopped by `max_tokens`, `max_tokens`.
+- In a non-streaming reply, a tool call the output ended inside comes back as a text block with the arguments it wrote.
+
 ### The Responses API and Codex CLI
 
 `POST /v1/responses` speaks OpenAI's newer Responses API, which Codex CLI uses (it no longer
@@ -1346,10 +1381,15 @@ are refused with an error that says so.
 
 | Request | What XeStrata does |
 | --- | --- |
-| `input` as a string, or as items | `message` items (`user`, `assistant`, `system`, `developer`; text and images), `reasoning`, `function_call`, `function_call_output`, `custom_tool_call(_output)` |
+| `input` as a string, or as items | `message` items (`user`, `assistant`, `system`, `developer`; text and images), `reasoning`, `function_call`, `function_call_output`, `custom_tool_call(_output)`, an earlier answer's `image_generation_call` (the image is kept, so a following `edit_image` can change it). Hosted tools' items (`web_search_call`, `mcp_call`, ...) go into the conversation as text |
 | `instructions` | The system message (with leading `developer` messages; later ones become user messages, as on the chat path) |
 | `tools` | `function` tools, `namespace` tools (the model sees `namespace.name`; calls come back with `namespace` and `name`), `custom` tools (one free-form `input` string). Hosted tools (`web_search`, `file_search`, ...) are left out: the model cannot run them |
-| `tool_choice` | `"none"` hides the tools; anything else lets the model choose (it cannot be forced) |
+| `tool_choice` | `"none"` hides the tools. `required`, a named tool (`custom` and `namespace` ones too) and `allowed_tools` work as on Chat Completions. `{"type": "image_generation"}` forces a call of the image tools. A name that is not one of the tools, or an unknown shape, is a 400 |
+| `parallel_tool_calls: false` | The reply ends when its first call is complete |
+| `max_tool_calls` | The cap on calls of hosted tools (here, the image tools); calls past it are not run. Not applied to `function` tools |
+| `truncation: "auto"` | When the conversation does not fit, the oldest items go (`instructions` stay; a call goes with its results). A conversation that still does not fit is a 400 |
+| `text.verbosity` | `low` and `high` add one sentence asking for a short or a detailed answer after the system message's own text |
+| `include` `message.output_text.logprobs`, `top_logprobs` | `output_text` carries `logprobs` |
 | `reasoning.effort` | `none`/`minimal`, `low`, `medium`, `high`/`xhigh`; without it the config's `reasoning_effort`, else the model's default (high) |
 | `max_output_tokens` | The output cap (thinking included). Running out ends the response `incomplete` (`max_output_tokens`). `0` and `-1` (or leaving it out) mean no cap, as for `max_tokens`; anything below `-1` is a 400 |
 | `text.format` | `json_schema` and `json_object` use the [JSON response formats](#json-response-formats) (checked, not constrained) |
@@ -1358,7 +1398,10 @@ are refused with an error that says so.
 The final event (`response.completed` or `response.incomplete`) and a non-streaming reply carry the same top-level `timings` object as `/v1/chat/completions`.
 
 The model's thinking comes back as a `reasoning` output item with `reasoning_text` content (streamed as
-`response.reasoning_text.delta`). This model writes no separate summaries, so `summary` is empty. With
+`response.reasoning_text.delta`). This model writes no separate summaries: when `reasoning.summary` (`auto`, `concise`,
+`detailed`) asks for one, the thinking's text also goes into `summary`, with the `response.reasoning_summary_*` events;
+otherwise `summary` is empty. A reasoning item sent back with only a `summary` readable has that summary read as the
+thinking. With
 `"include": ["reasoning.encrypted_content"]` the item also carries `encrypted_content`: an opaque string (base64, not
 encrypted; the client already holds the text). Send the reasoning items back with the rest of the conversation, as
 Codex does: their thinking goes back into the prompt, so it matches what the model wrote and the conversation cache
@@ -1370,7 +1413,7 @@ for each output item `response.output_item.added`, its deltas (`response.reasoni
 `response.output_item.done`, and at the end `response.completed`, `response.incomplete` or `response.failed`.
 While a long prompt is read, a `response.in_progress` event goes out every 15 s, which Codex counts as activity.
 Errors before the answer starts have the Responses form (`{"error": {"message", "type", "param", "code"}}`); after
-it started they arrive as `response.failed`.
+it started they arrive as an `error` event and `response.failed`.
 
 **Codex CLI.** In `~/.codex/config.toml`:
 

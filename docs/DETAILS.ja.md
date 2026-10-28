@@ -780,7 +780,7 @@ server は `http://127.0.0.1:8095` で待ち受けます（setup の `--port`、
 | OpenAI の Chat Completions（ストリーミングとそうでないもの、ツール） | `POST /v1/chat/completions` |
 | Anthropic の Messages（ストリーミングとそうでないもの、ツール） | `POST /v1/messages` |
 | OpenAI の Responses（ストリーミングとそうでないもの、ツール。状態を持たない、[下](#responses-api-と-codex-cli)） | `POST /v1/responses` |
-| モデルの一覧、状態 | `GET /v1/models`、`GET /models`、`GET /health` |
+| モデルの一覧、状態 | `GET /v1/models`、`GET /models`、`GET /v1/models/{id}`、`GET /health` |
 | モデルの属性 | `GET /props`（`?model=<読み込んだモデルの id>` も受け付ける） |
 | モデルがいま何をしているか | `GET /status`、`GET /slots`（スロットは 1 つで、busy か idle） |
 | Monitor のタブが示すすべて（エンジン、いまの状態、最近の要求、ハードウェア） | `GET /metrics` |
@@ -788,7 +788,10 @@ server は `http://127.0.0.1:8095` で待ち受けます（setup の `--port`、
 | 合計といま動いているものを Prometheus の形で（llama-server の名前） | `GET /metrics/prometheus` |
 | MCP サーバーとその状態とツール（[下](#mcp-サーバーのツールを使う)） | `GET /mcp` |
 
-`/models` と `/v1/models` は、読み込んだモデルだけを、文脈の上限と入力の種類とともに示します。
+`/models` と `/v1/models` は、モデルを文脈の上限と入力の種類とともに示します。
+読み込む前と起動中も並び、`status` が `loading`（遊休で下ろしたときは `unloaded`）になります。
+OpenAI の `created`（server の起動時刻）と `owned_by`（`xestrata`）も付きます。
+`GET /v1/models/{id}` は 1 つのモデルを返し、知らない id には 404（`model_not_found`）を返します。
 `/props` は、元のチャットテンプレート、文脈の上限、設定した生成の既定値（共有の設定が優先）、モデルのパス、エンジンの版を、わかる範囲で示します。
 文脈は、エンジンの文脈全体で、VRAM に置く KV の範囲ではありません。
 `n_predict: -1` は、出力の上限を決めていないという意味です。
@@ -812,14 +815,14 @@ print(r.choices[0].message.content)
 ### 思考の深さ
 
 モデルは答える前に考えます。
-思考は `reasoning_content`（Anthropic では `thinking` のブロック）としてストリーミングされます。
+思考は `reasoning_content` と `reasoning`（同じ文。Anthropic では `thinking` のブロック）としてストリーミングされます。
 深さは none、low、medium、high から要求ごとに選べます。
 チャットの画面の「Thinking」のメニュー、`chat.py` の `/think low`、API で指定します。
 
 | API | 指定の仕方 |
 | --- | --- |
 | OpenAI | `"reasoning_effort": "none" \| "low" \| "medium" \| "high"`（`"reasoning": {"effort": ...}`、`"chat_template_kwargs": {"enable_thinking": false}` も可） |
-| Anthropic | `"output_config": {"effort": "low" \| "medium" \| "high"}`、`"thinking": {"type": "disabled"}`、`"thinking": {"type": "enabled", "budget_tokens": N}`（2K 未満は low、8K 未満は medium、それ以上は high） |
+| Anthropic | `"output_config": {"effort": "low" \| "medium" \| "high"}`、`"thinking": {"type": "disabled"}`、`"thinking": {"type": "enabled", "budget_tokens": N}`（2K 未満は low、8K 未満は medium、それ以上は high）、`"thinking": {"type": "adaptive"}`（深さはモデルの既定か `effort`） |
 
 指定がなければ、モデル自身の既定の **high** になります。
 実行の設定に `"reasoning_effort": "low"`（`none`、`medium`、`high` も）を書くと、指定のない要求はその深さになります（upstream #1641）。
@@ -857,9 +860,9 @@ print(r.choices[0].message.content)
   引っかかったのがプロンプトの短い残り（最後のターンの境目の後、`--short-read` で窓に通す部分）を読む窓だったときは、送り直しはプロンプト全体をまとめて読みます（upstream #3465: その残りで毎回失敗し、`--short-read 0` で通った報告）。エンジンはそのことを 1 行書きます。
   カーネルはフラグを書くだけなので、NaN のない答えは `STRATA_NAN_GUARD=0`（カーネルを入れない）と同じです。
   試しのスイッチ: `STRATA_NAN_INJECT=<n>[,<n>...]` で、エンジンが確かめる n 番目の窓を NaN として扱います。
-- **思考を求めない Anthropic の要求（任意）**: 既定では、`"thinking"`、深さ、上限のどれもない `/v1/messages` の要求は、モデルのテンプレートどおりに考えます。
-  `xestrata-<model>.json` に `"anthropic_thinking": "on_request"` を書くと、そうした要求を思考なしで処理します。
-  Anthropic 自身の規則で、Claude Code の短い補助の呼び出し（数十トークンで会話の題を付けるものなど）に要ります。
+- **思考を求めない Anthropic の要求**: `"thinking"`、深さ、上限のどれもない `/v1/messages` の要求は、Anthropic 自身の規則どおり思考なしで処理します。
+  Claude Code の短い補助の呼び出し（数十トークンで会話の題を付けるものなど）に要ります。
+  `xestrata-<model>.json` に `"anthropic_thinking": "model"` を書くと、そうした要求もモデルのテンプレートどおりに考えます。
   `POST /v1/messages/count_tokens` は、要求を `/v1/messages` と同じに組み立ててトークンに分け、モデルは動かしません。
 
 ### ストリーミングと接続
@@ -1302,6 +1305,38 @@ Monitor のタブの最近の要求の一覧は、prefill の速さ（`Prefill t
 
 ---
 
+### Chat Completions と Messages の項目
+
+エラーは API の形で返ります。OpenAI の経路は `{"error": {"message", "type", "param", "code"}}`（ない `param`・`code` は `null`）、Anthropic の経路は `{"type": "error", "error": {"type", "message"}}` です。
+知らない経路は 404（`Invalid URL`）です。
+エンジンの起動中などに断るときは、OpenAI の経路は 503、Anthropic の経路は 529（`overloaded_error`）で、どちらも `Retry-After` を付けます。
+
+**Chat Completions**:
+
+- `tools` の `custom` のツールは、文字列の `input` を 1 つ取るツールとしてモデルに見せ、呼び出しは `{"type": "custom", "custom": {"name", "input"}}` で返します。文法（`format`）はモデルへの説明に書くだけで、出力を縛りません。
+- `tool_choice` は `none`、`auto`、`required`、名前を指定したツール、`allowed_tools`（見せるツールをその組に絞り、`mode: required` なら呼び出しを強制）です。道具にない名前や知らない形は 400 です。
+- `parallel_tool_calls: false` では、最初の呼び出しが閉じたところで生成を止め、その 1 つを返します。
+- `n`（1〜128）は、choice ごとに 1 回ずつ生成します。`seed` があれば choice ごとに `seed + k` です。
+- `stream_options.include_usage` では、`choices: []` の usage の区切りも送ります。終わりの区切りの usage（llama.cpp と同じ）も残ります。
+- usage には `completion_tokens_details.reasoning_tokens` が入り、応答には `system_fingerprint`（エンジンの版とモデルから作る値）が入ります。
+- 古い形の `role: function` と assistant の `function_call` は、道具の結果と呼び出しとして読みます。
+- `user` と `system` の `name` は「名前: 」として発言の前に書きます。assistant の `refusal` は、本文がないときその発言の本文として読みます。
+- `image_url` の `detail: "low"` の画像は、長い辺を 512 に縮めて読みます。
+- `top_logprobs` は 0〜20 で、`logprobs: true` のときだけです。`input_audio` は 400 です（モデルが音声を読めません）。
+
+**Messages**:
+
+- `max_tokens` は必須で、1 以上の整数です。
+- 道具の結果は `tool_use_id` でその呼び出しに結び付けます。返す `tool_use` の id は `toolu_` で始まります。`disable_parallel_tool_use` では呼び出しを 1 つまでにします。`tool_choice` の道具にない名前や知らない形は 400 です。
+- `output_config.format`（と `output_format`）の `json_schema` は、[JSON の応答の形式](#json-の応答の形式) と同じく、答えをスキーマで確かめてから返します（出力を縛りません）。合わなければ 502（ストリームでは error のイベント）です。
+- `tool_result` の `is_error: true` は、結果の前に `Error:` と書いてモデルに伝えます。
+- 文の `document`（`source` が `text` か `content`）と `search_result` は、題と一緒に文として読みます。`citations.enabled: true` は 400 です。
+- 思考のブロックには `signature` が付きます（ストリームでは `signature_delta`）。思考の文を base64 にしたもので、送り返された思考がそれと違えば 400 です。XeStrata が付けた `redacted_thinking` は読み、ほかのものは落とします。
+- ストリームの keep-alive は `event: ping` です。`"thinking": {"type": "adaptive"}` は、深さをモデルに任せます。
+- usage は `message_start` と `message_delta` の両方で、会話のキャッシュが持っていた分を `cache_read_input_tokens`、読んだ分を `cache_creation_input_tokens` に分けます。区切りの `cache_control` は、接頭辞を自動でキャッシュするので何もしません。
+- 文脈の上限で止まったときの `stop_reason` は `model_context_window_exceeded`、`max_tokens` で止まったときは `max_tokens` です。
+- ストリームでない返事で、途中で切れた道具の呼び出しは、書かれた引数を文のブロックとして返します。
+
 ### Responses API と Codex CLI
 
 `POST /v1/responses` は、OpenAI の新しい Responses API を話します。Codex CLI はこれを使います（Chat Completions はもう話しません）。
@@ -1312,10 +1347,15 @@ Monitor のタブの最近の要求の一覧は、prefill の速さ（`Prefill t
 
 | 要求 | XeStrata の扱い |
 | --- | --- |
-| `input` が文字列か項目の並び | `message` の項目（`user`、`assistant`、`system`、`developer`。文字と画像）、`reasoning`、`function_call`、`function_call_output`、`custom_tool_call(_output)` |
+| `input` が文字列か項目の並び | `message` の項目（`user`、`assistant`、`system`、`developer`。文字と画像）、`reasoning`、`function_call`、`function_call_output`、`custom_tool_call(_output)`、前の回の `image_generation_call`（画像を保存し、続く `edit_image` が直せます）。ホストのツールの項目（`web_search_call`、`mcp_call` など）は文として会話に入れます |
 | `instructions` | システムメッセージ（先頭の `developer` のメッセージも含む。後のものはチャットの経路と同じくユーザーのメッセージになります） |
 | `tools` | `function` のツール、`namespace` のツール（モデルには `namespace.name` に見え、呼び出しは `namespace` と `name` で返ります）、`custom` のツール（自由な文字列の `input` 1 つ）。ホストのツール（`web_search`、`file_search` など）はモデルが動かせないので外します |
-| `tool_choice` | `"none"` はツールを隠します。ほかはモデルが選びます（強制はできません） |
+| `tool_choice` | `"none"` はツールを隠します。`required`、名前を指定したツール（`custom`、`namespace` も）、`allowed_tools` は Chat Completions と同じです。`{"type": "image_generation"}` は画像の道具の呼び出しを強制します。道具にない名前や知らない形は 400 です |
+| `parallel_tool_calls: false` | 最初の呼び出しが閉じたところで生成を止めます |
+| `max_tool_calls` | ホストのツール（ここでは画像の道具）の呼び出しの上限。超えた呼び出しは動かしません。`function` のツールには当てません |
+| `truncation: "auto"` | 文脈に入らないとき、古い項目から落とします（`instructions` は残し、道具の呼び出しはその結果と一緒に）。落としても入らなければ 400 です |
+| `text.verbosity` | `low` と `high` は、system の文の後ろに短く・詳しくの 1 文を足します |
+| `include` の `message.output_text.logprobs`、`top_logprobs` | `output_text` に `logprobs` を入れます |
 | `reasoning.effort` | `none`/`minimal`、`low`、`medium`、`high`/`xhigh`。なければ設定の `reasoning_effort`、それもなければモデルの既定（high） |
 | `max_output_tokens` | 出力の上限（思考を含む）。使い切ると応答は `incomplete`（`max_output_tokens`）で終わります。`0` と `-1`（と、書かないこと）は `max_tokens` と同じく上限なし、`-1` より小さい値は 400 です |
 | `text.format` | `json_schema` と `json_object` は [JSON の応答の形式](#json-の応答の形式) を使います（確かめるだけで、出力を縛りません） |
@@ -1324,13 +1364,14 @@ Monitor のタブの最近の要求の一覧は、prefill の速さ（`Prefill t
 最後のイベント（`response.completed` か `response.incomplete`）とストリームでない返事は、`/v1/chat/completions` と同じ `timings` を一番上に持ちます。
 
 モデルの思考は、`reasoning_text` を中身に持つ `reasoning` の出力項目で返ります（`response.reasoning_text.delta` で流れます）。
-このモデルは別の要約を書かないので、`summary` は空です。
+このモデルは別の要約を書かないので、`reasoning.summary`（`auto`、`concise`、`detailed`）を求めると、思考の文を `summary` にも入れ、`response.reasoning_summary_*` のイベントも流します。求めなければ `summary` は空です。
+送り返された reasoning の項目で読めるのが `summary` だけなら、その要約を思考として読みます。
 `"include": ["reasoning.encrypted_content"]` を付けると、項目に `encrypted_content` も付きます。不透明な文字列（base64 で、暗号化はしていません。クライアントは文字をすでに持っています）です。
 Codex と同じく、reasoning の項目も会話の残りと一緒に送り返してください。思考がプロンプトに戻るので、モデルが書いたものと一致し、会話のキャッシュが使い直されます。
 
 `"stream": true` では、公式のイベントを順に出します。`response.created`、`response.in_progress`、続いて出力の項目ごとに `response.output_item.added`、その差分（`response.reasoning_text.delta`、`response.output_text.delta`、`response.function_call_arguments.delta`）、その `...done` のイベントと `response.output_item.done`、最後に `response.completed`、`response.incomplete`、`response.failed` のどれかです。
 長いプロンプトを読む間は 15 秒ごとに `response.in_progress` を出します。Codex はこれを動いている印と数えます。
-答えが始まる前のエラーは Responses の形（`{"error": {"message", "type", "param", "code"}}`）で、始まった後は `response.failed` で届きます。
+答えが始まる前のエラーは Responses の形（`{"error": {"message", "type", "param", "code"}}`）で、始まった後は `error` のイベントと `response.failed` で届きます。
 
 **Codex CLI**: `~/.codex/config.toml` に次を書きます。
 
