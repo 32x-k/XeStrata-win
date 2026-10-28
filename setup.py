@@ -4276,23 +4276,15 @@ def gpu_drives_display(g) -> bool:
     return (text or "").strip().lower() == "enabled"
 
 
-def small_card_note(ctx: int, draft_vocab: str | None) -> list[str]:
-    """#496 (upstream e1ee248, 4731a9b): what frees VRAM on a card under 8 GB when the start stops with "no VRAM is
-    left for the expert cache" (the engine already lowers its own reserve on such a card) - a recommendation, setup
-    changes none of it.  (The draft layer stays: the server needs it.)"""
-    tips = []
-    if ctx > 8192:
-        tips.append("an 8K context (a smaller KV cache)")
-    if draft_vocab != "en":
-        tips.append("--draft-vocab en (a smaller draft head)")
-    lines = ["If the start stops with \"no VRAM is left for the expert cache\" (the engine's log says how much is "
-             "short):"]
-    if tips:
-        lines.append(f"  run {SETUP_CMD} again with " + " and ".join(tips) +
-                     ", or close other programs that use the GPU.")
-    else:
-        lines.append("  close other programs that use the GPU.")
-    return lines
+def small_card_note() -> list[str]:
+    """#41: on a card under 8 GB, Qwen3.8-Flash-Next's draft head, KV cache and buffers leave its experts little or no
+    VRAM, and the start can stop with "no VRAM is left for the expert cache": the models that run on such a card
+    instead (#496's 8K context and smaller draft head only moved where it stopped) - a recommendation, setup changes
+    nothing."""
+    titles = [PLAIN_FAMILIES[f]["title"] for f in ("qwen35", "qwen36", "ornith", "llmjp")]
+    return ["This GPU has under 8 GB of VRAM: Qwen3.8-Flash-Next leaves its experts little or "
+            "no room there, and its start may stop with \"no VRAM is left for the expert cache\".",
+            "  These models run on such a GPU: " + ", ".join(titles) + f" (run {SETUP_CMD} again and choose one)."]
 
 
 IMAGES_GPU_ENCODER_MIN_VRAM_GB = 23.5   # upstream 45752724 (#2406): below this the images answer "yes" gets the CPU
@@ -7237,9 +7229,11 @@ def main() -> int:
         ok(f"VRAM kept free for other programs: {a.vram_reserve_mib} MiB (--vram-reserve-mib; the expert cache takes "
            "that much less)")
     if 0 < gpu_expert_vram(gpu) < SMALL_CARD_GB:
-        # #496: on a 6 GB card the expert cache can get no room at all; the engine lowers its own reserve when that
-        # is what it takes, and says what is short when even that is not enough.  Setup only says what helps.
-        for line in small_card_note(ctx, draft_vocab):   # a recommendation: nothing changes
+        # #496, #41: on a 6 GB card the expert cache can get no room at all; the engine lowers its own reserve when
+        # that is what it takes, and says what is short when even that is not enough.  Setup names the models instead.
+        lines = small_card_note()                       # a recommendation: nothing changes
+        warn(lines[0])
+        for line in lines[1:]:
             say("  " + line)
     elif gpu.get("vendor") == "amd" and a.vram_reserve_mib is None and linux_desktop():
         for line in desktop_reserve_note():              # upstream #560 #516: a recommendation: nothing changes
