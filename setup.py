@@ -5437,6 +5437,26 @@ def tiny_png(w=64, h=48) -> bytes:
             + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
 
 
+WARM_UP_SAY_S = 30         # how often the warm-up says where the engine is
+# The engine's log unchanged this long ends the warm-up: the whole of it takes 1-3 minutes, so five without a line is
+# a start that stopped (#34: 15 minutes waited out, the engine idle), not a slow compile
+WARM_UP_STALL_S = 300
+
+
+def log_last_line(path: str, since: int) -> tuple[int, str]:
+    """The size of the log at `path` and its last non-empty line after byte `since` ((-1, "") when it cannot be
+    read)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(since, size - 4096))
+            lines = [x.strip() for x in f.read().decode("utf-8", "replace").splitlines() if x.strip()]
+    except OSError:
+        return -1, ""
+    return size, lines[-1] if lines else ""
+
+
 def warm_up(cfg_path: Path) -> None:
     """Start the model once and answer a long prompt (and a picture): the GPU code is SPIR-V that the driver compiles
     on first use and keeps in its cache (~/.cache/neo_compiler_cache), so the first real request does not wait for it
@@ -5462,24 +5482,66 @@ def warm_up(cfg_path: Path) -> None:
     except OSError:
         since = 0
     share = None
-    say("  Compiling the GPU code for this model: starting it once and asking two questions (1-3 minutes) ...")
+    say("  Compiling the GPU code for this model: starting it once and asking two questions (1-3 minutes; Ctrl+C "
+        "skips it) ...")
+    say(f"  its logs: {log}" + (f" and {elog}" if elog else ""))
     t0 = time.time()
+    watched = (elog, since) if elog else (str(log), 0)  # the engine's own lines say where it is
+
+    def wait(what: str, done: Callable[[], bool], limit_s: float) -> None:
+        """Until done(): a line every WARM_UP_SAY_S with the engine's last log line; an error when the server ends,
+        when the engine's log stays the same for WARM_UP_STALL_S, or after limit_s."""
+        size, changed, said, end = -1, time.time(), time.time(), time.time() + limit_s
+        while not done():
+            if proc.poll() is not None:
+                raise RuntimeError(f"the model stopped while {what} (see {log.name})")
+            now = time.time()
+            n, line = log_last_line(*watched)
+            if n != size:
+                size, changed = n, now
+            elif now - changed > WARM_UP_STALL_S:
+                raise RuntimeError(f"nothing new in the engine's log for {WARM_UP_STALL_S // 60} minutes while {what}"
+                                   f" (its last line: {line or 'none'}; see {log.name})")
+            if now > end:
+                raise RuntimeError(f"the model was still {what} after {limit_s / 60:.0f} minutes (see {log.name})")
+            if now - said >= WARM_UP_SAY_S:
+                said = now
+                say(f"    {now - t0:.0f} s, {what}: {line[:90] or '...'}")
+            time.sleep(2)
+
+    def started() -> bool:
+        try:
+            urllib.request.urlopen(urllib.request.Request(base + "/v1/models", headers=auth), timeout=5).read()
+            return True
+        except (urllib.error.URLError, OSError):
+            return False
+
+    def ask(body: dict, what: str) -> dict:
+        """The server's answer to one chat request, waited for as wait() does."""
+        req = urllib.request.Request(base + "/v1/chat/completions",
+                                     headers={"Content-Type": "application/json", **auth},
+                                     data=json.dumps(body).encode())
+        box: dict[str, Any] = {}
+
+        def go() -> None:
+            try:
+                box["answer"] = json.loads(urllib.request.urlopen(req, timeout=900).read())
+            except Exception as e:                     # handed to the waiting thread
+                box["error"] = e
+        th = threading.Thread(target=go, daemon=True)
+        th.start()
+        wait(what, lambda: not th.is_alive(), 900)
+        err = box.get("error")
+        if err is not None:
+            raise err if isinstance(err, (RuntimeError, OSError, ValueError)) else RuntimeError(str(err))
+        return box["answer"]
+
     with open(log, "w", encoding="utf-8") as out:
         proc = subprocess.Popen([sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config",
                                  str(cfg_path), "--port", str(port)], stdout=out, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, **new_process_group())
         try:
-            deadline = time.time() + 900
-            while True:
-                if proc.poll() is not None:
-                    raise RuntimeError(f"the model stopped while starting (see {log.name})")
-                try:
-                    urllib.request.urlopen(urllib.request.Request(base + "/v1/models", headers=auth), timeout=5).read()
-                    break
-                except (urllib.error.URLError, OSError):
-                    if time.time() > deadline:
-                        raise RuntimeError(f"the model did not start within 15 minutes (see {log.name})")
-                    time.sleep(2)
+            wait("starting", started, 900)
             notes = " ".join(f"Note {i}: the {c} sensor read {i * 7 % 100} at step {i}."
                              for i, c in zip(range(60), ["red", "blue", "green", "amber"] * 15))
             asks: list[list[dict[str, Any]]] = [
@@ -5488,26 +5550,20 @@ def warm_up(cfg_path: Path) -> None:
                 url = "data:image/png;base64," + base64.b64encode(tiny_png()).decode()
                 asks.append([{"role": "user", "content": [{"type": "text", "text": "What colours are in this picture?"},
                                                           {"type": "image_url", "image_url": {"url": url}}]}])
-            for messages in asks:
-                req = urllib.request.Request(base + "/v1/chat/completions",
-                                             headers={"Content-Type": "application/json", **auth},
-                                             data=json.dumps({"messages": messages, "max_tokens": 32,
-                                                              "temperature": 0}).encode())
-                json.loads(urllib.request.urlopen(req, timeout=900).read())
+            for i, messages in enumerate(asks):
+                ask({"messages": messages, "max_tokens": 32, "temperature": 0}, f"answering question {i + 1}")
             ok(f"GPU code compiled for this model ({time.time() - t0:.0f} s)")
             # a text prompt of the same length again, the code compiled (other numbers: no cached prefix): the CPU's
             # share of its experts measured now is the one kept
             notes2 = " ".join(f"Note {i}: the {c} sensor read {i * 11 % 100} at step {i}."
                               for i, c in zip(range(60), ["red", "blue", "green", "amber"] * 15))
             again = [{"role": "user", "content": "Summarize these notes in two sentences.\n" + notes2}]
-            req = urllib.request.Request(base + "/v1/chat/completions",
-                                         headers={"Content-Type": "application/json", **auth},
-                                         data=json.dumps({"messages": again, "max_tokens": 1,
-                                                          "temperature": 0}).encode())
-            json.loads(urllib.request.urlopen(req, timeout=900).read())
+            ask({"messages": again, "max_tokens": 1, "temperature": 0}, "measuring the prompt's CPU share")
             share = measured_cpu_share(elog, since)
         except (RuntimeError, OSError, ValueError) as e:
             warn(f"the warm-up did not finish ({e}): the first request will take longer")
+        except KeyboardInterrupt:                       # the config is written: the next start compiles instead
+            warn("the warm-up was skipped (Ctrl+C): the first request will take longer")
         finally:
             end_process_group(proc)
     if share is not None:
