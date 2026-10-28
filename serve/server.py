@@ -7368,6 +7368,10 @@ def make_handler(svc: Service):
                 err = {"error": {"type": "server_error", "message": str(e)}}   # headers are sent, so no 400 now
                 self._note(error=err["error"])
                 self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
+            except Exception as e:  # noqa: BLE001 - a bug after the stream started: said, and the stream ends
+                err = {"error": {"type": "server_error", "message": self._stream_bug(e)}}
+                self._note(error=err["error"])
+                self.wfile.write(b"data: " + json.dumps(err).encode() + b"\n\ndata: [DONE]\n\n")
 
         def _responses_ready(self, req, events):
             """Send a finished Responses result that did not run on the engine."""
@@ -7489,6 +7493,8 @@ def make_handler(svc: Service):
                 self._responses_failed(asm, str(e), "structured_output_failed", send)
             except ValueError as e:                          # the engine's ERR after the stream started
                 self._responses_failed(asm, str(e), "server_error", send)
+            except Exception as e:  # noqa: BLE001 - a bug after the stream started: response.failed, as above
+                self._responses_failed(asm, self._stream_bug(e), "server_error", send)
 
         def _responses_failed(self, asm, message, code, send):
             # OpenAI's order: the error event, then response.failed - made in that order, as the sequence numbers
@@ -7731,6 +7737,17 @@ def make_handler(svc: Service):
                 err = {"type": "error", "error": {"type": "api_error", "message": str(e)}}
                 self._note(error=err["error"])
                 self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+            except Exception as e:  # noqa: BLE001 - a bug after the stream started: the error event, as above
+                err = {"type": "error", "error": {"type": "api_error", "message": self._stream_bug(e)}}
+                self._note(error=err["error"])
+                self.wfile.write(b"event: error\ndata: " + json.dumps(err).encode() + b"\n\n")
+
+        def _stream_bug(self, e: Exception) -> str:
+            """An error no other handler expects, raised after a stream's headers went out (a bug): its traceback to
+            the log, and the sentence its error event carries - a stream that only stopped read as an empty answer."""
+            import traceback
+            print(f"[strata] error in a stream ({type(e).__name__}: {e}):\n" + traceback.format_exc(), flush=True)
+            return f"internal error ({type(e).__name__}: {e}); the server's log has the details"
 
     return Handler
 

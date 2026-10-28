@@ -2197,6 +2197,46 @@ class EngineDeath(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
 
+    def test_an_unexpected_error_mid_stream_is_said(self):
+        """A bug after a stream started (no handler expects it) reaches the client as each API's error, not as a stream
+        that only stops (an empty answer); a boolean schema (parameters: true, a property true) is no such bug."""
+        class BuggyEngine(MockEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                yield None                                  # a prompt-progress heartbeat: the stream has started
+                raise RuntimeError("a bug")
+
+        tok = ByteTokenizer()
+        svc = Service(BuggyEngine(tok, ANSWER, max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+
+        def post(path, body):
+            req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.read().decode()
+        try:
+            user = [{"role": "user", "content": "hi"}]
+            for path, body, said in (("/v1/chat/completions", {"model": "m", "messages": user}, "data: [DONE]"),
+                                     ("/v1/messages", {"model": "m", "messages": user, "max_tokens": 20},
+                                      "event: error"),
+                                     ("/v1/responses", {"model": "m", "input": "hi"}, "response.failed")):
+                with self.subTest(path):
+                    text = post(path, {**body, "stream": True})
+                    self.assertIn("internal error (RuntimeError: a bug)", text)
+                    self.assertIn(said, text)
+            svc.engine = MockEngine(tok, "</think>\n\n<tool_call>\n<function=a>\n<parameter=x>\n1\n</parameter>\n"
+                                         "</function>\n</tool_call>", max_context=CTX)
+            for params in (True, {"type": "object", "properties": {"x": True}}):
+                tool = {"type": "function", "name": "a", "parameters": params}
+                out = json.loads(post("/v1/responses", {"model": "m", "input": "go", "tools": [tool]}))
+                self.assertEqual([json.loads(o["arguments"]) for o in out["output"] if o["type"] == "function_call"],
+                                 [{"x": 1}])
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
     def test_responses_failed_in_order(self):
         """/v1/responses failing mid-stream: the error event, then response.failed, their sequence numbers rising."""
         tok = ByteTokenizer()
