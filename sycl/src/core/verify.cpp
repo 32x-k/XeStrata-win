@@ -841,7 +841,8 @@ bool Verifier::record_window(int T, dpct::queue_ptr cs, std::string &err) {
     const bool ple_on = ss.ple.ready() && ple_stage();
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
     const int G = (split_ && T >= 2 && !batch_rec_) ? 2 : 1;   // a batch window is one group
-    const bool self_commit = T == 1 && !batch_rec_ && !g_qfuse() && one_token_self_commit();   // see Verifier::commit
+    const bool self_commit = T == 1 && !batch_rec_ && !g_qfuse() && one_token_self_commit() &&
+                              !self_commit_off_;   // see Verifier::commit
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     // SYCL port, STRATA_VERIFY_EAGER=1: the window runs on the queue instead of as a graph, and each stage stamp is
     // a host-side wait + clock (there is no %globaltimer here), so the existing stage profiler reports ms per stage.
@@ -2693,7 +2694,7 @@ bool Verifier::commit(int n_keep, std::string &err) try {
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
-    if (last_t_ == 1 && one_token_self_commit()) {
+    if (last_t_ == 1 && one_token_self_commit() && !self_commit_off_) {
         // a one-token window has advanced the state itself (record_window): no commit graph
     } else {
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -4009,7 +4010,7 @@ bool Verifier::pl_commit_async(int n_keep, std::string &err) try {
     // single-token window; the first decode window is always one token, so the two paths' GDN states were
     // equal after the prompt and different after that window (STRATA_PIPELINE_DUMP), and the tokens diverged
     // at the fourth.  With this skip the pipelined windows are token-identical to the serial path.
-    if (last_t_ == 1 && one_token_self_commit()) {
+    if (last_t_ == 1 && one_token_self_commit() && !self_commit_off_) {
         h_commit_[0] = n_keep;
         h_commit_[1] = n_keep - 1;
         for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;

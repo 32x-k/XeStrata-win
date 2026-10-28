@@ -7279,10 +7279,14 @@ int main(int argc, char **argv) try {
             for (strata::core::Verifier* v : {&ver, &ver_b}) {
                 v->set_stream(pl_stream[0]);
                 v->set_always_publish(true);
+                v->set_self_commit_off(true);   // a pipelined window may run speculatively: never let it
+                // advance the state itself, the commit graph always does
             }
             for (strata::core::Verifier* v : {&stages[0]->ver, &stages[0]->ver_b}) {
                 v->set_stream(pl_stream[1]);
                 v->set_always_publish(true);
+                v->set_self_commit_off(true);   // a pipelined window may run speculatively: never let it
+                // advance the state itself, the commit graph always does
             }
         }
         if (n_stages > 1) {
@@ -11551,17 +11555,33 @@ int main(int argc, char **argv) try {
                         const size_t n = (size_t) ss.gdn_alloc * (size_t) gdn_floats;
                         std::vector<float> h(n);
                         (void) DPCT_CHECK_ERROR(s0->memcpy(h.data(), ss.gdn_state, n * sizeof(float)).wait());
-                        uint64_t hs = 1469598103934665603ull;
-                        double sum = 0.0;
-                        for (size_t i = 0; i < n; ++i) {
-                            uint64_t b = 0;
-                            std::memcpy(&b, &h[i], sizeof(float));
-                            hs = (hs ^ b) * 1099511628211ull;
-                            sum += (double) h[i];
+                        // the recurrence state and the conv history hashed apart: a wrong row shows which half it is
+                        const size_t n_rec = (size_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                        const size_t n_cnv = (size_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+                        double rec_sum = 0.0, cnv_sum = 0.0;
+                        uint64_t rec_hash = 1469598103934665603ull, cnv_hash = 1469598103934665603ull;
+                        for (int64_t l = 0; l < ss.gdn_alloc; ++l) {
+                            const size_t base = (size_t) l * (size_t) gdn_floats;
+                            uint64_t rh = 1469598103934665603ull, ch = 1469598103934665603ull;
+                            for (size_t i = 0; i < n_rec; ++i) {
+                                uint64_t b = 0;
+                                std::memcpy(&b, &h[base + i], sizeof(float));
+                                rh = (rh ^ b) * 1099511628211ull;
+                                rec_sum += (double) h[base + i];
+                            }
+                            for (size_t i = 0; i < n_cnv; ++i) {
+                                uint64_t b = 0;
+                                std::memcpy(&b, &h[base + n_rec + i], sizeof(float));
+                                ch = (ch ^ b) * 1099511628211ull;
+                                cnv_sum += (double) h[base + n_rec + i];
+                            }
+                            rec_hash = (rec_hash ^ rh) * 1099511628211ull;
+                            cnv_hash = (cnv_hash ^ ch) * 1099511628211ull;
                         }
                         if (std::FILE* df = std::fopen(pl_dump, "a")) {
-                            std::fprintf(df, "pos %lld windows %lld gdn %zu sum %.9g hash %016llx\n", (long long) p,
-                                         (long long) dec_windows, n, sum, (unsigned long long) hs);
+                            std::fprintf(df, "pos %lld windows %lld rec %.9g %016llx cnv %.9g %016llx\n", (long long) p,
+                                         (long long) dec_windows, rec_sum, (unsigned long long) rec_hash, cnv_sum,
+                                         (unsigned long long) cnv_hash);
                             std::fclose(df);
                         }
                     }
@@ -11781,17 +11801,32 @@ int main(int argc, char **argv) try {
                         const size_t n = (size_t) ss.gdn_alloc * (size_t) gf;
                         std::vector<float> h(n);
                         (void) DPCT_CHECK_ERROR(ver.stream()->memcpy(h.data(), ss.gdn_state, n * sizeof(float)).wait());
-                        uint64_t hs = 1469598103934665603ull;
-                        double sum = 0.0;
-                        for (size_t i = 0; i < n; ++i) {
-                            uint64_t bb = 0;
-                            std::memcpy(&bb, &h[i], sizeof(float));
-                            hs = (hs ^ bb) * 1099511628211ull;
-                            sum += (double) h[i];
+                        const size_t n_rec = (size_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                        const size_t n_cnv = (size_t) g.ssm_conv_channels * (g.ssm_d_conv - 1);
+                        double rec_sum = 0.0, cnv_sum = 0.0;
+                        uint64_t rec_hash = 1469598103934665603ull, cnv_hash = 1469598103934665603ull;
+                        for (int64_t l = 0; l < ss.gdn_alloc; ++l) {
+                            const size_t base = (size_t) l * (size_t) gf;
+                            uint64_t rh = 1469598103934665603ull, ch = 1469598103934665603ull;
+                            for (size_t i = 0; i < n_rec; ++i) {
+                                uint64_t bb = 0;
+                                std::memcpy(&bb, &h[base + i], sizeof(float));
+                                rh = (rh ^ bb) * 1099511628211ull;
+                                rec_sum += (double) h[base + i];
+                            }
+                            for (size_t i = 0; i < n_cnv; ++i) {
+                                uint64_t bb = 0;
+                                std::memcpy(&bb, &h[base + n_rec + i], sizeof(float));
+                                ch = (ch ^ bb) * 1099511628211ull;
+                                cnv_sum += (double) h[base + n_rec + i];
+                            }
+                            rec_hash = (rec_hash ^ rh) * 1099511628211ull;
+                            cnv_hash = (cnv_hash ^ ch) * 1099511628211ull;
                         }
                         if (std::FILE* df = std::fopen(sd, "a")) {
-                            std::fprintf(df, "pos %lld serial gdn %zu sum %.9g hash %016llx\n", (long long) (p + a + 1), n,
-                                         sum, (unsigned long long) hs);
+                            std::fprintf(df, "pos %lld serial rec %.9g %016llx cnv %.9g %016llx\n", (long long) (p + a + 1),
+                                         rec_sum, (unsigned long long) rec_hash, cnv_sum,
+                                         (unsigned long long) cnv_hash);
                             std::fclose(df);
                         }
                     }
