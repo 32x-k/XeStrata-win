@@ -8,9 +8,11 @@ An engine with grammar-constrained decoding (its INFO grammar=1) writes the answ
 errors, never silently retried or returned as successful structured output.
 
 json_schema and a strict tool's arguments are checked against their schema with `jsonschema` (requirements.txt; the
-deb and rpm packages recommend the distribution's): json_object needs only the standard library, and without the
-package only that the answer is one JSON object is checked, which the server says once.  jsonschema without
-`referencing` (before 4.18: Ubuntu 24.04's 4.10) checks the same; remote references are refused either way.
+deb and rpm packages depend on the distribution's): json_object needs only the standard library.  Without the
+package a strict request (json_schema's strict: true, Anthropic's format, a strict tool) is a 400, as its answer
+could not be checked; any other json_schema is checked to be one JSON object, which the server says once.
+jsonschema without `referencing` (before 4.18: Ubuntu 24.04's 4.10) checks the same; remote references are refused
+either way.
 """
 import json
 import threading
@@ -77,6 +79,10 @@ _jsonschema = None   # (validators, SchemaError, Registry, NoSuchResource; the l
 _jsonschema_lock = threading.Lock()
 
 
+NO_JSONSCHEMA = ("strict: true needs the Python package jsonschema on the server to check the reply against the "
+                 "schema, and it is not installed (the distribution's python3-jsonschema, or ./setup.sh again)")
+
+
 def jsonschema_modules():
     """jsonschema, imported on first use; None when it is not installed (said once, in the server window)."""
     global _jsonschema
@@ -88,8 +94,8 @@ def jsonschema_modules():
             except ImportError:
                 _jsonschema = False
                 print("[strata] json_schema and strict tools: the Python package jsonschema is not installed, so "
-                      "answers and strict calls are only checked to be one JSON object (the distribution's "
-                      "python3-jsonschema, or ./setup.sh again)", flush=True)
+                      "strict requests are refused and other json_schema answers are only checked to be one JSON "
+                      "object (the distribution's python3-jsonschema, or ./setup.sh again)", flush=True)
             else:
                 try:
                     from referencing import Registry
@@ -183,6 +189,8 @@ def prepare_format(response_format, messages, with_tools=False):
             raise ValueError("response_format schema must accept only JSON objects at its root "
                              "(type object, or anyOf/oneOf of object schemas)")
         modules = jsonschema_modules()
+        if modules is None and spec.get("strict") is True:
+            raise ValueError(NO_JSONSCHEMA)
     else:
         raise ValueError("response_format.type must be text, json_object or json_schema")
 
@@ -373,10 +381,13 @@ def constrained_tools(tools, namespace: str = "") -> tuple[set, dict]:
 
 def strict_schemas(tools, strict: set) -> dict:
     """The template's tools (name, parameters) -> {name: parameters} of the strict ones (constrained_tools), which
-    the server checks the calls against (checked_calls); a schema jsonschema refuses is a 400 now."""
+    the server checks the calls against (checked_calls); a schema jsonschema refuses, or no jsonschema to check
+    with, is a 400 now."""
     out = {t["name"]: t.get("parameters") or {"type": "object"} for t in tools or []
            if isinstance(t, dict) and t.get("name") in strict}
     modules = jsonschema_modules() if out else None
+    if out and modules is None:
+        raise ValueError(NO_JSONSCHEMA)
     for name, schema in out.items():
         schema_validator(schema, modules, f"tool {name}'s parameters")
     return out
@@ -384,8 +395,9 @@ def strict_schemas(tools, strict: set) -> dict:
 
 def checked_calls(events, schemas: dict):
     """A run's ("event", Event) items with the calls of strict tools (`schemas`: strict_schemas) checked against
-    their parameters before any of them is sent: such a call is not announced while it is written (its tool_start
-    and tool_args are held back) and goes out whole with its tool_call, or is a StructuredOutputError.  This holds
+    their parameters, and for numbers JSON cannot hold, before any of them is sent: such a call is not announced while
+    it is written (its tool_start and tool_args are held back) and goes out whole with its tool_call, or is a
+    StructuredOutputError.  This holds
     whether the engine wrote the call under a grammar (tool_grammar) or not (another call form, an engine without
     grammars)."""
     modules = jsonschema_modules()
@@ -396,6 +408,11 @@ def checked_calls(events, schemas: dict):
             if x.kind in ("tool_start", "tool_args"):
                 continue
             if x.kind == "tool_call":
+                try:      # NaN or Infinity (1e999 reads as it): no JSON, and jsonschema's "number" takes them
+                    json.dumps(call.arguments, allow_nan=False)
+                except ValueError:
+                    raise StructuredOutputError(f"the call of strict tool {call.name} has a number that is not "
+                                                "finite (NaN or Infinity), which JSON cannot hold") from None
                 try:
                     error = next(checks[call.name].iter_errors(call.arguments), None)
                 except Exception as exc:

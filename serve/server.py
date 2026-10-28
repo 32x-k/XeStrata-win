@@ -4257,10 +4257,12 @@ class Service:
         return self.tok.encode(force, parse_special=True) if force and kwargs.get("enable_thinking", True) is False \
             else []
 
-    def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
-        """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
-        the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
-        prompt; with thinking, Service.run writes it once the thinking is over."""
+    def prompt_ids(self, messages, tools, kwargs, force=None, cancel=None, store=True):
+        """The prompt the engine reads for these messages, as prepare() and Anthropic's count_tokens make it -> (the
+        messages as read: files expanded, tool pictures resolved; the prompt's ids, each picture's marker expanded to
+        its image tokens and the forced call's opening (forced_ids) at the end; the rendered text's ids; each
+        picture's (embeddings file, tokens)).  The pictures are encoded here (in the FIFO's turn; one encoded before
+        comes from the cache).  `store`: keep the rendering for the next request (encode_prompt)."""
         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
         # between pictures and raise ClientGone
         messages = self.expand_files(messages, cancel)
@@ -4285,10 +4287,9 @@ class Service:
                     else:
                         part["source"] = str(image)
         fetched = self._note_unreadable_tool_images(messages, cancel)
-        ids = encoded_ids = self.encode_prompt(messages, tools, kwargs)
+        ids = encoded_ids = self.encode_prompt(messages, tools, kwargs, store=store)
         ids = ids + self.forced_ids(force, kwargs)
-        self.embeddings.path = None
-        self.embeddings.keys = None
+        encoded: list = []
         images = images_of(messages)
         if images:
             if self.vision is None:
@@ -4340,6 +4341,16 @@ class Service:
             if k != len(encoded):
                 raise ValueError("the prompt and its images do not match")
             ids = out
+        return messages, ids, encoded_ids, encoded
+
+    def prepare(self, messages, tools, kwargs, max_new=None, force=None, req=None, cancel=None):
+        """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
+        the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
+        prompt; with thinking, Service.run writes it once the thinking is over."""
+        self.embeddings.path = None
+        self.embeddings.keys = None
+        messages, ids, encoded_ids, encoded = self.prompt_ids(messages, tools, kwargs, force, cancel)
+        images = encoded
         ctx = self.engine.max_context
         if ctx <= 0:
             if getattr(self.engine, "starting", False):   # #344: (re)starting, not a prompt that is too long
@@ -7631,10 +7642,14 @@ def make_handler(svc: Service):
                 tools = None
             force = forced_call(req.get("tool_choice"), tools, getattr(svc.template, "call_form", "qwen"))
             messages, _ = anthropic_prepare_format(req, messages, tools)   # its instruction is part of the prompt
-            messages = svc.expand_files(messages)            # a document's text and pages, as the request reads it
-            stop_strings(req)                                 # the same 400 as the request itself would get
+            self._no_local_images(messages)                   # the same 400s as the request itself would get
+            stop_strings(req)
             check_request_sampling(req)                       # ... likewise a sampling field of the wrong type
-            ids = svc.encode_prompt(messages, tools, kw, store=False) + svc.forced_ids(force, kw)   # as prepare()
+            cancel = threading.Event()
+            self._watch_client(cancel)
+            # the prompt /v1/messages would read: a document's text and pages, each picture's image tokens (encoded
+            # here, in the FIFO's turn, unless the cache has it) and a forced call's opening
+            _, ids, _, _ = svc.prompt_ids(messages, tools, kw, force, cancel, store=False)
             self._json(200, {"input_tokens": len(ids)})
 
         def _anthropic(self, req):

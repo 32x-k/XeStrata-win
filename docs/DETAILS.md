@@ -900,7 +900,7 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
 - **Anthropic requests that don't ask for thinking.** A `/v1/messages` request with no `"thinking"`, effort or budget is rendered without thinking, by Anthropic's own rule.
   Claude Code's short helper calls (a session title in a few dozen tokens) need it.
   `"anthropic_thinking": "model"` in `xestrata-<model>.json` makes such a request think as the model's template does.
-  `POST /v1/messages/count_tokens` renders and tokenizes a request as `/v1/messages` would, without running the model.
+  `POST /v1/messages/count_tokens` renders and tokenizes a request as `/v1/messages` would, without running the model. A picture counts as the image tokens it becomes when read, so one not read yet is read by the image encoder (a picture read once is kept, for later requests too).
 
 ### Streaming and connecting
 
@@ -1250,14 +1250,14 @@ The same held on the small configuration (8 GB, no XMX) and with the icpx build.
 `{"type":"json_schema","json_schema":{"name":"answer","strict":true,"schema":{"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"],"additionalProperties":false}}}`.
 The schema must describe an object at its root.
 Local `#` references work; remote references are refused.
-`json_schema` is checked with the Python package `jsonschema` (setup installs it into `.venv`, the deb and rpm packages recommend the distribution's python3-jsonschema, and the Windows 7z carries it).
-Without it the answer is only checked to be one JSON object, and the server says so once; `xestrata --setup` says how to install it.
+`json_schema` is checked with the Python package `jsonschema` (setup installs it into `.venv`, the deb and rpm packages depend on the distribution's python3-jsonschema, and the Windows 7z carries it).
+Without it a `strict: true` request (`json_schema`'s `strict: true`, Messages' `output_config.format`, a `strict: true` tool) cannot be checked and is a 400, and another `json_schema` answer is only checked to be one JSON object; the server says so once, and `xestrata --setup` says how to install it.
 
 When the engine can constrain its decoding (not with continuous batching, not the plain models' engine), **the answer is written under the schema's grammar** and checked after it as well.
 The thinking is not constrained: only the JSON answer after it.
 Otherwise the schema is in the prompt and the server checks the answer; `STRATA_GRAMMAR=0` in the environment turns the constraint off too.
 A tool's `strict: true` (Chat Completions, Responses, Messages; on Responses a namespace's and `additional_tools`' tools too) and a `custom` tool's regex grammar constrain the call's arguments the same way (models with Qwen's call form); text and the other tools' calls are not constrained.
-A call of a `strict: true` tool has its arguments checked against the schema before it is sent, whether or not it was constrained: it is not sent while it is written, but whole once it is; one that does not match is a `structured_output_failed`, as an answer is.
+A call of a `strict: true` tool has its arguments checked against the schema before it is sent, whether or not it was constrained: it is not sent while it is written, but whole once it is; one that does not match, or holds a number JSON cannot (NaN, Infinity, one too large), is a `structured_output_failed`, as an answer is.
 One generation is made per request, with no hidden retry.
 Successful responses contain a validated JSON object.
 Malformed JSON, duplicate keys, non-finite numbers, schema violations and incomplete generations return **502** with `error.code: structured_output_failed`;
@@ -1361,7 +1361,7 @@ On Linux a PDF is read with poppler's `pdftotext` and `pdftoppm`, on Windows wit
 - `n` (1 to 128) generates each choice in its own run; with a `seed`, choice k gets `seed + k`.
 - `stream_options.include_usage` adds the usage chunk with `choices: []`; the finishing chunk keeps its usage too (as llama.cpp's does).
 - The usage has `completion_tokens_details.reasoning_tokens`, and responses carry a `system_fingerprint` (made from the engine's version and the model).
-- The old `role: function` and an assistant's `function_call` are read as a tool's result and call. A request with the old `functions` and `function_call` is read as `tools` and `tool_choice` (one call at a time), and answered in the old shape (`function_call`, finish reason `function_call`); they cannot be used with `tools` or `tool_choice`.
+- The old `role: function` and an assistant's `function_call` are read as a tool's result and call. A request with the old `functions` and `function_call` is read as `tools` and `tool_choice` (one call at a time), and answered in the old shape (`function_call`, finish reason `function_call`); they cannot be used with `tools` or `tool_choice`. A null field, and `function_call: "none"` without `functions`, are read as nothing asked.
 - A `user` or `system` message's `name` is written before what it says, followed by a colon. An assistant's `refusal` is read as its text when it has no content.
 - An image with `image_url` `detail: "low"` is read with its longer side brought down to 512.
 - `top_logprobs` is 0 to 20 and only with `logprobs: true`. `input_audio` and audio output (`audio` in `modalities`, or `audio`) are a 400 (the model reads and writes no audio).
