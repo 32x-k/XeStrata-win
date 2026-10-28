@@ -504,6 +504,17 @@ std::string Runtime::device_status() {
         }
     }
 #endif
+    // no status query here (CUDA, HIP, Windows): whether the driver still answers a question about the device's free
+    // memory, which CUDA refuses once a kernel has faulted its context (its errors stick).  A failure report on these
+    // said "the GPU: unknown" every time (#36, #39).
+    if (device_.has(sycl::aspect::ext_intel_free_memory)) {
+        try {
+            (void) device_.get_info<sycl::ext::intel::info::device::free_memory>();
+            return "answers a memory query";
+        } catch (const std::exception& e) {
+            return std::string("does not answer a memory query (") + e.what() + ")";
+        }
+    }
     return "unknown";
 }
 

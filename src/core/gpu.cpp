@@ -133,7 +133,9 @@ std::string failure_report(const std::exception& e) {
     try {
         auto& runtime = rt();
         const std::string status = runtime.device_status();
-        r += "; the GPU: " + status;
+        // with more than one GPU, which one (the logs' CUDA<n>)
+        r += (core::Runtime::count() > 1 ? "; GPU " + std::to_string(runtime.ordinal()) : std::string("; the GPU")) +
+             ": " + status;
         size_t free_b = 0, total_b = 0;
         if (status != "lost" && mem_info(&free_b, &total_b)) {
             char buf[64];

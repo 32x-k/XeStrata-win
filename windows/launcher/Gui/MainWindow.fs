@@ -53,6 +53,8 @@ type MainWindow() as this =
     let version = muted ""
     let updateBar = Border(IsVisible = false, Background = accentTint, CornerRadius = CornerRadius 6.0, Padding = Thickness 10.0)
     let mutable running: Setup.Run option = None
+    // setup's warnings while it checked this PC: why a GPU is missing ("the engine could not list the GPUs: ...", #41)
+    let mutable checkWarnings: string list = []
 
     let show (content: Control) =
         host.Content <- ScrollViewer(Content = content, HorizontalScrollBarVisibility = Primitives.ScrollBarVisibility.Disabled)
@@ -268,6 +270,7 @@ type MainWindow() as this =
         task {
             let! messages, code = Setup.collect [ "--describe" ]
             let found = messages |> List.tryPick (function Described d -> Some d | _ -> None)
+            checkWarnings <- messages |> List.choose (function Warn s -> Some s | _ -> None)
             ui (fun () ->
                 match found with
                 | Some d -> homePage d
@@ -296,6 +299,8 @@ type MainWindow() as this =
                 for g in d.Gpus do
                     if not (isNull g.Problem) then
                         yield coloured warnBrush (sprintf "%s: %s" g.Name g.Problem)
+                for w in checkWarnings do
+                    yield coloured warnBrush ("⚠ " + w)
                 yield text (sprintf "RAM: %s" (gb d.RamGb))
                 yield
                     text (
