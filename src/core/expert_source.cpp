@@ -2402,7 +2402,7 @@ bool FileExpertSource::replace_resident(int64_t layer, int64_t in, int64_t out) 
     file_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
                        std::memory_order_relaxed);
     file_read_bytes_.fetch_add(bytes, std::memory_order_relaxed);
-    std::memcpy((uint8_t*) complement_host_ + (size_t) at, ram_adapt_buf_.data(), (size_t) bytes);
+    std::memcpy(complement_at(at), ram_adapt_buf_.data(), (size_t) bytes);
     if (!detail::exchange_cache_complement(complement_offsets_, i_out, i_in)) return false;
     ++ram_adapts_;
     return true;
@@ -2424,7 +2424,7 @@ bool FileExpertSource::replace_resident_staged(int64_t layer, int64_t in, int64_
         std::lock_guard<std::mutex> lk(stage_mu_);
         const auto it = stage_of_.find((int64_t) i_in);
         if (it == stage_of_.end() || stage_busy_[it->second] || stage_key_[it->second] != (int64_t) i_in) return false;
-        std::memcpy((uint8_t*) complement_host_ + (size_t) at, stage_buf_[it->second].get(), (size_t) bytes);
+        std::memcpy(complement_at(at), stage_buf_[it->second].get(), (size_t) bytes);
     }
     if (!detail::exchange_cache_complement(complement_offsets_, i_out, i_in)) return false;
     ++ram_adapts_;
