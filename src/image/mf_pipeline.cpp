@@ -203,7 +203,7 @@ bool MfPipeline::want_q8(int64_t rows, int n, int64_t max_text, int64_t n_ids) c
     if ((w8_faster_ < 0 || rows > 2 * w8_rows_) && prefill::Gemm::i8_usable(s_)) {
         const auto [f16, w8] = d16.time_forms(rows);
         if (f16 > 0.0 && w8 > 0.0) {
-            w8_faster_ = w8 < f16 ? 1 : 0;
+            w8_faster_ = w8 < f16 * 1.05 ? 1 : 0;   // 8 bits unless clearly the slower: a near tie stays put
             w8_rows_ = rows;
             std::fprintf(stderr, "image engine: Mage-Flow's DiT in %s (its MLP's product at %lld rows: %.2f ms in "
                                  "FP16, %.2f in W8A8)\n", w8_faster_ ? "8 bits" : "16 bits", (long long) rows, 1e3 * f16,

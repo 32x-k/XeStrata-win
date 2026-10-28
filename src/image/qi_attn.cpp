@@ -836,7 +836,9 @@ void qi_attention(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
                     });
                     g_no_i8 = false;
                 }
-                use = i8ms > 0.0 && i8ms < f16ms;
+                // int8 unless it is clearly the slower: a near tie (the RX 9060 XT, Qwen-Image's 4096 rows, 2026-10-29:
+                // 6.58 against 6.66 ms) picked one or the other from start to start, and with it the image
+                use = i8ms > 0.0 && i8ms < f16ms * 1.05;
                 ch.of[key] = use;
                 std::fprintf(stderr, "strata-image: the attention's image rows %s at %lld rows of %lld keys (int8 "
                                      "%.2f ms, 16-bit %.2f ms)\n", use ? "in int8" : "in 16 bits", (long long) (T - r0),
