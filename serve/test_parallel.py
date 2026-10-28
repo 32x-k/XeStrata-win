@@ -637,7 +637,7 @@ class ParallelService(unittest.TestCase):
 
     def test_nonfinite_in_batch_mode(self):
         """#879 in --batch mode: DONE ... nonfinite on the solo path or at an admission (nothing emitted yet) sends the
-        request again once; BDONE ... nonfinite in a slot ends the reply that had started, as "length"."""
+        request again once; BDONE ... nonfinite in a slot ends the reply that had started with an error (503)."""
         self.start(2)
         self.assertEqual(self.chat("NFSOLO alone")["choices"][0]["message"]["content"], "ok, done.")
         gens = [x for x in self.log.read_text().splitlines() if x.startswith("GEN")]
@@ -652,15 +652,20 @@ class ParallelService(unittest.TestCase):
             body = {"messages": [{"role": "user", "content": t}], "max_tokens": 64, "reasoning_effort": "none"}
             req = urllib.request.Request(self.base + "/v1/chat/completions", data=json.dumps(body).encode(),
                                          headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req, timeout=60) as r:
-                out[t] = json.loads(r.read().decode())["choices"][0]
+            try:
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    out[t] = json.loads(r.read().decode())["choices"][0]
+            except urllib.error.HTTPError as e:
+                with e:
+                    out[t] = (e.code, json.loads(e.read().decode()))
         a = threading.Thread(target=go, args=("third question LONGREPLY",))
         a.start()
         time.sleep(0.15)
         go("NFSLOT fourth")
         a.join(30)
-        c = out["NFSLOT fourth"]
-        self.assertEqual((c["message"]["content"], c["finish_reason"]), ("ok", "length"))
+        code, err = out["NFSLOT fourth"]
+        self.assertEqual((code, err["error"]["type"]), (503, "server_error"))
+        self.assertIn("non-finite (NaN) after", err["error"]["message"])
         self.assertEqual(out["third question LONGREPLY"]["message"]["content"], "ok, " + "la " * 15 + "done.")
         # the engine dropped that slot's state: the server does not route the conversation's next turn to it
         self.assertFalse([h for h in self.engine.slot_held if bytes(t & 255 for t in h).find(b"NFSLOT") >= 0])

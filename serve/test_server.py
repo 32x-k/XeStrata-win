@@ -2400,7 +2400,7 @@ class NonFiniteEngine(MockEngine):
 
 class NonFiniteLogits(unittest.TestCase):
     """#879: non-finite logits before the first token -> the same request once more; after tokens went out -> the
-    reply ends as "length"; again on the retry -> an error, no loop."""
+    reply ends with an error after its text (as vLLM and llama.cpp); again on the retry -> an error, no loop."""
 
     def run_reply(self, plan):
         tok = ByteTokenizer()
@@ -2432,11 +2432,13 @@ class NonFiniteLogits(unittest.TestCase):
 
     def test_mid_reply_ends_without_retry(self):
         eng, svc, ids, done, error, text, log = self.run_reply([3])    # "hel"  # codespell:ignore
-        self.assertIsNone(error)
+        self.assertIsNotNone(error)
+        self.assertIn("after 3 tokens", str(error))
         self.assertEqual(len(eng.calls), 1)
-        self.assertEqual((done["finish"], done["completion_tokens"]), ("length", 3))
+        self.assertIsNone(done)
         self.assertEqual(text, "hel")  # codespell:ignore
         self.assertIn("non-finite after 3 tokens", log)
+        self.assertEqual(svc.metrics()["requests"][0]["finish"], "error")
 
     def test_twice_is_an_error(self):
         eng, svc, ids, done, error, text, log = self.run_reply([0, 0, 0])

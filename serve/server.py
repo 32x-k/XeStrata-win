@@ -357,8 +357,8 @@ class EngineNonFinite(ValueError):
     """#879: the engine's DONE (or a slot's BDONE) said `nonfinite`: a window's logits held a NaN or an infinity.  The
     engine wrote none of that window's tokens and drops every cached state that may carry the poison, so its next
     request reads the prompt from token 0.  Service.run sends a request that had produced nothing yet once more, and
-    ends one that had started (as "length").  A ValueError, so a stream that has started reports it as an error
-    event."""
+    ends one that had started with this error (as vLLM and llama.cpp end a reply their engine broke off).  A
+    ValueError, so a stream that has started reports it as an error event."""
 
 
 class SessionRefused(ValueError):
@@ -4805,18 +4805,22 @@ class Service:
                                       "(upstream Strata #879); it dropped its cached state: sending the request again "
                                       "once", flush=True)
                                 continue
+                            finish = "error"
                             if n == 0:
-                                finish = "error"
                                 print("[strata] the engine's logits became non-finite again on the retry (upstream "
                                       "Strata #879): the request ends with an error", flush=True)
                                 raise EngineNonFinite("the model's output became non-finite (NaN) twice in a row "
                                                       "(upstream Strata #879); the engine has dropped its cached "
                                                       "state - send the request again")
+                            # an error, as vLLM and llama.cpp end a reply their engine broke off: a stream gets its
+                            # error event after the text it already has, a whole answer is not sent; a "length"
+                            # finish would read as a reply cut at max_tokens
                             print(f"[strata] the engine's logits became non-finite after {n} tokens (upstream Strata "
-                                  "#879): the reply ends here as \"length\"; the engine dropped its cached state, so "
-                                  "the next request reads its prompt from the start", flush=True)
-                            finish = "length"
-                            break
+                                  "#879): the request ends with an error; the engine dropped its cached state, so the "
+                                  "next request reads its prompt from the start", flush=True)
+                            raise EngineNonFinite(f"the model's output became non-finite (NaN) after {n} tokens "
+                                                  "(upstream Strata #879); the engine has dropped its cached state - "
+                                                  "send the request again")
                         if recover_prompt is not None and not cancel.is_set() and n < max_new:
                             recovery_count += 1
                             # Only the two settings that keep the same words coming are raised (temperature to at
