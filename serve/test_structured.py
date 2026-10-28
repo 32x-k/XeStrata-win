@@ -281,6 +281,25 @@ class Structured(unittest.TestCase):
         fmt = {"type": "json_schema", "json_schema": {"name": "h3_story", "strict": None, "schema": STORY_SCHEMA}}
         self.assertEqual(self.chat(response_format=fmt)[0], 200)
 
+    @unittest.skipUnless(HAVE_JSONSCHEMA, "jsonschema is not installed")
+    def test_responses_strict_by_default_where_possible(self):
+        # Responses: a function tool without strict is strict when its parameters meet strict mode's rules (every
+        # object additionalProperties false, every property required), else not - and the response's tools say which
+        def call(days):
+            return (f"</think>\n\n<tool_call>\n<function=f>\n<parameter=days>\n{days}\n</parameter>\n</function>\n"
+                    "</tool_call>")
+        exact = object_schema({"days": {"type": "integer"}})
+        loose = {"type": "object", "properties": {"days": {"type": "integer"}}}
+        for params, strict in ((exact, True), (loose, False)):
+            with self.subTest(strict=strict):
+                body = {"model": "m", "input": "go", "tools": [{"type": "function", "name": "f", "parameters": params}]}
+                self.engine = self.svc.engine = MockEngine(self.tok, call(3), max_context=16384)
+                code, reply = self.request("/v1/responses", body)
+                self.assertEqual(code, 200, reply)
+                self.assertIs(reply["tools"][0]["strict"], strict)
+                self.engine = self.svc.engine = MockEngine(self.tok, call("three"), max_context=16384)
+                self.assertEqual(self.request("/v1/responses", body)[0], 502 if strict else 200)
+
     def test_the_server_does_not_import_jsonschema_at_start(self):
         import subprocess
         import sys

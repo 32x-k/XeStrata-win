@@ -7396,6 +7396,7 @@ def make_handler(svc: Service):
                 return self._json(e.status, e.body())
             if title is not None:
                 return self._responses_ready(req, title)
+            req = responses_api.with_strict_defaults(req)    # a function tool without strict: strict where possible
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             try:

@@ -32,6 +32,7 @@ import uuid
 from typing import Any
 
 from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs, file_item
+from serve.structured import jsonschema_modules
 
 ENCRYPTED_PREFIX = "strata.r1:"                   # our own reasoning replay strings; others' are ignored
 HOSTED_TOOLS = ("web_search", "web_search_preview", "file_search", "computer_use_preview", "computer_use",
@@ -336,6 +337,51 @@ def _order_tool_results(messages):
         m.pop("_call_id", None)
         for c in m.get("tool_calls") or []:
             c.pop("_call_id", None)
+
+
+def strict_compatible(schema) -> bool:
+    """A function's parameters strict mode takes as they are, by OpenAI's two rules: every object has
+    additionalProperties false, and every one of its properties is required."""
+    def ok(node) -> bool:
+        if isinstance(node, list):
+            return all(ok(x) for x in node)
+        if not isinstance(node, dict):
+            return True
+        props = node.get("properties")
+        if node.get("type") == "object" or isinstance(props, dict):
+            if node.get("additionalProperties") is not False:
+                return False
+            if isinstance(props, dict) and not set(props) <= set(node.get("required") or []):
+                return False
+        return all(ok(v) for v in node.values() if isinstance(v, (dict, list)))
+    return isinstance(schema, dict) and ok(schema)
+
+
+def with_strict_defaults(req: dict) -> dict:
+    """OpenAI's Responses default for a function tool whose strict is not given (or null): strict where possible,
+    else non-strict, and the response's tools show which.  "Possible" here: its parameters meet strict mode's rules
+    as they are (strict_compatible; they are not rewritten) and jsonschema is there to check the calls.  -> the
+    request with each such tool's strict set (the request's own tools, a namespace's, additional_tools')."""
+    possible = jsonschema_modules() is not None
+
+    def resolve(tools, member=False):
+        out = []
+        for t in tools:
+            if isinstance(t, dict) and t.get("type") == "namespace" and isinstance(t.get("tools"), list):
+                t = {**t, "tools": resolve(t["tools"], True)}
+            elif isinstance(t, dict) and t.get("type", "function" if member else None) == "function" \
+                    and t.get("strict") is None:
+                t = {**t, "strict": possible and strict_compatible(t.get("parameters"))}
+            out.append(t)
+        return out
+    out = dict(req)
+    if isinstance(req.get("tools"), list):
+        out["tools"] = resolve(req["tools"])
+    if isinstance(req.get("input"), list):
+        out["input"] = [{**item, "tools": resolve(item["tools"])} if isinstance(item, dict)
+                        and item.get("type") == "additional_tools" and isinstance(item.get("tools"), list) else item
+                        for item in req["input"]]
+    return out
 
 
 def given_tools(req: dict) -> list:
