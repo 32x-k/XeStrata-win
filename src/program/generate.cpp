@@ -27,6 +27,7 @@
 #include "strata/core/conversation_disk.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/logit_bias.hpp"
+#include "strata/core/grammar.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
 #include "strata/core/expert_source.hpp"
@@ -8888,7 +8889,7 @@ int main(int argc, char** argv) {
                         "spec_min_p=%.2f spec_window=%s conversation_cache_mib=%lld conversation_cache_slots=%d "
                         "conversation_cache_min_free_mib=%lld conversation_cache_min_tokens=%lld tail_role_token=%lld "
                         "vram_elastic=%d batch_slots=%d batch_groups=%d slot_cache=%d experts_ram=%s "
-                        "igc_workaround=%s engine=" STRATA_VERSION "\n",
+                        "igc_workaround=%s grammar=%d engine=" STRATA_VERSION "\n",
                         (long long) o.max_context, o.kv.c_str(),
                         (long long) (g.n_qsa_layers() > 0 && ss.qsa_states[ss.qsa_primary()].kv_mode == 1
                                          ? ss.qsa_states[ss.qsa_primary()].n_slots * 4 : 0),
@@ -8899,7 +8900,7 @@ int main(int argc, char** argv) {
                         (long long) o.conversation_cache_min_free_mib, (long long) o.conversation_cache_min_tokens,
                         (long long) o.tail_role_token, xcache.segmented() ? 1 : 0, o.batch,
                         o.batch > 0 ? o.batch_groups : 1, o.batch > 0 && o.prompt_cache > 0 ? 1 : 0, experts_ram,
-                        igc_workaround.c_str());
+                        igc_workaround.c_str(), strata::core::grammar_built() && o.batch == 0 ? 1 : 0);
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -10310,6 +10311,10 @@ int main(int argc, char** argv) {
             // with the token's log-probability and the K most likely tokens', from the verify window's head logits
             // (before sampling, penalties and temperature).  -1 (absent): no LP lines
             int req_logprobs = -1;
+            // grammar=<base64 JSON> (src/core/grammar.cpp): the reply follows this grammar - each window's rows sample only
+            // the tokens it allows after the tokens before them (serve builds it from a JSON schema, a strict tool's
+            // parameters, a regex or a Lark grammar).  Not with continuous batching (INFO grammar=0 there)
+            std::string req_grammar;
             // allowed=a,b,c: the LP line names only these ids after the chosen one (the server renormalises over them;
             // OpenAI's allowed_token_ids, upstream 9ea044962).  Empty: the K most likely tokens, as before
             std::vector<int32_t> req_allowed;
@@ -10336,6 +10341,7 @@ int main(int argc, char** argv) {
                     else if (key == "min_p") req_min_p = fv;
                     else if (key == "penalty_last_n") req_penalty_last_n = (int) std::strtol(tok.c_str() + eq + 1, nullptr, 10);
                     else if (key == "logprobs") req_logprobs = (int) std::clamp(std::strtol(tok.c_str() + eq + 1, nullptr, 10), -1L, 20L);
+                    else if (key == "grammar") req_grammar = tok.substr(eq + 1);
                     else if (key == "allowed") {   // allowed=a,b,c: with logprobs, these ids only (upstream 9ea044962, #3200)
                         req_allowed.clear();
                         for (const char* c = tok.c_str() + eq + 1; *c != '\0';) {
@@ -10374,6 +10380,15 @@ int main(int argc, char** argv) {
                 !strata::core::parse_logit_bias(req_bias_text, (int) n_vocab, req_bias, bias_error))) {
                 std::printf("ERR logit_bias: %s\n", o.batch > 0 ? "continuous batching is not supported" : bias_error.c_str());
                 continue;
+            }
+            static strata::core::Grammar grammar;   // one request at a time (not with --batch)
+            grammar.stop();
+            std::vector<uint32_t> grammar_rows;
+            if (!req_grammar.empty()) {
+                std::vector<int32_t> stops(o.eos_ids.begin(), o.eos_ids.end());
+                if (o.batch > 0) { std::printf("ERR grammar: continuous batching is not supported\n"); continue; }
+                if (!grammar.start(req_grammar, (int) n_vocab, stops, err)) { std::printf("ERR %s\n", err.c_str()); continue; }
+                grammar_rows.resize((size_t) strata::kernels::kVerifyMaxT * (size_t) grammar.words());
             }
             std::string emb_path;
             if (geni && endp != nullptr) {
@@ -11401,7 +11416,8 @@ int main(int argc, char** argv) {
             req_sp.penalty_freq = req_penalty_freq;
             req_sp.penalty_present = req_penalty_present;
             req_sp.counter = 0;
-            if (!ver.set_logit_bias(req_bias, err) || (pipe && !ver_b.set_logit_bias(req_bias, err))) {
+            if (!ver.set_logit_bias(req_bias, err) || (pipe && !ver_b.set_logit_bias(req_bias, err)) ||
+                !ver.set_allowed(nullptr, 0, err)) {   // a grammar's masks are set window by window
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
@@ -11662,6 +11678,7 @@ int main(int argc, char** argv) {
                                   : hist_n > 0 ? "repetition penalties (penalty_last_n)"
                                   : mtp.coupled() ? "coupled draft sampling"
                                   : req_logprobs >= 0 ? "log-probabilities"
+                                  : grammar.active() ? "a grammar"
                                   : o.lookup_chain > 0 ? "--lookup-chain" : nullptr;
             if (pl_serial != nullptr) {   // said once per reason
                 static std::set<std::string> said;
@@ -12339,6 +12356,17 @@ int main(int argc, char** argv) {
                     std::printf("ERR the K/V cannot grow: no VRAM is left\n");
                     return 1;
                 }
+                if (grammar.active() && !grammar.fill(window.data(), T, grammar_rows.data())) {
+                    std::fprintf(stderr, "strata serve: the grammar failed: the rest of this reply is not constrained\n");
+                    grammar.stop();
+                    if (!ver.set_allowed(nullptr, 0, err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                }
+                if (grammar.active()) {   // row t samples only what the grammar allows after the window's drafts 1..t
+                    if (!ver.set_allowed(grammar_rows.data(), T, err)) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return 1;
+                    }
+                }
                 tr("window", p, T);
                 const Clock::time_point tw0 = Clock::now();
                 dt_pre += std::chrono::duration<double, std::milli>(tw0 - round0).count();
@@ -12362,6 +12390,12 @@ int main(int argc, char** argv) {
                 }
                 int a = 0;
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                if (grammar.active() && !grammar.commit(outv.data(), a + 1)) {   // the masks made this impossible
+                    std::fprintf(stderr, "strata serve: the grammar refused a token its mask allowed: the rest of this "
+                                         "reply is not constrained\n");
+                    grammar.stop();
+                    if (!ver.set_allowed(nullptr, 0, err)) { std::printf("ERR %s\n", err.c_str()); return 1; }
+                }
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
                 if (!from_sfx && !first_window) {
