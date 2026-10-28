@@ -37,9 +37,10 @@ model Qwen-Image-2.1 in 40; mage-flow-turbo|mage-flow|mage-flow-base[-uncensored
 magetrail[-uncensored]: MageTrail, Mage-Flow tuned on Danbooru and e621 images, in 30; -uncensored: the text
 encoder with the refusal direction removed; several, comma-separated: the first the default, the others named by a
 request's "model"; hunyuan-image-3-distil: HunyuanImage 3.0 Instruct-Distil in 8 steps, its own tokenizer and
-system prompt, no text encoder; --image-quant Q4_K_M|Q6_K|Q8_0 (Qwen-Image) or w4a8|int8 (HunyuanImage 3.0),
---image-dit-q8 auto|on|off and --image-dit-keep on|off (Mage-Flow), --image-ssd-offload on|off, --image-gpu-policy
-auto|keep|shrink|unload).
+system prompt, no text encoder; moss-image|moss-image-base[-uncensored]: MOSS-Image in 50 with guidance, the text
+encoder Qwen3.5-9B; --image-quant Q4_K_M|Q6_K|Q8_0 (Qwen-Image) or w4a8|int8 (HunyuanImage 3.0), --image-dit-q8
+auto|on|off (Mage-Flow, MOSS-Image) and --image-dit-keep on|off (Mage-Flow), --image-ssd-offload on|off,
+--image-gpu-policy auto|keep|shrink|unload).
 
 Setup recommends, it never forces: the recommended answers are the defaults (--yes, or Enter), and a bigger choice
 than it recommends - a longer context, a size it thinks will not fit - is kept, with what it risks.  With --yes, an
@@ -4000,7 +4001,17 @@ def text_ram_gb(args: list, ram: float, model: str | None = None) -> float:
     return gb
 
 
-def image_plan(a, choice: str, text_gb: float | None, size: str | None = None) -> dict:
+def shared_text_quant(QI, dit: str, enc: str, chat_gguf: Path | None) -> str | None:
+    """The size of an image model's text encoder that is the chat model's own file (`chat_gguf`, its GGUF; MOSS-Image's
+    Qwen3.5-9B beside a Qwen3.5-9B chat model of the same maker and size), else None: that file is shared (linked, not
+    fetched again; serve's text_states has the chat engine encode the prompts) and its RAM already counted."""
+    if chat_gguf is None or not enc:
+        return None
+    return next((q for q in QI.text_quants(dit) if QI.FILES[QI.text_file(enc, q)][1] == Path(chat_gguf).name), None)
+
+
+def image_plan(a, choice: str, text_gb: float | None, size: str | None = None,
+               chat_gguf: Path | None = None) -> dict:
     """One --images choice (qimage.IMAGE_MODELS) and the size asked after its name (`size`; else --image-quant's):
     its sizes and files -> {choice, quant, tquant, lowered, names}.
     `text_gb`: the RAM the text model keeps (text_ram_gb): the denoiser's and the text encoder's quants are the largest
@@ -4008,7 +4019,8 @@ def image_plan(a, choice: str, text_gb: float | None, size: str | None = None) -
     asked for with --image-ssd-offload on (what does not fit read from the SSD).  One image model runs at a time, so
     each is fitted to that RAM on its own.  HunyuanImage 3.0 has no text encoder: its two quantizations are lowered
     (int8 to w4a8), and its system prompt is read out of the model's own `system_prompt.py` once the files are there
-    (setup_images)."""
+    (setup_images).  A text encoder the chat model's own file (shared_text_quant, `chat_gguf`) keeps that size: its
+    RAM is the chat model's."""
     QI = _qimage()
     _, dit, enc = QI.IMAGE_MODELS[choice]
     label, steps, _ = QI.DITS[dit]
@@ -4019,7 +4031,7 @@ def image_plan(a, choice: str, text_gb: float | None, size: str | None = None) -
         warn(f"--image-quant {asked}: {label} comes as w4a8 or int8 (Tencent's quantizations); w4a8 taken (int8 is "
              "the nearer the model's bf16 weights, and about twice as slow a step)")
         asked = QI.default_quant(dit)
-    if QI.is_mage(dit):   # Mage-Flow's DiT comes in one size (bf16: the engine's FP16 or 8 bits of it, --image-dit-q8)
+    if QI.engine_quantized(dit):   # Mage-Flow's and MOSS-Image's DiT: one size (bf16: FP16 or 8 bits, --image-dit-q8)
         q8 = QI.mage_q8(size) if size else q8      # :int8 / :bf16 after its name, for this model alone
         if a.image_quant and not size:
             warn(f"--image-quant {a.image_quant}: {label} comes in one size, which the engine quantizes itself "
@@ -4027,6 +4039,9 @@ def image_plan(a, choice: str, text_gb: float | None, size: str | None = None) -
         asked = QI.dit_quants(dit)[-1]
     dit_keep = getattr(a, "image_dit_keep", None) != "off"
     tasked = "" if hunyuan else QI.DEFAULT_TEXT_QUANT       # HunyuanImage 3.0 has no text encoder
+    shared = shared_text_quant(QI, dit, enc, chat_gguf)
+    if shared:
+        tasked = shared
     ssd = getattr(a, "image_ssd_offload", None) == "on"
     quant, tquant = asked, tasked
     lowered = None
@@ -4034,6 +4049,8 @@ def image_plan(a, choice: str, text_gb: float | None, size: str | None = None) -
     was, now = (f" (text encoder {tasked})", f" (text encoder {tquant})") if tasked else ("", "")
     if not ssd and text_gb is not None:
         left = ram_gb() - text_gb
+        if shared:   # the chat model's file: counted in text_gb already, so not twice
+            left += QI.FILES[QI.text_file(enc, shared)][2] / 1e9
         quant, tquant, fits = QI.fit_ram(left, enc, asked, tasked, dit, dit_keep, q8)
         if (quant, tquant) != (asked, tasked):
             # kept in the config: the server says it at start and on the web page (the user's decision, 2026-10-15)
@@ -4057,9 +4074,10 @@ def image_plan(a, choice: str, text_gb: float | None, size: str | None = None) -
         "POST /v1/images/generations)")
     if enc:
         tfile = QI.FILES[QI.text_file(enc, tquant)]
+        base = "Qwen3.5-9B" if QI.is_moss(dit) else f"Qwen3-VL-{'4B' if QI.is_mage(dit) else '8B'}"
         say(f"  Text encoder: {Path(tfile[1]).name} ({tfile[0]}"
-            + (f", Qwen3-VL-{'4B' if QI.is_mage(dit) else '8B'} with its refusal direction removed)"
-               if enc.endswith("uncensored") else ")"))
+            + (f", {base} with its refusal direction removed)" if enc.endswith("uncensored") else ")")
+            + (", the chat model's own file" if shared == tquant else ""))
     else:
         say(f"  Prompt: the model's own tokenizer ({QI.FILES['hunyuanimage3-tokenizer'][1]}) and its system prompt")
     say("  " + QI.license_note(dit))
@@ -4150,12 +4168,33 @@ def write_ratio_head(QI, models_dir: Path) -> None:
     ok(f"{dst.name}: the model's size choice ({len(data) >> 10} KiB out of the bf16 shards)")
 
 
-def setup_images(a, gpu: dict, models_dir: Path, eng: Path,
-                 text_gb: float | None = None) -> tuple[dict, list[dict]] | None:
+def link_identical(dst: Path, sha: str, candidates: list, models_dir: Path) -> None:
+    """`dst` linked to a copy already on the disk with the pinned SHA-256 in its finish mark (`candidates`, then the
+    models folder's files of the same name one folder down: the chat model's GGUF that an image model's text encoder
+    is), not fetched again; nothing when `dst` is there, or no such copy, or the link fails (another drive)."""
+    if dst.exists():
+        return
+    for p in [*candidates, *Path(models_dir).glob("*/" + dst.name)]:
+        if p == dst or not p.exists() or not done(p) or f"sha256 {sha}" not in \
+                p.with_name(p.name + ".done").read_text(encoding="utf-8", errors="replace"):
+            continue
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            os.link(p, dst)
+            mark(dst, f"sha256 {sha}")
+            ok(f"{dst.name} shared with {p.parent.name} (identical file)")
+            return
+        except OSError:
+            continue
+
+
+def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | None = None,
+                 chat_gguf: Path | None = None) -> tuple[dict, list[dict]] | None:
     """--images (one choice of qimage.IMAGE_MODELS, or several, comma-separated): their files for the image engine in
     `eng` -> the run config's "images" section (serve/images.py; the first choice, the default) and its
     "image_models" (the others, which a request names by "model"); None for --images no, or when not wanted after
-    all.  The models' sizes as image_plan fits them to the RAM."""
+    all.  The models' sizes as image_plan fits them to the RAM; `chat_gguf`, the chat model's GGUF, which a text
+    encoder of the same file shares (shared_text_quant)."""
     if not a.images or a.images == "no":
         return None
     remove_old_image_engine()
@@ -4163,7 +4202,7 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path,
     exe = eng / IMAGE_EXE
     if not exe.exists():
         fail(f"the image engine is missing ({exe})", "run setup again to compile the engine (it builds both)")
-    plans = [image_plan(a, choice, text_gb, size) for choice, size in QI.parse_choices(a.images)]
+    plans = [image_plan(a, choice, text_gb, size, chat_gguf) for choice, size in QI.parse_choices(a.images)]
     names = list(dict.fromkeys(n for p in plans for n in p["names"]))   # the files the models share, once
     need = sum(QI.FILES[k][2] for k in names) / 1e9
     what = "the image model" if len(plans) == 1 else f"the {len(plans)} image models"
@@ -4175,6 +4214,7 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path,
     for name in names:
         repo, path, size, sha = QI.FILES[name]
         dst = QI.local_path(models_dir, name)
+        link_identical(dst, sha, [Path(chat_gguf)] if chat_gguf else [], models_dir)
         download(QI.file_url(name, hf_endpoint()), dst, f"image model: {Path(path).name}")
         verify_sha256(dst, size, sha)
     if "hunyuanimage3-system-prompt" in names:   # the system prompt, out of the model's own file (parsed, never run)
@@ -6115,6 +6155,16 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
                              "gpu_pci": gpu["pci"], "max_tokens": vt, "fallback": cpu_enc}
     elif a.vision_tokens is not None:
         warn("--vision-tokens: images are off for this model, so it is not used")
+    if a.images is None and not a.yes and not JSON_OUT:   # as for Qwen3.8-Flash-Next: asked only interactively
+        a.images = ask_images(CONF / f"xestrata-{tag.lower()}.json")
+    if a.images:   # only when given: else an earlier "images" is carried over
+        # the RAM the chat model keeps, as --describe estimates it (a dense model's DENSE_RAM_GB, the others' file and
+        # 8 GB); an image model's text encoder of the same file shares it (shared_text_quant)
+        text_gb = DENSE_RAM_GB if dense else d["size"] / 1e9 + 8
+        got = setup_images(a, gpu, Path(a.models_dir), eng, text_gb, gguf)
+        cfg["images"], cfg["image_models"] = got if got is not None else (None, None)
+        if not cfg["image_models"]:
+            cfg["image_models"] = None
     return finish_setup(a, cfg, tag, port, adopted, vision != "none", tune=False)
 
 
@@ -6236,13 +6286,13 @@ def describe() -> dict:
         images.append({"id": choice, "title": QI.DITS[dit][0], "about": QI.ABOUT.get(choice, ""),
                        "download_gb": round(sum(QI.FILES[n][2] for n in names) / 1e9, 1),
                        "ram_gb": round(QI.ram_need_gb(QI.default_quant(dit), enc, QI.DEFAULT_TEXT_QUANT, dit), 1),
-                       "edits": dit in QI.MF_EDIT or not QI.is_mage(dit),
+                       "edits": dit in QI.MF_EDIT or not QI.engine_quantized(dit),
                        "license": QI.license_note(dit),
                        "uncensored": choice + "-uncensored" in QI.IMAGE_MODELS,
                        # the sizes one can ask for after its name (--images qwen-image-turbo:Q6_K, magetrail:int8,
                        # hunyuan-image-3-distil:int8), largest first; Mage-Flow's: 8 bits always (int8) or 16 (bf16),
                        # not the file's
-                       "quants": list(QI.size_choices(dit)) if QI.is_mage(dit)
+                       "quants": list(QI.size_choices(dit)) if QI.engine_quantized(dit)
                        else list(reversed(QI.size_choices(dit)))})
     by_name = {v[0]: k for k, v in QI.IMAGE_MODELS.items()}   # a config's model_name -> its --images choice
     installed = []
@@ -6298,7 +6348,7 @@ def main() -> int:
                          "the CPU): more reads small text and charts better, and takes longer to encode; remembered "
                          "for this model")
     ap.add_argument("--images", metavar="qwen-image-turbo|qwen-image-base|mage-flow-turbo|mage-flow|"
-                    "mage-flow-base|magetrail[-uncensored]|hunyuan-image-3-distil|no",
+                    "mage-flow-base|magetrail|moss-image|moss-image-base[-uncensored]|hunyuan-image-3-distil|no",
                     help="image generation (POST /v1/images/generations) on XeStrata's image engine: "
                          "qwen-image-turbo (Qwen-Image-2.1-Turbo, 8 steps) or qwen-image-base (its base model "
                          "Qwen-Image-2.1, 40 steps by default, about 5 times as long an image); the text encoder "
@@ -6309,7 +6359,11 @@ def main() -> int:
                          "tuned on Danbooru and e621 images, 30 steps, guidance 5; no edits), the text encoder "
                          "Unsloth's Qwen3-VL-4B or, -uncensored, huihui-ai's abliterated one; hunyuan-image-3-distil "
                          "(HunyuanImage 3.0 Instruct-Distil, 8 steps, guidance 2.5, about 50 GB of RAM), which reads "
-                         "its own prompt with the model's tokenizer and system prompt (no text encoder); several, "
+                         "its own prompt with the model's tokenizer and system prompt (no text encoder); moss-image "
+                         "(MOSS-Image, 50 steps, guidance 3; text and a layout of boxes in the prompt) or "
+                         "moss-image-base (its base model), the text encoder Qwen3.5-9B (Unsloth's or, -uncensored, "
+                         "HauhauCS's; Q8_0, lowered first (Q6_K, Q4_K_M), or the chat model's own file when that is "
+                         "Qwen3.5-9B of the same maker); several, "
                          "comma-separated (qwen-image-turbo,magetrail): the first the default, the others named by a "
                          "request's \"model\" (one on the GPU at a time); no = take it out of the config")
     ap.add_argument("--image-quant", choices=["Q4_K_M", "Q6_K", "Q8_0", "w4a8", "int8"],
@@ -6317,8 +6371,9 @@ def main() -> int:
                          "would not fit the RAM the text model leaves, after its text encoder; the GPU's memory does "
                          "not decide it)")
     ap.add_argument("--image-dit-q8", choices=["auto", "on", "off"],
-                    help="Mage-Flow: auto (default) keeps its image model in VRAM as 16-bit when it fits there "
-                         "with the text encoder (nearer the reference) and quantizes it to 8 bits when it does not "
+                    help="Mage-Flow, MOSS-Image: auto (default) keeps its image model in VRAM as 16-bit when it "
+                         "fits there with the text encoder (nearer the reference) and quantizes it to 8 bits when it "
+                         "does not "
                          "(half the VRAM and the bytes streamed; int8 products where the GPU's math library has "
                          "them, else Q8_0); on always 8 bits, off always 16-bit")
     ap.add_argument("--image-dit-keep", choices=["on", "off"],
