@@ -5985,3 +5985,10 @@ class ImageEditForm(unittest.TestCase):
         self.assertIs(fields["stream"], True)
         self.assertEqual(fields["partial_images"], 2)
         self.assertIs(self.form(stream=False)["stream"], False)
+
+    def test_vllm_omni_numbers(self):
+        # vLLM-Omni's fields (extra_body in the SDK) come as numbers, as in a JSON request
+        fields = self.form(extra_body={"num_inference_steps": 4, "guidance_scale": 2.5, "true_cfg_scale": 2.5})
+        self.assertEqual((fields["num_inference_steps"], fields["guidance_scale"], fields["true_cfg_scale"]),
+                         (4, 2.5, 2.5))
+        self.assertIsInstance(fields["guidance_scale"], float)

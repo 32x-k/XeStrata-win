@@ -6146,8 +6146,9 @@ def body_limit() -> int:
 
 def parse_multipart(ctype: str, body: bytes) -> tuple[dict, list[bytes]]:
     """A multipart/form-data body (OpenAI's /v1/images/edits) -> (its text fields, the bytes of its image or image[]
-    files in order); whole numbers in the fields (n, seed, steps, output_compression, partial_images) as ints, stream's
-    true or false (as OpenAI's SDK writes a boolean in a form) as a bool, the mask file's bytes as "mask"."""
+    files in order); the numbers the JSON request takes as numbers (n, seed, steps, num_inference_steps,
+    output_compression, partial_images whole; vLLM-Omni's guidance_scale and true_cfg_scale) as numbers, stream's true
+    or false (as OpenAI's SDK writes a boolean in a form) as a bool, the mask file's bytes as "mask"."""
     from email.parser import BytesParser
     from email.policy import HTTP
     msg = BytesParser(policy=HTTP).parsebytes(b"Content-Type: " + ctype.encode("latin-1") + b"\r\n\r\n" + body)
@@ -6165,9 +6166,15 @@ def parse_multipart(ctype: str, body: bytes) -> tuple[dict, list[bytes]]:
             fields["mask"] = data
         elif isinstance(name, str) and name:
             value = data.decode("utf-8", "replace")
-            whole = name in ("n", "seed", "steps", "output_compression", "partial_images") and value.strip().isdigit()
+            whole = name in ("n", "seed", "steps", "num_inference_steps", "output_compression", "partial_images") \
+                and value.strip().isdigit()
             if name == "stream" and value.strip().lower() in ("true", "false"):
                 fields[name] = value.strip().lower() == "true"
+            elif name in ("guidance_scale", "true_cfg_scale"):
+                try:
+                    fields[name] = float(value)          # out of range or not finite: the request's own 400
+                except ValueError:
+                    fields[name] = value
             else:
                 fields[name] = int(value) if whole else value
     return fields, files
