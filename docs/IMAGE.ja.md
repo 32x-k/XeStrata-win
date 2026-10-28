@@ -197,6 +197,7 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
 | `slg_layers`、`slg_scale` | なし、0 | skip-layer guidance。そのブロックを飛ばしたプロンプトをもう 1 回計算し、差の `slg_scale` 倍を足します（1 ステップが 3 回分になります）。`slg_scale` が 0 か、ブロックがなければ掛けません |
 | `slg_start`、`slg_stop` | 0、1 | 上の 2 つのブロックを飛ばすステップの範囲（全体のステップに対する割合） |
 | `layout` | なし | 配置（下の「MOSS-Image の配置」） |
+| `enhance` | なし（オフ） | プロンプトをチャットのモデルで書き広げてから作ります。`true`（モデルが文章か配置かを選ぶ）、`"caption"`、`"layout"`。`layout` とは一緒に使えません |
 
 #### MOSS-Image の配置
 
@@ -213,6 +214,11 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
 - `items`: 1 つ以上。`label` は `object`、`character`、`text`、`caption` は見た目、文字の項目は `text` に書く文字をそのまま（改行は `\n`）、`bbox` は枠。`tags` と `palette` も受けます。ほかの項目は断ります。
 - 枠は画像の中に収めます。`width` と `height` を付けるときは `size` と同じにします。
 - サーバーは、枠を画像の真ん中からの `[y_min, x_min, y_max, x_max]` に直して（端は外側の整数のピクセルへ）、公式の形の JSON にしてモデルに読ませます。応答の `revised_prompt` がその JSON です。
+
+#### プロンプトの書き広げ（`enhance`）
+
+`enhance` を付けると、まずチャットのモデル（読み込んでいる文章のモデル）が、プロンプトを MOSS-Image 向けの詳しい説明か配置に書き広げ、それで画像を作ります。書き広げ方は、MOSS-Image の公式のプロンプトの書き手（skills/moss-image-prompt-enhancer）にならっています。
+応答の `revised_prompt` がモデルの読んだプロンプトで、`strata.enhance` に、作ったもの（`made`: `caption` か `layout`、配置ならその下書き）とかかった秒数が入ります。書き広げに失敗したとき（読めない答え、チャットのモデルがない）は、元のプロンプトのまま作り、`strata.enhance.error` に理由を書きます。
 
 ### 画像を直す（`POST /v1/images/edits`）
 
@@ -237,13 +243,14 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
 
 - `data[]`: 画像（`b64_json` か `url`）と、`revised_prompt`、`seed`。
 - `usage`: 画像のエンジンのトークンで数えます（プロンプトのトークンと、参照画像と作った画像の 16x16 ピクセルで 1 つのトークン）。HunyuanImage 3.0 では、プロンプトの ids と、作った画像の 16x16 画素ごとの 1 個で、参照画像は VAE のトークンと SigLIP2 の 1,024 スロットを数えます。
-- `strata`: かかった秒数、ステップ数（strength で回した数）、`strength`（1 未満のとき）、img2img か（`img2img`）とマスクを使ったか（`mask`）、配置を使ったか（`layout`）、CFG の強さ、文の読み手・サンプリング・VAE のそれぞれの時間、文章のモデルの扱い（`gpu_policy`）。HunyuanImage 3.0 では、ガイダンスの強さ（`guidance`）、バケットの番号（`ratio`）、頼んだ大きさが別のときはそれ（`requested_size`）、モデルが大きさを選んだときはそれにかかった秒数（`size_choice_s`）も。
+- `strata`: かかった秒数、ステップ数（strength で回した数）、`strength`（1 未満のとき）、img2img か（`img2img`）とマスクを使ったか（`mask`）、配置を使ったか（`layout`）、書き広げの結果（`enhance`）、CFG の強さ、文の読み手・サンプリング・VAE のそれぞれの時間、文章のモデルの扱い（`gpu_policy`）。HunyuanImage 3.0 では、ガイダンスの強さ（`guidance`）、バケットの番号（`ratio`）、頼んだ大きさが別のときはそれ（`requested_size`）、モデルが大きさを選んだときはそれにかかった秒数（`size_choice_s`）も。
 - 画像のモデルは `/v1/models` にも出ます。
 
 ### チャットから
 
 - `/v1/chat/completions` に `"strata_images": true` を付けると（Web のページは付けます）、モデルに `generate_image` と `edit_image` の道具を渡し、モデルが呼ぶとサーバーが画像を作ってその場に出します。
   `edit_image` は、会話の最後の画像（添付したものか、会話で作ったもの）を直します。`strength` も受け、編集のないモデルでは img2img になります。1 回の要求で道具を呼べるのは 4 回までです。
+- MOSS-Image では、`generate_image` に配置（`layout`、API と同じ形）も渡し、チャットのモデルが枠の下書きを書けます。
 - `/v1/responses` では、OpenAI の組み込みの `image_generation` の道具を付けると同じことをし、作った画像を `image_generation_call` の項目（`result` に画像の base64、`size`・`quality`・`background`・`output_format`・`revised_prompt` も）で返します。
   道具の `size`・`quality`・`output_format`・`output_compression`・`background` は、その道具で作る画像に使います（`size` が `auto` ならモデルの指定した大きさ）。
 

@@ -197,6 +197,7 @@ MOSS-Image also takes these fields, by its official pipeline's names (the other 
 | `slg_layers`, `slg_scale` | none, 0 | Skip-layer guidance: the prompt computed once more with those blocks skipped, `slg_scale` times the difference added (a step then takes three passes). None when `slg_scale` is 0 or there are no blocks |
 | `slg_start`, `slg_stop` | 0, 1 | The steps where the two skips above act (shares of all the steps) |
 | `layout` | none | A layout (MOSS-Image's layout, below) |
+| `enhance` | none (off) | The prompt written out by the chat's model first: `true` (the model chooses a caption or a layout), `"caption"` or `"layout"`. Not with `layout` |
 
 #### MOSS-Image's layout
 
@@ -213,6 +214,11 @@ With `layout`, a JSON of boxes that place things and text, the image is made fro
 - `items`: one or more. `label` is `object`, `character` or `text`; `caption` its look; a text item's `text` the exact words (`\n` for a line break); `bbox` its box. `tags` and `palette` are taken too; other fields are refused.
 - The boxes stay inside the image. `width` and `height`, when given, must be the `size`'s.
 - The server turns each box into `[y_min, x_min, y_max, x_max]` from the image's middle (its edges outward to whole pixels) and gives the model the JSON in its official form; the answer's `revised_prompt` is that JSON.
+
+#### Writing the prompt out (`enhance`)
+
+With `enhance`, the chat's model (the text model loaded) first writes the prompt out into a detailed description or a layout for MOSS-Image, and the image is made from that. It writes it the way MOSS-Image's official prompt writer (skills/moss-image-prompt-enhancer) does.
+The answer's `revised_prompt` is the prompt the model read, and `strata.enhance` says what was made (`made`: `caption` or `layout`, with the layout's draft) and the seconds it took. When it fails (an answer that cannot be read, no chat model), the image is made from the prompt as it was, and `strata.enhance.error` says why.
 
 ### Changing an image (`POST /v1/images/edits`)
 
@@ -237,13 +243,14 @@ A model without edits (MageTrail, Mage-Flow without its edit model, MOSS-Image) 
 
 - `data[]`: the images (`b64_json` or `url`), with `revised_prompt` and `seed`.
 - `usage`: counted in the image engine's tokens (the prompt's tokens, and one token for each 16x16 pixels of the reference images and the image made). For HunyuanImage 3.0: the prompt's ids, one for each 16x16 pixels of the image made, and a reference image's VAE tokens and 1,024 SigLIP2 slots.
-- `strata`: the seconds taken, the steps (those a strength ran), `strength` (when below 1), whether it was img2img (`img2img`) and took a mask (`mask`), whether it took a layout (`layout`), CFG's strength, the text encoder's, the sampling's and the VAE's times, and what happened to the text model (`gpu_policy`). For HunyuanImage 3.0 it also has the guidance's strength (`guidance`), the bucket's number (`ratio`), when the size asked for was another, that size (`requested_size`), and when the model chose the size, the seconds the choice took (`size_choice_s`).
+- `strata`: the seconds taken, the steps (those a strength ran), `strength` (when below 1), whether it was img2img (`img2img`) and took a mask (`mask`), whether it took a layout (`layout`), what the prompt's writing out made (`enhance`), CFG's strength, the text encoder's, the sampling's and the VAE's times, and what happened to the text model (`gpu_policy`). For HunyuanImage 3.0 it also has the guidance's strength (`guidance`), the bucket's number (`ratio`), when the size asked for was another, that size (`requested_size`), and when the model chose the size, the seconds the choice took (`size_choice_s`).
 - The image model is listed in `/v1/models` too.
 
 ### From the chat
 
 - `/v1/chat/completions` with `"strata_images": true` (the web page sends it) gives the model the `generate_image` and `edit_image` tools; when the model calls one, the server makes the image and shows it there.
   `edit_image` changes the conversation's last image (one attached or one made in the conversation); it takes a `strength` too, and is img2img with a model without edits. One request calls the tools up to 4 times.
+- With MOSS-Image, `generate_image` takes a layout too (`layout`, as the API's), so the chat's model can draft its boxes.
 - `/v1/responses` does the same with OpenAI's built-in `image_generation` tool, and returns the image in an `image_generation_call` item (`result`, the image in base64, with `size`, `quality`, `background`, `output_format` and `revised_prompt`).
   The tool's `size`, `quality`, `output_format`, `output_compression` and `background` are used for the images it makes (`size` `auto`: the size the model asks for).
 
