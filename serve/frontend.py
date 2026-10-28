@@ -30,6 +30,7 @@ import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import unquote
 
 import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
@@ -1284,51 +1285,101 @@ def json_tool_call(body: str, schemas: dict) -> ToolCall | None:
 
 
 def _json_type(value) -> str:
-    return ("null" if value is None else "boolean" if isinstance(value, bool) else "integer" if isinstance(value, int)
+    # JSON Schema treats 1.0 as an integer too; Python's representation must not turn a valid enum number into text.
+    return ("null" if value is None else "boolean" if isinstance(value, bool)
+            else "integer" if isinstance(value, int) or isinstance(value, float) and value.is_integer()
             else "number" if isinstance(value, float) else "string" if isinstance(value, str)
             else "array" if isinstance(value, list) else "object")
 
 
-def _schema_types(schema, depth: int = 0) -> set | None:
-    """The JSON types a parameter's schema allows: its type (a name or a list), its anyOf / oneOf branches', or its
-    enum / const values' types; None when it does not say (no type, a $ref, a boolean schema, a branch that allows
-    anything)."""
+def _schema_hints(schema, root=None, depth: int = 0, refs: tuple = ()) -> tuple:
+    """Upper bounds on JSON types and on string enum/const values, not validation. None means unconstrained or
+    unknown; an empty set means impossible. Siblings (including $ref) intersect; anyOf/oneOf branches union.
+    Only same-resource JSON pointers are followed, from the supplied parameters root, never from a property.
+    Anchors, remote refs, nested resource IDs and cycles are unknown; strict validation remains the final check."""
+    if schema is False:
+        return set(), set()
     if not isinstance(schema, dict) or depth > 8:
-        return None
+        return None, None
+    if "$id" in schema and schema is not root:
+        root = None                         # a nested resource changes the base of its references
+
+    def intersect(a, b):
+        return b if a is None else a if b is None else a & b
+
+    def merge(a, b):
+        return intersect(a[0], b[0]), intersect(a[1], b[1])
+
+    def types_of(values):
+        kinds = set(values)
+        if "number" in kinds:
+            kinds.add("integer")            # JSON Schema's number includes integer
+        return kinds
+
     t = schema.get("type")
-    types = {t} if isinstance(t, str) else {x for x in t if isinstance(x, str)} if isinstance(t, list) else set()
-    for key in ("anyOf", "oneOf"):
+    types = types_of([t]) if isinstance(t, str) else types_of(t) if isinstance(t, list) and \
+        all(isinstance(x, str) for x in t) else None
+    hint = types, None
+    for key in ("enum", "const"):
+        values = schema.get(key) if key == "enum" else [schema[key]] if key in schema else None
+        if isinstance(values, list):
+            hint = merge(hint, (types_of(_json_type(v) for v in values),
+                                {v for v in values if isinstance(v, str)}))
+    ref = schema.get("$ref")
+    if isinstance(ref, str) and root is not None and ref not in refs and (ref == "#" or ref.startswith("#/")):
+        target = root
+        for part in unquote(ref[2:]).split("/") if ref != "#" else ():
+            part = part.replace("~1", "/").replace("~0", "~")
+            if isinstance(target, dict) and (target is root or not isinstance(target.get("$id"), str)):
+                target = target.get(part)
+            elif isinstance(target, list) and len(part) <= len(str(len(target))) and part.isdecimal() and \
+                    str(int(part)) == part and int(part) < len(target):
+                target = target[int(part)]
+            else:
+                target = None
+                break
+        hint = merge(hint, _schema_hints(target, root, depth + 1, refs + (ref,)))
+    for key in ("allOf", "anyOf", "oneOf"):
         branches = schema.get(key)
-        for b in branches if isinstance(branches, list) else ():
-            more = _schema_types(b, depth + 1)
-            if more is None:
-                return None
-            types |= more
-    values = schema.get("enum") if isinstance(schema.get("enum"), list) else \
-        [schema["const"]] if "const" in schema else None
-    if values and not types:
-        types = {_json_type(v) for v in values}
-    return types or None
+        if not isinstance(branches, list):
+            continue
+        combined: tuple = (None, None) if key == "allOf" else (set(), set())
+        for branch in branches:
+            more = _schema_hints(branch, root, depth + 1, refs)
+            if key == "allOf":
+                combined = merge(combined, more)
+            else:
+                combined = tuple(None if a is None or b is None else a | b for a, b in zip(combined, more))
+        hint = merge(hint, combined)
+    return hint
 
 
-def _text_only(schema) -> bool:
-    """A parameter whose value is always a string: what the model writes is the value, as it is."""
-    return _schema_types(schema) == {"string"}
+def _schema_types(schema, depth: int = 0, *, root=None) -> set | None:
+    """A conservative type bound; unknown branches cannot erase a sibling's explicit type constraint."""
+    return _schema_hints(schema, root, depth)[0]
 
 
-def param_value(text: str, schema):
-    """A call's parameter as the model wrote it -> its value by the parameter's schema: a string-only parameter is the
-    text as it is; otherwise the text read as JSON, unless that gives a type the schema does not allow while it allows
-    a string (["string", "null"]'s "1" stays "1"); text that is not JSON stays text."""
-    types = _schema_types(schema)
-    if types == {"string"}:
+def _text_only(schema, root=None) -> bool:
+    """Raw string text can stream immediately only when no enum/const may disambiguate JSON quoting."""
+    types, strings = _schema_hints(schema, root)
+    return types == {"string"} and strings is None
+
+
+def param_value(text: str, schema, root=None):
+    """Restore parameter types, not validity. Plain string schemas keep raw text. An enum/const permits removing
+    JSON string quotes only when the raw text is excluded and the decoded string is a candidate; ambiguity keeps
+    the original. Nullable strings still decode null, but keep e.g. 1 as text when numbers are not allowed."""
+    types, strings = _schema_hints(schema, root)
+    if types == {"string"} and (strings is None or text in strings):
         return text
     try:
         value = json.loads(text)
     except ValueError:
         return text
     kind = _json_type(value)
-    if types is not None and "string" in types and kind not in types and not (kind == "integer" and "number" in types):
+    if kind == "string" and strings is not None and (text in strings or value not in strings):
+        return text
+    if types is not None and "string" in types and kind not in types:
         return text
     return value
 
@@ -1350,6 +1401,7 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
     name = body[len("<function="):body.index(">")].strip()      # `<function= capture>`: the model's stray space
     rest = body[body.index(">") + 1:]
     props = _properties(schema)
+    root = schema.get("parameters") if isinstance(schema, dict) else None
     args = {}
     while "<parameter=" in rest:
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
@@ -1362,7 +1414,7 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
             value = value[1:]
         if value.endswith("\n"):
             value = value[:-1]
-        args[pname] = param_value(value, props.get(pname))
+        args[pname] = param_value(value, props.get(pname), root)
     return ToolCall(name=name, arguments=args)
 
 
@@ -1715,6 +1767,7 @@ class OutputParser:
         self.sfirst = True
         self.sval_started = False
         self.sprops = {}             # the streamed call's parameters' schemas
+        self.sroot = None            # their reference resolution root (the full parameters schema)
         self.spname = ""             # the parameter being streamed
 
     def _wrapped_call_end(self) -> int:
@@ -1751,7 +1804,9 @@ class OutputParser:
                 if raw_name != raw_name.strip() and name not in self.schemas:
                     return out
                 self.scall = ToolCall(name=name, arguments={})
-                self.sprops = _properties(self.schemas.get(name))
+                tool = self.schemas.get(name)
+                self.sprops = _properties(tool)
+                self.sroot = tool.get("parameters") if isinstance(tool, dict) else None
                 out.append(Event("tool_start", call=self.scall))
                 args("{")
                 self.sp += b + 1
@@ -1767,7 +1822,7 @@ class OutputParser:
                     args(("" if self.sfirst else ",") + json.dumps(pname) + ":")
                     self.sfirst = False
                     self.sp += b + 1
-                    if _text_only(self.sprops.get(pname)):
+                    if _text_only(self.sprops.get(pname), self.sroot):
                         args('"')
                         self.ss, self.sval_started = "str", False
                     else:
@@ -1811,7 +1866,7 @@ class OutputParser:
                     value = value[1:]
                 if value.endswith("\n"):
                     value = value[:-1]
-                args(json.dumps(param_value(value, self.sprops.get(self.spname)), ensure_ascii=False))
+                args(json.dumps(param_value(value, self.sprops.get(self.spname), self.sroot), ensure_ascii=False))
                 self.sp += end + len(PARAM_END)
                 self.ss = "between"
             else:
