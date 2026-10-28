@@ -7468,10 +7468,11 @@ def make_handler(svc: Service):
                                           int(req.get("max_output_tokens") or 0), req, cancel,
                                           set(image_tools.routes()), force=force)
                 else:
-                    # a call counts only for a tool the request declared (tool_choice none: none), as on the
-                    # other routes - but for a Codex compaction, whose calls come back as they did
+                    # Compaction may replay undeclared calls, but an explicit none still forbids calls, just as
+                    # it does on the other routes.  Do not promote a quoted call to an executable output item.
                     source = svc.run(ids, thinking, tools, max_new, req, cancel, force=force,
-                                     declared_only=not responses_api.codex_compaction(req))
+                                     declared_only=not responses_api.codex_compaction(req)
+                                     or tool_choice_of(req.get("tool_choice"))[0] == "none")
                 for kind, x in source:
                     if kind == "ping":
                         yield None

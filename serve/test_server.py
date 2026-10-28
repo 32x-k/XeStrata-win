@@ -1886,10 +1886,24 @@ class NamedToolChoice(unittest.TestCase):
         turn = {"request_kind": "compaction", "session_id": "s", "thread_id": "t"}
         meta = {"x-codex-turn-metadata": json.dumps(turn)}
         for name, body, want in (("none", {"tools": [tool], "tool_choice": "none"}, 0), ("no tools", {}, 0),
-                                 ("compaction", {"client_metadata": meta}, 1)):
-            with self.subTest(name):
-                out = json.loads(self.run_api(script, "/v1/responses", {"model": "m", "input": "go", **body}))
-                self.assertEqual(len([o for o in out["output"] if o["type"] == "function_call"]), want)
+                                 ("compaction", {"client_metadata": meta}, 1),
+                                 ("compaction none", {"client_metadata": meta, "tool_choice": "none"}, 0),
+                                 ("compaction none with tools", {"client_metadata": meta, "tools": [tool],
+                                                                 "tool_choice": "none"}, 0)):
+            for stream in (False, True):
+                with self.subTest(name=name, stream=stream):
+                    text = self.run_api(script, "/v1/responses",
+                                        {"model": "m", "input": "go", "stream": stream, **body})
+                    if stream:
+                        events = [json.loads(line[5:]) for line in text.splitlines() if line.startswith("data:")]
+                        self.assertEqual(events[-1]["type"], "response.completed")
+                        out = events[-1]["response"]
+                        if not want:
+                            self.assertFalse(any(e["type"].startswith("response.function_call_arguments.")
+                                                 for e in events))
+                    else:
+                        out = json.loads(text)
+                    self.assertEqual(len([o for o in out["output"] if o["type"] == "function_call"]), want)
 
 
 class ToolArguments(unittest.TestCase):
