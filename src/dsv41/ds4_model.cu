@@ -122,6 +122,17 @@ inline cudaError_t emb_upload(void* dst, const void* src, size_t n, cudaStream_t
 
 size_t align256(size_t n) { return (n + 255) & ~(size_t) 255; }
 
+// A run of chunks' device-side waits for another group (xfer_get, wait_flags: flag >= seq) are queued only once the
+// host sees the flag up, so the kernel finds it up and never spins.  A wait kernel spinning on a device while its
+// thread goes on queueing the layer stalled that thread's first cuBLAS call behind it, and with it the other
+// devices' (two H100s, the IQ2_XS pack on a layer split: both threads stopped in cublasSgemm, hc_mix_chunk).
+void host_wait_at_least(const unsigned* flag, unsigned seq) {
+    for (int spin = 0; (int) (*(volatile const unsigned*) flag - seq) < 0; ++spin) {
+        if (spin < 1000) std::this_thread::yield();
+        else std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
+}
+
 // part p of np of `whole` (a multiple of 128) in 128-blocks, as even as they go (whole / 128 % np parts a block more:
 // those from part rot on, cyclically - so a group's layers, each its own rot, even out what each member holds):
 // tensor parallel's columns of an FFN or of the head - an even split is what whole / np gave before
@@ -8007,7 +8018,10 @@ struct Model::Impl {
                 if (mi == 0 && sr.remote) {   // the new rows for the other groups' readers (slot k % 2, once
                     const int slot = wp.k % 2;  // they took the chunk before last's)
                     if (wp.k >= 2)
-                        for (int r : sr.readers) wait_flags(sr.x_ack + ((size_t) slot * devs.size() + r) * 32, 1, 32, wp.win - 2, s);
+                        for (int r : sr.readers) {
+                            host_wait_at_least(sr.x_ack + ((size_t) slot * devs.size() + r) * 32, wp.win - 2);
+                            wait_flags(sr.x_ack + ((size_t) slot * devs.size() + r) * 32, 1, 32, wp.win - 2, s);
+                        }
                     Xfer x;
                     x.src[0] = fc.pdst;
                     x.dst[0] = sr.stage(slot);
@@ -8546,6 +8560,7 @@ struct Model::Impl {
                         init_pre(c.pre, T, s);
                     } else {
                         Chunk& a = *chunks[(size_t) L[(size_t) il - 1].dev];
+                        host_wait_at_least(a.hand_flag[slot], wp.win);
                         xfer_get(chunk_xfer(a.hand[slot], c, T, false), a.hand_flag[slot], wp.win, s);
                         set_flag(a.hand_ack + ((size_t) slot * 8 + mi) * 32, wp.win, s);
                     }
@@ -8568,7 +8583,10 @@ struct Model::Impl {
                         x.dst[x.n] = sr.ik[(size_t) di] + (size_t) g_first * ik_rb();
                         x.bytes[x.n++] = (size_t) ng * ik_rb();
                     }
-                    if (x.n > 0) xfer_get(x, sr.flag(slot), wp.win, s);
+                    if (x.n > 0) {
+                        host_wait_at_least(sr.flag(slot), wp.win);
+                        xfer_get(x, sr.flag(slot), wp.win, s);
+                    }
                     set_flag(sr.x_ack + ((size_t) slot * devs.size() + di) * 32, wp.win, s);   // (taken, or none)
                 }
                 if (last_k && mi == 0 && g.n_mtp > 0) {   // the drafter's taps: the last chunk's last rows
@@ -8587,7 +8605,11 @@ struct Model::Impl {
                 const bool last = il + 1 == g.nl || L[(size_t) il + 1].grp != L0.grp;
                 if (last && mi == 0 && il + 1 < g.nl) {   // the hand-off, once the next group took the chunk before last
                     const int nnext = L[(size_t) il + 1].nm;
-                    if (k >= 2) wait_flags(c.hand_ack + (size_t) slot * 8 * 32, nnext, 32, wp.win - 2, s);
+                    if (k >= 2) {
+                        for (int m = 0; m < nnext; ++m)
+                            host_wait_at_least(c.hand_ack + ((size_t) slot * 8 + m) * 32, wp.win - 2);
+                        wait_flags(c.hand_ack + (size_t) slot * 8 * 32, nnext, 32, wp.win - 2, s);
+                    }
                     xfer_put(chunk_xfer(c.hand[slot], c, T, true), c.hand_flag[slot], wp.win, d.xcnt, s);
                 }
             }
