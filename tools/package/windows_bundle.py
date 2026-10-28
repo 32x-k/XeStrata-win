@@ -95,6 +95,13 @@ COMPONENTS = [
     ("Outfit (the web app's font)", "outfit", "OFL-1.1", "https://github.com/Outfitio/Outfit-Fonts",
      ["src:third_party/main/outfit/OFL.txt"], []),
     ("KaTeX (the web chat's math)", "0.19.0", "MIT", "https://katex.org/", ["src:third_party/main/katex/LICENSE"], []),
+    ("XGrammar (compiled into the engine: grammar-constrained decoding)", "0.2.8", "Apache-2.0",
+     "https://github.com/mlc-ai/xgrammar",
+     ["src:third_party/main/xgrammar/LICENSE", "src:third_party/main/xgrammar/NOTICE"], []),
+    ("picojson (in XGrammar, compiled into the engine)", "XGrammar 0.2.8's copy", "BSD-2-Clause",
+     "https://github.com/kazuho/picojson", ["src:third_party/main/picojson/LICENSE"], []),
+    ("DLPack (a header XGrammar reads)", "bbd2f4d", "Apache-2.0", "https://github.com/dmlc/dlpack",
+     ["src:third_party/main/dlpack/LICENSE"], []),
     ("AOTriton (its library and kernels' images)", "0.14.2b", "MIT; the images can carry parts of aiter (MIT), "
      "FlyDSL's kernels (Apache-2.0) and Triton (MIT)", "https://github.com/ROCm/aotriton",
      ["src:third_party/main/aotriton/LICENSE", "src:third_party/main/aotriton/LICENSE.aiter",

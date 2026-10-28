@@ -422,9 +422,40 @@ if(STRATA_ENABLE_XE)
                                    src/core/plain_model.cpp src/core/plain_glm5.cpp src/core/pcie_split.cpp
                                    src/core/mtp.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
                                    src/core/conversation_memory.cpp src/core/conversation_disk.cpp
-                                   src/core/conversation_file.cpp src/core/vmm.cpp src/core/draft_head.cpp)
+                                   src/core/conversation_file.cpp src/core/vmm.cpp src/core/draft_head.cpp
+                                   src/core/grammar.cpp)
   target_include_directories(strata_engine PUBLIC include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu)
+  # grammar-constrained decoding (src/core/grammar.cpp, --serve's grammar=): xgrammar (Apache-2.0) at a pinned release
+  # and dlpack (Apache-2.0), the one header it reads, both checked by SHA-256.  Built here from xgrammar's C++ sources
+  # alone: its own CMakeLists builds Python bindings and compiles with -flto.  OFF: the engine builds without it and
+  # serve checks a structured reply after it is written, as before.
+  option(STRATA_GRAMMAR "grammar-constrained decoding (xgrammar)" ON)
+  if(STRATA_GRAMMAR)
+    include(FetchContent)
+    FetchContent_Declare(strata_xgrammar
+      URL https://github.com/mlc-ai/xgrammar/archive/refs/tags/v0.2.8.tar.gz
+      URL_HASH SHA256=16c06f7cef8f13ae597b007cce515991725603bded6ebce5f1828e6a9c9685be)
+    FetchContent_Declare(strata_dlpack
+      URL https://github.com/dmlc/dlpack/archive/bbd2f4d32427e548797929af08cfe2a9cbb3cf12.tar.gz
+      URL_HASH SHA256=f5dcb30f8a3d1a41d48b5d5b3fe1631dfce11de76f9e7e5bd22c6dc75a758885)
+    foreach(strata_dep strata_xgrammar strata_dlpack)
+      FetchContent_GetProperties(${strata_dep})
+      if(NOT ${strata_dep}_POPULATED)
+        FetchContent_Populate(${strata_dep})
+      endif()
+    endforeach()
+    file(GLOB_RECURSE _strata_xg_src ${strata_xgrammar_SOURCE_DIR}/cpp/*.cc)
+    list(FILTER _strata_xg_src EXCLUDE REGEX "/cpp/tvm_ffi/")   # its Python bindings
+    add_library(strata_xgrammar STATIC ${_strata_xg_src})
+    target_include_directories(strata_xgrammar SYSTEM PUBLIC ${strata_xgrammar_SOURCE_DIR}/include
+                               ${strata_xgrammar_SOURCE_DIR}/3rdparty/picojson ${strata_dlpack_SOURCE_DIR}/include)
+    target_compile_definitions(strata_xgrammar PUBLIC XGRAMMAR_ENABLE_CPPTRACE=0)
+    set_target_properties(strata_xgrammar PROPERTIES CXX_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
+    target_compile_options(strata_xgrammar PRIVATE -w)   # another project's code: its warnings are not ours
+    target_link_libraries(strata_engine PRIVATE strata_xgrammar)
+    target_compile_definitions(strata_engine PRIVATE STRATA_GRAMMAR=1)
+  endif()
   # c-blosc2 (libblosc2-dev; free, BSD-3), optional: --conversation-save-compress stores the saved conversations'
   # floating-point parts compressed.  Without it the engine builds and runs, and refuses that option.
   find_path(STRATA_BLOSC2_INCLUDE blosc2.h)
