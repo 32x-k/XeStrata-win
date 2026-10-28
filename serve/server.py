@@ -76,8 +76,8 @@ from serve import runconfig  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
 from serve import release_check  # noqa: E402
-from serve.structured import (StructuredOutputError, answer_grammar, constrained_tools,  # noqa: E402
-                              extract_json, prepare_format, tool_grammar, validated_json)
+from serve.structured import (StructuredOutputError, answer_grammar, checked_calls, constrained_tools,  # noqa: E402
+                              extract_json, prepare_format, strict_schemas, tool_grammar, validated_json)
 from serve import responses as responses_api  # noqa: E402
 from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
 from serve import images as images_api  # noqa: E402
@@ -3516,6 +3516,13 @@ class Service:
         req["strata_grammar"] = {**grammar, "vocab": self.tokenizer_dir, "prefix": ""}
         return True
 
+    def check_strict(self, req: dict, tools, strict: set) -> None:
+        """The request's strict tools (`strict`: constrained_tools' names) have their calls checked against their
+        parameters before they are sent (structured.checked_calls, in run), whether or not a grammar wrote them."""
+        schemas = strict_schemas(tools, strict)
+        if schemas:
+            req["strata_strict_tools"] = schemas
+
     def reasoning_budget(self, req) -> int | None:
         """#123: the most tokens this request may think, or None: the request's `reasoning_budget_tokens` (or, as
         llama.cpp reads it, `thinking_budget_tokens`), else the config's.  0 (or less) means no budget, so a request can
@@ -4502,6 +4509,12 @@ class Service:
             declared_only=False) -> Iterator[tuple[str, object]]:
         """Yields ("event", Event) as text arrives, then ("done", {"finish": .., "completion_tokens": ..}).
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
+        strict = (sampling or {}).get("strata_strict_tools")
+        if strict:                     # the strict tools' calls, checked before they are sent (check_strict)
+            rest = {k: v for k, v in sampling.items() if k != "strata_strict_tools"}
+            yield from checked_calls(self.run(ids, thinking, tools, max_new, rest, cancel, force, declared_only),
+                                     strict)
+            return
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
         # apps; the request's own fields win over all of them
         defaults = {**model_card_sampling(self.model_arch, thinking), **self.sampling_defaults, **self.shared}
@@ -7265,8 +7278,10 @@ def make_handler(svc: Service):
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
             form = getattr(svc.template, "call_form", "qwen")
             # the engine writes the answer, or a strict tool's call, under its schema when it can (structured.py)
+            strict, patterns = constrained_tools(req.get("tools"))
             svc.attach_grammar(req, answer_grammar(req.get("response_format"), thinking) if validator is not None
-                               else tool_grammar(tools, *constrained_tools(req.get("tools")), thinking, form))
+                               else tool_grammar(tools, strict, patterns, thinking, form))
+            svc.check_strict(req, tools, strict)
             _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
             run = run_with_mcp(svc, hubs[0] if len(hubs) == 1 else ToolHubs(hubs), messages, tools, kw, ids,
                                thinking, max_new, max_req, req, cancel, {t["name"] for t in extra}) if use_mcp else None
@@ -7589,10 +7604,12 @@ def make_handler(svc: Service):
             if svc.codex_compaction_cache:
                 responses_api.prompt_made(req, shown)
             req = dict(req)
+            strict, patterns = constrained_tools(responses_api.given_tools(req))   # namespaces' and additional_tools'
             svc.attach_grammar(req, answer_grammar(responses_api.text_format(req), thinking)
                                if validator is not None and not tools
-                               else tool_grammar(tools, *constrained_tools(req.get("tools")), thinking,
+                               else tool_grammar(tools, strict, patterns, thinking,
                                                  getattr(svc.template, "call_form", "qwen")))
+            svc.check_strict(req, tools, strict)
             _debug_req("responses", req, messages, tools, max_new, thinking, len(ids))
             asm = responses_api.Assembler(req, svc.model_for(req), len(ids), names,
                                           "reasoning.encrypted_content" in include, validator is not None)
@@ -7635,9 +7652,11 @@ def make_handler(svc: Service):
             cancel = threading.Event()
             self._watch_client(cancel)                       # #430 #431 (#1999: before prepare, which can take long)
             ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, req=req, cancel=cancel)
+            strict, patterns = constrained_tools(req.get("tools"))
             svc.attach_grammar(req, answer_grammar(anthropic_format(req), thinking) if validator is not None
-                               else tool_grammar(tools, *constrained_tools(req.get("tools")), thinking,
+                               else tool_grammar(tools, strict, patterns, thinking,
                                                  getattr(svc.template, "call_form", "qwen")))
+            svc.check_strict(req, tools, strict)
             _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
             if validator is not None:

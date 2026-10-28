@@ -7,9 +7,10 @@ An engine with grammar-constrained decoding (its INFO grammar=1) writes the answ
 (answer_grammar, tool_grammar below); either way the answer is checked before delivery.  Failed generations are
 errors, never silently retried or returned as successful structured output.
 
-`jsonschema` is optional (no new hard dependency of the server): json_object needs only the standard library, and
-json_schema is checked against its schema when the package is installed - without it, only that the answer is one
-JSON object, and the server says so once.
+json_schema and a strict tool's arguments are checked against their schema with `jsonschema` (requirements.txt; the
+deb and rpm packages recommend the distribution's): json_object needs only the standard library, and without the
+package only that the answer is one JSON object is checked, which the server says once.  jsonschema without
+`referencing` (before 4.18: Ubuntu 24.04's 4.10) checks the same; remote references are refused either way.
 """
 import json
 import threading
@@ -72,7 +73,7 @@ def repair_latex_escapes(text: str) -> str:
     return "".join(out)
 
 
-_jsonschema = None                     # (validators, SchemaError, Registry, NoSuchResource), False when not installed
+_jsonschema = None   # (validators, SchemaError, Registry, NoSuchResource; the last two None before 4.18), False: none
 _jsonschema_lock = threading.Lock()
 
 
@@ -84,14 +85,18 @@ def jsonschema_modules():
             try:
                 from jsonschema import validators
                 from jsonschema.exceptions import SchemaError
-                from referencing import Registry
-                from referencing.exceptions import NoSuchResource
-                _jsonschema = (validators, SchemaError, Registry, NoSuchResource)
             except ImportError:
                 _jsonschema = False
-                print('[strata] response_format json_schema: the Python package jsonschema is not installed, so '
-                      'answers are only checked to be one JSON object (python -m pip install "jsonschema>=4.23,<5")',
-                      flush=True)
+                print("[strata] json_schema and strict tools: the Python package jsonschema is not installed, so "
+                      "answers and strict calls are only checked to be one JSON object (the distribution's "
+                      "python3-jsonschema, or ./setup.sh again)", flush=True)
+            else:
+                try:
+                    from referencing import Registry
+                    from referencing.exceptions import NoSuchResource
+                except ImportError:                 # jsonschema before 4.18: its own resolver, local references only
+                    Registry = NoSuchResource = None
+                _jsonschema = (validators, SchemaError, Registry, NoSuchResource)
         return _jsonschema or None
 
 
@@ -124,6 +129,36 @@ def _only_objects(node, root, refs=()):
     return isinstance(branches, list) and any(_only_objects(b, root, refs) for b in branches)
 
 
+def schema_validator(schema: dict, modules, what: str):
+    """A validator of `schema` with jsonschema's `modules` (jsonschema_modules), or one that checks for one JSON
+    object without them.  A reference that is not local (#...) - nothing is fetched - or a schema jsonschema refuses
+    is a ValueError (a 400) naming `what`."""
+
+    def check_refs(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if key in ("$ref", "$dynamicRef") and isinstance(value, str) and not value.startswith("#"):
+                    raise ValueError(f"{what} supports only local schema references (#...)")
+                check_refs(value)
+        elif isinstance(node, list):
+            for value in node:
+                check_refs(value)
+    check_refs(schema)
+    if modules is None:
+        return _ObjectOnly()
+    validators, SchemaError, Registry, NoSuchResource = modules
+
+    def no_remote(uri):
+        raise NoSuchResource(ref=uri)
+
+    try:
+        cls = validators.validator_for(schema)
+        cls.check_schema(schema)
+        return cls(schema, registry=Registry(retrieve=no_remote)) if Registry is not None else cls(schema)
+    except SchemaError as exc:
+        raise ValueError(f"invalid {what} schema: {exc.message}") from exc
+
+
 def prepare_format(response_format, messages, with_tools=False):
     if response_format is None:
         return messages, None
@@ -151,30 +186,7 @@ def prepare_format(response_format, messages, with_tools=False):
     else:
         raise ValueError("response_format.type must be text, json_object or json_schema")
 
-    def check_refs(node):
-        if isinstance(node, dict):
-            for key, value in node.items():
-                if key in ("$ref", "$dynamicRef") and isinstance(value, str) and not value.startswith("#"):
-                    raise ValueError("response_format supports only local schema references (#...)")
-                check_refs(value)
-        elif isinstance(node, list):
-            for value in node:
-                check_refs(value)
-    check_refs(schema)
-    if modules is None:
-        validator = _ObjectOnly()
-    else:
-        validators, SchemaError, Registry, NoSuchResource = modules
-
-        def no_remote(uri):
-            raise NoSuchResource(ref=uri)
-
-        try:
-            cls = validators.validator_for(schema)
-            cls.check_schema(schema)
-            validator = cls(schema, registry=Registry(retrieve=no_remote))
-        except SchemaError as exc:
-            raise ValueError(f"invalid response_format schema: {exc.message}") from exc
+    validator = schema_validator(schema, modules, "response_format")
     directive = ("OUTPUT FORMAT REQUIREMENT: Return exactly one JSON object matching the JSON Schema below. "
                  "No Markdown, headings, code fences, commentary, or text outside the JSON. "
                  "Use every required field, correct types, and only allowed fields. "
@@ -328,18 +340,24 @@ def tool_grammar(tools, strict: set, patterns: dict, thinking: bool, form: str):
     return _structural({"type": "sequence", "elements": [_THINKING, calls]} if thinking else calls)
 
 
-def constrained_tools(tools) -> tuple[set, dict]:
-    """A request's tools as sent (Chat's, Responses', Anthropic's shapes) -> (the names of those with "strict": true,
-    {name: pattern} of the custom tools whose format is a regex grammar) for tool_grammar.  A Lark grammar is not
+def constrained_tools(tools, namespace: str = "") -> tuple[set, dict]:
+    """A request's tools as sent (Chat's, Responses', Anthropic's shapes; a Responses namespace's tools under
+    "namespace.name", the name the template has) -> (the names of those with "strict": true, {name: pattern} of the
+    custom tools whose format is a regex grammar) for tool_grammar and checked_calls.  A Lark grammar is not
     constrained (it is described to the model, as before)."""
     strict, patterns = set(), {}
     for t in tools if isinstance(tools, list) else []:
         if not isinstance(t, dict):
             continue
+        if t.get("type") == "namespace" and isinstance(t.get("name"), str):
+            inner_strict, inner_patterns = constrained_tools(t.get("tools"), t["name"] + ".")
+            strict |= inner_strict
+            patterns.update(inner_patterns)
+            continue
         inner = t.get("function")
         fn: dict = inner if isinstance(inner, dict) else t
         if fn.get("strict") is True and isinstance(fn.get("name"), str):
-            strict.add(fn["name"])
+            strict.add(namespace + fn["name"])
         inner = t.get("custom")
         custom: dict = inner if isinstance(inner, dict) else t if t.get("type") == "custom" else {}
         inner = custom.get("format")
@@ -349,5 +367,41 @@ def constrained_tools(tools) -> tuple[set, dict]:
         name = custom.get("name")
         if fmt.get("type") == "grammar" and g.get("syntax") == "regex" and isinstance(g.get("definition"), str) \
                 and isinstance(name, str):
-            patterns[name] = g["definition"]
+            patterns[namespace + name] = g["definition"]
     return strict, patterns
+
+
+def strict_schemas(tools, strict: set) -> dict:
+    """The template's tools (name, parameters) -> {name: parameters} of the strict ones (constrained_tools), which
+    the server checks the calls against (checked_calls); a schema jsonschema refuses is a 400 now."""
+    out = {t["name"]: t.get("parameters") or {"type": "object"} for t in tools or []
+           if isinstance(t, dict) and t.get("name") in strict}
+    modules = jsonschema_modules() if out else None
+    for name, schema in out.items():
+        schema_validator(schema, modules, f"tool {name}'s parameters")
+    return out
+
+
+def checked_calls(events, schemas: dict):
+    """A run's ("event", Event) items with the calls of strict tools (`schemas`: strict_schemas) checked against
+    their parameters before any of them is sent: such a call is not announced while it is written (its tool_start
+    and tool_args are held back) and goes out whole with its tool_call, or is a StructuredOutputError.  This holds
+    whether the engine wrote the call under a grammar (tool_grammar) or not (another call form, an engine without
+    grammars)."""
+    modules = jsonschema_modules()
+    checks = {name: schema_validator(schema, modules, f"tool {name}'s parameters") for name, schema in schemas.items()}
+    for kind, x in events:
+        call = getattr(x, "call", None) if kind == "event" else None
+        if call is not None and call.name in checks:
+            if x.kind in ("tool_start", "tool_args"):
+                continue
+            if x.kind == "tool_call":
+                try:
+                    error = next(checks[call.name].iter_errors(call.arguments), None)
+                except Exception as exc:
+                    raise StructuredOutputError(f"could not validate the call of {call.name}: {exc}") from exc
+                if error is not None:
+                    path = "/" + "/".join(str(part) for part in error.absolute_path)
+                    raise StructuredOutputError(f"the call of strict tool {call.name} failed its parameters' "
+                                                f"JSON Schema at {path}: {error.message}")
+        yield kind, x
