@@ -1136,13 +1136,14 @@ class StrataEngine:
         # #1705: STRATA_VERIFY_TRACE dumps are ~30 KB and push the watchdog's line out of a 4 KB tail
         for line in reversed(wide.splitlines()):
             if "issue #29" in line:
-                return ("The engine stopped itself because it had stopped making progress - a hang it caught. Its log "
-                        "line: " + line.strip() + " - please report it at github.com/Niko1221/Strata/issues.")
+                return ("The engine stopped itself because it had stopped making progress - a hang it caught (issue "
+                        "#29 there is upstream Strata's). Its log line: " + line.strip() + " - please report it at "
+                        "github.com/MistVVK/XeStrata/issues.")
         proc = self.proc                                 # None while a restart has not started the next one yet
         rc = proc.poll() if proc is not None else None
         if rc is not None and rc >= 0 and self.last_err:  # its own last words on stdout: they say why
             return (f"The engine exited (code {rc}) after it reported: {self.last_err} - please report it at "
-                    "github.com/Niko1221/Strata/issues with the log.")
+                    "github.com/MistVVK/XeStrata/issues with the log.")
         last = next((x.strip() for x in reversed(tail.splitlines()) if x.strip().startswith(("strata", "ERR"))), "")
         if rc is not None and rc < 0 and -rc != signal.SIGKILL:   # issue #12: a crash, not the OS ending it for RAM
             return (f"The engine crashed ({exit_text(rc)}). " + (f"It reported: {self.last_err}" if self.last_err
@@ -1150,7 +1151,7 @@ class StrataEngine:
                     " - please report it with the log.")
         if rc is not None and rc >= 0 and last:          # it ended by itself: its own last words say why (#215)
             return (f"The engine exited (code {rc}). Its last log line: {last} - if that does not explain it, please "
-                    "report it at github.com/Niko1221/Strata/issues with the log.")
+                    "report it at github.com/MistVVK/XeStrata/issues with the log.")
         rt_note = rttime_limit_note() if rc == -9 else ""
         if rt_note:                                       # upstream #3238: the kernel killed it, but not for RAM
             return ("The engine was ended by signal 9. " + rt_note + " If dmesg (sudo dmesg | grep -i -E "
@@ -1756,7 +1757,7 @@ class StrataEngine:
                         out.append(t)
                         yield t
                     if self._done_finish() == "nonfinite":    # #879 (never promoted to a slot)
-                        raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                        raise EngineNonFinite("the engine's logits became non-finite (upstream Strata #879)")
                     if self._yielded is not None and reserved is not None and self._yielded[0] == reserved:
                         slot, reserved = reserved, None     # gave way: the read goes on in that slot (below)
                     elif reserved is not None:              # it did not give way: the slot is free again
@@ -1891,7 +1892,7 @@ class StrataEngine:
                         out.append(t)
                         yield t
                     if not cont and self._done_finish() == "nonfinite":   # #879
-                        raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                        raise EngineNonFinite("the engine's logits became non-finite (upstream Strata #879)")
                     if not cont and self._yielded is not None and self._yielded[0] == slot and not cancel.is_set():
                         continue                            # gave way: again once the shorter request is in
                     break
@@ -1936,7 +1937,7 @@ class StrataEngine:
                         self.slot_held[slot] = list(prompt) + out[gen0:-1] if len(out) > gen0 else []
                         if f[3:4] == ["nonfinite"]:              # #879: the engine dropped the slot's state
                             self.slot_held[slot] = []
-                            raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                            raise EngineNonFinite("the engine's logits became non-finite (upstream Strata #879)")
                         if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
                                 and not (out and out[-1] in self.eos_ids)):
                             # the solo path continues it: the engine copies the slot's sessions back (all but the
@@ -2172,7 +2173,7 @@ class StrataEngine:
                     self._parse_done(line)
                     done = True
                     if self.last.get("finish") == "nonfinite":   # #879
-                        raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                        raise EngineNonFinite("the engine's logits became non-finite (upstream Strata #879)")
                     return
                 elif line.startswith("ERR"):
                     done = True
@@ -4801,19 +4802,19 @@ class Service:
                                 # the retry reads from token 0: its DONE, not this one's, says what was reused
                                 del segments[segments_before:]
                                 print("[strata] the engine's logits became non-finite before the first token "
-                                      "(#879); it dropped its cached state: sending the request again once",
-                                      flush=True)
+                                      "(upstream Strata #879); it dropped its cached state: sending the request again "
+                                      "once", flush=True)
                                 continue
                             if n == 0:
                                 finish = "error"
-                                print("[strata] the engine's logits became non-finite again on the retry (#879): the "
-                                      "request ends with an error", flush=True)
+                                print("[strata] the engine's logits became non-finite again on the retry (upstream "
+                                      "Strata #879): the request ends with an error", flush=True)
                                 raise EngineNonFinite("the model's output became non-finite (NaN) twice in a row "
-                                                      "(#879); the engine has dropped its cached state - send the "
-                                                      "request again")
-                            print(f"[strata] the engine's logits became non-finite after {n} tokens (#879): the reply "
-                                  "ends here as \"length\"; the engine dropped its cached state, so the next request "
-                                  "reads its prompt from the start", flush=True)
+                                                      "(upstream Strata #879); the engine has dropped its cached "
+                                                      "state - send the request again")
+                            print(f"[strata] the engine's logits became non-finite after {n} tokens (upstream Strata "
+                                  "#879): the reply ends here as \"length\"; the engine dropped its cached state, so "
+                                  "the next request reads its prompt from the start", flush=True)
                             finish = "length"
                             break
                         if recover_prompt is not None and not cancel.is_set() and n < max_new:
