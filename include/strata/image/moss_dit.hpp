@@ -93,6 +93,8 @@ public:
     int resident_blocks() const { return blocks_stream_.resident(); }
     uint64_t blocks_vram() const { return blocks_stream_.vram(); }
     void drop_blocks() { blocks_stream_.drop(); }
+    /// Frees the streamed blocks' copies in RAM (LayerStream's homes).
+    void drop_block_homes() { blocks_stream_.drop_homes(); }
     uint64_t weight_bytes() const { return weight_bytes_; }   // what stays on the GPU besides the blocks and the text's
     uint64_t text_bytes() const { return text_bytes_; }       // the text embedder's weights
     bool text_loaded() const { return text_loaded_; }

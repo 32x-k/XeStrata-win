@@ -299,6 +299,7 @@ void MossPipeline::release(bool all) {
     }
     if (dit_) {
         dit_->drop_blocks();
+        dit_->drop_block_homes();   // the RAM the streamed blocks' copies hold, back for the other engines
         dit_->drop_activations();
     }
     te_.reset();
