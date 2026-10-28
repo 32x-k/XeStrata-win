@@ -4281,7 +4281,7 @@ def small_card_note() -> list[str]:
     VRAM, and the start can stop with "no VRAM is left for the expert cache": the models that run on such a card
     instead (#496's 8K context and smaller draft head only moved where it stopped) - a recommendation, setup changes
     nothing."""
-    titles = [PLAIN_FAMILIES[f]["title"] for f in ("qwen35", "qwen36", "ornith", "llmjp")]
+    titles = [PLAIN_FAMILIES[f]["title"] for f in ("qwen36", "ornith", "llmjp")]
     return ["This GPU has under 8 GB of VRAM: Qwen3.8-Flash-Next leaves its experts little or "
             "no room there, and its start may stop with \"no VRAM is left for the expert cache\".",
             "  These models run on such a GPU: " + ", ".join(titles) + f" (run {SETUP_CMD} again and choose one)."]
