@@ -505,13 +505,35 @@ class ImageMarkers(unittest.TestCase):
                                                  headers={"Content-Type": "application/json"})
                     with urllib.request.urlopen(req, timeout=30) as r:
                         return json.loads(r.read())
+                user = body["messages"]
+                tool = [{"role": "user", "content": "look"},
+                        {"role": "assistant", "content": [
+                            {"type": "tool_use", "id": "t", "name": "Read", "input": {}}]},
+                        {"role": "user", "content": [
+                            {"type": "tool_result", "tool_use_id": "t", "content": [img]}]}]
+                for messages in (user, tool):
+                    with self.subTest(tool=messages is tool):
+                        body["messages"] = messages
+                        svc.unload()
+                        self.assertFalse(vision.alive())
+                        counted = post("/v1/messages/count_tokens")["input_tokens"]
+                        self.assertTrue(vision.alive())
+                        usage = post("/v1/messages")["usage"]
+                        keys = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+                        self.assertEqual(counted, sum(usage.get(k) or 0 for k in keys))
+                        self.assertNotIn("image omitted", tok.decode(svc.engine.last_prompt))
+                # A reader that cannot restart is an admission failure, not a bad tool picture to omit and count.
                 svc.unload()
+                with mock.patch.object(vision, "restart", side_effect=RuntimeError("restart failed")):
+                    with self.assertRaises(urllib.error.HTTPError) as failed:
+                        post("/v1/messages/count_tokens")
+                    with failed.exception as response:
+                        self.assertEqual(response.code, 503)
+                        self.assertIn("restart failed", json.loads(response.read())["error"]["message"])
+                # Counting text does not need to start the reader or the engine after that failure.
+                body["messages"] = [{"role": "user", "content": "text only"}]
+                self.assertGreater(post("/v1/messages/count_tokens")["input_tokens"], 0)
                 self.assertFalse(vision.alive())
-                counted = post("/v1/messages/count_tokens")["input_tokens"]
-                self.assertTrue(vision.alive())
-                usage = post("/v1/messages")["usage"]
-                keys = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
-                self.assertEqual(counted, sum(usage.get(k) or 0 for k in keys))
             finally:
                 httpd.shutdown()
                 httpd.server_close()

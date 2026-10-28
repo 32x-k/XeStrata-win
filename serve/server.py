@@ -4293,14 +4293,16 @@ class Service:
                         part.update(type="text", text=f"[image omitted: {why}]")
                     else:
                         part["source"] = str(image)
+        # A stopped reader is not an unreadable tool picture.  Wake it before the tool-image probe can replace
+        # that picture with an omission note; load failures keep their admission error, as on the generation path.
+        if wake and images_of(messages) and self._vision_down():
+            self.load()                 # its admission (before_load, the free VRAM) and the encoder's restart
         fetched = self._note_unreadable_tool_images(messages, cancel)
         ids = encoded_ids = self.encode_prompt(messages, tools, kwargs, store=store)
         ids = ids + self.forced_ids(force, kwargs)
         encoded: list = []
         images = images_of(messages)
         if images:
-            if wake and self._vision_down():
-                self.load()             # its admission (before_load, the free VRAM) and the encoder's restart
             if self.vision is None:
                 if self.vision_error:
                     raise ValueError("images are unavailable: " + self.vision_error)
