@@ -24,6 +24,9 @@
 #include <string>
 
 namespace strata::kernels {
+
+class RouterPublishKernel;   // asked for its work-group (work_group_upto_1024_of)
+
 namespace {
 
 constexpr int RT_MAX_THREADS = 512;
@@ -256,12 +259,13 @@ void native_router_top10_publish(const float* logits, int32_t* ids, float* weigh
         !valid(weights, (size_t) n_tok * 10 * 4))
         throw std::invalid_argument("native router (publish) requires a stream and aligned [n,E]/[n,10] buffers");
     sycl::queue& q = queue_for(stream, true);
-    const int wg = xe::work_group_upto_1024(q);
+    const int wg = xe::work_group_upto_1024_of<RouterPublishKernel>(q);
     if (n_tok * WARP > wg) throw std::invalid_argument("native router (publish): more tokens than the work-group's sub-groups");
     const int ni = (int) n_x;
     // one work-group: the first n_tok sub-groups route a token each (as native_router_top10_multi), every work-item
     // copies the rows, and after the fence and the barrier one work-item rings the host (as doorbell_publish)
-    q.parallel_for(sycl::nd_range<1>((size_t) wg, (size_t) wg), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+    q.parallel_for<RouterPublishKernel>(sycl::nd_range<1>((size_t) wg, (size_t) wg),
+                                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
         const sycl::sub_group sg = it.get_sub_group();
         const int t = (int) it.get_local_id(0);
         const int tok = (int) sg.get_group_linear_id();

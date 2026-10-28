@@ -22,6 +22,11 @@
 #include <vector>
 
 namespace strata::kernels {
+
+template <int THREADS, typename D> class SampleKernel;   // asked for its work-group (work_group_upto_1024)
+template <int THREADS> using SampleKernelDouble = SampleKernel<THREADS, double>;
+template <int THREADS> using SampleKernelFloat = SampleKernel<THREADS, float>;
+
 namespace {
 
 constexpr int WARP = 32;
@@ -237,7 +242,7 @@ sycl::event sample_launch(sycl::queue& q, const float* logits, int n_tokens, int
         sycl::local_accessor<int, 1> si(sycl::range<1>(THREADS / WARP), h);
         sycl::local_accessor<int, 1> sel_ids(sycl::range<1>(KMAX), h);
         sycl::local_accessor<float, 1> sel_logit(sycl::range<1>(KMAX), h);
-        h.parallel_for(sycl::nd_range<1>((size_t) n_tokens * THREADS, THREADS),
+        h.parallel_for<SampleKernel<THREADS, D>>(sycl::nd_range<1>((size_t) n_tokens * THREADS, THREADS),
                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const int t = (int) it.get_group(0);
             const int tid = (int) it.get_local_id(0);
@@ -474,7 +479,8 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
                              ? (size_t) ((n_vocab + 31) / 32) : 1;   // the penalty bitmap
     const SamplerParams pp = p;
     const bool greedy = p.greedy || p.temperature <= 0.0f;
-    const int wg = xe::work_group_upto_1024(q);
+    const int wg = xe::has_fp64(q) ? xe::work_group_upto_1024<SampleKernelDouble>(q)
+                                   : xe::work_group_upto_1024<SampleKernelFloat>(q);
     auto launch = xe::has_fp64(q)
                       ? (wg == 1024 ? sample_launch<1024, double> : wg == 512 ? sample_launch<512, double>
                                                                        : sample_launch<256, double>)

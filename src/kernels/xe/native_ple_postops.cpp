@@ -24,6 +24,9 @@
 #include <string>
 
 namespace strata::kernels {
+
+template <int BlockSize> class RmsRepKernel;   // asked for its work-group (work_group_upto_1024)
+
 namespace {
 
 constexpr int N = 2560, H = 4, D = N * H, HISTORY = 9;
@@ -81,7 +84,7 @@ template <int BlockSize>
 void rms_rep_launch(sycl::queue& q, const float* input, const float* gamma, float* output, int rows) {
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> sums(sycl::range<1>(32), h);
-        h.parallel_for(sycl::nd_range<1>((size_t) rows * BlockSize, BlockSize),
+        h.parallel_for<RmsRepKernel<BlockSize>>(sycl::nd_range<1>((size_t) rows * BlockSize, BlockSize),
                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
             const int tid = (int) it.get_local_id(0);
@@ -108,7 +111,7 @@ void rms_rep_launch(sycl::queue& q, const float* input, const float* gamma, floa
     });
 }
 void rms_rep(sycl::queue& q, const float* input, const float* gamma, float* output, int rows) {
-    const int wg = xe::work_group_upto_1024(q);
+    const int wg = xe::work_group_upto_1024<RmsRepKernel>(q);
     if (wg == 1024) rms_rep_launch<1024>(q, input, gamma, output, rows);
     else if (wg == 512) rms_rep_launch<512>(q, input, gamma, output, rows);
     else rms_rep_launch<256>(q, input, gamma, output, rows);

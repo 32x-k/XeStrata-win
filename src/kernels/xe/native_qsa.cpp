@@ -22,6 +22,9 @@
 #include <stdexcept>
 
 namespace strata::kernels {
+
+template <int BlockSize> class NormKernel;   // asked for its work-group (work_group_upto_1024)
+
 namespace {
 
 std::atomic<bool> enabled{false};
@@ -48,7 +51,7 @@ void norm(sycl::queue& q, const float* input, const float* gamma_all, float* out
           float epsilon, int groups = 1, void* q8 = nullptr) {
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> sums(sycl::range<1>(32), h);
-        h.parallel_for(sycl::nd_range<1>(std::size_t(n_rows) * BlockSize, BlockSize),
+        h.parallel_for<NormKernel<BlockSize>>(sycl::nd_range<1>(std::size_t(n_rows) * BlockSize, BlockSize),
                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
             const int tid = int(it.get_local_id(0));
@@ -125,7 +128,7 @@ void native_qsa_rms_norm_weighted(const float* input, const float* gamma, float*
     buffers(input, count * 4, gamma, std::size_t(n_cols) * 4, output, stream);
     auto& q = queue_for(stream);
     // a device that takes no 1024-item work-group (the UHD 770: 512) sums the long rows in another order
-    const int wg = n_cols < 1024 ? 256 : xe::work_group_upto_1024(q);
+    const int wg = n_cols < 1024 ? 256 : xe::work_group_upto_1024<NormKernel>(q);
     if (wg == 1024) norm<1024>(q, input, gamma, output, n_cols, n_rows, epsilon);
     else if (wg == 512) norm<512>(q, input, gamma, output, n_cols, n_rows, epsilon);
     else norm<256>(q, input, gamma, output, n_cols, n_rows, epsilon);
@@ -139,7 +142,7 @@ void native_qsa_rms_norm_weighted_q8_1(const float* input, const float* gamma, f
     if (n_cols % 32 != 0 || x_q8_1 == nullptr) throw std::invalid_argument("the q8_1 output needs 32 | n_cols");
     buffers(input, count * 4, gamma, std::size_t(n_cols) * 4, output, stream);
     auto& q = queue_for(stream);
-    const int wg = n_cols < 1024 ? 256 : xe::work_group_upto_1024(q);
+    const int wg = n_cols < 1024 ? 256 : xe::work_group_upto_1024<NormKernel>(q);
     if (wg == 1024) norm<1024>(q, input, gamma, output, n_cols, n_rows, epsilon, 1, x_q8_1);
     else if (wg == 512) norm<512>(q, input, gamma, output, n_cols, n_rows, epsilon, 1, x_q8_1);
     else norm<256>(q, input, gamma, output, n_cols, n_rows, epsilon, 1, x_q8_1);
@@ -153,7 +156,7 @@ void native_qsa_rms_norm_grouped(const float* input, const float* gamma, float* 
         throw std::invalid_argument("native QSA requires finite nonnegative epsilon");
     buffers(input, count * 4, gamma, std::size_t(n_cols) * groups * 4, output, stream);
     auto& q = queue_for(stream);
-    const int wg = n_cols < 1024 ? 256 : xe::work_group_upto_1024(q);
+    const int wg = n_cols < 1024 ? 256 : xe::work_group_upto_1024<NormKernel>(q);
     if (wg == 1024) norm<1024>(q, input, gamma, output, n_cols, n_rows, epsilon, groups);
     else if (wg == 512) norm<512>(q, input, gamma, output, n_cols, n_rows, epsilon, groups);
     else norm<256>(q, input, gamma, output, n_cols, n_rows, epsilon, groups);

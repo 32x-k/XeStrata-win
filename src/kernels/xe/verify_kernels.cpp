@@ -35,6 +35,9 @@
 #include <vector>
 
 namespace strata::kernels {
+
+template <int WG> class TopProbKernel;   // asked for its work-group (work_group_upto_1024)
+
 namespace {
 
 constexpr int S = 128;          // GDN state size
@@ -1152,7 +1155,8 @@ sycl::event row_top_prob_launch(sycl::queue& q, const float* logits, int n_rows,
                                 float* probs) {
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> part(sycl::range<1>(WG / 32), h);
-        h.parallel_for(sycl::nd_range<1>((size_t) n_rows * WG, WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        h.parallel_for<TopProbKernel<WG>>(sycl::nd_range<1>((size_t) n_rows * WG, WG),
+                                          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
             const int t = (int) it.get_group(0), tid = (int) it.get_local_id(0);
             const float* l = logits + (size_t) t * n_vocab;
@@ -1243,9 +1247,12 @@ void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* i
         done(stream, e, "row_top_prob");
         return;
     }
-    const auto e = wg == 1024 ? row_top_prob_launch<1024>(q, logits, n_rows, n_vocab, ids, probs)
-                   : wg == 512 ? row_top_prob_launch<512>(q, logits, n_rows, n_vocab, ids, probs)
-                               : row_top_prob_launch<256>(q, logits, n_rows, n_vocab, ids, probs);
+    // one work-group a row: also as many work-items as the kernel itself takes (its groups are WG; the split's are
+    // WG / TOP_SPLIT)
+    const int one = xe::work_group_upto_1024<TopProbKernel>(q);
+    const auto e = one == 1024 ? row_top_prob_launch<1024>(q, logits, n_rows, n_vocab, ids, probs)
+                   : one == 512 ? row_top_prob_launch<512>(q, logits, n_rows, n_vocab, ids, probs)
+                                : row_top_prob_launch<256>(q, logits, n_rows, n_vocab, ids, probs);
     done(stream, e, "row_top_prob");
 }
 
