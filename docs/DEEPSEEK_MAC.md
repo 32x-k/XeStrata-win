@@ -34,19 +34,19 @@ Files you already have: `--model-path DIR`.
 
 ## What it did (M5 Max, 128 GB, 0.2.7.1 build)
 
-Speeds are from the packaged engine with the shipped defaults, one fresh process per run, two or three runs each. They were
+Speeds are from the packaged engine with the shipped defaults (two Engram reader threads), one fresh process per run, two runs each. They were
 measured while another person's Qwen server (a 60 GB model, loaded and idle) was running on the same Mac, so the file cache that
 serves the streamed experts was shared with it. A Mac with nothing else running may be faster; that was not measured.
 
 | | 2.00 bpw | 2.25 bpw |
 |---|---|---|
-| Short answer, code prompt | 15.2 to 17.9 tokens/s | 12.7 to 15.7 |
-| Short answer, agent prompt | 14.9 to 16.6 | 12.5 to 14.9 |
-| After a 3,000-token prompt | 13.1 to 14.8 | 11.2 to 12.5 |
-| After a 14,000-token prompt | 14.3 to 15.4 | 10.3 to 12.1 |
-| 3,000-token prompt | 270 to 275 tokens/s | 267 to 309 |
-| 14,000-token prompt | 536 to 549 | 564 to 637 |
-| 32,000-token prompt | 600 to 630 | 720 to 742 |
+| Short answer, code prompt | 15.2 to 16.0 tokens/s | 14.7 to 15.3 |
+| Short answer, agent prompt | 15.3 to 16.2 | 13.1 to 13.6 |
+| After a 3,000-token prompt | 14.5 to 15.1 | 11.7 to 11.8 |
+| After a 14,000-token prompt | 13.8 to 15.1 | 10.5 to 11.1 |
+| 3,000-token prompt | 236 to 241 tokens/s | 293 to 294 |
+| 14,000-token prompt | 479 to 512 | 553 to 586 |
+| 32,000-token prompt | 609 | 720 |
 | Read from the SSD per word | 48 MB | 111 MB |
 | Quality against the original model (KL, 4,995 positions) | 0.170 | 0.111 |
 
@@ -76,8 +76,9 @@ Full quality. That is what was measured and scored.
 - Smaller Macs: nothing under 128 GB was run with DeepSeek. The plan screen shows how much of the model your Mac keeps in memory
   and warns when that is under a quarter of it. That estimate follows the engine's own rule and is not a measurement.
 - The 1.75 bpw set shares the 2.00 set's kernel but was not run on a Mac, so it is not offered there.
-- The Mac reads the Engram table with two threads. With more, the same prompt gave slightly different words from run to run
-  (in 3 to 9 of 16 runs); with one or two threads it did not. The cause is under study.
+- On the Mac, DeepSeek reads its Engram rows with two threads, because more threads gave slightly different words from run to
+  run (in 3 to 9 of 16 runs; the cause is being studied). This costs about 3 to 12% of prompt speed (3,000 tokens about 12%,
+  14,000 tokens 7 to 12%, 32,000 tokens about 3%); answer speed is the same. `DS4_ENGRAM_THREADS=N` sets another number.
 - Two runs of the same prompt can differ in the last digits of a score, because the engine moves experts between memory and the
   SSD as it learns what the prompt needs. The answers stay equally good.
 
