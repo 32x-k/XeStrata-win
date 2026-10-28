@@ -6974,8 +6974,11 @@ def make_handler(svc: Service):
             started is an error event."""
             kind = "image_edit" if edit else "image_generation"
             fmt, opaque = job["output_format"], job["background"] == "opaque"
-            common = {"size": f"{job['width']}x{job['height']}", "quality": job["quality"],
-                      "background": job["background"], "output_format": fmt}
+
+            def common():
+                # read at each event: a size "auto" is the model's choice once it has made it (the job's, by then)
+                return {"size": f"{job['width']}x{job['height']}", "quality": job["quality"],
+                        "background": job["background"], "output_format": fmt}
             events: queue.Queue = queue.Queue()
             result: dict = {}
 
@@ -7013,7 +7016,7 @@ def make_handler(svc: Service):
                         break
                     _, index, data = item
                     send(f"{kind}.partial_image", {"b64_json": base64.b64encode(data).decode("ascii"),
-                                                   "created_at": int(time.time()), **common,
+                                                   "created_at": int(time.time()), **common(),
                                                    "partial_image_index": index})
                 if "error" in result:
                     err = {"type": "server_error", "code": "image_generation_failed", "message": str(result["error"])}
@@ -7023,7 +7026,7 @@ def make_handler(svc: Service):
                 for i, png in enumerate(result["images"]):
                     data = images_api.encode_image(png, fmt, job["output_compression"], opaque)
                     send(f"{kind}.completed", {"b64_json": base64.b64encode(data).decode("ascii"),
-                                               "created_at": int(time.time()), **common,
+                                               "created_at": int(time.time()), **common(),
                                                "usage": images_api.usage(job), "model": gen.model,
                                                "seed": job["seed"] + i, "strata": result["figures"]})
             except OSError:

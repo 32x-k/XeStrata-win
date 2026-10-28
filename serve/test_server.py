@@ -5963,6 +5963,44 @@ except ImportError:
     openai = None
 
 
+class ImageStream(unittest.TestCase):
+    def test_streamed_size_is_the_one_made(self):
+        # size "auto": the model chooses the size once the job runs (HunyuanImage 3.0's buckets); the streamed events
+        # carry the size it made, as the JSON answer does
+        import io
+        from PIL import Image
+        from serve import images as images_api
+        buf = io.BytesIO()
+        Image.new("RGB", (64, 36)).save(buf, format="PNG")
+        png = buf.getvalue()
+
+        def make_images(svc, gen, job, cancel=None, preview=None):
+            job.update(width=1280, height=720)                       # as _choose_size does
+            if preview is not None:
+                preview(0, 0, png)
+            return [png], {"seconds": 1.0}, "keep"
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, ANSWER, max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
+        gen = SimpleNamespace(cfg={}, model="m")
+        svc.images = SimpleNamespace(pick=lambda name: gen)
+        httpd = serve(svc, port=0)
+        try:
+            with mock.patch.object(images_api, "make_images", make_images):
+                req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/images/generations",
+                                             data=json.dumps({"prompt": "p", "stream": True, "partial_images": 1,
+                                                              "response_format": "b64_json"}).encode(),
+                                             headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    events = [json.loads(line[6:]) for line in r.read().decode().splitlines()
+                              if line.startswith("data: ")]
+            self.assertEqual([(e["type"], e["size"]) for e in events], [("image_generation.partial_image", "1280x720"),
+                                                                        ("image_generation.completed", "1280x720")])
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
 @unittest.skipUnless(openai is not None, "the openai package is not installed")
 class ImageEditForm(unittest.TestCase):
     """OpenAI's SDK sends /v1/images/edits as a multipart form, its booleans and numbers as text: parse_multipart
