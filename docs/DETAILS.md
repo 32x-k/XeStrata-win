@@ -501,6 +501,16 @@ applies at the next start. Network, key, MCP and program keys are not editable t
   guessed: `bash` is not `shell`, and a reordered name (`server1_label_values` for `label_values_mcp_server1`) is not the declared one.
   A call whose envelope drifted by a token (`<=NAME>`,
   `<function:NAME>` or `<NAME>` instead of `<function=NAME>`) is read as the call when NAME is a declared tool.
+- **What the parser repairs, and what it leaves.** A string argument that quotes a whole tool call, or repeats its own
+  `</parameter><parameter=NAME>`, stays exact (#4078). A call whose `</function>` was left out is read as the call (#4427), in the
+  answer and inside the thinking. An argument the tool declares as an array or an object, or declares nothing for, is read as
+  written when it has a slip in it: a trailing or doubled comma, single quotes or `True`/`False`/`None`, a bare string between two
+  members of an object (`"status": "pending", "in_progress", "pending": false`), brackets left open at the end. The server window
+  says `N tool call argument(s) repaired` and `/metrics/prometheus` counts them in `strata:tool_args_repaired_total`. Text that
+  is not an array or an object, a string cut short and a string-typed parameter are never touched. After the thinking has ended at
+  a closing think tag, a second one at the start of a line in the answer is dropped (the model quoted the tag while thinking, #4077):
+  the call that follows is kept. The reasoning between the two went out as the answer already, because a stream cannot take text
+  back.
 - **A call that came back as text because its name was not declared (#3796).** The text stays exactly as the model wrote it and
   `finish_reason` stays `stop` (or `end_turn` on `/v1/messages`). Next to it the reply carries a list, only when there is something in it:
   `"strata_rejected_tool_calls": [{"name": "bash", "reason": "undeclared"}]` (at the top level of a Chat Completions reply, in
@@ -697,6 +707,15 @@ The RAM figure the floor is checked against is the smallest of `MemAvailable`, t
 the engine (v2 `memory.max` and `memory.high`, v1 `memory.limit_in_bytes`, less clean inactive file cache) and the
 `--memory-limit-mib` cap. The startup line `strata generate: memory guard: limit X GiB (source: flag|cgroup|meminfo) ...` names
 the source. It covers parking and session files only, not the startup sizing of the arena, the resident budget or the Windows commit check.
+
+**When the arena does not fit in the RAM that is free (#4051).** The engine checks the RAM before it reads the experts into the
+arena. A memory limit below the arena (a container) stops the start with the numbers. Less free RAM than the arena (an engine
+that was still exiting, another program) is waited for up to 20 s, and the log says so (`STRATA_ARENA_RAM_WAIT_S` changes the
+seconds, `0` loads at once); if it is still short the load goes on with a warning that says how much, never a refusal. Below half
+of the arena the warning adds that the whole PC can stall in memory reclaim, and that a systemd `MemoryHigh=` below the RAM keeps
+one program from taking all of it. The server, before it starts an engine, ends one that an earlier run left behind and now waits up
+to 120 s for it to be gone (it used to wait 10 s): an engine with tens of GB of pinned memory needs longer to give it back, and the
+next one started beside it ran the PC out of RAM (#4051).
 
 Snapshots hold running state, checkpoints, used K/V pages and draft-layer K/V. They add host RAM, not VRAM. Oldest parked entries
 are evicted first. A new conversation that starts at a checkpoint inside a parked one (sub-agents that share a system prompt)

@@ -128,17 +128,29 @@ def rttime_limit_note() -> str:
             "systemd-run --user --collect -p LimitRTTIME=infinity -- strata serve ...")
 
 
+LEFTOVER_SETTLE_S = 120.0       # #4051: how long an engine ended at a start is waited for to give its memory back
+
+
 def end_leftover_engines(exe: str) -> None:
     """Before an engine starts: end the ones a lost server left running (strata_control/procs.py). Only a process
     this install recorded whose starter is gone, or an orphan of exactly this executable running --serve, and only
-    after its PID, start time and command line are checked again at the moment of the signal. Never raises."""
+    after its PID, start time and command line are checked again at the moment of the signal. Never raises.
+    #4051: the new engine is not started while the old one still holds its memory (tens of GB take longer than the
+    10 s this used to wait): a 40 GiB arena loaded beside 50 GiB the old engine had not returned put a 60 GiB PC into
+    memory reclaim for good.  One still there after LEFTOVER_SETTLE_S is said in plain words, and the start goes on
+    (the engine waits for the RAM itself and warns; nothing is refused)."""
     if os.environ.get("STRATA_KEEP_LEFTOVERS") == "1":
         return
     try:
         from strata_control import procs
         say = lambda text: print(text, flush=True)        # noqa: E731
-        procs.end_leftovers(say=say)
-        procs.end_orphans(exe, say=say)
+        stuck = [r["pid"] for r in procs.end_leftovers(say=say, settle=LEFTOVER_SETTLE_S)["stuck"]]
+        stuck += [r["pid"] for r in procs.end_orphans(exe, say=say, settle=LEFTOVER_SETTLE_S) if r["outcome"] == "stuck"]
+        if stuck:
+            print(f"[strata] WARNING: the engine from an earlier run (process {', '.join(map(str, stuck))}) was told to stop "
+                  f"but still holds its memory after {LEFTOVER_SETTLE_S:.0f} s. Starting the next one now can leave this PC "
+                  "short of RAM and very slow: wait until that process is gone (it is shown by `ps`/Task Manager), "
+                  "or restart the PC if it does not go.", flush=True)
     except Exception as e:  # noqa: BLE001 - a failed check must not stop a start
         print(f"[strata] could not check for engines left by an earlier run: {type(e).__name__}", flush=True)
 
