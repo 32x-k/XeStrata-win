@@ -1343,6 +1343,12 @@ Errors come in the API's own shape: on OpenAI's routes `{"error": {"message", "t
 An unknown route is a 404 (`Invalid URL`).
 A refusal while the engine starts (and the like) is a 503 on OpenAI's routes and a 529 (`overloaded_error`) on Anthropic's, both with `Retry-After`.
 
+**Files**: Chat Completions' `file`, Responses' `input_file` and Messages' `document` (a PDF, `base64` or `url`) are read.
+A PDF goes in as its text page by page and, when the model reads pictures (a setup with vision), each page as a picture, in page order.
+A text file (`text/*`, JSON, XML, YAML, ...; UTF-8) goes in as its text.
+A file is read up to 32 MiB and a PDF up to 100 pages; another format, an encrypted or broken PDF, and a `file_id` (the Files API) are a 400.
+The deb and rpm packages read a PDF's text only: the distributions have no pypdfium2.
+
 **Chat Completions**:
 
 - A `custom` tool in `tools` is shown to the model as a tool that takes one `input` string; its calls come back as `{"type": "custom", "custom": {"name", "input"}}`. Its grammar (`format`) is only described to the model; the output is not constrained.
@@ -1381,7 +1387,7 @@ are refused with an error that says so.
 
 | Request | What XeStrata does |
 | --- | --- |
-| `input` as a string, or as items | `message` items (`user`, `assistant`, `system`, `developer`; text and images), `reasoning`, `function_call`, `function_call_output`, `custom_tool_call(_output)`, an earlier answer's `image_generation_call` (the image is kept, so a following `edit_image` can change it). Hosted tools' items (`web_search_call`, `mcp_call`, ...) go into the conversation as text |
+| `input` as a string, or as items | `message` items (`user`, `assistant`, `system`, `developer`; text and images), `reasoning`, `function_call`, `function_call_output`, `custom_tool_call(_output)`, `input_file` (the files [above](#chat-completions-and-messages-fields)), an earlier answer's `image_generation_call` (the image is kept, so a following `edit_image` can change it). Hosted tools' items (`web_search_call`, `mcp_call`, ...) go into the conversation as text |
 | `instructions` | The system message (with leading `developer` messages; later ones become user messages, as on the chat path) |
 | `tools` | `function` tools, `namespace` tools (the model sees `namespace.name`; calls come back with `namespace` and `name`), `custom` tools (one free-form `input` string). Hosted tools (`web_search`, `file_search`, ...) are left out: the model cannot run them |
 | `tool_choice` | `"none"` hides the tools. `required`, a named tool (`custom` and `namespace` ones too) and `allowed_tools` work as on Chat Completions. `{"type": "image_generation"}` forces a call of the image tools. A name that is not one of the tools, or an unknown shape, is a 400 |

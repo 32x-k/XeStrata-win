@@ -1311,6 +1311,12 @@ Monitor のタブの最近の要求の一覧は、prefill の速さ（`Prefill t
 知らない経路は 404（`Invalid URL`）です。
 エンジンの起動中などに断るときは、OpenAI の経路は 503、Anthropic の経路は 529（`overloaded_error`）で、どちらも `Retry-After` を付けます。
 
+**ファイル**: Chat Completions の `file`、Responses の `input_file`、Messages の `document`（PDF。`base64` か `url`）を読みます。
+PDF は、ページごとの文と、モデルが画像を読めるとき（vision を入れた設定）は各ページの画像を、ページの順に入れます。
+文のファイル（`text/*`、JSON、XML、YAML など。UTF-8）は、その文を入れます。
+1 つのファイルは 32 MiB まで、PDF は 100 ページまでで、ほかの形式、暗号化された PDF、壊れた PDF、`file_id`（Files API）は 400 です。
+deb・rpm のパッケージでは、ディストリビューションに pypdfium2 がないので、PDF は文だけを読みます。
+
 **Chat Completions**:
 
 - `tools` の `custom` のツールは、文字列の `input` を 1 つ取るツールとしてモデルに見せ、呼び出しは `{"type": "custom", "custom": {"name", "input"}}` で返します。文法（`format`）はモデルへの説明に書くだけで、出力を縛りません。
@@ -1347,7 +1353,7 @@ Monitor のタブの最近の要求の一覧は、prefill の速さ（`Prefill t
 
 | 要求 | XeStrata の扱い |
 | --- | --- |
-| `input` が文字列か項目の並び | `message` の項目（`user`、`assistant`、`system`、`developer`。文字と画像）、`reasoning`、`function_call`、`function_call_output`、`custom_tool_call(_output)`、前の回の `image_generation_call`（画像を保存し、続く `edit_image` が直せます）。ホストのツールの項目（`web_search_call`、`mcp_call` など）は文として会話に入れます |
+| `input` が文字列か項目の並び | `message` の項目（`user`、`assistant`、`system`、`developer`。文字と画像）、`reasoning`、`function_call`、`function_call_output`、`custom_tool_call(_output)`、`input_file`（[上](#chat-completions-と-messages-の項目) のファイル）、前の回の `image_generation_call`（画像を保存し、続く `edit_image` が直せます）。ホストのツールの項目（`web_search_call`、`mcp_call` など）は文として会話に入れます |
 | `instructions` | システムメッセージ（先頭の `developer` のメッセージも含む。後のものはチャットの経路と同じくユーザーのメッセージになります） |
 | `tools` | `function` のツール、`namespace` のツール（モデルには `namespace.name` に見え、呼び出しは `namespace` と `name` で返ります）、`custom` のツール（自由な文字列の `input` 1 つ）。ホストのツール（`web_search`、`file_search` など）はモデルが動かせないので外します |
 | `tool_choice` | `"none"` はツールを隠します。`required`、名前を指定したツール（`custom`、`namespace` も）、`allowed_tools` は Chat Completions と同じです。`{"type": "image_generation"}` は画像の道具の呼び出しを強制します。道具にない名前や知らない形は 400 です |
