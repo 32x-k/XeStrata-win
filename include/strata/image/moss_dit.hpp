@@ -197,6 +197,21 @@ private:
     int8_t* xq8_ = nullptr;
     int64_t xq8_rows_ = 0, xq8_cols_ = 0;
     int xs_next_ = 0;
+    // the other of the two arrays of scales, made the current one (what product's same_input reads)
+    float* i8_slot() {
+        xs_next_ ^= 1;
+        return reinterpret_cast<float*>(xq8_ + xq8_rows_ * xq8_cols_) + xs_next_ * xq8_rows_;
+    }
+    // the last block's MLP output not yet added to x: the next block's first kernel adds it where it runs over the
+    // same rows (rows_i8's RmsI8), else flush_pending; its weights' scales copied to pend_sw_
+    struct Pending {
+        MfOut add;
+        const float* gate = nullptr;
+        float* x = nullptr;
+        int64_t R = 0;
+    } pend_;
+    float* pend_sw_ = nullptr;
+    void flush_pending();
     float* b0_ = nullptr;
 };
 

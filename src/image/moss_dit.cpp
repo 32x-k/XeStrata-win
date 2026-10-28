@@ -94,6 +94,46 @@ struct Situ {
     float bound(int64_t, int64_t) const { return 0.f; }
 };
 
+// RowsI8Of's ops (a W8A8 product's input without the FP16 rows): RmsMod's rows, after x += gate * add where add is a
+// deferred product (gate_add, its sums written back to x); Situ's; the attention's output times its heads' scales
+struct RmsI8 {
+    static constexpr bool kRms = true, kKeep = true;
+    float* x;
+    MfOut add;
+    const float *gate, *w, *shift, *scale;
+    int64_t C;
+    float raw(int64_t t, int64_t c) const {
+        const float v = x[t * C + c];
+        return add.C > 0 ? v + gate[c] * add.at(t, c) : v;
+    }
+    void keep(int64_t t, int64_t c, float v) const {
+        if (add.C > 0) x[t * C + c] = v;
+    }
+    float inv(float ss) const { return 1.f / sycl::sqrt(ss / (float) C + kEps); }
+    float out(int64_t, int64_t c, float v, float inv) const {
+        const float y = v * inv * w[c];
+        return scale != nullptr ? y * (1.f + scale[c]) + shift[c] : y;
+    }
+};
+
+struct SituI8 {
+    static constexpr bool kRms = false, kKeep = false;
+    Situ s;
+    float raw(int64_t t, int64_t c) const { return s.value(t, c, Stats{}); }
+    void keep(int64_t, int64_t, float) const {}
+    float inv(float) const { return 1.f; }
+    float out(int64_t, int64_t, float v, float) const { return v; }
+};
+
+struct HeadsI8 {
+    static constexpr bool kRms = false, kKeep = false;
+    Heads h;
+    float raw(int64_t t, int64_t c) const { return h.value(t, c, Stats{}); }
+    void keep(int64_t, int64_t, float) const {}
+    float inv(float) const { return 1.f; }
+    float out(int64_t, int64_t, float v, float) const { return v; }
+};
+
 // For each row and head: q and k RMS-normed over the head (weights wq, wk; eps 1e-6) and rotated in pairs (j,
 // j + head_dim / 2) by cos[t][j], sin[t][j] (tables [T][head_dim / 2]), v divided by its head's scale; FP16 out
 struct QkRope {
@@ -556,7 +596,7 @@ uint64_t MossDit::activation_bytes(int64_t hw, int n, int64_t max_text, int64_t 
            (uint64_t) R * C_ * 2 +                              // the attention's output, a row's scale
            (uint64_t) n * (hw + max_text) * hd_ * 4 +           // the rotary tables
            (uint64_t) TP * C_ * 4 +                             // the plain attention's scratch
-           (w8_ ? (uint64_t) std::max(R, band) * std::max(C_, F_) + (uint64_t) std::max(R, band) * 8 : 0);
+           (w8_ ? (uint64_t) std::max(R, band) * std::max(C_, F_) + (uint64_t) std::max(R, band) * 8 + C_ * 4 : 0);
 }
 
 void MossDit::ensure(int64_t hw, int n, int64_t max_text) {
@@ -586,6 +626,7 @@ void MossDit::ensure(int64_t hw, int n, int64_t max_text) {
         xq8_rows_ = std::max(R, mlp_rows_);
         xq8_cols_ = std::max(C_, F_);
         xq8_ = alloc<int8_t>(allocs_, xq8_rows_ * xq8_cols_ + 2 * xq8_rows_ * 4);
+        pend_sw_ = alloc<float>(allocs_, C_);
     }
     jrows_ = TP;
     jq16_ = alloc<uint16_t>(allocs_, n * TP * C_, true);
@@ -604,10 +645,11 @@ void MossDit::ensure(int64_t hw, int n, int64_t max_text) {
 void MossDit::drop_activations() {
     gpu::stream_sync(s_);
     for (void* p : {(void*) x_, (void*) q_, (void*) k_, (void*) v_, (void*) a_, (void*) gu_, (void*) h16_, (void*) rs_,
-                    (void*) rs2_, (void*) rs_o_, (void*) hs_, (void*) vpart_, (void*) xq8_, (void*) jq16_,
-                    (void*) jk16_, (void*) jv16_, (void*) jo16_, (void*) o16_, (void*) attn_scratch_, (void*) b0_})
+                    (void*) rs2_, (void*) rs_o_, (void*) hs_, (void*) vpart_, (void*) xq8_, (void*) pend_sw_,
+                    (void*) jq16_, (void*) jk16_, (void*) jv16_, (void*) jo16_, (void*) o16_, (void*) attn_scratch_,
+                    (void*) b0_})
         release(allocs_, p);
-    x_ = q_ = k_ = v_ = a_ = gu_ = rs_ = rs2_ = rs_o_ = hs_ = vpart_ = attn_scratch_ = b0_ = nullptr;
+    x_ = q_ = k_ = v_ = a_ = gu_ = rs_ = rs2_ = rs_o_ = hs_ = vpart_ = attn_scratch_ = b0_ = pend_sw_ = nullptr;
     h16_ = jq16_ = jk16_ = jv16_ = jo16_ = o16_ = nullptr;
     xq8_ = nullptr;
     cap_hw_ = cap_n_ = cap_text_ = 0;
@@ -707,14 +749,31 @@ void MossDit::run_block(const W* const* w, const float* const* bias, const float
     const float* shift_f = mod != nullptr ? mod + 3 * C : nullptr;
     const float* scale_f = mod != nullptr ? mod + 4 * C : nullptr;
     const float* gate_f = mod != nullptr ? mod + 5 * C : nullptr;
+    // W8A8 blocks take their products' int8 inputs from the row-wise kernels themselves (rows_i8), each into the
+    // scales' slot the deferred sums before it do not read (i8_slot)
+    const bool i8 = std::all_of(w, w + 6, [](const W* p) { return p->type == kTypeW8; });
+    // the block before's MLP output, added to x by this block's first kernel where it ran over the same rows
+    MfOut pre;
+    const float* pre_gate = nullptr;
+    if (pend_.x != nullptr) {
+        if (i8 && pend_.x == x && pend_.R == R) {
+            pre = pend_.add;
+            pre_gate = pend_.gate;
+            pend_ = {};
+        } else {
+            flush_pending();
+        }
+    }
     // q, k, v of every row (the products' sums scaled by their readers)
-    rows16(RmsMod{x, n1, shift_a, scale_a, C}, R, C, h16_, rs_, s_);
-    const MfOut q = product(h16_, rs_, *w[0], base, q_, R, b(0), false, true);
+    if (i8) rows_i8(RmsI8{x, pre, pre_gate, n1, shift_a, scale_a, C}, R, C, xq8_, i8_slot(), s_);
+    else rows16(RmsMod{x, n1, shift_a, scale_a, C}, R, C, h16_, rs_, s_);
+    const MfOut q = product(h16_, rs_, *w[0], base, q_, R, b(0), i8, true);
     const MfOut k = product(h16_, rs_, *w[1], base, k_, R, b(1), w[0]->type == kTypeW8, true);
     const MfOut v = product(h16_, rs_, *w[2], base, v_, R, b(2), w[1]->type == kTypeW8, true);
     // each segment: its v heads' scales, its q and k normed and rotated, the attention among its rows, the output
     // back as FP16 rows scaled by row
     int64_t r0 = 0;
+    float* so = i8 ? i8_slot() : nullptr;   // the attention's output's scales (q, k and v's sums read the other slot)
     for (size_t i = 0; i < seg.size(); ++i) {
         const int64_t T = seg[i], o = (int64_t) i * jrows_ * C;
         if (dirty_[i] > T)
@@ -726,18 +785,43 @@ void MossDit::run_block(const W* const* w, const float* const* bias, const float
         qk_rope16(q.from(r0), k.from(r0), v.from(r0), nq, nk, cos[i], sin[i], hs_, T, heads_, hd_, jq16_ + o,
                   jk16_ + o, jv16_ + o, s_);
         qi_attention(jq16_ + o, jk16_ + o, jv16_ + o, T, heads_, hd_, 0, jo16_, attn_scratch_, s_);
-        rows16(Heads{jo16_, hs_, C, hd_}, T, C, o16_ + r0 * C, rs_o_ + r0, s_);
+        if (i8) rows_i8(HeadsI8{Heads{jo16_, hs_, C, hd_}}, T, C, xq8_ + r0 * C, so + r0, s_);
+        else rows16(Heads{jo16_, hs_, C, hd_}, T, C, o16_ + r0 * C, rs_o_ + r0, s_);
         r0 += T;
     }
-    gate_add(x, product(o16_, rs_o_, *w[3], base, a_, R, b(3), false, true), gate_a, R, C, s_);
-    // the MLP, a band of rows at a time
+    const MfOut ao = product(o16_, rs_o_, *w[3], base, a_, R, b(3), i8, true);
+    // the MLP, a band of rows at a time; in one band, the attention's gate_add in the kernel that makes its input
+    const bool one_band = i8 && mlp_rows_ >= R;
+    if (!one_band) gate_add(x, ao, gate_a, R, C, s_);
     for (int64_t m0 = 0; m0 < R; m0 += mlp_rows_) {
         const int64_t mr = std::min(mlp_rows_, R - m0);
+        if (i8) {
+            rows_i8(RmsI8{x + m0 * C, one_band ? ao : MfOut{}, gate_a, n2, shift_f, scale_f, C}, mr, C, xq8_,
+                    i8_slot(), s_);
+            const MfOut g = product(h16_, rs_, *w[4], base, gu_, mr, b(4), true, true);
+            rows_i8(SituI8{Situ{g, F_}}, mr, F_, xq8_, i8_slot(), s_);
+            MfOut d = product(h16_, rs2_, *w[5], base, a_, mr, b(5), true, true);
+            if (!one_band || mod == nullptr) {
+                gate_add(x + m0 * C, d, gate_f, mr, C, s_);
+                continue;
+            }
+            // left to the next block's first kernel, the weights' scales copied out of the block's region (the
+            // stream may refill it before then)
+            gpu::copy_async(pend_sw_, d.sw, (size_t) C * 4, s_);
+            d.sw = pend_sw_;
+            pend_ = {d, gate_f, x, R};
+            continue;
+        }
         rows16(RmsMod{x + m0 * C, n2, shift_f, scale_f, C}, mr, C, h16_, rs_, s_);
         // SiTU reads the first product's sums with rs_, so its own rows' scales go to rs2_
         rows16(Situ{product(h16_, rs_, *w[4], base, gu_, mr, b(4), false, true), F_}, mr, F_, h16_, rs2_, s_);
         gate_add(x + m0 * C, product(h16_, rs2_, *w[5], base, a_, mr, b(5), false, true), gate_f, mr, C, s_);
     }
+}
+
+void MossDit::flush_pending() {
+    if (pend_.x != nullptr) gate_add(pend_.x, pend_.add, pend_.gate, pend_.R, C_, s_);
+    pend_ = {};
 }
 
 void MossDit::set_context(int i, const float* states, int64_t rows) {
@@ -816,9 +900,11 @@ void MossDit::forward(const float* x, float timestep, int64_t h, int64_t w, int 
             run_block(ws, nullptr, f(b.n1), f(b.n2), f(b.nq), f(b.nk), base, mod_, x_ + off[(size_t) c0] * C, seg,
                       cs, ss);
         }
+        if (bi == 0 && keep0_) flush_pending();
         blocks_stream_.end(bi);
         if (bi == 0 && keep0_) gpu::copy_async(b0_, x_, (size_t) ((HW + ctx_[0].rows) * C) * 4, s_);
     }
+    flush_pending();
     // the head: each context's image rows normed, scaled and shifted by the time, projected to the latent's channels
     for (int i = 0; i < n; ++i) {
         rows16(RmsMod{x_ + off[(size_t) i] * C, fnorm_, head_, head_ + C, C}, HW, C, h16_, rs_, s_);
