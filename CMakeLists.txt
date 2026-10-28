@@ -433,18 +433,16 @@ if(STRATA_ENABLE_XE)
   option(STRATA_GRAMMAR "grammar-constrained decoding (xgrammar)" ON)
   if(STRATA_GRAMMAR)
     include(FetchContent)
-    FetchContent_Declare(strata_xgrammar
+    FetchContent_Populate(strata_xgrammar QUIET
       URL https://github.com/mlc-ai/xgrammar/archive/refs/tags/v0.2.8.tar.gz
-      URL_HASH SHA256=16c06f7cef8f13ae597b007cce515991725603bded6ebce5f1828e6a9c9685be)
-    FetchContent_Declare(strata_dlpack
+      URL_HASH SHA256=16c06f7cef8f13ae597b007cce515991725603bded6ebce5f1828e6a9c9685be
+      DOWNLOAD_EXTRACT_TIMESTAMP FALSE SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/strata_xgrammar-src
+      SUBBUILD_DIR ${CMAKE_BINARY_DIR}/_deps/strata_xgrammar-subbuild)
+    FetchContent_Populate(strata_dlpack QUIET
       URL https://github.com/dmlc/dlpack/archive/bbd2f4d32427e548797929af08cfe2a9cbb3cf12.tar.gz
-      URL_HASH SHA256=f5dcb30f8a3d1a41d48b5d5b3fe1631dfce11de76f9e7e5bd22c6dc75a758885)
-    foreach(strata_dep strata_xgrammar strata_dlpack)
-      FetchContent_GetProperties(${strata_dep})
-      if(NOT ${strata_dep}_POPULATED)
-        FetchContent_Populate(${strata_dep})
-      endif()
-    endforeach()
+      URL_HASH SHA256=f5dcb30f8a3d1a41d48b5d5b3fe1631dfce11de76f9e7e5bd22c6dc75a758885
+      DOWNLOAD_EXTRACT_TIMESTAMP FALSE SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/strata_dlpack-src
+      SUBBUILD_DIR ${CMAKE_BINARY_DIR}/_deps/strata_dlpack-subbuild)
     file(GLOB_RECURSE _strata_xg_src ${strata_xgrammar_SOURCE_DIR}/cpp/*.cc)
     list(FILTER _strata_xg_src EXCLUDE REGEX "/cpp/tvm_ffi/")   # its Python bindings
     add_library(strata_xgrammar STATIC ${_strata_xg_src})
