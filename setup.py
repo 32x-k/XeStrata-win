@@ -239,7 +239,7 @@ LLAMA_CPP_TREE_SHA256 = "87b1443f593e9b9159a61fa933e0fd4a2bc29e95f5ad6da422789d1
 # KV bytes per context token and attention layer: 8-bit 1056 (the default), rotated 4-bit 576, hybrid K8V4 (8-bit K,
 # 4-bit V) 816, 16-bit 2112 (8K and less, and --kv fp16)
 KV_CELL_BYTES = {"q4_0": 576, "k8v4": 816, "fp16": 2112}
-PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "pillow", "psutil"]
+PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "pillow", "psutil", "pypdf", "pypdfium2"]
 REQUIREMENTS = ROOT / "requirements.txt"   # the same packages and their dependencies, pinned (upstream #214)
 # the build helpers, installed into .venv only when an engine or image-encoder build finds none (upstream a24253783)
 BUILD_PACKAGES = ["cmake", "ninja"]

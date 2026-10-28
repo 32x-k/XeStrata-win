@@ -47,8 +47,9 @@ FORBIDDEN = ("vcruntime*.dll", "msvcp*.dll", "concrt*.dll", "ucrtbase*.dll", "ap
              "*hipblaslt*.dll")
 # the Python packages the 7z carries (requirements.txt, and colorama, which tqdm takes on
 # Windows): a wheel not named here stops the script
-WHEELS = ("numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "pillow", "psutil", "markupsafe", "certifi",
-          "charset-normalizer", "charset_normalizer", "idna", "urllib3", "colorama", "pip")
+WHEELS = ("numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "pillow", "psutil", "pypdf", "pypdfium2",
+          "markupsafe", "certifi", "charset-normalizer", "charset_normalizer", "idna", "urllib3", "typing_extensions",
+          "colorama", "pip")
 
 # name, version (a key of `versions`, or the text), license, source, license texts (paths relative to `roots`' keys, or
 # URLs), the files in the folder it covers (globs relative to its top)
@@ -301,8 +302,10 @@ def main() -> None:
         meta = (dist / "METADATA").read_text(errors="replace")
         field = lambda key: next((ln.split(":", 1)[1].strip() for ln in meta.splitlines()  # noqa: E731
                                   if ln.startswith(key + ":")), "")
-        wheel_texts = [f for f in dist.rglob("*") if f.is_file() and f.name.upper().startswith(
-            ("LICEN", "COPYING", "NOTICE", "AUTHORS"))]
+        # by name, or anything in the licenses/ folder (PEP 639: pypdfium2 keeps PDFium's and its parts' texts there
+        # under their own names)
+        wheel_texts = [f for f in dist.rglob("*") if f.is_file() and (f.name.upper().startswith(
+            ("LICEN", "COPYING", "NOTICE", "AUTHORS")) or f.relative_to(dist).parts[0] == "licenses")]
         if not wheel_texts:
             fail(f"{dist.name}: no license text in the wheel")
         kept = []
