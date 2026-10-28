@@ -176,10 +176,10 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 | `size` | `auto`（1024x1024） | `幅x高さ`。一辺 256〜2048。16 の倍数でない大きさ（1920x1080 など）は、16 の倍数に切り上げて作り、真ん中を切り出します。HunyuanImage 3.0 は、縦横比がいちばん近いバケット（37 の大きさ）で作り、応答の `size` はその大きさです。`auto` か付けないときは、モデルが選んだバケットで作ります |
 | `n` | 1 | 1〜`max_n`（16）。`budget_s` に収まらない数は、見積もりの時間を添えて断ります。i 枚目は種 `seed + i` で作ります |
 | `seed` | ランダム | 0〜2^62 |
-| `steps`（`num_inference_steps`） | モデルのステップ数 | Qwen-Image-2.1 の元のモデルは 2〜100、Mage-Flow と HunyuanImage 3.0 は 1〜100（HunyuanImage 3.0 の既定は 8）。Turbo は 8 のままです |
+| `steps`（`num_inference_steps`） | モデルのステップ数 | Qwen-Image-2.1 の元のモデルは 2〜100、Mage-Flow、HunyuanImage 3.0、MOSS-Image は 1〜100（HunyuanImage 3.0 の既定は 8、MOSS-Image は 50）。Turbo は 8 のままです |
 | `quality` | `auto` | Qwen-Image-2.1 の元のモデルのステップ数: `low` 20、`medium`（`standard`）30、`high`・`hd`・`auto` は既定の 40（`steps` を付けたときはそちら）。Mage-Flow と HunyuanImage 3.0 では使いません |
-| `negative_prompt` | なし（Mage-Flow は空白 1 文字） | CFG のネガティブのプロンプト。HunyuanImage 3.0 では使いません（ガイダンスはトークン 1 個で、掛けるものがありません） |
-| `true_cfg_scale`、`guidance_scale` | Mage-Flow と HunyuanImage 3.0 は設定の値 | CFG の強さ（0〜30、1 なら CFG なし）。Qwen-Image-2.1 は `true_cfg_scale` が 1 より大きく `negative_prompt` があるときだけ掛け（`guidance_scale` は使いません）、Mage-Flow は `true_cfg_scale`、なければ `guidance_scale`。HunyuanImage 3.0 はガイダンスの強さとして `guidance_scale`（なければ `true_cfg_scale`、どちらも無ければ設定の 2.5）を使い、CFG は掛けません |
+| `negative_prompt` | なし（Mage-Flow は空白 1 文字、MOSS-Image は空） | CFG のネガティブのプロンプト。HunyuanImage 3.0 では使いません（ガイダンスはトークン 1 個で、掛けるものがありません） |
+| `true_cfg_scale`、`guidance_scale` | Mage-Flow、HunyuanImage 3.0、MOSS-Image は設定の値 | CFG の強さ（0〜30、1 なら CFG なし）。Qwen-Image-2.1 は `true_cfg_scale` が 1 より大きく `negative_prompt` があるときだけ掛け（`guidance_scale` は使いません）、Mage-Flow と MOSS-Image は `true_cfg_scale`、なければ `guidance_scale`（MOSS-Image の既定は 3）。HunyuanImage 3.0 はガイダンスの強さとして `guidance_scale`（なければ `true_cfg_scale`、どちらも無ければ設定の 2.5）を使い、CFG は掛けません |
 | `background` | `auto` | `transparent` で透明な背景（Qwen の推奨する形でプロンプトを包みます。png、webp、jxl だけ）、`opaque` でアルファを白の上に重ねて消す。Mage-Flow と HunyuanImage 3.0 は `transparent` を断ります |
 | `output_format` | `png` | `png`、`jpeg`、`webp`、`jxl`（JPEG XL。libjxl の cjxl があるときだけ） |
 | `output_compression` | 100 | 0〜100。jpeg、webp、jxl の画質（jxl の 100 は可逆） |
@@ -188,10 +188,36 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 Qwen-Image-2.1 の CFG は、diffusers の Qwen-Image-2.1 と同じ式です。条件ありとネガティブの 2 つ分を計算するので、時間は 1024x1024 で約 2 倍、512x512 では約 1.5 倍です。
 ほかの項目（`style`、`user`、`moderation` など）は受けて、使いません。
 
+MOSS-Image は、公式のパイプラインと同じ名前の項目も受けます（ほかのモデルでは使いません）。
+
+| 項目 | 既定 | 意味 |
+| --- | --- | --- |
+| `shift` | 5 | サンプラーの時間のずらし（0 より大きく 20 まで） |
+| `uncond_skip_layers` | `[22]` | CFG のネガティブの側で飛ばす DiT のブロック（0〜41）。`[]` か `null` で飛ばしません |
+| `slg_layers`、`slg_scale` | なし、0 | skip-layer guidance。そのブロックを飛ばしたプロンプトをもう 1 回計算し、差の `slg_scale` 倍を足します（1 ステップが 3 回分になります）。`slg_scale` が 0 か、ブロックがなければ掛けません |
+| `slg_start`、`slg_stop` | 0、1 | 上の 2 つのブロックを飛ばすステップの範囲（全体のステップに対する割合） |
+| `layout` | なし | 配置（下の「MOSS-Image の配置」） |
+
+#### MOSS-Image の配置
+
+`layout` に、物や文字の置き場所を枠で書いた JSON を付けると、MOSS-Image の配置のプロンプトにして画像を作ります。枠は、画像の左上からのピクセルで `[x_min, y_min, x_max, y_max]` です（公式のプロンプトの書き手の下書きと同じ形）。
+
+```json
+{"prompt": "a travel poster", "size": "1024x1024",
+ "layout": {"summary": {"caption": "A minimalist travel poster with a cream background, a blue mountain and the title EXPLORE at the top."},
+            "items": [{"label": "text", "caption": "Large dark-blue uppercase title.", "text": "EXPLORE", "bbox": [128, 96, 896, 224]},
+                      {"label": "object", "caption": "A flat blue mountain illustration.", "bbox": [224, 320, 800, 896]}]}}
+```
+
+- `summary`: `caption`（画像全体の説明。付けないときは `prompt`）、`meta`（種類の文字列の配列）、`canvas`（`single`、`multi_panel`、`collage`）、`palette`。
+- `items`: 1 つ以上。`label` は `object`、`character`、`text`、`caption` は見た目、文字の項目は `text` に書く文字をそのまま（改行は `\n`）、`bbox` は枠。`tags` と `palette` も受けます。ほかの項目は断ります。
+- 枠は画像の中に収めます。`width` と `height` を付けるときは `size` と同じにします。
+- サーバーは、枠を画像の真ん中からの `[y_min, x_min, y_max, x_max]` に直して（端は外側の整数のピクセルへ）、公式の形の JSON にしてモデルに読ませます。応答の `revised_prompt` がその JSON です。
+
 ### 画像を直す（`POST /v1/images/edits`）
 
 参照画像を元に画像を作ります。参照画像を書き換えたり、その中の人や物を主題にしたりできます。
-編集のないモデル（MageTrail、編集のモデルを入れていない Mage-Flow）は、1 枚の画像から始める img2img になります。
+編集のないモデル（MageTrail、編集のモデルを入れていない Mage-Flow、MOSS-Image）は、1 枚の画像から始める img2img になります。
 
 - **参照画像**: OpenAI の形の multipart の `image` か `image[]`、または JSON の `"images": [{"image_url": ...}]`（data: の URL、http(s) の URL）。
   Qwen-Image-2.1 は 10 枚まで、Mage-Flow と HunyuanImage 3.0 は 3 枚まで、編集のないモデルは 1 枚です。1 枚 32 MiB まで、16x16 ピクセル以上です。
@@ -204,14 +230,14 @@ Qwen-Image-2.1 の CFG は、diffusers の Qwen-Image-2.1 と同じ式です。�
 - **マスク**: `mask` に、1 枚目の画像と同じ大きさのアルファ付きの PNG を付けると、その透明な部分だけを描き直し、残りは 1 枚目の画像の画素のまま残します。どのモデルでも使えます。
 - **strength**: 0 より大きく 1 以下。1 枚目の画像からどれだけ変えるかで、小さいほど元の画像を多く残します。diffusers の img2img と同じく、ステップの表の先頭 floor(ステップ数 × (1 − strength)) を飛ばし、元の画像の潜在にその時点の分のノイズを混ぜて始めます（回すステップ数が減るので、その分速くなります）。
   既定は、編集では 1（今までの編集。ComfyUI の KSampler の denoise の既定）、img2img では 0.87（ComfyUI の公式の img2img の例の denoise。ただし少なくとも 1 ステップ飛ばすよう、1 − 1/ステップ数 を超えない。4 ステップなら 0.75）、マスクだけの img2img では 1 です。1 ステップも回らない値は断ります。ComfyUI の `denoise` は受けません（`denoise` 0.5 の 20 ステップは、`strength` 0.5 の 40 ステップと同じです）。
-- **ステップ数**: Qwen-Image-2.1 と HunyuanImage 3.0 は生成と同じです。Mage-Flow の編集は Turbo が 4、ほかの 2 つは 30 で、img2img は生成と同じです。
+- **ステップ数**: Qwen-Image-2.1、HunyuanImage 3.0、MOSS-Image は生成と同じです。Mage-Flow の編集は Turbo が 4、ほかの 2 つは 30 で、img2img は生成と同じです。
 - 参照画像のアルファも、そのまま画像のモデルに渡します。ほかの項目は生成と同じです。
 
 ### 応答
 
 - `data[]`: 画像（`b64_json` か `url`）と、`revised_prompt`、`seed`。
 - `usage`: 画像のエンジンのトークンで数えます（プロンプトのトークンと、参照画像と作った画像の 16x16 ピクセルで 1 つのトークン）。HunyuanImage 3.0 では、プロンプトの ids と、作った画像の 16x16 画素ごとの 1 個で、参照画像は VAE のトークンと SigLIP2 の 1,024 スロットを数えます。
-- `strata`: かかった秒数、ステップ数（strength で回した数）、`strength`（1 未満のとき）、img2img か（`img2img`）とマスクを使ったか（`mask`）、CFG の強さ、文の読み手・サンプリング・VAE のそれぞれの時間、文章のモデルの扱い（`gpu_policy`）。HunyuanImage 3.0 では、ガイダンスの強さ（`guidance`）、バケットの番号（`ratio`）、頼んだ大きさが別のときはそれ（`requested_size`）、モデルが大きさを選んだときはそれにかかった秒数（`size_choice_s`）も。
+- `strata`: かかった秒数、ステップ数（strength で回した数）、`strength`（1 未満のとき）、img2img か（`img2img`）とマスクを使ったか（`mask`）、配置を使ったか（`layout`）、CFG の強さ、文の読み手・サンプリング・VAE のそれぞれの時間、文章のモデルの扱い（`gpu_policy`）。HunyuanImage 3.0 では、ガイダンスの強さ（`guidance`）、バケットの番号（`ratio`）、頼んだ大きさが別のときはそれ（`requested_size`）、モデルが大きさを選んだときはそれにかかった秒数（`size_choice_s`）も。
 - 画像のモデルは `/v1/models` にも出ます。
 
 ### チャットから

@@ -176,10 +176,10 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 | `size` | `auto` (1024x1024) | `WIDTHxHEIGHT`, sides of 256 to 2048. A size whose sides are not multiples of 16 (1920x1080 and the like) is made at the multiples of 16 above it and its middle cut out. HunyuanImage 3.0 makes the image at the bucket (of its 37) whose shape is nearest, and the answer's `size` is that one; with `auto` or none, at the bucket the model chooses |
 | `n` | 1 | 1 to `max_n` (16); a number that does not fit in `budget_s` is refused with the estimated time. Image i uses the seed `seed + i` |
 | `seed` | random | 0 to 2^62 |
-| `steps` (`num_inference_steps`) | the model's steps | 2 to 100 for Qwen-Image-2.1's base model, 1 to 100 for Mage-Flow and HunyuanImage 3.0 (8 by default there); Turbo stays at 8 |
+| `steps` (`num_inference_steps`) | the model's steps | 2 to 100 for Qwen-Image-2.1's base model, 1 to 100 for Mage-Flow, HunyuanImage 3.0 and MOSS-Image (8 by default for HunyuanImage 3.0, 50 for MOSS-Image); Turbo stays at 8 |
 | `quality` | `auto` | The steps of Qwen-Image-2.1's base model: `low` 20, `medium` (`standard`) 30, `high`, `hd` and `auto` the default 40 (`steps`, when given, wins). Mage-Flow and HunyuanImage 3.0 do not use it |
-| `negative_prompt` | none (one space for Mage-Flow) | CFG's negative prompt. HunyuanImage 3.0 does not use it (its guidance is one token: there is nothing to steer) |
-| `true_cfg_scale`, `guidance_scale` | the config's for Mage-Flow and HunyuanImage 3.0 | CFG's strength (0 to 30; 1 is no CFG). Qwen-Image-2.1 applies it only when `true_cfg_scale` is above 1 and there is a `negative_prompt` (it does not use `guidance_scale`); Mage-Flow takes `true_cfg_scale`, else `guidance_scale`. HunyuanImage 3.0 takes it as the guidance's strength (`guidance_scale`, else `true_cfg_scale`, else the config's 2.5) and applies no CFG |
+| `negative_prompt` | none (one space for Mage-Flow, empty for MOSS-Image) | CFG's negative prompt. HunyuanImage 3.0 does not use it (its guidance is one token: there is nothing to steer) |
+| `true_cfg_scale`, `guidance_scale` | the config's for Mage-Flow, HunyuanImage 3.0 and MOSS-Image | CFG's strength (0 to 30; 1 is no CFG). Qwen-Image-2.1 applies it only when `true_cfg_scale` is above 1 and there is a `negative_prompt` (it does not use `guidance_scale`); Mage-Flow and MOSS-Image take `true_cfg_scale`, else `guidance_scale` (3 by default for MOSS-Image). HunyuanImage 3.0 takes it as the guidance's strength (`guidance_scale`, else `true_cfg_scale`, else the config's 2.5) and applies no CFG |
 | `background` | `auto` | `transparent` makes a transparent background (the prompt wrapped as Qwen recommends; png, webp or jxl only); `opaque` flattens the alpha onto white. Mage-Flow and HunyuanImage 3.0 refuse `transparent` |
 | `output_format` | `png` | `png`, `jpeg`, `webp`, `jxl` (JPEG XL; only with libjxl's cjxl) |
 | `output_compression` | 100 | 0 to 100: jpeg's, webp's and jxl's quality (jxl's 100 is lossless) |
@@ -188,10 +188,36 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 Qwen-Image-2.1's CFG is diffusers' Qwen-Image-2.1 formula. It computes the prompt and the negative prompt both, so an image takes about twice as long at 1024x1024, about 1.5 times at 512x512.
 Other fields (`style`, `user`, `moderation` and the like) are accepted and not used.
 
+MOSS-Image also takes these fields, by its official pipeline's names (the other models do not use them).
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `shift` | 5 | The sampler's time shift (above 0, up to 20) |
+| `uncond_skip_layers` | `[22]` | The DiT's blocks (0 to 41) CFG's negative side skips; `[]` or `null` skips none |
+| `slg_layers`, `slg_scale` | none, 0 | Skip-layer guidance: the prompt computed once more with those blocks skipped, `slg_scale` times the difference added (a step then takes three passes). None when `slg_scale` is 0 or there are no blocks |
+| `slg_start`, `slg_stop` | 0, 1 | The steps where the two skips above act (shares of all the steps) |
+| `layout` | none | A layout (MOSS-Image's layout, below) |
+
+#### MOSS-Image's layout
+
+With `layout`, a JSON of boxes that place things and text, the image is made from MOSS-Image's layout prompt. A box is `[x_min, y_min, x_max, y_max]` in pixels from the image's top-left corner (the draft of the model's official prompt writer).
+
+```json
+{"prompt": "a travel poster", "size": "1024x1024",
+ "layout": {"summary": {"caption": "A minimalist travel poster with a cream background, a blue mountain and the title EXPLORE at the top."},
+            "items": [{"label": "text", "caption": "Large dark-blue uppercase title.", "text": "EXPLORE", "bbox": [128, 96, 896, 224]},
+                      {"label": "object", "caption": "A flat blue mountain illustration.", "bbox": [224, 320, 800, 896]}]}}
+```
+
+- `summary`: `caption` (the whole image; `prompt` when none), `meta` (an array of genre strings), `canvas` (`single`, `multi_panel` or `collage`), `palette`.
+- `items`: one or more. `label` is `object`, `character` or `text`; `caption` its look; a text item's `text` the exact words (`\n` for a line break); `bbox` its box. `tags` and `palette` are taken too; other fields are refused.
+- The boxes stay inside the image. `width` and `height`, when given, must be the `size`'s.
+- The server turns each box into `[y_min, x_min, y_max, x_max]` from the image's middle (its edges outward to whole pixels) and gives the model the JSON in its official form; the answer's `revised_prompt` is that JSON.
+
 ### Changing an image (`POST /v1/images/edits`)
 
 Makes an image from reference images: rewriting a reference image, or making a person or a thing in one the subject.
-A model without edits (MageTrail, Mage-Flow without its edit model) makes it from one image, img2img.
+A model without edits (MageTrail, Mage-Flow without its edit model, MOSS-Image) makes it from one image, img2img.
 
 - **The reference images:** OpenAI's multipart form with `image` or `image[]`, or JSON with `"images": [{"image_url": ...}]` (a data: URL or an http(s) URL).
   Up to 10 for Qwen-Image-2.1, 3 for Mage-Flow and HunyuanImage 3.0, 1 for a model without edits; each up to 32 MiB and at least 16x16 pixels.
@@ -204,14 +230,14 @@ A model without edits (MageTrail, Mage-Flow without its edit model) makes it fro
 - **A mask:** `mask`, a PNG with an alpha channel the size of the first image, redraws only its transparent part and keeps the rest as the first image's pixels. Every model takes one.
 - **strength:** above 0 and at most 1: how much of the first image to change; the lower, the more of it is kept. As diffusers' img2img, it skips the first floor(steps × (1 − strength)) of the schedule and starts from the image's latent with that point's share of noise (fewer steps run, so it is faster too).
   The default is 1 for an edit (the edits as before; the default denoise of ComfyUI's KSampler), 0.87 for img2img (the denoise of ComfyUI's own img2img example, but no more than 1 − 1/steps, so that it skips one step at least: 0.75 at 4 steps), and 1 for img2img with a mask alone. A value that runs no step is refused. ComfyUI's `denoise` is not taken (`denoise` 0.5 at 20 steps is `strength` 0.5 at 40).
-- **The steps:** for Qwen-Image-2.1 and HunyuanImage 3.0 the same as for generating; for Mage-Flow's edits 4 for Turbo, 30 for the other two, and for its img2img those of generating.
+- **The steps:** for Qwen-Image-2.1, HunyuanImage 3.0 and MOSS-Image the same as for generating; for Mage-Flow's edits 4 for Turbo, 30 for the other two, and for its img2img those of generating.
 - A reference image's alpha goes to the image model as it is. The other fields are those of generating.
 
 ### The answer
 
 - `data[]`: the images (`b64_json` or `url`), with `revised_prompt` and `seed`.
 - `usage`: counted in the image engine's tokens (the prompt's tokens, and one token for each 16x16 pixels of the reference images and the image made). For HunyuanImage 3.0: the prompt's ids, one for each 16x16 pixels of the image made, and a reference image's VAE tokens and 1,024 SigLIP2 slots.
-- `strata`: the seconds taken, the steps (those a strength ran), `strength` (when below 1), whether it was img2img (`img2img`) and took a mask (`mask`), CFG's strength, the text encoder's, the sampling's and the VAE's times, and what happened to the text model (`gpu_policy`). For HunyuanImage 3.0 it also has the guidance's strength (`guidance`), the bucket's number (`ratio`), when the size asked for was another, that size (`requested_size`), and when the model chose the size, the seconds the choice took (`size_choice_s`).
+- `strata`: the seconds taken, the steps (those a strength ran), `strength` (when below 1), whether it was img2img (`img2img`) and took a mask (`mask`), whether it took a layout (`layout`), CFG's strength, the text encoder's, the sampling's and the VAE's times, and what happened to the text model (`gpu_policy`). For HunyuanImage 3.0 it also has the guidance's strength (`guidance`), the bucket's number (`ratio`), when the size asked for was another, that size (`requested_size`), and when the model chose the size, the seconds the choice took (`size_choice_s`).
 - The image model is listed in `/v1/models` too.
 
 ### From the chat
