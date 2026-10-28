@@ -2296,6 +2296,9 @@ HSA_START = re.compile(r"hsa_exception|HSA_STATUS_ERROR", re.I)
 HSA_START_NEXT = ("The graphics card was not ready yet; wait a few seconds and run it again. If it keeps happening, restart the PC "
                   "and report the log.")
 KNOWN_CAUSES = (
+    (re.compile(r"cannot run the expert kernel|needs AVX-?512", re.I),
+     "This model folder holds the pack for CPUs with AVX-512, and this PC's CPU does not have it. Run `strata setup` again: on a CPU "
+     "without AVX-512 it builds the pack that runs on AVX2 CPUs (Ryzen 3000-5000, Intel Core 12th-14th generation)."),
     (re.compile(r"no device of requested type|device not found|no (gpu|sycl|level.zero) device|permission denied.*(dri|render)", re.I),
      "The engine could not open the graphics card. On Linux the account must be allowed to use it: add it to the render group "
      "(`sudo usermod -aG render $USER`), log in again and start it again."),

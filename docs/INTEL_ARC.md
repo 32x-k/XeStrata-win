@@ -38,6 +38,11 @@ engine package. Otherwise [build the image yourself](DOCKER.md#build-it-yourself
 - **Linux**, for example Ubuntu 24.04, with Intel's GPU driver: the `xe` or `i915` kernel driver plus the compute runtime and
   Level Zero. On Ubuntu: `intel-opencl-icd libze1 libze-intel-gpu1`, or follow Intel's
   [client GPU guide](https://dgpu-docs.intel.com/driver/client/overview.html).
+- **The CPU and the model folder.** The CPU needs no AVX-512: a Ryzen 3000-5000 or an Intel Core 12th-14th generation runs the experts that
+  do not fit on the card on AVX2 (measured on an A750 with a Ryzen 5 5600X, [INTEL.md](INTEL.md)). That holds for the model folders that
+  have a `native_experts.txt` (IQ3_XXS, IQ3_S, NVFP4, Unsloth). The older Q2_0 folder without that file has a CPU kernel that needs
+  AVX-512; the engine then stops with "this CPU cannot run the expert kernel", `strata doctor` says so before the start, and
+  building the model folder again with `tools/iq_pack.py` (or `strata setup`) fixes it.
 - For a source build without Docker: **Intel oneAPI** with the DPC++ compiler (`icpx`, 2025.3 or newer) and **oneMKL**
   (about 5 GB), `cmake` 3.24+, `ninja`, `git`, Python 3. The build fetches ggml unless you point `STRATA_GGML_DIR` at a
   llama.cpp checkout.
