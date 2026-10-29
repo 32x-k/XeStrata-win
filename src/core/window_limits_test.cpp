@@ -9,6 +9,10 @@
 #include <cstdlib>
 
 namespace {
+#if defined(_WIN32)
+void setenv(const char* k, const char* v, int) { _putenv_s(k, v); }   // MSVC has _putenv_s only; an empty value unsets it
+void unsetenv(const char* k) { _putenv_s(k, ""); }
+#endif
 int checks = 0;
 void check(bool ok, const char* label) {
     ++checks;
