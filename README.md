@@ -386,6 +386,8 @@ permission under GPL section 7, what goes in, and how to report).
   Each model's own license applies to its files.
 - **Parts it uses:**
    - parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT); Gyro's formats from agentionai's fork of llama.cpp (MIT);
+   - [Project Maya](https://github.com/mw00/project-maya), by Peasant Smith and the Project Maya contributors (MIT): the
+     server's loop guard (`serve/loop_guard.py`);
    - [oneMath](https://github.com/uxlfoundation/oneMath) (Apache-2.0): the dense matrix products (the contrib-llvm mode,
      and the free mode for AMD GPUs), which CMake fetches from XeStrata's fork with XeStrata's
      changes ([MistVVK/oneMath](https://github.com/MistVVK/oneMath), under the same license);

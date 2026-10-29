@@ -62,6 +62,7 @@ class MaxTokens(unittest.TestCase):
         tok = ByteTokenizer()
         cls.engine = RecordingEngine(tok, "</think>\n\n" + ANSWER, max_context=CTX)
         cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
+        cls.svc.loop_guard = False  # ANSWER is a loop to serve/loop_guard.py
         cls.httpd = serve(cls.svc, port=0)
         cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
 
@@ -287,6 +288,7 @@ class FitMaxTokens(unittest.TestCase):
         tok = ByteTokenizer()
         cls.engine = RecordingEngine(tok, "</think>\n\n" + ANSWER, max_context=CTX)
         cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/test_chat_template.jinja"), fit_max_tokens=True)
+        cls.svc.loop_guard = False  # ANSWER is a loop to serve/loop_guard.py
         cls.httpd = serve(cls.svc, port=0)
         cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
 
@@ -4158,6 +4160,7 @@ class ThinkingBudget(unittest.TestCase):
         self.tok = ByteTokenizer()
         self.engine = ThinkingEngine(self.tok)
         self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
+        self.svc.loop_guard = False      # THOUGHT is a loop to serve/loop_guard.py
         self.httpd = serve(self.svc, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
 

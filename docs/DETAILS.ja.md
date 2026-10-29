@@ -848,6 +848,14 @@ print(r.choices[0].message.content)
   エンジンは会話のチェックポイントをそのターンの前に置くので（`--tail-role-token`。server がエンジンが知っているかを確かめます）、次の要求は深さによらず会話を使い直せます。
   既定（`"start"`）のプロンプトは変わりません。
   既定でない深さを、モデルは学習とは違う場所で見ることになります。
+- **ループに入った返答を抜けさせます（既定）**: 返答が同じトークンの塊（8〜2,048 トークン）を続けて繰り返し始めたら、server はそれを見つけて抜けさせます（[Project Maya](https://github.com/mw00/project-maya) のループ対策を写したもの）。
+  塊が 32 トークン未満なら 4 回、それ以上なら 3 回、合わせて 96 トークン以上で、思考の中では 5 回・4 回、192 トークン以上です。表の行、配列、似たコードの行は、同じ塊がそのまま続くわけではないので当たりません。
+  見つけるまで出力は変わりません。ストリームは、繰り返しかもしれない末尾を最大 64 トークン送らずに持ちます。
+  1 回目は、まだ送っていない繰り返しを捨て、残した出力の続きから、短い repetition penalty（1.15。窓は周期の 2 倍、最低 128 トークン）を周期の 2 倍 + 128 トークンのあいだだけかけて続けます。その後は要求のサンプリングに戻ります。
+  答えで 2 回目（合わせて 4 回目）が来たら答えを終えます（`finish_reason` は `"stop"`）。思考の中では 2 回目まで penalty で、3 回目で思考を閉じて答えさせます（Harmony の思考は閉じず、penalty だけです）。
+  ツール呼び出しにかかるループは切りません。同じ呼び出しの繰り返しはそのまま、1 つの呼び出しの中のループは penalty だけです。
+  server のウィンドウに 1 行出し、`/metrics` の `loop_guard`（Prometheus では `strata:loop_guard_*_total`）で数えます。
+  `xestrata-<model>.json` の `"loop_guard": false` か環境変数 `STRATA_LOOP_GUARD=0` で切れ、要求の `"loop_guard": true` / `false` でその要求だけ変えられます。
 - **1 つのトークンを繰り返す返答は打ち切ります**: 返答が同じトークンを 256 回続けたら、server はそこで `finish_reason` を `"length"` にして終え、ウィンドウにそう表示します。
   ループに入ったモデルや、1 つのトークンを出し続ける壊れた状態のためです（upstream の #606 では `!` が 36,689 個続きました）。
   `xestrata-<model>.json` の `"repeat_stop_tokens": N` で回数を決め、`0` で止めません（本当に同じトークンを何度も求める要求のため）。
@@ -1762,7 +1770,7 @@ Strata の設計、測定、ボトルネックは、upstream の論文 **[docs/p
 ## クレジットとライセンス
 
 XeStrata は全体が [LGPL-3.0-or-later](../COPYING.LESSER) です。
-Strata と ggml / llama.cpp（どちらも MIT）から来たコードも XeStrata の一部として LGPL で、著作権表示と許諾表示は [NOTICE](../NOTICE) にあります。
+Strata、ggml / llama.cpp と Project Maya（どれも MIT）から来たコードも XeStrata の一部として LGPL で、著作権表示と許諾表示は [NOTICE](../NOTICE) にあります。
 例外は、元のライセンスのままの intel/llvm へのパッチと oneMath への変更、`third_party/main/` の写し（`ggml-common.h`、`ggml-common-tq.h`、`quantscope.py`、`stb_image.h`、Outfit、KaTeX）と AOTriton へのパッチ、`third_party/nonfree/` です（下と [third_party/main/README.md](../third_party/main/README.md)）。
 モデルのファイルは XeStrata に含まれず、それぞれのライセンスが適用されます（下）。
 
@@ -1789,6 +1797,7 @@ Strata と ggml / llama.cpp（どちらも MIT）から来たコードも XeStra
   そのとき当てる XeStrata の修正は `third_party/main/intel-llvm/patches/` にあり、intel/llvm と同じライセンスです。`third_party/main/intel-llvm/LICENSE.TXT` を参照。
 - **画像のエンジンの部品**: 注意の計算に [oneDNN](https://github.com/uxlfoundation/oneDNN)（Apache-2.0、Intel の GPU）、[AOTriton](https://github.com/ROCm/aotriton)（MIT、AMD の GPU。中のカーネルは aiter（MIT）、FlyDSL（Apache-2.0）、Triton（MIT）の一部を含むことがあります）、[cuDNN Frontend](https://github.com/NVIDIA/cudnn-frontend)（Apache-2.0、一部 MIT、contrib-llvm の NVIDIA の GPU）、参照画像の読み込みに [stb_image](https://github.com/nothings/stb)（MIT か Unlicense）。Windows では AOTriton に [XZ Utils](https://tukaani.org/xz/) の liblzma（0BSD）をリンクします。
 - **[quantscope](https://github.com/1872183316/quantscope)**（MIT か Apache-2.0）: `setup.py --inspect` が GGUF の中身を確かめるのに使います。
+- **[Project Maya](https://github.com/mw00/project-maya)**（MIT、Peasant Smith と Project Maya の貢献者）: server のループ対策（`serve/loop_guard.py`）を写しました。
 - **[ROCm のデバイスライブラリ](https://github.com/ROCm/llvm-project/tree/f30ae3e6b680ad23dcf522e668c6d4c5c90838d0/amd/device-libs)**（University of Illinois/NCSA、AMD）: ocml・ockl などの、AMD の GPU 向けのコードがリンクするライブラリ。
   リポジトリには含めず、`tools/intel_llvm_build.py` が ROCm の llvm-project のリリースから取ってきて、intel/llvm と一緒にビルドします。`third_party/main/rocm-device-libs/LICENSE.TXT` を参照。
   そのビルドに渡す機能の指定は、Debian の [rocm-llvm](https://salsa.debian.org/rocm-team/rocm-llvm) のパッケージ（Expat、著作者は NOTICE）の `debian/rules` から写しました。

@@ -885,6 +885,14 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   The engine keeps its conversation checkpoint in front of that turn (`--tail-role-token`; the server checks that the engine knows it), so the next request reuses the conversation whatever its effort.
   The default (`"start"`) prompt is unchanged.
   The model sees a level that is not the default in another place than it was trained with.
+- **A reply that falls into a loop is steered out of it (on by default).** When a reply starts repeating one block of tokens (8 to 2,048 tokens) back to back, the server sees it and breaks it (the loop guard of [Project Maya](https://github.com/mw00/project-maya), transcribed).
+  A block under 32 tokens must come 4 times, a longer one 3 times, 96 tokens in all at least; in the thinking 5 and 4 times, 192 tokens. A table's rows, an array or similar code lines are not one block repeated as it is, so they do not count.
+  Until a loop is seen the output is the same; the stream holds back at most 64 tokens of a tail that could be a loop's repeats.
+  The first time, the repeats not sent yet are dropped and the reply goes on from what was kept with a short repetition penalty (1.15 over 2 x the period, at least 128 tokens) for the next 2 x the period + 128 tokens, then with the request's own sampling.
+  A second loop in the answer (or a fourth in all) ends it (`finish_reason` `"stop"`). In the thinking the first two get the penalty and the third closes the thinking, so the model answers (Harmony's thinking is never closed: the penalty only).
+  A loop that touches a tool call is never cut: calls that repeat stay whole, and a loop inside one call only gets the penalty.
+  The server says so in its window and counts it in `/metrics` under `loop_guard` (in the Prometheus form, `strata:loop_guard_*_total`).
+  `"loop_guard": false` in `xestrata-<model>.json` or `STRATA_LOOP_GUARD=0` turns it off; a request's `"loop_guard": true` / `false` changes it for that request.
 - **A reply stuck on one token is ended.** When a reply repeats the same token 256 times in a row, the server ends it there with `finish_reason` `"length"` and says so in its window:
   a model in a loop, or a broken state that answers one token forever (upstream's #606 saw 36,689 tokens of `!`).
   `"repeat_stop_tokens": N` in `xestrata-<model>.json` sets the run length; `0` turns it off (for a request that really wants one token many times).
@@ -1804,7 +1812,7 @@ Strata's design, measurements and bottlenecks are in upstream's paper, **[docs/p
 ## Credits and licenses
 
 The whole of XeStrata is under the [LGPL-3.0-or-later](../COPYING.LESSER).
-The code from Strata and from ggml / llama.cpp (both MIT) is part of it under the LGPL too; their copyright and permission notices are in [NOTICE](../NOTICE).
+The code from Strata, from ggml / llama.cpp and from Project Maya (all MIT) is part of it under the LGPL too; their copyright and permission notices are in [NOTICE](../NOTICE).
 The exceptions stay under their own licenses: the patches to intel/llvm, the changes to oneMath, the copies in `third_party/main/` (`ggml-common.h`, `ggml-common-tq.h`, `quantscope.py`, `stb_image.h`, Outfit, KaTeX) and the patch to AOTriton, and `third_party/nonfree/` (below and [third_party/main/README.md](../third_party/main/README.md)).
 The model files are not part of it; their licenses apply to them (below).
 
@@ -1831,6 +1839,7 @@ The model files are not part of it; their licenses apply to them (below).
   with XeStrata's fixes from `third_party/main/intel-llvm/patches/`, under intel/llvm's license. See `third_party/main/intel-llvm/LICENSE.TXT`.
 - **The image engine's parts**: for the attention, [oneDNN](https://github.com/uxlfoundation/oneDNN) (Apache-2.0, Intel GPUs), [AOTriton](https://github.com/ROCm/aotriton) (MIT, AMD GPUs; its kernels can carry parts of aiter (MIT), FlyDSL (Apache-2.0) and Triton (MIT)) and [cuDNN Frontend](https://github.com/NVIDIA/cudnn-frontend) (Apache-2.0, parts MIT, NVIDIA GPUs in the contrib-llvm mode); for reading reference images, [stb_image](https://github.com/nothings/stb) (MIT or the Unlicense). On Windows AOTriton links [XZ Utils](https://tukaani.org/xz/)' liblzma (0BSD).
 - **[quantscope](https://github.com/1872183316/quantscope)** (MIT or Apache-2.0): what `setup.py --inspect` reads a GGUF's contents with.
+- **[Project Maya](https://github.com/mw00/project-maya)** (MIT, by Peasant Smith and the Project Maya contributors): the server's loop guard (`serve/loop_guard.py`) is transcribed from it.
 - **[ROCm's device libraries](https://github.com/ROCm/llvm-project/tree/f30ae3e6b680ad23dcf522e668c6d4c5c90838d0/amd/device-libs)** (University of Illinois/NCSA, by AMD): ocml, ockl and the others, which the code for AMD GPUs links.
   They are not in the repository: `tools/intel_llvm_build.py` fetches them from a release of ROCm's llvm-project and builds them with intel/llvm. See `third_party/main/rocm-device-libs/LICENSE.TXT`.
   The target features their build is given are transcribed from the `debian/rules` of Debian's [rocm-llvm](https://salsa.debian.org/rocm-team/rocm-llvm) package (Expat; its authors in NOTICE).

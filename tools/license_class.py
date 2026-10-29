@@ -32,7 +32,8 @@ XE = "2026 MistVVK and the XeStrata contributors"
 STRATA = "2026 Niko1221 and the Strata contributors"
 # copyright holders whose code is under a permissive license XeStrata's files may carry (AGENTS.md, Licenses);
 # all of them MIT (Expat)
-PERMISSIVE = ("Niko1221 and the Strata contributors", "The ggml authors", "Debian's rocm-llvm packaging")
+PERMISSIVE = ("Niko1221 and the Strata contributors", "The ggml authors", "Debian's rocm-llvm packaging",
+              "Peasant Smith and the Project Maya contributors")
 OWN = "LGPL-3.0-or-later"
 MIXED = "LGPL-3.0-or-later AND MIT"
 # the files the classes do not cover: other projects' folders, license texts, the notices
