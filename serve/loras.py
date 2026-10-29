@@ -148,12 +148,12 @@ def split_key(raw: str) -> tuple[str, str]:
 
 
 def form_of(roles) -> str:
-    """The form a weight's tensors are in, as the engine's kind_of reads them: lora, lokr, loha, glora, oft, diff; ""
-    when they are none of those."""
+    """The form a weight's tensors are in, as the engine's kind_of reads them: lora, lokr, loha, glora, oft, diff (a
+    whole delta: diff, set_weight or w_norm); "" when they are none of those."""
     for role, form in (("lora_A", "lora"), ("lora_B", "lora"), ("lokr_w1", "lokr"), ("lokr_w2", "lokr"),
                        ("lokr_w1_a", "lokr"), ("lokr_w2_a", "lokr"), ("hada_w1_a", "loha"), ("hada_w2_a", "loha"),
                        ("a1", "glora"), ("b1", "glora"), ("oft_blocks", "oft"), ("diff", "diff"),
-                       ("set_weight", "diff")):
+                       ("set_weight", "diff"), ("w_norm", "diff")):
         if role in roles:
             return form
     return ""
@@ -408,8 +408,11 @@ class Folder:
         targets: set[str] = set()
         rank = 0
         for key, roles in sorted(weights.items()):
+            if "diff_b" in roles or "b_norm" in roles:
+                # a bias's delta: the engine binds a weight's delta and adds a bias nowhere: refused, with the key
+                return f"{key}: a bias diff (diff_b/b_norm), which the image engine does not apply yet"
             form = form_of(roles)
-            if form not in ("lora", "lokr"):
+            if form not in ("lora", "lokr", "diff"):
                 return f"{key}: a {form or 'non-LoRA'} adapter, which the image engine applies not yet"
             if "dora_scale" in roles and form != "lora":
                 return f"{key}: a DoRA (dora_scale) on a {form} adapter, which the image engine applies not yet"
@@ -417,6 +420,14 @@ class Folder:
                 return f"{key}: a text encoder's weight, which the image engine applies not yet"
             if not any(m.match(key) for m in _MATCH[self.family]):
                 return f"{key} is not one of this image model's weights"
+            if form == "diff":
+                # the weight's own matrix (set_weight is the weight itself, diff and w_norm a delta), as ComfyUI's
+                # patch table takes one a key; its rows and columns are the DiT's, which the engine checks
+                whole = roles.get("set_weight", roles.get("diff", roles.get("w_norm")))
+                if whole is None or len(whole) != 2:
+                    return f"{key}: a whole delta (diff/set_weight) must be the weight's matrix"
+                targets.add(kind_of(key))
+                continue
             if form == "lokr":
                 r, why = _lokr_rank(roles)
                 if why:

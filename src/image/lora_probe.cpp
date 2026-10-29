@@ -4,9 +4,10 @@
 // its entries and metadata), the delta's arithmetic on the GPU against a CPU reference, and the deltas a DiT binds.
 //
 //   strata-image-lora-probe list LORA.safetensors|LORA.gguf      the entries and the metadata
-//   strata-image-lora-probe selftest                     y += scale (x A^T) B^T, a LoKr's kron(w1, w2) and a
-//                                                               DoRA's rows (the base product scaled, the delta's
-//                                                               rows by c) against FP64 (random)
+//   strata-image-lora-probe selftest                     y += scale (x A^T) B^T, a LoKr's kron(w1, w2), a DoRA's
+//                                                               rows (the base product scaled, the delta's rows by c)
+//                                                               and a whole delta's (diff, set_weight) against FP64
+//                                                               (random)
 //   strata-image-lora-probe map DIT.gguf [LORA [scale]]          the weights adapters may take, and where a file's keys
 //                                                                land (or that they do not)
 //   strata-image-lora-probe step DIT.gguf OUT.bin [LORA [scale]] one forward of a fixed context and noise, its
@@ -70,9 +71,10 @@ int list(const std::string& path) {
                 (double) f->host_bytes() / 1048576.0);
     for (const auto& [k, v] : f->metadata()) std::printf("  meta %s = %s\n", k.c_str(), clip(v).c_str());
     for (const auto& e : f->entries()) {
-        std::printf("  %-56s %-5s rank %-4lld %s %lld x %lld scale %.4f%s%s\n", e.key.c_str(),
+        std::printf("  %-56s %-5s rank %-4lld %s %lld x %lld scale %.4f%s%s%s\n", e.key.c_str(),
                     strata::image::lora_kind_name(e.kind), (long long) e.rank, "in/out", (long long) e.cols,
                     (long long) e.rows, e.scale(), e.dora.empty() ? "" : " dora",
+                    e.delta.empty() ? "" : (e.replaces ? " set_weight" : " diff"),
                     e.extra.empty() ? "" : " +tensors");
     }
     return 0;
@@ -247,6 +249,96 @@ void selftest_lokr(void* s, int64_t T, int64_t out_l, int64_t in_m, int64_t out_
     if (!ok) throw std::runtime_error(std::string("the delta of ") + label + " is not the reference's");
 }
 
+// one whole delta (diff, set_weight): y[t][row0 + c] += scale * row_scale[t] * sum_k x[t][k] Delta[src_row + c][k],
+// the weight's own product (a set_weight's, the weight interpolated towards: `base` scales the base product's rows)
+void selftest_diff(void* s, int64_t T, int64_t K, int64_t N, bool rows_scaled, float base = 0.0f,
+                   int64_t src_row = 0, int64_t row0 = 0, int64_t n = 0) {
+    namespace si = strata::image;
+    if (n <= 0) n = N - src_row;
+    std::mt19937 rng((uint32_t) (rows_scaled ? 23u : 19u) ^ (uint32_t) (T * 29 + K * 11 + N * 5));
+    std::normal_distribution<float> nd(0.0f, 0.5f);
+    si::LoraEntry e;
+    e.key = "selftest-diff";
+    e.kind = si::LoraKind::diff;
+    e.cols = K;
+    e.rows = N;
+    e.replaces = base > 0.0f;   // a set_weight: its base factor is 1 - the strength
+    std::vector<float> w((size_t) (N * K)), w0((size_t) (N * K)), x((size_t) (T * K)), rs((size_t) T, 1.0f);
+    for (float& v : w) v = nd(rng);
+    for (float& v : w0) v = nd(rng);
+    for (float& v : x) v = nd(rng);
+    for (int64_t t = 0; t < T; ++t) rs[(size_t) t] = std::exp2((float) (t % 3));   // 1, 2, 4
+    si::lora_to_f16(w, e.delta);
+    const float scale = 0.8f;
+
+    si::LoraLayer layer;
+    si::LoraPart part;
+    auto dev = std::make_shared<si::LoraDeviceEntry>();
+    std::string err;
+    if (!dev->upload(e, s, err)) throw std::runtime_error(err);
+    part.entry = dev;
+    part.row0 = row0;
+    part.n = n;
+    part.src_row = src_row;
+    part.scale = scale;
+    if (e.replaces) part.base.assign((size_t) n, 1.0f - scale);
+    layer.parts.push_back(std::move(part));
+    if (!layer.build_base(N, s, err)) throw std::runtime_error(err);
+
+    strata::prefill::Gemm gemm;
+    if (!gemm.init(s, 0, err)) throw std::runtime_error(err);
+    auto* dx = static_cast<uint16_t*>(gpu::alloc_device((size_t) (T * K) * 2));
+    auto* dy = static_cast<float*>(gpu::alloc_device((size_t) (T * N) * 4));
+    auto* dw = static_cast<uint16_t*>(gpu::alloc_device((size_t) (N * K) * 2));
+    auto* drs = static_cast<float*>(gpu::alloc_device((size_t) T * 4));
+    auto* tf = static_cast<float*>(gpu::alloc_device((size_t) (T * si::lora_scratch_cols(e)) * 4));
+    auto* t16 = static_cast<uint16_t*>(gpu::alloc_device((size_t) (T * si::lora_scratch_cols(e)) * 2));
+    std::vector<uint16_t> x16((size_t) (T * K)), w016((size_t) (N * K));
+    si::lora_to_f16(x, x16);
+    si::lora_to_f16(w0, w016);
+    std::vector<float> zero((size_t) (T * N), 0.0f);
+    gpu::copy(dx, x16.data(), x16.size() * 2);
+    gpu::copy(dw, w016.data(), w016.size() * 2);
+    gpu::copy(dy, zero.data(), zero.size() * 4);
+    gpu::copy(drs, rs.data(), rs.size() * 4);
+    if (e.replaces) {   // the weight's own product first, its rows scaled by 1 - the strength (a DiT's product)
+        gemm.f16(dx, dw, dy, T, N, K);
+        si::qi_rows_scale(dy, T, N, N, layer.base(), s);
+    }
+    layer.add(dx, T, dy, N, 0, N, rows_scaled ? drs : nullptr, gemm, tf, t16, s);
+    if (!gpu::stream_sync(s)) throw std::runtime_error(gpu::last_error());
+    std::vector<float> got((size_t) (T * N));
+    gpu::copy(got.data(), dy, got.size() * 4);
+    // the reference, FP64 from the FP16 values the GPU took
+    std::vector<uint16_t> hd((size_t) (N * K));
+    si::lora_to_f16(w, hd);
+    std::vector<double> want((size_t) (T * N), 0.0), xd((size_t) (T * K));
+    for (int64_t i = 0; i < T * K; ++i) xd[(size_t) i] = strata::kernels::f32_from_f16(x16[(size_t) i]);
+    for (int64_t t = 0; t < T; ++t)
+        for (int64_t c = 0; c < n; ++c) {
+            const int64_t r = row0 + c;
+            double& y = want[(size_t) (t * N + r)];
+            if (e.replaces)
+                for (int64_t k = 0; k < K; ++k)
+                    y += (double) (1.0f - scale) * strata::kernels::f32_from_f16(w016[(size_t) (r * K + k)]) *
+                         xd[(size_t) (t * K + k)];
+            for (int64_t k = 0; k < K; ++k)
+                y += (double) strata::kernels::f32_from_f16(hd[(size_t) ((src_row + c) * K + k)]) *
+                     xd[(size_t) (t * K + k)] * scale * (rows_scaled ? rs[(size_t) t] : 1.0);
+        }
+    char label[96];
+    std::snprintf(label, sizeof label, "%s %lldx%lld", e.replaces ? "set_weight" : "diff", (long long) T,
+                  (long long) N);
+    const bool ok = compare(label, got, want);
+    gpu::free(dx);
+    gpu::free(dy);
+    gpu::free(dw);
+    gpu::free(drs);
+    gpu::free(tf);
+    gpu::free(t16);
+    if (!ok) throw std::runtime_error(std::string("the delta of ") + label + " is not the reference's");
+}
+
 // one DoRA entry: the base product's rows scaled by 1 + strength (c - 1), then the delta's rows by strength (file
 // scale) * c; c = dora_scale / (the weight's row norm + eps), the weight as the product takes it (FP16)
 void selftest_dora(void* s, int64_t T, int64_t K, int64_t R, int64_t N) {
@@ -371,6 +463,12 @@ int selftest() {
         selftest_lokr(s, 16, 8, 8, 8, 8, false);
         // a DoRA: the base product's rows scaled by 1 + strength (c - 1), the delta's by strength (file scale) c
         selftest_dora(s, 8, 64, 8, 32);
+        // a whole delta: the weight's own product, a strength that scales the input and a W8A8 product's row scale
+        selftest_diff(s, 8, 64, 32, false);
+        selftest_diff(s, 8, 64, 32, true);
+        selftest_diff(s, 8, 64, 32, true, 0.8f);   // a set_weight's base factors, 1 - strength
+        // the rows of a fused weight: the entry's second half into the weight's second half
+        selftest_diff(s, 8, 64, 64, false, 0.0f, 32, 32, 32);
     } catch (...) {
         strata::core::Runtime::get().destroy_stream(static_cast<sycl::queue*>(s));
         throw;

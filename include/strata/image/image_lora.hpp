@@ -17,6 +17,12 @@
 // y = [1 + s (c - 1)] (W x) + s c (alpha/rank BA x): the base product's rows scaled by 1 + s (c - 1) (LoraPart::base,
 // the DiT's product applies it where its output is in the input's units) and the delta's rows by c (folded into B when
 // the entry goes to the GPU).  eps is FP32's, whatever the file's tensors are (LP64_IEC_559's 1.1920929e-07).
+//
+// A whole delta (diff, set_weight, w_norm) is the weight's own matrix: y[t] += s * Delta x[t] (LoraEntry::delta, on
+// the GPU as FP16, a product of its own).  ComfyUI patches a diff as W += strength * diff; a set_weight replaces the
+// weight whatever the strength (comfy/lora.py's "set"), and the engine interpolates instead - W' = W + s (S - W), the
+// base product's rows scaled by 1 - s (the same base factors a DoRA's are) and the delta's by s - so the strength 1
+// is ComfyUI's replacement and 0 leaves the weight as it was.
 #pragma once
 
 #include <cstdint>
@@ -42,7 +48,7 @@ enum class LoraKind : int {
     loha = 2,   // (hada_w1_a hada_w1_b) * (hada_w2_a hada_w2_b)
     glora = 3,  // a1/a2/b1/b2
     oft = 4,    // oft_blocks: the output's rows turned by a block-diagonal orthogonal matrix (BOFT: 4 dimensions)
-    diff = 5,   // a full delta (.diff, .set_weight): y += scale * x Delta^T
+    diff = 5,   // a whole delta (.diff, .set_weight, .w_norm): y += scale * x Delta^T
 };
 
 /// The kind's name, as the reports and the errors write it.
@@ -73,6 +79,9 @@ struct LoraEntry {
     /// (ComfyUI divides the file's alpha by it, and by nothing where both of its matrices are whole).
     float scale() const { return alpha_set && rank > 0 ? alpha / static_cast<float>(rank) : 1.0f; }
     std::vector<uint16_t> a, b;       // lora: a [rank][cols], b [rows][rank], row-major
+    std::vector<uint16_t> delta;      // diff: the weight's own delta [rows][cols], row-major, FP16 (a set_weight's:
+                                      // the weight it sets, what the strength interpolates towards)
+    bool replaces = false;            // the delta is a set_weight's (the weight it sets), not a value added to it
     std::vector<float> dora;          // dora_scale (DoRA): over the rows, else over the columns
     bool dora_over_rows = true;
     std::map<std::string, std::vector<float>> extra;   // the other forms' tensors, FP32, by role
@@ -112,7 +121,9 @@ struct LoraUse {
 uint64_t lora_gpu_bytes(const std::vector<LoraUse>& loras, int64_t T);
 
 /// The values an entry's delta holds for each row of the product's scratch (FP32): a plain LoRA's rank, LoKr's
-/// in_m * out_k (its product's intermediate [T][in_m][out_k]).  A DiT sizes its deltas' scratch by the largest.
+/// in_m * out_k (its product's intermediate [T][in_m][out_k]), a whole delta's cols where the input's rows must be
+/// scaled before its product (a W8A8 product's row scale, or a strength other than 1).  A DiT sizes its deltas'
+/// scratch by the largest.
 int64_t lora_scratch_cols(const LoraEntry& e);
 
 /// One entry's tensors on the GPU (FP16: a plain LoRA's A and B, a LoKr's w1 and w2), and the entry's delta applied
@@ -139,10 +150,13 @@ public:
 
     /// y[t][row0 + c] (row stride ldy) += scale * (x16[t] A^T) B^T, t < T, for the entry's rows
     /// [src_row, src_row + n) into the weight's rows [row0, row0 + n) (a fused weight's half, or the whole).  An
-    /// LoKr's rows are its Kronecker product's; the delta is the same product's, its own way.  A W8A8 product's output
-    /// is its weights' and activations' scales applied (no row scale of the input): `row_scale` (null: none) is the
-    /// input rows' scale, which the base product's sum does not carry and this delta must.  `tmp_f32` and `tmp16` hold
-    /// T * lora_scratch_cols(e) values each (grown by the caller).
+    /// LoKr's rows are its Kronecker product's; the delta is the same product's, its own way.  A whole delta's is
+    /// scale * (x16[t] Delta^T) over the entry's rows, the input scaled into `tmp16` (T * cols values) where the
+    /// scale * (x16[t] Delta^T) over the entry's rows, the input scaled into `tmp16` (T * cols values) where the
+    /// strength is not 1 or a row scale is passed.  A W8A8 product's output is its weights' and activations'
+    /// scales applied (no row scale of the input): `row_scale` (null: none) is the input rows' scale, which the base
+    /// product's sum does not carry and this delta must.  `tmp_f32` and `tmp16` hold T * lora_scratch_cols(e) values
+    /// each (grown by the caller).
     void add(const uint16_t* x16, int64_t T, float* y, int64_t ldy, int64_t src_row, int64_t row0, int64_t n,
              float scale, const float* row_scale, prefill::Gemm& gemm, float* tmp_f32, uint16_t* tmp16,
              void* stream) const;
@@ -150,12 +164,15 @@ public:
 private:
     void add_lokr(const uint16_t* x16, int64_t T, float* y, int64_t ldy, int64_t src_row, int64_t row0, int64_t n,
                   float scale, const float* row_scale, prefill::Gemm& gemm, float* tmp_f32, void* stream) const;
+    void add_diff(const uint16_t* x16, int64_t T, float* y, int64_t ldy, int64_t src_row, int64_t row0, int64_t n,
+                  float scale, const float* row_scale, prefill::Gemm& gemm, uint16_t* tmp16, void* stream) const;
 
     LoraKind kind_ = LoraKind::lora;
     uint16_t* a_ = nullptr;   // lora: A [rank][cols]
     uint16_t* b_ = nullptr;   // lora: B [rows][rank]
     uint16_t* w1_ = nullptr;  // lokr: w1 [out_l][in_m]
     uint16_t* w2_ = nullptr;  // lokr: w2 [out_k][in_n]
+    uint16_t* diff_ = nullptr;   // diff: Delta [rows][cols]
     LokrShape lokr_;
     int64_t rank_ = 0, cols_ = 0, rows_ = 0;
     uint64_t bytes_ = 0;
@@ -167,8 +184,9 @@ struct LoraPart {
     std::shared_ptr<const LoraDeviceEntry> entry;
     int64_t row0 = 0, n = 0, src_row = 0;
     float scale = 1.0f;
-    /// DoRA: the base product's factor of each of the part's rows, 1 + strength (c - 1) (empty: not a DoRA, the rows
-    /// as the weight has them).
+    bool dora = false;   // a DoRA's: its base factors are c's, which the weight's other patches do not know
+    /// DoRA: the base product's factor of each of the part's rows, 1 + strength (c - 1); a set_weight's: 1 - the
+    /// strength.  Empty: the rows as the weight has them.  A row of the weight takes one part's factors.
     std::vector<float> base;
 };
 

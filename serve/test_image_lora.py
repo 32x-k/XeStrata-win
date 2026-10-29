@@ -185,6 +185,24 @@ class Listing(Tree):
         self.assertIn("DoRA", f.skipped["columns"])
         self.assertEqual(loras.field([{"name": "dora", "scale": 0.7}], f)[0]["scale"], 0.7)
 
+    def test_a_whole_delta_is_listed_and_a_bias_diff_is_not(self):
+        b = "transformer.transformer_blocks.0."
+        safetensors(self.d / "diff.safetensors", {
+            b + "attn.to_q.diff": (256, 256), b + "img_mlp.out.diff": (256, 512)})
+        safetensors(self.d / "set.safetensors", {b + "attn.to_q.set_weight": (256, 256)})
+        safetensors(self.d / "norm.safetensors", {b + "attn.to_q.w_norm": (256, 256)})
+        safetensors(self.d / "bias.safetensors", {
+            b + "attn.to_q.diff": (256, 256), b + "attn.to_q.diff_b": (256,)})
+        safetensors(self.d / "bias-only.safetensors", {b + "attn.to_q.diff_b": (256,)})
+        f = self.folder()
+        self.assertEqual([e["name"] for e in f.listing()], ["diff", "norm", "set"], f.skipped)
+        diff = [e for e in f.listing() if e["name"] == "diff"][0]
+        self.assertEqual(diff["targets"], ["attn.to_q", "img_mlp.out"])
+        self.assertEqual(diff["rank"], 0, "a whole delta has no rank")
+        self.assertIn("bias diff", f.skipped["bias"], "a bias's delta beside the weight's is refused, not sent")
+        self.assertIn("bias diff", f.skipped["bias-only"])
+        self.assertEqual(loras.field([{"name": "set", "scale": 0.7}], f)[0]["scale"], 0.7)
+
     def test_another_models_file_and_the_forms_not_applied_are_left_out(self):
         self.qwen("qwen")
         safetensors(self.d / "moss.safetensors", {

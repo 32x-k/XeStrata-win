@@ -806,15 +806,17 @@ bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                     return false;
                 }
             }
-            if (lora_dora_overlap(slot->w->lora, slot->row0, slot->rows, !base.empty()) != nullptr) {
+            if (lora_dora_overlap(slot->w->lora, slot->row0, slot->rows, !coef.empty()) != nullptr) {
                 err = "image engine: " + u.file->path() + ": " + e.key + ": the weight's rows " +
                       std::to_string(slot->row0) + " .. " + std::to_string(slot->row0 + slot->rows) +
                       " are another adapter's, and a DoRA's rows are the weight's before the other's patch";
                 drop_loras();
                 return false;
             }
+            if (e.replaces)   // a set_weight: the weight interpolates to the file's, W + s (S - W)
+                base.assign((size_t) slot->rows, 1.0f - u.scale);
             auto entry = std::make_shared<LoraDeviceEntry>();
-            if (!entry->upload(e, s_, err, base.empty() ? nullptr : coef.data())) {
+            if (!entry->upload(e, s_, err, coef.empty() ? nullptr : coef.data())) {
                 drop_loras();
                 return false;
             }
@@ -828,6 +830,7 @@ bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
             part.n = slot->rows;
             part.src_row = slot->src_row;
             part.scale = scale;
+            part.dora = !coef.empty();
             part.base = std::move(base);
             slot->w->lora->parts.push_back(std::move(part));
             lora_cols_ = std::max(lora_cols_, lora_scratch_cols(e));

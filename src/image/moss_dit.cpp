@@ -831,6 +831,8 @@ bool MossDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                     }
                     for (int64_t j = 0; j < slot->rows; ++j) coef[(size_t) (slot->src_row + j)] = c[(size_t) j];
                 }
+                if (e.replaces)   // a set_weight: the weight interpolates to the file's, W + s (S - W)
+                    bases[i].assign((size_t) slot->rows, 1.0f - u.scale);
                 if (lora_dora_overlap(slot->w->lora, slot->row0, slot->rows, dora) != nullptr) {
                     err = "image engine: " + u.file->path() + ": " + e.key + ": the weight's rows " +
                           std::to_string(slot->row0) + " .. " + std::to_string(slot->row0 + slot->rows) +
@@ -856,6 +858,7 @@ bool MossDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                 part.n = slot->rows;
                 part.src_row = slot->src_row;
                 part.scale = scale;
+                part.dora = dora;
                 part.base = std::move(bases[i]);
                 slot->w->lora->parts.push_back(std::move(part));
             }
