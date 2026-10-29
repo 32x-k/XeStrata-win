@@ -72,11 +72,11 @@ int list(const std::string& path) {
                 (double) f->host_bytes() / 1048576.0);
     for (const auto& [k, v] : f->metadata()) std::printf("  meta %s = %s\n", k.c_str(), clip(v).c_str());
     for (const auto& e : f->entries()) {
-        std::printf("  %-56s %-5s rank %-4lld %s %lld x %lld scale %.4f%s%s%s\n", e.key.c_str(),
+        std::printf("  %-56s %-5s rank %-4lld %s %lld x %lld scale %.4f%s%s%s%s\n", e.key.c_str(),
                     strata::image::lora_kind_name(e.kind), (long long) e.rank, "in/out", (long long) e.cols,
                     (long long) e.rows, e.scale(), e.dora.empty() ? "" : " dora",
                     e.delta.empty() ? "" : (e.replaces ? " set_weight" : " diff"),
-                    e.extra.empty() ? "" : " +tensors");
+                    e.bias.empty() ? "" : " +bias", e.extra.empty() ? "" : " +tensors");
     }
     return 0;
 }
@@ -559,6 +559,84 @@ void selftest_dora(void* s, int64_t T, int64_t K, int64_t R, int64_t N) {
     if (!ok) throw std::runtime_error("the DoRA's product is not the reference's");
 }
 
+// a bias's delta (ComfyUI's "diff" patch of a weight's bias): y[t][row0 + c] += scale * bias[src_row + c], alone
+// (LoraKind::bias: the file holds no weight's delta) and beside a plain LoRA's, both into the rows of a fused weight's
+// second half where that is asked
+void selftest_bias(void* s, int64_t T, int64_t N, bool with_weight, int64_t src_row = 0, int64_t row0 = 0,
+                   int64_t n = 0) {
+    namespace si = strata::image;
+    if (n <= 0) n = N - src_row;
+    const int64_t K = 64, R = 8;
+    std::mt19937 rng((uint32_t) (with_weight ? 23u : 29u) ^ (uint32_t) (T * 31 + N * 7 + src_row * 13));
+    std::normal_distribution<float> nd(0.0f, 0.5f);
+    si::LoraEntry e;
+    e.key = "selftest-bias";
+    e.kind = with_weight ? si::LoraKind::lora : si::LoraKind::bias;
+    e.rows = N;
+    e.cols = with_weight ? K : 0;
+    e.rank = with_weight ? R : 0;
+    e.bias.resize((size_t) N);
+    for (float& v : e.bias) v = nd(rng);
+    std::vector<float> a((size_t) (R * K)), b((size_t) (N * R)), x((size_t) (T * K));
+    if (with_weight) {
+        for (float& v : a) v = nd(rng);
+        for (float& v : b) v = nd(rng);
+        si::lora_to_f16(a, e.a);
+        si::lora_to_f16(b, e.b);
+    }
+    for (float& v : x) v = nd(rng);
+
+    si::LoraDeviceEntry dev;
+    std::string err;
+    if (!dev.upload(e, s, err)) throw std::runtime_error(err);
+    strata::prefill::Gemm gemm;
+    if (!gemm.init(s, 0, err)) throw std::runtime_error(err);
+    const int64_t cols = std::max<int64_t>(R, 1);
+    auto* dx = static_cast<uint16_t*>(gpu::alloc_device((size_t) (T * K) * 2));
+    auto* dy = static_cast<float*>(gpu::alloc_device((size_t) (T * N) * 4));
+    auto* tf = static_cast<float*>(gpu::alloc_device((size_t) (T * cols) * 4));
+    auto* t16 = static_cast<uint16_t*>(gpu::alloc_device((size_t) (T * cols) * 2));
+    std::vector<uint16_t> x16((size_t) (T * K));
+    si::lora_to_f16(x, x16);
+    std::vector<float> zero((size_t) (T * N), 0.0f);
+    gpu::copy(dx, x16.data(), x16.size() * 2);
+    gpu::copy(dy, zero.data(), zero.size() * 4);
+    const float wscale = 1.3f, bscale = 0.7f;
+    if (with_weight) dev.add(dx, T, dy, N, src_row, row0, n, wscale, nullptr, gemm, tf, t16, s);
+    dev.add_bias(dy, T, N, src_row, row0, n, bscale, s);
+    if (!gpu::stream_sync(s)) throw std::runtime_error(gpu::last_error());
+    std::vector<float> got((size_t) (T * N));
+    gpu::copy(got.data(), dy, got.size() * 4);
+    // the reference, FP64 from the same FP16 inputs the GPU took
+    std::vector<double> want((size_t) (T * N), 0.0), xd((size_t) (T * K)), ad((size_t) (R * K));
+    std::vector<double> bd((size_t) (N * R));
+    for (int64_t i = 0; i < T * K; ++i) xd[(size_t) i] = strata::kernels::f32_from_f16(x16[(size_t) i]);
+    if (with_weight) {
+        for (int64_t i = 0; i < R * K; ++i) ad[(size_t) i] = strata::kernels::f32_from_f16(e.a[(size_t) i]);
+        for (int64_t i = 0; i < N * R; ++i) bd[(size_t) i] = strata::kernels::f32_from_f16(e.b[(size_t) i]);
+    }
+    for (int64_t t = 0; t < T; ++t) {
+        if (with_weight)
+            for (int64_t r = 0; r < R; ++r) {
+                double v = 0;
+                for (int64_t k = 0; k < K; ++k) v += xd[(size_t) (t * K + k)] * ad[(size_t) (r * K + k)];
+                for (int64_t c = 0; c < n; ++c)
+                    want[(size_t) (t * N + row0 + c)] += v * bd[(size_t) ((src_row + c) * R + r)] * wscale;
+            }
+        for (int64_t c = 0; c < n; ++c)
+            want[(size_t) (t * N + row0 + c)] += (double) bscale * e.bias[(size_t) (src_row + c)];
+    }
+    char label[64];
+    std::snprintf(label, sizeof label, "%s %lldx%lld", with_weight ? "lora+bias" : "bias", (long long) T,
+                  (long long) N);
+    const bool ok = compare(label, got, want);
+    gpu::free(dx);
+    gpu::free(dy);
+    gpu::free(tf);
+    gpu::free(t16);
+    if (!ok) throw std::runtime_error(std::string("the bias's delta of ") + label + " is not the reference's");
+}
+
 int selftest() {
     void* s = strata::core::Runtime::get().create_stream();
     try {
@@ -590,6 +668,11 @@ int selftest() {
         // the rows of a fused weight, the side written the core's way
         selftest_loha(s, 8, 64, 8, 4, 64, false, false, 32, 32, 32);
         selftest_loha(s, 8, 64, 8, 4, 64, true, true, 32, 32, 32);
+        // a bias's delta: alone (the file holds no weight's delta) and beside a LoRA's, the second into the rows of a
+        // fused weight's second half
+        selftest_bias(s, 8, 32, false);
+        selftest_bias(s, 8, 32, true);
+        selftest_bias(s, 8, 64, true, 32, 32, 32);
     } catch (...) {
         strata::core::Runtime::get().destroy_stream(static_cast<sycl::queue*>(s));
         throw;
@@ -623,7 +706,8 @@ int map(const std::string& dit_path, const std::string& lora_path, float scale) 
         if (t == nullptr) {
             std::printf("MISSING %-46s %-5s rank %-4lld %lld x %lld\n", e.key.c_str(), si::lora_kind_name(e.kind),
                         (long long) e.rank, (long long) e.cols, (long long) e.rows);
-        } else if (e.rows != t->rows || e.cols != t->cols) {
+        } else if (e.rows != t->rows ||
+                   (e.kind != si::LoraKind::bias && e.cols != t->cols)) {   // a bias's delta alone: its columns are none
             std::printf("SHAPE   %-46s %lld x %lld, the weight %lld x %lld\n", e.key.c_str(), (long long) e.cols,
                         (long long) e.rows, (long long) t->cols, (long long) t->rows);
         } else {
@@ -735,7 +819,8 @@ int moss_map(const std::string& dit_path, const std::string& lora_path, float sc
         if (g == nullptr) {
             std::printf("MISSING %-46s %-5s rank %-4lld %lld x %lld\n", e.key.c_str(), si::lora_kind_name(e.kind),
                         (long long) e.rank, (long long) e.cols, (long long) e.rows);
-        } else if (e.rows != g->rows || e.cols != g->cols) {
+        } else if (e.rows != g->rows ||
+                   (e.kind != si::LoraKind::bias && e.cols != g->cols)) {   // a bias's delta alone: its columns are none
             std::printf("SHAPE   %-46s %lld x %lld, the weight %lld x %lld\n", e.key.c_str(), (long long) e.cols,
                         (long long) e.rows, (long long) g->cols, (long long) g->rows);
         } else {
@@ -860,7 +945,8 @@ int mf_map(const std::string& dit_path, const std::string& lora_path, float scal
         if (t == nullptr) {
             std::printf("MISSING %-46s %-5s rank %-4lld %lld x %lld\n", e.key.c_str(), si::lora_kind_name(e.kind),
                         (long long) e.rank, (long long) e.cols, (long long) e.rows);
-        } else if (e.rows != t->rows || e.cols != t->cols) {
+        } else if (e.rows != t->rows ||
+                   (e.kind != si::LoraKind::bias && e.cols != t->cols)) {   // a bias's delta alone: its columns are none
             std::printf("SHAPE   %-46s %lld x %lld, the weight %lld x %lld\n", e.key.c_str(), (long long) e.cols,
                         (long long) e.rows, (long long) t->cols, (long long) t->rows);
         } else {

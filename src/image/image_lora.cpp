@@ -21,8 +21,9 @@
 // A whole delta is the weight's own matrix: `x.diff` (LyCORIS's full form, a fine tune's difference from its base),
 // `x.w_norm` (the same role in ComfyUI's patch table) and `x.set_weight` (the weight itself).  ComfyUI patches them
 // as W += strength * diff and W = set_weight; the engine keeps the first and interpolates the second
-// (W + s (S - W)), so that a strength scales both.  `x.diff_b` and `x.b_norm` are a bias's delta, which the engine
-// does not apply yet: a file holding one is refused when a set is bound, never silently sent with it.
+// (W + s (S - W)), so that a strength scales both.  `x.diff_b` (or `x.b_norm`, which ComfyUI reads only beside the
+// weight's `w_norm`, `x.diff_b` overriding it) is the same patch of the weight's bias: b' = b + strength * Db, added
+// where the DiT adds the bias it has, and no alpha involved (a file may hold one alone: LoraKind::bias).
 #include "strata/image/image_lora.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
@@ -322,10 +323,7 @@ LoraKind kind_of(const Group& g, const std::string& path) {
     if (glora) return LoraKind::glora;
     if (oft) return LoraKind::oft;
     if (diff) return LoraKind::diff;
-    if (has("diff_b") || has("b_norm"))
-        throw std::runtime_error(path_key_what(path, g.key,
-                                               "a bias diff (diff_b/b_norm) with no weight's delta: the image "
-                                               "engine applies no bias's diff yet"));
+    if (has("diff_b") || has("b_norm")) return LoraKind::bias;   // a bias's delta alone: no weight changed
     throw std::runtime_error(path_and(path, g.key) +
                              ": not a LoRA tensor (no lora_A/B, lokr_w1/w2, hada_w1_a, a1/b1, oft_blocks, diff or "
                              "set_weight beside it)");
@@ -646,9 +644,7 @@ LoraEntry make_entry(Group& g, const std::string& path) {
             role("set_weight") != nullptr ? "set_weight" : (role("diff") != nullptr ? "diff" : "w_norm");
         const RawTensor* t = role(which);
         if (t == nullptr)
-            throw std::runtime_error(path_key_what(path, e.key,
-                                                   "a bias diff (diff_b/b_norm) with no weight's delta: the image "
-                                                   "engine applies no bias's diff yet"));
+            throw std::runtime_error(path_key_what(path, e.key, "a whole delta's tensor is missing"));
         if (t->shape.size() != 2)
             throw std::runtime_error(path_key_what(path, e.key,
                                                    std::string("a whole delta (") + which +
@@ -678,12 +674,41 @@ LoraEntry make_entry(Group& g, const std::string& path) {
         throw std::runtime_error(path_and(path, e.key) +
                                  ": a LoRA with a middle layer (a convolution's) is not one the image engine's linear "
                                  "products take");
+    // a bias's delta: ComfyUI's load_lora papers the weight's bias with `diff_b` (or with `b_norm` beside the weight's
+    // `w_norm`, which `diff_b` then overrides), the same "diff" patch as the weight's - no alpha, the request's
+    // strength only.  An entry may hold one alone (LoraKind::bias): its rows are the bias's.
+    const RawTensor* bb = role("diff_b");
+    if (bb == nullptr) {
+        bb = role("b_norm");
+        if (bb != nullptr && role("w_norm") == nullptr)
+            throw std::runtime_error(path_key_what(path, e.key,
+                                                   "a bias's delta (b_norm) without the weight's w_norm, beside "
+                                                   "which ComfyUI's load_lora reads it"));
+    }
+    if (bb != nullptr) {
+        if (bb->shape.size() != 1)
+            throw std::runtime_error(path_key_what(path, e.key,
+                                                   "a bias's delta (diff_b/b_norm) must be the bias's vector"));
+        e.bias = bb->v;
+        if (e.kind == LoraKind::bias) {
+            e.rows = (int64_t) e.bias.size();
+            if (!e.dora.empty())
+                throw std::runtime_error(path_key_what(path, e.key,
+                                                       "a dora_scale with a bias's delta alone: the engine's DoRA is "
+                                                       "a weight's"));
+        } else if ((int64_t) e.bias.size() != e.rows) {
+            throw std::runtime_error(path_key_what(path, e.key, "a bias's delta is " +
+                                                                   std::to_string(e.bias.size()) +
+                                                                   " values, not the weight's " +
+                                                                   std::to_string(e.rows) + " rows"));
+        }
+    }
     // the other forms' tensors, as they are (the forms the engine learns to apply later read them); a LoKr's are
-    // its two materialized matrices (above), not the file's factors, and a whole delta's is above
+    // its two materialized matrices (above), not the file's factors, and a whole delta's and a bias's are above
     for (const auto& [r, t] : g.by_role) {
         if (r == "lora_A" || r == "lora_B" || r == "alpha" || r == "dora_scale") continue;
         if (r.rfind("lokr_", 0) == 0) continue;
-        if (r == "diff" || r == "set_weight" || r == "w_norm") continue;
+        if (r == "diff" || r == "set_weight" || r == "w_norm" || r == "diff_b" || r == "b_norm") continue;
         e.shapes[r] = t.shape;
         e.extra[r] = t.v;
     }
@@ -755,6 +780,7 @@ const char* lora_kind_name(LoraKind k) {
     case LoraKind::glora: return "glora";
     case LoraKind::oft: return "oft";
     case LoraKind::diff: return "diff";
+    case LoraKind::bias: return "bias";
     }
     return "?";
 }
@@ -772,7 +798,7 @@ std::string LoraFile::meta(const std::string& key) const {
 uint64_t LoraFile::host_bytes() const {
     uint64_t n = 0;
     for (const LoraEntry& e : entries_) {
-        n += e.a.size() * 2 + e.b.size() * 2 + e.dora.size() * 4 + e.delta.size() * 2;
+        n += e.a.size() * 2 + e.b.size() * 2 + e.dora.size() * 4 + e.delta.size() * 2 + e.bias.size() * 4;
         for (const auto& [role, v] : e.extra) n += v.size() * 4;
     }
     return n;
@@ -858,6 +884,19 @@ struct KronRows {
     }
 };
 
+// A bias's delta: y[t][row0 + c] += scale * b[src_row + c] (ComfyUI's "diff" patch of the weight's bias)
+struct AddBias {
+    const float* b;
+    float scale;
+    float* y;
+    int64_t ldy, src_row, row0, n;
+    void operator()(sycl::id<1> id) const {
+        const int64_t at = (int64_t) id[0];
+        const int64_t t = at / n, c = at - t * n;
+        y[t * ldy + row0 + c] += scale * b[src_row + c];
+    }
+};
+
 }  // namespace lora_kernels
 
 LoraDeviceEntry::~LoraDeviceEntry() { release(); }
@@ -867,6 +906,8 @@ void LoraDeviceEntry::release() {
         if (*p != nullptr) strata::gpu::free(*p);
         *p = nullptr;
     }
+    if (bias_ != nullptr) strata::gpu::free(bias_);
+    bias_ = nullptr;
     lokr_ = {};
     rank_ = cols_ = rows_ = 0;
     bytes_ = 0;
@@ -875,11 +916,41 @@ void LoraDeviceEntry::release() {
 bool LoraDeviceEntry::upload(const LoraEntry& e, void* stream, std::string& err, const float* row_coef) {
     release();
     kind_ = e.kind;
-    if (e.extra.count("diff_b") != 0 || e.extra.count("b_norm") != 0) {
-        // a bias's delta is another place than the weight's product (the DiTs add their biases there): not applied
-        err = "the image engine: " + e.key +
-              ": a bias diff (diff_b/b_norm): the engine applies a weight's delta, not a bias's yet";
-        return false;
+    // a bias's delta (ComfyUI's "diff" patch of the weight's bias), beside or instead of the weight's own
+    const auto bias_to_gpu = [&]() -> bool {
+        if (e.bias.empty()) return true;
+        if ((int64_t) e.bias.size() != e.rows) {
+            err = "the image engine: " + e.key + ": a bias's delta is " + std::to_string(e.bias.size()) +
+                  " values, not the weight's " + std::to_string(e.rows) + " rows";
+            return false;
+        }
+        if (!strata::gpu::alloc_device(&bias_, e.bias.size() * 4)) {
+            err = "the image engine: the adapter " + e.key + "'s bias on the GPU: " + strata::gpu::last_error();
+            return false;
+        }
+        strata::gpu::copy_async(bias_, e.bias.data(), e.bias.size() * 4, stream);
+        if (!strata::gpu::stream_sync(stream)) {
+            err = "the image engine: the adapter " + e.key + "'s bias to the GPU: " + strata::gpu::last_error();
+            return false;
+        }
+        bytes_ += (uint64_t) e.bias.size() * 4;
+        return true;
+    };
+    if (e.kind == LoraKind::bias) {   // a bias's delta alone: nothing of the weight's
+        if (e.rows <= 0 || e.cols != 0) {
+            err = "the image engine: " + e.key + ": a bias's delta alone is " + std::to_string(e.rows) + " values";
+            return false;
+        }
+        if (row_coef != nullptr) {
+            err = "the image engine: " + e.key + ": a DoRA (dora_scale) on a bias's delta";
+            return false;
+        }
+        rows_ = e.rows;
+        if (!bias_to_gpu()) {
+            release();
+            return false;
+        }
+        return true;
     }
     if (e.kind == LoraKind::diff || e.kind == LoraKind::loha) {
         if (row_coef != nullptr) {
@@ -915,6 +986,10 @@ bool LoraDeviceEntry::upload(const LoraEntry& e, void* stream, std::string& err,
             return false;
         }
         bytes_ = (uint64_t) delta->size() * 2;
+        if (!bias_to_gpu()) {
+            release();
+            return false;
+        }
         return true;
     }
     if (e.kind == LoraKind::lokr) {
@@ -950,6 +1025,10 @@ bool LoraDeviceEntry::upload(const LoraEntry& e, void* stream, std::string& err,
             return false;
         }
         bytes_ = (uint64_t) (h1.size() + h2.size()) * 2;
+        if (!bias_to_gpu()) {
+            release();
+            return false;
+        }
         return true;
     }
     if (e.kind != LoraKind::lora) {
@@ -992,6 +1071,10 @@ bool LoraDeviceEntry::upload(const LoraEntry& e, void* stream, std::string& err,
         return false;
     }
     bytes_ = (uint64_t) (e.a.size() + e.b.size()) * 2;
+    if (!bias_to_gpu()) {
+        release();
+        return false;
+    }
     return true;
 }
 
@@ -1015,6 +1098,15 @@ void LoraDeviceEntry::add(const uint16_t* x16, int64_t T, float* y, int64_t ldy,
     q.parallel_for(sycl::range<1>((size_t) (T * rank_)),
                    lora_kernels::ScaleRows{tmp_f32, scale, row_scale, rank_, tmp16});
     gemm.f16(tmp16, b_ + src_row * rank_, y + row0, T, n, rank_, ldy, false, true);   // y[:, row0 ..] += t16 . B^T
+}
+
+void LoraDeviceEntry::add_bias(float* y, int64_t T, int64_t ldy, int64_t src_row, int64_t row0, int64_t n,
+                               float scale, void* stream) const {
+    if (bias_ == nullptr || T <= 0 || n <= 0 || scale == 0.0f) return;
+    if (src_row < 0 || src_row + n > rows_) return;   // the caller keeps the rows within the entry
+    if (ldy <= 0) ldy = n;
+    sycl::queue& q = strata::core::Runtime::get().stream(stream);
+    q.parallel_for(sycl::range<1>((size_t) (T * n)), lora_kernels::AddBias{bias_, scale, y, ldy, src_row, row0, n});
 }
 
 void LoraDeviceEntry::add_diff(const uint16_t* x16, int64_t T, float* y, int64_t ldy, int64_t src_row, int64_t row0,
@@ -1103,10 +1195,13 @@ void LoraLayer::add(const uint16_t* x16, int64_t T, float* y, int64_t ldy, int64
         if (b <= a) continue;
         p.entry->add(x16, T, y, ldy, p.src_row + (a - p.row0), a - w_row0, b - a, p.scale, row_scale, gemm, tmp_f32,
                      tmp16, stream);
+        if (p.entry->has_bias())   // the bias's delta, where the DiT adds the weight's own bias
+            p.entry->add_bias(y, T, ldy, p.src_row + (a - p.row0), a - w_row0, b - a, p.bias_scale, stream);
     }
 }
 
 int64_t lora_scratch_cols(const LoraEntry& e) {
+    if (e.kind == LoraKind::bias) return 0;                                    // no weight's product: no scratch
     if (e.kind == LoraKind::lokr) return e.lokr.empty() ? 0 : e.lokr.in_m * e.lokr.out_k;
     if (e.kind == LoraKind::diff || e.kind == LoraKind::loha) return e.cols;   // a scaled input's rows: the weight's
                                                                               // columns
@@ -1125,8 +1220,9 @@ uint64_t lora_gpu_bytes(const std::vector<LoraUse>& loras, int64_t T) {
                 bytes += 2 * (uint64_t) (e.lokr.out_l * e.lokr.in_m + e.lokr.out_k * e.lokr.in_n);   // w1 and w2
             else if ((e.kind == LoraKind::diff || e.kind == LoraKind::loha) && e.rows > 0 && e.cols > 0)
                 bytes += 2 * (uint64_t) e.rows * (uint64_t) e.cols;   // the whole delta (a LoHa's, made at the bind)
-            else
+            else if (e.kind != LoraKind::bias)
                 continue;
+            if (!e.bias.empty()) bytes += (uint64_t) e.rows * 4;   // the bias's delta, FP32
             if (!e.dora.empty()) bytes += (uint64_t) e.rows * 4;   // the base product's rows' factors
             cols = std::max(cols, lora_scratch_cols(e));
         }

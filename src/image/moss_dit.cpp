@@ -707,45 +707,45 @@ std::vector<MossDit::LoraTarget> MossDit::lora_targets() const {
 
 void MossDit::build_lora_targets() {
     lora_slots_.clear();
-    auto add = [this](std::string name, W& w, int64_t row0, int64_t rows, int64_t src_row) {
+    auto add = [this](std::string name, W& w, int64_t row0, int64_t rows, int64_t src_row, bool biased) {
         if (w.n <= 0 || w.k <= 0 || rows <= 0 || row0 + rows > w.n) return;
-        lora_slots_.push_back({std::move(name), &w, row0, rows, src_row});
+        lora_slots_.push_back({std::move(name), &w, row0, rows, src_row, biased});
     };
     // the weights outside the blocks (the norms are norms, not linear products: unchanged)
-    add("video_embedder", vin_, 0, vin_.n, 0);
-    add("time_embedding.0", t1_, 0, t1_.n, 0);
-    add("time_embedding.2", t2_, 0, t2_.n, 0);
-    add("shared_block_modulation", smod_, 0, smod_.n, 0);
-    add("video_head_modulation", hmod_, 0, hmod_.n, 0);
-    add("final_linear_video", fout_, 0, fout_.n, 0);
+    add("video_embedder", vin_, 0, vin_.n, 0, true);
+    add("time_embedding.0", t1_, 0, t1_.n, 0, true);
+    add("time_embedding.2", t2_, 0, t2_.n, 0, true);
+    add("shared_block_modulation", smod_, 0, smod_.n, 0, true);
+    add("video_head_modulation", hmod_, 0, hmod_.n, 0, true);
+    add("final_linear_video", fout_, 0, fout_.n, 0, false);
     // the text embedder: its projection and its blocks.  Its q, k and v rows are three weights on the GPU (b.q, b.k,
     // b.v) out of one qkv on the file's side (q the entry's rows [0, C), k [C, 2C), v [2C, 3C)); ffn_up and ffn_gate
-    // are the two halves of the one [up | gate] the products take.
-    add("text_embedder.proj", tproj_, 0, tproj_.n, 0);
+    // are the two halves of the one [up | gate] the products take.  These products add biases; the blocks' below do not.
+    add("text_embedder.proj", tproj_, 0, tproj_.n, 0, true);
     for (int i = 0; i < (int) tblocks_.size(); ++i) {
         const std::string p = "text_embedder.blocks." + std::to_string(i) + ".";
         TextBlock& b = tblocks_[(size_t) i];
-        add(p + "qkv", b.q, 0, b.q.n, 0);
-        add(p + "qkv", b.k, 0, b.k.n, b.q.n);
-        add(p + "qkv", b.v, 0, b.v.n, b.q.n + b.k.n);
-        add(p + "proj", b.o, 0, b.o.n, 0);
-        add(p + "ffn_up_gate", b.up_gate, 0, b.up_gate.n, 0);
-        add(p + "ffn_up", b.up_gate, 0, b.up_gate.n / 2, 0);
-        add(p + "ffn_gate", b.up_gate, b.up_gate.n / 2, b.up_gate.n / 2, 0);
-        add(p + "ffn_down", b.down, 0, b.down.n, 0);
+        add(p + "qkv", b.q, 0, b.q.n, 0, true);
+        add(p + "qkv", b.k, 0, b.k.n, b.q.n, true);
+        add(p + "qkv", b.v, 0, b.v.n, b.q.n + b.k.n, true);
+        add(p + "proj", b.o, 0, b.o.n, 0, true);
+        add(p + "ffn_up_gate", b.up_gate, 0, b.up_gate.n, 0, true);
+        add(p + "ffn_up", b.up_gate, 0, b.up_gate.n / 2, 0, true);
+        add(p + "ffn_gate", b.up_gate, b.up_gate.n / 2, b.up_gate.n / 2, 0, true);
+        add(p + "ffn_down", b.down, 0, b.down.n, 0, true);
     }
     // the 42 blocks: proj.q, proj.k, proj.v, proj.o, the [up | gate] of proj.ffn_up_gate, proj.ffn_down
     for (int bi = 0; bi < (int) blocks_.size(); ++bi) {
         const std::string p = "layers." + std::to_string(bi) + ".proj.";
         Block& b = blocks_[(size_t) bi];
-        add(p + "q", b.q, 0, b.q.n, 0);
-        add(p + "k", b.k, 0, b.k.n, 0);
-        add(p + "v", b.v, 0, b.v.n, 0);
-        add(p + "o", b.o, 0, b.o.n, 0);
-        add(p + "ffn_up_gate", b.up_gate, 0, b.up_gate.n, 0);
-        add(p + "ffn_up", b.up_gate, 0, b.up_gate.n / 2, 0);
-        add(p + "ffn_gate", b.up_gate, b.up_gate.n / 2, b.up_gate.n / 2, 0);
-        add(p + "ffn_down", b.down, 0, b.down.n, 0);
+        add(p + "q", b.q, 0, b.q.n, 0, false);
+        add(p + "k", b.k, 0, b.k.n, 0, false);
+        add(p + "v", b.v, 0, b.v.n, 0, false);
+        add(p + "o", b.o, 0, b.o.n, 0, false);
+        add(p + "ffn_up_gate", b.up_gate, 0, b.up_gate.n, 0, false);
+        add(p + "ffn_up", b.up_gate, 0, b.up_gate.n / 2, 0, false);
+        add(p + "ffn_gate", b.up_gate, b.up_gate.n / 2, b.up_gate.n / 2, 0, false);
+        add(p + "ffn_down", b.down, 0, b.down.n, 0, false);
     }
 }
 
@@ -796,15 +796,33 @@ bool MossDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
             }
             int64_t rows = 0;   // the entry's rows the weight takes
             for (const LoraSlot* s : slots) rows = std::max(rows, s->src_row + s->rows);
-            if (e.rows != rows || e.cols != slots[0]->w->k) {
+            if (e.kind == LoraKind::bias) {   // a bias's delta alone: its rows are the bias's, its columns none
+                if (e.rows != rows) {
+                    err = "image engine: " + u.file->path() + ": " + e.key + ": a bias's delta (diff_b/b_norm) of " +
+                          std::to_string(e.rows) + " values, not the weight's " + std::to_string(rows) + " rows";
+                    drop_loras();
+                    return false;
+                }
+            } else if (e.rows != rows || e.cols != slots[0]->w->k) {
                 err = "image engine: " + u.file->path() + ": " + e.key + " is " + std::to_string(e.cols) + " x " +
                       std::to_string(e.rows) + ", not the DiT's " + std::to_string(slots[0]->w->k) + " x " +
                       std::to_string(rows);
                 drop_loras();
                 return false;
             }
+            if (!e.bias.empty()) {   // a bias's delta is added where the weight adds its bias: the weight must have one
+                for (const LoraSlot* s : slots)
+                    if (!s->biased) {
+                        err = "image engine: " + u.file->path() + ": " + e.key +
+                              ": a bias's delta (diff_b/b_norm), and the DiT's weight adds no bias (its block's "
+                              "modulation does the shift)";
+                        drop_loras();
+                        return false;
+                    }
+            }
             const float scale = u.scale * e.scale();
-            if (scale == 0.0f) continue;   // a strength of 0 changes nothing: the weight keeps its product's path
+            // a strength of 0 changes nothing: the weight keeps its product's path (an alpha of 0 leaves the bias's)
+            if (scale == 0.0f && (e.bias.empty() || u.scale == 0.0f)) continue;
             // a DoRA's: the entry's rows' delta factors (its B's, by the entry's rows), and each part's base factors
             const bool dora = !e.dora.empty();
             std::vector<float> coef((size_t) e.rows, 1.0f);
@@ -858,6 +876,7 @@ bool MossDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                 part.n = slot->rows;
                 part.src_row = slot->src_row;
                 part.scale = scale;
+                part.bias_scale = u.scale;   // a diff patch has no alpha: the request's strength only
                 part.dora = dora;
                 part.base = std::move(bases[i]);
                 slot->w->lora->parts.push_back(std::move(part));

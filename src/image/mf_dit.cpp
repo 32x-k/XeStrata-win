@@ -772,7 +772,14 @@ bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                 unknown.push_back(e.key);
                 continue;
             }
-            if (e.rows != slot->rows || e.cols != slot->w->k) {
+            if (e.kind == LoraKind::bias) {   // a bias's delta alone: its rows are the bias's, its columns none
+                if (e.rows != slot->rows) {
+                    err = "image engine: " + u.file->path() + ": " + e.key + ": a bias's delta (diff_b/b_norm) of " +
+                          std::to_string(e.rows) + " values, not the weight's " + std::to_string(slot->rows) + " rows";
+                    drop_loras();
+                    return false;
+                }
+            } else if (e.rows != slot->rows || e.cols != slot->w->k) {
                 err = "image engine: " + u.file->path() + ": " + e.key + " is " + std::to_string(e.cols) + " x " +
                       std::to_string(e.rows) + ", not the DiT's " + std::to_string(slot->w->k) + " x " +
                       std::to_string(slot->rows);
@@ -786,7 +793,8 @@ bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                 return false;
             }
             const float scale = u.scale * e.scale();
-            if (scale == 0.0f) continue;   // a strength of 0 changes nothing: the weight keeps its product's path
+            // a strength of 0 changes nothing: the weight keeps its product's path (an alpha of 0 leaves the bias's)
+            if (scale == 0.0f && (e.bias.empty() || u.scale == 0.0f)) continue;
             std::vector<float> coef, base;   // a DoRA's: the delta's rows' c, the base product's factors
             if (!e.dora.empty()) {
                 std::vector<float> norms;
@@ -830,6 +838,7 @@ bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
             part.n = slot->rows;
             part.src_row = slot->src_row;
             part.scale = scale;
+            part.bias_scale = u.scale;   // a diff patch has no alpha: the request's strength only
             part.dora = !coef.empty();
             part.base = std::move(base);
             slot->w->lora->parts.push_back(std::move(part));

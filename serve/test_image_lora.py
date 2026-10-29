@@ -89,7 +89,8 @@ def qwen_lora(rank: int = 4, blocks: tuple[int, ...] = (0, 1), prefix: str = "tr
 
 
 def mage_lora(rank: int = 4, blocks: tuple[int, ...] = (0, 1),
-              prefix: str = "diffusion_model.") -> dict[str, tuple[int, ...]]:
+              prefix: str = "diffusion_model.",
+              extra: dict[str, tuple[int, ...]] | None = None) -> dict[str, tuple[int, ...]]:
     """Mage-Flow's adapter's tensors, as ai-toolkit's mageflow form and ComfyUI's saves name them
     (transformer_blocks.N.attn.to_q and the like), at `rank` and that prefix."""
     out: dict[str, tuple[int, ...]] = {}
@@ -99,6 +100,7 @@ def mage_lora(rank: int = 4, blocks: tuple[int, ...] = (0, 1),
                                  ("img_mod.1", 256, 1536)):
             out[f"{prefix}transformer_blocks.{b}.{name}.lora_A.weight"] = (rank, cols)
             out[f"{prefix}transformer_blocks.{b}.{name}.lora_B.weight"] = (rows, rank)
+    out.update(extra or {})
     return out
 
 
@@ -217,12 +219,13 @@ class Listing(Tree):
         self.assertIn("convolution's kernel", f.skipped["kernel"])
         self.assertEqual(loras.field([{"name": "loha", "scale": 0.7}], f)[0]["scale"], 0.7)
 
-    def test_a_whole_delta_is_listed_and_a_bias_diff_is_not(self):
+    def test_a_whole_delta_is_listed_and_this_models_bias_delta_is_not(self):
         b = "transformer.transformer_blocks.0."
         safetensors(self.d / "diff.safetensors", {
             b + "attn.to_q.diff": (256, 256), b + "img_mlp.out.diff": (256, 512)})
         safetensors(self.d / "set.safetensors", {b + "attn.to_q.set_weight": (256, 256)})
         safetensors(self.d / "norm.safetensors", {b + "attn.to_q.w_norm": (256, 256)})
+        # Qwen-Image-2.1's DiT weights add no bias: its file's bias's delta has no place, and the engine refuses it
         safetensors(self.d / "bias.safetensors", {
             b + "attn.to_q.diff": (256, 256), b + "attn.to_q.diff_b": (256,)})
         safetensors(self.d / "bias-only.safetensors", {b + "attn.to_q.diff_b": (256,)})
@@ -231,9 +234,39 @@ class Listing(Tree):
         diff = [e for e in f.listing() if e["name"] == "diff"][0]
         self.assertEqual(diff["targets"], ["attn.to_q", "img_mlp.out"])
         self.assertEqual(diff["rank"], 0, "a whole delta has no rank")
-        self.assertIn("bias diff", f.skipped["bias"], "a bias's delta beside the weight's is refused, not sent")
-        self.assertIn("bias diff", f.skipped["bias-only"])
+        self.assertIn("adds no bias", f.skipped["bias"], "the model's weights have no bias to add it beside")
+        self.assertIn("adds no bias", f.skipped["bias-only"])
         self.assertEqual(loras.field([{"name": "set", "scale": 0.7}], f)[0]["scale"], 0.7)
+
+    def test_a_bias_delta_is_listed_where_the_weight_adds_a_bias(self):
+        # Mage-Flow's DiT: every weight of the table has a bias, so a file may hold one beside a LoRA's or alone
+        b = "diffusion_model.transformer_blocks.0."
+        safetensors(self.d / "with.safetensors", mage_lora(extra={
+            b + "attn.to_q.diff_b": (256,), b + "img_mod.1.diff_b": (1536,)}))
+        safetensors(self.d / "alone.safetensors", {b + "attn.to_q.diff_b": (256,)})
+        safetensors(self.d / "norm.safetensors", {   # b_norm beside the weight's w_norm: the same bias's patch
+            b + "attn.to_q.w_norm": (256, 256), b + "attn.to_q.b_norm": (256,)})
+        safetensors(self.d / "loose.safetensors", {   # b_norm without w_norm: ComfyUI reads it beside w_norm only
+            b + "attn.to_q.b_norm": (256,)})
+        f = self.folder("mage-flow")
+        self.assertEqual([e["name"] for e in f.listing()], ["alone", "norm", "with"], f.skipped)
+        listed = {e["name"]: e for e in f.listing()}
+        self.assertEqual(listed["alone"]["targets"], ["attn.to_q"])
+        self.assertEqual(listed["alone"]["rank"], 0, "a bias's delta alone changes no weight")
+        self.assertIn("img_mod.1", listed["with"]["targets"], "the file's other tensors are its rank's")
+        self.assertEqual(listed["norm"]["targets"], ["attn.to_q"])
+        self.assertIn("w_norm", f.skipped["loose"])
+
+    def test_a_moss_images_bias_delta_and_the_blocks_that_add_none(self):
+        # MOSS-Image: its text embedder and the weights outside the blocks add biases; the 42 blocks' shift is their
+        # modulation's, and the engine refuses a bias's delta there
+        safetensors(self.d / "text.safetensors", {
+            "transformer.text_embedder.blocks.0.qkv.diff_b": (384,)})
+        safetensors(self.d / "block.safetensors", {"transformer.layers.0.proj.q.diff_b": (128,)})
+        f = self.folder("moss-image")
+        self.assertEqual([e["name"] for e in f.listing()], ["text"], f.skipped)
+        self.assertEqual(f.listing()[0]["targets"], ["qkv"])
+        self.assertIn("adds no bias", f.skipped["block"])
 
     def test_another_models_file_and_the_forms_not_applied_are_left_out(self):
         self.qwen("qwen")

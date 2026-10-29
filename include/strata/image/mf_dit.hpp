@@ -192,7 +192,8 @@ private:
                  b_imlp1 = 0, b_imlp2 = 0, b_tmlp1 = 0, b_tmlp2 = 0;   // the FP32 biases' offsets
         uint64_t nq = 0, nk = 0, ntq = 0, ntk = 0;                     // the FP32 q / k norms' offsets
     };
-    /// A weight and the rows of a file's entry it takes.
+    /// A weight and the rows of a file's entry it takes (Mage-Flow's DiT has no fused or split weight: one name is one
+    /// weight, all of them with a bias, which an entry's bias's delta is added beside).
     struct LoraSlot {
         std::string name;
         W* w = nullptr;

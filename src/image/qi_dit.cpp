@@ -918,6 +918,15 @@ bool QiDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                 unknown.push_back(e.key);
                 continue;
             }
+            if (e.kind == LoraKind::bias || !e.bias.empty()) {
+                // no place for it: the DiT's products add no bias (its blocks' modulation does the shift), so a file's
+                // bias's delta would change nothing while it was asked for
+                err = "image engine: " + u.file->path() + ": " + e.key +
+                      ": a bias's delta (diff_b/b_norm), and the DiT's weights add no bias (Qwen-Image-2.1's DiT has "
+                      "none)";
+                drop_loras();
+                return false;
+            }
             if (e.rows != slot->rows || e.cols != slot->w->k) {
                 err = "image engine: " + u.file->path() + ": " + e.key + " is " + std::to_string(e.cols) + " x " +
                       std::to_string(e.rows) + ", not the DiT's " + std::to_string(slot->w->k) + " x " +

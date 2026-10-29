@@ -10,8 +10,10 @@ is one the DiT's products take (TARGETS: the names of qi_dit.cpp's, moss_dit.cpp
 build_lora_targets, written here a second time; the record's check sets them against the probe's `map` on the models,
 name for name), in a form the engine applies today: a plain LoRA, LoKr or LoHa (a DoRA: a plain LoRA with a
 dora_scale over the weight's rows, ComfyUI's weight_decompose), or a whole weight's difference (diff, set_weight,
-w_norm), and no GLoRA, OFT or text encoder's weight.  The engine refuses those when it binds a set (QiDit::set_loras,
-MossDit::set_loras, MfDit::set_loras), so no image is made with part of a file.
+w_norm), and no GLoRA, OFT or text encoder's weight.  A bias's delta (diff_b, or b_norm beside w_norm) goes with any of
+them or alone, where the weight adds a bias of its own (BIASED: Mage-Flow's DiT's weights all do; MOSS-Image's outside
+its blocks and in its text embedder; Qwen-Image-2.1's none).  The engine refuses the forms it applies not when it binds
+a set (QiDit::set_loras, MossDit::set_loras, MfDit::set_loras), so no image is made with part of a file.
 
 A listing entry - ImageGen.defaults' "loras" (the engine's capabilities: /health's image_defaults and image_models,
 /v1/models' image model):
@@ -86,6 +88,17 @@ TARGETS: dict[str, tuple[str, ...]] = {
     "mage-flow": (_MAGE_OUTSIDE + tuple("transformer_blocks.{b}." + n for n in _MAGE_BLOCKS)),
 }
 
+# The weights that add a bias of their own, where a bias's delta (diff_b, or b_norm beside w_norm) goes: Mage-Flow's
+# DiT adds one under every product, MOSS-Image's outside the blocks and in its text embedder (the 42 blocks' shift is
+# their modulation's), and Qwen-Image-2.1's DiT has none (the engine refuses a bias's delta for it).
+_BIASED_NAMES: dict[str, tuple[str, ...]] = {
+    "qwen-image": (),
+    "moss-image": ("video_embedder", "time_embedding.0", "time_embedding.2", "shared_block_modulation",
+                   "video_head_modulation", "text_embedder.proj") + tuple(
+                       "text_embedder.blocks.{b}." + n for n in _MOSS_TEXT_BLOCKS),
+    "mage-flow": TARGETS["mage-flow"],
+}
+
 
 def _target_pattern(name: str) -> re.Pattern[str]:
     """A TARGETS name as the pattern a file's key is matched with ("{b}" a block's number)."""
@@ -93,6 +106,7 @@ def _target_pattern(name: str) -> re.Pattern[str]:
 
 
 _MATCH = {family: tuple(_target_pattern(n) for n in names) for family, names in TARGETS.items()}
+_BIASED = {family: tuple(_target_pattern(n) for n in names) for family, names in _BIASED_NAMES.items()}
 
 # A file's key -> the DiT's weight and the tensor's role, as the engine reads them (src/image/image_lora.cpp's
 # split_key): the longest prefix first, ".weight" off every form but PEFT's bare lora_A and lora_B, then the role's
@@ -441,16 +455,31 @@ class Folder:
         targets: set[str] = set()
         rank = 0
         for key, roles in sorted(weights.items()):
-            if "diff_b" in roles or "b_norm" in roles:
-                # a bias's delta: the engine binds a weight's delta and adds a bias nowhere: refused, with the key
-                return f"{key}: a bias diff (diff_b/b_norm), which the image engine does not apply yet"
-            form = form_of(roles)
-            if form not in ("lora", "lokr", "loha", "diff"):
-                return f"{key}: a {form or 'non-LoRA'} adapter, which the image engine applies not yet"
-            if "dora_scale" in roles and form != "lora":
-                return f"{key}: a DoRA (dora_scale) on a {form} adapter, which the image engine applies not yet"
             if is_text_encoder(key):
                 return f"{key}: a text encoder's weight, which the image engine applies not yet"
+            # a bias's delta (ComfyUI's .diff_b, or .b_norm beside the weight's w_norm, which .diff_b overrides): the
+            # engine adds it where the DiT adds the weight's own bias, and only the weights that add one take it
+            bias = roles.get("diff_b", roles.get("b_norm"))
+            if bias is not None:
+                if len(bias) != 1:
+                    return f"{key}: a bias's delta (diff_b/b_norm) must be the bias's vector"
+                if "diff_b" not in roles and "w_norm" not in roles:
+                    return (f"{key}: a bias's delta (b_norm) without the weight's w_norm, beside which ComfyUI's "
+                            f"load_lora reads it")
+                if not any(m.match(key) for m in _BIASED[self.family]):
+                    return f"{key}: a bias's delta (diff_b/b_norm), and this model's weight adds no bias"
+            form = form_of(roles)
+            if not form:
+                if bias is None:
+                    return f"{key}: a non-LoRA adapter, which the image engine applies not yet"
+                if not any(m.match(key) for m in _MATCH[self.family]):   # a bias's delta alone: it changes no weight
+                    return f"{key} is not one of this image model's weights"
+                targets.add(kind_of(key))
+                continue
+            if form not in ("lora", "lokr", "loha", "diff"):
+                return f"{key}: a {form} adapter, which the image engine applies not yet"
+            if "dora_scale" in roles and form != "lora":
+                return f"{key}: a DoRA (dora_scale) on a {form} adapter, which the image engine applies not yet"
             if not any(m.match(key) for m in _MATCH[self.family]):
                 return f"{key} is not one of this image model's weights"
             if form == "diff":
@@ -459,36 +488,31 @@ class Folder:
                 whole = roles.get("set_weight", roles.get("diff", roles.get("w_norm")))
                 if whole is None or len(whole) != 2:
                     return f"{key}: a whole delta (diff/set_weight) must be the weight's matrix"
-                targets.add(kind_of(key))
-                continue
-            if form == "lokr":
+            elif form == "lokr":
                 r, why = _lokr_rank(roles)
                 if why:
                     return f"{key}: {why}"
                 rank = max(rank, r)
-                targets.add(kind_of(key))
-                continue
-            if form == "loha":
+            elif form == "loha":
                 r, why = _loha_rank(roles)
                 if why:
                     return f"{key}: {why}"
                 rank = max(rank, r)
-                targets.add(kind_of(key))
-                continue
-            a, b = roles.get("lora_A"), roles.get("lora_B")
-            if a is None or b is None:
-                return f"{key}: a LoRA weight needs both lora_A (down) and lora_B (up)"
-            if len(a) != 2 or len(b) != 2:
-                return f"{key}: lora_A and lora_B must be matrices"
-            if b[1] != a[0]:
-                return f"{key}: lora_B is {b[0]} x {b[1]}, not the rank its lora_A has ({a[0]})"
-            if "dora_scale" in roles and tuple(roles["dora_scale"]) != (b[0],):
-                # the engine's DoRA scales the weight's output rows, c = dora_scale / (|W| a row + eps)
-                if tuple(roles["dora_scale"]) == (a[1],):
-                    return (f"{key}: a DoRA (dora_scale) over the weight's columns, which the engine's DoRA does "
-                            f"not take (it scales a product's rows)")
-                return f"{key}: dora_scale is neither the weight's rows nor its columns"
-            rank = max(rank, a[0])
+            else:
+                a, b = roles.get("lora_A"), roles.get("lora_B")
+                if a is None or b is None:
+                    return f"{key}: a LoRA weight needs both lora_A (down) and lora_B (up)"
+                if len(a) != 2 or len(b) != 2:
+                    return f"{key}: lora_A and lora_B must be matrices"
+                if b[1] != a[0]:
+                    return f"{key}: lora_B is {b[0]} x {b[1]}, not the rank its lora_A has ({a[0]})"
+                if "dora_scale" in roles and tuple(roles["dora_scale"]) != (b[0],):
+                    # the engine's DoRA scales the weight's output rows, c = dora_scale / (|W| a row + eps)
+                    if tuple(roles["dora_scale"]) == (a[1],):
+                        return (f"{key}: a DoRA (dora_scale) over the weight's columns, which the engine's DoRA "
+                                f"does not take (it scales a product's rows)")
+                    return f"{key}: dora_scale is neither the weight's rows nor its columns"
+                rank = max(rank, a[0])
             targets.add(kind_of(key))
         return {"name": name, "path": rel, "rank": rank, "scale": _recommended(meta), "trigger": _trigger(meta),
                 "targets": sorted(targets), "size_mib": round(path.stat().st_size / 1048576, 1)}

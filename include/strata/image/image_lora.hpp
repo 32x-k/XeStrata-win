@@ -25,6 +25,11 @@
 // is ComfyUI's replacement and 0 leaves the weight as it was.  A LoHa's is the same kind of delta, made from its four
 // factors when it is bound ((w1a . w1b) * (w2a . w2b), comfy/weight_adapter/loha.py) rather than kept: the weight's
 // size is not held on the host a second time, the file's tensors are a few MiB.
+//
+// A bias's delta (x.diff_b, or x.b_norm beside the weight's w_norm) is the second patch comfy/lora.py writes for one
+// key, on the weight's bias: b' = b + s * Db, the request's strength only - a diff patch has no alpha - added where
+// the DiT adds the weight's bias (after the product's row scales and whatever its own bias's value is).  A file may
+// hold one alone (LoraKind::bias: it changes no weight) or beside the weight's own delta.
 #pragma once
 
 #include <cstdint>
@@ -51,6 +56,7 @@ enum class LoraKind : int {
     glora = 3,  // a1/a2/b1/b2
     oft = 4,    // oft_blocks: the output's rows turned by a block-diagonal orthogonal matrix (BOFT: 4 dimensions)
     diff = 5,   // a whole delta (.diff, .set_weight, .w_norm): y += scale * x Delta^T
+    bias = 6,   // a bias's delta alone (.diff_b, .b_norm): y += scale * Db, no weight changed
 };
 
 /// The kind's name, as the reports and the errors write it.
@@ -88,6 +94,8 @@ struct LoraEntry {
     bool replaces = false;            // the delta is a set_weight's (the weight it sets), not a value added to it
     std::vector<float> dora;          // dora_scale (DoRA): over the rows, else over the columns
     bool dora_over_rows = true;
+    std::vector<float> bias;          // a bias's delta (.diff_b/.b_norm): `rows` values, FP32; empty: none.  A
+                                      // LoraKind::bias entry's whole delta is this (its `cols` is 0)
     std::map<std::string, std::vector<float>> extra;   // the other forms' tensors, FP32, by role
     std::map<std::string, std::vector<int64_t>> shapes;   // their shapes, the file's order
 };
@@ -156,13 +164,20 @@ public:
     /// [src_row, src_row + n) into the weight's rows [row0, row0 + n) (a fused weight's half, or the whole).  An
     /// LoKr's rows are its Kronecker product's; the delta is the same product's, its own way.  A whole delta's (and a
     /// LoHa's, its factors' product made when it was uploaded) is scale * (x16[t] Delta^T) over the entry's rows, the
-    /// input scaled into `tmp16` (T * cols values) where the strength is not 1 or a row scale is passed.  A W8A8 product's output is its weights' and activations'
-    /// scales applied (no row scale of the input): `row_scale` (null: none) is the input rows' scale, which the base
-    /// product's sum does not carry and this delta must.  `tmp_f32` and `tmp16` hold T * lora_scratch_cols(e) values
-    /// each (grown by the caller).
+    /// input scaled into `tmp16` (T * cols values) where the strength is not 1 or a row scale is passed.  A W8A8
+    /// product's output is its weights' and activations' scales applied (no row scale of the input): `row_scale`
+    /// (null: none) is the input rows' scale, which the base product's sum does not carry and this delta must.
+    /// `tmp_f32` and `tmp16` hold T * lora_scratch_cols(e) values each (grown by the caller).
     void add(const uint16_t* x16, int64_t T, float* y, int64_t ldy, int64_t src_row, int64_t row0, int64_t n,
              float scale, const float* row_scale, prefill::Gemm& gemm, float* tmp_f32, uint16_t* tmp16,
              void* stream) const;
+
+    /// y[t][row0 + c] (row stride ldy) += scale * bias[src_row + c], t < T: the bias's delta (ComfyUI's "diff"
+    /// patch of the weight's bias), added where the DiT adds the weight's own bias.  No bias: nothing.  A
+    /// LoraKind::bias entry has no weight's delta: this is its whole patch.
+    void add_bias(float* y, int64_t T, int64_t ldy, int64_t src_row, int64_t row0, int64_t n, float scale,
+                  void* stream) const;
+    bool has_bias() const { return bias_ != nullptr; }
 
 private:
     void add_lokr(const uint16_t* x16, int64_t T, float* y, int64_t ldy, int64_t src_row, int64_t row0, int64_t n,
@@ -176,6 +191,7 @@ private:
     uint16_t* w1_ = nullptr;  // lokr: w1 [out_l][in_m]
     uint16_t* w2_ = nullptr;  // lokr: w2 [out_k][in_n]
     uint16_t* diff_ = nullptr;   // diff: Delta [rows][cols]
+    float* bias_ = nullptr;      // a bias's delta [rows], FP32
     LokrShape lokr_;
     int64_t rank_ = 0, cols_ = 0, rows_ = 0;
     uint64_t bytes_ = 0;
@@ -187,6 +203,7 @@ struct LoraPart {
     std::shared_ptr<const LoraDeviceEntry> entry;
     int64_t row0 = 0, n = 0, src_row = 0;
     float scale = 1.0f;
+    float bias_scale = 0.0f;   // the entry's bias's delta (none: 0), times the request's strength only (no alpha)
     bool dora = false;   // a DoRA's: its base factors are c's, which the weight's other patches do not know
     /// DoRA: the base product's factor of each of the part's rows, 1 + strength (c - 1); a set_weight's: 1 - the
     /// strength.  Empty: the rows as the weight has them.  A row of the weight takes one part's factors.
@@ -211,8 +228,8 @@ public:
     bool has_base() const { return base_ != nullptr; }
     const float* base() const { return base_; }
 
-    /// y[t][ldy] += the parts that cover the weight's rows [w_row0, w_row0 + w_rows), each into its own rows there.
-    /// `tmp_f32` and `tmp16` hold T * rank values each (grown by the caller).
+    /// y[t][ldy] += the parts that cover the weight's rows [w_row0, w_row0 + w_rows), each into its own rows there,
+    /// and the parts' bias deltas.  `tmp_f32` and `tmp16` hold T * rank values each (grown by the caller).
     void add(const uint16_t* x16, int64_t T, float* y, int64_t ldy, int64_t w_row0, int64_t w_rows,
              const float* row_scale, prefill::Gemm& gemm, float* tmp_f32, uint16_t* tmp16, void* stream) const;
 

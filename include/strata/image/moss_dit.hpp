@@ -157,11 +157,13 @@ private:
         LoraLayer* lora = nullptr;   // the adapters' deltas for its products (null: none: the product is unchanged)
     };
     /// A weight and the rows of a file's entry it takes (a fused weight's range, or one of the three weights of the
-    /// text embedder's qkv split).
+    /// text embedder's qkv split).  `biased`: the weight adds a bias of its own rows, where an entry's bias's delta is
+    /// added (the MOSS-Image blocks' products add none: their modulation does the shift).
     struct LoraSlot {
         std::string name;
         W* w = nullptr;
         int64_t row0 = 0, rows = 0, src_row = 0;
+        bool biased = false;
     };
     struct Block {
         W q, k, v, o, up_gate, down;
