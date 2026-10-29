@@ -2730,8 +2730,26 @@ int main(int argc, char **argv) try {
         }
     }
     // the canonical Q2_0 pack's CPU kernels are AVX-512 only; a native pack runs on AVX2 CPUs as well
-    if (!native_pack) strata::kernels::cpu::cpu_require_expert_support();
-    else if (!strata::kernels::cpu::cpu_avx512_ok())
+    if (!native_pack) {
+        // #2347 (the CUDA engine has this too): a --pack folder without native_experts.txt is read as the canonical Q2_0 pack, whose CPU
+        // kernel needs AVX-512; on an AVX2 CPU (Ryzen 5000, Intel 12th-14th gen) that reads as "this CPU is too old" when the folder is
+        // simply not the native pack (a half-built pack, the wrong folder).  Say so before the refusal.
+        if (!strata::kernels::cpu::cpu_features().usable()) {
+            std::error_code ec;
+            const std::filesystem::path pk(o.pack);
+            std::fprintf(stderr, "strata generate: %s has no native_experts.txt, so it is read as the canonical Q2_0 "
+                                 "pack, whose CPU kernel needs AVX-512.\n"
+                                 "        An NVFP4, i-quant or Unsloth pack has that file in the folder given as --pack "
+                                 "and runs on an AVX2 CPU as well;\n",
+                         o.pack.c_str());
+            if (std::filesystem::exists(pk / "pack" / "native_experts.txt", ec))
+                std::fprintf(stderr, "        it is in %s: use that folder as --pack.\n", (pk / "pack").generic_string().c_str());
+            else
+                std::fprintf(stderr, "        if this is one of those packs, the folder is incomplete or the wrong one "
+                                     "(build it again with tools/iq_pack.py, or run setup again).\n");
+        }
+        strata::kernels::cpu::cpu_require_expert_support();
+    } else if (!strata::kernels::cpu::cpu_avx512_ok())
         std::fprintf(stderr, "strata generate: this CPU has no AVX-512: the expert kernels run on %s "
                              "(multi-token for the i-quant gate/up rows)\n",
                      !strata::kernels::cpu::cpu_avx2_ok() ? "ggml-cpu vec_dot (no AVX2: the older-CPU build)"
