@@ -8,7 +8,9 @@
 // it is), then grouped: one entry a weight, with the form it holds.  The DiT says which of its weights an entry
 // changes and over which rows (a fused weight such as Qwen-Image-2.1's img_mlp.gate_up takes a row range, or the
 // separate gate_layer and proj of diffusers' form).  The delta, for the plain form: y[t] += scale * (x[t] A^T) B^T,
-// A [rank][k] and B [n][rank], in FP16 with FP32 sums (LoraDeviceEntry::add).
+// A [rank][k] and B [n][rank], in FP16 with FP32 sums (LoraDeviceEntry::add).  LoKr's delta is its two factors'
+// Kronecker product, w1 [out_l][in_m] and w2 [out_k][in_n]: the input's rows read in in_m groups of in_n, w2's product
+// of each group, then w1's over the groups (the same two steps ComfyUI's adapter takes).
 #pragma once
 
 #include <cstdint>
@@ -36,16 +38,29 @@ enum class LoraKind : int {
 /// The kind's name, as the reports and the errors write it.
 const char* lora_kind_name(LoraKind k);
 
+/// LoKr's geometry: w1 [out_l][in_m] and w2 [out_k][in_n], the file's matrices or its two factors' products (in
+/// `extra`), the delta their Kronecker product is at the weight's rows out_l * out_k and input columns in_m * in_n.
+struct LokrShape {
+    int64_t out_l = 0;   // w1's rows
+    int64_t in_m = 0;    // w1's columns, the input's groups
+    int64_t out_k = 0;   // w2's rows
+    int64_t in_n = 0;    // w2's columns
+    bool empty() const { return out_l <= 0 || in_m <= 0 || out_k <= 0 || in_n <= 0; }
+};
+
 /// One weight's delta, on the host: the tensors the file gave, A and B in FP16 (half the RAM of FP32, which is what
-/// the GPU takes), the scales in FP32.  The other forms' tensors are kept in `extra` by their role (`lokr_w1`,
-/// `hada_w1_a`, `oft_blocks`, `diff`, ...) and FP32, for the forms the engine learns to apply.
+/// the GPU takes), the scales in FP32.  The other forms' tensors are kept in `extra` by their role (`hada_w1_a`,
+/// `oft_blocks`, `diff`, ...) and FP32, for the forms the engine learns to apply; a LoKr's materialized w1 and w2 are
+/// in `extra` under "lokr_w1" and "lokr_w2".
 struct LoraEntry {
     std::string key;                  // the DiT's name, e.g. "transformer_blocks.0.attn.to_q"
     LoraKind kind = LoraKind::lora;
     int64_t rows = 0, cols = 0, rank = 0;
     bool alpha_set = false;
     float alpha = 0.0f;               // from ".alpha" (ComfyUI's rule: none, 1.0)
-    /// alpha / rank, the file's own scale (the caller's strength multiplies it).
+    LokrShape lokr;                   // LoraKind::lokr: the factors' shape, `rows` and `cols` their product's
+    /// alpha / rank, the file's own scale (the caller's strength multiplies it).  LoKr's rank is the factorization's
+    /// (ComfyUI divides the file's alpha by it, and by nothing where both of its matrices are whole).
     float scale() const { return alpha_set && rank > 0 ? alpha / static_cast<float>(rank) : 1.0f; }
     std::vector<uint16_t> a, b;       // lora: a [rank][cols], b [rows][rank], row-major
     std::vector<float> dora;          // dora_scale (DoRA): over the rows, else over the columns
@@ -82,11 +97,16 @@ struct LoraUse {
     float scale = 1.0f;
 };
 
-/// The bytes the adapters take on the GPU: their entries' A and B (FP16), and the products' scratch of T rows (T times
-/// the largest rank, FP32 and FP16 each): what a request's budget puts beside the model.
+/// The bytes the adapters take on the GPU: their entries' tensors (FP16), and the products' scratch of T rows (T times
+/// the most values an entry's delta holds a row, FP32 and FP16 each): what a request's budget puts beside the model.
 uint64_t lora_gpu_bytes(const std::vector<LoraUse>& loras, int64_t T);
 
-/// One entry's A and B on the GPU (FP16), and the entry's delta applied to a product's output.
+/// The values an entry's delta holds for each row of the product's scratch (FP32): a plain LoRA's rank, LoKr's
+/// in_m * out_k (its product's intermediate [T][in_m][out_k]).  A DiT sizes its deltas' scratch by the largest.
+int64_t lora_scratch_cols(const LoraEntry& e);
+
+/// One entry's tensors on the GPU (FP16: a plain LoRA's A and B, a LoKr's w1 and w2), and the entry's delta applied
+/// to a product's output.
 class LoraDeviceEntry {
 public:
     LoraDeviceEntry() = default;
@@ -106,17 +126,25 @@ public:
     uint64_t bytes() const { return bytes_; }
 
     /// y[t][row0 + c] (row stride ldy) += scale * (x16[t] A^T) B^T, t < T, for the entry's rows
-    /// [src_row, src_row + n) into the weight's rows [row0, row0 + n) (a fused weight's half, or the whole).  A W8A8
-    /// product's output is its weights' and activations' scales applied (no row scale of the input): `row_scale`
-    /// (null: none) is the input rows' scale, which the base product's sum does not carry and this delta must.
-    /// `tmp_f32` and `tmp16` hold T * rank values each (grown by the caller).
+    /// [src_row, src_row + n) into the weight's rows [row0, row0 + n) (a fused weight's half, or the whole).  An
+    /// LoKr's rows are its Kronecker product's; the delta is the same product's, its own way.  A W8A8 product's output
+    /// is its weights' and activations' scales applied (no row scale of the input): `row_scale` (null: none) is the
+    /// input rows' scale, which the base product's sum does not carry and this delta must.  `tmp_f32` and `tmp16` hold
+    /// T * lora_scratch_cols(e) values each (grown by the caller).
     void add(const uint16_t* x16, int64_t T, float* y, int64_t ldy, int64_t src_row, int64_t row0, int64_t n,
              float scale, const float* row_scale, prefill::Gemm& gemm, float* tmp_f32, uint16_t* tmp16,
              void* stream) const;
 
 private:
-    uint16_t* a_ = nullptr;
-    uint16_t* b_ = nullptr;
+    void add_lokr(const uint16_t* x16, int64_t T, float* y, int64_t ldy, int64_t src_row, int64_t row0, int64_t n,
+                  float scale, const float* row_scale, prefill::Gemm& gemm, float* tmp_f32, void* stream) const;
+
+    LoraKind kind_ = LoraKind::lora;
+    uint16_t* a_ = nullptr;   // lora: A [rank][cols]
+    uint16_t* b_ = nullptr;   // lora: B [rows][rank]
+    uint16_t* w1_ = nullptr;  // lokr: w1 [out_l][in_m]
+    uint16_t* w2_ = nullptr;  // lokr: w2 [out_k][in_n]
+    LokrShape lokr_;
     int64_t rank_ = 0, cols_ = 0, rows_ = 0;
     uint64_t bytes_ = 0;
 };

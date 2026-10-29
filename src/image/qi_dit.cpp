@@ -783,7 +783,7 @@ uint64_t QiDit::activation_bytes(int64_t T, int64_t mlp_rows) const {
            (plain ? (uint64_t) T * (uint64_t) C_ * 4 : 0) +
            (packed_ ? std::max(kernels::iq_mmq_act_bytes(T, C_), kernels::iq_mmq_act_bytes(mr, inter_)) : 0) +
            (w8_ ? (uint64_t) std::max(T * C_, mr * inter_) + (uint64_t) T * 8 : 0) +
-           (lora_rank_ > 0 ? (uint64_t) std::max(T, lora_tmp_t_) * (uint64_t) lora_rank_ * 6 : 0);
+           (lora_cols_ > 0 ? (uint64_t) std::max(T, lora_tmp_t_) * (uint64_t) lora_cols_ * 6 : 0);
 }
 
 void QiDit::set_mlp_rows(int64_t rows) {
@@ -831,7 +831,7 @@ void QiDit::build_lora_targets() {
 }
 
 void QiDit::lora_scratch(int64_t T) {
-    if (lora_rank_ <= 0 || T <= 0) return;
+    if (lora_cols_ <= 0 || T <= 0) return;
     if (lora_f32_ != nullptr && T <= lora_tmp_t_) return;
     gpu::stream_sync(s_);   // the old buffers may still be read
     for (void** p : {reinterpret_cast<void**>(&lora_f32_), reinterpret_cast<void**>(&lora16_)})
@@ -840,8 +840,8 @@ void QiDit::lora_scratch(int64_t T) {
             gpu::free(*p);
             *p = nullptr;
         }
-    lora_f32_ = alloc<float>(allocs_, T * lora_rank_);
-    lora16_ = alloc<uint16_t>(allocs_, T * lora_rank_);
+    lora_f32_ = alloc<float>(allocs_, T * lora_cols_);
+    lora16_ = alloc<uint16_t>(allocs_, T * lora_cols_);
     lora_tmp_t_ = T;
 }
 
@@ -944,7 +944,7 @@ bool QiDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
             part.n = slot->rows;
             part.scale = scale;
             slot->w->lora->parts.push_back(part);
-            lora_rank_ = std::max(lora_rank_, e.rank);
+            lora_cols_ = std::max(lora_cols_, lora_scratch_cols(e));
         }
     }
     if (!text_encoder.empty()) {
@@ -981,7 +981,7 @@ void QiDit::drop_loras() {
     lora_layers_.clear();
     lora_files_.clear();
     lora_key_.clear();
-    lora_rank_ = 0;
+    lora_cols_ = 0;
     if (lora_f32_ != nullptr || lora16_ != nullptr) {
         gpu::stream_sync(s_);
         for (void** p : {reinterpret_cast<void**>(&lora_f32_), reinterpret_cast<void**>(&lora16_)})

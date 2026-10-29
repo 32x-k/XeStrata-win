@@ -4,7 +4,8 @@
 // its entries and metadata), the delta's arithmetic on the GPU against a CPU reference, and the deltas a DiT binds.
 //
 //   strata-image-lora-probe list LORA.safetensors|LORA.gguf      the entries and the metadata
-//   strata-image-lora-probe selftest                             y += scale (x A^T) B^T against FP64 (random)
+//   strata-image-lora-probe selftest                     y += scale (x A^T) B^T, and a LoKr's kron(w1, w2), against
+//                                                               FP64 (random)
 //   strata-image-lora-probe map DIT.gguf [LORA [scale]]          the weights adapters may take, and where a file's keys
 //                                                                land (or that they do not)
 //   strata-image-lora-probe step DIT.gguf OUT.bin [LORA [scale]] one forward of a fixed context and noise, its
@@ -14,7 +15,7 @@
 //   strata-image-lora-probe mf-map DIT.safetensors [LORA [scale]]  the same two for Mage-Flow's DiT (MfDit)
 //   strata-image-lora-probe mf-step DIT.safetensors OUT.bin [LORA [scale]]
 //
-// `list` and `map` read no GPU: they are the readers' checks.  `selftest` builds a small adapter and two products, with
+// `list` and `map` read no GPU: they are the readers' checks.  `selftest` builds small adapters and products, with
 // and without a per-row scale, and prints how far the GPU's output is from the reference's.  `step` is how a LoRA's
 // delta against the same delta baked into the weights is compared (the parity test of the catalogue's records): the
 // same C++ forward on the same noise, the model loaded twice.  MOSS_*_HW, MOSS_*_TEXT: the latent's and the text's
@@ -167,6 +168,83 @@ void selftest_case(void* s, int64_t T, int64_t K, int64_t R, int64_t N, bool row
     if (!ok) throw std::runtime_error(std::string("the delta of ") + label + " is not the reference's");
 }
 
+// one LoKr entry's delta: y[t][row0 + c] += scale * row_scale[t] * sum_j w1[i][j] u[t][j][k], the weight's row
+// src_row + c = i * out_k + k (the Kronecker product of w1 [out_l][in_m] and w2 [out_k][in_n])
+void selftest_lokr(void* s, int64_t T, int64_t out_l, int64_t in_m, int64_t out_k, int64_t in_n, bool rows_scaled,
+                   int64_t src_row = 0, int64_t row0 = 0, int64_t n = 0) {
+    namespace si = strata::image;
+    const int64_t rows = out_l * out_k, cols = in_m * in_n;
+    if (n <= 0) n = rows - src_row;
+    std::mt19937 rng((uint32_t) (rows_scaled ? 11u : 5u) ^
+                     (uint32_t) (out_l * 97 + in_m * 31 + out_k * 17 + in_n * 7));
+    std::normal_distribution<float> nd(0.0f, 0.5f);
+    si::LoraEntry e;
+    e.key = "selftest-lokr";
+    e.kind = si::LoraKind::lokr;
+    e.lokr = {out_l, in_m, out_k, in_n};
+    e.rows = rows;
+    e.cols = cols;
+    e.rank = 0;   // both matrices whole: the file's alpha is not divided
+    e.extra["lokr_w1"].resize((size_t) (out_l * in_m));
+    e.extra["lokr_w2"].resize((size_t) (out_k * in_n));
+    for (float& v : e.extra["lokr_w1"]) v = nd(rng);
+    for (float& v : e.extra["lokr_w2"]) v = nd(rng);
+    std::vector<float> x((size_t) (T * cols)), rs((size_t) T, 1.0f);
+    for (float& v : x) v = nd(rng);
+    for (int64_t t = 0; t < T; ++t) rs[(size_t) t] = std::exp2((float) (t % 3));   // 1, 2, 4
+    const float scale = 0.8f;
+
+    si::LoraDeviceEntry dev;
+    std::string err;
+    if (!dev.upload(e, s, err)) throw std::runtime_error(err);
+    strata::prefill::Gemm gemm;
+    if (!gemm.init(s, 0, err)) throw std::runtime_error(err);
+    auto* dx = static_cast<uint16_t*>(gpu::alloc_device((size_t) (T * cols) * 2));
+    auto* dy = static_cast<float*>(gpu::alloc_device((size_t) (T * rows) * 4));
+    auto* drs = static_cast<float*>(gpu::alloc_device((size_t) T * 4));
+    auto* tf = static_cast<float*>(gpu::alloc_device((size_t) (T * in_m * out_k) * 4));
+    auto* t16 = static_cast<uint16_t*>(gpu::alloc_device((size_t) (T * si::lora_scratch_cols(e)) * 2));
+    std::vector<uint16_t> x16((size_t) (T * cols));
+    si::lora_to_f16(x, x16);
+    std::vector<float> zero((size_t) (T * rows), 0.0f);
+    gpu::copy(dx, x16.data(), x16.size() * 2);
+    gpu::copy(dy, zero.data(), zero.size() * 4);
+    gpu::copy(drs, rs.data(), rs.size() * 4);
+    dev.add(dx, T, dy, rows, src_row, row0, n, scale, rows_scaled ? drs : nullptr, gemm, tf, t16, s);
+    if (!gpu::stream_sync(s)) throw std::runtime_error(gpu::last_error());
+    std::vector<float> got((size_t) (T * rows));
+    gpu::copy(got.data(), dy, got.size() * 4);
+    // the reference, in FP64 from the same FP16 inputs the GPU took (w1 and w2 go to the GPU as FP16)
+    std::vector<uint16_t> h1((size_t) (out_l * in_m)), h2((size_t) (out_k * in_n));
+    si::lora_to_f16(e.extra["lokr_w1"], h1);
+    si::lora_to_f16(e.extra["lokr_w2"], h2);
+    std::vector<double> want((size_t) (T * rows), 0.0), xd((size_t) (T * cols));
+    for (int64_t i = 0; i < T * cols; ++i) xd[(size_t) i] = strata::kernels::f32_from_f16(x16[(size_t) i]);
+    for (int64_t t = 0; t < T; ++t)
+        for (int64_t c = 0; c < n; ++c) {
+            const int64_t row = src_row + c;
+            const int64_t oi = row / out_k, ok = row - oi * out_k;
+            double v = 0;
+            for (int64_t j = 0; j < cols; ++j) {
+                const double w =
+                    (double) strata::kernels::f32_from_f16(h1[(size_t) (oi * in_m + j / in_n)]) *
+                    (double) strata::kernels::f32_from_f16(h2[(size_t) (ok * in_n + j % in_n)]);
+                v += xd[(size_t) (t * cols + j)] * w;
+            }
+            want[(size_t) (t * rows + row0 + c)] += v * scale * (rows_scaled ? rs[(size_t) t] : 1.0);
+        }
+    char label[96];
+    std::snprintf(label, sizeof label, "lokr %lldx%lld (%lldx%lld (x) %lldx%lld)", (long long) rows, (long long) cols,
+                  (long long) out_l, (long long) in_m, (long long) out_k, (long long) in_n);
+    const bool ok = compare(label, got, want);
+    gpu::free(dx);
+    gpu::free(dy);
+    gpu::free(drs);
+    gpu::free(tf);
+    gpu::free(t16);
+    if (!ok) throw std::runtime_error(std::string("the delta of ") + label + " is not the reference's");
+}
+
 int selftest() {
     void* s = strata::core::Runtime::get().create_stream();
     try {
@@ -176,6 +254,13 @@ int selftest() {
         selftest_case(s, 8, 64, 8, 64, false, 32, 32, 32);
         // a rank the matrix engines' accumulating product takes (K a multiple of 32)
         selftest_case(s, 64, 64, 64, 4096, false);
+        // a LoKr: both matrices whole, a rank-less entry (the file's alpha is not divided)
+        selftest_lokr(s, 8, 4, 8, 8, 4, false);
+        // its row scale (a W8A8 product's input rows) and the rows of a fused weight's second half
+        selftest_lokr(s, 8, 4, 8, 8, 4, true);
+        selftest_lokr(s, 8, 4, 8, 16, 4, false, 32, 16, 16);
+        // a block-shaped product, as a DiT's attention is (out_l * out_k = 64 rows of 64)
+        selftest_lokr(s, 16, 8, 8, 8, 8, false);
     } catch (...) {
         strata::core::Runtime::get().destroy_stream(static_cast<sycl::queue*>(s));
         throw;

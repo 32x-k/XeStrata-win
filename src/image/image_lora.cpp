@@ -8,6 +8,10 @@
 // `x.lora_B`/`x.lora_A` of PEFT's own saves), with `x.alpha` and `x.dora_scale` beside them.  A file's prefix says
 // whose names they are: `transformer.` for diffusers' saves, `diffusion_model.` and `model.diffusion_model.` for
 // ComfyUI's and a GGUF's.  What is left is the DiT's own name, which the DiT's target table matches.
+//
+// A LoKr (LyCORIS) writes one weight's two matrices whole (`x.lokr_w1`, `x.lokr_w2`) or as two factors each
+// (`x.lokr_w1_a` [rows][rank] and `x.lokr_w1_b` [rank][cols]), w2's under a Tucker core (`x.lokr_t2`); the delta is
+// their Kronecker product, and the file's alpha is divided by the factorization's rank (comfy/weight_adapter/lokr.py).
 #include "strata/image/image_lora.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
@@ -138,7 +142,8 @@ public:
         if (t->dtype != "F32" && t->dtype != "F16" && t->dtype != "BF16")
             throw std::runtime_error(path_ + ": " + name + ": a tensor of " + t->dtype +
                                      " (adapters are F16, BF16 or F32)");
-        if (t->shape.size() > 2) throw std::runtime_error(path_ + ": " + name + ": more than two dimensions");
+        if (t->shape.size() > 4)   // a matrix; a LoKr's Tucker core has four dimensions
+            throw std::runtime_error(path_ + ": " + name + ": more than four dimensions");
         return {t->shape, st_.f32(name)};
     }
 
@@ -168,7 +173,8 @@ public:
         // GGUF's shape runs from the innermost dimension (dimension 0 varies fastest): a matrix of rows x columns is
         // {columns, rows} there, and its data is row-major in the engine's order.
         std::vector<int64_t> shape(t->shape.rbegin(), t->shape.rend());
-        if (shape.size() > 2) throw std::runtime_error(g_.path() + ": " + name + ": more than two dimensions");
+        if (shape.size() > 4)   // a matrix; a LoKr's Tucker core has four dimensions
+            throw std::runtime_error(g_.path() + ": " + name + ": more than four dimensions");
         const int64_t n = (int64_t) t->elements();
         const auto* p = g_.tensor_data(*t);
         RawTensor out;
@@ -228,6 +234,21 @@ bool json_true(const std::string& s, const std::string& key) {
     return s.compare(i, 4, "true") == 0;
 }
 
+// A row-major matrix product in FP32: out [m][n] = a [m][k] . b [k][n], as a LoKr's factors make its matrices.
+std::vector<float> mat_mul(const float* a, int64_t m, int64_t k, const float* b, int64_t n) {
+    std::vector<float> out((size_t) (m * n), 0.0f);
+    for (int64_t i = 0; i < m; ++i) {
+        float* o = out.data() + i * n;
+        for (int64_t t = 0; t < k; ++t) {
+            const float v = a[i * k + t];
+            if (v == 0.0f) continue;
+            const float* br = b + t * n;
+            for (int64_t j = 0; j < n; ++j) o[j] += v * br[j];
+        }
+    }
+    return out;
+}
+
 bool is_training_aid(const std::string& key) {
     // SimpleTuner's auxiliary projector: trained beside the adapter, not applied to the model.
     return key.find("crepa_projector") != std::string::npos;
@@ -246,6 +267,96 @@ LoraKind kind_of(const Group& g, const std::string& path) {
                              "set_weight beside it)");
 }
 
+// A LoKr's two matrices -> its entry: w1 [out_l][in_m] and w2 [out_k][in_n], the file's whole matrices or its two
+// factors' products (w2's under a Tucker core), the delta their Kronecker product is at the weight's rows
+// out_l * out_k and columns in_m * in_n.  `rank` is the factorization's, where a matrix has one: ComfyUI divides the
+// file's alpha by w2's factors' rank, else w1's, and by nothing where both matrices are whole
+// (comfy/weight_adapter/lokr.py's calculate_weight).
+void make_lokr(LoraEntry& e, Group& g, const std::string& path) {
+    const auto get = [&g](const char* r) -> const RawTensor* {
+        auto it = g.by_role.find(r);
+        return it == g.by_role.end() ? nullptr : &it->second;
+    };
+    // One of the two: the whole matrix, or its two factors' product.
+    int64_t rank = 0;
+    const auto matrix_of = [&](const char* full, const char* fa, const char* fb) -> RawTensor {
+        const RawTensor* whole = get(full);
+        const RawTensor* a = get(fa);
+        const RawTensor* b = get(fb);
+        if (whole != nullptr) {
+            if (a != nullptr || b != nullptr)
+                throw std::runtime_error(path_key_what(path, e.key, std::string("both ") + full + " and its factors " +
+                                                                       fa + "/" + fb));
+            if (whole->shape.size() != 2)
+                throw std::runtime_error(path_key_what(path, e.key, std::string(full) + " must be a matrix"));
+            return *whole;
+        }
+        if (a == nullptr || b == nullptr)
+            throw std::runtime_error(path_key_what(path, e.key, std::string("a LoKr weight needs ") + full +
+                                                                   " or both " + fa + " and " + fb));
+        if (a->shape.size() != 2 || b->shape.size() != 2)
+            throw std::runtime_error(path_key_what(path, e.key, std::string(fa) + " and " + fb + " must be matrices"));
+        if (a->shape[1] != b->shape[0])
+            throw std::runtime_error(path_key_what(path, e.key, std::string(fa) + " is " +
+                                                                   std::to_string(a->shape[0]) + " x " +
+                                                                   std::to_string(a->shape[1]) + ", " + fb + " " +
+                                                                   std::to_string(b->shape[0]) + " x " +
+                                                                   std::to_string(b->shape[1]) +
+                                                                   ": not the rank each other has"));
+        rank = b->shape[0];
+        RawTensor out;
+        out.shape = {a->shape[0], b->shape[1]};
+        out.v = mat_mul(a->v.data(), a->shape[0], a->shape[1], b->v.data(), b->shape[1]);
+        return out;
+    };
+    RawTensor w1 = matrix_of("lokr_w1", "lokr_w1_a", "lokr_w1_b");
+    RawTensor w2;
+    const RawTensor* t2 = get("lokr_t2");
+    if (t2 == nullptr || get("lokr_w2") != nullptr) {   // a core beside the whole matrix stays unread, as ComfyUI
+        w2 = matrix_of("lokr_w2", "lokr_w2_a", "lokr_w2_b");
+    } else {
+        // Tucker: w2 [out_k][in_n] = w2_a [core_out][out_k]^T . T . w2_b [core_in][in_n], T the core's kernel, 1 x 1
+        const RawTensor* a = get("lokr_w2_a");
+        const RawTensor* b = get("lokr_w2_b");
+        if (a == nullptr || b == nullptr)
+            throw std::runtime_error(path_key_what(path, e.key,
+                                                   "a Tucker core (lokr_t2) needs w2's two factors beside it"));
+        if (a->shape.size() != 2 || b->shape.size() != 2)
+            throw std::runtime_error(path_key_what(path, e.key,
+                                                   "lokr_w2_a and lokr_w2_b must be matrices"));
+        if (!(t2->shape.size() == 2 || (t2->shape.size() == 4 && t2->shape[2] == 1 && t2->shape[3] == 1)))
+            throw std::runtime_error(path_key_what(path, e.key,
+                                                   "a LoKr Tucker core with a convolution's kernel dimensions: the "
+                                                   "image engine's products are linear"));
+        if (a->shape[0] != t2->shape[0] || b->shape[0] != t2->shape[1])
+            throw std::runtime_error(path_key_what(path, e.key, "the Tucker core is " +
+                                                                   std::to_string(t2->shape[0]) + " x " +
+                                                                   std::to_string(t2->shape[1]) + "; w2_a's rows " +
+                                                                   std::to_string(a->shape[0]) + ", w2_b's " +
+                                                                   std::to_string(b->shape[0])));
+        const int64_t core_out = t2->shape[0], core_in = t2->shape[1];
+        const int64_t out_k = a->shape[1], in_n = b->shape[1];
+        rank = core_in;   // ComfyUI's dim: w2_b's rows
+        const std::vector<float> tb = mat_mul(t2->v.data(), core_out, core_in, b->v.data(), in_n);
+        w2.shape = {out_k, in_n};
+        w2.v.assign((size_t) (out_k * in_n), 0.0f);
+        for (int64_t i = 0; i < core_out; ++i)
+            for (int64_t p = 0; p < out_k; ++p) {
+                const float va = a->v[(size_t) (i * out_k + p)];
+                if (va == 0.0f) continue;
+                for (int64_t r = 0; r < in_n; ++r) w2.v[(size_t) (p * in_n + r)] += va * tb[(size_t) (i * in_n + r)];
+            }
+    }
+    e.lokr = {w1.shape[0], w1.shape[1], w2.shape[0], w2.shape[1]};
+    e.rows = e.lokr.out_l * e.lokr.out_k;
+    e.cols = e.lokr.in_m * e.lokr.in_n;
+    e.rank = rank;
+    e.shapes["lokr_w1"] = w1.shape;
+    e.shapes["lokr_w2"] = w2.shape;
+    e.extra["lokr_w1"] = std::move(w1.v);
+    e.extra["lokr_w2"] = std::move(w2.v);
+}
+
 // One weight's role tensors -> its entry.
 LoraEntry make_entry(Group& g, const std::string& path) {
     LoraEntry e;
@@ -255,6 +366,9 @@ LoraEntry make_entry(Group& g, const std::string& path) {
         auto it = g.by_role.find(r);
         return it == g.by_role.end() ? nullptr : &it->second;
     };
+    if (e.kind == LoraKind::lokr) {
+        make_lokr(e, g, path);
+    }
     if (e.kind == LoraKind::lora) {
         RawTensor* a = role("lora_A");
         RawTensor* b = role("lora_B");
@@ -292,9 +406,11 @@ LoraEntry make_entry(Group& g, const std::string& path) {
         throw std::runtime_error(path_and(path, e.key) +
                                  ": a LoRA with a middle layer (a convolution's) is not one the image engine's linear "
                                  "products take");
-    // the other forms' tensors, as they are (the forms the engine learns to apply later read them)
+    // the other forms' tensors, as they are (the forms the engine learns to apply later read them); a LoKr's are
+    // its two materialized matrices (above), not the file's factors
     for (const auto& [r, t] : g.by_role) {
         if (r == "lora_A" || r == "lora_B" || r == "alpha" || r == "dora_scale") continue;
+        if (r.rfind("lokr_", 0) == 0) continue;
         e.shapes[r] = t.shape;
         e.extra[r] = t.v;
     }
@@ -430,20 +546,78 @@ struct ScaleRows {
     }
 };
 
+// A LoKr's second step: y[t][row0 + c] += scale * row_scale[t] * sum_j w1[i][j] u[t][j][k], the weight's row
+// src_row + c = i * out_k + k (the Kronecker product's rows are w1's, each w2's rows).
+struct KronRows {
+    const uint16_t* w1;   // [out_l][in_m]
+    const float* u;       // [T][in_m][out_k], the first product's
+    float* y;
+    const float* row_scale;
+    float scale;
+    int64_t in_m, out_k, ldy, src_row, row0, n;
+    void operator()(sycl::id<1> id) const {
+        const int64_t at = (int64_t) id[0];
+        const int64_t t = at / n, c = at - t * n;
+        const int64_t row = src_row + c;
+        const int64_t i = row / out_k, k = row - i * out_k;
+        const uint16_t* w = w1 + i * in_m;
+        const float* up = u + (t * in_m) * out_k + k;
+        float acc = 0.0f;
+        for (int64_t j = 0; j < in_m; ++j) acc += strata::kernels::f32_from_f16(w[j]) * up[j * out_k];
+        float v = acc * scale;
+        if (row_scale != nullptr) v *= row_scale[t];
+        y[t * ldy + row0 + c] += v;
+    }
+};
+
 }  // namespace lora_kernels
 
 LoraDeviceEntry::~LoraDeviceEntry() { release(); }
 
 void LoraDeviceEntry::release() {
-    if (a_ != nullptr) strata::gpu::free(a_);
-    if (b_ != nullptr) strata::gpu::free(b_);
-    a_ = b_ = nullptr;
+    for (uint16_t** p : {&a_, &b_, &w1_, &w2_}) {
+        if (*p != nullptr) strata::gpu::free(*p);
+        *p = nullptr;
+    }
+    lokr_ = {};
     rank_ = cols_ = rows_ = 0;
     bytes_ = 0;
 }
 
 bool LoraDeviceEntry::upload(const LoraEntry& e, void* stream, std::string& err) {
     release();
+    kind_ = e.kind;
+    if (e.kind == LoraKind::lokr) {
+        const auto w1 = e.extra.find("lokr_w1");
+        const auto w2 = e.extra.find("lokr_w2");
+        if (e.lokr.empty() || w1 == e.extra.end() || w2 == e.extra.end() ||
+            (int64_t) w1->second.size() != e.lokr.out_l * e.lokr.in_m ||
+            (int64_t) w2->second.size() != e.lokr.out_k * e.lokr.in_n) {
+            err = "the image engine: " + e.key + ": the LoKr's factors do not match its shape";
+            return false;
+        }
+        std::vector<uint16_t> h1, h2;
+        lora_to_f16(w1->second, h1);
+        lora_to_f16(w2->second, h2);
+        lokr_ = e.lokr;
+        rank_ = e.rank;
+        cols_ = e.cols;
+        rows_ = e.rows;
+        if (!strata::gpu::alloc_device(&w1_, h1.size() * 2) || !strata::gpu::alloc_device(&w2_, h2.size() * 2)) {
+            err = "the image engine: the adapter " + e.key + " on the GPU: " + strata::gpu::last_error();
+            release();
+            return false;
+        }
+        strata::gpu::copy_async(w1_, h1.data(), h1.size() * 2, stream);
+        strata::gpu::copy_async(w2_, h2.data(), h2.size() * 2, stream);
+        if (!strata::gpu::stream_sync(stream)) {
+            err = "the image engine: the adapter " + e.key + " to the GPU: " + strata::gpu::last_error();
+            release();
+            return false;
+        }
+        bytes_ = (uint64_t) (h1.size() + h2.size()) * 2;
+        return true;
+    }
     if (e.kind != LoraKind::lora) {
         err = "the image engine: ";
         err += lora_kind_name(e.kind);
@@ -478,14 +652,32 @@ bool LoraDeviceEntry::upload(const LoraEntry& e, void* stream, std::string& err)
 void LoraDeviceEntry::add(const uint16_t* x16, int64_t T, float* y, int64_t ldy, int64_t src_row, int64_t row0,
                           int64_t n, float scale, const float* row_scale, prefill::Gemm& gemm, float* tmp_f32,
                           uint16_t* tmp16, void* stream) const {
-    if (T <= 0 || n <= 0 || rank_ <= 0 || scale == 0.0f) return;
+    if (T <= 0 || n <= 0 || scale == 0.0f) return;
     if (src_row < 0 || src_row + n > rows_) return;   // the caller keeps the rows within the entry
+    if (kind_ == LoraKind::lokr) {
+        add_lokr(x16, T, y, ldy, src_row, row0, n, scale, row_scale, gemm, tmp_f32, stream);
+        return;
+    }
+    if (rank_ <= 0) return;
     if (ldy <= 0) ldy = n;
     gemm.f16(x16, a_, tmp_f32, T, rank_, cols_);   // t = x . A^T, [T][rank]
     sycl::queue& q = strata::core::Runtime::get().stream(stream);
     q.parallel_for(sycl::range<1>((size_t) (T * rank_)),
                    lora_kernels::ScaleRows{tmp_f32, scale, row_scale, rank_, tmp16});
     gemm.f16(tmp16, b_ + src_row * rank_, y + row0, T, n, rank_, ldy, false, true);   // y[:, row0 ..] += t16 . B^T
+}
+
+void LoraDeviceEntry::add_lokr(const uint16_t* x16, int64_t T, float* y, int64_t ldy, int64_t src_row, int64_t row0,
+                               int64_t n, float scale, const float* row_scale, prefill::Gemm& gemm, float* tmp_f32,
+                               void* stream) const {
+    if (lokr_.empty()) return;
+    if (ldy <= 0) ldy = n;
+    // u[t][j][k] = sum_l x[t][j][l] w2[k][l]: the input's rows in in_m groups of in_n, w2's product of each
+    gemm.f16(x16, w2_, tmp_f32, T * lokr_.in_m, lokr_.out_k, lokr_.in_n);
+    sycl::queue& q = strata::core::Runtime::get().stream(stream);
+    q.parallel_for(sycl::range<1>((size_t) (T * n)),
+                   lora_kernels::KronRows{w1_, tmp_f32, y, row_scale, scale, lokr_.in_m, lokr_.out_k, ldy, src_row,
+                                          row0, n});
 }
 
 uint64_t LoraLayer::bytes() const {
@@ -507,18 +699,27 @@ void LoraLayer::add(const uint16_t* x16, int64_t T, float* y, int64_t ldy, int64
     }
 }
 
+int64_t lora_scratch_cols(const LoraEntry& e) {
+    if (e.kind == LoraKind::lokr) return e.lokr.empty() ? 0 : e.lokr.in_m * e.lokr.out_k;
+    return e.rank;
+}
+
 uint64_t lora_gpu_bytes(const std::vector<LoraUse>& loras, int64_t T) {
     uint64_t bytes = 0;
-    int64_t rank = 0;
+    int64_t cols = 0;
     for (const LoraUse& u : loras) {
         if (!u.file) continue;
         for (const LoraEntry& e : u.file->entries()) {
-            if (e.kind != LoraKind::lora) continue;
-            bytes += 2 * (uint64_t) e.rank * (uint64_t) (e.rows + e.cols);   // A and B, FP16
-            rank = std::max(rank, e.rank);
+            if (e.kind == LoraKind::lora)
+                bytes += 2 * (uint64_t) e.rank * (uint64_t) (e.rows + e.cols);   // A and B, FP16
+            else if (e.kind == LoraKind::lokr && !e.lokr.empty())
+                bytes += 2 * (uint64_t) (e.lokr.out_l * e.lokr.in_m + e.lokr.out_k * e.lokr.in_n);   // w1 and w2
+            else
+                continue;
+            cols = std::max(cols, lora_scratch_cols(e));
         }
     }
-    return bytes + (uint64_t) std::max<int64_t>(T, 0) * (uint64_t) rank * 6;
+    return bytes + (uint64_t) std::max<int64_t>(T, 0) * (uint64_t) cols * 6;
 }
 
 }  // namespace strata::image

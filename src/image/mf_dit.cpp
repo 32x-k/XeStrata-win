@@ -610,7 +610,7 @@ uint64_t MfDit::activation_bytes(int64_t hw, int n, int64_t max_text, int64_t ml
            (uint64_t) (hw + max_text) * hd_ * 4 +        // the rotary tables
            (uint64_t) TP * C_ * 4 +                      // the plain attention's scratch
            (w8_ ? (uint64_t) std::max(X * C_, band * F_) + (uint64_t) std::max(X, band) * 8 : 0) +   // W8A8's input
-           (lora_rank_ > 0 ? (uint64_t) std::max(X, band) * (uint64_t) lora_rank_ * 6 : 0);   // the deltas' scratch
+           (lora_cols_ > 0 ? (uint64_t) std::max(X, band) * (uint64_t) lora_cols_ * 6 : 0);   // the deltas' scratch
 }
 
 void MfDit::ensure(int64_t hw, int n, int64_t max_text) {
@@ -722,7 +722,7 @@ void MfDit::build_lora_targets() {
 }
 
 void MfDit::lora_scratch(int64_t T) {
-    if (lora_rank_ <= 0 || T <= 0) return;
+    if (lora_cols_ <= 0 || T <= 0) return;
     if (lora_f32_ != nullptr && T <= lora_tmp_t_) return;
     gpu::stream_sync(s_);   // the old buffers may still be read
     for (void** p : {reinterpret_cast<void**>(&lora_f32_), reinterpret_cast<void**>(&lora16_)})
@@ -730,8 +730,8 @@ void MfDit::lora_scratch(int64_t T) {
             release(allocs_, *p);
             *p = nullptr;
         }
-    lora_f32_ = alloc<float>(allocs_, T * lora_rank_);
-    lora16_ = alloc<uint16_t>(allocs_, T * lora_rank_);
+    lora_f32_ = alloc<float>(allocs_, T * lora_cols_);
+    lora16_ = alloc<uint16_t>(allocs_, T * lora_cols_);
     lora_tmp_t_ = T;
 }
 
@@ -805,7 +805,7 @@ bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
             part.src_row = slot->src_row;
             part.scale = scale;
             slot->w->lora->parts.push_back(part);
-            lora_rank_ = std::max(lora_rank_, e.rank);
+            lora_cols_ = std::max(lora_cols_, lora_scratch_cols(e));
         }
     }
     if (!text_encoder.empty()) {
@@ -840,7 +840,7 @@ void MfDit::drop_loras() {
     lora_layers_.clear();
     lora_files_.clear();
     lora_key_.clear();
-    lora_rank_ = 0;
+    lora_cols_ = 0;
     if (lora_f32_ != nullptr || lora16_ != nullptr) {
         gpu::stream_sync(s_);
         for (void** p : {reinterpret_cast<void**>(&lora_f32_), reinterpret_cast<void**>(&lora16_)})

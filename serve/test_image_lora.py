@@ -153,6 +153,26 @@ class Listing(Tree):
         self.assertEqual(entries[0]["scale"], 1.0, "no recommended strength: 1.0")
         self.assertIsNone(entries[0]["trigger"])
 
+    def test_a_lokr_is_listed_with_its_factorizations_rank(self):
+        b = "transformer.transformer_blocks.0."
+        safetensors(self.d / "lokr.safetensors", {
+            # to_q: w1 from its two factors, w2 whole (the file's alpha divides w1's factorization's rank)
+            b + "attn.to_q.lokr_w1_a.weight": (16, 8), b + "attn.to_q.lokr_w1_b.weight": (8, 16),
+            b + "attn.to_q.lokr_w2": (16, 16),
+            b + "attn.to_q.alpha": (1,),
+            # to_out.0: both from factors, w2's under a linear Tucker core
+            b + "attn.to_out.0.lokr_w1_a.weight": (16, 8), b + "attn.to_out.0.lokr_w1_b.weight": (8, 16),
+            b + "attn.to_out.0.lokr_w2_a.weight": (16, 16), b + "attn.to_out.0.lokr_w2_b.weight": (16, 16),
+            b + "attn.to_out.0.lokr_t2": (16, 16, 1, 1),
+        })
+        f = self.folder()
+        entries = f.listing()
+        self.assertEqual([e["name"] for e in entries], ["lokr"], f.skipped)
+        e = entries[0]
+        self.assertEqual(e["rank"], 16, "the rank of w2's factors where w2 is decomposed (ComfyUI's dim)")
+        self.assertEqual(e["targets"], ["attn.to_out.0", "attn.to_q"])
+        self.assertEqual(loras.field([{"name": "lokr", "scale": 0.7}], f)[0]["scale"], 0.7)
+
     def test_another_models_file_and_the_forms_not_applied_are_left_out(self):
         self.qwen("qwen")
         safetensors(self.d / "moss.safetensors", {
@@ -176,7 +196,8 @@ class Listing(Tree):
         self.assertEqual([e["name"] for e in f.listing()], ["qwen"])
         self.assertEqual(f.skipped["moss"], "layers.0.proj.q is not one of this image model's weights")
         self.assertIn("DoRA", f.skipped["dora"])
-        self.assertIn("lokr", f.skipped["lokr"])
+        self.assertIn("lokr_w2_b is 4 x 64, not the rank its lokr_w2_a has (64)", f.skipped["lokr"],
+                      "a LoKr's factors that do not meet are not one")
         self.assertIn("text encoder", f.skipped["text-encoder"])
         self.assertIn("not one of this image model's weights", f.skipped["a-norm"])
         self.assertIn("header", f.skipped["broken"])

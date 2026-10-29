@@ -213,7 +213,7 @@ private:
     std::vector<std::unique_ptr<LoraLayer>> lora_layers_;
     std::vector<std::shared_ptr<const LoraFile>> lora_files_;
     std::string lora_key_;
-    int64_t lora_rank_ = 0, lora_tmp_t_ = 0;
+    int64_t lora_cols_ = 0, lora_tmp_t_ = 0;   // the deltas' scratch's columns and rows (the largest lora_scratch_cols)
     float* lora_f32_ = nullptr;
     uint16_t* lora16_ = nullptr;
     bool dry_ = false, q8_ = true, w8_ = false, keep0_ = false, text_loaded_ = false;

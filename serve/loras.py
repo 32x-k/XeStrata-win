@@ -9,8 +9,8 @@ the file's prefix off, ".weight" off, the role's suffix off), and a file is this
 is one the DiT's products take (TARGETS: the names of qi_dit.cpp's, moss_dit.cpp's and mf_dit.cpp's
 build_lora_targets, written here a second time; the record's check sets them against the probe's `map` on the models,
 name for name), in a form the engine
-applies today: a plain LoRA, not a DoRA (dora_scale), LoKr, LoHa, GLoRA, OFT or a whole weight's difference, and no text
-encoder's weight.  The engine refuses those when it binds a set (QiDit::set_loras, MossDit::set_loras,
+applies today: a plain LoRA or LoKr, not a DoRA (dora_scale), LoHa, GLoRA, OFT or a whole weight's difference, and no
+text encoder's weight.  The engine refuses those when it binds a set (QiDit::set_loras, MossDit::set_loras,
 MfDit::set_loras), so no image is made with part of a file.
 
 A listing entry - ImageGen.defaults' "loras" (the engine's capabilities: /health's image_defaults and image_models,
@@ -156,6 +156,38 @@ def form_of(roles) -> str:
         if role in roles:
             return form
     return ""
+
+
+def _lokr_rank(roles: dict[str, tuple[int, ...]]) -> tuple[int, str]:
+    """A LoKr weight's tensors -> (the factorization's rank, "") or (0, why they make no Kronecker product): its
+    two matrices whole (lokr_w1 and lokr_w2) or each from two factors (lokr_w1_a [rows][rank] and lokr_w1_b
+    [rank][cols]), w2's under a Tucker core (lokr_t2, a linear product's: a kernel of 1 x 1).  The rank is the one
+    ComfyUI divides the file's alpha by (w2's factors' rows, else w1's); the engine reads the tensors the same way
+    (src/image/image_lora.cpp's make_lokr)."""
+    rank = 0
+    for name in ("w1", "w2"):
+        whole, fa, fb = f"lokr_{name}", f"lokr_{name}_a", f"lokr_{name}_b"
+        if whole in roles:   # the whole matrix: a Tucker core beside w2 stays unread, as ComfyUI leaves it
+            if fa in roles or fb in roles:
+                return 0, f"both {whole} and its factors {fa}/{fb}"
+            if len(roles[whole]) != 2:
+                return 0, f"{whole} must be a matrix"
+            continue
+        if fa not in roles or fb not in roles:
+            return 0, f"a LoKr weight needs {whole} or both {fa} and {fb}"
+        a, b = roles[fa], roles[fb]
+        if len(a) != 2 or len(b) != 2:
+            return 0, f"{fa} and {fb} must be matrices"
+        if name == "w2" and "lokr_t2" in roles:
+            t2 = roles["lokr_t2"]
+            if not (len(t2) == 2 or (len(t2) == 4 and t2[2] == 1 and t2[3] == 1)):
+                return 0, "a LoKr Tucker core with a convolution's kernel dimensions"
+            if a[0] != t2[0] or b[0] != t2[1]:
+                return 0, f"the Tucker core is {t2[0]} x {t2[1]}; w2_a's rows {a[0]}, w2_b's {b[0]}"
+        elif a[1] != b[0]:
+            return 0, f"{fb} is {b[0]} x {b[1]}, not the rank its {fa} has ({a[1]})"
+        rank = b[0]
+    return rank, ""
 
 
 def is_text_encoder(key: str) -> bool:
@@ -376,7 +408,7 @@ class Folder:
         rank = 0
         for key, roles in sorted(weights.items()):
             form = form_of(roles)
-            if form != "lora":
+            if form not in ("lora", "lokr"):
                 return f"{key}: a {form or 'non-LoRA'} adapter, which the image engine applies not yet"
             if "dora_scale" in roles:
                 return f"{key}: a DoRA (dora_scale) adapter, which the image engine applies not yet"
@@ -384,6 +416,13 @@ class Folder:
                 return f"{key}: a text encoder's weight, which the image engine applies not yet"
             if not any(m.match(key) for m in _MATCH[self.family]):
                 return f"{key} is not one of this image model's weights"
+            if form == "lokr":
+                r, why = _lokr_rank(roles)
+                if why:
+                    return f"{key}: {why}"
+                rank = max(rank, r)
+                targets.add(kind_of(key))
+                continue
             a, b = roles.get("lora_A"), roles.get("lora_B")
             if a is None or b is None:
                 return f"{key}: a LoRA weight needs both lora_A (down) and lora_B (up)"
