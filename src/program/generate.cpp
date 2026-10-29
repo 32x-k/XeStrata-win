@@ -6961,6 +6961,15 @@ int main(int argc, char** argv) {
         std::vector<std::pair<int32_t, int32_t>> other_gpus;
         for (const auto& st : stages)
             other_gpus.insert(other_gpus.end(), st->profile.begin(), st->profile.begin() + st->held);
+        // a stage on another maker's GPU keeps its layers' page-locked experts in host USM of its own: CUDA0's could
+        // not be registered there (#38, a B70 and an RTX 3080 Ti), and that stage read none of its misses over PCIe
+        std::vector<int> layer_dev;
+        for (const auto& st : stages)
+            if (!strata::gpu::same_backend(0, st->dev)) {
+                layer_dev.resize((size_t) g.n_layers, 0);
+                for (int64_t l = st->lb; l < st->le; ++l) layer_dev[(size_t) l] = st->dev;
+            }
+        src.layer_devices(std::move(layer_dev));
         // STRATA_RESIDENT_PIN=0: never page-locked, 1: always; else as the RAM allows (#11)
         using Pin = strata::core::FileExpertSource::Pin;
         const char* pin_env = std::getenv("STRATA_RESIDENT_PIN");
@@ -7281,13 +7290,19 @@ int main(int argc, char** argv) {
                     // unregistered, a Level Zero GPU copied them as pageable memory
                     std::string reg_err;
                     const bool registered = srcp->register_on(gs.dev, reg_err) && srcp->registered_on(gs.dev);
-                    gs.pcie_reads = host_expert == nullptr || strata::gpu::kernels_read_host(host_expert) ||
-                                    (strata::gpu::kernels_read_registered() && registered);
+                    // a stage on another maker's GPU holds its layers of the page-locked RAM copy in its own host USM
+                    // (layer_devices), for its copies; its share of the misses stays the CPU's, as before that copy:
+                    // over the RTX 4070's link (x4, 6.4 GB/s) beside a B70 the share read 890 experts and the decode
+                    // took 8% longer than with the CPU taking them (Qwen3.8 IQ3_XXS, layers 24-47, 2026-10-29)
+                    const bool own_part = host_expert != nullptr && !strata::gpu::same_backend(0, gs.dev);
+                    gs.pcie_reads = !own_part && (host_expert == nullptr || strata::gpu::kernels_read_host(host_expert) ||
+                                                  (strata::gpu::kernels_read_registered() && registered));
                     if (!reg_err.empty()) std::fprintf(stderr, "strata serve: layer split, CUDA%d: %s\n", gs.dev, reg_err.c_str());
                     if (!gs.pcie_reads && gs.pcie_frac > 0.0)
-                        std::fprintf(stderr, "strata serve: layer split, CUDA%d: its kernels cannot read the experts in "
-                                             "CUDA0's host memory: the CPU takes its missed experts (no PCIe share)\n",
-                                     gs.dev);
+                        std::fprintf(stderr, "strata serve: layer split, CUDA%d: %s: the CPU takes its missed experts (no "
+                                             "PCIe share)\n", gs.dev,
+                                     own_part ? "another maker's GPU, its RAM copy in its own host memory"
+                                              : "its kernels cannot read the experts in CUDA0's host memory");
                     split_drive.pcie_num[st] = gs.pcie_reads ? pcie_num_of(gs.pcie_frac) : 0;
                 }
                 if (!ok_s) {
@@ -8364,7 +8379,13 @@ int main(int argc, char** argv) {
         // verdict (after the drafter's chain is launched) and, while a round is in flight, every 0.5 ms without
         // counting a window.
         struct ASwap { int32_t layer, in, out, slot; int home; int64_t j; bool exchange; const uint8_t* from; };
-        struct AHome { strata::core::ExpertCache* cache; strata::gpu::Stream stream; strata::gpu::Event* ev; int dev; bool used; };
+        // direct: its copies straight from the page-locked RAM copy; false for a stage on another maker's GPU, which
+        // copies through the exchange buffers, pageable there as its copies were before its layers had host USM of
+        // their own (layer_devices): straight from that the rounds' copies shared the RTX 4070's x4 link with the
+        // windows, the window rule offered 35 drafts instead of 86 and the decode of 91 tokens took 15% longer
+        // (B70 + RTX 4070, layers 24-47, 2026-10-29)
+        struct AHome { strata::core::ExpertCache* cache; strata::gpu::Stream stream; strata::gpu::Event* ev; int dev; bool used;
+                       bool direct = true; };
         enum class AState { Idle, Pick, CopyBack, SwapIn, RamFence, Commit };
         AState astate = AState::Idle;
         std::vector<ASwap> aswaps;
@@ -8402,7 +8423,9 @@ int main(int argc, char** argv) {
         if (o.adapt_async && !drive.d.usage.empty() &&
             ((src.complement_ready() && src.exchange_capacity() >= 2 * a_cap) || a_arena)) {
             ahomes.push_back({&xcache, adapt_stream, adapt_ev, 0, false});
-            for (auto& st : stages) ahomes.push_back({&st->cache, st->adapt_stream, st->adapt_ev, st->dev, false});
+            for (auto& st : stages)
+                ahomes.push_back({&st->cache, st->adapt_stream, st->adapt_ev, st->dev, false,
+                                  strata::gpu::same_backend(0, st->dev)});
             ajob = std::make_unique<JobThread>();
             std::fprintf(stderr, "strata serve: adaptive tier asynchronous (--adapt-async 1): up to %lld swaps per round, "
                                  "a round every %d windows%s\n", (long long) a_cap, o.adapt_every,
@@ -8474,7 +8497,7 @@ int main(int argc, char** argv) {
                 }
                 return b;
             }
-            if (src.pinned(w.layer, w.in))
+            if (src.pinned(w.layer, w.in) && ahomes[(size_t) w.home].direct)
                 if (const uint8_t* b = src.resident_blob(w.layer, w.in)) return b;
             // pageable, or not in the RAM copy: through a bounce buffer (an async copy)
             uint8_t* bb = src.exchange_buffer(a_cap + w.j);
