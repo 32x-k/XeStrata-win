@@ -77,6 +77,9 @@ public:
 private:
     QiPlan plan(int64_t hw, int n, int64_t max_text, bool text = false);
     void ensure_open(bool q8);
+    /// The adapters r asks for, bound to the DiT's products (set_loras): a failure throws err.  A set that changed
+    /// makes the contexts again (their text rows were the other adapters' weights).
+    void use_loras(const QiRequest& r);
     bool want_q8(int64_t rows, int n, int64_t max_text);
     bool open_text();
     void encode(const std::vector<int32_t>& ids, std::vector<float>& out);

@@ -44,8 +44,8 @@
 // a strength each: the IMG line's LORA:<strength>:<path>, repeated, in the order given.  Their A and B stay on the GPU
 // with the DiT's weights (the budget's fixed part; the IMAGE line says how many, lora_n, and their MiB, lora_mib), and
 // a set that differs from the last request's starts the context again (the prefix's K and V were the other set's).  A
-// model that applies none refuses a request that names one: HunyuanImage 3.0 (it takes no adapters), Mage-Flow and
-// MOSS-Image (their adapters are not applied yet).
+// model that applies none refuses a request that names one: HunyuanImage 3.0 (it takes no adapters), Mage-Flow (its
+// adapters are not applied yet).
 // Writes RGBA8 rows to --out and a line of times and of the budget's split a run.
 //
 // --serve: the engine stays, its layers and the last prompt's states kept between requests, and takes lines on stdin
@@ -369,6 +369,11 @@ void no_loras(si::ImagePipeline& p) {
     throw std::invalid_argument("image engine: this image model's adapters are not applied yet");
 }
 
+// the pipelines whose DiT's products add the adapters a request names (image_lora.hpp)
+bool takes_loras(si::ImagePipeline& p) {
+    return dynamic_cast<si::QiPipeline*>(&p) != nullptr || dynamic_cast<si::MossPipeline*>(&p) != nullptr;
+}
+
 int serve(si::ImagePipeline& p) {
     Loras loras;   // the adapters' files, read once for the requests that name them
     {
@@ -407,7 +412,7 @@ int serve(si::ImagePipeline& p) {
                 if (!ls || out.empty()) throw std::invalid_argument("IMG <width> <height> <seed> <drop> <out> <ids>");
                 r.ids = parse_ids(ids);
                 r.refs = read_refs(ls, r, loras);
-                if (!r.loras.empty() && dynamic_cast<si::QiPipeline*>(&p) == nullptr) no_loras(p);
+                if (!r.loras.empty() && !takes_loras(p)) no_loras(p);
                 r.on_preview = [&out](int index, int done, const std::vector<uint8_t>& rgba) {
                     const std::string path = out + ".p" + std::to_string(index);
                     write_file(path, rgba);

@@ -28,6 +28,7 @@
 // set_context reads them again from the file.
 #pragma once
 
+#include "strata/image/image_lora.hpp"
 #include "strata/image/mf_dit.hpp"
 #include "strata/image/qi_stream.hpp"
 #include "strata/prefill/gemm.hpp"
@@ -123,12 +124,43 @@ public:
     const float* block0() const { return b0_; }
     const float* text_rows(int i) const { return ctx_[i].txt0; }
 
+    /// An adapter as a file names it: a weight of the DiT, the rows of the weight a file's entry changes, and the rows
+    /// of the entry they are (the text embedder's fused qkv is three weights on the GPU: q takes the entry's rows
+    /// [0, C), k [C, 2C), v [2C, 3C); the text embedder's ffn_up and ffn_gate are halves of one [up | gate]).
+    struct LoraTarget {
+        std::string name;
+        int64_t row0 = 0, rows = 0, cols = 0, src_row = 0;
+    };
+    /// The weights adapters may change: what a file's keys are matched against (the probe's map, the server's list).
+    std::vector<LoraTarget> lora_targets() const;
+
+    /// The adapters the next steps apply, each with its strength, bound to the weights' products: a key the DiT does
+    /// not take (or a shape that is not its weight's, or a form the engine does not apply) is false with err, and
+    /// nothing bound.  The contexts' rows were made from the other adapters' weights, so set_context again before the
+    /// next forward.  The same set again (its files and strengths) changes nothing.
+    bool set_loras(const std::vector<LoraUse>& loras, std::string& err);
+    /// The set bound, as its files' paths and strengths (empty: none).
+    const std::string& lora_key() const { return lora_key_; }
+    /// The bound entries' A and B on the GPU.
+    uint64_t lora_bytes() const;
+    /// The adapter files bound (a set whose strengths are all 0 binds none).
+    int lora_count() const { return (int) lora_files_.size(); }
+    void drop_loras();
+
 private:
     struct W {
         int type = 0;            // 8 Q8_0, 1 F16, -8 W8A8's int8 rows and their scales
         int64_t n = 0, k = 0;    // n rows of k
         const void* d = nullptr; // a block's: its offset in the block's region; else a device pointer
         uint64_t row_bytes = 0;
+        LoraLayer* lora = nullptr;   // the adapters' deltas for its products (null: none: the product is unchanged)
+    };
+    /// A weight and the rows of a file's entry it takes (a fused weight's range, or one of the three weights of the
+    /// text embedder's qkv split).
+    struct LoraSlot {
+        std::string name;
+        W* w = nullptr;
+        int64_t row0 = 0, rows = 0, src_row = 0;
     };
     struct Block {
         W q, k, v, o, up_gate, down;
@@ -151,6 +183,11 @@ private:
             uint64_t& bytes);
     const float* vec(const std::string& name, std::vector<void*>& owned, uint64_t& bytes);
     void load_text();
+    /// The weights adapters may take, from the blocks, the text embedder and the weights outside them (open, and a
+    /// later load_text).
+    void build_lora_targets();
+    /// The products' scratch: T rows of the largest bound rank, FP32 and FP16 (grown on use).
+    void lora_scratch(int64_t T);
     MfOut product(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y, int64_t T,
                   const float* bias, bool same_input = false, bool defer = false);
     void ensure(int64_t hw, int n, int64_t max_text);
@@ -170,6 +207,15 @@ private:
     std::vector<void*> allocs_, text_allocs_;
     uint64_t weight_bytes_ = 0, text_bytes_ = 0;
     int64_t scratch_ = 0;
+    // the adapters: the weights' table, the bound layers (the parts keep the entries' A and B on the GPU) and the
+    // products' scratch
+    std::vector<LoraSlot> lora_slots_;
+    std::vector<std::unique_ptr<LoraLayer>> lora_layers_;
+    std::vector<std::shared_ptr<const LoraFile>> lora_files_;
+    std::string lora_key_;
+    int64_t lora_rank_ = 0, lora_tmp_t_ = 0;
+    float* lora_f32_ = nullptr;
+    uint16_t* lora16_ = nullptr;
     bool dry_ = false, q8_ = true, w8_ = false, keep0_ = false, text_loaded_ = false;
     int64_t C_ = 3072, F_ = 8192, heads_ = 24, hd_ = 128, in_ch_ = 128, txt_dim_ = 4096, freq_ = 256;
     double rope_base_ = 10000.0;

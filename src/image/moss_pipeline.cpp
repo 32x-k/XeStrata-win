@@ -189,6 +189,16 @@ bool MossPipeline::open(const std::string& dit, const std::string& vae, const st
     return true;
 }
 
+void MossPipeline::use_loras(const QiRequest& r) {
+    std::string err;
+    const std::string before = dit_->lora_key();
+    if (!dit_->set_loras(r.loras, err)) throw std::runtime_error(err);
+    if (dit_->lora_key() != before) {   // the contexts' text rows were made with the other adapters' weights
+        ctx_states_[0].clear();
+        ctx_states_[1].clear();
+    }
+}
+
 uint64_t MossPipeline::text_fixed() const { return te_fixed_ > 0 ? te_fixed_ : te_other_ + kTextWork; }
 
 void MossPipeline::ensure_open(bool q8) {
@@ -242,7 +252,8 @@ uint64_t MossPipeline::held() const {
     uint64_t b = 0;
     if (vae_) b += vae_->weight_bytes() + vae_->scratch_held() + (vae_->has_encoder() ? vae_->encoder_bytes() : 0);
     if (dit_) {
-        b += dit_->weight_bytes() + dit_->scratch_bytes() + dit_->blocks_vram() + dit_->activations_held();
+        b += dit_->weight_bytes() + dit_->lora_bytes() + dit_->scratch_bytes() + dit_->blocks_vram() +
+             dit_->activations_held();
         if (dit_->text_loaded()) b += dit_->text_bytes();
     }
     if (te_) b += text_fixed() + te_->layers_vram();
@@ -258,14 +269,16 @@ QiNeed MossPipeline::need(int64_t n_text, int64_t width, int64_t height,
                           const std::vector<std::pair<int64_t, int64_t>>& refs, bool mask, int64_t n_neg,
                           const std::vector<LoraUse>& loras) {
     (void) refs;   // MOSS-Image has no edits
-    (void) loras;   // MOSS-Image takes no adapters yet: strata_image refuses a request that asks for one
     const MossDit& dit = q8_ == 0 ? *dit16_size_ : *dit_size_;   // the least: 8 bits, unless FP16 is asked for
     const MossDit& full = q8_ == 1 ? *dit_size_ : *dit16_size_;  // all resident: FP16's, unless 8 bits are
     const MfVae& vae = *vae_size_;
     const int64_t h = height / 16, w = width / 16, hw = h * w;
     const int64_t max_text = std::max(n_text, n_neg);
     const int n = n_neg > 0 ? 2 : 1;
-    uint64_t base = 0, fixed = vae.weight_bytes() + dit.text_bytes();
+    // the adapters: their A and B (in VRAM for the request, the blocks streamed or not), and the products' scratch of a
+    // step's rows; nothing bound yet, so the DiT's activations here hold none of it
+    const uint64_t lora = lora_gpu_bytes(loras, n * (hw + max_text));
+    uint64_t base = 0, fixed = vae.weight_bytes() + dit.text_bytes() + lora;
     if (mask && base_encoder_) {   // a base image: its encode, and its latent (and a mask's) kept
         fixed += vae.encoder_bytes() + LatentStart::bytes(dit.latent_channels() * hw, hw, true);
         base = vae.encode_scratch_bytes(h, w) + (uint64_t) (3 * height * width) * 4;
@@ -297,7 +310,10 @@ void MossPipeline::release(bool all) {
     gpu::stream_sync(s_);
     if (all) {
         te_.reset();
-        if (dit_ && dit_->q8()) dit_host_ = dit_->take_host();   // the RAM setup counts for it: kept for the next open
+        if (dit_) {
+            dit_->drop_loras();   // the adapters' A and B too (they go back on the next request's, from its files)
+            if (dit_->q8()) dit_host_ = dit_->take_host();   // the RAM setup counts for it: kept for the next open
+        }
         dit_.reset();
         vae_.reset();
         ctx_states_[0].clear();
@@ -322,9 +338,11 @@ QiPlan MossPipeline::plan(int64_t hw, int n, int64_t max_text, bool text) {
     QiPlan p;
     p.budget = budget();
     MossDit& d = *dit_;
-    p.fixed = d.weight_bytes() + d.scratch_bytes() + (text || d.text_loaded() ? d.text_bytes() : 0) +
-              vae_->weight_bytes() +
+    p.fixed = d.weight_bytes() + d.lora_bytes() + d.scratch_bytes() +
+              (text || d.text_loaded() ? d.text_bytes() : 0) + vae_->weight_bytes() +
               (vae_->has_encoder() ? vae_->encoder_bytes() : 0);
+    p.lora = d.lora_bytes();
+    p.lora_n = d.lora_count();
     if (p.budget <= p.fixed)
         throw std::runtime_error("image engine: the VRAM budget (" + std::to_string(p.budget >> 20) +
                                  " MiB) is below the weights that always stay");
@@ -498,6 +516,7 @@ std::vector<uint8_t> MossPipeline::generate(const QiRequest& r, QiTimes* times, 
     const int64_t rows1 = guided ? (r.neg_te_rows > 0 ? r.neg_te_rows : (int64_t) r.neg_ids.size()) : 0;
     ensure_open(want_q8(h * w, n, std::max(rows0, rows1)));
     MossDit& d = *dit_;
+    use_loras(r);   // before the plan (their bytes are fixed) and the contexts (a set that changed makes them again)
     LatentStart ls;
     if (base != nullptr) {
         if (stage) stage("refs");

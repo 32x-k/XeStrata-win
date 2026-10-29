@@ -58,6 +58,21 @@ def gguf(path: Path, tensors: dict[str, tuple[int, ...]], meta: dict[str, str] |
     path.write_bytes(bytes(out) + bytes(4096))
 
 
+def moss_lora(rank: int = 4, blocks: tuple[int, ...] = (0, 1),
+              prefix: str = "transformer.") -> dict[str, tuple[int, ...]]:
+    """MOSS-Image's adapter's tensors, as a diffusers save names them (layers.N.proj.*), at `rank` and that prefix."""
+    out: dict[str, tuple[int, ...]] = {}
+    for b in blocks:
+        for name, cols, rows in (("proj.q", 128, 128), ("proj.ffn_up_gate", 128, 256), ("proj.ffn_down", 128, 128)):
+            out[f"{prefix}layers.{b}.{name}.lora_A.weight"] = (rank, cols)
+            out[f"{prefix}layers.{b}.{name}.lora_B.weight"] = (rows, rank)
+    for name, cols, rows in (("qkv", 128, 384), ("ffn_up", 128, 128), ("ffn_gate", 128, 128),
+                             ("ffn_down", 128, 128)):
+        out[f"{prefix}text_embedder.blocks.0.{name}.lora_A.weight"] = (rank, cols)
+        out[f"{prefix}text_embedder.blocks.0.{name}.lora_B.weight"] = (rows, rank)
+    return out
+
+
 def qwen_lora(rank: int = 4, blocks: tuple[int, ...] = (0, 1), prefix: str = "transformer.",
               extra: dict[str, tuple[int, ...]] | None = None, meta: dict[str, str] | None = None) -> dict:
     """A Qwen-Image-2.1 adapter's tensors, as diffusers' saves name them (transformer_blocks.N.attn.to_q and the
@@ -173,8 +188,23 @@ class Listing(Tree):
 
     def test_a_model_that_takes_no_adapter_lists_none(self):
         self.qwen()
-        for family in ("moss-image", "mage-flow", "hunyuan-image-3"):
+        for family in ("mage-flow", "hunyuan-image-3"):
             self.assertEqual(self.folder(family).listing(), [], family)
+
+    def test_moss_images_file_and_the_weights_of_its_split_qkv(self):
+        safetensors(self.d / "moss.safetensors", moss_lora())
+        self.qwen("qwen")
+        f = self.folder("moss-image")
+        entries = f.listing()
+        self.assertEqual([e["name"] for e in entries], ["moss"])
+        e = entries[0]
+        self.assertEqual(e["rank"], 4)
+        self.assertEqual(e["targets"], ["ffn_down", "ffn_gate", "ffn_up", "proj.ffn_down", "proj.ffn_up_gate",
+                                        "proj.q", "qkv"], "a block's number is not part of the kind")
+        self.assertIn("is not one of this image model's weights", f.skipped["qwen"],
+                      "Qwen-Image-2.1's weights are not MOSS-Image's")
+        use = loras.field([{"name": "moss"}], f)[0]
+        self.assertEqual(use["name"], "moss")
 
 
 class Requests(Tree):
@@ -267,7 +297,7 @@ class Requests(Tree):
             loras.strip_tags("<lora:style/gouache:1:heavy>", self.f)
 
     def test_a_model_that_takes_no_adapter_refuses_both(self):
-        for family in ("moss-image", "mage-flow", "hunyuan-image-3"):
+        for family in ("mage-flow", "hunyuan-image-3"):
             f = self.folder(family)
             with self.assertRaises(loras.LoraError) as e:
                 loras.field([{"name": "style/gouache"}], f)

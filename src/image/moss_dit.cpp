@@ -56,6 +56,24 @@ void release(std::vector<void*>& owned, void* p) {
     gpu::free(p);
 }
 
+// A file's key that changes a text encoder (kohya's lora_te_, diffusers' text_encoder. prefix, the te. other tools
+// write): the image engine applies adapters to the DiT only, and says so rather than leaving it out.
+bool is_text_encoder_key(const std::string& k) {
+    return k.rfind("lora_te", 0) == 0 || k.rfind("text_encoder", 0) == 0 || k.rfind("te.", 0) == 0;
+}
+
+// Six of the names, then "and N more": the errors' list of a file's keys the DiT does not take.
+std::string name_list(const std::vector<std::string>& names) {
+    std::string out;
+    const size_t n = std::min<size_t>(names.size(), 6);
+    for (size_t i = 0; i < n; ++i) {
+        if (i > 0) out += ", ";
+        out += names[i];
+    }
+    if (names.size() > n) out += " (and " + std::to_string(names.size() - n) + " more)";
+    return out;
+}
+
 // RMSNorm(x[t]) * w (eps 1e-6), then * (1 + scale) + shift where the time gives them (null: not)
 struct RmsMod {
     const float *x, *w, *shift, *scale;
@@ -375,6 +393,7 @@ bool MossDit::open(const std::string& path, void* stream, std::string& err, bool
         F_ = blocks_[0].down.k;
         if (blocks_[0].up_gate.n != 2 * F_)
             throw std::runtime_error("image engine (MOSS-Image DiT): ffn_up_gate is not twice ffn_down's width");
+        build_lora_targets();
         if (!q8_)   // each block's weights, as they reach the GPU (resident, or a streamed slot): bf16 to FP16
             blocks_stream_.set_prepare([this](int i, uint8_t* d) {
                 sycl::queue& q = q_of(s_);
@@ -459,33 +478,43 @@ void MossDit::load_text() {
         if (r.d != nullptr) r.d = static_cast<const uint16_t*>(w.d) + r0 * w.k;
         return r;
     };
-    tproj_ = dense({"text_embedder.proj"}, true, &b_tproj_, text_allocs_, text_bytes_);
-    txt_dim_ = tproj_.k;
-    tblocks_.clear();
+    // the weight and the blocks go into the objects an earlier load made: a bound adapter's layer is the weight's own,
+    // and the table of the weights adapters may take points into them (drop_text frees their bytes, not the objects)
+    const auto keep = [](W& dst, const W& src) {
+        LoraLayer* l = dst.lora;   // a weight the adapters are bound to keeps its layer across a load
+        dst = src;
+        dst.lora = l;
+    };
+    {
+        const W tproj = dense({"text_embedder.proj"}, true, &b_tproj_, text_allocs_, text_bytes_);
+        keep(tproj_, tproj);
+        txt_dim_ = tproj_.k;
+    }
     for (int i = 0;; ++i) {
         const std::string p = "text_embedder.blocks." + std::to_string(i) + ".";
         if (files_->find(p + "qkv.weight") == nullptr) break;
-        TextBlock b;
+        if (tblocks_.size() <= (size_t) i) tblocks_.resize((size_t) i + 1);
+        TextBlock& b = tblocks_[(size_t) i];
         const float* bqkv = nullptr;
         const W qkv = dense({p + "qkv"}, true, &bqkv, text_allocs_, text_bytes_);
-        b.q = rows(qkv, 0, C_);
-        b.k = rows(qkv, C_, C_);
-        b.v = rows(qkv, 2 * C_, C_);
+        keep(b.q, rows(qkv, 0, C_));
+        keep(b.k, rows(qkv, C_, C_));
+        keep(b.v, rows(qkv, 2 * C_, C_));
         if (!dry_) {
             b.bq = bqkv;
             b.bk = bqkv + C_;
             b.bv = bqkv + 2 * C_;
         }
-        b.o = dense({p + "proj"}, true, &b.bo, text_allocs_, text_bytes_);
-        b.up_gate = dense({p + "ffn_up", p + "ffn_gate"}, true, &b.bug, text_allocs_, text_bytes_);
-        b.down = dense({p + "ffn_down"}, true, &b.bdown, text_allocs_, text_bytes_);
+        keep(b.o, dense({p + "proj"}, true, &b.bo, text_allocs_, text_bytes_));
+        keep(b.up_gate, dense({p + "ffn_up", p + "ffn_gate"}, true, &b.bug, text_allocs_, text_bytes_));
+        keep(b.down, dense({p + "ffn_down"}, true, &b.bdown, text_allocs_, text_bytes_));
         b.n1 = vec(p + "norm1.weight", text_allocs_, text_bytes_);
         b.n2 = vec(p + "norm2.weight", text_allocs_, text_bytes_);
         b.nq = vec(p + "q_norm.weight", text_allocs_, text_bytes_);
         b.nk = vec(p + "k_norm.weight", text_allocs_, text_bytes_);
-        tblocks_.push_back(b);
     }
     text_loaded_ = !dry_;
+    build_lora_targets();
 }
 
 void MossDit::drop_text() {
@@ -553,6 +582,8 @@ MfOut MossDit::product(const uint16_t* x16, const float* rs, const W& w, const u
     out.f = y;
     out.C = w.n;
     if (T <= 0) return out;
+    LoraLayer* lora = w.lora;
+    if (lora != nullptr) defer = false;   // a delta is FP32: the int32 sums are scaled into y first
     const auto* d = base != nullptr ? base + reinterpret_cast<uintptr_t>(w.d) : static_cast<const uint8_t*>(w.d);
     if (w.type == kTypeW8) {
         // the activations rotated and quantized as the weights (once for the products of one input), their scales
@@ -572,17 +603,22 @@ MfOut MossDit::product(const uint16_t* x16, const float* rs, const W& w, const u
             out.b = bias;
             return out;
         }
-        qi_i8_scale(y, T, w.n, w.n, sx, sw, bias, s_);
-        return out;
+        qi_i8_scale(y, T, w.n, w.n, sx, sw, bias, s_);   // sx carries the rows' scales: y is in the input's units
+    } else {
+        if (w.type == kTypeF16) gemm_.f16(x16, reinterpret_cast<const uint16_t*>(d), y, T, w.n, w.k);
+        else gemm_.native(x16, w.type, d, y, T, w.n, w.k);
+        if (defer) {
+            out.rs = rs;
+            out.b = bias;
+            return out;
+        }
+        if (rs != nullptr || bias != nullptr) rows_back(y, rs, bias, T, w.n, s_);
     }
-    if (w.type == kTypeF16) gemm_.f16(x16, reinterpret_cast<const uint16_t*>(d), y, T, w.n, w.k);
-    else gemm_.native(x16, w.type, d, y, T, w.n, w.k);
-    if (defer) {
-        out.rs = rs;
-        out.b = bias;
-        return out;
+    if (lora != nullptr) {
+        // the delta is the input's own (x16 = x / rs): its rows' scales put it back in y's units, as rows_back does
+        lora_scratch(T);
+        lora->add(x16, T, y, w.n, 0, w.n, rs, gemm_, lora_f32_, lora16_, s_);
     }
-    if (rs != nullptr || bias != nullptr) rows_back(y, rs, bias, T, w.n, s_);
     return out;
 }
 
@@ -596,7 +632,8 @@ uint64_t MossDit::activation_bytes(int64_t hw, int n, int64_t max_text, int64_t 
            (uint64_t) R * C_ * 2 +                              // the attention's output, a row's scale
            (uint64_t) n * (hw + max_text) * hd_ * 4 +           // the rotary tables
            (uint64_t) TP * C_ * 4 +                             // the plain attention's scratch
-           (w8_ ? (uint64_t) std::max(R, band) * std::max(C_, F_) + (uint64_t) std::max(R, band) * 8 + C_ * 4 : 0);
+           (w8_ ? (uint64_t) std::max(R, band) * std::max(C_, F_) + (uint64_t) std::max(R, band) * 8 + C_ * 4 : 0) +
+           (lora_rank_ > 0 ? (uint64_t) std::max(R, lora_tmp_t_) * (uint64_t) lora_rank_ * 6 : 0);
 }
 
 void MossDit::ensure(int64_t hw, int n, int64_t max_text) {
@@ -647,12 +684,193 @@ void MossDit::drop_activations() {
     for (void* p : {(void*) x_, (void*) q_, (void*) k_, (void*) v_, (void*) a_, (void*) gu_, (void*) h16_, (void*) rs_,
                     (void*) rs2_, (void*) rs_o_, (void*) hs_, (void*) vpart_, (void*) xq8_, (void*) pend_sw_,
                     (void*) jq16_, (void*) jk16_, (void*) jv16_, (void*) jo16_, (void*) o16_, (void*) attn_scratch_,
-                    (void*) b0_})
+                    (void*) b0_, (void*) lora_f32_, (void*) lora16_})
         release(allocs_, p);
     x_ = q_ = k_ = v_ = a_ = gu_ = rs_ = rs2_ = rs_o_ = hs_ = vpart_ = attn_scratch_ = b0_ = pend_sw_ = nullptr;
     h16_ = jq16_ = jk16_ = jv16_ = jo16_ = o16_ = nullptr;
     xq8_ = nullptr;
+    lora_f32_ = nullptr;
+    lora16_ = nullptr;
+    lora_tmp_t_ = 0;
     cap_hw_ = cap_n_ = cap_text_ = 0;
+}
+
+std::vector<MossDit::LoraTarget> MossDit::lora_targets() const {
+    std::vector<LoraTarget> out;
+    out.reserve(lora_slots_.size());
+    for (const LoraSlot& s : lora_slots_) out.push_back({s.name, s.row0, s.rows, s.w->k, s.src_row});
+    return out;
+}
+
+void MossDit::build_lora_targets() {
+    lora_slots_.clear();
+    auto add = [this](std::string name, W& w, int64_t row0, int64_t rows, int64_t src_row) {
+        if (w.n <= 0 || w.k <= 0 || rows <= 0 || row0 + rows > w.n) return;
+        lora_slots_.push_back({std::move(name), &w, row0, rows, src_row});
+    };
+    // the weights outside the blocks (the norms are norms, not linear products: unchanged)
+    add("video_embedder", vin_, 0, vin_.n, 0);
+    add("time_embedding.0", t1_, 0, t1_.n, 0);
+    add("time_embedding.2", t2_, 0, t2_.n, 0);
+    add("shared_block_modulation", smod_, 0, smod_.n, 0);
+    add("video_head_modulation", hmod_, 0, hmod_.n, 0);
+    add("final_linear_video", fout_, 0, fout_.n, 0);
+    // the text embedder: its projection and its blocks.  Its q, k and v rows are three weights on the GPU (b.q, b.k,
+    // b.v) out of one qkv on the file's side (q the entry's rows [0, C), k [C, 2C), v [2C, 3C)); ffn_up and ffn_gate
+    // are the two halves of the one [up | gate] the products take.
+    add("text_embedder.proj", tproj_, 0, tproj_.n, 0);
+    for (int i = 0; i < (int) tblocks_.size(); ++i) {
+        const std::string p = "text_embedder.blocks." + std::to_string(i) + ".";
+        TextBlock& b = tblocks_[(size_t) i];
+        add(p + "qkv", b.q, 0, b.q.n, 0);
+        add(p + "qkv", b.k, 0, b.k.n, b.q.n);
+        add(p + "qkv", b.v, 0, b.v.n, b.q.n + b.k.n);
+        add(p + "proj", b.o, 0, b.o.n, 0);
+        add(p + "ffn_up_gate", b.up_gate, 0, b.up_gate.n, 0);
+        add(p + "ffn_up", b.up_gate, 0, b.up_gate.n / 2, 0);
+        add(p + "ffn_gate", b.up_gate, b.up_gate.n / 2, b.up_gate.n / 2, 0);
+        add(p + "ffn_down", b.down, 0, b.down.n, 0);
+    }
+    // the 42 blocks: proj.q, proj.k, proj.v, proj.o, the [up | gate] of proj.ffn_up_gate, proj.ffn_down
+    for (int bi = 0; bi < (int) blocks_.size(); ++bi) {
+        const std::string p = "layers." + std::to_string(bi) + ".proj.";
+        Block& b = blocks_[(size_t) bi];
+        add(p + "q", b.q, 0, b.q.n, 0);
+        add(p + "k", b.k, 0, b.k.n, 0);
+        add(p + "v", b.v, 0, b.v.n, 0);
+        add(p + "o", b.o, 0, b.o.n, 0);
+        add(p + "ffn_up_gate", b.up_gate, 0, b.up_gate.n, 0);
+        add(p + "ffn_up", b.up_gate, 0, b.up_gate.n / 2, 0);
+        add(p + "ffn_gate", b.up_gate, b.up_gate.n / 2, b.up_gate.n / 2, 0);
+        add(p + "ffn_down", b.down, 0, b.down.n, 0);
+    }
+}
+
+void MossDit::lora_scratch(int64_t T) {
+    if (lora_rank_ <= 0 || T <= 0) return;
+    if (lora_f32_ != nullptr && T <= lora_tmp_t_) return;
+    gpu::stream_sync(s_);   // the old buffers may still be read
+    for (void** p : {reinterpret_cast<void**>(&lora_f32_), reinterpret_cast<void**>(&lora16_)})
+        if (*p != nullptr) {
+            release(allocs_, *p);
+            *p = nullptr;
+        }
+    lora_f32_ = alloc<float>(allocs_, T * lora_rank_);
+    lora16_ = alloc<uint16_t>(allocs_, T * lora_rank_);
+    lora_tmp_t_ = T;
+}
+
+bool MossDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
+    // the set as the same again (its files and strengths): nothing to bind
+    std::string key;
+    for (const LoraUse& u : loras) {
+        if (!u.file) continue;
+        char num[32];
+        std::snprintf(num, sizeof num, "%.7g", (double) u.scale);
+        key += u.file->path();
+        key += ':';
+        key += num;
+        key += ';';
+    }
+    if (key == lora_key_) return true;
+    drop_loras();
+    if (key.empty()) return true;
+    std::vector<std::string> unknown, text_encoder;
+    for (const LoraUse& u : loras) {
+        if (!u.file) continue;
+        for (const LoraEntry& e : u.file->entries()) {
+            if (is_text_encoder_key(e.key)) {
+                text_encoder.push_back(e.key);
+                continue;
+            }
+            // the slots of the entry's name: one weight, or the weights a fused one is split into
+            std::vector<const LoraSlot*> slots;
+            for (const LoraSlot& s : lora_slots_)
+                if (s.name == e.key) slots.push_back(&s);
+            if (slots.empty()) {
+                unknown.push_back(e.key);
+                continue;
+            }
+            int64_t rows = 0;   // the entry's rows the weight takes
+            for (const LoraSlot* s : slots) rows = std::max(rows, s->src_row + s->rows);
+            if (e.rows != rows || e.cols != slots[0]->w->k) {
+                err = "image engine: " + u.file->path() + ": " + e.key + " is " + std::to_string(e.cols) + " x " +
+                      std::to_string(e.rows) + ", not the DiT's " + std::to_string(slots[0]->w->k) + " x " +
+                      std::to_string(rows);
+                drop_loras();
+                return false;
+            }
+            const float scale = u.scale * e.scale();
+            if (scale == 0.0f) continue;   // a strength of 0 changes nothing: the weight keeps its product's path
+            if (!e.dora.empty()) {   // DoRA's rows are scaled by m / |W| (comfy/weight_adapter): not applied yet
+                err = "image engine: " + u.file->path() + ": " + e.key +
+                      ": a DoRA (dora_scale) adapter: the engine scales no weight's rows by it yet";
+                drop_loras();
+                return false;
+            }
+            auto entry = std::make_shared<LoraDeviceEntry>();
+            if (!entry->upload(e, s_, err)) {
+                drop_loras();
+                return false;
+            }
+            for (const LoraSlot* slot : slots) {
+                if (slot->w->lora == nullptr) {
+                    lora_layers_.push_back(std::make_unique<LoraLayer>());
+                    slot->w->lora = lora_layers_.back().get();
+                }
+                LoraPart part;
+                part.entry = entry;
+                part.row0 = slot->row0;
+                part.n = slot->rows;
+                part.src_row = slot->src_row;
+                part.scale = scale;
+                slot->w->lora->parts.push_back(part);
+            }
+            lora_rank_ = std::max(lora_rank_, e.rank);
+        }
+    }
+    if (!text_encoder.empty()) {
+        err = "image engine: a text encoder's adapter: the image engine applies adapters to the DiT only (" +
+              name_list(text_encoder) + ")";
+        drop_loras();
+        return false;
+    }
+    if (!unknown.empty()) {
+        err = "image engine: the DiT takes no adapter for " + name_list(unknown);
+        drop_loras();
+        return false;
+    }
+    if (lora_layers_.empty()) {   // every strength 0: as no adapter at all (the products are untouched)
+        drop_loras();
+        return true;
+    }
+    for (const LoraUse& u : loras)
+        if (u.file) lora_files_.push_back(u.file);
+    lora_key_ = key;
+    return true;
+}
+
+uint64_t MossDit::lora_bytes() const {
+    uint64_t n = 0;
+    for (const std::unique_ptr<LoraLayer>& l : lora_layers_) n += l->bytes();
+    return n;
+}
+
+void MossDit::drop_loras() {
+    for (LoraSlot& s : lora_slots_) s.w->lora = nullptr;
+    lora_layers_.clear();
+    lora_files_.clear();
+    lora_key_.clear();
+    lora_rank_ = 0;
+    if (lora_f32_ != nullptr || lora16_ != nullptr) {
+        gpu::stream_sync(s_);
+        for (void** p : {reinterpret_cast<void**>(&lora_f32_), reinterpret_cast<void**>(&lora16_)})
+            if (*p != nullptr) {
+                release(allocs_, *p);
+                *p = nullptr;
+            }
+        lora_tmp_t_ = 0;
+    }
 }
 
 namespace {
@@ -750,8 +968,10 @@ void MossDit::run_block(const W* const* w, const float* const* bias, const float
     const float* scale_f = mod != nullptr ? mod + 4 * C : nullptr;
     const float* gate_f = mod != nullptr ? mod + 5 * C : nullptr;
     // W8A8 blocks take their products' int8 inputs from the row-wise kernels themselves (rows_i8), each into the
-    // scales' slot the deferred sums before it do not read (i8_slot)
-    const bool i8 = std::all_of(w, w + 6, [](const W* p) { return p->type == kTypeW8; });
+    // scales' slot the deferred sums before it do not read (i8_slot).  A block an adapter changes takes its products'
+    // inputs as the FP16 rows (rows16): the delta is the input's own, and rows_i8 makes only its int8 values (and every
+    // product there is one pass more, the adapter applied)
+    const bool i8 = std::all_of(w, w + 6, [](const W* p) { return p->type == kTypeW8 && p->lora == nullptr; });
     // the block before's MLP output, added to x by this block's first kernel where it ran over the same rows
     MfOut pre;
     const float* pre_gate = nullptr;
