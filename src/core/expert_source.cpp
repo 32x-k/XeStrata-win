@@ -3195,6 +3195,18 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
             ++d.cache_refused;
             int16_t& jo = d.job_of[(size_t) e];
+            // #45: a job takes MAXT tokens, and an id routed twice within a token (the same expert in two of its k
+            // slots) can give one expert more: a ninth wrote past act/out/nact into fmt and the pool's per-job arrays,
+            // and the CPU pool faulted.  The expert gets another job then (jobs_multi has n_tok * k of them).
+            if (jo >= 0 && d.jobs_multi[(size_t) jo].nt >= MAXT) {
+                static std::atomic<bool> said{false};
+                if (!said.exchange(true))
+                    std::fprintf(stderr, "strata: expert %lld of layer %lld is routed more than %d times in a window "
+                                         "of %lld tokens (an id repeated within a token); it is computed in two "
+                                         "jobs (#45, said once)\n",
+                                 (long long) e, (long long) d.layers, MAXT, (long long) n_tok);
+                jo = -1;
+            }
             if (jo < 0) {
                 const uint8_t* zp[3] = {nullptr, nullptr, nullptr};
                 const bool zc = d.cold_mode == 4 && native && d.src->zc_roles(d.layers, e, zp);
