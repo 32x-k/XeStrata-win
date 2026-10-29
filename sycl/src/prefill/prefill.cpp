@@ -697,6 +697,22 @@ struct PeerPrefill {
     }
 };
 
+// SYCL port: how many queries the prompt path hands the FP32 attention kernel at once (STRATA_ATTN_BATCH, default 32; the
+// tensor-core kernel is opt-in and slower here).  Its scratch is batch x chunks x n_head x 258 floats, about 0.41 GB at 32 and
+// 1.65 GB at 128 on Flash-Next, independent of the prompt chunk, so the size that init allocates (attn_batch_for) and the size
+// the budget counts (bytes_needed_impl, which sizes the expert cache and the prompt path's loan) must be the same number.
+// 128 reads a prompt 1.1-1.3% faster on two Arc Pro B65s with the lane-cell score phase, but its extra 1.2 GB comes out of
+// the expert cache on every card (an 8 GB A750 most), so the default stays 32.
+static int64_t attn_batch_setting() {
+    const char* v = std::getenv("STRATA_ATTN_BATCH");
+    const long long n = v ? std::atoll(v) : 32;
+    return (n >= 1 && n <= 1024) ? (int64_t) n : 32LL;
+}
+// A chunk of T tokens never runs more than T queries at once: the scratch of the rest would sit unused.
+static int64_t attn_batch_for(size_t T) {
+    return std::max<int64_t>(1, std::min<int64_t>(attn_batch_setting(), (int64_t) T));
+}
+
 struct Prefill::Impl {
     const core::WeightTable* wt = nullptr;
     const core::ModelGeometry* g = nullptr;
@@ -734,11 +750,7 @@ struct Prefill::Impl {
     float* sel_scores = nullptr;          // [sel_batch, max_blocks]
     int64_t sel_batch = 256, max_blocks = 0;
     float* attn_scratch = nullptr;
-    int64_t attn_batch = [] {   // SYCL port: how many queries the prompt path hands the FP32 attention kernel at once
-        const char* v = std::getenv("STRATA_ATTN_BATCH");   // (the tensor-core kernel is opt-in and slower here)
-        const long long n = v ? std::atoll(v) : 128;        // 32 was picked for a vector-matrix kernel; with the
-        return (n >= 1 && n <= 1024) ? (int64_t) n : 128LL; // lane-cell score phase 128 reads a 4,106-token prompt
-    }(), cap = 0;                                            // 1.1% faster than 32 and a 16,380-token one 1.3%
+    int64_t attn_batch = 32, cap = 0;       // attn_batch: set by carve from the chunk (attn_batch_for)
     // MoE
     float *logits = nullptr, *w = nullptr, *GU = nullptr, *Dm = nullptr, *sgate = nullptr, *sup = nullptr,
           *shared = nullptr, *sg = nullptr;
@@ -1445,6 +1457,7 @@ bool Prefill::carve(size_t T, void* alloc) {
     m.steps_dev = o.take<int32_t>(T * strata::kernels::kStepCount, ok);
     strata::kernels::QsaShapes s = core::qsa_shapes(g);
     m.cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
+    m.attn_batch = attn_batch_for(T);
     m.max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
     {
         // one region for the attention half's and the MoE half's scratch (see gdn_set_bytes)
@@ -2166,7 +2179,7 @@ uint64_t Prefill::bytes_needed_impl(const core::ModelGeometry& g, const core::Se
     strata::kernels::QsaShapes s = core::qsa_shapes(g);
     const int64_t cap = strata::kernels::qsa_selection_width(strata::kernels::kTopkMaxCells, s);
     const int64_t max_blocks = ss.qsa_states[ss.qsa_primary()].max_cells / s.idx_block + 2;
-    o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, 32, s),
+    o.take<uint8_t>((size_t) std::max({gdn_set_bytes(T), qsa_set_bytes(T, cap, max_blocks, 256, attn_batch_for(T), s),
                                        moe_set_bytes(T, g.n_expert, fused_layout(T, src))}), ok);
     for (int i = 0; i < dq_slots(); ++i) { o.take<uint16_t>(1280 * 2560, ok); o.take<uint16_t>(2560 * 640, ok); }
     if (mmq_plan().any) {
