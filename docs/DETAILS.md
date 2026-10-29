@@ -1847,8 +1847,8 @@ The model files are not part of it; their licenses apply to them (below).
    - [Splash](https://github.com/incoai/splash), by Inco AI and the Splash contributors;
    - [ninfer](https://github.com/Neroued/ninfer), by Neroued;
    - [HyperQwen](https://github.com/syv-ai/HyperQwen), by syv.ai and the HyperQwen contributors;
-   - [Project Maya](https://github.com/mw00/project-maya), by mw00 and the Project Maya contributors (how many of the
-     experts missing from VRAM the CPU computes and how many are read over PCIe,
+   - [Project Maya](https://github.com/mw00/project-maya), by Peasant Smith and the Project Maya contributors (how many
+     of the experts missing from VRAM the CPU computes and how many are read over PCIe,
      [XE](XE.md#splitting-the-missed-experts-between-the-cpu-and-pcie));
    - [nextsycl](https://github.com/maxfridbe/nextsycl), by maxfridbe (which kernels the decode of the Qwen3.5 family's
      models merges; the code is written anew).
