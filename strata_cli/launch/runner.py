@@ -534,6 +534,9 @@ def derive_config(base: dict, s: S.LaunchSettings, *, bool_flags: frozenset[str]
         draft_layer.apply(cfg)
     elif s.mtp == "on":
         cfg["mtp"] = True
+    if cfg.get("backend") == "sycl":                         # exactly two Arc B-series cards: --spec 2 (strata_control/intel_spec.py); the person's
+        from strata_control import intel_spec                # own choices (user_args, an extra option below) come after it and win
+        intel_spec.apply_for_launch(cfg)
     if s.extra:
         a_changes, e_changes = S.as_argv_changes(s.extra, bool_flags)
         cfg["args"] = tune_knobs.apply_to_argv([str(x) for x in cfg.get("args") or []], a_changes)
