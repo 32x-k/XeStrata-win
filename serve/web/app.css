@@ -258,6 +258,14 @@ main { flex: 1; min-height: 0; display: flex; }
 .img-moss{display:flex;flex-direction:column;gap:12px}
 .img-moss[hidden],.img-layout[hidden]{display:none}
 .img-moss-more .st-collapse__body{padding:10px 14px}
+.img-lora{display:flex;flex-direction:column;gap:8px}
+.img-lora[hidden]{display:none}
+.img-lora-chips{display:flex;flex-direction:column;gap:6px;align-items:flex-start}
+.img-lora-chip{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:4px 8px;border:1px solid var(--st-line);
+  border-radius:var(--st-r-md);background:var(--st-surface-2)}
+.img-lora-chip__name{font-size:var(--st-fs-sm);max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.img-lora-chip input[type=number]{width:84px}
+.img-lora-chip .st-btn--icon{font-size:var(--st-fs-md);line-height:1}
 .img-layout{display:flex;flex-direction:column;gap:8px}
 .img-layout-stage{position:relative;width:100%;max-width:512px;border:1px dashed var(--st-line);border-radius:8px;
   background:var(--st-surface-2) center/100% 100% no-repeat;touch-action:none;cursor:crosshair;user-select:none;overflow:hidden}

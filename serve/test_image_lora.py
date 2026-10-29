@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later
 """serve/loras.py and the image endpoint's adapters: the folder's listing (a file's keys read by its header), a
 request's "lora" field and prompt tags, the IMG and NEED words the engine is sent, the response, and the models that
-take none.
+take none.  The web page's side too (serve/web/app.js): its picker, chips, strengths and trigger words.
 
 The files are written here, not read from a model: a safetensors' header is the 8-byte length of its JSON and the
 JSON; a GGUF's is its metadata's fields and its tensors' infos (the data is never read: the listing knows a weight's
@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import shutil
 import struct
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -407,6 +408,197 @@ class Job(Tree):
         d = self.gen.defaults()
         self.assertEqual([e["name"] for e in d["loras"]], ["Strong Style", "style/gouache"])
         self.assertEqual(images.model_defaults(self.cfg).get("loras"), None, "the pure defaults carry no folder read")
+
+
+APP = Path(__file__).resolve().parent / "web" / "app.js"
+
+
+def slice_between(src: str, start: str, end: str) -> str:
+    a = src.index(start)
+    return src[a:src.index(end, a)]
+
+
+def entry(name: str, scale: float = 1.0, trigger: str | None = None, **kw) -> dict:
+    """One adapter of a model's listing (/health's image_models[].defaults.loras, serve/loras.py)."""
+    return {"name": name, "path": f"{name}.safetensors", "rank": 16, "scale": scale, "trigger": trigger,
+            "targets": ["attn.to_q"], "size_mib": 12.5, **kw}
+
+
+# The page's own code runs in node against a small fake page: the elements the Images tab's adapters touch, the
+# browser's localStorage (the store the page keeps xestrata.* in) and the model of the moment with its listing.
+HARNESS = r"""
+const state = __STATE__;
+const els = new Map();
+class El {
+  constructor(tag) {
+    this.tag = tag; this.hidden = false; this.value = ""; this.disabled = false; this.textContent = "";
+    this.children = []; this.dataset = {}; this.attrs = {}; this.className = ""; this.title = "";
+  }
+  append(...c) { this.children.push(...c); }
+  replaceChildren(...c) { this.children = [...c]; }
+  setAttribute(k, v) { this.attrs[k] = v; }
+  focus() { this.focused = true; }
+}
+const $ = (id) => { if (!els.has(id)) els.set(id, new El(id)); return els.get(id); };
+class Option { constructor(text, value) { this.text = text; this.value = value; } }
+const data = new Map(Object.entries(state.stored || {}));
+const store = {
+  get(k, d) { const v = data.get("xestrata." + k); return v === undefined ? d : JSON.parse(v); },
+  set(k, v) { data.set("xestrata." + k, JSON.stringify(v)); return true; },
+};
+const document = {createElement: (tag) => new El(tag)};
+const imgModel = () => ({id: state.model, defaults: {loras: state.loras}});
+const tr = (key, english, vars) => String(english == null ? key : english)
+  .replace(/\{(\w+)\}/g, (m, k) => (vars && k in vars ? String(vars[k]) : m));
+const chips = () => $("img-lora-chips").children.map(c => {
+  const name = c.children.find(x => x.className === "img-lora-chip__name");
+  const scale = c.children.find(x => x.type === "number");
+  const buttons = c.children.filter(x => x.type === "button");
+  return {name: name && name.textContent, title: name && name.title, scale: scale && scale.value,
+          trigger: buttons.some(b => b.textContent === "Trigger"),
+          remove: buttons.some(b => b.textContent === "\u00d7")};
+});
+const picker = () => $("img-lora-add").children.map(o => ({text: o.text, value: o.value}));
+const stored = () => Object.fromEntries([...data.entries()]);
+const scaleInput = (i) => $("img-lora-chips").children[i].children.find(x => x.type === "number");
+const trigger = (i) => $("img-lora-chips").children[i].children
+  .find(x => x.type === "button" && x.textContent === "Trigger");
+const choose = (name) => { $("img-lora-add").value = name; $("img-lora-add").onchange(); };
+"""
+
+
+@unittest.skipUnless(shutil.which("node"), "node is not installed")
+class WebPage(unittest.TestCase):
+    """The Images tab's adapters in serve/web/app.js: the block the model's listing fills, the picker, a chip per
+    chosen adapter (its strength, its trigger words, its removal), the count's limit and what the page stores and
+    sends."""
+
+    code: str
+
+    @classmethod
+    def setUpClass(cls):
+        cls.code = slice_between(APP.read_text(encoding="utf-8"), "// the adapters this image model applies",
+                                 "// the count: up to max_n")
+
+    def run_js(self, body: str, loras: list[dict], model: str = "qwen-image-2.1-turbo",
+               stored: dict | None = None) -> dict:
+        page = {"model": model, "loras": loras, "stored": stored or {}}
+        js = HARNESS.replace("__STATE__", json.dumps(page)) + "\n" + self.code + "\n" + body
+        r = subprocess.run(["node", "-e", js], capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return json.loads(r.stdout.strip().splitlines()[-1])
+
+    def test_a_model_that_takes_no_adapter_hides_the_block(self):
+        out = self.run_js('imgLoras();\nconsole.log(JSON.stringify({hidden: $("img-lora").hidden, chips: chips(),'
+                          ' body: imgLorasBody()}));', loras=[], model="mage-flow-turbo")
+        self.assertEqual(out, {"hidden": True, "chips": [], "body": []})
+
+    def test_the_picker_lists_the_models_adapters_and_a_chosen_one_becomes_a_chip(self):
+        out = self.run_js("""
+imgLoras();
+const before = {hidden: $("img-lora").hidden, picker: picker(), chips: chips()};
+choose("style/gouache");
+console.log(JSON.stringify({before, after: chips(), picker: picker(), hint: $("img-lora-hint").hidden,
+                            stored: stored(), body: imgLorasBody(), title: chips()[0].title}));
+""", loras=[entry("style/gouache", 0.8, "gouache style"), entry("Strong Style", 1.0)])
+        self.assertFalse(out["before"]["hidden"])
+        self.assertEqual([o["value"] for o in out["before"]["picker"]], ["", "style/gouache", "Strong Style"])
+        self.assertEqual(out["before"]["chips"], [])
+        # the recommended strength of the listing is the chip's, the trigger words have their button, and the chosen
+        # name leaves the picker; the page keeps the choice for this model
+        self.assertEqual(out["after"], [{"name": "style/gouache", "title": "rank 16, 12.5 MiB · attn.to_q",
+                                         "scale": "0.8", "trigger": True, "remove": True}])
+        self.assertEqual([o["value"] for o in out["picker"]], ["", "Strong Style"])
+        self.assertTrue(out["hint"], "under the limit: no hint")
+        self.assertEqual(out["stored"], {"xestrata.img_loras.qwen-image-2.1-turbo":
+                                         '[{"name":"style/gouache","scale":0.8}]'})
+        self.assertEqual(out["body"], [{"name": "style/gouache", "scale": 0.8}])
+
+    def test_a_stored_choice_comes_back_without_the_names_the_model_lost(self):
+        stored = {"xestrata.img_loras.qwen-image-2.1-turbo": json.dumps(
+            [{"name": "gone", "scale": 1.0}, {"name": "Strong Style", "scale": -1.5}])}
+        out = self.run_js('imgLoras();\nconsole.log(JSON.stringify({chips: chips(), picker: picker(),'
+                          ' body: imgLorasBody()}));', loras=[entry("Strong Style")], stored=stored)
+        self.assertEqual(out["chips"], [{"name": "Strong Style", "title": "rank 16, 12.5 MiB · attn.to_q",
+                                         "scale": "-1.5", "trigger": False, "remove": True}])
+        self.assertEqual([o["value"] for o in out["picker"]], [""], "a chosen adapter leaves the picker")
+        self.assertEqual(out["body"], [{"name": "Strong Style", "scale": -1.5}])
+
+    def test_a_strength_is_the_apis_range_two_decimals_and_the_listings_when_unreadable(self):
+        out = self.run_js("""
+imgLoras();
+choose("style/gouache");
+const seen = [];
+for (const v of ["7", "-9", "", "abc", "0.333", "1.5"]) {
+  scaleInput(0).value = v;
+  scaleInput(0).onchange();
+  seen.push(scaleInput(0).value);
+}
+console.log(JSON.stringify({seen, body: imgLorasBody()}));
+""", loras=[entry("style/gouache", 0.8)])
+        self.assertEqual(out["seen"], ["2", "-2", "0.8", "0.8", "0.33", "1.5"])
+        self.assertEqual(out["body"], [{"name": "style/gouache", "scale": 1.5}])
+
+    def test_four_at_most_and_the_hint(self):
+        loras = [entry(f"loRA{i}", 1.0) for i in range(5)]
+        out = self.run_js("""
+imgLoras();
+for (const e of ["loRA0", "loRA1", "loRA2", "loRA3", "loRA4"]) choose(e);
+console.log(JSON.stringify({chips: chips().map(c => c.name), disabled: $("img-lora-add").disabled,
+                            hint: {text: $("img-lora-hint").textContent, hidden: $("img-lora-hint").hidden},
+                            count: imgLorasBody().length}));
+""", loras=loras)
+        self.assertEqual(out["chips"], ["loRA0", "loRA1", "loRA2", "loRA3"], "the fifth is not taken")
+        self.assertTrue(out["disabled"], "the picker is off at the limit")
+        self.assertEqual(out["hint"], {"text": "Up to 4 LoRAs at once (the API's limit)", "hidden": False})
+        self.assertEqual(out["count"], 4)
+
+    def test_the_trigger_words_go_into_the_prompt_once(self):
+        out = self.run_js("""
+imgLoras();
+choose("style/gouache");
+trigger(0).onclick();
+const once = $("img-prompt").value;
+trigger(0).onclick();
+const twice = $("img-prompt").value;
+$("img-prompt").value = "a fox in the snow,";
+trigger(0).onclick();
+console.log(JSON.stringify({once, twice, after: $("img-prompt").value, focused: $("img-prompt").focused === true}));
+""", loras=[entry("style/gouache", 0.8, "gouache style")])
+        self.assertEqual(out["once"], "gouache style")
+        self.assertEqual(out["twice"], "gouache style", "said once")
+        self.assertEqual(out["after"], "a fox in the snow, gouache style")
+        self.assertTrue(out["focused"])
+
+    def test_each_model_comes_back_with_its_own_choice(self):
+        out = self.run_js("""
+imgLoras();
+choose("style/gouache");
+state.model = "mage-flow-turbo";
+state.loras = [];
+imgLoras();
+const other = {hidden: $("img-lora").hidden, chips: chips(), body: imgLorasBody()};
+state.model = "qwen-image-2.1-turbo";
+state.loras = LORAS;
+imgLoras();
+console.log(JSON.stringify({other, back: chips().map(c => [c.name, c.scale]), stored: stored()}));
+""".replace("LORAS", json.dumps([entry("style/gouache", 0.8)])),
+                             loras=[entry("style/gouache", 0.8)])
+        self.assertEqual(out["other"], {"hidden": True, "chips": [], "body": []})
+        self.assertEqual(out["back"], [["style/gouache", "0.8"]])
+        self.assertEqual(list(out["stored"]), ["xestrata.img_loras.qwen-image-2.1-turbo"])
+
+    def test_removing_a_chip_puts_its_name_back_in_the_picker(self):
+        out = self.run_js("""
+imgLoras();
+choose("style/gouache");
+const rm = $("img-lora-chips").children[0].children.find(x => x.textContent === "\u00d7");
+rm.onclick();
+console.log(JSON.stringify({chips: chips(), picker: picker(), stored: stored()}));
+""", loras=[entry("style/gouache", 0.8)])
+        self.assertEqual(out["chips"], [])
+        self.assertEqual([o["value"] for o in out["picker"]], ["", "style/gouache"])
+        self.assertEqual(out["stored"], {"xestrata.img_loras.qwen-image-2.1-turbo": "[]"})
 
 
 if __name__ == "__main__":

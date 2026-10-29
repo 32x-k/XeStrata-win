@@ -115,6 +115,14 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
         <label class="st-field" id="img-neg-f"><span data-i18n="img.negative">Negative prompt (optional)</span>
           <textarea class="st-input img-prompt" id="img-neg" rows="2" placeholder="What the image should not have&hellip;" data-i18n-placeholder="img.negativeHint"></textarea></label>
         <span class="composer-hint" id="img-neg-hint" hidden></span>
+        <div class="img-lora" id="img-lora" hidden>
+          <div class="img-row">
+            <label class="st-field" id="img-lora-add-f"><span data-i18n="img.lora">LoRA</span>
+              <select class="st-input" id="img-lora-add"></select></label>
+            <span class="composer-hint" id="img-lora-hint" hidden></span>
+          </div>
+          <div class="img-lora-chips" id="img-lora-chips"></div>
+        </div>
         <div class="img-row">
           <label class="st-field" id="img-model-f" hidden><span data-i18n="img.model">Model</span>
             <select class="st-input" id="img-model"></select></label>

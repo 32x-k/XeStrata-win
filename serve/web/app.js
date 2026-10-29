@@ -1908,7 +1908,116 @@ function imgDefaults() {
   imgFormat();
   imgNegHint();
   imgMossSetup();
+  imgLoras();
 }
+// the adapters this image model applies (/health's image_models[].defaults.loras, serve/loras.py's listing): the ones
+// it takes, chosen here, with a strength each (the API's -2 to 2, starting from the listing's recommended one) and,
+// where the file names them, its trigger words, which a button puts into the prompt.  The choice is kept in this
+// browser for each model (xestrata.img_loras.<model>) and comes back with it.  A model whose listing is empty takes no
+// adapter (HunyuanImage 3.0; Mage-Flow and MOSS-Image until their stage): the block is hidden and none is sent.
+const IMG_LORA_COUNT = 4, IMG_LORA_SCALE = 2;   // serve/loras.py's MAX_LORA, and its SCALE_MIN..SCALE_MAX
+let imgLoraSel = [];   // [{name, scale}]: the adapters the next request applies, in the order they were chosen
+function imgLoras() {
+  const list = (imgModel().defaults || {}).loras || [];
+  $("img-lora").hidden = !list.length;
+  const by = new Map(list.map(e => [e.name, e]));
+  const kept = list.length ? store.get(`img_loras.${imgModel().id || "default"}`, []) : [];
+  const names = new Set();
+  imgLoraSel = (Array.isArray(kept) ? kept : []).filter(u => {
+    if (!u || typeof u.name !== "string" || !by.has(u.name) || names.has(u.name)) return false;
+    names.add(u.name);
+    return true;
+  }).slice(0, IMG_LORA_COUNT)
+    .map(u => ({name: u.name, scale: imgLoraStrength(u.scale, by.get(u.name).scale)}));
+  imgLoraDraw(list);
+}
+// a strength the API takes: the field's number within -2..2 at two decimals, `fallback` (the listing's recommended
+// one) when the field is empty or not a number, else the API's default 1
+function imgLoraStrength(value, fallback) {
+  const v = value == null || value === "" || typeof value === "boolean" ? NaN : Number(value);
+  const want = Number.isFinite(v) ? v : Number(fallback);
+  const use = Number.isFinite(want) ? want : 1;
+  return Math.max(-IMG_LORA_SCALE, Math.min(IMG_LORA_SCALE, Math.round(use * 100) / 100));
+}
+// the picker (the adapters not chosen yet) and a chip for each chosen one: its name, its strength, its trigger words
+// when it has them, and the button that takes it off
+function imgLoraDraw(list) {
+  const add = $("img-lora-add"), chosen = new Set(imgLoraSel.map(u => u.name));
+  const open = list.filter(e => !chosen.has(e.name));
+  add.replaceChildren(new Option(tr("img.loraAdd", "Add a LoRA…"), ""), ...open.map(e => new Option(e.name, e.name)));
+  add.value = "";
+  add.disabled = !open.length || imgLoraSel.length >= IMG_LORA_COUNT;
+  $("img-lora-chips").replaceChildren(...imgLoraSel.map(u => {
+    const e = list.find(x => x.name === u.name) || {name: u.name};
+    const chip = document.createElement("div"), name = document.createElement("span");
+    chip.className = "img-lora-chip";
+    chip.dataset.name = u.name;
+    name.className = "img-lora-chip__name";
+    name.textContent = u.name;
+    name.title = imgLoraAbout(e);
+    const scale = document.createElement("input");
+    scale.className = "st-input";
+    scale.type = "number";
+    scale.min = String(-IMG_LORA_SCALE);
+    scale.max = String(IMG_LORA_SCALE);
+    scale.step = "0.05";
+    scale.value = String(u.scale);
+    scale.setAttribute("aria-label", tr("img.strength", "Strength"));
+    scale.onchange = () => { u.scale = imgLoraStrength(scale.value, e.scale); scale.value = String(u.scale); imgLoraSave(); };
+    chip.append(name, scale);
+    if (e.trigger) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "st-btn st-btn--secondary";
+      b.textContent = tr("img.loraTrigger", "Trigger");
+      b.title = tr("img.loraTriggerTitle", "Put its trigger words into the prompt");
+      b.onclick = () => imgLoraTrigger(e.trigger);
+      chip.append(b);
+    }
+    const rm = document.createElement("button");
+    rm.type = "button";
+    rm.className = "st-btn st-btn--icon";
+    rm.textContent = "×";
+    rm.title = tr("img.loraRemove", "Remove this LoRA");
+    rm.setAttribute("aria-label", rm.title);
+    rm.onclick = () => { imgLoraSel = imgLoraSel.filter(x => x !== u); imgLoraSave(); imgLoraDraw(list); };
+    chip.append(rm);
+    return chip;
+  }));
+  const most = imgLoraSel.length >= IMG_LORA_COUNT ? tr("img.loraMost", "Up to {n} LoRAs at once (the API's limit)", {n: IMG_LORA_COUNT}) : "";
+  $("img-lora-hint").textContent = most;
+  $("img-lora-hint").hidden = !most;
+}
+// a chip's tooltip: the rank and the file's size, and the kinds of weight it changes
+function imgLoraAbout(e) {
+  const parts = [tr("img.loraAbout", "rank {rank}, {size} MiB", {rank: e.rank || "–", size: e.size_mib == null ? "–" : e.size_mib})];
+  if ((e.targets || []).length) parts.push(e.targets.join(", "));
+  return parts.join(" · ");
+}
+// an adapter's trigger words into the prompt, once: after what is written there, comma-separated (the file's own
+// words, not a <lora:...> tag: the page names its adapters in the request's field)
+function imgLoraTrigger(words) {
+  const p = $("img-prompt"), was = p.value.trim();
+  if (!was) p.value = words;
+  else if (!was.includes(words)) p.value = `${was.replace(/[\s,]+$/, "")}, ${words}`;
+  p.focus();
+}
+function imgLoraSave() {
+  store.set(`img_loras.${imgModel().id || "default"}`, imgLoraSel.map(u => ({name: u.name, scale: u.scale})));
+}
+// the adapters this request asks for, as the API's field (serve/loras.py's "lora": [{"name", "scale"}]); none for a
+// model whose block is hidden, or when none is chosen (the model's own weights)
+function imgLorasBody() {
+  return $("img-lora").hidden ? [] : imgLoraSel.slice(0, IMG_LORA_COUNT).map(u => ({name: u.name, scale: imgLoraStrength(u.scale)}));
+}
+$("img-lora-add").onchange = () => {
+  const list = (imgModel().defaults || {}).loras || [], e = list.find(x => x.name === $("img-lora-add").value);
+  if (e && imgLoraSel.length < IMG_LORA_COUNT && !imgLoraSel.some(u => u.name === e.name)) {
+    imgLoraSel.push({name: e.name, scale: imgLoraStrength(null, e.scale)});
+    imgLoraSave();
+  }
+  imgLoraDraw(list);
+};
 // the count: up to max_n, and as many as take budget_s at the speed the server measured (its rates; before it has
 // made an image, 4), with the time the images chosen take (the server refuses more, ImageGen.check_n)
 function imgEstimate(n) {
@@ -2333,6 +2442,8 @@ $("img-form").onsubmit = async (ev) => {
   // "auto" goes as it is: the server makes it 1024 x 1024, a reference's shape, or the model's own choice
   const body = {prompt, size, response_format: "b64_json"};
   if (!$("img-model-f").hidden) body.model = $("img-model").value;
+  const loras = imgLorasBody();
+  if (loras.length) body.lora = loras;
   if ($("img-seed").value !== "") body.seed = Number($("img-seed").value);
   const neg = $("img-neg").value.trim();
   if (neg) body.negative_prompt = neg;
