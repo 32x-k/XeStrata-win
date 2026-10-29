@@ -32,8 +32,14 @@
 // each context, [target, reference 1, ..., reference N], and take part in every block; each image's rows are rotated
 // by its own size's centred positions and by its frame (0 the target, j reference j), and only the target's rows
 // give the velocity.
+//
+// Adapters (image_lora.hpp): a request's files are bound to the weights' products (set_loras) and their delta added to
+// the product's output there (y += strength (x A^T) B^T), in the input's own units as the readers take it: the whole
+// weight, every block's, and the ones outside the blocks.  A weight with an adapter keeps its sums in FP32 (a delta
+// cannot be added to an int32 sum) and its rows' scale is the delta's input's, as the plain product's is.
 #pragma once
 
+#include "strata/image/image_lora.hpp"
 #include "strata/image/qi_stream.hpp"
 #include "strata/prefill/gemm.hpp"
 
@@ -128,6 +134,7 @@ public:
     uint64_t block_min() const { return blocks_stream_.min_budget(); }
     void set_block_budget(uint64_t bytes) { blocks_stream_.configure(bytes, s_); }
     int resident_blocks() const { return blocks_stream_.resident(); }
+    int blocks() const { return (int) blocks_.size(); }
     uint64_t blocks_vram() const { return blocks_stream_.vram(); }
     void drop_blocks() { blocks_stream_.drop(); }
     void drop_block_homes() { blocks_stream_.drop_homes(); }
@@ -141,6 +148,28 @@ public:
     }
     void drop_activations();
 
+    /// An adapter as a file names it: a weight of the DiT, the rows of the weight a file's entry changes, and the rows
+    /// of the entry they are (one name a weight here: no weight is fused or split).
+    struct LoraTarget {
+        std::string name;
+        int64_t row0 = 0, rows = 0, cols = 0, src_row = 0;
+    };
+    /// The weights adapters may change: what a file's keys are matched against (the probe's map, the server's list).
+    std::vector<LoraTarget> lora_targets() const;
+
+    /// The adapters the next steps apply, each with its strength, bound to the weights' products: a key the DiT does
+    /// not take (or a shape that is not its weight's, or a form the engine does not apply) is false with err, and
+    /// nothing bound.  The contexts' rows are made from the other adapters' weights, so set_context again before the
+    /// next forward.  The same set again (its files and strengths) changes nothing.
+    bool set_loras(const std::vector<LoraUse>& loras, std::string& err);
+    /// The set bound, as its files' paths and strengths (empty: none).
+    const std::string& lora_key() const { return lora_key_; }
+    /// The bound entries' A and B on the GPU.
+    uint64_t lora_bytes() const;
+    /// The adapter files bound (a set whose strengths are all 0 binds none).
+    int lora_count() const { return (int) lora_files_.size(); }
+    void drop_loras();
+
     /// The image and text streams after block 0 of the last forward's context 0 (device FP32 [h w][C], [rows][C]), for
     /// the probe (kept when keep_block0(true)).
     void keep_block0(bool on) { keep0_ = on; }
@@ -153,12 +182,19 @@ private:
         int64_t n = 0, k = 0;    // n rows of k
         const void* d = nullptr; // a block's: its offset in the block's region; else a device pointer
         uint64_t row_bytes = 0;
+        LoraLayer* lora = nullptr;   // the adapters' deltas for its products (null: none: the product is unchanged)
     };
     struct Block {
         W imod, tmod, q, k, v, tq, tk, tv, o, to, imlp1, imlp2, tmlp1, tmlp2;
         uint64_t b_imod = 0, b_tmod = 0, b_q = 0, b_k = 0, b_v = 0, b_tq = 0, b_tk = 0, b_tv = 0, b_o = 0, b_to = 0,
                  b_imlp1 = 0, b_imlp2 = 0, b_tmlp1 = 0, b_tmlp2 = 0;   // the FP32 biases' offsets
         uint64_t nq = 0, nk = 0, ntq = 0, ntk = 0;                     // the FP32 q / k norms' offsets
+    };
+    /// A weight and the rows of a file's entry it takes.
+    struct LoraSlot {
+        std::string name;
+        W* w = nullptr;
+        int64_t row0 = 0, rows = 0, src_row = 0;
     };
     struct Ctx {
         int64_t rows = 0;
@@ -172,6 +208,8 @@ private:
     // a block's modulation y [w.n] = SiLU(temb) . w^T + bias (tsil: its FP16 copy, for a 16-bit w); an F32 w (the
     // low-rank form) reads the shared projection mlow_ instead
     void modulation(const uint16_t* tsil, const W& w, const uint8_t* base, float* y, const float* bias);
+    void build_lora_targets();
+    void lora_scratch(int64_t T);
     void ensure(int64_t hw, int n, int64_t max_text);
     void rope_tables(int64_t h, int64_t w);
     void drop_refs();
@@ -219,6 +257,14 @@ private:
     int64_t ref_rows_ = 0, refs_gen_ = 0;
     std::vector<std::pair<int64_t, int64_t>> ref_sizes_;
     float* xin_ = nullptr;    // the image rows' input [hw + ref_rows_][in_ch_]
+    // the adapters bound
+    std::vector<LoraSlot> lora_slots_;
+    std::vector<std::unique_ptr<LoraLayer>> lora_layers_;
+    std::vector<std::shared_ptr<const LoraFile>> lora_files_;
+    std::string lora_key_;
+    int64_t lora_rank_ = 0, lora_tmp_t_ = 0;
+    float* lora_f32_ = nullptr;
+    uint16_t* lora16_ = nullptr;
 };
 
 }  // namespace strata::image

@@ -250,9 +250,14 @@ uint64_t MfPipeline::held() const {
     uint64_t b = vae_->weight_bytes() + kScratch + te_->layers_vram() + vae_->scratch_held() +
                  (vision_ ? vision_->weight_bytes() : 0);
     for (const MfDit* d : {dit_.get(), edit_dit_.get()})
-        if (d != nullptr) b += d->weight_bytes();
+        if (d != nullptr) b += d->weight_bytes() + d->lora_bytes();
     if (const MfDit* d = active()) b += d->blocks_vram() + d->activations_held();
     return b;
+}
+
+void MfPipeline::use_loras(const QiRequest& r) {
+    std::string err;
+    if (!dit().set_loras(r.loras, err)) throw std::runtime_error(err);
 }
 
 void MfPipeline::fit(uint64_t reserve) {
@@ -265,7 +270,6 @@ void MfPipeline::fit(uint64_t reserve) {
 QiNeed MfPipeline::need(int64_t n_text, int64_t width, int64_t height,
                         const std::vector<std::pair<int64_t, int64_t>>& refs, bool mask, int64_t n_neg,
                         const std::vector<LoraUse>& loras) {
-    (void) loras;   // Mage-Flow takes no adapters yet: strata_image refuses a request that asks for one
     const MfDit& dit = q8_ == 0 ? *dit16_size_ : *dit_size_;   // the least: Q8_0's, unless FP16 is asked for
     const MfDit& full = q8_ == 1 ? *dit_size_ : *dit16_size_;  // all resident: FP16's, unless Q8_0 is
     const QiText& te = *te_size_;
@@ -294,11 +298,13 @@ QiNeed MfPipeline::need(int64_t n_text, int64_t width, int64_t height,
     const int64_t max_text = std::max(n_text, n_neg);
     const int n = n_neg > 0 ? 2 : 1;
     const uint64_t te_act = te.activation_bytes(std::max(n_text, n_neg) + 64);   // the system turn's ids too
+    // the adapters' A and B and their scratch (the most rows one product has: a context's image rows plus its text)
+    const uint64_t lora = lora_gpu_bytes(loras, n * (hw + max_text));
     QiNeed nd;
-    nd.least = fixed +
+    nd.least = fixed + lora +
                std::max({dit.activation_bytes(hw, n, max_text, 512), vae.least_scratch_bytes(h, w), te_act, edit}) +
                dit.block_min() + te.layer_min();
-    nd.full = fixed - dit.weight_bytes() + full.weight_bytes() + full.block_bytes() + te.layer_min() +
+    nd.full = fixed - dit.weight_bytes() + full.weight_bytes() + full.block_bytes() + te.layer_min() + lora +
               std::max({full.activation_bytes(hw, n, max_text), vae.scratch_bytes(h, w), te_act, edit});
     nd.held = held();
     size_t free = 0, total = 0;
@@ -322,6 +328,8 @@ void MfPipeline::release(bool all) {
         te_.reset();
         // the RAM setup counts for them: their blocks kept quantized for the next open (the other DiT's only with keep_,
         // which is when it is still open)
+        if (dit_) dit_->drop_loras();   // the adapters' A and B too (they go back on the next request's, from its files)
+        if (edit_dit_) edit_dit_->drop_loras();
         if (dit_ && dit_->q8()) dit_host_ = dit_->take_host();
         if (edit_dit_ && edit_dit_->q8()) edit_host_ = edit_dit_->take_host();
         dit_.reset();
@@ -347,7 +355,9 @@ QiPlan MfPipeline::plan(int64_t hw, int n, int64_t max_text, int64_t n_ids) {
     p.budget = budget();
     MfDit& d = dit();
     const MfDit* o = edit_active_ ? dit_.get() : edit_dit_.get();
-    p.fixed = d.weight_bytes() + (o ? o->weight_bytes() : 0) + vae_->weight_bytes() + kScratch;
+    p.fixed = d.weight_bytes() + d.lora_bytes() + (o ? o->weight_bytes() : 0) + vae_->weight_bytes() + kScratch;
+    p.lora = d.lora_bytes();
+    p.lora_n = d.lora_count();
     if (vision_) {
         // the vision encoder an edit opened stays only where the DiT's blocks and the encoder's layers all fit
         // beside it: opening it again takes 0.2 s (B70, its 836 MB), a streamed block more each step
@@ -525,6 +535,7 @@ std::vector<uint8_t> MfPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     const int64_t max_ids = (int64_t) std::max(editing ? e.ids.size() : r.ids.size(),
                                                editing ? e.neg_ids.size() : r.neg_ids.size());
     MfDit& d = use_dit(editing, want_q8(h * w + e.rows, guided ? 2 : 1, max_ids - r.drop, max_ids));
+    use_loras(r);   // before the plan (their bytes are fixed) and the contexts (they are made from the weights)
     if (stage) stage("text");
     const std::vector<int32_t>& ids = editing ? e.ids : r.ids;
     const std::vector<int32_t>& neg_ids = editing ? e.neg_ids : r.neg_ids;

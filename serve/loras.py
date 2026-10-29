@@ -6,11 +6,12 @@ prompt tags checked against them (the image engine reads and applies them: src/i
 The files are read by their headers only (a safetensors' JSON, a GGUF's metadata and tensor infos): each tensor's name
 and shape and the file's string metadata.  A key is brought to the DiT's name the way the engine brings it (split_key:
 the file's prefix off, ".weight" off, the role's suffix off), and a file is this model's when every weight it changes
-is one the DiT's products take (TARGETS: the names of qi_dit.cpp's and moss_dit.cpp's build_lora_targets, written here a
-second time; the record's check sets them against the probe's `map` on the models, name for name), in a form the engine
+is one the DiT's products take (TARGETS: the names of qi_dit.cpp's, moss_dit.cpp's and mf_dit.cpp's
+build_lora_targets, written here a second time; the record's check sets them against the probe's `map` on the models,
+name for name), in a form the engine
 applies today: a plain LoRA, not a DoRA (dora_scale), LoKr, LoHa, GLoRA, OFT or a whole weight's difference, and no text
-encoder's weight.  The engine refuses those when it binds a set (QiDit::set_loras, MossDit::set_loras), so no image is
-made with part of a file.
+encoder's weight.  The engine refuses those when it binds a set (QiDit::set_loras, MossDit::set_loras,
+MfDit::set_loras), so no image is made with part of a file.
 
 A listing entry - ImageGen.defaults' "loras" (the engine's capabilities: /health's image_defaults and image_models,
 /v1/models' image model):
@@ -56,11 +57,13 @@ FAMILY_NAMES = {"qwen-image": "Qwen-Image-2.1", "moss-image": "MOSS-Image", "mag
                 "hunyuan-image-3": "HunyuanImage 3.0"}
 
 # The weights adapters may take, by the name a file's key is left with after split_key: the DiTs' target tables
-# (src/image/qi_dit.cpp's and moss_dit.cpp's build_lora_targets write these names).  "{b}" is a block's number - the
-# same names for every block, so a listing needs no block count.  Qwen-Image-2.1's MLP's first weight is one
-# [gate | up] on the GPU: a file may name it fused (gate_up, ComfyUI's and a GGUF's form) or as diffusers' two halves
-# (gate_layer is its rows [0, inter), proj the rest).  MOSS-Image's text embedder holds one qkv of three C-row
+# (src/image/qi_dit.cpp's, moss_dit.cpp's and mf_dit.cpp's build_lora_targets write these names).  "{b}" is a block's
+# number - the same names for every block, so a listing needs no block count.  Qwen-Image-2.1's MLP's first weight is
+# one [gate | up] on the GPU: a file may name it fused (gate_up, ComfyUI's and a GGUF's form) or as diffusers' two
+# halves (gate_layer is its rows [0, inter), proj the rest).  MOSS-Image's text embedder holds one qkv of three C-row
 # weights (one name on the file's side), and up and gate apart on the file's side where the GPU has one [up | gate].
+# Mage-Flow's and MageTrail's blocks are the same 14 weights (the two streams' modulations, the attention's projections,
+# the MLPs); MageTrail's low-rank modulation is F32 and the engine binds no adapter to it (set_loras says so).
 _QWEN_BLOCKS = ("attn.to_q", "attn.to_k", "attn.to_v", "attn.to_out.0", "img_mlp.gate_up", "img_mlp.gate_layer",
                 "img_mlp.proj", "img_mlp.out")
 _MOSS_TEXT_BLOCKS = ("qkv", "proj", "ffn_up_gate", "ffn_up", "ffn_gate", "ffn_down")
@@ -68,12 +71,18 @@ _MOSS_BLOCKS = ("proj.q", "proj.k", "proj.v", "proj.o", "proj.ffn_up_gate", "pro
                 "proj.ffn_down")
 _MOSS_OUTSIDE = ("video_embedder", "time_embedding.0", "time_embedding.2", "shared_block_modulation",
                  "video_head_modulation", "final_linear_video", "text_embedder.proj")
+_MAGE_BLOCKS = ("attn.to_q", "attn.to_k", "attn.to_v", "attn.add_q_proj", "attn.add_k_proj", "attn.add_v_proj",
+                "attn.to_out.0", "attn.to_add_out", "img_mlp.net.0.proj", "img_mlp.net.2", "txt_mlp.net.0.proj",
+                "txt_mlp.net.2", "img_mod.1", "txt_mod.1")
+_MAGE_OUTSIDE = ("img_in", "txt_in", "time_text_embed.timestep_embedder.linear_1",
+                 "time_text_embed.timestep_embedder.linear_2", "norm_out.linear", "proj_out")
 TARGETS: dict[str, tuple[str, ...]] = {
     "qwen-image": ("img_in", "time_text_embed.timestep_embedder.linear_1",
                    "time_text_embed.timestep_embedder.linear_2", "modulation.1", "norm_out.linear", "proj_out",
                    "txt_in.in_layer", "txt_in.out_layer") + tuple("transformer_blocks.{b}." + n for n in _QWEN_BLOCKS),
     "moss-image": (_MOSS_OUTSIDE + tuple("text_embedder.blocks.{b}." + n for n in _MOSS_TEXT_BLOCKS) +
                    tuple("layers.{b}." + n for n in _MOSS_BLOCKS)),
+    "mage-flow": (_MAGE_OUTSIDE + tuple("transformer_blocks.{b}." + n for n in _MAGE_BLOCKS)),
 }
 
 
@@ -446,10 +455,7 @@ def folder(cfg: dict) -> Folder:
 # ------------------------------------------------------------------------------------------------- a request's
 def _no_loras(f: Folder) -> str:
     name = FAMILY_NAMES.get(f.family, f.family)
-    if f.family == "hunyuan-image-3":
-        return f"lora: {name} takes no adapters (its DiT has no adapter path in the image engine)"
-    return (f"lora: {name} takes no adapters yet (the image engine applies them to Qwen-Image-2.1 and MOSS-Image, "
-            "for now)")
+    return f"lora: {name} takes no adapters (its DiT has no adapter path in the image engine)"
 
 
 def _unknown(f: Folder) -> str:

@@ -69,6 +69,9 @@ private:
     QiPlan plan(int64_t hw, int n, int64_t max_text, int64_t n_ids);
     void ensure_open();
     MfDit& use_dit(bool edit, bool q8);
+    /// Binds the request's adapters to the DiT's products (MfDit::set_loras); after use_dit, which may open the DiT
+    /// again (a set that does not bind leaves the products as they were).
+    void use_loras(const QiRequest& r);
     bool want_q8(int64_t rows, int n, int64_t max_text, int64_t n_ids) const;
     MfDit* active() const { return edit_active_ ? edit_dit_.get() : dit_.get(); }
     MfDit& dit() { return *active(); }

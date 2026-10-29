@@ -228,6 +228,24 @@ void euler(float* x, const float* out, int64_t n, int ctxs, float cfg, float ds,
     });
 }
 
+// A file's key that changes a text encoder (kohya's lora_te_, diffusers' text_encoder. prefix, the te. other tools
+// write): the image engine applies adapters to the DiT only, and says so rather than leaving it out.
+bool is_text_encoder_key(const std::string& k) {
+    return k.rfind("lora_te", 0) == 0 || k.rfind("text_encoder", 0) == 0 || k.rfind("te.", 0) == 0;
+}
+
+// Six of the names, then "and N more": the errors' list of a file's keys the DiT does not take.
+std::string name_list(const std::vector<std::string>& names) {
+    std::string out;
+    const size_t n = std::min<size_t>(names.size(), 6);
+    for (size_t i = 0; i < n; ++i) {
+        if (i > 0) out += ", ";
+        out += names[i];
+    }
+    if (names.size() > n) out += " (and " + std::to_string(names.size() - n) + " more)";
+    return out;
+}
+
 }  // namespace mf_dit_detail
 
 using namespace mf_dit_detail;
@@ -439,6 +457,7 @@ bool MfDit::open(const std::string& path, void* stream, std::string& err, bool d
             F_ = b.imlp1.n;
         }
         if (blocks_.empty()) throw std::runtime_error("image engine (Mage-Flow DiT): no transformer blocks");
+        build_lora_targets();
         if (!q8_)   // each block's weights, as they reach the GPU (resident, or a streamed slot): bf16 to FP16
             blocks_stream_.set_prepare([this](int i, uint8_t* d) {
                 sycl::queue& q = q_of(s_);
@@ -522,6 +541,8 @@ MfOut MfDit::product(const uint16_t* x16, const float* rs, const W& w, const uin
     out.f = y;
     out.C = w.n;
     if (T <= 0) return out;
+    LoraLayer* lora = w.lora;
+    if (lora != nullptr) defer = false;   // a delta is FP32: the int32 sums are scaled into y first
     const auto* d = base != nullptr ? base + reinterpret_cast<uintptr_t>(w.d) : static_cast<const uint8_t*>(w.d);
     if (w.type == kTypeW8) {
         // the activations rotated and quantized as the weights (once for the products of one input), their scales
@@ -541,17 +562,22 @@ MfOut MfDit::product(const uint16_t* x16, const float* rs, const W& w, const uin
             out.b = bias;
             return out;
         }
-        qi_i8_scale(y, T, w.n, w.n, sx, sw, bias, s_);
-        return out;
+        qi_i8_scale(y, T, w.n, w.n, sx, sw, bias, s_);   // sx carries the rows' scales: y is in the input's units
+    } else {
+        if (w.type == kTypeF16) gemm_.f16(x16, reinterpret_cast<const uint16_t*>(d), y, T, w.n, w.k);
+        else gemm_.native(x16, w.type, d, y, T, w.n, w.k);
+        if (defer) {
+            out.rs = rs;
+            out.b = bias;
+            return out;
+        }
+        if (rs != nullptr || bias != nullptr) rows_back(y, rs, bias, T, w.n, s_);
     }
-    if (w.type == kTypeF16) gemm_.f16(x16, reinterpret_cast<const uint16_t*>(d), y, T, w.n, w.k);
-    else gemm_.native(x16, w.type, d, y, T, w.n, w.k);
-    if (defer) {
-        out.rs = rs;
-        out.b = bias;
-        return out;
+    if (lora != nullptr) {
+        // the delta is the input's own (x16 = x / rs): its rows' scales put it back in y's units, as rows_back does
+        lora_scratch(T);
+        lora->add(x16, T, y, w.n, 0, w.n, rs, gemm_, lora_f32_, lora16_, s_);
     }
-    if (rs != nullptr || bias != nullptr) rows_back(y, rs, bias, T, w.n, s_);
     return out;
 }
 
@@ -560,7 +586,8 @@ void MfDit::modulation(const uint16_t* tsil, const W& w, const uint8_t* base, fl
         f32_vec(reinterpret_cast<const float*>(base + reinterpret_cast<uintptr_t>(w.d)), mlow_, bias, y, w.n, w.k, s_);
         return;
     }
-    if (w.type != kTypeQ8_0) {
+    if (w.type != kTypeQ8_0 || w.lora != nullptr) {
+        // (a weight an adapter changes takes the product: its delta is added to the dense product's output)
         product(tsil, nullptr, w, base, y, 1, bias);
         return;
     }
@@ -582,7 +609,8 @@ uint64_t MfDit::activation_bytes(int64_t hw, int n, int64_t max_text, int64_t ml
            (uint64_t) (R + L) * C_ * 2 +                 // the attention's outputs by stream
            (uint64_t) (hw + max_text) * hd_ * 4 +        // the rotary tables
            (uint64_t) TP * C_ * 4 +                      // the plain attention's scratch
-           (w8_ ? (uint64_t) std::max(X * C_, band * F_) + (uint64_t) std::max(X, band) * 8 : 0);   // W8A8's input
+           (w8_ ? (uint64_t) std::max(X * C_, band * F_) + (uint64_t) std::max(X, band) * 8 : 0) +   // W8A8's input
+           (lora_rank_ > 0 ? (uint64_t) std::max(X, band) * (uint64_t) lora_rank_ * 6 : 0);   // the deltas' scratch
 }
 
 void MfDit::ensure(int64_t hw, int n, int64_t max_text) {
@@ -653,7 +681,175 @@ void MfDit::drop_activations() {
     img_ = txt_ = q_ = k_ = v_ = a_ = gu_ = cos_ = sin_ = cos_id_ = sin_id_ = nullptr;
     attn_scratch_ = b0_img_ = b0_txt_ = xin_ = nullptr;
     h16_ = jq16_ = jk16_ = jv16_ = jo16_ = io16_ = to16_ = nullptr;
+    lora_f32_ = nullptr;
+    lora16_ = nullptr;
+    lora_tmp_t_ = 0;
     cap_hw_ = cap_n_ = cap_text_ = 0;
+}
+
+std::vector<MfDit::LoraTarget> MfDit::lora_targets() const {
+    std::vector<LoraTarget> out;
+    out.reserve(lora_slots_.size());
+    for (const LoraSlot& s : lora_slots_) out.push_back({s.name, s.row0, s.rows, s.w->k, s.src_row});
+    return out;
+}
+
+void MfDit::build_lora_targets() {
+    lora_slots_.clear();
+    auto add = [this](std::string name, W& w) {
+        if (w.n <= 0 || w.k <= 0) return;
+        lora_slots_.push_back({std::move(name), &w, 0, w.n, 0});
+    };
+    // the weights outside the blocks (the norms are norms, not linear products: unchanged)
+    add("img_in", img_in_);
+    add("txt_in", txt_in_);
+    add("time_text_embed.timestep_embedder.linear_1", t1_);
+    add("time_text_embed.timestep_embedder.linear_2", t2_);
+    add("norm_out.linear", nout_);
+    add("proj_out", pout_);
+    // the blocks: the two streams' modulations, the attention's projections and the MLPs
+    for (int i = 0; i < (int) blocks_.size(); ++i) {
+        const std::string p = "transformer_blocks." + std::to_string(i) + ".";
+        Block& b = blocks_[(size_t) i];
+        const std::pair<const char*, W*> items[] = {
+            {"img_mod.1", &b.imod}, {"txt_mod.1", &b.tmod}, {"attn.to_q", &b.q}, {"attn.to_k", &b.k},
+            {"attn.to_v", &b.v}, {"attn.add_q_proj", &b.tq}, {"attn.add_k_proj", &b.tk},
+            {"attn.add_v_proj", &b.tv}, {"attn.to_out.0", &b.o}, {"attn.to_add_out", &b.to},
+            {"img_mlp.net.0.proj", &b.imlp1}, {"img_mlp.net.2", &b.imlp2}, {"txt_mlp.net.0.proj", &b.tmlp1},
+            {"txt_mlp.net.2", &b.tmlp2}};
+        for (const auto& item : items) add(p + item.first, *item.second);
+    }
+}
+
+void MfDit::lora_scratch(int64_t T) {
+    if (lora_rank_ <= 0 || T <= 0) return;
+    if (lora_f32_ != nullptr && T <= lora_tmp_t_) return;
+    gpu::stream_sync(s_);   // the old buffers may still be read
+    for (void** p : {reinterpret_cast<void**>(&lora_f32_), reinterpret_cast<void**>(&lora16_)})
+        if (*p != nullptr) {
+            release(allocs_, *p);
+            *p = nullptr;
+        }
+    lora_f32_ = alloc<float>(allocs_, T * lora_rank_);
+    lora16_ = alloc<uint16_t>(allocs_, T * lora_rank_);
+    lora_tmp_t_ = T;
+}
+
+bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
+    // the set as the same again (its files and strengths): nothing to bind
+    std::string key;
+    for (const LoraUse& u : loras) {
+        if (!u.file) continue;
+        char num[32];
+        std::snprintf(num, sizeof num, "%.7g", (double) u.scale);
+        key += u.file->path();
+        key += ':';
+        key += num;
+        key += ';';
+    }
+    if (key == lora_key_) return true;
+    drop_loras();
+    if (key.empty()) return true;
+    std::vector<std::string> unknown, text_encoder;
+    for (const LoraUse& u : loras) {
+        if (!u.file) continue;
+        for (const LoraEntry& e : u.file->entries()) {
+            if (is_text_encoder_key(e.key)) {
+                text_encoder.push_back(e.key);
+                continue;
+            }
+            const LoraSlot* slot = nullptr;
+            for (const LoraSlot& s : lora_slots_)
+                if (s.name == e.key) {
+                    slot = &s;
+                    break;
+                }
+            if (slot == nullptr) {
+                unknown.push_back(e.key);
+                continue;
+            }
+            if (e.rows != slot->rows || e.cols != slot->w->k) {
+                err = "image engine: " + u.file->path() + ": " + e.key + " is " + std::to_string(e.cols) + " x " +
+                      std::to_string(e.rows) + ", not the DiT's " + std::to_string(slot->w->k) + " x " +
+                      std::to_string(slot->rows);
+                drop_loras();
+                return false;
+            }
+            if (slot->w->type == kTypeF32) {   // MageTrail's low-rank modulation: F32 factors, read by f32_vec
+                err = "image engine: " + u.file->path() + ": " + e.key +
+                      ": the DiT's modulation is the low-rank form (F32, MageTrail's); its adapters are not applied";
+                drop_loras();
+                return false;
+            }
+            const float scale = u.scale * e.scale();
+            if (scale == 0.0f) continue;   // a strength of 0 changes nothing: the weight keeps its product's path
+            if (!e.dora.empty()) {   // DoRA's rows are scaled by m / |W| (comfy/weight_adapter): not applied yet
+                err = "image engine: " + u.file->path() + ": " + e.key +
+                      ": a DoRA (dora_scale) adapter: the engine scales no weight's rows by it yet";
+                drop_loras();
+                return false;
+            }
+            auto entry = std::make_shared<LoraDeviceEntry>();
+            if (!entry->upload(e, s_, err)) {
+                drop_loras();
+                return false;
+            }
+            if (slot->w->lora == nullptr) {
+                lora_layers_.push_back(std::make_unique<LoraLayer>());
+                slot->w->lora = lora_layers_.back().get();
+            }
+            LoraPart part;
+            part.entry = entry;
+            part.row0 = slot->row0;
+            part.n = slot->rows;
+            part.src_row = slot->src_row;
+            part.scale = scale;
+            slot->w->lora->parts.push_back(part);
+            lora_rank_ = std::max(lora_rank_, e.rank);
+        }
+    }
+    if (!text_encoder.empty()) {
+        err = "image engine: a text encoder's adapter: the image engine applies adapters to the DiT only (" +
+              name_list(text_encoder) + ")";
+        drop_loras();
+        return false;
+    }
+    if (!unknown.empty()) {
+        err = "image engine: the DiT takes no adapter for " + name_list(unknown);
+        drop_loras();
+        return false;
+    }
+    if (lora_layers_.empty()) {   // every strength 0: as no adapter at all (the products are untouched)
+        drop_loras();
+        return true;
+    }
+    for (const LoraUse& u : loras)
+        if (u.file) lora_files_.push_back(u.file);
+    lora_key_ = key;
+    return true;
+}
+
+uint64_t MfDit::lora_bytes() const {
+    uint64_t n = 0;
+    for (const std::unique_ptr<LoraLayer>& l : lora_layers_) n += l->bytes();
+    return n;
+}
+
+void MfDit::drop_loras() {
+    for (LoraSlot& s : lora_slots_) s.w->lora = nullptr;
+    lora_layers_.clear();
+    lora_files_.clear();
+    lora_key_.clear();
+    lora_rank_ = 0;
+    if (lora_f32_ != nullptr || lora16_ != nullptr) {
+        gpu::stream_sync(s_);
+        for (void** p : {reinterpret_cast<void**>(&lora_f32_), reinterpret_cast<void**>(&lora16_)})
+            if (*p != nullptr) {
+                release(allocs_, *p);
+                *p = nullptr;
+            }
+        lora_tmp_t_ = 0;
+    }
 }
 
 // the image rows' 2D multi-scale RoPE: pairs 0 .. 7 by the frame (0 the target, j an edit's reference j), then

@@ -11,6 +11,8 @@
 //                                                                velocity written as raw FP32 (a base run has no LORA)
 //   strata-image-lora-probe moss-map DIR [LORA [scale]]          the same two for MOSS-Image's DiT (MossDit)
 //   strata-image-lora-probe moss-step DIR OUT.bin [LORA [scale]]
+//   strata-image-lora-probe mf-map DIT.safetensors [LORA [scale]]  the same two for Mage-Flow's DiT (MfDit)
+//   strata-image-lora-probe mf-step DIT.safetensors OUT.bin [LORA [scale]]
 //
 // `list` and `map` read no GPU: they are the readers' checks.  `selftest` builds a small adapter and two products, with
 // and without a per-row scale, and prints how far the GPU's output is from the reference's.  `step` is how a LoRA's
@@ -19,9 +21,13 @@
 // rows (2 and 4); MOSS_STEP_Q8=1: the DiT's blocks in 8 bits (else FP16, the same on both sides of a parity);
 // MOSS_STEP_DROP_TEXT=1: the text embedder's weights dropped and read again, a forward each (the same velocity, an
 // adapter's layer kept on the weight through the load); MOSS_STEP_BLOCK_MIB: the blocks' VRAM (the rest streamed).
+// MF_STEP_HW, MF_STEP_TEXT: the latent's rows a side (2) and the text's (4); MF_STEP_Q8=1: the blocks in 8 bits (else
+// FP16); MF_STEP_BLOCK_MIB: the blocks' VRAM (the rest streamed from RAM); MF_STEP_REFS: an edit's reference images
+// (one, at the latent size, its own rows after the target's).
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/image/image_lora.hpp"
+#include "strata/image/mf_dit.hpp"
 #include "strata/image/moss_dit.hpp"
 #include "strata/image/moss_pipeline.hpp"
 #include "strata/image/qi_dit.hpp"
@@ -415,6 +421,109 @@ int moss_step(const std::string& dit_path, const std::string& out_path, const st
     return 0;
 }
 
+// Mage-Flow's table of the weights adapters may take (one line a name: its rows and columns), and where each entry of
+// `lora` lands on it (a line a mapped weight, MISSING a key the DiT does not take, SHAPE a weight whose rows and
+// columns are not the entry's).
+int mf_map(const std::string& dit_path, const std::string& lora_path, float scale) {
+    namespace si = strata::image;
+    si::MfDit dit;
+    std::string err;
+    if (!dit.open(dit_path, nullptr, err, true)) throw std::runtime_error(err);
+    const auto targets = dit.lora_targets();
+    std::printf("targets %zu\n", targets.size());
+    for (const auto& t : targets) std::printf("  %-52s rows %lld cols %lld\n", t.name.c_str(), (long long) t.rows,
+                                              (long long) t.cols);
+    if (lora_path.empty()) return 0;
+    const auto f = si::LoraFile::open(lora_path);
+    size_t mapped = 0;
+    for (const auto& e : f->entries()) {
+        const si::MfDit::LoraTarget* t = nullptr;
+        for (const auto& c : targets)
+            if (c.name == e.key) {
+                t = &c;
+                break;
+            }
+        if (t == nullptr) {
+            std::printf("MISSING %-46s %-5s rank %-4lld %lld x %lld\n", e.key.c_str(), si::lora_kind_name(e.kind),
+                        (long long) e.rank, (long long) e.cols, (long long) e.rows);
+        } else if (e.rows != t->rows || e.cols != t->cols) {
+            std::printf("SHAPE   %-46s %lld x %lld, the weight %lld x %lld\n", e.key.c_str(), (long long) e.cols,
+                        (long long) e.rows, (long long) t->cols, (long long) t->rows);
+        } else {
+            ++mapped;
+            std::printf("mapped  %-46s %-5s rank %-4lld rows %lld, scale %.4f\n", e.key.c_str(),
+                        si::lora_kind_name(e.kind), (long long) e.rank, (long long) e.rows, e.scale() * scale);
+        }
+    }
+    std::printf("%zu of %zu entries mapped\n", mapped, f->entries().size());
+    return mapped == f->entries().size() ? 0 : 1;
+}
+
+// One forward of a fixed context and noise (torch_cpu_randn of seed 42), the velocity written as raw FP32: the same
+// numbers as an adapterless run of a model with the same delta in its weights mean the delta is applied as baked.
+int mf_step(const std::string& dit_path, const std::string& out_path, const std::string& lora_path, float scale) {
+    namespace si = strata::image;
+    void* s = strata::core::Runtime::get().create_stream();
+    si::MfDit dit;
+    std::string err;
+    const bool q8 = std::getenv("MF_STEP_Q8") != nullptr;
+    if (!dit.open(dit_path, s, err, false, q8)) throw std::runtime_error(err);
+    if (const char* mib = std::getenv("MF_STEP_BLOCK_MIB"); mib != nullptr && *mib != 0) {   // VRAM of the blocks
+        dit.set_block_budget((uint64_t) std::strtoull(mib, nullptr, 10) << 20);
+        std::printf("the blocks' VRAM %s MiB, %d of %d resident\n", mib, dit.resident_blocks(), (int) dit.blocks());
+    }
+    if (!lora_path.empty()) {
+        std::vector<si::LoraUse> loras;
+        loras.push_back({si::LoraFile::open(lora_path), scale});
+        if (!dit.set_loras(loras, err)) throw std::runtime_error(err);
+    }
+    const char* hw_env = std::getenv("MF_STEP_HW");
+    const char* text_env = std::getenv("MF_STEP_TEXT");
+    const int64_t hw = hw_env != nullptr ? std::strtoll(hw_env, nullptr, 10) : 2;
+    const int64_t n_text = text_env != nullptr ? std::strtoll(text_env, nullptr, 10) : 4;
+    std::vector<float> ctx((size_t) (n_text * dit.text_dim()));
+    for (size_t i = 0; i < ctx.size(); ++i) ctx[i] = (float) ((int64_t) ((i * 37) % 101) - 50) / 50.0f;   // exact both sides
+    dit.set_context(0, ctx.data(), n_text);
+    // an edit: a reference the target's size, after its rows (the same on both sides)
+    std::vector<float> rz;
+    std::vector<std::pair<int64_t, int64_t>> rsz;
+    if (const char* refs = std::getenv("MF_STEP_REFS"); refs != nullptr && *refs != 0) {
+        for (int64_t j = 0; j < std::strtoll(refs, nullptr, 10); ++j) {
+            const auto z = si::torch_cpu_randn(43 + (uint64_t) j, (uint64_t) (hw * hw * dit.latent_channels()));
+            rz.insert(rz.end(), z.begin(), z.end());
+            rsz.emplace_back(hw, hw);
+        }
+    }
+    const int64_t Cl = dit.latent_channels(), n = Cl * hw * hw;
+    if (!rz.empty()) dit.set_refs(rz.data(), rsz);
+    const auto noise = si::torch_cpu_randn(42, (uint64_t) n);
+    std::vector<float> tokens((size_t) n);
+    for (int64_t c = 0; c < Cl; ++c)
+        for (int64_t q = 0; q < hw * hw; ++q) tokens[(size_t) (q * Cl + c)] = noise[(size_t) (c * hw * hw + q)];
+    float *x = nullptr, *v = nullptr;
+    if (!gpu::alloc_device(&x, (size_t) n * 4) || !gpu::alloc_device(&v, (size_t) n * 4)) throw std::runtime_error("alloc");
+    gpu::copy(x, tokens.data(), tokens.size() * 4);
+    dit.forward(x, 0.5f, hw, hw, 1, v);
+    if (!gpu::stream_sync(s)) throw std::runtime_error(gpu::last_error());
+    std::vector<float> got((size_t) n);
+    gpu::copy(got.data(), v, got.size() * 4);
+    std::ofstream fo(out_path, std::ios::binary);
+    if (!fo) throw std::runtime_error("cannot write " + out_path);
+    fo.write(reinterpret_cast<const char*>(got.data()), (std::streamsize) (got.size() * 4));
+    double norm = 0;
+    for (float g : got) norm += (double) g * g;
+    std::printf("velocity %lld values, norm %.6f, first %.6f %.6f %.6f\n", (long long) n, std::sqrt(norm), got[0],
+                got[1], got[2]);
+    std::printf("lora %.1f MiB on the GPU, %d files\n", (double) dit.lora_bytes() / 1048576.0, dit.lora_count());
+    std::printf("products: %s; blocks %s\n",
+                strata::prefill::Gemm::i8_usable(s) ? "int8 (W8A8) where the weights allow it"
+                                                    : "FP16/native (no int8 products)",
+                q8 ? "8 bits" : "16 bits");
+    gpu::free(x);
+    gpu::free(v);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -430,11 +539,16 @@ int main(int argc, char** argv) {
             return moss_map(argv[2], argc > 3 ? argv[3] : "", argc == 5 ? std::strtof(argv[4], nullptr) : 1.0f);
         if (what == "moss-step" && (argc == 4 || argc == 5 || argc == 6))
             return moss_step(argv[2], argv[3], argc > 4 ? argv[4] : "", argc == 6 ? std::strtof(argv[5], nullptr) : 1.0f);
+        if (what == "mf-map" && (argc == 3 || argc == 4 || argc == 5))
+            return mf_map(argv[2], argc > 3 ? argv[3] : "", argc == 5 ? std::strtof(argv[4], nullptr) : 1.0f);
+        if (what == "mf-step" && (argc == 4 || argc == 5 || argc == 6))
+            return mf_step(argv[2], argv[3], argc > 4 ? argv[4] : "", argc == 6 ? std::strtof(argv[5], nullptr) : 1.0f);
         std::fprintf(stderr,
                      "usage: %s list LORA.safetensors|LORA.gguf | %s selftest | %s map DIT.gguf [LORA [scale]] | "
                      "%s step DIT.gguf OUT.bin [LORA [scale]] | %s moss-map DIR [LORA [scale]] | "
-                     "%s moss-step DIR OUT.bin [LORA [scale]]\n",
-                     argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
+                     "%s moss-step DIR OUT.bin [LORA [scale]] | %s mf-map DIT [LORA [scale]] | "
+                     "%s mf-step DIT OUT.bin [LORA [scale]]\n",
+                     argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 2;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "strata-image-lora-probe: %s\n", e.what());

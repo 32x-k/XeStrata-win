@@ -88,6 +88,20 @@ def qwen_lora(rank: int = 4, blocks: tuple[int, ...] = (0, 1), prefix: str = "tr
     return out
 
 
+def mage_lora(rank: int = 4, blocks: tuple[int, ...] = (0, 1),
+              prefix: str = "diffusion_model.") -> dict[str, tuple[int, ...]]:
+    """Mage-Flow's adapter's tensors, as ai-toolkit's mageflow form and ComfyUI's saves name them
+    (transformer_blocks.N.attn.to_q and the like), at `rank` and that prefix."""
+    out: dict[str, tuple[int, ...]] = {}
+    for b in blocks:
+        for name, cols, rows in (("attn.to_q", 256, 256), ("attn.add_q_proj", 256, 256),
+                                 ("attn.to_add_out", 256, 256), ("img_mlp.net.0.proj", 256, 512),
+                                 ("img_mod.1", 256, 1536)):
+            out[f"{prefix}transformer_blocks.{b}.{name}.lora_A.weight"] = (rank, cols)
+            out[f"{prefix}transformer_blocks.{b}.{name}.lora_B.weight"] = (rows, rank)
+    return out
+
+
 class Tree(unittest.TestCase):
     """A temporary LoRA folder (the config's "lora_dir")."""
 
@@ -188,8 +202,20 @@ class Listing(Tree):
 
     def test_a_model_that_takes_no_adapter_lists_none(self):
         self.qwen()
-        for family in ("mage-flow", "hunyuan-image-3"):
-            self.assertEqual(self.folder(family).listing(), [], family)
+        self.assertEqual(self.folder("hunyuan-image-3").listing(), [])
+
+    def test_a_mage_flow_file_and_its_two_streams(self):
+        safetensors(self.d / "rooms9.safetensors", mage_lora())
+        self.qwen("qwen")
+        f = self.folder("mage-flow")
+        entries = f.listing()
+        self.assertEqual([e["name"] for e in entries], ["rooms9"])
+        e = entries[0]
+        kinds = ["attn.add_q_proj", "attn.to_add_out", "attn.to_q", "img_mlp.net.0.proj", "img_mod.1"]
+        self.assertEqual(e["targets"], kinds, "a block's number is not part of the kind")
+        self.assertIn("is not one of this image model's weights", f.skipped["qwen"],
+                      "Qwen-Image-2.1's weights are not Mage-Flow's")
+        self.assertEqual(loras.field([{"name": "rooms9", "scale": 0.6}], f)[0]["scale"], 0.6)
 
     def test_moss_images_file_and_the_weights_of_its_split_qkv(self):
         safetensors(self.d / "moss.safetensors", moss_lora())
@@ -297,14 +323,13 @@ class Requests(Tree):
             loras.strip_tags("<lora:style/gouache:1:heavy>", self.f)
 
     def test_a_model_that_takes_no_adapter_refuses_both(self):
-        for family in ("mage-flow", "hunyuan-image-3"):
-            f = self.folder(family)
-            with self.assertRaises(loras.LoraError) as e:
-                loras.field([{"name": "style/gouache"}], f)
-            self.assertIn("takes no adapters", str(e.exception))
-            with self.assertRaises(loras.LoraError):
-                loras.strip_tags("a cat <lora:style/gouache:1>", f)
-            self.assertEqual(loras.field(None, f), [], "a request of none is no request for one")
+        f = self.folder("hunyuan-image-3")
+        with self.assertRaises(loras.LoraError) as e:
+            loras.field([{"name": "style/gouache"}], f)
+        self.assertIn("takes no adapters", str(e.exception))
+        with self.assertRaises(loras.LoraError):
+            loras.strip_tags("a cat <lora:style/gouache:1>", f)
+        self.assertEqual(loras.field(None, f), [], "a request of none is no request for one")
 
 
 def cfg(**kw) -> dict:
@@ -395,7 +420,8 @@ class Job(Tree):
         mage = {**self.cfg, "family": "mage-flow", "schedule": "mage", "steps": 4}
         with self.assertRaises(images.ImageRequestError) as e:
             images.parse_request({"prompt": "a cat", "lora": [{"name": "style/gouache"}]}, mage)
-        self.assertIn("Mage-Flow", str(e.exception))
+        self.assertIn("is not one of this image model's weights", str(e.exception),
+                      "Mage-Flow takes adapters now: Qwen-Image-2.1's file is another model's")
         hunyuan = {"exe": "strata-image", "family": "hunyuan-image-3", "diffusion_model": "d", "vae": "v",
                    "tokenizer": "t", "system_prompt": "s", "schedule": "hunyuanimage3"}
         with self.assertRaises(images.ImageRequestError) as e:
