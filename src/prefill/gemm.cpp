@@ -441,20 +441,22 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
 }
 
 void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
-               bool half) {
+               bool half, bool accumulate) {
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
 #if STRATA_ONEMATH
-    if (dense_f32(X, W, Y, T, N, K, ldy, stream_)) return;
-    if (half && half_sums(X, W, Y, T, N, K, ldy, stream_)) return;
-    if (blas<sycl::half>(X, W, Y, T, N, K, ldy, false, stream_)) return;
+    // the FP32 copies and the half-sum path leave Y unread (or write it whole): an accumulating product keeps the
+    // half GEMM's FP32 sums, as the engine's own kernels do
+    if (!accumulate && dense_f32(X, W, Y, T, N, K, ldy, stream_)) return;
+    if (half && !accumulate && half_sums(X, W, Y, T, N, K, ldy, stream_)) return;
+    if (blas<sycl::half>(X, W, Y, T, N, K, ldy, accumulate, stream_)) return;
 #else
     (void) half;
 #endif
     if (strata::kernels::xmx_gemm_ok(X, W, Y, N, K, ldy))
-        strata::kernels::xmx_gemm(XmxType::f16, X, W, Y, T, N, K, ldy, stream_);
+        strata::kernels::xmx_gemm(XmxType::f16, X, W, Y, T, N, K, ldy, stream_, accumulate);
     else
-        strata::kernels::gemm_rows(XmxType::f16, X, W, Y, T, N, K, ldy, stream_);
+        strata::kernels::gemm_rows(XmxType::f16, X, W, Y, T, N, K, ldy, stream_, accumulate);
 }
 
 bool Gemm::i8_usable(void* stream) {

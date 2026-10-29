@@ -36,9 +36,10 @@ public:
 
     /// Y = X . W^T with both in FP16 (bits).  `half_sums`: the sums in FP16 where oneMath takes the product (its
     /// half GEMM, then widened into Y), for products whose sums stay in FP16's range (inputs after a norm); else, and
-    /// in XeStrata's own kernels, in FP32.
+    /// in XeStrata's own kernels, in FP32.  `accumulate`: Y += (read before the product, in FP32; with `half_sums`
+    /// the sums stay FP32, the half GEMM taking no beta).
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
-             bool half_sums = false);
+             bool half_sums = false, bool accumulate = false);
 
     /// The experts' groups (FP16), one product each through oneMath: rows bounds[e] .. bounds[e + 1] (host values) of
     /// X and Y (row stride N) by W + e * w_stride, e < G.  False when oneMath does not take FP16 products on `stream`'s

@@ -719,6 +719,7 @@ if(STRATA_ENABLE_XE)
   # DiT against tools/image/qi21_ref.py's NumPy reference, and strata-image-dit-probe, the whole DiT and its sampler
   # against stable-diffusion.cpp's values, timed
   add_library(strata_image STATIC src/image/qi_kernels.cpp src/image/qi_attn.cpp src/image/qi_dit.cpp
+                           src/image/image_lora.cpp
                            src/image/qi_vae.cpp src/image/qi_text.cpp src/image/qi_pipeline.cpp
                            src/image/img_start.cpp
                            src/image/mf_vae.cpp src/image/mf_dit.cpp
@@ -961,6 +962,8 @@ if(STRATA_ENABLE_XE)
   target_include_directories(strata_image SYSTEM PRIVATE third_party/main/stb)
   set_source_files_properties(src/image/qi_image_io.cpp PROPERTIES COMPILE_OPTIONS "-w")
   target_link_libraries(strata_image PUBLIC strata_prefill)
+  add_executable(strata-image-lora-probe src/image/lora_probe.cpp)
+  target_link_libraries(strata-image-lora-probe PRIVATE strata_image)
   add_executable(strata-image-probe src/image/qi_block_probe.cpp)
   target_link_libraries(strata-image-probe PRIVATE strata_image)
   add_executable(strata-image-dit-probe src/image/qi_dit_probe.cpp)
