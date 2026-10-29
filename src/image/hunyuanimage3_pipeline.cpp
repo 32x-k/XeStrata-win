@@ -373,7 +373,8 @@ bool HunyuanImage3Pipeline::reference_grids(const QiRequest& r, std::vector<Huny
 }
 
 QiNeed HunyuanImage3Pipeline::need(int64_t n_text, int64_t width, int64_t height,
-                                   const std::vector<std::pair<int64_t, int64_t>>& refs, bool mask, int64_t) {
+                                   const std::vector<std::pair<int64_t, int64_t>>& refs, bool mask, int64_t,
+                                   const std::vector<LoraUse>&) {
     const int64_t th = height / kDownsample, tw = width / kDownsample;
     if (th <= 0 || tw <= 0 || n_text < th * tw + 1) {
         throw std::invalid_argument("image engine: the ids do not hold the image block and some text");

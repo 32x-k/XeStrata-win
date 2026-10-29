@@ -133,6 +133,8 @@ public:
     const std::string& lora_key() const { return lora_key_; }
     /// The bound entries' A and B on the GPU.
     uint64_t lora_bytes() const;
+    /// The adapter files bound (a set whose strengths are all 0 binds none).
+    int lora_count() const { return (int) lora_files_.size(); }
     void drop_loras();
 
 private:

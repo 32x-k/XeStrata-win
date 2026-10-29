@@ -263,7 +263,9 @@ void MfPipeline::fit(uint64_t reserve) {
 }
 
 QiNeed MfPipeline::need(int64_t n_text, int64_t width, int64_t height,
-                        const std::vector<std::pair<int64_t, int64_t>>& refs, bool mask, int64_t n_neg) {
+                        const std::vector<std::pair<int64_t, int64_t>>& refs, bool mask, int64_t n_neg,
+                        const std::vector<LoraUse>& loras) {
+    (void) loras;   // Mage-Flow takes no adapters yet: strata_image refuses a request that asks for one
     const MfDit& dit = q8_ == 0 ? *dit16_size_ : *dit_size_;   // the least: Q8_0's, unless FP16 is asked for
     const MfDit& full = q8_ == 1 ? *dit_size_ : *dit16_size_;  // all resident: FP16's, unless Q8_0 is
     const QiText& te = *te_size_;

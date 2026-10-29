@@ -95,8 +95,8 @@ void QiPipeline::ensure_open() {
 
 uint64_t QiPipeline::held() const {
     if (!(dit_ && vae_ && te_)) return 0;
-    return dit_->weight_bytes() + vae_->weight_bytes() + kScratch + dit_->blocks_vram() + te_->layers_vram() +
-           dit_->activations_held() + vae_->scratch_held();
+    return dit_->weight_bytes() + dit_->lora_bytes() + vae_->weight_bytes() + kScratch + dit_->blocks_vram() +
+           te_->layers_vram() + dit_->activations_held() + vae_->scratch_held();
 }
 
 void QiPipeline::fit(uint64_t reserve) {
@@ -107,7 +107,8 @@ void QiPipeline::fit(uint64_t reserve) {
 }
 
 QiNeed QiPipeline::need(int64_t n_text, int64_t width, int64_t height,
-                        const std::vector<std::pair<int64_t, int64_t>>& refs, bool mask, int64_t n_neg) {
+                        const std::vector<std::pair<int64_t, int64_t>>& refs, bool mask, int64_t n_neg,
+                        const std::vector<LoraUse>& loras) {
     const QiDit& dit = *dit_size_;
     const QiText& te = *te_size_;
     const QiVae& vae = *vae_size_;
@@ -130,8 +131,11 @@ QiNeed QiPipeline::need(int64_t n_text, int64_t width, int64_t height,
     // its activations: both sequences side by side after the first step (forward_pair)
     const int64_t neg_pre = n_neg > 0 ? n_neg + (T - h * w - n_text) : 0,
                   T_act = n_neg > 0 ? qi_attn_rows(T) + qi_attn_rows(neg_pre + h * w) : T;
-    const uint64_t fixed = dit.weight_bytes() + vae.weight_bytes() + kScratch + dit.prefix_row_bytes(T - h * w) +
-                           dit.prefix_row_bytes(neg_pre) + inpaint;
+    // the adapters: their A and B (in VRAM for the request, the blocks streamed or not), and the products' scratch of
+    // a step's rows; nothing bound yet, so the DiT's activations here hold none of it
+    const uint64_t lora = lora_gpu_bytes(loras, T_act);
+    const uint64_t fixed = dit.weight_bytes() + vae.weight_bytes() + kScratch + lora +
+                           dit.prefix_row_bytes(T - h * w) + dit.prefix_row_bytes(neg_pre) + inpaint;
     // the prefix cache: in VRAM in the plan's room, the rest in pinned RAM (least: all of it there)
     const uint64_t kv = dit.prefix_kv_bytes(T - h * w) + dit.prefix_kv_bytes(neg_pre), kv_all = kv * (uint64_t) dit.blocks();
     QiNeed n;
@@ -164,6 +168,7 @@ void QiPipeline::release(bool all) {
     if (!(dit_ && vae_ && te_)) return;
     if (all) {   // every buffer the parts hold goes with them; the next request opens them again
         drop_kept();
+        dit_->drop_loras();   // the adapters' A and B too (they go back on the next request's, from its files)
         te_.reset();
         dit_.reset();
         vae_.reset();
@@ -179,6 +184,11 @@ void QiPipeline::release(bool all) {
     mlp_set_ = -1;
 }
 
+void QiPipeline::use_loras(const QiRequest& r) {
+    std::string err;
+    if (!dit_->set_loras(r.loras, err)) throw std::runtime_error(err);
+}
+
 void QiPipeline::te_layers() {
     if (te_set_ == te_want_) return;
     te_->set_layer_budget(te_want_);
@@ -190,7 +200,11 @@ QiPlan QiPipeline::plan(int64_t T, int64_t h, int64_t w, int64_t n_ids, int64_t 
     p.budget = budget_ > 0 ? budget_ : auto_budget_;
     // the prefix's rows stay through the sampling and the decode (an edit's: its references' tokens too)
     const int64_t n_pre = T > 0 ? T - h * w : 0;
-    p.fixed = dit_->weight_bytes() + vae_->weight_bytes() + kScratch + dit_->prefix_row_bytes(n_pre) +
+    // the adapters' A and B are the fixed weights' (in VRAM whatever the plan does with the blocks; their scratch of a
+    // step's rows is among the activations, activation_bytes).  Bound already: what this plan puts beside them
+    p.lora = dit_->lora_bytes();
+    p.lora_n = dit_->lora_count();
+    p.fixed = dit_->weight_bytes() + p.lora + vae_->weight_bytes() + kScratch + dit_->prefix_row_bytes(n_pre) +
               dit_->prefix_row_bytes(n_neg_pre);
     // the activations: guidance's both sequences side by side after the first step (forward_pair)
     if (T > 0 && n_neg_pre > 0) T = qi_attn_rows(T) + qi_attn_rows(n_neg_pre + h * w);
@@ -386,6 +400,7 @@ std::vector<uint8_t> QiPipeline::generate(const QiRequest& r, QiTimes* times, Qi
     const int64_t h = r.height / 16, w = r.width / 16;
     const auto t0 = clock::now();
     ensure_open();
+    use_loras(r);   // before the plan (their bytes are fixed) and the context (a set that changed drops it)
     // an edit: its references through the vision encoder and the VAE's encoder, their pads widened to their tokens
     std::vector<int32_t> ids;
     std::vector<QiVisionOut> vouts;

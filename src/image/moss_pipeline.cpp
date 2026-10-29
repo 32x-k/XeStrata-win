@@ -255,8 +255,10 @@ void MossPipeline::fit(uint64_t reserve) {
 }
 
 QiNeed MossPipeline::need(int64_t n_text, int64_t width, int64_t height,
-                          const std::vector<std::pair<int64_t, int64_t>>& refs, bool mask, int64_t n_neg) {
+                          const std::vector<std::pair<int64_t, int64_t>>& refs, bool mask, int64_t n_neg,
+                          const std::vector<LoraUse>& loras) {
     (void) refs;   // MOSS-Image has no edits
+    (void) loras;   // MOSS-Image takes no adapters yet: strata_image refuses a request that asks for one
     const MossDit& dit = q8_ == 0 ? *dit16_size_ : *dit_size_;   // the least: 8 bits, unless FP16 is asked for
     const MossDit& full = q8_ == 1 ? *dit_size_ : *dit16_size_;  // all resident: FP16's, unless 8 bits are
     const MfVae& vae = *vae_size_;

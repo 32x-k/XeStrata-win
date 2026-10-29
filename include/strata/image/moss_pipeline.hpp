@@ -67,7 +67,7 @@ public:
     uint64_t held() const override;
     QiNeed need(int64_t n_text, int64_t width, int64_t height,
                 const std::vector<std::pair<int64_t, int64_t>>& refs = {}, bool mask = false,
-                int64_t n_neg = 0) override;
+                int64_t n_neg = 0, const std::vector<LoraUse>& loras = {}) override;
     /// need() for a request whose states the chat's engine makes (the server's TE:): no text encoder counted
     void set_states_given(bool given) { states_given_ = given; }
     std::vector<uint8_t> generate(const QiRequest& r, QiTimes* times = nullptr, QiPlan* plan = nullptr,

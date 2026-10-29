@@ -93,10 +93,11 @@ public:
     /// nothing is added to it.  The image is (width x height)/16 on a side in tokens.  `refs` (their sizes): an
     /// edit's reference images, whose encoding before the walk takes the VAE encoder's and SigLIP2's buffers;
     /// `mask`: a base image (img_start.hpp: img2img's or a mask's) encoded at the image's size before the walk;
-    /// `n_neg`: what this model does not take - ignored.
+    /// `n_neg`: what this model does not take - ignored; `loras`: so too (HunyuanImage 3.0 takes no adapters, and
+    /// strata_image refuses a request that asks for one).
     QiNeed need(int64_t n_text, int64_t width, int64_t height,
                 const std::vector<std::pair<int64_t, int64_t>>& refs = {}, bool mask = false,
-                int64_t n_neg = 0) override;
+                int64_t n_neg = 0, const std::vector<LoraUse>& loras = {}) override;
 
     /// `r.ids`: the request's sequence up to the generated block's `<boi> <img_size_N>` (the system turn and the
     /// reference images' blocks before it, as generate takes them), `r.refs` the images; width, height and the

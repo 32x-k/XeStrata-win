@@ -40,6 +40,12 @@
 // 1, the default, starts from noise); --mask, a mask over the base image (the --init image, else the first --ref;
 // OpenAI's: a PNG whose transparent pixels are where the image changes, the rest kept as the base has it); see
 // img_start.hpp.
+// Adapters (LoRA files, image_lora.hpp: the forms ComfyUI's core reads, the plain LoRA's now) are applied at run time,
+// a strength each: the IMG line's LORA:<strength>:<path>, repeated, in the order given.  Their A and B stay on the GPU
+// with the DiT's weights (the budget's fixed part; the IMAGE line says how many, lora_n, and their MiB, lora_mib), and
+// a set that differs from the last request's starts the context again (the prefix's K and V were the other set's).  A
+// model that applies none refuses a request that names one: HunyuanImage 3.0 (it takes no adapters), Mage-Flow and
+// MOSS-Image (their adapters are not applied yet).
 // Writes RGBA8 rows to --out and a line of times and of the budget's split a run.
 //
 // --serve: the engine stays, its layers and the last prompt's states kept between requests, and takes lines on stdin
@@ -48,6 +54,8 @@
 //                            -> STAGE <refs|text|sampling|decode> as each stage starts and STEP <done> <steps> lines,
 //                            then IMAGE key=value ... (times, the budget's split); SIGMAS: as --sigmas; REF: an
 //                            edit's reference images; MASK:, INIT: and STRENGTH: as --mask, --init and --strength;
+//                            LORA:<strength>:<path> an adapter (repeated, in the order given; the strength first, so
+//                            that a path's own colons, as Windows' have, stand);
 //                            NEG:<ids, commas> and CFG:<scale> (above 1):
 //                            classifier-free guidance with that negative prompt (its pads as the prompt's); GUID:
 //                            <scale> is HunyuanImage 3.0's guidance token instead (it samples once: no NEG:, no CFG:);
@@ -55,10 +63,11 @@
 //                            <step> <path> before the next STEP, its RGBA8 rows at <out path>.p<index>
 //                            MOSS-Image's SHIFT:, USKIP:<blocks|none>, SLG:<blocks>, SLGSCALE:, SLGSTART:, SLGSTOP:
 //                            as the options, and TE:<path>, NEGTE:<path> the chat engine's states
-//   NEED <width> <height> <n> [REF:<path>]... [MASK:<path>] [INIT:<path>] [NEG:<n>]  the VRAM an image of n prompt
-//                            ids needs (from the files); MASK: or INIT:, a base image (with a strength below 1 and
-//                            references, MASK:<their first>); NEG: guidance's negative prompt of n ids; TE: the
-//                            states come from the chat's engine (MOSS-Image: no text encoder counted)
+//   NEED <width> <height> <n> [REF:<path>]... [MASK:<path>] [INIT:<path>] [NEG:<n>] [LORA:<strength>:<path>]...
+//                            the VRAM an image of n prompt ids needs (from the files); MASK: or INIT:, a base image
+//                            (with a strength below 1 and references, MASK:<their first>); NEG: guidance's negative
+//                            prompt of n ids; LORA: the request's adapters (their A and B are fixed); TE: the states
+//                            come from the chat's engine (MOSS-Image: no text encoder counted)
 //                                                                                          -> NEED least_mib=...
 //                            full_mib=... held_mib=... free_mib=... cap_mib=... host_mib=... (si::QiNeed)
 //   FREE                     the free VRAM and what the engine holds                        -> FREE free_mib=... held_mib=...
@@ -83,18 +92,25 @@
 #include "strata/image/qi_pipeline.hpp"
 
 #include <atomic>
+#include <cerrno>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <fstream>
-#include <iostream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#if defined(_WIN32)
+#include <io.h>
+#else
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -145,8 +161,41 @@ si::QiRef read_image(const std::string& path) {
     return f;
 }
 
+// The adapters the process has read: each file once, however many requests name it (the next request of the same set
+// binds nothing: QiDit::set_loras keeps the bound key)
+struct Loras {
+    std::map<std::string, std::shared_ptr<const si::LoraFile>> files;
+    std::shared_ptr<const si::LoraFile> get(const std::string& path) {
+        const auto at = files.find(path);
+        if (at != files.end()) return at->second;
+        auto f = si::LoraFile::open(path);
+        std::shared_ptr<const si::LoraFile> shared = std::move(f);
+        files.emplace(path, shared);
+        return shared;
+    }
+};
+
+// LORA:<strength>:<path> into the request's set: the strength first, the path the rest of the word (its own colons,
+// as a Windows path has, are not read as the strength's)
+void read_lora(const std::string& word, si::QiRequest& r, Loras& loras) {
+    const std::string rest = word.substr(5);
+    const size_t colon = rest.find(':');
+    const std::string scale = rest.substr(0, colon), path = colon == std::string::npos ? "" : rest.substr(colon + 1);
+    float s = 0.0f;
+    size_t used = 0;
+    try {
+        s = std::stof(scale, &used);
+    } catch (const std::exception&) {
+        used = 0;
+    }
+    if (scale.empty() || used != scale.size() || !std::isfinite(s))
+        throw std::invalid_argument("LORA:<strength>:<path>: the strength is not a number: " + word);
+    if (path.empty()) throw std::invalid_argument("LORA:<strength>:<path>: no file: " + word);
+    r.loras.push_back({loras.get(path), s});
+}
+
 // the words left on an IMG line: its REF:<path> images (and SIGMAS:, MASK:, INIT:, STRENGTH:...)
-std::vector<si::QiRef> read_refs(std::istringstream& ls, si::QiRequest& r) {
+std::vector<si::QiRef> read_refs(std::istringstream& ls, si::QiRequest& r, Loras& loras) {
     std::vector<si::QiRef> refs;
     for (std::string word; ls >> word;) {
         if (word.rfind("SIGMAS:", 0) == 0) r.sigmas = parse_sigmas(word.substr(7));
@@ -170,6 +219,7 @@ std::vector<si::QiRef> read_refs(std::istringstream& ls, si::QiRequest& r) {
         else if (word.rfind("SLGSTOP:", 0) == 0) r.slg_stop = std::stof(word.substr(8));
         else if (word.rfind("TE:", 0) == 0) read_states(word.substr(3), r.te, r.te_rows);
         else if (word.rfind("NEGTE:", 0) == 0) read_states(word.substr(6), r.neg_te, r.neg_te_rows);
+        else if (word.rfind("LORA:", 0) == 0) read_lora(word, r, loras);
         else if (word.rfind("REF:", 0) == 0) refs.push_back(read_image(word.substr(4)));
         else throw std::invalid_argument("unknown word " + word);
     }
@@ -177,10 +227,15 @@ std::vector<si::QiRef> read_refs(std::istringstream& ls, si::QiRequest& r) {
 }
 
 // a NEED line's: the REF:<path> images' sizes; MASK:<path> or INIT:<path> (a base image) sets `mask`, NEG:<n> `n_neg`,
-// TE:<path> (the chat engine's states) `states`
-std::vector<std::pair<int64_t, int64_t>> ref_sizes(std::istringstream& ls, bool& mask, int64_t& n_neg, bool& states) {
+// TE:<path> (the chat engine's states) `states`, and LORA:<strength>:<path> goes into `r.loras`
+std::vector<std::pair<int64_t, int64_t>> ref_sizes(std::istringstream& ls, bool& mask, int64_t& n_neg, bool& states,
+                                                   si::QiRequest& r, Loras& loras) {
     std::vector<std::pair<int64_t, int64_t>> sizes;
     for (std::string word; ls >> word;) {
+        if (word.rfind("LORA:", 0) == 0) {
+            read_lora(word, r, loras);
+            continue;
+        }
         if (word.rfind("MASK:", 0) == 0 || word.rfind("INIT:", 0) == 0) {
             mask = true;
             continue;
@@ -202,17 +257,17 @@ std::vector<std::pair<int64_t, int64_t>> ref_sizes(std::istringstream& ls, bool&
 }
 
 std::string plan_kv(const si::QiTimes& t, const si::QiPlan& p) {
-    char b[640];
+    char b[768];
     std::snprintf(b, sizeof b,
                   "text_s=%.3f sampling_s=%.3f decode_s=%.3f budget_mib=%llu blocks_mib=%llu resident_blocks=%d "
                   "layers_mib=%llu resident_layers=%d activations_mib=%llu mlp_rows=%lld vae_mib=%llu vae_tiled=%d "
-                  "text_cached=%d prefix_kv_mib=%llu resident_kv=%d streamed_mib=%llu",
+                  "text_cached=%d prefix_kv_mib=%llu resident_kv=%d streamed_mib=%llu lora_n=%d lora_mib=%llu",
                   t.text, t.sampling, t.decode, (unsigned long long) (p.budget >> 20),
                   (unsigned long long) (p.blocks >> 20), p.resident_blocks, (unsigned long long) (p.layers >> 20),
                   p.resident_layers, (unsigned long long) (p.activations >> 20), (long long) p.mlp_rows,
                   (unsigned long long) (p.vae >> 20), p.vae_tiled ? 1 : 0, p.text_cached ? 1 : 0,
                   (unsigned long long) (p.prefix_kv >> 20), p.resident_kv,
-                  (unsigned long long) (p.streamed >> 20));
+                  (unsigned long long) (p.streamed >> 20), p.lora_n, (unsigned long long) (p.lora >> 20));
     return b;
 }
 
@@ -220,6 +275,35 @@ void write_file(const std::string& path, const std::vector<uint8_t>& img) {
     std::ofstream o(path, std::ios::binary);
     o.write(reinterpret_cast<const char*>(img.data()), (std::streamsize) img.size());
     if (!o) throw std::runtime_error("cannot write " + path);
+}
+
+// stdin's next line, read from the descriptor rather than through std::cin: glibc's exit() flushes every stdio stream
+// and waits for stdin's lock, which getline holds while it waits for input - an engine that ends on QUIT (or on an
+// error, every std::exit) would hang in exit() on Linux and the server would wait for it until it kills it.  The
+// reader thread is never woken; it ends with the process.  (strata serve reads its lines the same way.)
+bool stdin_line(std::string& out, std::string& buf) {
+    char chunk[4096];
+    for (;;) {
+        const size_t nl = buf.find('\n');
+        if (nl != std::string::npos) {
+            out.assign(buf, 0, nl);
+            buf.erase(0, nl + 1);
+            return true;
+        }
+#if defined(_WIN32)
+        const int n = _read(0, chunk, (unsigned) sizeof chunk);
+#else
+        const ssize_t n = ::read(0, chunk, sizeof chunk);
+#endif
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) {
+            if (buf.empty()) return false;
+            out.swap(buf);
+            buf.clear();
+            return true;
+        }
+        buf.append(chunk, (size_t) n);
+    }
 }
 
 // stdin's lines on a thread of their own, so that STOP reaches a running request
@@ -230,7 +314,8 @@ struct Lines {
     bool eof = false;
     std::atomic<bool> stop{false};
     void run() {
-        for (std::string line; std::getline(std::cin, line);) {
+        std::string buf;
+        for (std::string line; stdin_line(line, buf);) {
             if (!line.empty() && line.back() == '\r') line.pop_back();
             if (line == "STOP") {
                 stop = true;
@@ -254,7 +339,15 @@ struct Lines {
     }
 };
 
+// a request that names adapters the model does not apply: refused, rather than an image made without them
+void no_loras(si::ImagePipeline& p) {
+    if (dynamic_cast<si::HunyuanImage3Pipeline*>(&p) != nullptr)
+        throw std::invalid_argument("image engine: HunyuanImage 3.0 takes no adapters");
+    throw std::invalid_argument("image engine: this image model's adapters are not applied yet");
+}
+
 int serve(si::ImagePipeline& p) {
+    Loras loras;   // the adapters' files, read once for the requests that name them
     {
         // the warm-up: a 256 x 256 image of one step from token ids the vocabulary has; where the GPU has no room
         // for it now (another program holds it), the first request builds the kernels instead.  A model whose
@@ -276,7 +369,7 @@ int serve(si::ImagePipeline& p) {
     std::fflush(stdout);
     Lines in;
     std::thread reader([&in] { in.run(); });
-    reader.detach();   // ends with the process: a blocked getline cannot be woken
+    reader.detach();   // ends with the process: a blocked read cannot be woken
     for (std::string line; in.next(line);) {
         std::istringstream ls(line);
         std::string op;
@@ -290,7 +383,8 @@ int serve(si::ImagePipeline& p) {
                 ls >> r.width >> r.height >> r.seed >> r.drop >> out >> ids;
                 if (!ls || out.empty()) throw std::invalid_argument("IMG <width> <height> <seed> <drop> <out> <ids>");
                 r.ids = parse_ids(ids);
-                r.refs = read_refs(ls, r);
+                r.refs = read_refs(ls, r, loras);
+                if (!r.loras.empty() && dynamic_cast<si::QiPipeline*>(&p) == nullptr) no_loras(p);
                 r.on_preview = [&out](int index, int done, const std::vector<uint8_t>& rgba) {
                     const std::string path = out + ".p" + std::to_string(index);
                     write_file(path, rgba);
@@ -316,7 +410,7 @@ int serve(si::ImagePipeline& p) {
                 ls >> r.drop >> ids;
                 if (!ls) throw std::invalid_argument("RATIO <drop> <ids> [REF:<path>]...");
                 r.ids = parse_ids(ids);
-                r.refs = read_refs(ls, r);
+                r.refs = read_refs(ls, r, loras);
                 double secs = 0.0;
                 const int i = p.choose_ratio(r, &secs);
                 std::printf("RATIO index=%d ratio_s=%.3f\n", i, secs);
@@ -326,10 +420,11 @@ int serve(si::ImagePipeline& p) {
                 if (!ls) throw std::invalid_argument("NEED <width> <height> <n> [REF:<path>]... [MASK:<path>]");
                 bool mask = false, states = false;
                 int64_t n_neg = 0;
-                const auto sizes = ref_sizes(ls, mask, n_neg, states);
+                si::QiRequest lr;   // the request's adapters, which the need counts and nothing else uses
+                const auto sizes = ref_sizes(ls, mask, n_neg, states, lr, loras);
                 auto* moss = dynamic_cast<si::MossPipeline*>(&p);
                 if (moss != nullptr) moss->set_states_given(states);
-                const si::QiNeed nd = p.need(n, w, h, sizes, mask, n_neg);
+                const si::QiNeed nd = p.need(n, w, h, sizes, mask, n_neg, lr.loras);
                 if (moss != nullptr) moss->set_states_given(false);
                 std::printf("NEED least_mib=%llu full_mib=%llu held_mib=%llu free_mib=%llu cap_mib=%llu host_mib=%llu\n",
                             (unsigned long long) (nd.least >> 20), (unsigned long long) (nd.full >> 20),

@@ -62,7 +62,7 @@ public:
     /// n_neg: guidance's negative prompt's ids after the system turn (0: no guidance), its own prefix beside the first.
     QiNeed need(int64_t n_text, int64_t width, int64_t height,
                 const std::vector<std::pair<int64_t, int64_t>>& refs = {}, bool mask = false,
-                int64_t n_neg = 0) override;
+                int64_t n_neg = 0, const std::vector<LoraUse>& loras = {}) override;
 
     /// RGBA8 [height][width][4] of the request.  `step`: the DiT's progress (QiDit::sample), false to stop.
     /// `stage`: each stage as it starts ("refs", the references through the vision encoder and the VAE's encoder;
@@ -73,6 +73,11 @@ public:
 
 private:
     QiPlan plan(int64_t T, int64_t h, int64_t w, int64_t n_ids = 0, int64_t n_neg_pre = 0);
+
+    /// The adapters r asks for, bound to the DiT's products (set_loras): a failure throws err.  A set that changed
+    /// takes the context with it, so the request's set_context comes after this (the text states themselves are the
+    /// encoder's, the adapters' or not, and are kept).
+    void use_loras(const QiRequest& r);
 
     void ensure_open();
     void te_layers();

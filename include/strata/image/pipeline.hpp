@@ -4,6 +4,8 @@
 // Mage-Flow's MfPipeline): its VRAM budget, what an image needs, the image itself, and letting its cache go.
 #pragma once
 
+#include "strata/image/image_lora.hpp"
+
 #include <cstdint>
 #include <functional>
 #include <stdexcept>
@@ -62,6 +64,10 @@ struct QiRequest {
     // and of the negative prompt's); empty: the image engine encodes the ids itself
     std::vector<float> te, neg_te;
     int64_t te_rows = 0, neg_te_rows = 0;
+    // the adapters the DiT's products add (image_lora.hpp), each file read once with the strength its delta is scaled
+    // by, applied in this order: a set that changes starts the context again (the prefix's K and V were the other
+    // set's).  A model that applies none refuses the request rather than make another image.
+    std::vector<LoraUse> loras;
 };
 
 struct QiTimes {
@@ -74,6 +80,8 @@ struct QiPlan {
     int resident_blocks = 0, resident_layers = 0, resident_kv = 0;   // resident_kv: the blocks whose prefix cache is in VRAM
     int64_t mlp_rows = 0;   // 0: all
     uint64_t streamed = 0;  // HunyuanImage 3.0's: the expert banks' bytes one pass reads past what is resident
+    uint64_t lora = 0;      // the adapters bound, their A and B on the GPU (part of fixed)
+    int lora_n = 0;
     bool vae_tiled = false, text_cached = false;
 };
 
@@ -103,9 +111,11 @@ public:
     /// What an image of n_text prompt ids (after the system turn) at width x height needs (from the parts' sizes:
     /// nothing put on the GPU); refs: an edit's reference images' sizes (width, height as read); mask: the edit has a
     /// mask; n_neg: guidance's negative prompt's ids after the system turn (0: no guidance).
+    /// `loras`: the adapters the request applies, whose A and B stay on the GPU (the fixed weights); a model that
+    /// applies none counts none.
     virtual QiNeed need(int64_t n_text, int64_t width, int64_t height,
                         const std::vector<std::pair<int64_t, int64_t>>& refs = {}, bool mask = false,
-                        int64_t n_neg = 0) = 0;
+                        int64_t n_neg = 0, const std::vector<LoraUse>& loras = {}) = 0;
     /// The request `serve` warms the engine up with.  The default is the generic one (a plain token-id ramp at
     /// 256 x 256, one step), which the models whose DiT reads any ids take; a model whose sequence must carry its
     /// image block's markers (HunyuanImage 3.0) fills `r` with a sequence of its own and returns true.
