@@ -378,10 +378,12 @@ constexpr int CH = 32;            // keys a chunk
 constexpr int QT = 2;             // query tiles of 16 a wave: K's and V^T's operands read once for both
 constexpr int NW = 4;             // waves a work-group: NW * 16 * QT query rows
 constexpr int KLD = D + 16;       // a key's row of K in local memory (bytes)
-constexpr int VLD = CH + 16;      // a dim's row of V^T in local memory (bytes)
+constexpr int VLD = CH;           // a dim's row of V^T in local memory (bytes; padded to CH + 16 it was 4% slower on
+                                  // the RX 9060 XT, 2026-10-29: a smaller work-group's local memory)
 constexpr int SLICES = 32;        // the key stats' partial sums: slices of the keys
 
-// the per-device buffers, grown to the largest T asked: int8 Q and K [T][heads D], V^T [heads D][Tp], their scales
+// the per-device buffers, grown to the largest T asked: int8 Q and K [T][heads D], V^T [heads][Tp / CH][D][CH], their
+// scales
 struct Bufs {
     int8_t *q = nullptr, *k = nullptr, *vt = nullptr;
     float *sq = nullptr, *sk = nullptr, *sv = nullptr, *mean = nullptr, *part = nullptr;
@@ -431,8 +433,9 @@ void key_stats(sycl::queue& q, const uint16_t* k16, const uint16_t* v16, int64_t
 }
 
 // Q's and K's rows (a (row, head)'s 128 values, less `mean` for K) as int8 with their scales (Q's times `qmul`), and V
-// as int8 by its (head, dim) scales, transposed into vt [heads D][Tp]: one kernel, a work-group a head and RB keys, V^T
-// built in local memory so its rows go out RB bytes at a time; rows and keys past T zero
+// as int8 by its (head, dim) scales, transposed into vt [heads][Tp / CH][D][CH] (a chunk's V^T in one piece, which the
+// attention reads at once: a dim's CH bytes Tp apart were 2% slower on the RX 9060 XT): one kernel, a work-group a head
+// and RB keys, V^T built in local memory so its rows go out RB bytes at a time; rows and keys past T zero
 void prep_i8(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, const float* mean,
              const float* sv, int64_t T, int64_t Tp, int64_t heads, float qmul, int8_t* q8, int8_t* k8, int8_t* vt,
              float* sq, float* sk) {
@@ -495,7 +498,8 @@ void prep_i8(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uin
             for (int i = lid; i < D * RB / 4; i += WG) {   // V^T along the keys, 4 a work-item
                 const int d = i / (RB / 4), tt = i % (RB / 4) * 4;
                 if (tt < nk)
-                    *reinterpret_cast<uint32_t*>(vt + (hd * D + d) * Tp + t0 + tt) =
+                    *reinterpret_cast<uint32_t*>(vt + (((int64_t) hd * (Tp / CH) + (t0 + tt) / CH) * D + d) * CH +
+                                                 (t0 + tt) % CH) =
                         *reinterpret_cast<const uint32_t*>(&tile[d * TLD + tt]);
             }
         });
@@ -585,7 +589,7 @@ struct Kernel {
                 const int kr = i / (D / 16), c = i % (D / 16) * 16;
                 rk[p] = *reinterpret_cast<const u4*>(k8 + (j0 + kr) * C + h * D + c);
                 const int d = i / (CH / 16), cv = i % (CH / 16) * 16;
-                rv[p] = *reinterpret_cast<const u4*>(vt + (h * D + d) * Tp + j0 + cv);
+                rv[p] = *reinterpret_cast<const u4*>(vt + ((h * (Tp / CH) + j0 / CH) * D + d) * CH + cv);
             }
             if (lid < CH) rs = j0 + lid < T ? sk[(j0 + lid) * heads + h] : 0.f;
         };
