@@ -25,6 +25,7 @@
 #include <sycl/sycl.hpp>
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
+#include "strata/pipeline_auto.hpp"
 #include "strata/sycl_doorbell.hpp"
 #include "strata/core/arch_defaults.hpp"
 #include "strata/core/dma_batch.hpp"
@@ -704,11 +705,12 @@ struct Options {
     /// result) goes through the verify windows, S tokens at a time, instead of the batched prompt path (0 = always
     /// the batched path)
     int64_t short_read = 64;
-    /// --pipeline-windows N (--serve, a layer split on exactly two GPUs; opt-in): 1 = a prompt's short reads through
+    /// --pipeline-windows N (--serve, a layer split on exactly two GPUs): 1 = a prompt's short reads through
     /// the verify windows run with the stages overlapped (stage 0 reads window K+1 while stage 1 reads window K);
     /// 2 = the decode windows too: stage 0 runs window K+1 speculatively while stage 1 verifies window K (rolled back
-    /// when K is not accepted as guessed).  0 = off (the stages take turns).
-    int pipeline_windows = 0;
+    /// when K is not accepted as guessed).  0 = off (the stages take turns).  -1 (not given) = automatic: 2 when both
+    /// GPUs of the two-stage split are Battlemage (Xe2) cards and the MTP drafter runs (spec >= 2), else 0.
+    int pipeline_windows = -1;
     /// The suffix drafter (prompt lookup): when the text being written repeats an earlier stretch of the context (code
     /// edits, quoted input, tool-call JSON) by at least this many tokens, the window may be filled with what followed
     /// it there instead of the MTP's drafts, where the MTP's own first guess agrees and the draft policy expects it to
@@ -834,7 +836,8 @@ void usage() {
                  "  --batch-mtp          --batch (opt-in, one GPU, needs --mtp and --spec): each slot also verifies one MTP\n"
                  "                       proposal per window (STRATA_BATCH_MTP=1 does the same); needs VRAM per slot\n"
                  "  --batch-groups G     --batch with a layer split: the slots in G groups pipelined through the GPUs\n"
-                 "  --pipeline-windows N --serve with a layer split on two GPUs (opt-in): one conversation's verify windows\n"
+                 "  --pipeline-windows N --serve with a layer split on two GPUs (default 2 on two Arc B-series cards with\n"
+                 "                       the MTP drafter, else 0): one conversation's verify windows\n"
                  "                       with the GPUs overlapped - 1 = the prompt's short reads, 2 = decode as well\n"
                  "                       (stage 0 runs the next window while stage 1 verifies this one); docs/MULTI_GPU.md\n"
                  "  --trim-stage-weights an explicit --layer-split: each GPU loads only its own layers' dense weights\n"
@@ -3387,9 +3390,39 @@ int main(int argc, char **argv) try {
         }
     }
     strata::core::Verifier::set_commit_async(!multi_gpu);   // see Verifier::set_commit_async
-    // --pipeline-windows (opt-in): one conversation's windows with the two stages of a layer split overlapped.  Decided
+    // --pipeline-windows: one conversation's windows with the two stages of a layer split overlapped.  Decided
     // here, before any stage sizes its expert cache (the second verifier per stage and the snapshots are allocated
     // after the caches, so their room is kept out of them).  What it does not support turns it off, said once.
+    // Not given: on by default (2) for a split of exactly two Battlemage (Xe2) cards, found from the devices'
+    // architecture ids (strata::intel_gpu_gen), with --serve and the MTP drafter; a single card, an Arc A-series card or
+    // anything the pipeline does not support stays serial, said nothing.  STRATA_PIPELINE_AUTO=0 or
+    // --pipeline-windows 0 turns it off.
+    if (o.pipeline_windows < 0) {
+        static const char* ae = std::getenv("STRATA_PIPELINE_AUTO");
+        const auto battlemage = [](int d) -> bool {
+            try {
+                return strata::intel_gpu_gen(dpct::get_device(d)) == strata::IntelGpuGen::Battlemage;
+            } catch (...) {
+                return false;
+            }
+        };
+        strata::PipelineAutoInputs in;
+        in.serve = o.serve; in.multi_gpu = multi_gpu; in.split_same = split_same;
+        in.later_stages = (unsigned) split_devs.size();
+        in.auto_off = ae != nullptr && std::atoi(ae) == 0;
+        in.has_mtp = !o.mtp.empty(); in.spec = o.spec; in.batch = o.batch;
+        in.peer_device = o.peer_device >= 1;     // the same test as the validation below
+        in.helper_caches = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
+        if (split_devs.size() == 1) {            // the devices are looked at only for a split the pipeline could take
+            in.first_is_battlemage = battlemage(0);
+            in.later_is_battlemage = battlemage(split_devs[0]);
+        }
+        const bool on = strata::pipeline_auto_on(in);
+        o.pipeline_windows = on ? 2 : 0;
+        if (on)
+            std::fprintf(stderr, "strata generate: --pipeline-windows 2 is on by default for a layer split across two Arc "
+                                 "B-series cards (--pipeline-windows 0 or STRATA_PIPELINE_AUTO=0 turns it off)\n");
+    }
     if (o.pipeline_windows > 0) {
         const bool helpers = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
         const char* off = !o.serve ? "it needs --serve"
