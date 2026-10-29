@@ -188,7 +188,7 @@ It cannot be used with `"replicas"`, `--layer-split`, `--split-device`, `--batch
 | `prefill_gpu`, `decode_gpu` | required | The two cards' PCI addresses. Different cards. |
 | `min_prompt_tokens` | 2048 | A request is handed over only when the decode engine would otherwise read at least this many new tokens itself; below it the decode engine reads them in place. |
 | `dir` | `/dev/shm` if it has room, else the temp folder | Where the session file lives during a hand-over. |
-| `shared_arena` | `true` | One copy of the experts in RAM for both engines (Linux, a file in `/dev/shm` when the experts fit there). `false`: each engine keeps its own. A file name: that file backs it (a file on disk works). |
+| `shared_arena` | `true` | One copy of the experts in RAM for both engines (Linux: a memory file without a name, which leaves RAM once the server and its engines have all ended). `false`: each engine keeps its own. A file name: that file backs it (a file on disk works). |
 | `prefill_args`, `decode_args` | none | Extra engine arguments for one role (a bigger expert cache for the decode engine, say). They must not change the session settings below. |
 
 The start line says what was chosen, and `/metrics` has a `split_serve` block: requests, hand-overs, fallbacks to reading in place, bytes moved and the time spent saving and restoring.

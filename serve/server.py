@@ -878,8 +878,10 @@ class StrataEngine:
             tl.last = value
 
     def __init__(self, exe: str, args: list[str], cwd: str | None = None, log: str | None = None,
-                 env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0):
+                 env: dict | None = None, lazy: bool = False, cpus: list[int] | None = None, _attempt: int = 0,
+                 *, fds: tuple[int, ...] = ()):
         self.spawn = (exe, list(args), cwd, log, env, False, cpus)   # to start it again after it died (issue #27)
+        self.spawn_kw = {"fds": tuple(fds)} if fds else {}           # descriptors the engine inherits (split's arena)
         self.session_save_reclaim = '--session-save-reclaim' in args
         paths = {k: v for k, v in zip(args, args[1:]) if k in ("--native", "--pack")}
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
@@ -923,9 +925,11 @@ class StrataEngine:
             except OSError:
                 pass
         self.max_context = 0                             # before the new process is visible: never its predecessor's
-        pin = {}
+        pin: dict[str, Any] = {}
         if cpus and hasattr(os, "sched_setaffinity"):    # replicas: this engine's own physical cores (replicas.py)
             pin["preexec_fn"] = lambda: os.sched_setaffinity(0, cpus)
+        if fds:
+            pin["pass_fds"] = tuple(fds)
         spawned_at = time.monotonic()
         try:
             self.proc = popen("the Strata engine", [exe, "--serve", *args], cwd=cwd, stdin=subprocess.PIPE,
@@ -1008,7 +1012,7 @@ class StrataEngine:
                           f"ready yet: starting it again in {wait_s:.0f} s (try {_attempt + 2} of {START_RETRIES + 1})",
                           flush=True)
                 time.sleep(wait_s)
-                StrataEngine.__init__(self, exe, args, cwd, log, env, lazy, cpus, _attempt + 1)
+                StrataEngine.__init__(self, exe, args, cwd, log, env, lazy, cpus, _attempt + 1, fds=fds)
                 return
             why = (f"the engine did not report READY within {ENGINE_READY_S:.0f} s" if timed_out else
                    f"the engine exited before it was ready ({exit_text(self.proc.poll())})")
@@ -1276,7 +1280,8 @@ class StrataEngine:
                 # (0)".  __init__ clears `ended` itself once READY (before its pump thread can set it again).
                 self.ended = True
                 try:
-                    self.__init__(*self.spawn)   # type: ignore[misc]  # (a test's subclass starts again as itself)
+                    # (a test's subclass starts again as itself; spawn_kw is not there for one built without __init__)
+                    self.__init__(*self.spawn, **getattr(self, "spawn_kw", {}))   # type: ignore[misc]
                     break
                 except RuntimeError:
                     try:
@@ -8545,7 +8550,7 @@ def start_split(cfg: dict, spec: dict, exe: str, effort_end: list[str], lazy: bo
     once; the SplitEngine in front hands a long prompt from the first to the second."""
     from serve import split as sp
     sp.check_cfg(cfg, spec)
-    arena, arena_note = sp.arena_path(cfg, spec)
+    arena, arena_fd, arena_note = sp.arena_path(cfg, spec)
     work = sp.session_dir(spec)
     print(f"[strata] split serving: the prompt is read on card {spec['prefill_gpu']}, the answer is made on card "
           f"{spec['decode_gpu']} (prompts with {spec['min_prompt_tokens']}+ new tokens are handed over); {arena_note}",
@@ -8561,7 +8566,7 @@ def start_split(cfg: dict, spec: dict, exe: str, effort_end: list[str], lazy: bo
             env = child_env(rc)
             env["STRATA_GPU_PCI"] = rc["gpu_pci"]       # its own card, whatever the server's environment names
             engines[role] = StrataEngine(exe, engine_args(rc) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
-                                         env=env, lazy=lazy)
+                                         env=env, lazy=lazy, fds=(arena_fd,) if arena_fd is not None else ())
     except BaseException:
         for e in engines.values():
             try:
@@ -8569,9 +8574,11 @@ def start_split(cfg: dict, spec: dict, exe: str, effort_end: list[str], lazy: bo
             except Exception:        # noqa: BLE001
                 pass
         shutil.rmtree(work, ignore_errors=True)
+        if arena_fd is not None:
+            os.close(arena_fd)
         raise
     return sp.SplitEngine(engines["prefill"], engines["decode"], min_tokens=spec["min_prompt_tokens"], work_dir=work,
-                          arena_file=arena)
+                          arena_fd=arena_fd)
 
 
 # The sampling each model card recommends ("Best Practices"), used when neither the request, the Chat settings nor the

@@ -19,9 +19,9 @@ two cards may be of different makers (an Intel Arc and an NVIDIA card) when the 
     min_prompt_tokens          hand a request over only when the decode engine would read at least this many new tokens
                                itself (default 2048); a shorter tail is read by the decode engine in place
     dir                        where the session files go (default /dev/shm when it has room, else the temp folder)
-    shared_arena               true (default): one copy of the experts in RAM for both engines (Linux, a file in
-                               /dev/shm when the experts fit there); false: each engine keeps its own copy; a path:
-                               that file
+    shared_arena               true (default): one copy of the experts in RAM for both engines (Linux, a memory file
+                               without a name, which goes when the last of the server and its engines ends); false:
+                               each engine keeps its own copy; a path: that file
     prefill_args / decode_args extra engine arguments for one role (a bigger expert cache for the decode engine, say)
 
 What must match between the two engines is what the session file checks (docs/MULTIGPU.md): the model files, the engine
@@ -162,39 +162,33 @@ def _arg_value(args: list, flag: str):
     return None
 
 
-def arena_path(cfg: dict, spec: dict) -> tuple[str | None, str]:
-    """(file for --shared-expert-arena or None, a line for the log).  Only Linux can share the arena; the experts
-    file must fit /dev/shm (a tmpfs is half of the RAM by default) unless the config names another file."""
+def arena_path(cfg: dict, spec: dict) -> tuple[str | None, int | None, str]:
+    """(file for --shared-expert-arena or None, the descriptor the engines inherit for it or None, a line for the log).
+    Only Linux can share the arena.  By default it is a memfd the server holds and the engines open as
+    /proc/self/fd/<n>: a named file in /dev/shm stayed in RAM, the size of the experts, whenever the server ended
+    without its close() (SIGKILL, a crash), and a restarted engine still finds the arena through the server's
+    descriptor."""
     args = [str(a) for a in cfg.get("args") or []]
     if "--shared-expert-arena" in args:
-        return None, "the config already names a shared expert arena"
+        return None, None, "the config already names a shared expert arena"
     sa = spec["shared_arena"]
     if sa is False:
-        return None, "shared_arena is off: each engine keeps its own copy of the experts in RAM"
+        return None, None, "shared_arena is off: each engine keeps its own copy of the experts in RAM"
     if "--mmap-experts" in args:
-        return None, "--mmap-experts reads the experts from the file (the engine cannot share an arena with it)"
+        return None, None, "--mmap-experts reads the experts from the file (the engine cannot share an arena with it)"
     if os.name == "nt":
-        return None, ("this OS cannot share the expert arena between two engines (Linux only): each engine keeps its "
-                      "own copy of the experts in RAM, so the PC needs RAM for two")
+        return None, None, ("this OS cannot share the expert arena between two engines (Linux only): each engine "
+                            "keeps its own copy of the experts in RAM, so the PC needs RAM for two")
     if isinstance(sa, str):
-        return os.path.abspath(sa), f"shared expert arena in {os.path.abspath(sa)}"
-    pack = _arg_value(args, "--pack")
-    if pack and not os.path.isabs(pack):                # the engine's path, from the config's cwd
-        pack = os.path.join(cfg.get("cwd") or ".", pack)
-    experts = os.path.join(pack, "experts.bin") if pack else None
-    if not experts or not os.path.isfile(experts):
-        return None, ("no experts.bin to size a shared arena from (a pack that reads the GGUF in place): each engine "
-                      "keeps its own copy of the experts; name a file in \"shared_arena\" to share one")
-    need = os.path.getsize(experts)
+        return os.path.abspath(sa), None, f"shared expert arena in {os.path.abspath(sa)}"
+    if not hasattr(os, "memfd_create"):
+        return None, None, ("this OS has no memfd: each engine keeps its own copy of the experts; name a file in "
+                            "\"shared_arena\" to share one")
     try:
-        free = shutil.disk_usage("/dev/shm").free
-    except OSError:
-        free = 0
-    if free < need + (1 << 30):
-        return None, (f"/dev/shm has {free / 2**30:.1f} GiB free and the experts are {need / 2**30:.1f} GiB: each "
-                      "engine keeps its own copy of the experts in RAM (two copies). To share one copy name a file in "
-                      "\"shared_arena\" (a file on disk works, it is written once) or make /dev/shm bigger")
-    return "/dev/shm/strata-split-arena.bin", f"one shared expert arena in /dev/shm ({need / 2**30:.1f} GiB)"
+        fd = os.memfd_create("strata-split-arena")      # close-on-exec: only the engines given it (pass_fds) get it
+    except OSError as e:
+        return None, None, f"no memory file for a shared arena ({e}): each engine keeps its own copy of the experts"
+    return f"/proc/self/fd/{fd}", fd, "one shared expert arena in RAM"
 
 
 def session_dir(spec: dict) -> str:
@@ -229,13 +223,13 @@ class SplitEngine:
     PROPAGATE = {"silence_s", "gpu_busy"}
 
     def __init__(self, prefill, decode, *, min_tokens: int = MIN_TOKENS, work_dir: str | None = None,
-                 arena_file: str | None = None, say=None):
+                 arena_fd: int | None = None, say=None):
         d = self.__dict__
         d["prefill"], d["decode"] = prefill, decode
         d["cur"] = decode                      # the engine the request is on now (progress, last)
         d["min_tokens"] = int(min_tokens)
         d["work_dir"] = work_dir or tempfile.mkdtemp(prefix="strata-split-")
-        d["arena_file"] = arena_file
+        d["arena_fd"] = arena_fd
         d["say"] = say or (lambda s: print(s, flush=True))
         d["held"] = []                         # the tokens the decode engine's session holds (estimated: ids + answer)
         d["seq"] = 0
@@ -348,11 +342,12 @@ class SplitEngine:
             except BaseException as x:           # noqa: BLE001
                 err = err or x
         shutil.rmtree(self.work_dir, ignore_errors=True)
-        if self.arena_file and self.arena_file.startswith("/dev/shm/strata-split-"):
+        if self.arena_fd is not None:
             try:
-                os.unlink(self.arena_file)       # RAM until it is gone
+                os.close(self.arena_fd)          # the RAM goes once the engines that had it open have ended
             except OSError:
                 pass
+            self.__dict__["arena_fd"] = None
         if err:
             raise err
 
