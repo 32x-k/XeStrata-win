@@ -26,8 +26,9 @@ A listing entry - ImageGen.defaults' "loras" (the engine's capabilities: /health
 A request's adapters come from the "lora" field - a list of {"name", "scale"} or one such object (vLLM-Omni's shape), a
 name alone, or one of those as JSON text (a multipart form's field) - and from the prompt's tags, <lora:name:0.8> in
 A1111's and Forge's form, in the positive prompt and the negative one.  "local_path" names a file inside the folder,
-and no other path is taken (a path is not a capability); "scale_text" is taken and not applied (the engine applies no
-text encoder's adapter yet), and the response says so.  A name the listing does not have is refused where the field
+and no other path is taken (a path is not a capability).  A text encoder's adapter is not applied (the human's
+decision of 2026-10-29): "scale_text" and a tag's third field, A1111's text encoder's weight, are taken as the
+engine's other unknown fields are, ignored.  A name the listing does not have is refused where the field
 gives it, and taken out of the prompt with a warning where a tag gives it (the response's strata.lora_unknown and the
 server's log; the human's decision of 2026-10-29, as A1111 and Forge do).  A model whose DiT takes no adapter at all
 takes neither the field nor a tag: both are refused, so no image is made without what was asked for.
@@ -537,8 +538,7 @@ def _items(value) -> list:
 
 
 def one(item, f: Folder) -> dict:
-    """One adapter a request names -> {"name", "path", "scale"} ("path": its file, absolute; "scale_text" kept where
-    it is given)."""
+    """One adapter a request names -> {"name", "path", "scale"} ("path": its file, absolute)."""
     if isinstance(item, str):
         item = {"name": item}
     if not isinstance(item, dict):
@@ -559,8 +559,6 @@ def one(item, f: Folder) -> dict:
         raise LoraError('lora: each adapter needs a "name" (one the model lists) or a "local_path"')
     use = {"name": entry["name"], "path": f.file_of(entry),
            "scale": _strength(item.get("scale"), f"lora: {entry['name']}: scale", 1.0)}
-    if item.get("scale_text") is not None:
-        use["scale_text"] = _strength(item["scale_text"], f"lora: {entry['name']}: scale_text", 1.0)
     return use
 
 
@@ -593,8 +591,9 @@ def field(value, f: Folder) -> list[dict]:
 def strip_tags(text: str, f: Folder) -> tuple[str, list[dict], list[str]]:
     """A prompt's <lora:name:weight> tags out of `text` -> (the text, the adapters the tags name in order - the first
     naming of a name wins, one()'s dicts - and the names the model does not list, which are left out and said in the
-    response).  <lora:name:weight:weight> is A1111's text encoder's weight: taken, not applied.  A weight that is not a
-    number, or a tag on a model that takes no adapter at all: LoraError."""
+    response).  <lora:name:weight:weight> is A1111's text encoder's weight: not applied, and taken as the engine's other
+    unknown fields are (the human's decision of 2026-10-29).  A weight that is not a number, or a tag on a model that
+    takes no adapter at all: LoraError."""
     if "<" not in text:
         return text, [], []
     found = list(TAG.finditer(text))
@@ -608,14 +607,10 @@ def strip_tags(text: str, f: Folder) -> tuple[str, list[dict], list[str]]:
         name = m.group(1).strip()
         entry = f.find(name)
         scale = _strength(m.group(2), f"<lora:{name}:weight>", 1.0)
-        text_scale = m.group(3)
         if entry is None:
             unknown.append(name)
             continue
         if any(u["name"] == entry["name"] for u in uses):
             continue
-        use = {"name": entry["name"], "path": f.file_of(entry), "scale": scale}
-        if text_scale is not None:
-            use["scale_text"] = _strength(text_scale, f"<lora:{name}:weight:weight>", 1.0)
-        uses.append(use)
+        uses.append({"name": entry["name"], "path": f.file_of(entry), "scale": scale})
     return TAG.sub("", text), uses, unknown

@@ -320,11 +320,14 @@ class Requests(Tree):
             loras.field([{"local_path": str(self.d / "style/gouache.safetensors")}],
                         loras.Folder({"lora_dir": str(self.d), "family": "moss-image"}))
 
-    def test_a_scale_text_is_taken_and_said_not_applied(self):
+    def test_a_scale_text_is_ignored_like_an_unknown_field(self):
+        # a text encoder's adapter is not applied (the human's decision of 2026-10-29): the field is no field of the
+        # engine's, and its value is not checked (an unknown field's is not either)
         use = loras.field([{"name": "style/gouache", "scale_text": 0.4}], self.f)[0]
-        self.assertEqual(use["scale_text"], 0.4)
-        with self.assertRaises(loras.LoraError):
-            loras.field([{"name": "style/gouache", "scale_text": -3}], self.f)
+        self.assertEqual(set(use), {"name", "path", "scale"})
+        self.assertEqual(use["scale"], 1.0)
+        use = loras.field([{"name": "style/gouache", "scale_text": -3}], self.f)[0]
+        self.assertEqual(use["scale"], 1.0)
 
     def test_tags_come_out_and_unknown_ones_are_left_out(self):
         text, uses, unknown = loras.strip_tags("a cat <lora:style/gouache:0.5> in <lora:nope:1> snow", self.f)
@@ -334,14 +337,15 @@ class Requests(Tree):
         text, uses, unknown = loras.strip_tags("<lora:style/gouache>", self.f)
         self.assertEqual((text, uses[0]["scale"], unknown), ("", 1.0, []))
         text, uses, unknown = loras.strip_tags("<lora:style/gouache:1:0.5>", self.f)
-        self.assertEqual((text, uses[0]["scale_text"]), ("", 0.5), "A1111's text encoder's weight: taken, not applied")
+        self.assertEqual((text, uses[0]["scale"], unknown), ("", 1.0, []),
+                         "A1111's text encoder's weight (the third field): not applied, and no field of the engine's")
         text, uses, unknown = loras.strip_tags("<lora:style/gouache:0.3> and <lora:style/gouache:0.9>", self.f)
         self.assertEqual([u["scale"] for u in uses], [0.3], "the first naming of a name wins")
         self.assertEqual(loras.strip_tags("no tags here", self.f), ("no tags here", [], []))
         with self.assertRaises(loras.LoraError):
             loras.strip_tags("<lora:style/gouache:heavy>", self.f)
-        with self.assertRaises(loras.LoraError):
-            loras.strip_tags("<lora:style/gouache:1:heavy>", self.f)
+        text, uses, unused = loras.strip_tags("<lora:style/gouache:1:heavy>", self.f)
+        self.assertEqual((text, uses[0]["scale"]), ("", 1.0), "the text encoder's field is not the engine's either")
 
     def test_a_model_that_takes_no_adapter_refuses_both(self):
         f = self.folder("hunyuan-image-3")
@@ -449,13 +453,17 @@ class Job(Tree):
             images.parse_request({"prompt": "a cat <lora:style/gouache:1>"}, hunyuan)
         self.assertIn("HunyuanImage 3.0", str(e.exception))
 
-    def test_a_scale_text_is_said_not_applied(self):
-        job = images.parse_request({"prompt": "a cat", "lora": [{"name": "style/gouache", "scale_text": 0.6}]},
-                                   self.cfg)
-        self.assertNotIn("scale_text", job["loras"][0])
-        self.assertTrue(job["lora_text"])
+    def test_a_scale_text_is_ignored(self):
+        job = images.parse_request({"prompt": "a cat", "size": "256x256",
+                                    "lora": [{"name": "style/gouache", "scale_text": 0.6}]}, self.cfg)
+        self.assertEqual(set(job["loras"][0]), {"name", "path", "scale"})
+        self.assertEqual(job["loras"][0]["scale"], 1.0, "the strength is the one given, else the default")
+        self.assertNotIn("lora_text", job)
+        self.gen.need(job)
+        word = f" LORA:1.0:{loras.encode_path(str(self.d / 'style/gouache.safetensors'))}"
+        self.assertTrue(self.gen.engine.lines[-1].endswith(word), self.gen.engine.lines[-1])
         made, figures = self.gen.run(job)
-        self.assertEqual(figures["lora_text"], "not applied (the image engine applies no text encoder's adapter)")
+        self.assertNotIn("lora_text", figures)
 
     def test_the_words_the_engine_is_sent_and_the_response(self):
         job = images.parse_request({"prompt": "a cat", "size": "256x256", "seed": 3,
