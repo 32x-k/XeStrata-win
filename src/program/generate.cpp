@@ -8379,13 +8379,16 @@ int main(int argc, char** argv) {
         // verdict (after the drafter's chain is launched) and, while a round is in flight, every 0.5 ms without
         // counting a window.
         struct ASwap { int32_t layer, in, out, slot; int home; int64_t j; bool exchange; const uint8_t* from; };
-        // direct: its copies straight from the page-locked RAM copy; false for a stage on another maker's GPU, which
-        // copies through the exchange buffers, pageable there as its copies were before its layers had host USM of
-        // their own (layer_devices): straight from that the rounds' copies shared the RTX 4070's x4 link with the
-        // windows, the window rule offered 35 drafts instead of 86 and the decode of 91 tokens took 15% longer
-        // (B70 + RTX 4070, layers 24-47, 2026-10-29)
+        // paced: a stage on another maker's GPU, whose layers of the page-locked RAM copy are in host USM of its own
+        // (layer_devices), copies its swaps straight from there one at a time, each waited for before the next, as
+        // its pageable copies went before that copy (each such copy returns once the host's side is read).  Queued at
+        // once, a round's copies held the RTX 4070's x4 link from the windows: the window rule offered 14 drafts
+        // instead of 71 and the second turn decoded 53 tok/s instead of 74.  Through the exchange buffers instead (a
+        // memcpy and a pageable copy each) the rounds took 152 ms instead of 143 and the first turn of 32K decoded
+        // 80.3 tok/s against 81.1 before; one at a time it decodes 82.0, and the first turn of 1K 63.1 against 60.0
+        // (B70 + RTX 4070, layers 24-47, Qwen3.8 IQ3_XXS, 2026-10-29)
         struct AHome { strata::core::ExpertCache* cache; strata::gpu::Stream stream; strata::gpu::Event* ev; int dev; bool used;
-                       bool direct = true; };
+                       bool paced = false; };
         enum class AState { Idle, Pick, CopyBack, SwapIn, RamFence, Commit };
         AState astate = AState::Idle;
         std::vector<ASwap> aswaps;
@@ -8425,7 +8428,7 @@ int main(int argc, char** argv) {
             ahomes.push_back({&xcache, adapt_stream, adapt_ev, 0, false});
             for (auto& st : stages)
                 ahomes.push_back({&st->cache, st->adapt_stream, st->adapt_ev, st->dev, false,
-                                  strata::gpu::same_backend(0, st->dev)});
+                                  !strata::gpu::same_backend(0, st->dev)});
             ajob = std::make_unique<JobThread>();
             std::fprintf(stderr, "strata serve: adaptive tier asynchronous (--adapt-async 1): up to %lld swaps per round, "
                                  "a round every %d windows%s\n", (long long) a_cap, o.adapt_every,
@@ -8497,7 +8500,7 @@ int main(int argc, char** argv) {
                 }
                 return b;
             }
-            if (src.pinned(w.layer, w.in) && ahomes[(size_t) w.home].direct)
+            if (src.pinned(w.layer, w.in))
                 if (const uint8_t* b = src.resident_blob(w.layer, w.in)) return b;
             // pageable, or not in the RAM copy: through a bounce buffer (an async copy)
             uint8_t* bb = src.exchange_buffer(a_cap + w.j);
@@ -8514,6 +8517,11 @@ int main(int argc, char** argv) {
             const strata::core::OnDevice on(h.dev);
             if (!strata::gpu::copy_async(h.cache->device_slot(w.slot), b,
                                          (size_t) strata::kernels::cpu::expert_layout().blob_bytes(w.layer), h.stream)) {
+                std::fprintf(stderr, "strata serve: adaptive tier: copy of layer %d into slot %d (GPU %d) failed: %s\n",
+                             (int) w.layer, (int) w.slot, h.dev, strata::gpu::last_error());
+                a_err = true;
+            }
+            if (h.paced && !strata::gpu::stream_sync(h.stream)) {   // one at a time (AHome)
                 std::fprintf(stderr, "strata serve: adaptive tier: copy of layer %d into slot %d (GPU %d) failed: %s\n",
                              (int) w.layer, (int) w.slot, h.dev, strata::gpu::last_error());
                 a_err = true;
