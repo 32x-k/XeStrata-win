@@ -655,9 +655,12 @@ struct Kernel {
                     m[qt] = cmx[qt];
                 }
                 // P^T as int8 against the chunk's largest (its scale ps), straight into O^T's B operands: against the
-                // row's m instead, a long row's many small probabilities round to 0 (LPIPS 0.09-0.27 on Qwen-Image)
+                // row's m instead, a long row's many small probabilities round to 0 (LPIPS 0.09-0.27 on Qwen-Image).
+                // P is taken from the scores less the chunk's largest, not from the row's m times 1 / ps: a chunk far
+                // below the row's largest (MOSS-Image's peaked heads, 2^-130 and below) makes ps denormal, 1 / ps
+                // infinite and the row's sum NaN, and the head's output 0 (MOSS-Image's fox blurred, LPIPS 0.146 against
+                // 0.022 so); such a chunk's ps is 0 and it adds nothing
                 ps[qt] = m[qt] == -INFINITY ? 0.f : sycl::native::exp2(cmx[qt] - m[qt]) / 127.f;
-                const float inv = ps[qt] > 0.f ? 1.f / ps[qt] : 0.f;
                 float sum = 0.f;
 #pragma unroll
                 for (int nt = 0; nt < CH / 16; ++nt) {
@@ -666,7 +669,7 @@ struct Kernel {
                     uint32_t w0 = 0, w1 = 0;
 #pragma unroll
                     for (int e = 0; e < 8; ++e) {
-                        const float pv = sycl::native::exp2(sycl::fma(s[qt][nt][e], sql[qt], -m[qt])) * inv;
+                        const float pv = sycl::native::exp2(sycl::fma(s[qt][nt][e], sql[qt], -cmx[qt])) * 127.f;
                         sum += pv;
                         if (e < 4) w0 = __builtin_amdgcn_cvt_pk_u8_f32(pv, (uint32_t) e, w0);
                         else w1 = __builtin_amdgcn_cvt_pk_u8_f32(pv, (uint32_t) (e - 4), w1);
