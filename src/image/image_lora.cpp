@@ -475,16 +475,50 @@ bool LoraDeviceEntry::upload(const LoraEntry& e, void* stream, std::string& err)
     return true;
 }
 
-void LoraDeviceEntry::add(const uint16_t* x16, int64_t T, float* y, int64_t ldy, int64_t row0, int64_t n, float scale,
-                          const float* row_scale, prefill::Gemm& gemm, float* tmp_f32, uint16_t* tmp16,
-                          void* stream) const {
+void LoraDeviceEntry::add(const uint16_t* x16, int64_t T, float* y, int64_t ldy, int64_t src_row, int64_t row0,
+                          int64_t n, float scale, const float* row_scale, prefill::Gemm& gemm, float* tmp_f32,
+                          uint16_t* tmp16, void* stream) const {
     if (T <= 0 || n <= 0 || rank_ <= 0 || scale == 0.0f) return;
+    if (src_row < 0 || src_row + n > rows_) return;   // the caller keeps the rows within the entry
     if (ldy <= 0) ldy = n;
     gemm.f16(x16, a_, tmp_f32, T, rank_, cols_);   // t = x . A^T, [T][rank]
     sycl::queue& q = strata::core::Runtime::get().stream(stream);
     q.parallel_for(sycl::range<1>((size_t) (T * rank_)),
                    lora_kernels::ScaleRows{tmp_f32, scale, row_scale, rank_, tmp16});
-    gemm.f16(tmp16, b_, y + row0, T, n, rank_, ldy, false, true);   // y[:, row0 ..] += t16 . B^T
+    gemm.f16(tmp16, b_ + src_row * rank_, y + row0, T, n, rank_, ldy, false, true);   // y[:, row0 ..] += t16 . B^T
+}
+
+uint64_t LoraLayer::bytes() const {
+    uint64_t n = 0;
+    for (const LoraPart& p : parts)
+        if (p.entry) n += p.entry->bytes();
+    return n;
+}
+
+void LoraLayer::add(const uint16_t* x16, int64_t T, float* y, int64_t ldy, int64_t w_row0, int64_t w_rows,
+                    const float* row_scale, prefill::Gemm& gemm, float* tmp_f32, uint16_t* tmp16,
+                    void* stream) const {
+    for (const LoraPart& p : parts) {
+        // the part's rows the product wrote: [a, b) of the weight's rows
+        const int64_t a = std::max(p.row0, w_row0), b = std::min(p.row0 + p.n, w_row0 + w_rows);
+        if (b <= a) continue;
+        p.entry->add(x16, T, y, ldy, p.src_row + (a - p.row0), a - w_row0, b - a, p.scale, row_scale, gemm, tmp_f32,
+                     tmp16, stream);
+    }
+}
+
+uint64_t lora_gpu_bytes(const std::vector<LoraUse>& loras, int64_t T) {
+    uint64_t bytes = 0;
+    int64_t rank = 0;
+    for (const LoraUse& u : loras) {
+        if (!u.file) continue;
+        for (const LoraEntry& e : u.file->entries()) {
+            if (e.kind != LoraKind::lora) continue;
+            bytes += 2 * (uint64_t) e.rank * (uint64_t) (e.rows + e.cols);   // A and B, FP16
+            rank = std::max(rank, e.rank);
+        }
+    }
+    return bytes + (uint64_t) std::max<int64_t>(T, 0) * (uint64_t) rank * 6;
 }
 
 }  // namespace strata::image

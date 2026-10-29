@@ -75,6 +75,17 @@ private:
     std::map<std::string, std::string> meta_;
 };
 
+/// One adapter a request applies: its file, read once and shared while its request runs, and the strength its delta is
+/// scaled by (the file's own alpha / rank is the entry's).
+struct LoraUse {
+    std::shared_ptr<const LoraFile> file;
+    float scale = 1.0f;
+};
+
+/// The bytes the adapters take on the GPU: their entries' A and B (FP16), and the products' scratch of T rows (T times
+/// the largest rank, FP32 and FP16 each): what a request's budget puts beside the model.
+uint64_t lora_gpu_bytes(const std::vector<LoraUse>& loras, int64_t T);
+
 /// One entry's A and B on the GPU (FP16), and the entry's delta applied to a product's output.
 class LoraDeviceEntry {
 public:
@@ -94,18 +105,47 @@ public:
     int64_t rows() const { return rows_; }
     uint64_t bytes() const { return bytes_; }
 
-    /// y[t][ldy] (from column `row0`) += scale * (x16[t] A^T) B^T, t < T, for the entry's first `n` rows.  A W8A8
+    /// y[t][row0 + c] (row stride ldy) += scale * (x16[t] A^T) B^T, t < T, for the entry's rows
+    /// [src_row, src_row + n) into the weight's rows [row0, row0 + n) (a fused weight's half, or the whole).  A W8A8
     /// product's output is its weights' and activations' scales applied (no row scale of the input): `row_scale`
     /// (null: none) is the input rows' scale, which the base product's sum does not carry and this delta must.
     /// `tmp_f32` and `tmp16` hold T * rank values each (grown by the caller).
-    void add(const uint16_t* x16, int64_t T, float* y, int64_t ldy, int64_t row0, int64_t n, float scale,
-             const float* row_scale, prefill::Gemm& gemm, float* tmp_f32, uint16_t* tmp16, void* stream) const;
+    void add(const uint16_t* x16, int64_t T, float* y, int64_t ldy, int64_t src_row, int64_t row0, int64_t n,
+             float scale, const float* row_scale, prefill::Gemm& gemm, float* tmp_f32, uint16_t* tmp16,
+             void* stream) const;
 
 private:
     uint16_t* a_ = nullptr;
     uint16_t* b_ = nullptr;
     int64_t rank_ = 0, cols_ = 0, rows_ = 0;
     uint64_t bytes_ = 0;
+};
+
+/// One share of a weight's delta: the entry's rows [src_row, src_row + n) at the weight's rows [row0, row0 + n), times
+/// `scale` (the file's and the request's).  Two files may change one weight: the weight takes a part each.
+struct LoraPart {
+    std::shared_ptr<const LoraDeviceEntry> entry;
+    int64_t row0 = 0, n = 0, src_row = 0;
+    float scale = 1.0f;
+};
+
+/// The deltas one weight adds to its products, as the DiT bound them.  A weight without one has no layer.
+class LoraLayer {
+public:
+    LoraLayer() = default;
+    ~LoraLayer() = default;
+    LoraLayer(const LoraLayer&) = delete;
+    LoraLayer& operator=(const LoraLayer&) = delete;
+
+    std::vector<LoraPart> parts;
+    bool empty() const { return parts.empty(); }
+    /// The GPU memory the parts' entries hold.
+    uint64_t bytes() const;
+
+    /// y[t][ldy] += the parts that cover the weight's rows [w_row0, w_row0 + w_rows), each into its own rows there.
+    /// `tmp_f32` and `tmp16` hold T * rank values each (grown by the caller).
+    void add(const uint16_t* x16, int64_t T, float* y, int64_t ldy, int64_t w_row0, int64_t w_rows,
+             const float* row_scale, prefill::Gemm& gemm, float* tmp_f32, uint16_t* tmp16, void* stream) const;
 };
 
 /// The host tensors of `e` as FP16 (a file's BF16, F16 or F32), for a test or a form built by hand.

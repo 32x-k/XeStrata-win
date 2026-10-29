@@ -1,24 +1,34 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // src/image/lora_probe.cpp - strata-image-lora-probe: a LoRA adapter file read (its keys brought to the DiT's names,
-// its entries and metadata), and the delta's arithmetic on the GPU against a CPU reference.
+// its entries and metadata), the delta's arithmetic on the GPU against a CPU reference, and the deltas a DiT binds.
 //
 //   strata-image-lora-probe list LORA.safetensors|LORA.gguf      the entries and the metadata
 //   strata-image-lora-probe selftest                             y += scale (x A^T) B^T against FP64 (random)
+//   strata-image-lora-probe map DIT.gguf [LORA [scale]]          the weights adapters may take, and where a file's keys
+//                                                                land (or that they do not)
+//   strata-image-lora-probe step DIT.gguf OUT.bin [LORA [scale]] one forward of a fixed context and noise, its
+//                                                                velocity written as raw FP32 (a base run has no LORA)
 //
-// `list` reads no GPU: it is the reader's check.  `selftest` builds a small adapter and two products, with and
-// without a per-row scale, and prints how far the GPU's output is from the reference's.
+// `list` and `map` read no GPU: they are the readers' checks.  `selftest` builds a small adapter and two products, with
+// and without a per-row scale, and prints how far the GPU's output is from the reference's.  `step` is how a LoRA's
+// delta against the same delta baked into the weights is compared (the parity test of the catalogue's records): the
+// same C++ forward on the same noise, the model loaded twice.
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/image/image_lora.hpp"
+#include "strata/image/qi_dit.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/prefill/gemm.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -56,7 +66,9 @@ struct Ref {
     double dot = 0, ng = 0, nw = 0, err = 0, mag = 0, mx = 0;
 };
 
-void compare(const char* what, const std::vector<float>& got, const std::vector<double>& want) {
+// The cosine of the GPU's output and the reference's (an accumulator of 4096 values and more stays FP32 in both), and
+// the relative error; true when the cosine is above 0.9999, the selftest's pass.
+bool compare(const char* what, const std::vector<float>& got, const std::vector<double>& want) {
     Ref r;
     for (size_t i = 0; i < got.size(); ++i) {
         r.dot += (double) got[i] * want[i];
@@ -67,15 +79,19 @@ void compare(const char* what, const std::vector<float>& got, const std::vector<
         r.mag += std::fabs(want[i]);
         r.mx = std::max(r.mx, e);
     }
-    std::printf("%-22s cos %.7f  rel %.3g  max %.3g\n", what, r.dot / std::sqrt(r.ng * r.nw + 1e-30), r.err / r.mag,
-                r.mx);
+    const double c = r.dot / std::sqrt(r.ng * r.nw + 1e-30);
+    std::printf("%-22s cos %.7f  rel %.3g  max %.3g%s\n", what, c, r.err / r.mag, r.mx,
+                c > 0.9999 ? "" : "  WRONG");
+    return c > 0.9999;
 }
 
-// one entry's delta: y[t][c] += scale * row_scale[t] * sum_r (x[t] . a[r]) b[c][r]
-void selftest_case(void* s, bool rows_scaled) {
+// one entry's delta: y[t][row0 + c] += scale * row_scale[t] * sum_r (x[t] . a[r]) b[src_row + c][r], the entry's
+// rows [src_row, src_row + n) at the weight's [row0, row0 + n)
+void selftest_case(void* s, int64_t T, int64_t K, int64_t R, int64_t N, bool rows_scaled, int64_t src_row = 0,
+                   int64_t row0 = 0, int64_t n = 0) {
     namespace si = strata::image;
-    constexpr int64_t T = 8, K = 64, R = 8, N = 32;
-    std::mt19937 rng(rows_scaled ? 7u : 3u);
+    if (n <= 0) n = N - src_row;
+    std::mt19937 rng((uint32_t) (rows_scaled ? 7u : 3u) ^ (uint32_t) (T * 31 + K * 17 + R * 13 + N * 7));
     std::normal_distribution<float> nd(0.0f, 0.5f);
     si::LoraEntry e;
     e.key = "selftest";
@@ -108,7 +124,7 @@ void selftest_case(void* s, bool rows_scaled) {
     gpu::copy(dx, x16.data(), x16.size() * 2);
     gpu::copy(dy, zero.data(), zero.size() * 4);
     gpu::copy(drs, rs.data(), rs.size() * 4);
-    dev.add(dx, T, dy, N, 0, N, scale, rows_scaled ? drs : nullptr, gemm, tf, t16, s);
+    dev.add(dx, T, dy, N, src_row, row0, n, scale, rows_scaled ? drs : nullptr, gemm, tf, t16, s);
     if (!gpu::stream_sync(s)) throw std::runtime_error(gpu::last_error());
     std::vector<float> got((size_t) (T * N));
     gpu::copy(got.data(), dy, got.size() * 4);
@@ -122,22 +138,135 @@ void selftest_case(void* s, bool rows_scaled) {
         for (int64_t r = 0; r < R; ++r) {
             double v = 0;
             for (int64_t k = 0; k < K; ++k) v += xd[(size_t) (t * K + k)] * ad[(size_t) (r * K + k)];
-            for (int64_t c = 0; c < N; ++c)
-                want[(size_t) (t * N + c)] += v * bd[(size_t) (c * R + r)] * scale * (rows_scaled ? rs[(size_t) t] : 1.0);
+            for (int64_t c = 0; c < n; ++c)
+                want[(size_t) (t * N + row0 + c)] +=
+                    v * bd[(size_t) ((src_row + c) * R + r)] * scale * (rows_scaled ? rs[(size_t) t] : 1.0);
         }
-    compare(rows_scaled ? "row-scaled (W8A8)" : "plain (FP16)", got, want);
+    char label[64];
+    std::snprintf(label, sizeof label, "%s %lldx%lld rank %lld", rows_scaled ? "row-scaled" : "plain",
+                  (long long) T, (long long) N, (long long) R);
+    const bool ok = compare(label, got, want);
     gpu::free(dx);
     gpu::free(dy);
     gpu::free(drs);
     gpu::free(tf);
     gpu::free(t16);
+    if (!ok) throw std::runtime_error(std::string("the delta of ") + label + " is not the reference's");
 }
 
 int selftest() {
     void* s = strata::core::Runtime::get().create_stream();
-    selftest_case(s, false);
-    selftest_case(s, true);
+    try {
+        selftest_case(s, 8, 64, 8, 32, false);
+        selftest_case(s, 8, 64, 8, 32, true);
+        // the rows of a fused weight: the entry's second half into the weight's second half
+        selftest_case(s, 8, 64, 8, 64, false, 32, 32, 32);
+        // a rank the matrix engines' accumulating product takes (K a multiple of 32)
+        selftest_case(s, 64, 64, 64, 4096, false);
+    } catch (...) {
+        strata::core::Runtime::get().destroy_stream(static_cast<sycl::queue*>(s));
+        throw;
+    }
     strata::core::Runtime::get().destroy_stream(static_cast<sycl::queue*>(s));
+    return 0;
+}
+
+// The DiT's table of the weights adapters may take, and where each entry of `lora` lands on it (a line a mapped
+// weight, MISSING a key the DiT does not take, SHAPE a weight whose rows and columns are not the entry's).
+int map(const std::string& dit_path, const std::string& lora_path, float scale) {
+    namespace si = strata::image;
+    si::QiDit dit;
+    std::string err;
+    if (!dit.open(dit_path, nullptr, err, true)) throw std::runtime_error(err);
+    const auto targets = dit.lora_targets();
+    std::printf("targets %zu\n", targets.size());
+    for (const auto& t : targets)
+        std::printf("  %-52s rows %lld cols %lld%s\n", t.name.c_str(), (long long) t.rows, (long long) t.cols,
+                    t.row0 != 0 ? (" at " + std::to_string(t.row0)).c_str() : "");
+    if (lora_path.empty()) return 0;
+    const auto f = si::LoraFile::open(lora_path);
+    size_t mapped = 0;
+    for (const auto& e : f->entries()) {
+        const si::QiDit::LoraTarget* t = nullptr;
+        for (const auto& c : targets)
+            if (c.name == e.key) {
+                t = &c;
+                break;
+            }
+        if (t == nullptr) {
+            std::printf("MISSING %-46s %-5s rank %-4lld %lld x %lld\n", e.key.c_str(), si::lora_kind_name(e.kind),
+                        (long long) e.rank, (long long) e.cols, (long long) e.rows);
+        } else if (e.rows != t->rows || e.cols != t->cols) {
+            std::printf("SHAPE   %-46s %lld x %lld, the weight %lld x %lld\n", e.key.c_str(), (long long) e.cols,
+                        (long long) e.rows, (long long) t->cols, (long long) t->rows);
+        } else {
+            ++mapped;
+            std::printf("mapped  %-46s %-5s rank %-4lld rows %lld at the weight's %lld, scale %.4f\n", e.key.c_str(),
+                        si::lora_kind_name(e.kind), (long long) e.rank, (long long) e.rows, (long long) t->row0,
+                        e.scale() * scale);
+        }
+    }
+    std::printf("%zu of %zu entries mapped\n", mapped, f->entries().size());
+    return mapped == f->entries().size() ? 0 : 1;
+}
+
+// One forward of a fixed context and noise (philox_randn of seed 42), the velocity written as raw FP32: the same
+// numbers as an adapterless run mean the adapter's delta compares equal to the same delta baked into the weights.
+int step(const std::string& dit_path, const std::string& out_path, const std::string& lora_path, float scale) {
+    namespace si = strata::image;
+    void* s = strata::core::Runtime::get().create_stream();
+    si::QiDit dit;
+    std::string err;
+    if (!dit.open(dit_path, s, err)) throw std::runtime_error(err);
+    if (!lora_path.empty()) {
+        std::vector<si::LoraUse> loras;
+        loras.push_back({si::LoraFile::open(lora_path), scale});
+        if (!dit.set_loras(loras, err)) throw std::runtime_error(err);
+    }
+    const char* hw_env = std::getenv("QI_STEP_HW");
+    const char* text_env = std::getenv("QI_STEP_TEXT");
+    const int64_t hw = hw_env != nullptr ? std::strtoll(hw_env, nullptr, 10) : 8;
+    const int64_t n_text = text_env != nullptr ? std::strtoll(text_env, nullptr, 10) : 4;
+    std::vector<float> ctx((size_t) (n_text * dit.hidden()));
+    for (size_t i = 0; i < ctx.size(); ++i) ctx[i] = (float) ((int64_t) ((i * 37) % 101) - 50) / 50.0f;   // exact both sides
+    dit.set_context(ctx.data(), n_text);
+    const int64_t n = dit.channels() * hw * hw;
+    const auto noise = si::philox_randn(42, (uint64_t) n);
+    float *x = nullptr, *v = nullptr;
+    if (!gpu::alloc_device(&x, (size_t) n * 4) || !gpu::alloc_device(&v, (size_t) n * 4)) throw std::runtime_error("alloc");
+    gpu::copy(x, noise.data(), noise.size() * 4);
+    dit.forward(x, 500.0f, hw, hw, false, v);
+    if (!gpu::stream_sync(s)) throw std::runtime_error(gpu::last_error());
+    std::vector<float> got((size_t) n);
+    gpu::copy(got.data(), v, got.size() * 4);
+    // the prefix cache: a step after the first one reads the context's K and V from it (the adapters' included)
+    float* vp = nullptr;
+    if (!gpu::alloc_device(&vp, (size_t) n * 4)) throw std::runtime_error("alloc");
+    dit.forward(x, 500.0f, hw, hw, true, vp);
+    if (!gpu::stream_sync(s)) throw std::runtime_error(gpu::last_error());
+    std::vector<float> cached((size_t) n);
+    gpu::copy(cached.data(), vp, cached.size() * 4);
+    double dot = 0, na = 0, nb = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        dot += (double) got[(size_t) i] * cached[(size_t) i];
+        na += (double) got[(size_t) i] * got[(size_t) i];
+        nb += (double) cached[(size_t) i] * cached[(size_t) i];
+    }
+    std::printf("prefix cache vs the whole sequence: cos %.7f\n", dot / std::sqrt(na * nb));
+    gpu::free(vp);
+    std::ofstream fo(out_path, std::ios::binary);
+    if (!fo) throw std::runtime_error("cannot write " + out_path);
+    fo.write(reinterpret_cast<const char*>(got.data()), (std::streamsize) (got.size() * 4));
+    double norm = 0;
+    for (float g : got) norm += (double) g * g;
+    std::printf("velocity %lld values, norm %.6f, first %.6f %.6f %.6f\n", (long long) n, std::sqrt(norm), got[0],
+                got[1], got[2]);
+    std::printf("lora %.1f MiB on the GPU%s%s\n", (double) dit.lora_bytes() / 1048576.0,
+                dit.lora_key().empty() ? " (none)" : "", dit.lora_key().empty() ? "" : dit.lora_key().c_str());
+    std::printf("products: %s\n", strata::prefill::Gemm::i8_usable(s) ? "int8 (W8A8) where the weights allow it"
+                                                                     : "FP16/native (no int8 products)");
+    gpu::free(x);
+    gpu::free(v);
     return 0;
 }
 
@@ -148,7 +277,14 @@ int main(int argc, char** argv) {
         const std::string what = argc > 1 ? argv[1] : "";
         if (what == "list" && argc == 3) return list(argv[2]);
         if (what == "selftest" && argc == 2) return selftest();
-        std::fprintf(stderr, "usage: %s list LORA.safetensors|LORA.gguf | %s selftest\n", argv[0], argv[0]);
+        if (what == "map" && (argc == 3 || argc == 4 || argc == 5))
+            return map(argv[2], argc > 3 ? argv[3] : "", argc == 5 ? std::strtof(argv[4], nullptr) : 1.0f);
+        if (what == "step" && (argc == 4 || argc == 5 || argc == 6))
+            return step(argv[2], argv[3], argc > 4 ? argv[4] : "", argc == 6 ? std::strtof(argv[5], nullptr) : 1.0f);
+        std::fprintf(stderr,
+                     "usage: %s list LORA.safetensors|LORA.gguf | %s selftest | %s map DIT.gguf [LORA [scale]] | "
+                     "%s step DIT.gguf OUT.bin [LORA [scale]]\n",
+                     argv[0], argv[0], argv[0], argv[0]);
         return 2;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "strata-image-lora-probe: %s\n", e.what());

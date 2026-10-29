@@ -12,6 +12,7 @@
 // pinned RAM and copied in at each step (an edit with many or large reference images).
 #pragma once
 
+#include "strata/image/image_lora.hpp"
 #include "strata/image/pipeline.hpp"
 #include "strata/image/qi_stream.hpp"
 #include "strata/image/qi_kernels.hpp"
@@ -114,6 +115,26 @@ public:
     /// The rows the MLP takes at a time (0: all of them): its 2 x 12288-wide product is the largest activation.
     void set_mlp_rows(int64_t rows);
 
+    /// An adapter as a file names it: a weight of the DiT, and the rows of the weight a file's entry of that name
+    /// changes (a fused weight's halves by their own names: img_mlp.gate_layer is gate_up's rows [0, inter)).
+    struct LoraTarget {
+        std::string name;
+        int64_t row0 = 0, rows = 0, cols = 0;
+    };
+    /// The weights adapters may change: what a file's keys are matched against (the probe's map, the server's list).
+    std::vector<LoraTarget> lora_targets() const;
+
+    /// The adapters the next steps apply, each with its strength, bound to the weights' products: a key the DiT does
+    /// not take (or a shape that is not its weight's, or a form the engine does not apply) is false with err, and
+    /// nothing bound.  The context starts again (set_context before the next forward): the prefix's K and V were the
+    /// other adapters'.  The same set again (its files and strengths) changes nothing.
+    bool set_loras(const std::vector<LoraUse>& loras, std::string& err);
+    /// The set bound, as its files' paths and strengths (empty: none).
+    const std::string& lora_key() const { return lora_key_; }
+    /// The bound entries' A and B on the GPU.
+    uint64_t lora_bytes() const;
+    void drop_loras();
+
 private:
     struct W {
         int type = 0;
@@ -122,6 +143,7 @@ private:
         uint64_t row_bytes = 0;
         bool packed = false;    // Q8_0 rewritten for q8_mma_gemm (q8_mma_repack)
         bool w8 = false;        // rewritten as int8 rows and a scale a row (qi_rows_i8) for prefill::Gemm::i8
+        LoraLayer* lora = nullptr;   // the adapters' deltas for its products (null: none: the product is unchanged)
     };
     struct Block {
         W q, k, v, o, gu, down;   // d: the offset within the block's region (LayerStream)
@@ -149,6 +171,12 @@ private:
     void forward_pair(const float* x, float t, int64_t H, int64_t W, float* out, float* out2);
     void ensure(int64_t T, int64_t HW);
     void swap_context();   // the first context's state <-> other_'s
+    /// The weights adapters may take, from the blocks and the weights outside them (open).
+    void build_lora_targets();
+    /// The products' scratch: T rows of the largest bound rank, FP32 and FP16 (grown on use).
+    void lora_scratch(int64_t T);
+    /// The context's prefix let go: its text rows, and both contexts' K and V caches (an adapter change).
+    void drop_prefix();
 
     std::unique_ptr<GgufFile> g_;
     void* s_ = nullptr;
@@ -162,6 +190,21 @@ private:
     const float* tnorm_ = nullptr;
     std::vector<Block> blocks_;
     LayerStream blocks_stream_;
+    // the adapters: the weights a file's keys land on, the layers the weights hold, and the products' scratch
+    struct LoraSlot {
+        std::string name;
+        W* w = nullptr;
+        int64_t row0 = 0, rows = 0;
+    };
+    std::vector<LoraSlot> lora_slots_;
+    std::vector<std::unique_ptr<LoraLayer>> lora_layers_;
+    std::vector<std::shared_ptr<const LoraFile>> lora_files_;
+    std::string lora_key_;
+    int64_t lora_rank_ = 0;   // the largest rank bound
+    float* lora_f32_ = nullptr;
+    uint16_t* lora16_ = nullptr;
+    int64_t lora_tmp_t_ = 0;   // the scratch's rows
+    bool prefix_cache_ = false;   // the blocks' pk and pv hold the context's prefix (set_context; set_loras drops it)
     // activations, grown on demand
     int64_t cap_T_ = 0, mlp_cap_ = 0, mlp_rows_ = 0;
     int64_t dirty_T_ = 0;   // the most rows q16_, k16_ and v16_ were written to (the padding past a shorter T is zeroed)
