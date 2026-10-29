@@ -1111,7 +1111,7 @@ int on_rotational_disk(const std::string& path, std::string& dev) {
 // (wchan): 16 threads in blk_io_schedule is a disk that cannot keep up, not a deadlock in the engine
 void disk_wait_threads(std::FILE* f) {
     std::map<std::string, int> where;
-    int waiting = 0, threads = 0;
+    int waiting = 0, threads = 0, in_driver = 0;
     std::error_code ec;
     for (const auto& e : std::filesystem::directory_iterator("/proc/self/task", ec)) {
         ++threads;
@@ -1124,15 +1124,20 @@ void disk_wait_threads(std::FILE* f) {
         std::ifstream w(e.path() / "wchan");
         std::string wc;
         std::getline(w, wc);
+        // #44: a GPU driver's call (xe_vm_bind_ioctl) waits in state D too, and is not the drive
+        if (wc.rfind("xe_", 0) == 0 || wc.rfind("drm_", 0) == 0 || wc.rfind("i915_", 0) == 0 || wc.rfind("amdgpu_", 0) == 0)
+            ++in_driver;
         ++where[wc.empty() || wc == "0" ? "?" : wc];
     }
     if (threads == 0) return;
     std::string list;
     for (const auto& [name, n] : where) list += (list.empty() ? " (" : ", ") + name + " x" + std::to_string(n);
     if (!list.empty()) list += ")";
-    std::fprintf(f, "  threads waiting on the disk (state D): %d of %d%s%s\n", waiting, threads, list.c_str(),
-                 waiting > 0 ? " - the engine is waiting for the drive: a rotational or failing disk with --ple-io "
-                               "direct (#605: --ple-io ram), or a drive too slow for the reads asked of it" : "");
+    std::fprintf(f, "  threads in uninterruptible sleep (state D): %d of %d%s%s%s\n", waiting, threads, list.c_str(),
+                 waiting > in_driver ? " - the engine is waiting for the drive: a rotational or failing disk with "
+                                       "--ple-io direct (#605: --ple-io ram), or a drive too slow for the reads asked of "
+                                       "it" : "",
+                 in_driver > 0 ? " - in the GPU driver: the driver itself is slow or stuck (dmesg says more)" : "");
 }
 #endif
 
@@ -8943,6 +8948,8 @@ int main(int argc, char** argv) {
             const int limit = ws ? (int) std::strtol(ws, nullptr, 10) : 60;   // one step (a prompt layer, a verify window) takes seconds
             // #1407: while the OS is still reading the file tier (major faults / bytes read advance), a silent step is
             // slow, not stuck; it gets up to STRATA_WATCHDOG_IO_S (default 10 x the limit) of such time. 0 = no allowance.
+            // #44: so does a step whose layers still finish (a verify window's CPU experts at 18 s a layer on a host
+            // that pages), within the same allowance.
             const char* wio = std::getenv("STRATA_WATCHDOG_IO_S");
             const int io_limit = wio ? (int) std::strtol(wio, nullptr, 10) : limit * 10;
             if (limit > 0)
@@ -8955,12 +8962,19 @@ int main(int argc, char** argv) {
                     auto io_since = since;
                     uint64_t io_last = file_tier_activity();
                     auto io_active_at = since;   // the last second the file tier was busy
-                    bool io_noted = false;
+                    uint64_t ticks_seen = ticks_at;
+                    auto tick_at = since;        // the last second a layer finished
+                    bool io_noted = false, tick_noted = false;
                     for (;;) {
                         std::this_thread::sleep_for(std::chrono::seconds(1));
                         const auto now = std::chrono::steady_clock::now();
                         const uint64_t b = p.beats.load();
-                        if (!p.busy.load() || b != last) { last = b; ticks_at = p.ticks.load(); since = now; io_since = now; io_active_at = now; io_noted = false; io_last = file_tier_activity(); continue; }
+                        if (!p.busy.load() || b != last) {
+                            last = b; ticks_at = ticks_seen = p.ticks.load(); since = io_since = io_active_at = tick_at = now;
+                            io_noted = tick_noted = false; io_last = file_tier_activity();
+                            continue;
+                        }
+                        if (const uint64_t tk = p.ticks.load(); tk != ticks_seen) { ticks_seen = tk; tick_at = now; }
                         {   // sampled every second, also during the first `limit` seconds, so a busy file tier is seen
                             const uint64_t a = file_tier_activity();
                             if (a >= io_last + 16) io_active_at = now;   // 16 = faults + MiB read in a second: busy
@@ -8974,17 +8988,35 @@ int main(int argc, char** argv) {
                                 if (!io_noted) {
                                     io_noted = true;
                                     std::fprintf(stderr, "strata serve: no step finished for %d s, but the file tier is still being read "
-                                                         "(slow storage or low RAM): waiting up to %d s in all (STRATA_WATCHDOG_IO_S) (#1407)\n",
+                                                         "(slow storage or low RAM): waiting while it is, up to %d s in all (STRATA_WATCHDOG_IO_S) (#1407)\n",
                                                  limit, io_limit);
+                                }
+                                continue;
+                            }
+                            // #44: a layer finished within the limit: slow, not stuck
+                            if (now - tick_at < std::chrono::seconds(limit)) {
+                                if (!tick_noted) {
+                                    tick_noted = true;
+                                    std::fprintf(stderr, "strata serve: no step finished for %d s, but its layers still "
+                                                         "do (a slow host): waiting while they do, up to %d s in all "
+                                                         "(STRATA_WATCHDOG_IO_S)\n", limit, io_limit);
                                 }
                                 continue;
                             }
                         }
                         // a blocking step's explicit allowance (session files): still within it, not yet stuck
                         if (strata::core::progress_now_ms() < p.allow_until_ms.load()) continue;
-                        std::fprintf(stderr, "strata serve: no progress for %d s during a request (%s) - stopping "
+                        const auto secs = [&](auto t) { return (long long) std::chrono::duration_cast<std::chrono::seconds>(now - t).count(); };
+                        // #44: how long it was, and why the allowance ended where there was one
+                        std::string why;
+                        if (io_limit > limit)
+                            why = now - io_since >= std::chrono::seconds(io_limit)
+                                      ? "; the allowance of " + std::to_string(io_limit) + " s (STRATA_WATCHDOG_IO_S) is used up"
+                                      : "; no file-tier read for " + std::to_string(secs(io_active_at)) + " s and no layer "
+                                        "finished for " + std::to_string(secs(tick_at)) + " s";
+                        std::fprintf(stderr, "strata serve: no progress for %lld s during a request (%s)%s - stopping "
                                              "the engine so the server starts it again (issue #29)\n",
-                                     limit, stage_text().c_str());
+                                     secs(since), stage_text().c_str(), why.c_str());
                         stall_report(stderr, p.ticks.load() - ticks_at);
                         std::fflush(stderr);
                         std::abort();
