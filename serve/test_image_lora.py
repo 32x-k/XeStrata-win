@@ -185,6 +185,38 @@ class Listing(Tree):
         self.assertIn("DoRA", f.skipped["columns"])
         self.assertEqual(loras.field([{"name": "dora", "scale": 0.7}], f)[0]["scale"], 0.7)
 
+    def test_a_loha_is_listed_with_its_factors_rank(self):
+        b = "transformer.transformer_blocks.0."
+        safetensors(self.d / "loha.safetensors", {
+            # attn.to_q: the plain form, the file's alpha's divisor w1_b's rows
+            b + "attn.to_q.hada_w1_a.weight": (256, 8), b + "attn.to_q.hada_w1_b.weight": (8, 256),
+            b + "attn.to_q.hada_w2_a.weight": (256, 4), b + "attn.to_q.hada_w2_b.weight": (4, 256),
+            b + "attn.to_q.alpha": (1,),
+            # img_mlp.out: both sides under linear Tucker cores, their factors written the core's way (a core of one
+            # dimension, w_a [1][out], is a rank of 1; both cores come together, as ComfyUI reads them)
+            b + "img_mlp.out.hada_w1_a.weight": (1, 256), b + "img_mlp.out.hada_w1_b.weight": (8, 512),
+            b + "img_mlp.out.hada_t1": (1, 8, 1, 1),
+            b + "img_mlp.out.hada_w2_a.weight": (5, 256), b + "img_mlp.out.hada_w2_b.weight": (4, 512),
+            b + "img_mlp.out.hada_t2": (5, 4, 1, 1),
+        })
+        safetensors(self.d / "sides.safetensors", {   # the two sides' products are not one weight's shape
+            b + "attn.to_q.hada_w1_a.weight": (256, 8), b + "attn.to_q.hada_w1_b.weight": (8, 256),
+            b + "attn.to_q.hada_w2_a.weight": (256, 4), b + "attn.to_q.hada_w2_b.weight": (4, 128)})
+        safetensors(self.d / "kernel.safetensors", {   # a convolution's core
+            b + "attn.to_q.hada_w1_a.weight": (256, 8), b + "attn.to_q.hada_w1_b.weight": (8, 256),
+            b + "attn.to_q.hada_t1": (3, 8, 3, 3),
+            b + "attn.to_q.hada_t2": (3, 8, 1, 1),
+            b + "attn.to_q.hada_w2_a.weight": (256, 4), b + "attn.to_q.hada_w2_b.weight": (4, 256)})
+        f = self.folder()
+        entries = f.listing()
+        self.assertEqual([e["name"] for e in entries], ["loha"], f.skipped)
+        e = entries[0]
+        self.assertEqual(e["rank"], 8, "the file's alpha is divided by w1_b's rows")
+        self.assertEqual(e["targets"], ["attn.to_q", "img_mlp.out"])
+        self.assertIn("products are 256 x 256 and 256 x 128", f.skipped["sides"])
+        self.assertIn("convolution's kernel", f.skipped["kernel"])
+        self.assertEqual(loras.field([{"name": "loha", "scale": 0.7}], f)[0]["scale"], 0.7)
+
     def test_a_whole_delta_is_listed_and_a_bias_diff_is_not(self):
         b = "transformer.transformer_blocks.0."
         safetensors(self.d / "diff.safetensors", {

@@ -9,6 +9,11 @@
 // whose names they are: `transformer.` for diffusers' saves, `diffusion_model.` and `model.diffusion_model.` for
 // ComfyUI's and a GGUF's.  What is left is the DiT's own name, which the DiT's target table matches.
 //
+// A LoHa (LyCORIS) writes one weight's delta as the element-wise product of two low-rank products,
+// (hada_w1_a . hada_w1_b) * (hada_w2_a . hada_w2_b), each side's under a Tucker core (hada_t1, hada_t2) where the
+// file has one (comfy/weight_adapter/loha.py).  The product is the weight's size, so it is made when the entry is bound
+// (LoraDeviceEntry::upload) rather than kept: the entry holds the four factors and the shapes that make it.
+//
 // A LoKr (LyCORIS) writes one weight's two matrices whole (`x.lokr_w1`, `x.lokr_w2`) or as two factors each
 // (`x.lokr_w1_a` [rows][rank] and `x.lokr_w1_b` [rank][cols]), w2's under a Tucker core (`x.lokr_t2`); the delta is
 // their Kronecker product, and the file's alpha is divided by the factorization's rank (comfy/weight_adapter/lokr.py).
@@ -35,6 +40,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <thread>
 #include <fstream>
 #include <stdexcept>
 
@@ -240,10 +246,33 @@ bool json_true(const std::string& s, const std::string& key) {
     return s.compare(i, 4, "true") == 0;
 }
 
-// A row-major matrix product in FP32: out [m][n] = a [m][k] . b [k][n], as a LoKr's factors make its matrices.
+/// The host's threads for one deltas' making: as many as the machine has, up to 16 (the image engine's other host rows
+/// work, dit_rows.hpp's quantization, takes the same).
+int host_threads() { return (int) std::max(1u, std::min(16u, std::thread::hardware_concurrency())); }
+
+/// The rows [from, m) step `step` on one thread: a LoHa's delta is made of the model's whole weights when a set is bound,
+/// so its products and its element-wise product take the host's threads.
+template <class Row>
+void for_rows(int64_t m, const Row& row) {
+    const int nt = (int) std::min<int64_t>(host_threads(), std::max<int64_t>(m, 1));
+    if (nt <= 1 || m < 64) {   // a small matrix: the threads' start costs more than the rows
+        for (int64_t i = 0; i < m; ++i) row(i);
+        return;
+    }
+    std::vector<std::thread> th;
+    th.reserve((size_t) nt);
+    for (int t = 0; t < nt; ++t)
+        th.emplace_back([&row, m, t, nt] {
+            for (int64_t i = t; i < m; i += nt) row(i);
+        });
+    for (std::thread& x : th) x.join();
+}
+
+// A row-major matrix product in FP32: out [m][n] = a [m][k] . b [k][n], as a LoKr's factors make its matrices (and a
+// LoHa's, made when its entry is bound).
 std::vector<float> mat_mul(const float* a, int64_t m, int64_t k, const float* b, int64_t n) {
     std::vector<float> out((size_t) (m * n), 0.0f);
-    for (int64_t i = 0; i < m; ++i) {
+    for_rows(m, [&](int64_t i) {
         float* o = out.data() + i * n;
         for (int64_t t = 0; t < k; ++t) {
             const float v = a[i * k + t];
@@ -251,7 +280,7 @@ std::vector<float> mat_mul(const float* a, int64_t m, int64_t k, const float* b,
             const float* br = b + t * n;
             for (int64_t j = 0; j < n; ++j) o[j] += v * br[j];
         }
-    }
+    });
     return out;
 }
 
@@ -392,6 +421,192 @@ void make_lokr(LoraEntry& e, Group& g, const std::string& path) {
     e.extra["lokr_w2"] = std::move(w2.v);
 }
 
+// One side of a LoHa's weight: m [out][in] = w_a [out][rank] . w_b [rank][in], or, under a Tucker core, m = w_a^T . T .
+// w_b with T the core's kernel ([i][j][1][1]: a linear product has no other).  `sa`, `sb` and `st` (empty: no core)
+// are the tensors' shapes; out and in are m's, t_rows the core's first dimension (the rows of T . w_b, which index
+// w_a's rows).  False with `why` where they make no such product.
+bool hada_side_shape(const std::vector<int64_t>& sa, const std::vector<int64_t>& sb, const std::vector<int64_t>& st,
+                     int64_t& out, int64_t& in, int64_t& t_rows, const std::string& what, std::string& why) {
+    if (sa.size() != 2 || sb.size() != 2) {
+        why = what + ": its factors must be matrices";
+        return false;
+    }
+    t_rows = 0;
+    if (st.empty()) {
+        if (sa[1] != sb[0]) {
+            why = what + ": " + std::to_string(sb[0]) + " x " + std::to_string(sb[1]) +
+                  " is not the rank the other factor has (" + std::to_string(sa[1]) + ")";
+            return false;
+        }
+        out = sa[0];
+        in = sb[1];
+        return true;
+    }
+    if (!(st.size() == 2 || (st.size() == 4 && st[2] == 1 && st[3] == 1))) {
+        why = what + ": a Tucker core with a convolution's kernel dimensions: the image engine's products are linear";
+        return false;
+    }
+    if (st[0] != sa[0] || st[1] != sb[0]) {
+        why = what + ": the Tucker core is " + std::to_string(st[0]) + " x " + std::to_string(st[1]) +
+              "; its first factor's rows " + std::to_string(sa[0]) + ", its second's " + std::to_string(sb[0]);
+        return false;
+    }
+    out = sa[1];
+    in = sb[1];
+    t_rows = st[0];
+    return true;
+}
+
+// A LoHa's four tensors -> its entry: the two sides' products must be one shape, the rank is ComfyUI's (w1's factors'
+// rows, the alpha's divisor).  The factors themselves go into `extra` and `shapes` with the file's other tensors (below),
+// for the delta made when the entry is bound.
+void make_loha(LoraEntry& e, Group& g, const std::string& path) {
+    const auto get = [&g](const char* r) -> const RawTensor* {
+        auto it = g.by_role.find(r);
+        return it == g.by_role.end() ? nullptr : &it->second;
+    };
+    const RawTensor* a1 = get("hada_w1_a");
+    const RawTensor* b1 = get("hada_w1_b");
+    const RawTensor* a2 = get("hada_w2_a");
+    const RawTensor* b2 = get("hada_w2_b");
+    if (a1 == nullptr || b1 == nullptr || a2 == nullptr || b2 == nullptr)
+        throw std::runtime_error(path_key_what(path, e.key,
+                                               "a LoHa weight needs hada_w1_a, hada_w1_b, hada_w2_a and hada_w2_b"));
+    const RawTensor* t1 = get("hada_t1");
+    const RawTensor* t2 = get("hada_t2");
+    if ((t1 == nullptr) != (t2 == nullptr))
+        throw std::runtime_error(path_key_what(path, e.key,
+                                               "a LoHa with one Tucker core (hada_t1/hada_t2): both or neither"));
+    int64_t r1 = 0, c1 = 0, r2 = 0, c2 = 0, t_rows = 0;
+    std::string why;
+    if (!hada_side_shape(a1->shape, b1->shape, t1 == nullptr ? std::vector<int64_t>() : t1->shape, r1, c1, t_rows,
+                         "hada_w1_a/hada_w1_b", why))
+        throw std::runtime_error(path_key_what(path, e.key, why));
+    if (!hada_side_shape(a2->shape, b2->shape, t2 == nullptr ? std::vector<int64_t>() : t2->shape, r2, c2, t_rows,
+                         "hada_w2_a/hada_w2_b", why))
+        throw std::runtime_error(path_key_what(path, e.key, why));
+    if (r1 != r2 || c1 != c2)
+        throw std::runtime_error(path_key_what(path, e.key,
+                                               "its two sides' products are " + std::to_string(r1) + " x " +
+                                                   std::to_string(c1) + " and " + std::to_string(r2) + " x " +
+                                                   std::to_string(c2) + ": not the weight's one shape"));
+    e.rows = r1;
+    e.cols = c1;
+    e.rank = b1->shape[0];   // ComfyUI's dim: w1_b's rows, which the file's alpha is divided by
+}
+
+// A LoHa entry's delta [rows][cols] in FP16: (w1a . w1b) * (w2a . w2b), each side's product made on its own (under its
+// Tucker core where the file has one), the weight's delta their element-wise product.  A tile of rows at a time, on the
+// host's threads: the delta is the weight's size and is made whenever a set is bound, so its temporaries stay a tile's
+// (the products' factors are the file's own, a few MiB).  FP32 while it is made.  False with err where the entry's
+// tensors do not make it (the shapes were checked when the file was read).
+bool loha_delta(const LoraEntry& e, std::vector<uint16_t>& out, std::string& err) {
+    const auto values = [&e](const char* r) -> const std::vector<float>* {
+        auto it = e.extra.find(r);
+        return it == e.extra.end() ? nullptr : &it->second;
+    };
+    const auto shape_of = [&e](const char* r) -> std::vector<int64_t> {
+        auto it = e.shapes.find(r);
+        return it == e.shapes.end() ? std::vector<int64_t>() : it->second;
+    };
+    // One side, as a tile of rows reads it: m[p][j] = sum_t a[t * a_t + p * a_p] * pre[t][j], `steps` t's.  A side
+    // without a core: a is w_a [rows][rank] and pre w_b [rank][cols]; under one, a is w_a [i][rows] and pre T . w_b.
+    struct Side {
+        const float* a = nullptr;
+        const float* pre = nullptr;
+        int64_t rows = 0, cols = 0, steps = 0, a_t = 0, a_p = 0;
+        std::vector<float> core;   // T . w_b [steps][cols], under a core
+    };
+    const auto side_of = [&](const char* a_role, const char* b_role, const char* t_role, Side& s) -> bool {
+        const std::vector<float>* a = values(a_role);
+        const std::vector<float>* b = values(b_role);
+        if (a == nullptr || b == nullptr) {
+            err = std::string("its ") + a_role + "/" + b_role + " are not on the host";
+            return false;
+        }
+        const std::vector<int64_t> sa = shape_of(a_role), sb = shape_of(b_role), st = shape_of(t_role);
+        int64_t rows = 0, cols = 0, t_rows = 0;
+        std::string why;
+        if (!hada_side_shape(sa, sb, st, rows, cols, t_rows, std::string(a_role) + "/" + b_role, why)) {
+            err = why;
+            return false;
+        }
+        if ((int64_t) a->size() != sa[0] * sa[1] || (int64_t) b->size() != sb[0] * sb[1]) {
+            err = std::string("its ") + a_role + "/" + b_role + " do not hold what their shapes say";
+            return false;
+        }
+        s.a = a->data();
+        s.rows = rows;
+        s.cols = cols;
+        if (t_rows == 0) {
+            s.pre = b->data();
+            s.steps = sb[0];
+            s.a_t = 1;
+            s.a_p = sb[0];   // w_a [rows][rank]
+            return true;
+        }
+        const std::vector<float>* t = values(t_role);
+        if (t == nullptr) {
+            err = std::string("its ") + t_role + " is not on the host";
+            return false;
+        }
+        s.steps = t_rows;
+        s.a_t = rows;
+        s.a_p = 1;   // w_a [core][rows]
+        s.core = mat_mul(t->data(), st[0], st[1], b->data(), sb[1]);   // T . w_b, [core][cols]
+        s.pre = s.core.data();
+        return true;
+    };
+    Side s1, s2;
+    if (!side_of("hada_w1_a", "hada_w1_b", "hada_t1", s1)) return false;
+    if (!side_of("hada_w2_a", "hada_w2_b", "hada_t2", s2)) return false;
+    if (s1.rows != s2.rows || s1.cols != s2.cols || s1.rows != e.rows || s1.cols != e.cols) {
+        err = "its two sides' products are not one weight's shape";
+        return false;
+    }
+    const int64_t cols = e.cols;
+    out.assign((size_t) (e.rows * cols), 0);
+    const auto fill = [cols](const Side& s, int64_t r0, int64_t n, float* m) {
+        for (int64_t p = 0; p < n; ++p) {
+            float* o = m + p * cols;
+            for (int64_t t = 0; t < s.steps; ++t) {
+                const float v = s.a[t * s.a_t + (r0 + p) * s.a_p];
+                if (v == 0.0f) continue;
+                const float* r = s.pre + t * cols;
+                for (int64_t j = 0; j < cols; ++j) o[j] += v * r[j];
+            }
+        }
+    };
+    const int64_t tile = 64;   // rows a thread makes at a time: a tile's two products stay in the cache
+    const int64_t tiles = (e.rows + tile - 1) / tile;
+    const auto work = [&](int64_t from, int64_t step) {
+        std::vector<float> m1((size_t) (tile * cols)), m2((size_t) (tile * cols));
+        for (int64_t ti = from; ti < tiles; ti += step) {
+            const int64_t r0 = ti * tile, n = std::min(e.rows - r0, tile);
+            std::fill(m1.begin(), m1.end(), 0.0f);
+            std::fill(m2.begin(), m2.end(), 0.0f);
+            fill(s1, r0, n, m1.data());
+            fill(s2, r0, n, m2.data());
+            for (int64_t p = 0; p < n; ++p) {
+                uint16_t* o = out.data() + (size_t) ((r0 + p) * cols);
+                const float* x1 = m1.data() + p * cols;
+                const float* x2 = m2.data() + p * cols;
+                for (int64_t j = 0; j < cols; ++j) o[j] = strata::kernels::f16_from_f32(x1[j] * x2[j]);
+            }
+        }
+    };
+    const int nt = (int) std::min<int64_t>(host_threads(), std::max<int64_t>(tiles, 1));
+    if (nt <= 1) {
+        work(0, 1);
+        return true;
+    }
+    std::vector<std::thread> th;
+    th.reserve((size_t) nt);
+    for (int t = 0; t < nt; ++t) th.emplace_back(work, t, nt);
+    for (std::thread& x : th) x.join();
+    return true;
+}
+
 // One weight's role tensors -> its entry.
 LoraEntry make_entry(Group& g, const std::string& path) {
     LoraEntry e;
@@ -403,6 +618,9 @@ LoraEntry make_entry(Group& g, const std::string& path) {
     };
     if (e.kind == LoraKind::lokr) {
         make_lokr(e, g, path);
+    }
+    if (e.kind == LoraKind::loha) {
+        make_loha(e, g, path);
     }
     if (e.kind == LoraKind::lora) {
         RawTensor* a = role("lora_A");
@@ -663,30 +881,40 @@ bool LoraDeviceEntry::upload(const LoraEntry& e, void* stream, std::string& err,
               ": a bias diff (diff_b/b_norm): the engine applies a weight's delta, not a bias's yet";
         return false;
     }
-    if (e.kind == LoraKind::diff) {
+    if (e.kind == LoraKind::diff || e.kind == LoraKind::loha) {
         if (row_coef != nullptr) {
-            err = "the image engine: " + e.key + ": a DoRA (dora_scale) on a whole delta (diff/set_weight)";
+            err = "the image engine: " + e.key + ": a DoRA (dora_scale) on a " + lora_kind_name(e.kind) +
+                  " adapter: the engine's DoRA is the plain form's (its rows are the weight's)";
             return false;
         }
-        if (e.rows <= 0 || e.cols <= 0 || (int64_t) e.delta.size() != e.rows * e.cols) {
+        std::vector<uint16_t> made;   // a LoHa's delta, made here: the file holds its four factors
+        const std::vector<uint16_t>* delta = &e.delta;
+        if (e.kind == LoraKind::loha) {
+            if (!loha_delta(e, made, err)) {
+                err = "the image engine: " + e.key + ": " + err;
+                return false;
+            }
+            delta = &made;
+        }
+        if (e.rows <= 0 || e.cols <= 0 || (int64_t) delta->size() != e.rows * e.cols) {
             err = "the image engine: " + e.key + ": the whole delta's tensors do not match its shape";
             return false;
         }
-        rank_ = 0;
+        rank_ = e.kind == LoraKind::loha ? e.rank : 0;
         cols_ = e.cols;
         rows_ = e.rows;
-        if (!strata::gpu::alloc_device(&diff_, e.delta.size() * 2)) {
+        if (!strata::gpu::alloc_device(&diff_, delta->size() * 2)) {
             err = "the image engine: the adapter " + e.key + " on the GPU: " + strata::gpu::last_error();
             release();
             return false;
         }
-        strata::gpu::copy_async(diff_, e.delta.data(), e.delta.size() * 2, stream);
+        strata::gpu::copy_async(diff_, delta->data(), delta->size() * 2, stream);
         if (!strata::gpu::stream_sync(stream)) {
             err = "the image engine: the adapter " + e.key + " to the GPU: " + strata::gpu::last_error();
             release();
             return false;
         }
-        bytes_ = (uint64_t) e.delta.size() * 2;
+        bytes_ = (uint64_t) delta->size() * 2;
         return true;
     }
     if (e.kind == LoraKind::lokr) {
@@ -776,7 +1004,7 @@ void LoraDeviceEntry::add(const uint16_t* x16, int64_t T, float* y, int64_t ldy,
         add_lokr(x16, T, y, ldy, src_row, row0, n, scale, row_scale, gemm, tmp_f32, stream);
         return;
     }
-    if (kind_ == LoraKind::diff) {
+    if (kind_ == LoraKind::diff || kind_ == LoraKind::loha) {
         add_diff(x16, T, y, ldy, src_row, row0, n, scale, row_scale, gemm, tmp16, stream);
         return;
     }
@@ -880,7 +1108,8 @@ void LoraLayer::add(const uint16_t* x16, int64_t T, float* y, int64_t ldy, int64
 
 int64_t lora_scratch_cols(const LoraEntry& e) {
     if (e.kind == LoraKind::lokr) return e.lokr.empty() ? 0 : e.lokr.in_m * e.lokr.out_k;
-    if (e.kind == LoraKind::diff) return e.cols;   // a scaled input's rows: the weight's columns
+    if (e.kind == LoraKind::diff || e.kind == LoraKind::loha) return e.cols;   // a scaled input's rows: the weight's
+                                                                              // columns
     return e.rank;
 }
 
@@ -894,8 +1123,8 @@ uint64_t lora_gpu_bytes(const std::vector<LoraUse>& loras, int64_t T) {
                 bytes += 2 * (uint64_t) e.rank * (uint64_t) (e.rows + e.cols);   // A and B, FP16
             else if (e.kind == LoraKind::lokr && !e.lokr.empty())
                 bytes += 2 * (uint64_t) (e.lokr.out_l * e.lokr.in_m + e.lokr.out_k * e.lokr.in_n);   // w1 and w2
-            else if (e.kind == LoraKind::diff && e.rows > 0 && e.cols > 0)
-                bytes += 2 * (uint64_t) e.rows * (uint64_t) e.cols;   // the whole delta
+            else if ((e.kind == LoraKind::diff || e.kind == LoraKind::loha) && e.rows > 0 && e.cols > 0)
+                bytes += 2 * (uint64_t) e.rows * (uint64_t) e.cols;   // the whole delta (a LoHa's, made at the bind)
             else
                 continue;
             if (!e.dora.empty()) bytes += (uint64_t) e.rows * 4;   // the base product's rows' factors

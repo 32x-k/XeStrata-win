@@ -22,7 +22,9 @@
 // the GPU as FP16, a product of its own).  ComfyUI patches a diff as W += strength * diff; a set_weight replaces the
 // weight whatever the strength (comfy/lora.py's "set"), and the engine interpolates instead - W' = W + s (S - W), the
 // base product's rows scaled by 1 - s (the same base factors a DoRA's are) and the delta's by s - so the strength 1
-// is ComfyUI's replacement and 0 leaves the weight as it was.
+// is ComfyUI's replacement and 0 leaves the weight as it was.  A LoHa's is the same kind of delta, made from its four
+// factors when it is bound ((w1a . w1b) * (w2a . w2b), comfy/weight_adapter/loha.py) rather than kept: the weight's
+// size is not held on the host a second time, the file's tensors are a few MiB.
 #pragma once
 
 #include <cstdint>
@@ -80,7 +82,9 @@ struct LoraEntry {
     float scale() const { return alpha_set && rank > 0 ? alpha / static_cast<float>(rank) : 1.0f; }
     std::vector<uint16_t> a, b;       // lora: a [rank][cols], b [rows][rank], row-major
     std::vector<uint16_t> delta;      // diff: the weight's own delta [rows][cols], row-major, FP16 (a set_weight's:
-                                      // the weight it sets, what the strength interpolates towards)
+                                      // the weight it sets, what the strength interpolates towards); a LoHa's is
+                                      // made from the factors in `extra` when it is bound (its delta is the weight's
+                                      // size and is not kept on the host)
     bool replaces = false;            // the delta is a set_weight's (the weight it sets), not a value added to it
     std::vector<float> dora;          // dora_scale (DoRA): over the rows, else over the columns
     bool dora_over_rows = true;
@@ -121,9 +125,9 @@ struct LoraUse {
 uint64_t lora_gpu_bytes(const std::vector<LoraUse>& loras, int64_t T);
 
 /// The values an entry's delta holds for each row of the product's scratch (FP32): a plain LoRA's rank, LoKr's
-/// in_m * out_k (its product's intermediate [T][in_m][out_k]), a whole delta's cols where the input's rows must be
-/// scaled before its product (a W8A8 product's row scale, or a strength other than 1).  A DiT sizes its deltas'
-/// scratch by the largest.
+/// in_m * out_k (its product's intermediate [T][in_m][out_k]), a whole delta's (or a LoHa's) cols where the input's
+/// rows must be scaled before its product (a W8A8 product's row scale, or a strength other than 1).  A DiT sizes its
+/// deltas' scratch by the largest.
 int64_t lora_scratch_cols(const LoraEntry& e);
 
 /// One entry's tensors on the GPU (FP16: a plain LoRA's A and B, a LoKr's w1 and w2), and the entry's delta applied
@@ -150,10 +154,9 @@ public:
 
     /// y[t][row0 + c] (row stride ldy) += scale * (x16[t] A^T) B^T, t < T, for the entry's rows
     /// [src_row, src_row + n) into the weight's rows [row0, row0 + n) (a fused weight's half, or the whole).  An
-    /// LoKr's rows are its Kronecker product's; the delta is the same product's, its own way.  A whole delta's is
-    /// scale * (x16[t] Delta^T) over the entry's rows, the input scaled into `tmp16` (T * cols values) where the
-    /// scale * (x16[t] Delta^T) over the entry's rows, the input scaled into `tmp16` (T * cols values) where the
-    /// strength is not 1 or a row scale is passed.  A W8A8 product's output is its weights' and activations'
+    /// LoKr's rows are its Kronecker product's; the delta is the same product's, its own way.  A whole delta's (and a
+    /// LoHa's, its factors' product made when it was uploaded) is scale * (x16[t] Delta^T) over the entry's rows, the
+    /// input scaled into `tmp16` (T * cols values) where the strength is not 1 or a row scale is passed.  A W8A8 product's output is its weights' and activations'
     /// scales applied (no row scale of the input): `row_scale` (null: none) is the input rows' scale, which the base
     /// product's sum does not carry and this delta must.  `tmp_f32` and `tmp16` hold T * lora_scratch_cols(e) values
     /// each (grown by the caller).

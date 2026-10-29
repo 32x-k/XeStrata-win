@@ -8,10 +8,10 @@ and shape and the file's string metadata.  A key is brought to the DiT's name th
 the file's prefix off, ".weight" off, the role's suffix off), and a file is this model's when every weight it changes
 is one the DiT's products take (TARGETS: the names of qi_dit.cpp's, moss_dit.cpp's and mf_dit.cpp's
 build_lora_targets, written here a second time; the record's check sets them against the probe's `map` on the models,
-name for name), in a form the engine applies today: a plain LoRA or LoKr (a DoRA: a plain LoRA with a dora_scale over
-the weight's rows, ComfyUI's weight_decompose), not a LoHa, GLoRA, OFT or a whole weight's difference, and no text
-encoder's weight.  The engine refuses those when it binds a set (QiDit::set_loras, MossDit::set_loras,
-MfDit::set_loras), so no image is made with part of a file.
+name for name), in a form the engine applies today: a plain LoRA, LoKr or LoHa (a DoRA: a plain LoRA with a
+dora_scale over the weight's rows, ComfyUI's weight_decompose), or a whole weight's difference (diff, set_weight,
+w_norm), and no GLoRA, OFT or text encoder's weight.  The engine refuses those when it binds a set (QiDit::set_loras,
+MossDit::set_loras, MfDit::set_loras), so no image is made with part of a file.
 
 A listing entry - ImageGen.defaults' "loras" (the engine's capabilities: /health's image_defaults and image_models,
 /v1/models' image model):
@@ -189,6 +189,39 @@ def _lokr_rank(roles: dict[str, tuple[int, ...]]) -> tuple[int, str]:
             return 0, f"{fb} is {b[0]} x {b[1]}, not the rank its {fa} has ({a[1]})"
         rank = b[0]
     return rank, ""
+
+
+def _loha_rank(roles: dict[str, tuple[int, ...]]) -> tuple[int, str]:
+    """A LoHa weight's tensors -> (the rank ComfyUI divides the file's alpha by, "") or (0, why they make no delta):
+    two low-rank products, (hada_w1_a . hada_w1_b) * (hada_w2_a . hada_w2_b), each side's under a Tucker core
+    (hada_t1/hada_t2; a linear product's, a kernel of 1 x 1), which writes the side's factors the core's way (w_a
+    [core][out], w_b [rank][in]).  The rank is w1_b's rows, as ComfyUI takes it; the engine makes the delta when it
+    binds the entry (src/image/image_lora.cpp's make_loha and loha_delta)."""
+    if ("hada_t1" in roles) != ("hada_t2" in roles):
+        return 0, "a LoHa with one Tucker core (hada_t1/hada_t2): both or neither"
+    sides = []
+    for name in ("w1", "w2"):
+        fa, fb, tc = f"hada_{name}_a", f"hada_{name}_b", f"hada_t{name[-1]}"
+        if fa not in roles or fb not in roles:
+            return 0, f"a LoHa weight needs {fa} and {fb}"
+        a, b = roles[fa], roles[fb]
+        if len(a) != 2 or len(b) != 2:
+            return 0, f"{fa} and {fb} must be matrices"
+        if tc in roles:
+            t = roles[tc]
+            if not (len(t) == 2 or (len(t) == 4 and t[2] == 1 and t[3] == 1)):
+                return 0, f"a {tc} with a convolution's kernel dimensions"
+            if t[0] != a[0] or t[1] != b[0]:
+                return 0, f"{tc} is {t[0]} x {t[1]}; {fa}'s rows {a[0]}, {fb}'s {b[0]}"
+            sides.append((a[1], b[1]))
+        else:
+            if a[1] != b[0]:
+                return 0, f"{fb} is {b[0]} x {b[1]}, not the rank its {fa} has ({a[1]})"
+            sides.append((a[0], b[1]))
+    if sides[0] != sides[1]:
+        return 0, (f"its two sides' products are {sides[0][0]} x {sides[0][1]} and {sides[1][0]} x {sides[1][1]}: "
+                   f"not the weight's one shape")
+    return roles["hada_w1_b"][0], ""
 
 
 def is_text_encoder(key: str) -> bool:
@@ -412,7 +445,7 @@ class Folder:
                 # a bias's delta: the engine binds a weight's delta and adds a bias nowhere: refused, with the key
                 return f"{key}: a bias diff (diff_b/b_norm), which the image engine does not apply yet"
             form = form_of(roles)
-            if form not in ("lora", "lokr", "diff"):
+            if form not in ("lora", "lokr", "loha", "diff"):
                 return f"{key}: a {form or 'non-LoRA'} adapter, which the image engine applies not yet"
             if "dora_scale" in roles and form != "lora":
                 return f"{key}: a DoRA (dora_scale) on a {form} adapter, which the image engine applies not yet"
@@ -430,6 +463,13 @@ class Folder:
                 continue
             if form == "lokr":
                 r, why = _lokr_rank(roles)
+                if why:
+                    return f"{key}: {why}"
+                rank = max(rank, r)
+                targets.add(kind_of(key))
+                continue
+            if form == "loha":
+                r, why = _loha_rank(roles)
                 if why:
                     return f"{key}: {why}"
                 rank = max(rank, r)

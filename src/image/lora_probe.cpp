@@ -5,8 +5,9 @@
 //
 //   strata-image-lora-probe list LORA.safetensors|LORA.gguf      the entries and the metadata
 //   strata-image-lora-probe selftest                     y += scale (x A^T) B^T, a LoKr's kron(w1, w2), a DoRA's
-//                                                               rows (the base product scaled, the delta's rows by c)
-//                                                               and a whole delta's (diff, set_weight) against FP64
+//                                                               rows (the base product scaled, the delta's rows by c),
+//                                                               a whole delta's (diff, set_weight) and a LoHa's (its
+//                                                               factors' product made when it is bound) against FP64
 //                                                               (random)
 //   strata-image-lora-probe map DIT.gguf [LORA [scale]]          the weights adapters may take, and where a file's keys
 //                                                                land (or that they do not)
@@ -339,6 +340,119 @@ void selftest_diff(void* s, int64_t T, int64_t K, int64_t N, bool rows_scaled, f
     if (!ok) throw std::runtime_error(std::string("the delta of ") + label + " is not the reference's");
 }
 
+// one LoHa entry: its four factors' delta ((w1a w1b) * (w2a w2b), made when it is bound) and the weight's own
+// product from there, with the strength and a W8A8 product's row scale; `tucker`: the sides' cores (a linear product's,
+// 1 x 1) in the factors' place, the factors then written the core's way ([core][out])
+void selftest_loha(void* s, int64_t T, int64_t K, int64_t R1, int64_t R2, int64_t N, bool rows_scaled, bool tucker,
+                   int64_t src_row = 0, int64_t row0 = 0, int64_t n = 0) {
+    namespace si = strata::image;
+    if (n <= 0) n = N - src_row;
+    const int64_t c1 = tucker ? 3 : 0, c2 = tucker ? 4 : 0;   // the cores' first dimensions (their rank)
+    std::mt19937 rng((uint32_t) (rows_scaled ? 37u : 29u) ^
+                     (uint32_t) (T * 41 + K * 23 + R1 * 13 + R2 * 7 + N * 3 + (tucker ? 1u : 0u)));
+    std::normal_distribution<float> nd(0.0f, 0.5f);
+    si::LoraEntry e;
+    e.key = "selftest-loha";
+    e.kind = si::LoraKind::loha;
+    e.cols = K;
+    e.rows = N;
+    e.rank = R1;   // ComfyUI's dim: w1_b's rows
+    const auto fill = [&](const char* role, std::vector<int64_t> shape) {
+        size_t n_values = 1;
+        for (int64_t d : shape) n_values *= (size_t) d;
+        e.shapes[role] = std::move(shape);
+        e.extra[role].resize(n_values);
+        for (float& v : e.extra[role]) v = nd(rng);
+    };
+    if (tucker) {   // the factors the core's way: w_a [core][out], w_b [rank][in]
+        fill("hada_w1_a", {c1, N});
+        fill("hada_w1_b", {R1, K});
+        fill("hada_w2_a", {c2, N});
+        fill("hada_w2_b", {R2, K});
+        fill("hada_t1", {c1, R1, 1, 1});
+        fill("hada_t2", {c2, R2, 1, 1});
+    } else {
+        fill("hada_w1_a", {N, R1});
+        fill("hada_w1_b", {R1, K});
+        fill("hada_w2_a", {N, R2});
+        fill("hada_w2_b", {R2, K});
+    }
+    std::vector<float> x((size_t) (T * K)), rs((size_t) T, 1.0f);
+    for (float& v : x) v = nd(rng);
+    for (int64_t t = 0; t < T; ++t) rs[(size_t) t] = std::exp2((float) (t % 3));   // 1, 2, 4
+    const float scale = 0.8f;
+
+    si::LoraDeviceEntry dev;
+    std::string err;
+    if (!dev.upload(e, s, err)) throw std::runtime_error(err);
+    strata::prefill::Gemm gemm;
+    if (!gemm.init(s, 0, err)) throw std::runtime_error(err);
+    auto* dx = static_cast<uint16_t*>(gpu::alloc_device((size_t) (T * K) * 2));
+    auto* dy = static_cast<float*>(gpu::alloc_device((size_t) (T * N) * 4));
+    auto* drs = static_cast<float*>(gpu::alloc_device((size_t) T * 4));
+    auto* tf = static_cast<float*>(gpu::alloc_device((size_t) (T * si::lora_scratch_cols(e)) * 4));
+    auto* t16 = static_cast<uint16_t*>(gpu::alloc_device((size_t) (T * si::lora_scratch_cols(e)) * 2));
+    std::vector<uint16_t> x16((size_t) (T * K));
+    si::lora_to_f16(x, x16);
+    std::vector<float> zero((size_t) (T * N), 0.0f);
+    gpu::copy(dx, x16.data(), x16.size() * 2);
+    gpu::copy(dy, zero.data(), zero.size() * 4);
+    gpu::copy(drs, rs.data(), rs.size() * 4);
+    dev.add(dx, T, dy, N, src_row, row0, n, scale, rows_scaled ? drs : nullptr, gemm, tf, t16, s);
+    if (!gpu::stream_sync(s)) throw std::runtime_error(gpu::last_error());
+    std::vector<float> got((size_t) (T * N));
+    gpu::copy(got.data(), dy, got.size() * 4);
+    // the delta as the engine makes it, in FP64 from the FP32 factors: each side's product (under its core), their
+    // element-wise product, then the FP16 the GPU took
+    const auto matrix = [&](const char* a_role, const char* b_role, const char* t_role) {
+        const std::vector<int64_t>& sa = e.shapes[a_role];
+        std::vector<double> m((size_t) (N * K), 0.0);
+        if (t_role == nullptr) {
+            for (int64_t p = 0; p < N; ++p)
+                for (int64_t j = 0; j < sa[1]; ++j) {
+                    const double v = e.extra[a_role][(size_t) (p * sa[1] + j)];
+                    for (int64_t k = 0; k < K; ++k) m[(size_t) (p * K + k)] += v * e.extra[b_role][(size_t) (j * K + k)];
+                }
+            return m;
+        }
+        const std::vector<int64_t>& st = e.shapes[t_role];
+        for (int64_t i = 0; i < st[0]; ++i)
+            for (int64_t j = 0; j < st[1]; ++j) {
+                const double w = e.extra[t_role][(size_t) ((i * st[1] + j) * st[2] * st[3])];
+                if (w == 0.0) continue;
+                for (int64_t p = 0; p < N; ++p) {
+                    const double v = w * e.extra[a_role][(size_t) (i * N + p)];
+                    for (int64_t k = 0; k < K; ++k) m[(size_t) (p * K + k)] += v * e.extra[b_role][(size_t) (j * K + k)];
+                }
+            }
+        return m;
+    };
+    const std::vector<double> m1 = matrix("hada_w1_a", "hada_w1_b", tucker ? "hada_t1" : nullptr);
+    const std::vector<double> m2 = matrix("hada_w2_a", "hada_w2_b", tucker ? "hada_t2" : nullptr);
+    std::vector<uint16_t> hd((size_t) (N * K));
+    for (size_t i = 0; i < hd.size(); ++i) hd[i] = strata::kernels::f16_from_f32((float) (m1[i] * m2[i]));
+    std::vector<double> want((size_t) (T * N), 0.0), xd((size_t) (T * K));
+    for (int64_t i = 0; i < T * K; ++i) xd[(size_t) i] = strata::kernels::f32_from_f16(x16[(size_t) i]);
+    for (int64_t t = 0; t < T; ++t)
+        for (int64_t c = 0; c < n; ++c) {
+            const int64_t row = src_row + c;
+            double v = 0;
+            for (int64_t k = 0; k < K; ++k)
+                v += (double) strata::kernels::f32_from_f16(hd[(size_t) (row * K + k)]) * xd[(size_t) (t * K + k)];
+            want[(size_t) (t * N + row0 + c)] += v * scale * (rows_scaled ? rs[(size_t) t] : 1.0);
+        }
+    char label[96];
+    std::snprintf(label, sizeof label, "loha%s %lldx%lld rank %lld", tucker ? " (tucker)" : "", (long long) T,
+                  (long long) N, (long long) R1);
+    const bool ok = compare(label, got, want);
+    gpu::free(dx);
+    gpu::free(dy);
+    gpu::free(drs);
+    gpu::free(tf);
+    gpu::free(t16);
+    if (!ok) throw std::runtime_error(std::string("the delta of ") + label + " is not the reference's");
+}
+
 // one DoRA entry: the base product's rows scaled by 1 + strength (c - 1), then the delta's rows by strength (file
 // scale) * c; c = dora_scale / (the weight's row norm + eps), the weight as the product takes it (FP16)
 void selftest_dora(void* s, int64_t T, int64_t K, int64_t R, int64_t N) {
@@ -469,6 +583,13 @@ int selftest() {
         selftest_diff(s, 8, 64, 32, true, 0.8f);   // a set_weight's base factors, 1 - strength
         // the rows of a fused weight: the entry's second half into the weight's second half
         selftest_diff(s, 8, 64, 64, false, 0.0f, 32, 32, 32);
+        // a LoHa: the factors' delta, its row scale and a Tucker core (a linear product's)
+        selftest_loha(s, 8, 64, 8, 4, 32, false, false);
+        selftest_loha(s, 8, 64, 8, 4, 32, true, false);
+        selftest_loha(s, 8, 64, 8, 4, 32, false, true);
+        // the rows of a fused weight, the side written the core's way
+        selftest_loha(s, 8, 64, 8, 4, 64, false, false, 32, 32, 32);
+        selftest_loha(s, 8, 64, 8, 4, 64, true, true, 32, 32, 32);
     } catch (...) {
         strata::core::Runtime::get().destroy_stream(static_cast<sycl::queue*>(s));
         throw;
