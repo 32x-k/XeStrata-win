@@ -784,7 +784,8 @@ void MossDit::run_block(const W* const* w, const float* const* bias, const float
         head_scale(vpart_, T, heads_, hs_, s_);
         qk_rope16(q.from(r0), k.from(r0), v.from(r0), nq, nk, cos[i], sin[i], hs_, T, heads_, hd_, jq16_ + o,
                   jk16_ + o, jv16_ + o, s_);
-        qi_attention(jq16_ + o, jk16_ + o, jv16_ + o, T, heads_, hd_, 0, jo16_, attn_scratch_, s_);
+        // every row sees every key: the int8 kernel may take them all where it is the faster (qi_attention's choice)
+        qi_attention(jq16_ + o, jk16_ + o, jv16_ + o, T, heads_, hd_, 0, jo16_, attn_scratch_, s_, nullptr, 0, true);
         if (i8) rows_i8(HeadsI8{Heads{jo16_, hs_, C, hd_}}, T, C, xq8_ + r0 * C, so + r0, s_);
         else rows16(Heads{jo16_, hs_, C, hd_}, T, C, o16_ + r0 * C, rs_o_ + r0, s_);
         r0 += T;
