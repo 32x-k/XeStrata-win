@@ -947,12 +947,19 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
 
 bool FileExpertSource::register_on(int device, std::string& err) {
     if (registered_on(device) || (!complement_ready_ && xstage_ == nullptr)) return true;
+    // layer_devices: a part in the device's own host USM needs no registration, and another maker's part holds
+    // layers this device does not run
+    const bool by_device = !complement_chunks_.empty() && complement_chunks_[0].owner >= 0;
     std::vector<std::pair<void*, size_t>> blocks;
-    if (!complement_chunks_.empty())
-        for (const ComplementChunk& c : complement_chunks_) blocks.emplace_back(c.host, (size_t) (c.end - c.start));
-    else if (complement_arena_ != nullptr && complement_bytes_ > 0)
+    if (!complement_chunks_.empty()) {
+        for (const ComplementChunk& c : complement_chunks_)
+            if (!by_device || (c.owner != device && strata::gpu::same_backend(c.owner, device)))
+                blocks.emplace_back(c.host, (size_t) (c.end - c.start));
+    } else if (complement_arena_ != nullptr && complement_bytes_ > 0)
         blocks.emplace_back(complement_arena_, (size_t) complement_bytes_);
-    if (xstage_ != nullptr && xstage_cap_ > 0) blocks.emplace_back(xstage_, (size_t) xstage_cap_ * (size_t) xstage_blob_);
+    // the exchange buffers: another maker's host USM is not registered here, and their copies stay pageable
+    if (xstage_ != nullptr && xstage_cap_ > 0 && !(xstage_pinned_ && !strata::gpu::same_backend(xstage_dev_, device)))
+        blocks.emplace_back(xstage_, (size_t) xstage_cap_ * (size_t) xstage_blob_);
     std::vector<void*> regs;
     for (const auto& [p, n] : blocks) {
         if (!strata::gpu::host_register_on(device, p, n)) {
@@ -964,6 +971,55 @@ bool FileExpertSource::register_on(int device, std::string& err) {
         regs.push_back(p);
     }
     stage_reg_.emplace_back(device, std::move(regs));
+    return true;
+}
+
+bool FileExpertSource::pin_by_device(std::vector<uint64_t>& offsets, std::vector<ComplementChunk>& chunks,
+                                     std::string& note) const {
+    if (layer_dev_.empty()) return false;
+    const int here = current_device();
+    auto owner_of = [&](size_t i) {
+        const size_t l = i / (size_t) n_expert_;
+        return l < layer_dev_.size() && layer_dev_[l] >= 0 ? layer_dev_[l] : here;
+    };
+    std::vector<int> owners;
+    for (size_t i = 0; i < offsets.size(); ++i)
+        if (offsets[i] != kNoComplement && std::find(owners.begin(), owners.end(), owner_of(i)) == owners.end())
+            owners.push_back(owner_of(i));
+    if (owners.size() < 2) return false;
+    std::vector<size_t> order;   // the blobs in their offsets' order, which each device's part keeps
+    for (size_t i = 0; i < offsets.size(); ++i)
+        if (offsets[i] != kNoComplement) order.push_back(i);
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return offsets[a] < offsets[b]; });
+    std::vector<uint64_t> packed(offsets.size(), kNoComplement);
+    std::vector<ComplementChunk> got;
+    uint64_t at = 0;
+    bool ok = true;
+    for (size_t k = 0; k < owners.size() && ok; ++k) {
+        const uint64_t start = at;
+        for (const size_t i : order)
+            if (owner_of(i) == owners[k]) {
+                packed[i] = at;
+                at += layer_blob_bytes_[i / (size_t) n_expert_];
+            }
+        const OnDevice on(owners[k]);
+        void* h = nullptr;
+        void* d = nullptr;
+        ok = strata::gpu::alloc_host(&h, (size_t) (at - start));
+        if (h != nullptr) got.push_back({start, at, (uint8_t*) h, nullptr, owners[k]});
+        ok = ok && strata::gpu::device_pointer(&d, h) && d != nullptr;
+        if (ok) got.back().device = (const uint8_t*) d;
+    }
+    if (!ok) {
+        std::fprintf(stderr, "FileExpertSource: a part of the page-locked copy for GPU %d was refused (%s): one copy\n",
+                     got.empty() ? owners[0] : got.back().owner, strata::gpu::last_error());
+        for (const ComplementChunk& c : got) (void) strata::gpu::free(c.host);
+        return false;
+    }
+    chunks.swap(got);
+    offsets.swap(packed);
+    note = "page-locked and mapped, one part per GPU's runtime (" + std::to_string(chunks.size()) +
+           ": each GPU's layers in its own host USM)";
     return true;
 }
 
@@ -2010,8 +2066,11 @@ bool FileExpertSource::pin_complement(
             // cache came slowly (a 71 GiB copy took 43 minutes after a few starts, 59 s after a reboot) and read slowly
             // from the GPU; the reclaim done first, on ordinary memory, leaves the driver free pages
             strata::platform::make_free_ram(bytes + (2ull << 30));
-            const bool allocated = strata::gpu::alloc_host(&arena, (size_t) bytes);
-            if (allocated == true) {
+            const bool by_device = pin_by_device(offsets, chunks, note);
+            const bool allocated = !by_device && strata::gpu::alloc_host(&arena, (size_t) bytes);
+            if (by_device) {
+                pinned_ok = true;
+            } else if (allocated == true) {
                 void* alias = nullptr;
                 const bool aliased = strata::gpu::device_pointer(&alias, arena);
                 if (aliased == true && alias != nullptr) {
@@ -2295,6 +2354,7 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err, int64_t bo
     void* p = nullptr;
     if (strata::gpu::alloc_host(&p, total) == true && p != nullptr) {
         xstage_pinned_ = true;
+        xstage_dev_ = current_device();
     } else {
 
         p = std::malloc(total);
