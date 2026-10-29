@@ -45,6 +45,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <utility>
@@ -77,6 +78,7 @@ struct MfOut {
 };
 
 class MappedFile;
+class SafeTensors;
 
 class MfDit {
 public:
@@ -210,12 +212,18 @@ private:
     void modulation(const uint16_t* tsil, const W& w, const uint8_t* base, float* y, const float* bias);
     void build_lora_targets();
     void lora_scratch(int64_t T);
+    /// A DoRA's row norms: the norms of a slot's weight, one a row of it, from the file's tensor, cached a tensor
+    /// (open drops the cache).
+    bool dora_norms(const LoraSlot& slot, std::vector<float>& out, std::string& err);
+    /// One of the file's tensors' row norms, FP32, cached (`name`: the file's own name).
+    bool tensor_norms(const std::string& name, const std::vector<float>*& out, std::string& err);
     void ensure(int64_t hw, int n, int64_t max_text);
     void rope_tables(int64_t h, int64_t w);
     void drop_refs();
     void time_embedding(float sigma);
 
     std::unique_ptr<MappedFile> file_;
+    std::unique_ptr<SafeTensors> st_;   // the file's header (a DoRA's row norms read its tensors)
     std::vector<std::vector<uint8_t>> host_;   // the blocks' Q8_0 (and every block's FP32 vectors), when not in place
     void* s_ = nullptr;
     prefill::Gemm gemm_;
@@ -263,6 +271,7 @@ private:
     std::vector<std::shared_ptr<const LoraFile>> lora_files_;
     std::string lora_key_;
     int64_t lora_cols_ = 0, lora_tmp_t_ = 0;   // the deltas' scratch's columns and rows (the largest lora_scratch_cols)
+    std::map<std::string, std::vector<float>> norm_cache_;   // DoRA's row norms, a file's tensor (open clears them)
     float* lora_f32_ = nullptr;
     uint16_t* lora16_ = nullptr;
 };

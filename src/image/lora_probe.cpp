@@ -4,8 +4,9 @@
 // its entries and metadata), the delta's arithmetic on the GPU against a CPU reference, and the deltas a DiT binds.
 //
 //   strata-image-lora-probe list LORA.safetensors|LORA.gguf      the entries and the metadata
-//   strata-image-lora-probe selftest                     y += scale (x A^T) B^T, and a LoKr's kron(w1, w2), against
-//                                                               FP64 (random)
+//   strata-image-lora-probe selftest                     y += scale (x A^T) B^T, a LoKr's kron(w1, w2) and a
+//                                                               DoRA's rows (the base product scaled, the delta's
+//                                                               rows by c) against FP64 (random)
 //   strata-image-lora-probe map DIT.gguf [LORA [scale]]          the weights adapters may take, and where a file's keys
 //                                                                land (or that they do not)
 //   strata-image-lora-probe step DIT.gguf OUT.bin [LORA [scale]] one forward of a fixed context and noise, its
@@ -32,6 +33,7 @@
 #include "strata/image/moss_dit.hpp"
 #include "strata/image/moss_pipeline.hpp"
 #include "strata/image/qi_dit.hpp"
+#include "strata/image/qi_kernels.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/prefill/gemm.hpp"
 
@@ -245,6 +247,112 @@ void selftest_lokr(void* s, int64_t T, int64_t out_l, int64_t in_m, int64_t out_
     if (!ok) throw std::runtime_error(std::string("the delta of ") + label + " is not the reference's");
 }
 
+// one DoRA entry: the base product's rows scaled by 1 + strength (c - 1), then the delta's rows by strength (file
+// scale) * c; c = dora_scale / (the weight's row norm + eps), the weight as the product takes it (FP16)
+void selftest_dora(void* s, int64_t T, int64_t K, int64_t R, int64_t N) {
+    namespace si = strata::image;
+    std::mt19937 rng((uint32_t) (T * 31 + K * 17 + R * 13 + N * 7 + 1));
+    std::normal_distribution<float> nd(0.0f, 0.5f);
+    std::normal_distribution<float> md(1.0f, 0.25f);
+    si::LoraEntry e;
+    e.key = "selftest-dora";
+    e.kind = si::LoraKind::lora;
+    e.cols = K;
+    e.rows = N;
+    e.rank = R;
+    e.alpha = 2.0f;
+    e.alpha_set = true;
+    e.dora.resize((size_t) N);
+    for (float& v : e.dora) v = std::fabs(md(rng)) + 0.05f;
+    std::vector<float> a((size_t) (R * K)), b((size_t) (N * R)), x((size_t) (T * K)), w((size_t) (N * K));
+    for (float& v : a) v = nd(rng);
+    for (float& v : b) v = nd(rng);
+    for (float& v : x) v = nd(rng);
+    for (float& v : w) v = nd(rng) * 0.1f;
+    si::lora_to_f16(a, e.a);
+    si::lora_to_f16(b, e.b);
+    const float strength = 0.7f, scale = strength * e.scale();
+    // the weight's rows' norms, from the FP16 values the product takes
+    std::vector<uint16_t> w16((size_t) (N * K));
+    si::lora_to_f16(w, w16);
+    std::vector<float> norms((size_t) N);
+    for (int64_t r = 0; r < N; ++r) {
+        double n2 = 0;
+        for (int64_t k = 0; k < K; ++k) {
+            const double v = strata::kernels::f32_from_f16(w16[(size_t) (r * K + k)]);
+            n2 += v * v;
+        }
+        norms[(size_t) r] = (float) std::sqrt(n2);
+    }
+    std::vector<float> coef, base;
+    std::string err;
+    if (!si::lora_dora_rows(e, 0, 0, N, norms, strength, coef, base, err)) throw std::runtime_error(err);
+
+    si::LoraLayer layer;
+    si::LoraPart part;
+    auto dev = std::make_shared<si::LoraDeviceEntry>();
+    if (!dev->upload(e, s, err, coef.data())) throw std::runtime_error(err);
+    part.entry = dev;
+    part.row0 = 0;
+    part.n = N;
+    part.scale = scale;
+    part.base = base;
+    layer.parts.push_back(std::move(part));
+    if (!layer.build_base(N, s, err)) throw std::runtime_error(err);
+
+    strata::prefill::Gemm gemm;
+    if (!gemm.init(s, 0, err)) throw std::runtime_error(err);
+    auto* dx = static_cast<uint16_t*>(gpu::alloc_device((size_t) (T * K) * 2));
+    auto* dw = static_cast<uint16_t*>(gpu::alloc_device((size_t) (N * K) * 2));
+    auto* dy = static_cast<float*>(gpu::alloc_device((size_t) (T * N) * 4));
+    auto* tf = static_cast<float*>(gpu::alloc_device((size_t) (T * R) * 4));
+    auto* t16 = static_cast<uint16_t*>(gpu::alloc_device((size_t) (T * R) * 2));
+    std::vector<uint16_t> x16((size_t) (T * K));
+    si::lora_to_f16(x, x16);
+    gpu::copy(dx, x16.data(), x16.size() * 2);
+    gpu::copy(dw, w16.data(), w16.size() * 2);
+    gemm.f16(dx, dw, dy, T, N, K);                       // the base product, W x
+    si::qi_rows_scale(dy, T, N, N, layer.base(), s);     // a DoRA's rows, as a DiT's product does
+    layer.add(dx, T, dy, N, 0, N, nullptr, gemm, tf, t16, s);
+    if (!gpu::stream_sync(s)) throw std::runtime_error(gpu::last_error());
+    std::vector<float> got((size_t) (T * N));
+    gpu::copy(got.data(), dy, got.size() * 4);
+    // the reference, FP64: the folded B (as upload made it), A and x FP16, the base product FP16-rounded
+    std::vector<double> want((size_t) (T * N), 0.0), xd((size_t) (T * K)), ad((size_t) (R * K));
+    std::vector<double> bd((size_t) (N * R)), wd((size_t) (N * K));
+    for (int64_t i = 0; i < T * K; ++i) xd[(size_t) i] = strata::kernels::f32_from_f16(x16[(size_t) i]);
+    for (int64_t i = 0; i < R * K; ++i) ad[(size_t) i] = strata::kernels::f32_from_f16(e.a[(size_t) i]);
+    for (int64_t i = 0; i < N * K; ++i) wd[(size_t) i] = strata::kernels::f32_from_f16(w16[(size_t) i]);
+    for (int64_t r = 0; r < N; ++r)
+        for (int64_t j = 0; j < R; ++j) {
+            const uint16_t h = strata::kernels::f16_from_f32(
+                strata::kernels::f32_from_f16(e.b[(size_t) (r * R + j)]) * coef[(size_t) r]);
+            bd[(size_t) (r * R + j)] = strata::kernels::f32_from_f16(h);
+        }
+    for (int64_t t = 0; t < T; ++t) {
+        std::vector<double> y1((size_t) R);
+        for (int64_t r = 0; r < R; ++r) {
+            double v = 0;
+            for (int64_t k = 0; k < K; ++k) v += xd[(size_t) (t * K + k)] * ad[(size_t) (r * K + k)];
+            y1[(size_t) r] = v;
+        }
+        for (int64_t r = 0; r < N; ++r) {
+            double v = 0;
+            for (int64_t k = 0; k < K; ++k) v += wd[(size_t) (r * K + k)] * xd[(size_t) (t * K + k)];
+            double d = 0;
+            for (int64_t j = 0; j < R; ++j) d += y1[(size_t) j] * bd[(size_t) (r * R + j)];
+            want[(size_t) (t * N + r)] = (double) base[(size_t) r] * v + (double) scale * d;
+        }
+    }
+    const bool ok = compare("dora", got, want);
+    gpu::free(dx);
+    gpu::free(dw);
+    gpu::free(dy);
+    gpu::free(tf);
+    gpu::free(t16);
+    if (!ok) throw std::runtime_error("the DoRA's product is not the reference's");
+}
+
 int selftest() {
     void* s = strata::core::Runtime::get().create_stream();
     try {
@@ -261,6 +369,8 @@ int selftest() {
         selftest_lokr(s, 8, 4, 8, 16, 4, false, 32, 16, 16);
         // a block-shaped product, as a DiT's attention is (out_l * out_k = 64 rows of 64)
         selftest_lokr(s, 16, 8, 8, 8, 8, false);
+        // a DoRA: the base product's rows scaled by 1 + strength (c - 1), the delta's by strength (file scale) c
+        selftest_dora(s, 8, 64, 8, 32);
     } catch (...) {
         strata::core::Runtime::get().destroy_stream(static_cast<sycl::queue*>(s));
         throw;

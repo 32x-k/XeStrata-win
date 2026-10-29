@@ -114,9 +114,14 @@ void qi_rows_i8(const uint16_t* src, bool bf16, int64_t rows, int64_t K, int8_t*
 void qi_swiglu_i8(const int32_t* gu, const QiI8& g, int64_t T, int64_t inter, int8_t* q, float* s, void* stream);
 
 /// y [T][N] (row stride ldy) holds a W8A8 product's int32 sums (their bits): y = sum * sx[t] * sw[n] + bias[n], in
-/// place (bias null: none).
+/// place (bias null: none).  col[n] (null: 1) is a DoRA's factor of the weight's row n: the product's part of y only,
+/// the bias not scaled.
 void qi_i8_scale(float* y, int64_t T, int64_t N, int64_t ldy, const float* sx, const float* sw, const float* bias,
-                 void* stream);
+                 const float* col, void* stream);
+
+/// y [T][N] (row stride ldy) *= col[n], in place: a dense product's rows, scaled where a DoRA's c is not 1 (col is
+/// the weight's rows' factors, y's rows the weight's row0 on).
+void qi_rows_scale(float* y, int64_t T, int64_t N, int64_t ldy, const float* col, void* stream);
 
 /// y16 = FP16(x), n elements.
 void qi_to_f16(const float* x, int64_t n, uint16_t* y16, void* stream);

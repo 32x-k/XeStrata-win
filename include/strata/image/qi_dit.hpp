@@ -20,6 +20,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -198,6 +199,11 @@ private:
         W* w = nullptr;
         int64_t row0 = 0, rows = 0;
     };
+    /// A DoRA's row norms: the norms of a slot's weight, one a row of it, from the file's tensor (a fused weight's
+    /// gate_layer and proj are its gate_up's rows), cached a tensor (open drops the cache).
+    bool dora_norms(const LoraSlot& slot, std::vector<float>& out, std::string& err);
+    /// One of the file's tensors' row norms, FP32, cached (`key`: the GGUF's own name).
+    bool tensor_norms(const std::string& key, const std::vector<float>*& out, std::string& err);
     std::vector<LoraSlot> lora_slots_;
     std::vector<std::unique_ptr<LoraLayer>> lora_layers_;
     std::vector<std::shared_ptr<const LoraFile>> lora_files_;
@@ -206,6 +212,7 @@ private:
     float* lora_f32_ = nullptr;
     uint16_t* lora16_ = nullptr;
     int64_t lora_tmp_t_ = 0;   // the scratch's rows
+    std::map<std::string, std::vector<float>> norm_cache_;   // DoRA's row norms, a file's tensor (open clears them)
     bool prefix_cache_ = false;   // the blocks' pk and pv hold the context's prefix (set_context; set_loras drops it)
     // activations, grown on demand
     int64_t cap_T_ = 0, mlp_cap_ = 0, mlp_rows_ = 0;

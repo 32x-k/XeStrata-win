@@ -264,10 +264,12 @@ bool MfDit::open(const std::string& path, void* stream, std::string& err, bool d
         s_ = stream;
         dry_ = dry;
         q8_ = q8;
+        norm_cache_.clear();
         // the int8 form: W8A8 (int8 activations a token, kTypeW8) where the GPU's library takes int8 products, else
         // Q8_0 (dequantized to FP16 for each product)
         w8_ = q8 && std::getenv("STRATA_NO_W8A8") == nullptr && prefill::Gemm::i8_usable(stream);
-        SafeTensors st(path);
+        st_ = std::make_unique<SafeTensors>(path);
+        SafeTensors& st = *st_;
         file_ = std::make_unique<MappedFile>(path);
         const uint8_t* data = file_->data() + st.data_base();
         auto tensor = [&](const std::string& name) -> const SafeTensor& {
@@ -523,7 +525,7 @@ std::pair<double, double> MfDit::time_forms(int64_t rows) const {
                 w8 = best([&] {
                     qi_rows_i8(x16, false, T, K, x8, sx, nullptr, s_);
                     prefill::Gemm::i8(x8, w8p, reinterpret_cast<int32_t*>(y), T, N, K, N, s_);
-                    qi_i8_scale(y, T, N, N, sx, sw, nullptr, s_);
+                    qi_i8_scale(y, T, N, N, sx, sw, nullptr, nullptr, s_);
                 });
         }
     } catch (const std::exception& e) {   // a form the library could not run: the 8-bit one is not chosen
@@ -543,6 +545,8 @@ MfOut MfDit::product(const uint16_t* x16, const float* rs, const W& w, const uin
     if (T <= 0) return out;
     LoraLayer* lora = w.lora;
     if (lora != nullptr) defer = false;   // a delta is FP32: the int32 sums are scaled into y first
+    // a DoRA's factor of the weight's rows: the base product's, then the delta's own
+    const float* col = lora != nullptr && lora->has_base() ? lora->base() : nullptr;
     const auto* d = base != nullptr ? base + reinterpret_cast<uintptr_t>(w.d) : static_cast<const uint8_t*>(w.d);
     if (w.type == kTypeW8) {
         // the activations rotated and quantized as the weights (once for the products of one input), their scales
@@ -562,7 +566,7 @@ MfOut MfDit::product(const uint16_t* x16, const float* rs, const W& w, const uin
             out.b = bias;
             return out;
         }
-        qi_i8_scale(y, T, w.n, w.n, sx, sw, bias, s_);   // sx carries the rows' scales: y is in the input's units
+        qi_i8_scale(y, T, w.n, w.n, sx, sw, bias, col, s_);   // sx carries the rows' scales: y is in the input's units
     } else {
         if (w.type == kTypeF16) gemm_.f16(x16, reinterpret_cast<const uint16_t*>(d), y, T, w.n, w.k);
         else gemm_.native(x16, w.type, d, y, T, w.n, w.k);
@@ -571,7 +575,7 @@ MfOut MfDit::product(const uint16_t* x16, const float* rs, const W& w, const uin
             out.b = bias;
             return out;
         }
-        if (rs != nullptr || bias != nullptr) rows_back(y, rs, bias, T, w.n, s_);
+        if (rs != nullptr || bias != nullptr || col != nullptr) rows_back(y, rs, bias, T, w.n, s_, col);
     }
     if (lora != nullptr) {
         // the delta is the input's own (x16 = x / rs): its rows' scales put it back in y's units, as rows_back does
@@ -783,14 +787,34 @@ bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
             }
             const float scale = u.scale * e.scale();
             if (scale == 0.0f) continue;   // a strength of 0 changes nothing: the weight keeps its product's path
-            if (!e.dora.empty()) {   // DoRA's rows are scaled by m / |W| (comfy/weight_adapter): not applied yet
-                err = "image engine: " + u.file->path() + ": " + e.key +
-                      ": a DoRA (dora_scale) adapter: the engine scales no weight's rows by it yet";
+            std::vector<float> coef, base;   // a DoRA's: the delta's rows' c, the base product's factors
+            if (!e.dora.empty()) {
+                std::vector<float> norms;
+                if (!dora_norms(*slot, norms, err)) {
+                    drop_loras();
+                    return false;
+                }
+                std::string why;
+                if (!lora_dora_rows(e, 0, slot->row0, slot->rows, norms, u.scale, coef, base, why)) {
+                    err = "image engine: ";
+                    err += u.file->path();
+                    err += ": ";
+                    err += e.key;
+                    err += ": ";
+                    err += why;
+                    drop_loras();
+                    return false;
+                }
+            }
+            if (lora_dora_overlap(slot->w->lora, slot->row0, slot->rows, !base.empty()) != nullptr) {
+                err = "image engine: " + u.file->path() + ": " + e.key + ": the weight's rows " +
+                      std::to_string(slot->row0) + " .. " + std::to_string(slot->row0 + slot->rows) +
+                      " are another adapter's, and a DoRA's rows are the weight's before the other's patch";
                 drop_loras();
                 return false;
             }
             auto entry = std::make_shared<LoraDeviceEntry>();
-            if (!entry->upload(e, s_, err)) {
+            if (!entry->upload(e, s_, err, base.empty() ? nullptr : coef.data())) {
                 drop_loras();
                 return false;
             }
@@ -804,7 +828,8 @@ bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
             part.n = slot->rows;
             part.src_row = slot->src_row;
             part.scale = scale;
-            slot->w->lora->parts.push_back(part);
+            part.base = std::move(base);
+            slot->w->lora->parts.push_back(std::move(part));
             lora_cols_ = std::max(lora_cols_, lora_scratch_cols(e));
         }
     }
@@ -823,9 +848,56 @@ bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
         drop_loras();
         return true;
     }
+    for (const LoraSlot& slot : lora_slots_)   // the base products' row factors, once every part is bound
+        if (slot.w->lora != nullptr && !slot.w->lora->build_base(slot.w->n, s_, err)) {
+            drop_loras();
+            return false;
+        }
     for (const LoraUse& u : loras)
         if (u.file) lora_files_.push_back(u.file);
     lora_key_ = key;
+    return true;
+}
+
+bool MfDit::tensor_norms(const std::string& name, const std::vector<float>*& out, std::string& err) {
+    auto it = norm_cache_.find(name);
+    if (it != norm_cache_.end()) {
+        out = &it->second;
+        return true;
+    }
+    try {
+        const SafeTensor* t = st_->find(name);
+        if (t == nullptr || t->shape.size() != 2)
+            throw std::runtime_error("image engine (Mage-Flow DiT): no " + name);
+        if (t->dtype != "BF16") throw std::runtime_error("image engine (Mage-Flow DiT): " + name + " is not bf16");
+        const uint8_t* data = file_->data() + st_->data_base() + t->begin;
+        const int64_t rows = (int64_t) t->shape[0], k = (int64_t) t->shape[1];
+        const auto* h = reinterpret_cast<const uint16_t*>(data);
+        std::vector<float> norms((size_t) rows);
+        for (int64_t r = 0; r < rows; ++r) {
+            double s = 0;
+            for (int64_t c = 0; c < k; ++c) {
+                const float v = kernels::f32_from_bf16(h[r * k + c]);
+                s += (double) v * (double) v;
+            }
+            norms[(size_t) r] = (float) std::sqrt(s);
+        }
+        out = &norm_cache_.emplace(name, std::move(norms)).first->second;
+        return true;
+    } catch (const std::exception& ex) {
+        err = std::string("image engine (Mage-Flow DiT): a DoRA's row norms: ") + ex.what();
+        return false;
+    }
+}
+
+bool MfDit::dora_norms(const LoraSlot& slot, std::vector<float>& out, std::string& err) {
+    const std::vector<float>* norms = nullptr;
+    if (!tensor_norms(slot.name + ".weight", norms, err)) return false;
+    if ((int64_t) norms->size() < slot.w->n) {
+        err = "image engine (Mage-Flow DiT): " + slot.name + ": the file's rows are fewer than the weight's";
+        return false;
+    }
+    out.assign(norms->begin(), norms->begin() + slot.w->n);
     return true;
 }
 

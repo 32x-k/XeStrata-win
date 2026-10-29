@@ -173,12 +173,26 @@ class Listing(Tree):
         self.assertEqual(e["targets"], ["attn.to_out.0", "attn.to_q"])
         self.assertEqual(loras.field([{"name": "lokr", "scale": 0.7}], f)[0]["scale"], 0.7)
 
+    def test_a_dora_is_listed_and_one_over_the_columns_is_not(self):
+        b = "transformer.transformer_blocks.0.attn.to_q"
+        safetensors(self.d / "dora.safetensors", qwen_lora(
+            extra={b + ".dora_scale": (256,)}))   # the weight's rows: ComfyUI's weight_decompose
+        safetensors(self.d / "columns.safetensors", qwen_lora(
+            extra={"transformer.transformer_blocks.0.img_mlp.out.dora_scale": (512,)}))   # the weight's columns
+        f = self.folder()
+        self.assertEqual([e["name"] for e in f.listing()], ["dora"], f.skipped)
+        self.assertIn("columns", f.skipped["columns"], "a DoRA over the weight's columns is not the engine's")
+        self.assertIn("DoRA", f.skipped["columns"])
+        self.assertEqual(loras.field([{"name": "dora", "scale": 0.7}], f)[0]["scale"], 0.7)
+
     def test_another_models_file_and_the_forms_not_applied_are_left_out(self):
         self.qwen("qwen")
         safetensors(self.d / "moss.safetensors", {
             "layers.0.proj.q.lora_A.weight": (8, 256), "layers.0.proj.q.lora_B.weight": (256, 8)})
-        safetensors(self.d / "dora.safetensors", qwen_lora(
-            extra={"transformer.transformer_blocks.0.attn.to_q.dora_scale": (256,)}))
+        safetensors(self.d / "dora.safetensors", {
+            "transformer.transformer_blocks.0.attn.to_q.lokr_w1": (256, 256),
+            "transformer.transformer_blocks.0.attn.to_q.lokr_w2": (256, 256),
+            "transformer.transformer_blocks.0.attn.to_q.dora_scale": (256,)})
         safetensors(self.d / "lokr.safetensors", {
             "transformer.transformer_blocks.0.attn.to_q.lokr_w1": (256, 256),
             "transformer.transformer_blocks.0.attn.to_q.lokr_w2_a": (4, 64),
@@ -195,7 +209,7 @@ class Listing(Tree):
         f = self.folder()
         self.assertEqual([e["name"] for e in f.listing()], ["qwen"])
         self.assertEqual(f.skipped["moss"], "layers.0.proj.q is not one of this image model's weights")
-        self.assertIn("DoRA", f.skipped["dora"])
+        self.assertIn("DoRA", f.skipped["dora"], "a DoRA on a LoKr is not the engine's")
         self.assertIn("lokr_w2_b is 4 x 64, not the rank its lokr_w2_a has (64)", f.skipped["lokr"],
                       "a LoKr's factors that do not meet are not one")
         self.assertIn("text encoder", f.skipped["text-encoder"])
@@ -278,7 +292,7 @@ class Requests(Tree):
             loras.field([{"name": "nope"}], self.f)
         self.assertIn("nope", str(e.exception))
         self.assertIn("style/gouache", str(e.exception))
-        scale = {"transformer.transformer_blocks.0.attn.to_q.dora_scale": (256,)}
+        scale = {"transformer.transformer_blocks.0.img_mlp.out.dora_scale": (512,)}   # the columns: not the engine's
         safetensors(self.d / "dora.safetensors", qwen_lora(extra=scale))
         with self.assertRaises(loras.LoraError) as e:
             loras.field([{"name": "dora"}], self.f)

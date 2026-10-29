@@ -8,9 +8,9 @@ and shape and the file's string metadata.  A key is brought to the DiT's name th
 the file's prefix off, ".weight" off, the role's suffix off), and a file is this model's when every weight it changes
 is one the DiT's products take (TARGETS: the names of qi_dit.cpp's, moss_dit.cpp's and mf_dit.cpp's
 build_lora_targets, written here a second time; the record's check sets them against the probe's `map` on the models,
-name for name), in a form the engine
-applies today: a plain LoRA or LoKr, not a DoRA (dora_scale), LoHa, GLoRA, OFT or a whole weight's difference, and no
-text encoder's weight.  The engine refuses those when it binds a set (QiDit::set_loras, MossDit::set_loras,
+name for name), in a form the engine applies today: a plain LoRA or LoKr (a DoRA: a plain LoRA with a dora_scale over
+the weight's rows, ComfyUI's weight_decompose), not a LoHa, GLoRA, OFT or a whole weight's difference, and no text
+encoder's weight.  The engine refuses those when it binds a set (QiDit::set_loras, MossDit::set_loras,
 MfDit::set_loras), so no image is made with part of a file.
 
 A listing entry - ImageGen.defaults' "loras" (the engine's capabilities: /health's image_defaults and image_models,
@@ -411,8 +411,8 @@ class Folder:
             form = form_of(roles)
             if form not in ("lora", "lokr"):
                 return f"{key}: a {form or 'non-LoRA'} adapter, which the image engine applies not yet"
-            if "dora_scale" in roles:
-                return f"{key}: a DoRA (dora_scale) adapter, which the image engine applies not yet"
+            if "dora_scale" in roles and form != "lora":
+                return f"{key}: a DoRA (dora_scale) on a {form} adapter, which the image engine applies not yet"
             if is_text_encoder(key):
                 return f"{key}: a text encoder's weight, which the image engine applies not yet"
             if not any(m.match(key) for m in _MATCH[self.family]):
@@ -431,6 +431,12 @@ class Folder:
                 return f"{key}: lora_A and lora_B must be matrices"
             if b[1] != a[0]:
                 return f"{key}: lora_B is {b[0]} x {b[1]}, not the rank its lora_A has ({a[0]})"
+            if "dora_scale" in roles and tuple(roles["dora_scale"]) != (b[0],):
+                # the engine's DoRA scales the weight's output rows, c = dora_scale / (|W| a row + eps)
+                if tuple(roles["dora_scale"]) == (a[1],):
+                    return (f"{key}: a DoRA (dora_scale) over the weight's columns, which the engine's DoRA does "
+                            f"not take (it scales a product's rows)")
+                return f"{key}: dora_scale is neither the weight's rows nor its columns"
             rank = max(rank, a[0])
             targets.add(kind_of(key))
         return {"name": name, "path": rel, "rank": rank, "scale": _recommended(meta), "trigger": _trigger(meta),

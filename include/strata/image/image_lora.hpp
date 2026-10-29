@@ -11,6 +11,12 @@
 // A [rank][k] and B [n][rank], in FP16 with FP32 sums (LoraDeviceEntry::add).  LoKr's delta is its two factors'
 // Kronecker product, w1 [out_l][in_m] and w2 [out_k][in_n]: the input's rows read in in_m groups of in_n, w2's product
 // of each group, then w1's over the groups (the same two steps ComfyUI's adapter takes).
+//
+// A DoRA (dora_scale, ComfyUI's weight_decompose) keeps the weight it changes: c = m / (|W| a row + eps) over the
+// weight's output rows, and W' = W + s (c (W + alpha/rank * BA) - W), so a product's output is
+// y = [1 + s (c - 1)] (W x) + s c (alpha/rank BA x): the base product's rows scaled by 1 + s (c - 1) (LoraPart::base,
+// the DiT's product applies it where its output is in the input's units) and the delta's rows by c (folded into B when
+// the entry goes to the GPU).  eps is FP32's, whatever the file's tensors are (LP64_IEC_559's 1.1920929e-07).
 #pragma once
 
 #include <cstdint>
@@ -24,6 +30,10 @@ class Gemm;
 }
 
 namespace strata::image {
+
+/// DoRA's eps: the weight dtype's rounding ComfyUI adds to a row's norm (torch.finfo(weight.dtype).eps); the engine's
+/// weights are FP32 on the host whatever their file holds, so FP32's, the same for every file and GPU.
+constexpr float kLoraDoraEps = 1.1920929e-07f;
 
 /// The delta forms a file may hold, as ComfyUI's adapters name them.
 enum class LoraKind : int {
@@ -114,9 +124,11 @@ public:
     LoraDeviceEntry(const LoraDeviceEntry&) = delete;
     LoraDeviceEntry& operator=(const LoraDeviceEntry&) = delete;
 
-    /// Puts the entry's A and B on the stream's GPU.  False with err on a failure (the memory, a form the GPU cannot
-    /// take: the shapes are the file's own and were checked when it was read).
-    bool upload(const LoraEntry& e, void* stream, std::string& err);
+    /// Puts the entry's A and B on the stream's GPU.  `row_coef` (null: 1), one a row of the entry's, folds into B
+    /// (the plain form's DoRA: the rows' c, a product's output scaled there; a LoKr's rows are the Kronecker product's
+    /// and the caller refuses its DoRA).  False with err on a failure (the memory, a form the GPU cannot take: the
+    /// shapes are the file's own and were checked when it was read).
+    bool upload(const LoraEntry& e, void* stream, std::string& err, const float* row_coef = nullptr);
     void release();
     const uint16_t* a() const { return a_; }
     const uint16_t* b() const { return b_; }
@@ -155,26 +167,54 @@ struct LoraPart {
     std::shared_ptr<const LoraDeviceEntry> entry;
     int64_t row0 = 0, n = 0, src_row = 0;
     float scale = 1.0f;
+    /// DoRA: the base product's factor of each of the part's rows, 1 + strength (c - 1) (empty: not a DoRA, the rows
+    /// as the weight has them).
+    std::vector<float> base;
 };
 
 /// The deltas one weight adds to its products, as the DiT bound them.  A weight without one has no layer.
 class LoraLayer {
 public:
     LoraLayer() = default;
-    ~LoraLayer() = default;
     LoraLayer(const LoraLayer&) = delete;
     LoraLayer& operator=(const LoraLayer&) = delete;
 
     std::vector<LoraPart> parts;
     bool empty() const { return parts.empty(); }
-    /// The GPU memory the parts' entries hold.
+    /// The GPU memory the parts' entries hold (and the base product's factors).
     uint64_t bytes() const;
+
+    /// The base product's factors over all of the weight's rows, 1 where no DoRA part changes the row: made from the
+    /// parts (`rows`: the weight's rows), on the GPU once the DiT has bound them all.  null: no part is a DoRA's.
+    bool build_base(int64_t rows, void* stream, std::string& err);
+    bool has_base() const { return base_ != nullptr; }
+    const float* base() const { return base_; }
 
     /// y[t][ldy] += the parts that cover the weight's rows [w_row0, w_row0 + w_rows), each into its own rows there.
     /// `tmp_f32` and `tmp16` hold T * rank values each (grown by the caller).
     void add(const uint16_t* x16, int64_t T, float* y, int64_t ldy, int64_t w_row0, int64_t w_rows,
              const float* row_scale, prefill::Gemm& gemm, float* tmp_f32, uint16_t* tmp16, void* stream) const;
+
+    ~LoraLayer();
+
+private:
+    float* base_ = nullptr;
+    int64_t base_rows_ = 0;
+    bool base_built_ = false;
 };
+
+/// One DoRA part's rows: `norms` (the weight's rows' norms, FP32) -> the delta's factor of each of the part's rows
+/// [src_row, src_row + n) of the entry at the weight's rows [row0, row0 + n), c = dora_scale / (norm + eps) in `coef`,
+/// and the base product's 1 + strength (c - 1) in `base`.  False with err for the DoRA the engine does not take: a
+/// scale over the columns (ComfyUI's other axis: its norm is of the weight with the delta in it, and the columns are
+/// an input's), or a form whose rows a product's output does not have (a LoKr's are its Kronecker product's).
+bool lora_dora_rows(const LoraEntry& e, int64_t src_row, int64_t row0, int64_t n, const std::vector<float>& norms,
+                    float strength, std::vector<float>& coef, std::vector<float>& base, std::string& err);
+
+/// The bound part whose rows overlap [row0, row0 + n) of a weight's, where one of the two is a DoRA's: the two cannot
+/// be composed (ComfyUI patches the weights in the file's order, and a DoRA's c is the weight's as it was before the
+/// other's patch), so the caller refuses the set.  null: no such part.
+const LoraPart* lora_dora_overlap(const LoraLayer* layer, int64_t row0, int64_t n, bool dora);
 
 /// The host tensors of `e` as FP16 (a file's BF16, F16 or F32), for a test or a form built by hand.
 void lora_to_f16(const std::vector<float>& f32, std::vector<uint16_t>& out);

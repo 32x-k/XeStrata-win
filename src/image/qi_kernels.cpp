@@ -507,13 +507,23 @@ void qi_swiglu_i8(const int32_t* gu, const QiI8& g, int64_t T, int64_t inter, in
 }
 
 void qi_i8_scale(float* y, int64_t T, int64_t N, int64_t ldy, const float* sx, const float* sw, const float* bias,
-                 void* stream) {
+                 const float* col, void* stream) {
     if (T <= 0 || N <= 0) return;
     const auto e = queue_for(stream).parallel_for(sycl::range<2>((size_t) T, (size_t) N), [=](sycl::id<2> i) {
         float& v = y[(int64_t) i[0] * ldy + (int64_t) i[1]];
-        v = (float) sycl::bit_cast<int32_t>(v) * sx[i[0]] * sw[i[1]] + (bias != nullptr ? bias[i[1]] : 0.f);
+        const int64_t n = (int64_t) i[1];
+        v = (float) sycl::bit_cast<int32_t>(v) * sx[i[0]] * sw[n] * (col != nullptr ? col[n] : 1.f) +
+            (bias != nullptr ? bias[n] : 0.f);
     });
     finish(stream, e, "qi_i8_scale");
+}
+
+void qi_rows_scale(float* y, int64_t T, int64_t N, int64_t ldy, const float* col, void* stream) {
+    if (T <= 0 || N <= 0 || col == nullptr) return;
+    const auto e = queue_for(stream).parallel_for(sycl::range<2>((size_t) T, (size_t) N), [=](sycl::id<2> i) {
+        y[(int64_t) i[0] * ldy + (int64_t) i[1]] *= col[(int64_t) i[1]];
+    });
+    finish(stream, e, "qi_rows_scale");
 }
 
 void qi_to_f16(const float* x, int64_t n, uint16_t* y16, void* stream) {

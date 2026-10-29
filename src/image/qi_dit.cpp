@@ -315,6 +315,8 @@ bool QiDit::product(const uint16_t* x16, const W& w, float* y, int64_t T, int64_
     LoraLayer* lora = w.lora;
     if (lora != nullptr) defer = false;   // a delta is FP32: the int32 sums are scaled into y first
     if (ldy <= 0) ldy = rows;
+    // a DoRA's factor of the weight's rows row0 .. row0 + rows - 1: the base product's, then the delta's own
+    const float* col = lora != nullptr && lora->has_base() ? lora->base() + row0 : nullptr;
     const auto* base = static_cast<const uint8_t*>(w.d) + (uint64_t) row0 * w.row_bytes;
     bool deferred = false;
     if (w.w8) {
@@ -337,7 +339,7 @@ bool QiDit::product(const uint16_t* x16, const W& w, float* y, int64_t T, int64_
             i8_ = {sx, sw};
             deferred = true;
         } else {
-            qi_i8_scale(y, T, rows, ldy, sx, sw, nullptr, s_);
+            qi_i8_scale(y, T, rows, ldy, sx, sw, nullptr, col, s_);
         }
     } else if (w.packed) {
         const size_t need = kernels::iq_mmq_act_bytes(T, w.k);
@@ -359,6 +361,8 @@ bool QiDit::product(const uint16_t* x16, const W& w, float* y, int64_t T, int64_
     if (deferred) return true;
     if (lora != nullptr) {
         lora_scratch(T);
+        // a DoRA's base product, its rows scaled before the delta adds to them (the int8 ones were scaled above)
+        if (col != nullptr && !w.w8) qi_rows_scale(y, T, rows, ldy, col, s_);
         // the delta is the input's own (not the rotated int8 one): no row scale to put back on it
         lora->add(x16, T, y, ldy, row0, rows, nullptr, gemm_, lora_f32_, lora16_, s_);
     }
@@ -923,14 +927,34 @@ bool QiDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
             }
             const float scale = u.scale * e.scale();
             if (scale == 0.0f) continue;   // a strength of 0 changes nothing: the weight keeps its product's path
-            if (!e.dora.empty()) {   // DoRA's rows are scaled by m / |W| (comfy/weight_adapter): not applied yet
-                err = "image engine: " + u.file->path() + ": " + e.key +
-                      ": a DoRA (dora_scale) adapter: the engine scales no weight's rows by it yet";
+            std::vector<float> coef, base;   // a DoRA's: the delta's rows' c, the base product's factors
+            if (!e.dora.empty()) {
+                std::vector<float> norms;
+                if (!dora_norms(*slot, norms, err)) {
+                    drop_loras();
+                    return false;
+                }
+                std::string why;
+                if (!lora_dora_rows(e, 0, slot->row0, slot->rows, norms, u.scale, coef, base, why)) {
+                    err = "image engine: ";
+                    err += u.file->path();
+                    err += ": ";
+                    err += e.key;
+                    err += ": ";
+                    err += why;
+                    drop_loras();
+                    return false;
+                }
+            }
+            if (lora_dora_overlap(slot->w->lora, slot->row0, slot->rows, !base.empty()) != nullptr) {
+                err = "image engine: " + u.file->path() + ": " + e.key + ": the weight's rows " +
+                      std::to_string(slot->row0) + " .. " + std::to_string(slot->row0 + slot->rows) +
+                      " are another adapter's, and a DoRA's rows are the weight's before the other's patch";
                 drop_loras();
                 return false;
             }
             auto entry = std::make_shared<LoraDeviceEntry>();
-            if (!entry->upload(e, s_, err)) {
+            if (!entry->upload(e, s_, err, base.empty() ? nullptr : coef.data())) {
                 drop_loras();
                 return false;
             }
@@ -943,7 +967,8 @@ bool QiDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
             part.row0 = slot->row0;
             part.n = slot->rows;
             part.scale = scale;
-            slot->w->lora->parts.push_back(part);
+            part.base = std::move(base);
+            slot->w->lora->parts.push_back(std::move(part));
             lora_cols_ = std::max(lora_cols_, lora_scratch_cols(e));
         }
     }
@@ -962,10 +987,95 @@ bool QiDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
         drop_loras();
         return true;
     }
+    for (const LoraSlot& slot : lora_slots_)   // the base products' row factors, once every part is bound
+        if (slot.w->lora != nullptr && !slot.w->lora->build_base(slot.w->n, s_, err)) {
+            drop_loras();
+            return false;
+        }
     for (const LoraUse& u : loras)
         if (u.file) lora_files_.push_back(u.file);
     lora_key_ = key;
     drop_prefix();   // the prefix's rows and K and V were the other adapters'
+    return true;
+}
+
+bool QiDit::tensor_norms(const std::string& key, const std::vector<float>*& out, std::string& err) {
+    auto it = norm_cache_.find(key);
+    if (it != norm_cache_.end()) {
+        out = &it->second;
+        return true;
+    }
+    const TensorInfo* t = g_->find(key);
+    if (t == nullptr || t->shape.size() != 2) {
+        err = "image engine: the DiT has no " + key;
+        return false;
+    }
+    const int64_t k = (int64_t) t->shape[0], rows = (int64_t) t->shape[1];
+    const uint8_t* p = g_->tensor_data(*t);
+    std::vector<float> norms((size_t) rows);
+    if (t->type == kTypeF32) {
+        const auto* f = reinterpret_cast<const float*>(p);
+        for (int64_t r = 0; r < rows; ++r) {
+            double s = 0;
+            for (int64_t c = 0; c < k; ++c) s += (double) f[r * k + c] * (double) f[r * k + c];
+            norms[(size_t) r] = (float) std::sqrt(s);
+        }
+    } else if (t->type == kTypeF16 || t->type == kTypeBF16) {
+        const auto* h = reinterpret_cast<const uint16_t*>(p);
+        for (int64_t r = 0; r < rows; ++r) {
+            double s = 0;
+            for (int64_t c = 0; c < k; ++c) {
+                const float v = t->type == kTypeF16 ? kernels::f32_from_f16(h[r * k + c])
+                                                   : kernels::f32_from_bf16(h[r * k + c]);
+                s += (double) v * (double) v;
+            }
+            norms[(size_t) r] = (float) std::sqrt(s);
+        }
+    } else if (t->type == 8) {   // Q8_0: 34 bytes a 32 values, an FP16 scale and then the int8 ones
+        const int64_t nb = k / 32;
+        for (int64_t r = 0; r < rows; ++r) {
+            const uint8_t* row = p + (size_t) (r * nb) * 34;
+            double s = 0;
+            for (int64_t b = 0; b < nb; ++b) {
+                const uint8_t* q = row + b * 34;
+                const float d = kernels::f32_from_f16((uint16_t) ((uint16_t) q[0] | ((uint16_t) q[1] << 8)));
+                for (int j = 0; j < 32; ++j) {
+                    const double v = (double) d * (int8_t) q[2 + j];
+                    s += v * v;
+                }
+            }
+            norms[(size_t) r] = (float) std::sqrt(s);
+        }
+    } else {
+        err = "image engine: " + key + ": a " + t->type_name() +
+              " tensor: a DoRA's row norms are read from the file's F32, F16, BF16 and Q8_0 rows";
+        return false;
+    }
+    out = &norm_cache_.emplace(key, std::move(norms)).first->second;
+    return true;
+}
+
+bool QiDit::dora_norms(const LoraSlot& slot, std::vector<float>& out, std::string& err) {
+    // the file's name of the weight: a fused weight takes diffusers' two names for its halves
+    std::string name = slot.name;
+    const auto ends = [&name](const char* suffix) {
+        const size_t n = std::strlen(suffix);
+        return name.size() >= n && name.compare(name.size() - n, n, suffix) == 0;
+    };
+    if (ends(".img_mlp.gate_layer")) {   // diffusers' two names for the fused weight's halves
+        name.resize(name.size() - 10);
+        name += "gate_up";
+    } else if (ends(".img_mlp.proj")) {
+        name.resize(name.size() - 4);
+        name += "gate_up";
+    }
+    const std::vector<float>* norms = nullptr;
+    if (!tensor_norms("model.diffusion_model." + name + ".weight", norms, err)) return false;
+    if ((int64_t) norms->size() < slot.w->n) {
+        err = "image engine: " + slot.name + ": the file's rows are fewer than the weight's";
+        return false;
+    }
+    out.assign(norms->begin(), norms->begin() + slot.w->n);
     return true;
 }
 

@@ -35,6 +35,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <utility>
@@ -188,6 +189,11 @@ private:
     void build_lora_targets();
     /// The products' scratch: T rows of the largest bound rank, FP32 and FP16 (grown on use).
     void lora_scratch(int64_t T);
+    /// A DoRA's row norms: the norms of a slot's weight, one a row of it, from the file's tensors (the text embedder's
+    /// up_gate is ffn_up's rows and then ffn_gate's), cached a tensor (open drops the cache).
+    bool dora_norms(const LoraSlot& slot, std::vector<float>& out, std::string& err);
+    /// One of the file's tensors' row norms, FP32, cached (`name`: the file's own name).
+    bool tensor_norms(const std::string& name, const std::vector<float>*& out, std::string& err);
     MfOut product(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y, int64_t T,
                   const float* bias, bool same_input = false, bool defer = false);
     void ensure(int64_t hw, int n, int64_t max_text);
@@ -214,6 +220,7 @@ private:
     std::vector<std::shared_ptr<const LoraFile>> lora_files_;
     std::string lora_key_;
     int64_t lora_cols_ = 0, lora_tmp_t_ = 0;   // the deltas' scratch's columns and rows (the largest lora_scratch_cols)
+    std::map<std::string, std::vector<float>> norm_cache_;   // DoRA's row norms, a file's tensor (open clears them)
     float* lora_f32_ = nullptr;
     uint16_t* lora16_ = nullptr;
     bool dry_ = false, q8_ = true, w8_ = false, keep0_ = false, text_loaded_ = false;

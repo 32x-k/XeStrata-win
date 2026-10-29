@@ -584,10 +584,14 @@ void LoraDeviceEntry::release() {
     bytes_ = 0;
 }
 
-bool LoraDeviceEntry::upload(const LoraEntry& e, void* stream, std::string& err) {
+bool LoraDeviceEntry::upload(const LoraEntry& e, void* stream, std::string& err, const float* row_coef) {
     release();
     kind_ = e.kind;
     if (e.kind == LoraKind::lokr) {
+        if (row_coef != nullptr) {   // a LoKr's rows are its Kronecker product's: its DoRA is not folded into them
+            err = "the image engine: " + e.key + ": a LoKr's rows are its factors' Kronecker product's";
+            return false;
+        }
         const auto w1 = e.extra.find("lokr_w1");
         const auto w2 = e.extra.find("lokr_w2");
         if (e.lokr.empty() || w1 == e.extra.end() || w2 == e.extra.end() ||
@@ -638,8 +642,20 @@ bool LoraDeviceEntry::upload(const LoraEntry& e, void* stream, std::string& err)
         release();
         return false;
     }
+    // a DoRA's c folded into B's rows (no copy where there is none, a rank-64 adapter's B being hundreds of MiB)
+    std::vector<uint16_t> scaled;
+    const uint16_t* b = e.b.data();
+    if (row_coef != nullptr) {
+        scaled = e.b;
+        for (int64_t r = 0; r < e.rows; ++r)
+            for (int64_t j = 0; j < e.rank; ++j) {
+                uint16_t& h = scaled[(size_t) (r * e.rank + j)];
+                h = strata::kernels::f16_from_f32(strata::kernels::f32_from_f16(h) * row_coef[r]);
+            }
+        b = scaled.data();
+    }
     strata::gpu::copy_async(a_, e.a.data(), e.a.size() * 2, stream);
-    strata::gpu::copy_async(b_, e.b.data(), e.b.size() * 2, stream);
+    strata::gpu::copy_async(b_, b, e.b.size() * 2, stream);
     if (!strata::gpu::stream_sync(stream)) {
         err = "the image engine: the adapter " + e.key + " to the GPU: " + strata::gpu::last_error();
         release();
@@ -681,10 +697,43 @@ void LoraDeviceEntry::add_lokr(const uint16_t* x16, int64_t T, float* y, int64_t
 }
 
 uint64_t LoraLayer::bytes() const {
-    uint64_t n = 0;
+    uint64_t n = base_rows_ > 0 ? (uint64_t) base_rows_ * 4 : 0;
     for (const LoraPart& p : parts)
         if (p.entry) n += p.entry->bytes();
     return n;
+}
+
+LoraLayer::~LoraLayer() {
+    if (base_ != nullptr) strata::gpu::free(base_);
+}
+
+bool LoraLayer::build_base(int64_t rows, void* stream, std::string& err) {
+    if (base_built_) return true;
+    base_built_ = true;
+    bool any = false;
+    for (const LoraPart& p : parts)
+        if (!p.base.empty()) any = true;
+    if (!any || rows <= 0) return true;
+    std::vector<float> host((size_t) rows, 1.0f);
+    for (const LoraPart& p : parts) {
+        if (p.base.empty()) continue;
+        if ((int64_t) p.base.size() != p.n || p.row0 < 0 || p.row0 + p.n > rows) {
+            err = "the image engine: a DoRA's rows are not the weight's";
+            return false;
+        }
+        std::copy(p.base.begin(), p.base.end(), host.begin() + p.row0);
+    }
+    if (!strata::gpu::alloc_device(&base_, (size_t) rows * 4)) {
+        err = std::string("the image engine: a DoRA's row factors on the GPU: ") + strata::gpu::last_error();
+        return false;
+    }
+    strata::gpu::copy_async(base_, host.data(), host.size() * 4, stream);
+    if (!strata::gpu::stream_sync(stream)) {
+        err = std::string("the image engine: a DoRA's row factors to the GPU: ") + strata::gpu::last_error();
+        return false;
+    }
+    base_rows_ = rows;
+    return true;
 }
 
 void LoraLayer::add(const uint16_t* x16, int64_t T, float* y, int64_t ldy, int64_t w_row0, int64_t w_rows,
@@ -699,8 +748,7 @@ void LoraLayer::add(const uint16_t* x16, int64_t T, float* y, int64_t ldy, int64
     }
 }
 
-int64_t lora_scratch_cols(const LoraEntry& e) {
-    if (e.kind == LoraKind::lokr) return e.lokr.empty() ? 0 : e.lokr.in_m * e.lokr.out_k;
+int64_t lora_scratch_cols(const LoraEntry& e) {    if (e.kind == LoraKind::lokr) return e.lokr.empty() ? 0 : e.lokr.in_m * e.lokr.out_k;
     return e.rank;
 }
 
@@ -716,10 +764,48 @@ uint64_t lora_gpu_bytes(const std::vector<LoraUse>& loras, int64_t T) {
                 bytes += 2 * (uint64_t) (e.lokr.out_l * e.lokr.in_m + e.lokr.out_k * e.lokr.in_n);   // w1 and w2
             else
                 continue;
+            if (!e.dora.empty()) bytes += (uint64_t) e.rows * 4;   // the base product's rows' factors
             cols = std::max(cols, lora_scratch_cols(e));
         }
     }
     return bytes + (uint64_t) std::max<int64_t>(T, 0) * (uint64_t) cols * 6;
+}
+
+bool lora_dora_rows(const LoraEntry& e, int64_t src_row, int64_t row0, int64_t n, const std::vector<float>& norms,
+                    float strength, std::vector<float>& coef, std::vector<float>& base, std::string& err) {
+    if (e.kind != LoraKind::lora) {
+        err = "a DoRA (dora_scale) on a ";
+        err += lora_kind_name(e.kind);
+        err += " adapter: the engine's DoRA is the plain form's (its rows are the weight's); this form's are not";
+        return false;
+    }
+    if (!e.dora_over_rows) {
+        err = "a DoRA (dora_scale) over the weight's columns: the engine's DoRA scales its output's rows, as ComfyUI's "
+              "weight_decompose does where the scale is the output axis's";
+        return false;
+    }
+    if (src_row < 0 || row0 < 0 || n < 0 || (int64_t) e.dora.size() < src_row + n ||
+        (int64_t) norms.size() < row0 + n) {
+        err = "a DoRA (dora_scale) whose rows are not the weight's";
+        return false;
+    }
+    coef.resize((size_t) n);
+    base.resize((size_t) n);
+    for (int64_t j = 0; j < n; ++j) {
+        const float c = e.dora[(size_t) (src_row + j)] / (norms[(size_t) (row0 + j)] + kLoraDoraEps);
+        coef[(size_t) j] = c;
+        base[(size_t) j] = 1.0f + strength * (c - 1.0f);
+    }
+    return true;
+}
+
+const LoraPart* lora_dora_overlap(const LoraLayer* layer, int64_t row0, int64_t n, bool dora) {
+    if (layer == nullptr) return nullptr;
+    for (const LoraPart& p : layer->parts) {
+        if (!dora && p.base.empty()) continue;   // neither is a DoRA's: the two add up, whatever their rows
+        if (row0 < p.row0 + p.n && p.row0 < row0 + n) return &p;
+    }
+    return nullptr;
 }
 
 }  // namespace strata::image
