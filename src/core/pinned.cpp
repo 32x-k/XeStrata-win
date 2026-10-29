@@ -57,21 +57,18 @@ namespace {
 std::vector<int> g_copy_devices;
 std::atomic<uint64_t> g_registered{0};   // what the arenas hold registered on their first GPU (pin_room's fallback)
 
-// The arena's registration on its first GPU: at most what pin_room leaves there (Windows), or STRATA_ARENA_PIN_GIB
-// GiB (0: no cap).  The bytes, all of them where nothing caps it (Linux); `why` names the cap when there is one.
+// The arena's registration on its first GPU: all of it, or STRATA_ARENA_PIN_GIB GiB where that is set (0: all).  Not
+// pin_room: one GPU registered a 33 GiB arena past its shared-memory budget on a 64 GB Windows PC and ran steadily
+// (#43, an Arc Pro B50); the budget is kept for the later GPUs (register_on).  `why` names the cap when there is one.
 uint64_t arena_pin_cap(uint64_t bytes, std::string& why) {
     why.clear();
-#if defined(_WIN32)
     if (const char* e = std::getenv("STRATA_ARENA_PIN_GIB"); e != nullptr && *e != '\0') {
         const uint64_t gib = std::strtoull(e, nullptr, 10);
         if (gib == 0) return bytes;
         why = "STRATA_ARENA_PIN_GIB=" + std::to_string(gib);
         return std::min(bytes, gib << 30);
     }
-    return std::min(bytes, pin_room(-1, why));
-#else
     return bytes;
-#endif
 }
 
 // Registers [base, base + bytes) for the current device's copies in pieces, those that end within `cap` bytes of
@@ -504,19 +501,6 @@ bool PinnedArena::to_host_usm(uint64_t pad, std::string& err, const std::functio
     }
     auto& runtime = Runtime::get();
     namespace sx = sycl::ext::oneapi::experimental;
-    {
-        // Windows: host USM is charged to the GPU's shared-memory budget as the registration is; the whole arena
-        // moves or none of it (the PCIe share reads any expert)
-        const uint64_t want = bounds_.back() - bounds_.front() + pad * (bounds_.size() - 1);
-        std::string why;
-        const uint64_t room = pin_room(-1, why);
-        const uint64_t held = piece_bytes(pieces_);
-        if (room != UINT64_MAX && want > room + held) {
-            err = "host USM for the whole arena (" + gib_text(want) + ") does not fit: " + gib_text(room + held) +
-                  " (" + why + ")";
-            return false;
-        }
-    }
     try {   // no copy may read the mapping while it moves, and its registrations go
         runtime.finish();
         for (auto& o : other_reg_) {
