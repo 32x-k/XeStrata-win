@@ -9034,14 +9034,17 @@ def main() -> int:
         webbrowser.open(f"http://{here}:{a.port}/")
     # #96: docker stop sends SIGTERM, which Python ignores by default, so the container's PID 1 would be killed after
     # the grace period with the engine still running. SIGTERM takes Ctrl+C's path below (QUIT to the engine).
+    # SIGHUP (the terminal closed) ended Python without that path, so it is taken as well (not on Windows).
     # SIGINT keeps Python's own handler, so Ctrl+C and a second Ctrl+C work as before.
 
     def on_sigterm(signum, frame):
         raise KeyboardInterrupt
-    try:
-        signal.signal(signal.SIGTERM, on_sigterm)
-    except (ValueError, OSError, AttributeError):         # not the main thread
-        pass
+    for sig in (signal.SIGTERM, getattr(signal, "SIGHUP", None)):
+        try:
+            if sig is not None:
+                signal.signal(sig, on_sigterm)
+        except (ValueError, OSError, AttributeError):     # not the main thread
+            pass
     try:
         while True:
             time.sleep(1)
