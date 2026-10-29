@@ -55,7 +55,8 @@
 //                            then IMAGE key=value ... (times, the budget's split); SIGMAS: as --sigmas; REF: an
 //                            edit's reference images; MASK:, INIT: and STRENGTH: as --mask, --init and --strength;
 //                            LORA:<strength>:<path> an adapter (repeated, in the order given; the strength first, so
-//                            that a path's own colons, as Windows' have, stand);
+//                            that a path's own colons, as Windows' have, stand; the path's spaces and other separators
+//                            %XX'd, the word's whitespace being the line's);
 //                            NEG:<ids, commas> and CFG:<scale> (above 1):
 //                            classifier-free guidance with that negative prompt (its pads as the prompt's); GUID:
 //                            <scale> is HunyuanImage 3.0's guidance token instead (it samples once: no NEG:, no CFG:);
@@ -176,7 +177,29 @@ struct Loras {
 };
 
 // LORA:<strength>:<path> into the request's set: the strength first, the path the rest of the word (its own colons,
-// as a Windows path has, are not read as the strength's)
+// as a Windows path has, are not read as the strength's).  The line is split on whitespace, so a path's separators - a
+// space, a '#' - arrive %XX'd (the server's serve/loras.py writes them so) and are decoded here; an unescaped char, a
+// '%' not followed by two hexadecimal digits among them, is kept as it is.
+std::string decoded_path(const std::string& s) {
+    const auto hex = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '%' && i + 2 < s.size() && hex(s[i + 1]) >= 0 && hex(s[i + 2]) >= 0) {
+            out += (char) (hex(s[i + 1]) * 16 + hex(s[i + 2]));
+            i += 2;
+        } else {
+            out += s[i];
+        }
+    }
+    return out;
+}
+
 void read_lora(const std::string& word, si::QiRequest& r, Loras& loras) {
     const std::string rest = word.substr(5);
     const size_t colon = rest.find(':');
@@ -191,7 +214,7 @@ void read_lora(const std::string& word, si::QiRequest& r, Loras& loras) {
     if (scale.empty() || used != scale.size() || !std::isfinite(s))
         throw std::invalid_argument("LORA:<strength>:<path>: the strength is not a number: " + word);
     if (path.empty()) throw std::invalid_argument("LORA:<strength>:<path>: no file: " + word);
-    r.loras.push_back({loras.get(path), s});
+    r.loras.push_back({loras.get(decoded_path(path)), s});
 }
 
 // the words left on an IMG line: its REF:<path> images (and SIGMAS:, MASK:, INIT:, STRENGTH:...)

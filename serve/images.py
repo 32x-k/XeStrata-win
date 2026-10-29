@@ -57,6 +57,15 @@ boxes in the image's pixels) becomes its JSON prompt (moss_layout_prompt).  It h
 Its text encoder is Qwen3.5-9B, read by the chat's engine when that reads the same file (text_states).
 enhance has the chat's model write the prompt out first (enhance_prompt).
 
+Adapters (serve/loras.py): a request's "lora" field - a list of {"name", "scale"}, one such object, a name alone, or
+the same as a form's JSON text - and the prompt's tags, <lora:name:0.8> in A1111's and Forge's form, positive prompt
+and negative; they go to the engine as IMG's and NEED's LORA:<strength>:<path> words (the path's whitespace %XX'd:
+the engine splits the line on it).  A name the model's LoRA folder ("lora_dir") does not offer is refused where the
+field gives it and taken out of the prompt with a warning where a tag does (the response's strata.lora_unknown).
+"local_path" is a file inside that folder only; "scale_text" is taken and not applied, and the response's strata
+says so (lora_text).  The response's data[] items carry the adapters applied as "lora": [{"name", "scale"}], and
+strata their count and VRAM (lora_n, lora_mib, the IMAGE line's).
+
 The GPU is shared with the text engine one job at a time: an image job takes the service's turn (the FIFO every chat
 request takes), so no chat turn runs on the GPU meanwhile.  The image engine works in the VRAM it is given: what it
 holds and what is free, less a reserve; layers that do not fit are streamed from RAM, so it runs, more slowly, in a few
@@ -87,6 +96,8 @@ byte-level BPE: tools/strata_tokenizer.py's Tokenizer.from_hf), "system_prompt":
 "vision": ".../model-0032-of-0032.safetensors" (SigLIP2, for the edits), "max_refs": 3, "steps": 8, "guidance": 2.5,
 "schedule": "hunyuanimage3", "resolutions": {"base_size": 1024, "step": 64, "align": 16, "extra_resolutions":
 [...]}, "transparency": false} - no "llm" (no text encoder).
+  lora_dir: the folder of the LoRA adapters the model may apply (setup writes <data>/models/loras; serve/loras.py
+  lists what its DiT takes and checks a request's names); without one, "loras" beside the DiT's file
   max_n: the most images one request makes; budget_s: the longest one request's images may take, by the speed this
   server measured (ImageGen.estimate_s; until it has made an image, at most UNMEASURED_N); schedule: Turbo's own
   sigmas or the base model's (base_sigmas; no "schedule" is Turbo), Mage-Flow's static shift (mage_sigmas),
@@ -119,6 +130,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Any
+
+from serve import loras as lora_api
 
 TURBO_STEPS = 8
 MAX_STEPS = 100                    # the base model's
@@ -303,7 +316,10 @@ def parse_request(req: dict, cfg: dict) -> dict:
     the shape asked for (the job's "width"/"height" are that bucket's, "bucket" its row of the table, and
     "requested_size" the size asked for when it is another); its size "auto" (or none) is the model's own choice where
     its config has the ratio head (job["choose_size"]: ImageGen.run asks the engine first, the 1024 x 1024 bucket
-    standing for it until then - no bucket has more tokens)."""
+    standing for it until then - no bucket has more tokens).  The adapters it applies come from "lora" and from the
+    two prompts' <lora:name:0.8> tags (serve/loras.py): job["loras"], and for a tag's name the model does not offer
+    job["lora_unknown"] (the response's strata.lora_unknown), for a scale_text taken and not applied
+    job["lora_text"]."""
     prompt = req.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise ImageRequestError("prompt: a non-empty string")
@@ -311,6 +327,29 @@ def parse_request(req: dict, cfg: dict) -> dict:
         raise ImageRequestError("prompt: at most 16000 characters")
     if "\0" in prompt:
         raise ImageRequestError("prompt: no NUL characters")
+    # the adapters: the "lora" field, then the tags of both prompts (A1111's and Forge's form); a tag's name the model
+    # does not offer is taken out and said in the response's strata (lora_unknown), a field's name is refused
+    folder = lora_api.folder(cfg)
+    try:
+        loras = lora_api.field(req.get("lora"), folder)
+        prompt, tagged, unknown = lora_api.strip_tags(prompt, folder)
+        negative = req.get("negative_prompt")
+        if isinstance(negative, str):
+            negative, neg_tagged, neg_unknown = lora_api.strip_tags(negative, folder)
+            req = {**req, "negative_prompt": negative}
+            tagged += neg_tagged
+            unknown += neg_unknown
+        for use in tagged:
+            if all(u["name"] != use["name"] for u in loras):
+                loras.append(use)
+        lora_api.limit(loras)
+    except lora_api.LoraError as e:
+        raise ImageRequestError(str(e)) from None
+    if loras and not prompt.strip():
+        raise ImageRequestError('prompt: a non-empty string (its LoRA tags are taken out: the "lora" field names them)')
+    text_scale = any("scale_text" in use for use in loras)
+    for use in loras:
+        use.pop("scale_text", None)
     fmt = req.get("response_format") or "b64_json"
     if fmt not in ("b64_json", "url"):
         raise ImageRequestError("response_format: b64_json or url")
@@ -364,6 +403,12 @@ def parse_request(req: dict, cfg: dict) -> dict:
     job = {"prompt": prompt, "width": w, "height": h, "n": n, "steps": steps, "seed": seed, "partial_images": partial,
            "quality": quality or "auto", "response_format": fmt, "output_format": out_fmt,
            "output_compression": compression, "background": background, "bucket": bucket, **requested, **cfg_fields}
+    if loras:
+        job["loras"] = loras
+    if unknown:
+        job["lora_unknown"] = list(dict.fromkeys(unknown))   # a name in both prompts said once
+    if text_scale:
+        job["lora_text"] = True
     if cfg.get("family") == "moss-image":
         job.update(moss_request(req, cfg))
         if req.get("layout") is not None:
@@ -1364,6 +1409,7 @@ class ImageGen:
         self.reserve = int(self.cfg.get("reserve_mib") or 512)
         self.spare = int(self.cfg.get("spare_mib") or 1024)
         self.lock = threading.Lock()              # one request line at a time even when the service's turn is not taken
+        self.loras = lora_api.folder(self.cfg)    # the adapters its DiT takes (serve/loras.py)
         self.engine = ImageEngine(self.cfg, dict(os.environ) if env is None else env, self.dir / "strata-image.log",
                                   self._say)
         self.tok = None
@@ -1398,9 +1444,11 @@ class ImageGen:
                 "(what does not fit is read from the SSD, slower).")
 
     def defaults(self) -> dict:
-        """What a request leaves out gets from this image model (model_defaults), and the speed it was measured at
-        (rates: [megapixels, a step's seconds, the rest's] of each size, for the web page's estimate, estimate_s)."""
-        return {**model_defaults(self.cfg), "size_exp": SIZE_EXP,
+        """What a request leaves out gets from this image model (model_defaults), the LoRA adapters its DiT takes
+        (loras: each with name, path, rank, scale, trigger, targets and size_mib; serve/loras.py), and the speed it was
+        measured at (rates: [megapixels, a step's seconds, the rest's] of each size, for the web page's estimate,
+        estimate_s)."""
+        return {**model_defaults(self.cfg), "loras": self.loras.listing(), "size_exp": SIZE_EXP,
                 "rates": {k: [[mp, *v] for mp, v in sorted(pts.items())] for k, pts in self.rates.items()}}
 
     @staticmethod
@@ -1573,6 +1621,14 @@ class ImageGen:
         return words
 
     @staticmethod
+    def _lora_words(job: dict) -> str:
+        """IMG's and NEED's adapters: LORA:<strength>:<path> for each, in the order the request gave them (the strength
+        first, so a Windows path's colons are not read as one; the path's separators %XX'd, as the engine splits the
+        line on whitespace - encode_path)."""
+        return "".join(f" LORA:{use['scale']!r}:{lora_api.encode_path(use['path'])}"
+                       for use in job.get("loras") or ())
+
+    @staticmethod
     def _cfg_words(job: dict) -> str:
         """IMG's guidance words: the negative prompt's ids and the scale (none without guidance)."""
         if not job.get("cfg"):
@@ -1633,7 +1689,8 @@ class ImageGen:
             self.stage(job)
             n = len(self.ids(job)) - self.drop_of(job)
             neg = f" NEG:{len(job['neg_ids']) - self.drop_of(job)}" if job.get("cfg") else ""
-            return self.engine.ask(f"NEED {w} {h} {n}{self._refs_words(job, need=True)}{neg}", "NEED", 600)
+            return self.engine.ask(f"NEED {w} {h} {n}{self._refs_words(job, need=True)}{neg}{self._lora_words(job)}",
+                                   "NEED", 600)
 
     def free_mib(self) -> int:
         """The device's free VRAM, as the engine sees it (its parts left as they are)."""
@@ -1675,6 +1732,9 @@ class ImageGen:
             with self.lock:
                 self._ready()
                 self.stage(job)
+                if job.get("loras"):
+                    self._say("image job: adapters " + ", ".join(f"{u['name']} at {u['scale']:g}"
+                                                                 for u in job["loras"]))
                 if job.get("choose_size"):
                     self._choose_size(job, timeout, cancel)
                 mw, mh = made_size(job)
@@ -1717,7 +1777,8 @@ class ImageGen:
                         self._live(stage=name, **({"sampling_at": time.monotonic()} if name == "sampling" else {}))
                     try:
                         r = self.engine.ask(f"IMG {mw} {mh} {job['seed'] + i} {self.drop_of(job)} {out} {ids}{sigmas}"
-                                            f"{guide}{self._refs_words(job)}{self._cfg_words(job)}{shown}", "IMAGE",
+                                            f"{guide}{self._refs_words(job)}{self._cfg_words(job)}{shown}"
+                                            f"{self._lora_words(job)}", "IMAGE",
                                             timeout, cancel, step, stage, **({"preview": peek} if shows else {}))
                     except ImageJobFailed as e:
                         self.totals["failed"] += 1
@@ -1755,6 +1816,12 @@ class ImageGen:
             figures["made_size"] = f"{mw}x{mh}"
         if job.get("requested_size"):                      # made at the model's bucket instead: the web page says so
             figures["requested_size"] = job["requested_size"]
+        if job.get("loras"):                               # the IMAGE line's count and VRAM, and a tag's names left out
+            figures.update(lora_n=int(parts[-1].get("lora_n") or 0), lora_mib=parts[-1].get("lora_mib"))
+        if job.get("lora_unknown"):
+            figures["lora_unknown"] = list(job["lora_unknown"])
+        if job.get("lora_text"):                           # a scale_text was given: there is no text encoder's adapter
+            figures["lora_text"] = "not applied (the image engine applies no text encoder's adapter)"
         if first + len(images) == job["n"]:
             self.totals["jobs"] += 1
         self.totals["images"] += len(images)
@@ -1796,8 +1863,11 @@ class ImageGen:
     def response(self, images: list[bytes], job: dict, figures: dict, base_url: str) -> dict:
         data = []
         fmt = job.get("output_format") or "png"
+        applied = [{"name": u["name"], "scale": u["scale"]} for u in job.get("loras") or ()]
         for i, png in enumerate(images):
             item = {"revised_prompt": model_prompt(job), "seed": job["seed"] + i}
+            if applied:   # the adapters this image was made with
+                item["lora"] = [dict(u) for u in applied]
             img = encode_image(png, fmt, job.get("output_compression", 100), job.get("background") == "opaque")
             if job["response_format"] == "url":
                 item["url"] = f"{base_url}/v1/images/files/{self.store(img, fmt)}"

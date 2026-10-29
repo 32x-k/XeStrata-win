@@ -181,6 +181,13 @@ class Config(unittest.TestCase):
             self.assertNotIn(key, self.cfg, key)
         self.assertNotIn("mask", self.cfg, "every model takes a mask: setup writes no mask flag")
         self.assertFalse(self.cfg["transparency"])
+        self.assertNotIn("lora_dir", self.cfg, "HunyuanImage 3.0 applies no adapter")
+
+    def test_the_models_that_take_adapters_name_their_folder(self):
+        """serve/loras.py reads a model's LoRA files from "lora_dir": one folder for every model that applies them."""
+        for model in ("qwen-image-turbo", "mage-flow-turbo", "moss-image"):
+            cfg = QI.image_config("Q8_0", "/engine/strata-image", "/models", model=model)
+            self.assertEqual(cfg["lora_dir"], "/models/loras", model)
 
 
 if __name__ == "__main__":

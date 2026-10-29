@@ -6731,6 +6731,7 @@ def make_handler(svc: Service):
             data = [model, *({**model, "id": x, "alias_of": svc.model} for x in svc.aliases)]
             if svc.images is not None:                    # the image models: POST /v1/images/generations
                 data += [{"id": m["id"], **common, "status": {"value": "loaded"},
+                          "defaults": m["defaults"],
                           "architecture": {"input_modalities": ["text"], "output_modalities": ["image"]}}
                          for m in svc.images.models()]
             return data
@@ -6998,8 +6999,12 @@ def make_handler(svc: Service):
             cancel = threading.Event()
             self._watch_client(cancel)
             print(f"[strata] image: {job['width']}x{job['height']}, n={job['n']}, {job['steps']} steps, "
-                  f"seed {job['seed']}" + (f", {len(job['refs'])} reference image(s)" if job.get("refs") else ""),
+                  f"seed {job['seed']}" + (f", {len(job['refs'])} reference image(s)" if job.get("refs") else "")
+                  + ("".join(f", adapter {u['name']} at {u['scale']:g}" for u in job.get("loras") or ())),
                   flush=True)
+            if job.get("lora_unknown"):
+                print(f"[strata] image: no such LoRA {', '.join(job['lora_unknown'])} in this model's folder: "
+                      "left out of the prompt", flush=True)
             if stream:
                 return self._image_stream(gen, job, cancel, edit)
             host = self.headers.get("Host") or f"{self.server.server_address[0]}:{self.server.server_address[1]}"
@@ -7073,8 +7078,10 @@ def make_handler(svc: Service):
                     return
                 for i, png in enumerate(result["images"]):
                     data = images_api.encode_image(png, fmt, job["output_compression"], opaque)
+                    applied = [{"name": u["name"], "scale": u["scale"]} for u in job.get("loras") or ()]
                     send(f"{kind}.completed", {"b64_json": base64.b64encode(data).decode("ascii"),
                                                "created_at": int(time.time()), **common(),
+                                               **({"lora": applied} if applied else {}),
                                                "usage": images_api.usage(job), "model": gen.model,
                                                "seed": job["seed"] + i, "strata": result["figures"]})
             except OSError:
@@ -8722,7 +8729,8 @@ def main() -> int:
         if not isinstance(extra, list) or not all(isinstance(m, dict) for m in extra):
             raise SystemExit('[strata] config: "image_models" must be a list of "images" sections')
         icfgs = [{k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))
-                      if k in ("exe", "diffusion_model", "vae", "llm", "tokenizer", "system_prompt", "out_dir")
+                      if k in ("exe", "diffusion_model", "vae", "llm", "tokenizer", "system_prompt", "out_dir",
+                               "lora_dir")
                       and isinstance(v, str)
                       and not os.path.isabs(v) else v)
                   for k, v in section.items()} for section in [cfg["images"], *extra]]

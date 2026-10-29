@@ -608,7 +608,8 @@ def image_config(quant: str, exe: Path, models_dir: Path, *, model: str = DEFAUL
                  dit_q8: bool | None = None, dit_keep: bool = True) -> dict:
     """The run config's "images" section for `model` (IMAGE_MODELS; serve/images.py reads it).  dit_q8: Mage-Flow's
     blocks as Q8_0 (True), FP16 (False) or by the VRAM (None, the default: no "dit_q8" in the section); dit_keep: its
-    DiT not in use kept in RAM."""
+    DiT not in use kept in RAM.  The models that take LoRA adapters name the folder they are read from ("lora_dir",
+    one folder for all of them: <models>/loras), which the user puts their files in; HunyuanImage 3.0 applies none."""
     name, dit, text_encoder = IMAGE_MODELS[model]
     if is_hunyuanimage3(dit):
         return {"model_name": name, "family": "hunyuan-image-3", "exe": str(exe), "quant": quant,
@@ -621,9 +622,11 @@ def image_config(quant: str, exe: Path, models_dir: Path, *, model: str = DEFAUL
                 "guidance": HUNYUANIMAGE3_GUIDANCE, "schedule": "hunyuanimage3",
                 "transparency": False, "resolutions": hunyuanimage3_resolutions(),
                 "gpu_policy": policy, "uma": bool(uma), "ssd_offload": bool(ssd_offload)}
+    loras = {"lora_dir": str(Path(models_dir) / "loras")}   # the folder the models that take adapters read
     if is_moss(dit):
         q8 = {"dit_q8": bool(dit_q8)} if dit_q8 is not None else {}
         return {**q8, "model_name": name, "family": "moss-image", "exe": str(exe), "quant": "bf16",
+                **loras,
                 "diffusion_model": str(local_path(models_dir, f"{dit}-1").parent), "steps": DITS[dit][1],
                 "schedule": "moss", "cfg_scale": MOSS_CFG, "shift": MOSS_SHIFT, "transparency": False,
                 "vae": str(local_path(models_dir, "moss-vae")),
@@ -634,12 +637,13 @@ def image_config(quant: str, exe: Path, models_dir: Path, *, model: str = DEFAUL
         edit = {"edit_model": str(local_path(models_dir, f"{MF_EDIT[dit][0]}-bf16")), "edit_steps": MF_EDIT[dit][1],
                 "vision": str(local_path(models_dir, "mf-mmproj"))} if dit in MF_EDIT else {}
         return {**q8, "model_name": name, "family": "mage-flow", "exe": str(exe), "quant": "bf16",
+                **loras,
                 "diffusion_model": str(local_path(models_dir, f"{dit}-bf16")), "steps": DITS[dit][1],
                 "schedule": "mage", "cfg_scale": MF_CFG[dit], **edit, "dit_keep": bool(dit_keep),
                 "transparency": False, "vae": str(local_path(models_dir, MF_VAE.get(dit, "mf-vae"))),
                 "llm": str(local_path(models_dir, text_file(text_encoder, text_quant))), "text_encoder": text_encoder,
                 "text_quant": text_quant, "gpu_policy": policy, "uma": bool(uma), "ssd_offload": bool(ssd_offload)}
-    return {"model_name": name, "exe": str(exe), "quant": quant,
+    return {"model_name": name, "exe": str(exe), "quant": quant, **loras,
             "diffusion_model": str(local_path(models_dir, f"{dit}-{quant}")), "steps": DITS[dit][1],
             "schedule": dit, "transparency": True, "vae": str(local_path(models_dir, "vae")),
             "llm": str(local_path(models_dir, text_file(text_encoder, text_quant))), "text_encoder": text_encoder,
