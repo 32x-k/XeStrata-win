@@ -1143,31 +1143,33 @@ struct AddRows {
 };
 
 // One OFT (or BOFT) stage: a work-group a block of a token's output rows, its bs values through local memory (a stage
-// in place reads its own block's rows).  dst[t][row0 + row(b, i)] = sum_m r[b][i][m] * src[t][row0 + row(b, m)], the
+// in place reads its own block's rows).  dst[t][row(b, i)] = sum_m r[b][i][m] * src[t][src_row0 + row(b, m)], the
 // row's place in the stage's order row(b, i) = m1 * group * k + j * r_b + i / group + (i % group) * k (m1 = block /
-// steps, j = block % steps, steps = k / r_b: boft.py's reshapes; an OFT's the rows as they are).
+// steps, j = block % steps, steps = k / r_b: boft.py's reshapes; an OFT's the rows as they are).  src is the
+// product's output (its row stride and the part's first row) or the scratch; dst is the scratch, the part's
+// blocks * bs rows a token, which is all it holds.
 struct OftStage {
     sycl::local_accessor<float, 1> row;
     const float* r;   // [blocks][bs][bs] of this stage
     const float* src;
     float* dst;
-    int64_t ldy, row0, bs, group, k, r_b, blocks;
+    int64_t src_ld, src_row0, bs, group, k, r_b, blocks;
     void operator()(sycl::nd_item<1> it) const {
         const int64_t gid = (int64_t) it.get_group_linear_id(), t = gid / blocks, b = gid - t * blocks;
         const int64_t i = (int64_t) it.get_local_linear_id();
         const int64_t steps = k / r_b, m1 = b / steps, j = b - m1 * steps, base = m1 * group * k + j * r_b;
         const int64_t off = base + i / group + (i % group) * k;
-        const int64_t at = t * ldy + row0;
-        row[i] = src[at + off];
+        row[i] = src[t * src_ld + src_row0 + off];
         sycl::group_barrier(it.get_group());
         const float* w = r + b * bs * bs + i * bs;
         float v = 0.0f;
         for (int64_t m = 0; m < bs; ++m) v += w[m] * row[m];
-        dst[at + off] = v;
+        dst[t * blocks * bs + off] = v;
     }
 };
 
-// The OFT's last step: y = (1 - scale) y + scale * rescale[src_row + c] * tmp, over the part's rows
+// The OFT's last step: y = (1 - scale) y + scale * rescale[src_row + c] * tmp, over the part's rows (tmp the scratch's
+// n rows a token)
 struct OftFinish {
     const float* tmp;
     const float* rescale;
@@ -1178,7 +1180,7 @@ struct OftFinish {
         const int64_t at = (int64_t) id[0];
         const int64_t t = at / n, c = at - t * n;
         const int64_t i = t * ldy + row0 + c;
-        const float v = (1.0f - scale) * y[i] + scale * (rescale != nullptr ? rescale[src_row + c] : 1.0f) * tmp[i];
+        const float v = (1.0f - scale) * y[i] + scale * (rescale != nullptr ? rescale[src_row + c] : 1.0f) * tmp[at];
         y[i] = v;
     }
 };
@@ -1519,16 +1521,19 @@ void LoraDeviceEntry::rotate(float* y, int64_t T, int64_t ldy, int64_t src_row, 
     sycl::queue& q = strata::core::Runtime::get().stream(stream);
     // the stages one after another: the first reads the product's rows into the scratch, the others turn it in place
     const float* src = y;
+    int64_t src_ld = ldy, src_row0 = row0;
     for (int64_t st = 0; st < oft_.stages; ++st) {
         const int64_t group = oft_.group(), k = oft_.k(st), r_b = oft_.r_b();
         q.submit([&](sycl::handler& h) {
             sycl::local_accessor<float, 1> rows(sycl::range<1>((size_t) oft_.bs), h);
             h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (T * oft_.blocks * oft_.bs)),
                                              sycl::range<1>((size_t) oft_.bs)),
-                           lora_kernels::OftStage{rows, rot_ + st * oft_.blocks * oft_.bs * oft_.bs, src, tmp, ldy, row0,
-                                                  oft_.bs, group, k, r_b, oft_.blocks});
+                           lora_kernels::OftStage{rows, rot_ + st * oft_.blocks * oft_.bs * oft_.bs, src, tmp, src_ld,
+                                                  src_row0, oft_.bs, group, k, r_b, oft_.blocks});
         });
         src = tmp;
+        src_ld = n;
+        src_row0 = 0;
     }
     q.parallel_for(sycl::range<1>((size_t) (T * n)),
                    lora_kernels::OftFinish{tmp, rescale_, scale, y, ldy, src_row, row0, n});
