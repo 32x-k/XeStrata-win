@@ -1759,21 +1759,24 @@ bool lora_dora_rows(const LoraEntry& e, int64_t src_row, int64_t row0, int64_t n
     return true;
 }
 
-const LoraPart* lora_dora_overlap(const LoraLayer* layer, int64_t row0, int64_t n, bool dora, bool oft, bool glora) {
+const LoraPart* lora_dora_overlap(const LoraLayer* layer, int64_t row0, int64_t n, bool dora, bool oft, bool glora,
+                                  bool replaces) {
     if (layer == nullptr) return nullptr;
     for (const LoraPart& p : layer->parts) {
-        // neither is a DoRA's, an OFT's or a GLoRA's: the two add up, whatever their rows
-        if (!dora && !p.dora && !oft && !p.oft && !glora && !p.glora) continue;
+        // neither is a DoRA's, an OFT's, a GLoRA's or a set_weight's: the two add up, whatever their rows
+        if (!dora && !p.dora && !oft && !p.oft && !glora && !p.glora && !replaces && !p.replaces) continue;
         if (row0 < p.row0 + p.n && p.row0 < row0 + n) return &p;
     }
     return nullptr;
 }
 
-std::string lora_patch_clash_why(const LoraPart& p) {
-    if (p.oft)
+std::string lora_patch_clash_why(const LoraPart& p, bool oft, bool glora, bool replaces) {
+    if (p.oft || oft)
         return "an OFT turns the product's output, so the other patch's place against it would be the files'";
-    if (p.glora)
+    if (p.glora || glora)
         return "a GLoRA's own path is the weight's, so the other patch's place against it would be the files'";
+    if (p.replaces || replaces)
+        return "a set_weight sets the weight, so whether it keeps the other patch would be the files' order";
     return "a DoRA's rows are the weight's before the other's patch";
 }
 

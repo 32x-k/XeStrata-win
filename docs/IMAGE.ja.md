@@ -320,7 +320,7 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 | GLoRA | `a1`・`a2`・`b1`・`b2` | `W (a1 a2)` と `b1 b2` の和。重みの積をもう一度通す。ComfyUI の読みと古い LyCORIS の読みの両方 |
 
 - 1 つの重みに 2 つの形式が並ぶファイルは、読むときに断ります（ComfyUI は片方を黙って落とします）。
-- DoRA・OFT・GLoRA の当たる行には、ほかのアダプターを重ねられません（重ねる順で絵が変わるため）。ほかの形式どうしは同じ行でも足し算になります。
+- DoRA・OFT・GLoRA・`set_weight` の当たる行には、ほかのアダプターを重ねられません（重ねる順で絵が変わるため）。ほかの形式どうしは同じ行でも足し算になります。
 - バイアスの差分は、その重みが自分のバイアスを足すときだけ当たります。Qwen-Image-2.1 の DiT はバイアスを足さないので、Qwen では当たりません。MOSS-Image は 42 のブロックと `final_linear_video` が足さず、Mage-Flow はどの重みも足します。
 - MageTrail の低ランクの変調（F32 の重み）に当たるアダプターは当たりません（キーと理由を返します）。
 - OFT は 1 本の重みに分かれる名前に当てられません（MOSS-Image の `qkv` は q・k・v の 3 本です）。Qwen-Image-2.1 の `modulation.1` は決まった行数ずつの帯で書くので、そこに当たる OFT は断ります。

@@ -320,7 +320,7 @@ A file's key has `diffusion_model.`, `transformer.` or `model.diffusion_model.` 
 | GLoRA | `a1`, `a2`, `b1`, `b2` | `W (a1 a2)` and `b1 b2` added, the weight's product run once more; both ComfyUI's reading and old LyCORIS's |
 
 - A file with two forms on one weight is refused when read (ComfyUI drops one of them silently).
-- A DoRA's, an OFT's or a GLoRA's rows take no other adapter (the order would change the image); the other forms add up even on one weight.
+- A DoRA's, an OFT's, a GLoRA's or a `set_weight`'s rows take no other adapter (the order would change the image); the other forms add up even on one weight.
 - A bias's delta acts only where the weight adds a bias of its own. Qwen-Image-2.1's DiT adds none, so Qwen takes no bias's delta. MOSS-Image's 42 blocks and `final_linear_video` add none, and every one of Mage-Flow's weights does.
 - MageTrail's low-rank modulation (F32 weights) takes no adapter (the key and the reason are returned).
 - An OFT cannot take a name that splits into more than one weight (MOSS-Image's `qkv` is q, k and v). Qwen-Image-2.1's `modulation.1` is written a band of rows at a time, so an OFT on it is refused.

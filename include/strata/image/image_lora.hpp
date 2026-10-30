@@ -296,6 +296,7 @@ struct LoraPart {
 
 /// The weight's own product of a GLoRA's input, added to the product's output: `output(v16, t0, rows, row0, n)` puts
 /// the weight's rows [row0, row0 + n) product of v16's [rows][cols] (the tokens t0 .. t0 + rows) into the product's
+    bool replaces = false;   // a set_weight's: the weight it sets, which a patch before or after it would not keep
 /// output at those rows: the DiT writes it, its weight's own path (an FP16 or a quantized weight's) and its own table
 /// of the rows.
 using LoraGloraOutput = std::function<void(const uint16_t* v16, int64_t t0, int64_t rows, int64_t row0, int64_t n)>;
@@ -361,15 +362,16 @@ void lora_output_add(float* y, int64_t T, int64_t ldy, int64_t row0, const float
 bool lora_dora_rows(const LoraEntry& e, int64_t src_row, int64_t row0, int64_t n, const std::vector<float>& norms,
                     float strength, std::vector<float>& coef, std::vector<float>& base, std::string& err);
 
-/// The bound part whose rows overlap [row0, row0 + n) of a weight's, where one of the two is a DoRA's, an OFT's or a
-/// GLoRA's: the two cannot be composed (ComfyUI patches the weights in the file's order, so a DoRA's c, an OFT's
-/// turning, and a GLoRA's read of the weight before its patch would depend on that order), so the caller refuses the
-/// set.  null: no such part.
+/// The bound part whose rows overlap [row0, row0 + n) of a weight's, where one of the two is a DoRA's, an OFT's, a
+/// GLoRA's or a set_weight's: the two cannot be composed (ComfyUI patches the weights in the file's order, so a DoRA's
+/// c, an OFT's turning, a GLoRA's read of the weight before its patch, and whether a set_weight keeps the other patch
+/// would depend on that order), so the caller refuses the set.  null: no such part.
 const LoraPart* lora_dora_overlap(const LoraLayer* layer, int64_t row0, int64_t n, bool dora, bool oft = false,
-                                  bool glora = false);
+                                  bool glora = false, bool replaces = false);
 
-/// Why a part's rows take no other adapter's (`lora_dora_overlap`'s part): the sentence a caller's error ends with.
-std::string lora_patch_clash_why(const LoraPart& p);
+/// Why a part's rows take no other adapter's (`lora_dora_overlap`'s part, and the forms of the entry being bound
+/// against it): the sentence a caller's error ends with.
+std::string lora_patch_clash_why(const LoraPart& p, bool oft = false, bool glora = false, bool replaces = false);
 
 /// The host tensors of `e` as FP16 (a file's BF16, F16 or F32), for a test or a form built by hand.
 void lora_to_f16(const std::vector<float>& f32, std::vector<uint16_t>& out);

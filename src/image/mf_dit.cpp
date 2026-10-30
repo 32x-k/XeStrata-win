@@ -895,10 +895,10 @@ bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                 }
             }
             if (const LoraPart* clash = lora_dora_overlap(slot->w->lora, slot->row0, slot->rows, !coef.empty(), oft,
-                                                          glora)) {
+                                                          glora, e.replaces)) {
                 err = "image engine: " + u.file->path() + ": " + e.key + ": the weight's rows " +
                       std::to_string(slot->row0) + " .. " + std::to_string(slot->row0 + slot->rows) +
-                      " are another adapter's, and " + lora_patch_clash_why(*clash);
+                      " are another adapter's, and " + lora_patch_clash_why(*clash, oft, glora, e.replaces);
                 drop_loras();
                 return false;
             }
@@ -923,6 +923,7 @@ bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
             part.dora = !coef.empty();
             part.oft = oft;
             part.glora = glora;
+            part.replaces = e.replaces;
             part.base = std::move(base);
             slot->w->lora->parts.push_back(std::move(part));
             lora_cols_ = std::max(lora_cols_, lora_scratch_cols(e));

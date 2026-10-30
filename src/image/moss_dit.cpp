@@ -916,10 +916,11 @@ bool MossDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                 }
                 if (e.replaces)   // a set_weight: the weight interpolates to the file's, W + s (S - W)
                     bases[i].assign((size_t) slot->rows, 1.0f - u.scale);
-                if (const LoraPart* clash = lora_dora_overlap(slot->w->lora, slot->row0, slot->rows, dora, oft, glora)) {
+                if (const LoraPart* clash = lora_dora_overlap(slot->w->lora, slot->row0, slot->rows, dora, oft, glora,
+                                                              e.replaces)) {
                     err = "image engine: " + u.file->path() + ": " + e.key + ": the weight's rows " +
                           std::to_string(slot->row0) + " .. " + std::to_string(slot->row0 + slot->rows) +
-                          " are another adapter's, and " + lora_patch_clash_why(*clash);
+                          " are another adapter's, and " + lora_patch_clash_why(*clash, oft, glora, e.replaces);
                     drop_loras();
                     return false;
                 }
@@ -945,6 +946,7 @@ bool MossDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                 part.dora = dora;
                 part.oft = oft;
                 part.glora = glora;
+                part.replaces = e.replaces;
                 part.base = std::move(bases[i]);
                 slot->w->lora->parts.push_back(std::move(part));
             }
