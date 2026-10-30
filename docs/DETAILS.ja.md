@@ -1810,8 +1810,8 @@ Strata の設計、測定、ボトルネックは、upstream の論文 **[docs/p
 
 ## クレジットとライセンス
 
-XeStrata は全体が [LGPL-3.0-or-later](../COPYING.LESSER) です。
-Strata、ggml / llama.cpp と Project Maya（どれも MIT）から来たコードも XeStrata の一部として LGPL で、著作権表示と許諾表示は [NOTICE](../NOTICE) にあります。
+XeStrata のために書いたコードは [LGPL-3.0-or-later](../COPYING.LESSER) で、組み合わせた XeStrata 全体も同じライセンスで配布します。
+Strata、ggml / llama.cpp と Project Maya（どれも MIT）から来たコードは、XeStrata の中でも MIT のままで、著作権表示と許諾表示は [NOTICE](../NOTICE) にあります。
 例外は、元のライセンスのままの intel/llvm へのパッチと oneMath への変更、`third_party/main/` の写し（`ggml-common.h`、`ggml-common-tq.h`、`quantscope.py`、`stb_image.h`、Outfit、KaTeX）と AOTriton へのパッチ、`third_party/nonfree/` です（下と [third_party/main/README.md](../third_party/main/README.md)）。
 モデルのファイルは XeStrata に含まれず、それぞれのライセンスが適用されます（下）。
 

@@ -393,8 +393,10 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
 
 ## ライセンス
 
-XeStrata（著作権は MistVVK と XeStrata の貢献者）は自由ソフトウェアで、全体を
-[GNU Lesser General Public License の第 3 版以降](COPYING.LESSER)（`COPYING.LESSER` と `COPYING`）で配布します。
+XeStrata は自由ソフトウェアです。MistVVK と XeStrata の貢献者が XeStrata のために書いたコードは
+[GNU Lesser General Public License の第 3 版以降](COPYING.LESSER)（`COPYING.LESSER` と `COPYING`）で、
+それらを組み合わせた XeStrata 全体も同じライセンスで配布します。ただし、Strata と ggml / llama.cpp から来たコード（MIT）と
+下に挙げる部品は、元のライセンスのままです。
 
 - **メーカーの計算ライブラリと OS のランタイムとのリンク**: GPU や CPU のメーカーが自社の製品向けに出している計算ライブラリとその実行時ライブラリ
   （oneMKL や Intel oneAPI のコンパイラの実行時ライブラリ、cuBLAS や CUDA のランタイムとドライバなど）、

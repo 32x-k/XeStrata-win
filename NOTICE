@@ -31,7 +31,8 @@ Copyright notices
 Every copyright holder whose work is in this repository, its license and where the license text is:
 
 - Copyright (C) 2026 MistVVK and the XeStrata contributors
-  LGPL-3.0-or-later - XeStrata, as a whole and in its own files - COPYING.LESSER, COPYING
+  LGPL-3.0-or-later - XeStrata's own code, and XeStrata as a combined work (its parts keep the licenses listed
+  here) - COPYING.LESSER, COPYING
 - Copyright (c) 2026 Niko1221 and the Strata contributors
   MIT - Strata, which XeStrata is a port of. Strata's files XeStrata has not changed stay under MIT alone
   (their headers say MIT); in those XeStrata has changed, Strata's code stays under MIT and XeStrata's changes

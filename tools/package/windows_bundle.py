@@ -338,7 +338,8 @@ def main() -> None:
         fail("programs or libraries of no component (COMPONENTS in this script): " + ", ".join(unknown))
 
     lines = ["# Third-party notices", "",
-             f"XeStrata {a.version} for Windows carries the components below. XeStrata itself is under the LGPL "
+             f"XeStrata {a.version} for Windows carries the components below. XeStrata's own code is under the LGPL "
+             "and its parts from other projects keep their licenses "
              "(`NOTICE`, `COPYING`, `COPYING.LESSER`); its source is at https://github.com/MistVVK/XeStrata. "
              "The license texts are in `licenses/`.", "",
              "The Microsoft Visual C++ runtime, the GPU makers' drivers and NVIDIA's libraries are not part of it: "

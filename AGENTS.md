@@ -76,7 +76,7 @@ A change that does not meet them, a pull request among others, does not go in as
 
 ## Licenses
 
-XeStrata as a whole is under the LGPL, version 3 or later (`COPYING.LESSER`, `COPYING`); copyright and license notices are in `NOTICE`.
+XeStrata's own code is under the LGPL, version 3 or later (`COPYING.LESSER`, `COPYING`), and XeStrata as a combined work is distributed under it; the code from other projects keeps its own license (below). Copyright and license notices are in `NOTICE`.
 `NOTICE` also grants an additional permission (GPL version 3, section 7): XeStrata linked with a GPU or CPU maker's math or compute library and its runtime libraries (oneMKL, cuBLAS, the CUDA runtime), or with the C and C++ runtime libraries of the operating system or its standard compiler (Microsoft's Universal C Runtime and Visual C++ runtime), may be conveyed.
 
 Each file carries the license of the code in it, by where that code comes from:

@@ -416,8 +416,10 @@ permission under GPL section 7, what goes in, and how to report).
 
 ## License
 
-XeStrata (copyright MistVVK and the XeStrata contributors) is free software; the whole of it is under the
-[GNU Lesser General Public License, version 3 or later](COPYING.LESSER) (`COPYING.LESSER`, with `COPYING`).
+XeStrata is free software. The code written for it, by MistVVK and the XeStrata contributors, is under the
+[GNU Lesser General Public License, version 3 or later](COPYING.LESSER) (`COPYING.LESSER`, with `COPYING`), and
+XeStrata as a combined work is distributed under that license. Some parts keep their own licenses: the code that
+comes from Strata and ggml / llama.cpp (MIT) and the components listed below.
 
 - **Linking with the vendors' math libraries and the system's runtime:** what is linked with a math or compute library
   a GPU or CPU maker publishes for its processors, and with the runtime libraries it needs (oneMKL and the runtime
