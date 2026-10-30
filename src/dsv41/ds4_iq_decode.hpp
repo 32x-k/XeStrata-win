@@ -338,22 +338,22 @@ template <int T> struct Decoder {
         const int code = (int) (byte ^ 128u) - 128;
         return d.d * (float) ((j < 16 ? d.s0 : d.s1) * code) - (j < 16 ? d.m0 : d.m1);
     }
+    float dot_q8_block(const uint8_t* row, int b, const int8_t* x) const {
+        Sub d{};
+        decode<T>(row, b, table<T>(), d);
+        int lo = 0, hi = 0, sl = 0, sh = 0;
+        for (int j = 0; j < 32; ++j) {
+            const uint32_t byte = ((uint32_t) d.q[j / 4] >> (8 * (j % 4))) & 255u;
+            const int code = (int) (byte ^ 128u) - 128;
+            const int v = (int) ((uint8_t) x[j] ^ 128u) - 128;
+            if (j < 16) { lo += code * v; sl += v; }
+            else { hi += code * v; sh += v; }
+        }
+        return d.d * (float) (d.s0 * lo + d.s1 * hi) - (d.m0 * (float) sl + d.m1 * (float) sh);
+    }
     float dot_q8(const uint8_t* row, const int8_t* x, const float* xd, int k) const {
         float sum = 0.0f;
-        for (int b = 0; b < k / 32; ++b) {
-            Sub d{};
-            decode<T>(row, b, table<T>(), d);
-            int lo = 0, hi = 0, sl = 0, sh = 0;
-            for (int j = 0; j < 32; ++j) {
-                const uint32_t byte = ((uint32_t) d.q[j / 4] >> (8 * (j % 4))) & 255u;
-                const int code = (int) (byte ^ 128u) - 128;
-                const int v = (int) ((uint8_t) x[b * 32 + j] ^ 128u) - 128;
-                if (j < 16) { lo += code * v; sl += v; }
-                else { hi += code * v; sh += v; }
-            }
-            const float dot = d.d * (float) (d.s0 * lo + d.s1 * hi) - (d.m0 * (float) sl + d.m1 * (float) sh);
-            sum = sycl::fma(xd[b], dot, sum);
-        }
+        for (int b = 0; b < k / 32; ++b) sum = sycl::fma(xd[b], dot_q8_block(row, b, x + (size_t) b * 32), sum);
         return sum;
     }
 };

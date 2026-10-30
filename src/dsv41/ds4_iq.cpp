@@ -11,9 +11,66 @@
 #include "ds4_quant_sycl.hpp"
 #include "ds4_numerics.cuh"
 #include "ds4_iq_decode.hpp"
+#include <algorithm>
+#include <cstdlib>
 
 namespace strata::ds4::gguf::iq {
 using namespace sycl_decode;
+
+namespace {
+bool light_on() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_DS4_NO_LIGHT");
+        return !(v && v[0] == '1');
+    }();
+    return on;
+}
+
+template <bool GU, typename Decoder>
+void light_set(const SetArgs& a, size_t rb, Decoder decode, sycl::queue& s) {
+    if (a.n_exp <= 0 || a.max_rows <= 0) return;
+    const int n = GU ? a.n_ff : a.n_embd, k = GU ? a.n_embd : a.n_ff;
+    const int rows = std::min(a.max_rows, kLightRows);
+    sycl_detail::parallel(s, (size_t) a.n_exp * rows * n, [=](size_t id) {
+        const int col = (int) (id % n), row = (int) ((id / n) % rows);
+        const int e = (int) (id / ((size_t) n * rows));
+        const int count = a.bounds[e + 1] - a.bounds[e];
+        if (row >= count || count > kLightRows) return;
+        const int first = a.bounds[e] - a.row0;
+        const size_t local = (size_t) first + (size_t) row;
+        const int input = GU && a.idx ? a.idx[local] : (int) local;
+        const uint8_t* blob = a.wbase + (size_t) e * a.stride;
+        const uint8_t* w = blob + a.tr[GU ? 0 : 2] + (size_t) col * rb;
+        const uint8_t* up = blob + a.tr[1] + (size_t) col * rb;
+        float sum = 0.0f, usum = 0.0f;
+        for (int b = 0; b < k / 32; ++b) {
+            const size_t base = (size_t) input * a.ldx + (size_t) b * 32;
+            float values[32], amax = 0.0f;
+            for (int j = 0; j < 32; ++j) {
+                values[j] = GU ? a.xf[base + j] : sycl_detail::f16_value(a.xh[base + j]);
+                amax = sycl::fmax(amax, sycl::fabs(values[j]));
+            }
+            const float scale = amax / 127.0f;
+            int8_t codes[32];
+            for (int j = 0; j < 32; ++j) codes[j] = (int8_t) (amax > 0.0f ? sycl::rint(values[j] / scale) : 0.0f);
+            sum = sycl::fma(scale, decode.dot_q8_block(w, b, codes), sum);
+            if constexpr (GU) usum = sycl::fma(scale, decode.dot_q8_block(up, b, codes), usum);
+        }
+        if constexpr (GU) a.h[local * a.ldo + col] = sycl_detail::f16_bits(portable::swiglu(sum, usum, a.limit));
+        else a.y[local * a.ldo + col] = sum;
+    });
+}
+
+template <bool GU>
+bool launch_light(const SetArgs& a, sycl::queue& s) {
+    const int type = GU ? a.tg : a.td;
+    if (is_tq(type) || type == kQ5_K || type == kQ6_K || !light_on() ||
+        a.n_embd % 256 != 0 || a.n_ff % 256 != 0 || (GU && !a.xf)) return false;
+    return dispatch(type, [&](auto t) {
+        light_set<GU>(a, row_bytes_t<t.value>(GU ? a.n_embd : a.n_ff), Decoder<t.value>{}, s);
+    });
+}
+}  // namespace
 
 bool gate_up(const Args& a, int groups, int ne_max, sycl::queue& s) {
     if (is_tq(a.tg)) return tq::gate_up(a, groups, ne_max, s);
@@ -29,15 +86,24 @@ bool down(const Args& a, int groups, int ne_max, sycl::queue& s) {
 }
 bool set_gate_up(const SetArgs& a, sycl::queue& s) {
     if (is_tq(a.tg)) return tq::set_gate_up(a, s);
-    return dispatch(a.tg, [&](auto t) { portable::set<true>(a, row_bytes_t<t.value>(a.n_embd), Decoder<t.value>{}, s); });
+    SetArgs rest = a;
+    if (light_gate_up(a, s)) {
+        if (a.max_rows <= kLightRows) return true;
+        rest.skip_le = std::max(a.skip_le, kLightRows);
+    }
+    return dispatch(a.tg, [&](auto t) { portable::set<true>(rest, row_bytes_t<t.value>(a.n_embd), Decoder<t.value>{}, s); });
 }
 bool set_down(const SetArgs& a, sycl::queue& s) {
     if (is_tq(a.td)) return tq::set_down(a, s);
-    return dispatch(a.td, [&](auto t) { portable::set<false>(a, row_bytes_t<t.value>(a.n_ff), Decoder<t.value>{}, s); });
+    SetArgs rest = a;
+    if (light_down(a, s)) {
+        if (a.max_rows <= kLightRows) return true;
+        rest.skip_le = std::max(a.skip_le, kLightRows);
+    }
+    return dispatch(a.td, [&](auto t) { portable::set<false>(rest, row_bytes_t<t.value>(a.n_ff), Decoder<t.value>{}, s); });
 }
-// The portable set path handles every row count. No light launch means the caller leaves skip_le at zero.
-bool light_gate_up(const SetArgs&, sycl::queue&) { return false; }
-bool light_down(const SetArgs&, sycl::queue&) { return false; }
+bool light_gate_up(const SetArgs& a, sycl::queue& s) { return launch_light<true>(a, s); }
+bool light_down(const SetArgs& a, sycl::queue& s) { return launch_light<false>(a, s); }
 bool hipk_force(int) { return false; }
 long long hipk_launches() { return -1; }
 

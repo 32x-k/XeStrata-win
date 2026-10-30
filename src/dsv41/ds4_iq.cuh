@@ -89,8 +89,11 @@ bool f16_rows_ok(int type);
 void gather_f16(const uint16_t* x, int ldx, const int* idx, int n, int k, uint16_t* dst, sycl::queue& s);
 /// h[r][c] = FP16 of the tiles' clamped SwiGLU of gu[r][c] (gate) and gu[r][ff + c] (up), F32 rows ld apart
 void swiglu_f16(const float* gu, int ld, int n, int ff, float limit, uint16_t* h, int ldh, sycl::queue& s);
-/// Optional light set path. The portable implementation returns false without launching; the caller submits
-/// every expert through set_gate_up / set_down.
+// Upstream's light-set boundary also selects the numerical contract (per-32 Q8 activations). It is not a device
+// tile size: keep it independent of work-group/sub-group sizes, as well as STRATA_DS4_NO_LIGHT's opt-out.
+constexpr int kLightRows = 16;
+/// Optional light set path: experts with at most kLightRows rows, quantized per 32 values to int8 with FP32 scales.
+/// Gate/up reads xf (FP32), even when xf16 is also supplied. Without xf it returns false for the caller's fallback.
 bool light_gate_up(const SetArgs& a, sycl::queue& s);
 bool light_down(const SetArgs& a, sycl::queue& s);
 

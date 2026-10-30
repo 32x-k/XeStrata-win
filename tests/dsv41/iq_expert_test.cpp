@@ -10,6 +10,7 @@
 //   iq_expert_test [--type 16,17,18,21,22,23,29] [--bench] [--iq256 0|1]
 #include "../../src/dsv41/ds4_gguf_cpu.hpp"
 #include "../../src/dsv41/ds4_iq.cuh"
+#include "../../src/dsv41/ds4_sycl.hpp"
 
 #include "sycl_test.hpp"
 using namespace dsv41_test;
@@ -67,6 +68,17 @@ static double swiglu(double g, double u, double lim) {
 static double dotd(const float* w, const float* x, int k, double* sabs = nullptr) {
     double s = 0, sa = 0; for (int i = 0; i < k; ++i) { const double t = (double) w[i] * x[i]; s += t; sa += std::fabs(t); } if (sabs) *sabs = sa; return s;
 }
+// The unquantized fallback accumulates one FP32 FMA per input. A double dot can differ substantially after
+// cancellation, before SwiGLU and its FP16 output rounding. Weights still come from ggml's independent decoder.
+static float dot_fma(const float* w, const float* x, int k) {
+    float sum = 0.0f;
+    for (int i = 0; i < k; ++i) sum = std::fma(w[i], x[i], sum);
+    return sum;
+}
+static float swiglu_f32(float gate, float up_value, float limit) {
+    if (limit > 0.0f) { gate = std::min(gate, limit); up_value = std::min(std::max(up_value, -limit), limit); }
+    return (gate / (1.0f + std::exp(-gate))) * up_value;
+}
 // an activation buffer of a ggml type (Q8_K for the i-quant rows) decoded by ggml itself
 static std::vector<float> act_values(int type, const void* act, int k) {
     std::vector<float> v((size_t) k);
@@ -115,6 +127,163 @@ static Mat make_mat(std::mt19937_64& rng, int type, int rows, int k) {
     const size_t rb = (size_t) (k / bv) * (size_t) bb;
     for (int r = 0; r < rows; ++r) tr->to_float(&m.bytes[(size_t) r * rb], &m.w[(size_t) r * k], k);
     return m;
+}
+
+// The 16-row boundary changes the activations' numerical representation, independently of the device's tiles.
+// CPU references use ggml's decoded weights and the host quantizer above, never the device decoder.
+template <class Report>
+static void light_contract(int type, const std::vector<Mat>& g, const std::vector<Mat>& u,
+                           const std::vector<Mat>& d, const std::vector<float>& x,
+                           const uint8_t* weights, size_t stride, const size_t* offsets, float limit, Report report) {
+    if (!iq::f16_rows_ok(type)) return;
+    const char* disabled = std::getenv("STRATA_DS4_NO_LIGHT");
+    if (disabled && disabled[0] == '1') return;
+    const int k = g[0].k, ff = g[0].rows, nt = (int) (x.size() / k), nr = 33;
+    if (nt <= 0) throw std::invalid_argument("empty light-set activation fixture");
+    const int ldx = k + 3, ldh = ff + 3, ldy = k + 5;
+    const uint16_t guard_h = 0x3555;
+    const float guard_y = -321.0f;
+    std::vector<int> bounds{7, 7, 23, 40}, idx(nr);
+    std::vector<float> xp((size_t) nt * ldx, -19.0f), xhalf(xp.size());
+    std::vector<uint16_t> x16(xp.size()), zeros(xp.size(), 0);
+    for (int t = 0; t < nt; ++t)
+        for (int j = 0; j < k; ++j) xp[(size_t) t * ldx + j] = x[(size_t) t * k + j];
+    for (size_t i = 0; i < xp.size(); ++i) {
+        x16[i] = strata::ds4::sycl_detail::f16_bits(xp[i]);
+        xhalf[i] = h2f(x16[i]);
+    }
+    for (int r = 0; r < nr; ++r) idx[r] = (nr - 1 - r) % nt;
+    std::vector<Q8> xquant(nt);
+    for (int t = 0; t < nt; ++t) xquant[t] = quant(xp.data() + (size_t) t * ldx, k);
+    iq::SetArgs a{};
+    a.wbase = weights; a.stride = stride;
+    for (int r = 0; r < 3; ++r) a.tr[r] = offsets[r];
+    a.bounds = up(bounds); a.row0 = 7; a.n_exp = 3; a.max_rows = 17; a.n_embd = k; a.n_ff = ff;
+    a.limit = limit; a.tg = a.td = type; a.idx = up(idx); a.ldx = ldx; a.ldo = ldh;
+    const float* dxf = up(xp);
+    const uint16_t* dx16 = up(x16), *dzero = up(zeros);
+    std::vector<uint16_t> initial((size_t) nr * ldh, guard_h);
+    a.h = up(initial);
+    const char* labels[] = {"light gate FP32 priority", "set gate 16/17", "set gate FP32 only",
+                            "set gate FP16 only", "set gate max_rows=16"};
+    for (int phase = 0; phase < 5; ++phase) {
+        a.n_exp = phase == 4 ? 2 : 3; a.max_rows = phase == 4 ? 16 : 17;
+        a.xf = phase == 3 ? nullptr : dxf;
+        a.xf16 = phase < 2 ? dzero : phase == 3 ? dx16 : nullptr;
+        queue().memcpy(a.h, initial.data(), initial.size() * sizeof(uint16_t)).wait_and_throw();
+        if (phase == 3 && iq::light_gate_up(a, queue()))
+            throw std::runtime_error("light gate/up accepted a missing FP32 input");
+        const bool accepted = phase == 0 ? iq::light_gate_up(a, queue()) : iq::set_gate_up(a, queue());
+        if (!accepted) throw std::runtime_error("light/set gate/up refused the regression fixture");
+        // Match the legacy parity tests' explicit launch completion before reading their numeric results.
+        queue().wait_and_throw();
+        const auto actual = down_(a.h, initial.size());
+        double worst = 0;
+        int worst_row = -1, worst_col = -1;
+        double worst_expected = 0;
+        struct ReferenceDelta {
+            double error = 0, gate = 0, gate_fma = 0, gate_abs = 0;
+            double up_value = 0, up_fma = 0, up_abs = 0, h = 0, h_fma = 0;
+            int row = 0, col = 0;
+        } delta;
+        const auto remember = [&](double error, int row, int col, double expected) {
+            if (!std::isfinite(error)) error = 1e30;
+            if (error > worst) { worst = error; worst_row = row; worst_col = col; worst_expected = expected; }
+        };
+        for (int r = 0; r < nr; ++r) {
+            const int e = r < 16 ? 1 : 2;
+            const bool untouched = (phase == 0 || phase == 4) && r >= 16;
+            const float* input = phase == 3 ? xhalf.data() + (size_t) idx[r] * ldx :
+                r < 16 ? xquant[idx[r]].xhat.data() : xp.data() + (size_t) idx[r] * ldx;
+            for (int c = 0; c < ldh; ++c) {
+                const size_t at = (size_t) r * ldh + c;
+                if (c >= ff || untouched) {
+                    if (actual[at] != guard_h) remember(1e30, r, c, h2f(guard_h));
+                    continue;
+                }
+                const float* wg = g[e].w.data() + (size_t) c * k;
+                const float* wu = u[e].w.data() + (size_t) c * k;
+                double gate_abs, up_abs;
+                const double gate = dotd(wg, input, k, &gate_abs), up_value = dotd(wu, input, k, &up_abs);
+                double expected = swiglu(gate, up_value, limit);
+                if (phase == 1 && r >= 16) expected = 0.0;  // The supplied FP16 copy is zero in this phase.
+                else if (phase == 3 || r >= 16) {
+                    const float gate_fma = dot_fma(wg, input, k), up_fma = dot_fma(wu, input, k);
+                    const double h_fma = swiglu_f32(gate_fma, up_fma, limit);
+                    const double difference = std::abs(h_fma - expected) / (1e-4 + 1e-3 * std::abs(expected));
+                    if (difference > delta.error)
+                        delta = {difference, gate, gate_fma, gate_abs, up_value, up_fma, up_abs,
+                                    expected, h_fma, r, c};
+                    expected = h_fma;
+                }
+                const double error = std::abs(h2f(actual[at]) - expected) / (1e-4 + 1e-3 * std::abs(expected));
+                remember(error, r, c, expected);
+            }
+        }
+        if (worst > 1.0) {
+            const uint16_t bits = actual[(size_t) worst_row * ldh + worst_col];
+            std::fprintf(stderr, "%s %s: row=%d col=%d expert=%d actual=%g bits=0x%04x expected=%g sentinel=%d\n",
+                iq::name(type), labels[phase], worst_row, worst_col, worst_row < 16 ? 1 : 2,
+                h2f(bits), (unsigned) bits, worst_expected, bits == guard_h);
+        }
+        if (delta.error > 1.0)
+            std::printf("%s %s CPU reference: row=%d col=%d gate64=%.9g gate_fma=%.9g sum_abs=%.9g "
+                        "up64=%.9g up_fma=%.9g sum_abs=%.9g h64=%.9g h_fma=%.9g\n",
+                iq::name(type), labels[phase], delta.row, delta.col, delta.gate, delta.gate_fma, delta.gate_abs,
+                delta.up_value, delta.up_fma, delta.up_abs, delta.h, delta.h_fma);
+        report(labels[phase], type, worst, 1.0);
+    }
+    std::vector<uint16_t> hin((size_t) nr * ldh, guard_h);
+    std::vector<std::vector<float>> hf(nr, std::vector<float>(ff));
+    std::vector<Q8> hquant(nr);
+    for (int r = 0; r < nr; ++r) {
+        for (int c = 0; c < ff; ++c) {
+            hin[(size_t) r * ldh + c] = strata::ds4::sycl_detail::f16_bits(x[((size_t) r * ff + c) % x.size()]);
+            hf[r][c] = h2f(hin[(size_t) r * ldh + c]);
+        }
+        hquant[r] = quant(hf[r].data(), ff);
+    }
+    a.xh = up(hin); a.ldx = ldh; a.ldo = ldy;
+    std::vector<float> initial_y((size_t) nr * ldy, guard_y);
+    a.y = up(initial_y);
+    for (int phase = 0; phase < 3; ++phase) {
+        a.n_exp = phase == 2 ? 2 : 3; a.max_rows = phase == 2 ? 16 : 17;
+        queue().memcpy(a.y, initial_y.data(), initial_y.size() * sizeof(float)).wait_and_throw();
+        const bool accepted = phase == 0 ? iq::light_down(a, queue()) : iq::set_down(a, queue());
+        if (!accepted) throw std::runtime_error("light/set down refused the regression fixture");
+        queue().wait_and_throw();
+        const auto actual = down_(a.y, initial_y.size());
+        double worst = 0;
+        int worst_row = -1, worst_col = -1;
+        double worst_expected = 0;
+        const auto remember = [&](double error, int row, int col, double expected) {
+            if (!std::isfinite(error)) error = 1e30;
+            if (error > worst) { worst = error; worst_row = row; worst_col = col; worst_expected = expected; }
+        };
+        for (int r = 0; r < nr; ++r) {
+            const int e = r < 16 ? 1 : 2;
+            const float* input = r < 16 ? hquant[r].xhat.data() : hf[r].data();
+            for (int c = 0; c < ldy; ++c) {
+                const size_t at = (size_t) r * ldy + c;
+                if (c >= k || ((phase == 0 || phase == 2) && r >= 16)) {
+                    if (actual[at] != guard_y) remember(1e30, r, c, guard_y);
+                    continue;
+                }
+                double scale;
+                const double expected = dotd(d[e].w.data() + (size_t) c * ff, input, ff, &scale);
+                const double error = std::abs(actual[at] - expected) / (scale + 1e-30);
+                remember(error, r, c, expected);
+            }
+        }
+        const char* label = phase == 0 ? "light down Q8 reference" : phase == 1 ? "set down 16/17" : "set down max_rows=16";
+        if (worst > 1e-6) {
+            const float value = actual[(size_t) worst_row * ldy + worst_col];
+            std::fprintf(stderr, "%s %s: row=%d col=%d expert=%d actual=%g expected=%g sentinel=%d\n",
+                iq::name(type), label, worst_row, worst_col, worst_row < 16 ? 1 : 2,
+                value, worst_expected, value == guard_y);
+        }
+        report(label, type, worst, 1e-6);
+    }
 }
 
 // one decode token of the DeepSeek shape (n_embd 5120, n_ff 2304, top-6 experts): gate/up + down launches, per-layer time
@@ -481,6 +650,7 @@ int main(int argc, char** argv) try {
                     worst = std::max(worst, std::fabs(part[(size_t) e * E + r] - ref) / (sa + 1e-30));
                 }
             report("token down", type, worst, 1e-6);
+            light_contract(type, G, U, D, x, dblob, blob, off, lim, report);
 
             // ---- the prompt sets: expert 0 owns rows [0, 37), expert 2 [37, 42)
             const int NR = 42;

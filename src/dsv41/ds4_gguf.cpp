@@ -6,6 +6,7 @@
 // Ported into Strata (third_party/main/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 #include "ds4_gguf.cuh"
 #include "ds4_kernels.cuh"
+#include "ds4_iq.cuh"
 #include "ds4_iq_decode.hpp"
 #include "ds4_tq_decode.hpp"
 #include "ds4_numerics.cuh"
@@ -65,6 +66,15 @@ bool layout_ok(const x3::ExpertLayout& lay, int n_embd, int n_ff) {
         if (!type_on_device(type) || k <= 0 || type_row_bytes(type, k) == 0) return false;
     }
     return true;
+}
+iq::SetArgs light_args(const x3::SetArgs& a) {
+    iq::SetArgs q{};
+    q.wbase = a.wbase; q.stride = a.stride;
+    for (int r = 0; r < 3; ++r) q.tr[r] = a.lay.trellis[r];
+    q.bounds = a.bounds; q.row0 = a.row0; q.max_rows = a.max_rows; q.n_exp = a.n_exp;
+    q.n_embd = a.n_embd; q.n_ff = a.n_ff; q.limit = a.limit; q.skip_ge = a.skip_ge;
+    q.tg = expert_type(a.lay, 0); q.td = expert_type(a.lay, 2);
+    return q;
 }
 }
 
@@ -207,10 +217,19 @@ void set_gate_up(const x3::SetArgs& a, const float* x, int ldx, const int* row_i
     if (!layout_ok(a.lay, a.n_embd, a.n_ff)) { fail("invalid expert set layout"); return; }
     const int tg = expert_type(a.lay, 0), tu = expert_type(a.lay, 1);
     const size_t rg = type_row_bytes(tg, a.n_embd), ru = type_row_bytes(tu, a.n_embd);
+    int skip_le = 0;
+    if (tg == tu) {
+        auto q = light_args(a);
+        q.xf = x; q.idx = row_idx; q.ldx = ldx; q.h = h16; q.ldo = ldh;
+        if (iq::light_gate_up(q, s)) {
+            if (a.max_rows <= iq::kLightRows) return;
+            skip_le = iq::kLightRows;
+        }
+    }
     parallel(s, size_t(a.n_exp) * a.max_rows * a.n_ff, [=](size_t z) {
         const size_t c = z % a.n_ff, r = (z / a.n_ff) % a.max_rows, e = z / (size_t(a.n_ff) * a.max_rows);
         const int count = a.bounds[e + 1] - a.bounds[e];
-        if (count <= 0 || r >= size_t(count) || (a.skip_ge > 0 && count >= a.skip_ge)) return;
+        if (count <= skip_le || r >= size_t(count) || (a.skip_ge > 0 && count >= a.skip_ge)) return;
         const int local = a.bounds[e] - a.row0 + int(r), src = row_idx ? row_idx[local] : local;
         const uint8_t* blob = a.wbase + e * a.stride;
         float g = 0.f, u = 0.f;
@@ -227,10 +246,17 @@ void set_down(const x3::SetArgs& a, const uint16_t* h16, int ldh, float* y, int 
     if (!layout_ok(a.lay, a.n_embd, a.n_ff)) { fail("invalid expert set layout"); return; }
     const int td = expert_type(a.lay, 2);
     const size_t rd = type_row_bytes(td, a.n_ff);
+    int skip_le = 0;
+    auto q = light_args(a);
+    q.xh = h16; q.ldx = ldh; q.y = y; q.ldo = ldy;
+    if (iq::light_down(q, s)) {
+        if (a.max_rows <= iq::kLightRows) return;
+        skip_le = iq::kLightRows;
+    }
     parallel(s, size_t(a.n_exp) * a.max_rows * a.n_embd, [=](size_t z) {
         const size_t c = z % a.n_embd, r = (z / a.n_embd) % a.max_rows, e = z / (size_t(a.n_embd) * a.max_rows);
         const int count = a.bounds[e + 1] - a.bounds[e];
-        if (count <= 0 || r >= size_t(count) || (a.skip_ge > 0 && count >= a.skip_ge)) return;
+        if (count <= skip_le || r >= size_t(count) || (a.skip_ge > 0 && count >= a.skip_ge)) return;
         const int local = a.bounds[e] - a.row0 + int(r);
         const uint8_t* row = a.wbase + e * a.stride + a.lay.trellis[2] + c * rd;
         float sum = 0.f;
