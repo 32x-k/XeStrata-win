@@ -11,11 +11,12 @@ build_lora_targets, written here a second time; the record's check sets them aga
 name for name), in a form the engine applies today: a plain LoRA, LoKr or LoHa (a DoRA: a plain LoRA with a
 dora_scale over the weight's rows, ComfyUI's weight_decompose), a whole weight's difference (diff, set_weight,
 w_norm), or an OFT's turn of the weight's rows (oft_blocks, a BOFT's four dimensions too; the file's alpha is the
-constraint on the block's skew part, not a scale), and a GLoRA (a1/a2/b1/b2: the weight's own product on the input its factors make, beside a plain form's pair), and
-no text encoder's weight.  A bias's delta (diff_b, or b_norm beside w_norm) goes with any of
-them or alone, where the weight adds a bias of its own (BIASED: Mage-Flow's DiT's weights all do; MOSS-Image's outside
-its blocks and in its text embedder; Qwen-Image-2.1's none).  The engine refuses the forms it applies not when it binds
-a set (QiDit::set_loras, MossDit::set_loras, MfDit::set_loras), so no image is made with part of a file.
+constraint on the block's skew part, not a scale), and a GLoRA (a1/a2/b1/b2: the weight's own product on the input
+its factors make, beside a plain form's pair), and no text encoder's weight.  A bias's delta (diff_b, or b_norm beside
+w_norm) goes with any of them or alone, where the weight adds a bias of its own (BIASED: Mage-Flow's DiT's weights all
+do; MOSS-Image's outside its blocks and in its text embedder; Qwen-Image-2.1's none).  The engine refuses the forms it
+does not apply when it binds a set (QiDit::set_loras, MossDit::set_loras, MfDit::set_loras), so no image is made with
+part of a file.
 
 A listing entry - ImageGen.defaults' "loras" (the engine's capabilities: /health's image_defaults and image_models,
 /v1/models' image model):
@@ -251,7 +252,8 @@ def _oft_shape(roles: dict[str, tuple[int, ...]]) -> tuple[int, str]:
     elif len(bl) == 4:
         stages, blocks, b = bl[0], bl[1], bl[2]
     else:
-        return 0, f"oft_blocks must be [blocks][b][b] (an OFT) or [stages][blocks][b][b] (a BOFT), not {len(bl)} dimensions"
+        return 0, (f"oft_blocks must be [blocks][b][b] (an OFT) or [stages][blocks][b][b] (a BOFT), not {len(bl)} "
+                   f"dimensions")
     if b <= 0 or blocks <= 0 or stages <= 0 or bl[-1] != b:
         return 0, f"oft_blocks' blocks are {b} x {bl[-1]}: not squares"
     if stages > 1:
