@@ -6034,6 +6034,1258 @@ struct Model::Impl {
 
     int img_tok = -1;
     std::vector<Image> imgs;
+    bool encode_image(const uint8_t*, int, int, std::vector<uint16_t>& span, std::string& err) {
+        span.clear();
+        err = "this build does not support images";
+        return false;
+    }
+    // the row of a picture's span at position p (null: p is in none)
+    const uint16_t* image_row(int64_t p) const {
+        if (imgs.empty()) return nullptr;
+        auto it = std::upper_bound(imgs.begin(), imgs.end(), p, [](int64_t v, const Image& im) { return v < im.start; });
+        if (it == imgs.begin()) return nullptr;
+        const Image& im = *(it - 1);
+        const int64_t r = p - im.start;
+        if (!im.rows || r >= (int64_t) (im.rows->size() / (size_t) g.dim)) return nullptr;
+        return im.rows->data() + (size_t) r * g.dim;
+    }
+    // token tk's embedding row at position p: inside a picture's span, the picture's
+    const uint16_t* emb_row(int64_t p, int tk) const {
+        const uint16_t* r = tk == img_tok ? image_row(p) : nullptr;
+        return r != nullptr ? r : embed_pinned + (size_t) tk * g.dim;
+    }
+    bool in_image(int64_t p) const { return img_tok >= 0 && toks[(size_t) p] == img_tok && image_row(p) != nullptr; }
+    // the Engram's compressed id of token tk at p (-1: a picture's, which no n-gram spans)
+    int32_t ctok(int64_t p, int tk) const {
+        if (tk == img_tok && image_row(p) != nullptr) return -1;
+        return tk < pk.eg_vocab ? pk.eg_map[(size_t) tk] : 0;
+    }
+    // a chunk's image rows (route()'s bits); false: none
+    bool vl_bits(int64_t p0, int T, VlBits& b) const {
+        if (imgs.empty()) return false;
+        std::memset(&b, 0, sizeof b);
+        bool any = false;
+        for (int t = 0; t < T && t < kVlRows; ++t)
+            if (in_image(p0 + t)) {
+                b.w[t >> 5] |= 1u << (t & 31);
+                any = true;
+            }
+        return any;
+    }
+
+    // ---- Engram: a window's rows of one table (Engram layer li), tokens p0 .. p0 + T - 1 into dst ([token] of [cols]
+    // [hd] codes then the scales; nullptr: h_eg).  eg_issue serves the rows already fetched from the row cache (and a
+    // row the window needs twice from one read) and hands the rest to the reader's threads; eg_finish waits for them,
+    // copies the repeats and keeps the new rows in the cache.  The rows are the file's bytes either way.
+    void eg_issue(int64_t p0, int T, int li, uint8_t* dst, EgBatch& b) {
+        const int cols = (pk.eg_ngram - 1) * pk.eg_heads, hd = pk.eg_hd;
+        const size_t per = (size_t) cols * (hd + hd / 32);
+        b.clear();
+        b.reads.reserve((size_t) T * cols);
+        const std::string P = "layers." + std::to_string(g.eg_layers[(size_t) li]) + ".engram.embed.";
+        const Tensor* tw = pk.get(P + "weight");
+        const Tensor* ts = pk.get(P + "scale");
+        const int fmt = eg_fmt[(size_t) li];
+        const bool mx8 = fmt == 0;   // (a GGUF: the scales between the codes, one per 32)
+        const bool q6k = fmt == 1;   // (a GGUF: one Q6_K superblock a 256 values, its scales inside)
+        const bool iq4 = fmt == 2;   // (a GGUF: 18-byte blocks a 32 values, d and 16 nibble bytes, no scales)
+        std::unordered_map<uint64_t, int> first;   // a row this batch reads already -> its read
+        int64_t hits = 0;
+        {
+            std::lock_guard<std::mutex> lk(eg_cache_mu);
+            for (int t = 0; t < T; ++t) {
+                const int64_t p = p0 + t;
+                uint8_t* rows = dst != nullptr ? dst + (size_t) t * per : h_eg + ((size_t) li * eg_cap + t) * per;
+                uint8_t* scales = rows + (size_t) cols * hd;
+                if (ctoks[(size_t) p] < 0) {   // a picture's token: no rows (zeros: its gate adds nothing)
+                    std::memset(rows, 0, per);
+                    continue;
+                }
+                int64_t prod[8];
+                bool blocked = false;
+                for (int s = 0; s < pk.eg_ngram; ++s) {   // (the look-back stops at the start and at a picture)
+                    blocked = blocked || p < s || ctoks[(size_t) (p - s)] < 0;
+                    const int64_t tk = blocked ? pk.eg_pad : ctoks[(size_t) (p - s)];
+                    prod[s] = tk * pk.eg_mult[(size_t) li * pk.eg_ngram + s];
+                }
+                int64_t rolling = prod[0];
+                for (int n = 1; n < pk.eg_ngram; ++n) {
+                    rolling ^= prod[n];
+                    for (int h = 0; h < pk.eg_heads; ++h) {
+                        const int c = (n - 1) * pk.eg_heads + h;
+                        const int64_t id = rolling % pk.eg_primes[(size_t) li * cols + c] + pk.eg_off[(size_t) li * cols + c];
+                        uint8_t* rd = rows + (size_t) c * hd;
+                        uint8_t* sd = scales + (size_t) c * (hd / 32);
+                        const uint64_t key = (uint64_t) id * 8 + (uint64_t) li;
+                        if (const uint8_t* hit = eg_cache.find(key)) {
+                            std::memcpy(rd, hit, (size_t) hd);
+                            std::memcpy(sd, hit + hd, (size_t) hd / 32);
+                            ++hits;
+                            continue;
+                        }
+                        const auto fi = first.find(key);
+                        if (fi != first.end()) {
+                            b.dups.push_back({fi->second, {rd, sd}});
+                            continue;
+                        }
+                        first.emplace(key, (int) b.reads.size());
+                        EgRead r;
+                        r.file = tw->file;
+                        r.dst = rd;
+                        r.scales = sd;
+                        r.key = key;
+                        if (mx8) {
+                            r.mx8 = true;
+                            r.n = (uint32_t) (hd / 32 * 33);
+                            r.off = tw->off + (uint64_t) id * r.n;
+                        } else if (q6k || iq4) {   // (into the row's code bytes; its scale bytes unused)
+                            r.n = (uint32_t) (q6k ? hd / 256 * 210 : hd / 32 * 18);
+                            r.off = tw->off + (uint64_t) id * r.n;
+                        } else {
+                            r.n = (uint32_t) hd;
+                            r.off = tw->off + (uint64_t) id * hd;
+                            r.file2 = ts->file;
+                            r.n2 = (uint32_t) (hd / 32);
+                            r.off2 = ts->off + (uint64_t) id * (hd / 32);
+                        }
+                        b.reads.push_back(r);
+                    }
+                }
+            }
+        }
+        eg_rows_n += hits + (int64_t) b.reads.size() + (int64_t) b.dups.size();
+        eg_hits_n += hits + (int64_t) b.dups.size();
+        eg_reads_n += (int64_t) b.reads.size();
+        eg_io.submit(b);
+    }
+    // b's rows all in place (any thread; a group's members may ask at once: one finishes, the others wait for it)
+    void eg_finish(EgBatch& b) {
+        if (b.post.load(std::memory_order_acquire) == 2) return;
+        const int64_t t0 = now_ns();
+        eg_io.wait(b);
+        int want = 0;
+        if (b.post.compare_exchange_strong(want, 1, std::memory_order_acq_rel)) {
+            const int hd = pk.eg_hd;
+            for (const auto& d : b.dups) {
+                const EgRead& r = b.reads[(size_t) d.first];
+                std::memcpy(d.second.first, r.dst, (size_t) hd);
+                std::memcpy(d.second.second, r.scales, (size_t) hd / 32);
+            }
+            if (ds4_dbg("DS4_DBG_EG") && pk.eg_hd >= 32) {}
+            {
+                std::lock_guard<std::mutex> lk(eg_cache_mu);
+                for (size_t i = 0; i < b.reads.size(); ++i) {
+                    const EgRead& r = b.reads[i];
+                    if (!b.ok[i]) {   // (a failed read: zeros, its gate adds nothing; not kept)
+                        std::memset(r.dst, 0, (size_t) hd);
+                        std::memset(r.scales, 0, (size_t) hd / 32);
+                        continue;
+                    }
+                    if (uint8_t* c = eg_cache.put(r.key)) {
+                        std::memcpy(c, r.dst, (size_t) hd);
+                        std::memcpy(c + hd, r.scales, (size_t) hd / 32);
+                    }
+                }
+            }
+            eg_io_ns += b.t1.load() - b.t0;
+            b.live = false;
+            b.post.store(2, std::memory_order_release);
+        } else {
+            while (b.post.load(std::memory_order_acquire) != 2) std::this_thread::yield();
+        }
+        eg_wait_ns += now_ns() - t0;
+    }
+    void eg_stats() {
+        st.eg_rows = eg_rows_n.load();
+        st.eg_hits = eg_hits_n.load();
+        st.eg_reads = eg_reads_n.load();
+        st.eg_io_ms = (double) eg_io_ns.load() / 1e6;
+        std::lock_guard<std::mutex> lk(eg_cache_mu);
+        st.eg_cached = (int64_t) eg_cache.size();
+        st.eg_cache_cap = (int64_t) eg_cache.capacity();
+    }
+    // the chunked prompt path: rows of Engram layer `only` into dst, now (a helper thread, a chunk ahead)
+    void engram_rows(int64_t p0, int T, int only, uint8_t* dst) {
+        EgBatch b;
+        eg_issue(p0, T, only, dst, b);
+        eg_finish(b);
+    }
+
+    // ---- the CPU lane: a window's routed experts that live on the host, as entries (an expert and up to 8 of its
+    // tokens, in rows slot0 ..) computed together: each node its column part of every matrix, from memory on that node,
+    // in four rounds (the gate / up split-K pieces, each preparing its two input blocks of every token; each band's
+    // sums / codebook / Hadamard / swiglu and that block of the down input, which both nodes then read whole; the down
+    // pieces; the down bands).  yd[slot] gets each row's expert output.
+    static constexpr int kEntMax = kWin > kc::kExl3CpuMaxN ? kWin : kc::kExl3CpuMaxN;
+    struct Ent {
+        int e = 0, n = 0, slot0 = 0;
+        int tok[kEntMax] = {};
+    };
+    // tokens an entry holds: the i-quant GGUF experts take a whole window's tokens of an expert in one call (the CPU
+    // lane's exact multi-token rows, 7+ tokens an expert: decoded once for all), the others (MXFP4, EXL3) up to 8
+    static int ent_cap(const Layer& l) {
+        return l.lay.fmt == gg::kFmtMXFP4 && !gg::mx_experts(l.lay) ? kEntMax : kc::kExl3CpuMaxN;
+    }
+    void run_nodes(int n, const std::function<void(int)>* f) {
+        std::exception_ptr failure;
+        int started = 0;
+        try {
+            for (int X = 0; X < NH; ++X) {
+                ++started;   // start may publish jobs before reporting a wake-up failure
+                pools[(size_t) X]->start(n, f[X]);
+            }
+            pools[0]->help();
+        } catch (...) { failure = std::current_exception(); }
+        // Keep f and its response buffers alive until every pool finishes, even
+        // if one fails. The CPU service publishes producer_done after this.
+        for (int X = 0; X < started; ++X) {
+            try { pools[(size_t) X]->wait(); }
+            catch (...) { if (!failure) failure = std::current_exception(); }
+        }
+        if (failure) std::rethrow_exception(failure);
+    }
+
+    // a GGUF's MXFP4 experts on the CPU lane, read from the file's mapping or their copy in RAM (mx_part_ptr): each
+    // node its rows of every matrix - the gate / up rows [X n_ff / NH, ..) of each entry (the swiglu into its h row),
+    // then (h whole) the down rows [X dim / NH, ..) into yd.  A row's sum is the same whatever the split: the same bits
+    // in a copy as in place.  The device's arithmetic (gg::mx_rows: int8 activations rounded as the device rounds
+    // them, exact integer sums a block; every CPU tier the same bits): each token's input quantized once, whatever
+    // number of entries take it, and each job its band of h straight into the down's int8 input.
+    // (ord: the order the entries are computed in - their slots, so the sums, stay the same; null: as they are)
+    void cpu_experts_mx(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord) {
+        if (!gg::mx_experts(l.lay)) return cpu_experts_iq(l, x, ents, ldx, ord);
+        constexpr int RB = 64;   // rows a job (whole blocks of h: RB % 32 == 0)
+        const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH;
+        const int GB = (FFh + RB - 1) / RB, DB = (Eh + RB - 1) / RB, ne = (int) ents.size();
+        const size_t gr = gg::mx_row_bytes(E), dr = gg::mx_row_bytes(FF);
+        const size_t xa = gg::mx_act_bytes(E), ha = gg::mx_act_bytes(FF);
+        const bool band_q = FFh % 32 == 0;   // (each job's rows whole blocks of h)
+        const float lim = g.lim;
+        static_assert(kc::kExl3CpuMaxN <= gg::kMxCpuMaxN, "a CPU-lane entry's tokens in one call");
+        {   // the experts read from the files (not in the RAM tier) that are not resident: all their pages asked for at
+            // once, so the SSD reads them with large requests side by side while the first entries compute
+            // (os::prefetch_cold: the resident ones are left alone - the hint walks every page of a range, which cost
+            // more than computing a warm expert, 0.34 ms a 6.3 MB matrix on Windows)
+            std::vector<std::pair<const void*, size_t>> want;
+            for (const Ent& en : ents)
+                if (!store && (l.ram.empty() || l.ram[(size_t) en.e] < 0))
+                    for (int r = 0; r < 3; ++r) want.push_back({mx_mat(l, en.e, r), mx_part_bytes(l, r)});
+            os::prefetch_cold(want);
+        }
+        // the int8 inputs in c_xh's bytes: token t's (t < kWin) at t xa, then the slots' h at (kWin + slot) ha; a token
+        // index past the window (none on the decode or chunk paths) gets a row of its own after them
+        uint8_t* xq = (uint8_t*) c_xh.data();
+        uint8_t* hq = xq + (size_t) kWin * xa;
+        uint8_t* xq_extra = hq + (size_t) kSlots * ha;
+        auto x_act = [&](const Ent& en, int i) -> const void* {
+            const int t = en.tok[i];
+            return t < kWin ? xq + (size_t) t * xa : xq_extra + (size_t) (en.slot0 + i) * xa;
+        };
+        {
+            bool done[kWin] = {};
+            for (const Ent& en : ents)
+                for (int i = 0; i < en.n; ++i) {
+                    const int t = en.tok[i];
+                    if (t < kWin && done[t]) continue;
+                    if (t < kWin) done[t] = true;
+                    gg::mx_quant(x + (size_t) t * ldx, E, (void*) x_act(en, i));
+                }
+        }
+        std::function<void(int)> f[4];
+        for (int X = 0; X < NH; ++X)
+            f[X] = [&, X](int j) {
+                const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / GB] : j / GB)];
+                const int r0 = X * FFh + (j % GB) * RB, r1 = std::min(X * FFh + FFh, r0 + RB);
+                const void* ap[gg::kMxCpuMaxN];
+                float yg[gg::kMxCpuMaxN][RB], yu[gg::kMxCpuMaxN][RB];
+                float *gp[gg::kMxCpuMaxN], *up[gg::kMxCpuMaxN];
+                for (int i = 0; i < en.n; ++i) {
+                    ap[i] = x_act(en, i);
+                    gp[i] = yg[i];
+                    up[i] = yu[i];
+                }
+                // (part X's rows, from where they are: a copy's part on node X, or the file's)
+                gg::mx_rows(mx_part_ptr(l, en.e, 0, X), gr, E, r0 - X * FFh, r1 - X * FFh, ap, en.n, gp);
+                gg::mx_rows(mx_part_ptr(l, en.e, 1, X), gr, E, r0 - X * FFh, r1 - X * FFh, ap, en.n, up);
+                for (int i = 0; i < en.n; ++i) {
+                    float* h = band_q ? yg[i] : c_xhd.data() + (size_t) (en.slot0 + i) * FF + r0;
+                    for (int r = r0; r < r1; ++r) {
+                        float gv = yg[i][r - r0], uv = yu[i][r - r0];
+                        if (lim > 0.0f) {
+                            gv = std::min(gv, lim);
+                            uv = std::min(std::max(uv, -lim), lim);
+                        }
+                        h[r - r0] = gv / (1.0f + std::exp(-gv)) * uv;
+                    }
+                    if (band_q) gg::mx_quant_blocks(h, r0 / 32, r1 / 32, hq + (size_t) (en.slot0 + i) * ha, FF);
+                }
+            };
+        run_nodes(ne * GB, f);
+        if (!band_q)
+            for (const Ent& en : ents)
+                for (int i = 0; i < en.n; ++i)
+                    gg::mx_quant(c_xhd.data() + (size_t) (en.slot0 + i) * FF, FF, hq + (size_t) (en.slot0 + i) * ha);
+        for (int X = 0; X < NH; ++X)
+            f[X] = [&, X](int j) {
+                const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / DB] : j / DB)];
+                const int r0 = X * Eh + (j % DB) * RB, r1 = std::min(X * Eh + Eh, r0 + RB);
+                const void* ap[gg::kMxCpuMaxN];
+                float* yp[gg::kMxCpuMaxN];
+                for (int i = 0; i < en.n; ++i) {
+                    ap[i] = hq + (size_t) (en.slot0 + i) * ha;
+                    yp[i] = c_yd.data() + (size_t) (en.slot0 + i) * E + r0;
+                }
+                gg::mx_rows(mx_part_ptr(l, en.e, 2, X), dr, FF, r0 - X * Eh, r1 - X * Eh, ap, en.n, yp);
+            };
+        run_nodes(ne * DB, f);
+    }
+    // ... the low-bit ones (ds4_iq's types): as above, through ggml-cpu's dots (gg::iq_cpu_*) - each token's input
+    // quantized once to the weight type's activation (Q8_K) in its c_xh row's bytes, then (h whole) its h the same
+    void cpu_experts_iq(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx, const int* ord) {
+        const double tp0 = now_ms();
+        constexpr int RB = 64;   // rows a job
+        const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH;
+        const int GB = (FFh + RB - 1) / RB, DB = (Eh + RB - 1) / RB, ne = (int) ents.size();
+        gg::IqCpu fm;
+        std::string ferr;
+        if (!gg::iq_cpu_fmt(gg::expert_type(l.lay, 0), gg::expert_type(l.lay, 2), E, FF, fm, ferr) ||
+            fm.act_bytes > (size_t) E * 4 || fm.h_bytes > (size_t) E * 4) {
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true)) std::fprintf(stderr, "ds4: layer %d's CPU-lane experts: %s\n", l.il, ferr.c_str());
+            for (const Ent& en : ents) std::memset(c_yd.data() + (size_t) en.slot0 * E, 0, (size_t) en.n * E * 4);
+            return;
+        }
+        const float lim = g.lim;
+        {   // (os::prefetch_cold, as above: the resident ones are left alone - on Windows the hint walks every page of a
+            // range, ~0.13 ms an IQ2_XXS expert, on the lane's critical path before the first entry computes.
+            // off by default (the mmap path, owner PC: not faster in every pair); DS4_IQ_PF_COLD=1 turns it on)
+            std::vector<std::pair<const void*, size_t>> want;
+            for (const Ent& en : ents)
+                if (!store && (l.ram.empty() || l.ram[(size_t) en.e] < 0))
+                    for (int r = 0; r < 3; ++r) want.push_back({mx_mat(l, en.e, r), mx_part_bytes(l, r)});
+            static const bool pf_all = std::getenv("DS4_IQ_PF_COLD") == nullptr || std::atoi(std::getenv("DS4_IQ_PF_COLD")) == 0;
+            if (pf_all) os::prefetch(want);
+            else os::prefetch_cold(want);
+        }
+        // the activations in c_xh's bytes, E 4 apart: token t's (t < kWin) at row t - quantized once, whatever number of
+        // entries take it - then a row a slot (kWin + slot): a token past the window's input (none on the decode or
+        // chunk paths), then (x no longer needed) the slot's h
+        uint8_t* aq = (uint8_t*) c_xh.data();
+        auto x_act = [&](const Ent& en, int i) -> uint8_t* {
+            const int t = en.tok[i];
+            return aq + (size_t) (t < kWin ? t : kWin + en.slot0 + i) * E * 4;
+        };
+        {
+            bool done[kWin] = {};
+            for (const Ent& en : ents)
+                for (int i = 0; i < en.n; ++i) {
+                    const int t = en.tok[i];
+                    if (t < kWin && done[t]) continue;
+                    if (t < kWin) done[t] = true;
+                    gg::iq_cpu_quant(fm.gu_act, x + (size_t) t * ldx, E, x_act(en, i));
+                }
+        }
+        const double tq1 = now_ms();
+        std::function<void(int)> f[4];
+        for (int X = 0; X < NH; ++X)
+            f[X] = [&, X](int j) {
+                const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / GB] : j / GB)];
+                const int r0 = X * FFh + (j % GB) * RB, r1 = std::min(X * FFh + FFh, r0 + RB);
+                const void* ap[kEntMax];
+                float* hp[kEntMax];
+                for (int i = 0; i < en.n; ++i) {
+                    ap[i] = x_act(en, i);
+                    hp[i] = c_xhd.data() + (size_t) (en.slot0 + i) * FF + (size_t) X * FFh;   // (part X's rows of h)
+                }
+                // (part X's rows, from where they are: a copy's part on node X, or the file's - whole rows, so any
+                // block size of the type)
+                gg::iq_cpu_gate_up(fm, mx_part_ptr(l, en.e, 0, X), mx_part_ptr(l, en.e, 1, X), ap, en.n, hp,
+                                   r0 - X * FFh, r1 - X * FFh, lim);
+            };
+        run_nodes(ne * GB, f);
+        const double tr1 = now_ms();
+        for (const Ent& en : ents)
+            for (int i = 0; i < en.n; ++i)
+                gg::iq_cpu_quant(fm.d_act, c_xhd.data() + (size_t) (en.slot0 + i) * FF, FF,
+                                 aq + (size_t) (kWin + en.slot0 + i) * E * 4);
+        const double tq2 = now_ms();
+        for (int X = 0; X < NH; ++X)
+            f[X] = [&, X](int j) {
+                const Ent& en = ents[(size_t) (ord != nullptr ? ord[j / DB] : j / DB)];
+                const int r0 = X * Eh + (j % DB) * RB, r1 = std::min(X * Eh + Eh, r0 + RB);
+                const void* hp[kEntMax];
+                float* yp[kEntMax];
+                for (int i = 0; i < en.n; ++i) {
+                    hp[i] = aq + (size_t) (kWin + en.slot0 + i) * E * 4;
+                    yp[i] = c_yd.data() + (size_t) (en.slot0 + i) * E + (size_t) X * Eh;   // (part X's rows of it)
+                }
+                gg::iq_cpu_down(fm, mx_part_ptr(l, en.e, 2, X), hp, en.n, yp, r0 - X * Eh, r1 - X * Eh);
+            };
+        run_nodes(ne * DB, f);
+        {   // DS4_PROF: where the CPU lane's time goes (act prep + prefetch, gate/up, h quant, down), summed
+            static const bool on = std::getenv("DS4_PROF") != nullptr;
+            if (on) {
+                static double acc[6] = {};
+                const double te = now_ms();
+                acc[0] += tq1 - tp0; acc[1] += tr1 - tq1; acc[2] += tq2 - tr1; acc[3] += te - tq2; acc[4] += 1; acc[5] += ne;
+                if (((long long) acc[4]) % 1000 == 0)
+                    std::fprintf(stderr, "ds4 prof CPU lane (IQ rows) per call: n %.0f, entries/call %.2f, prep %.3f ms, gate+up %.3f ms, h-quant %.3f ms, down %.3f ms\n", acc[4], acc[5] / acc[4], acc[0] / acc[4], acc[1] / acc[4], acc[2] / acc[4], acc[3] / acc[4]);
+            }
+        }
+    }
+
+    // the window's CPU-lane experts made ready (and pinned) in the store for the length of the call
+    struct StoreHold {
+        Impl* m = nullptr;
+        int layer = 0;
+        std::vector<int> es, sl;
+        std::vector<char> ok;
+        // lazy: the reads are started here and waited for by wait_all() / wait_expert(); the destructor releases
+        StoreHold(Impl* m_, const Layer& l, const std::vector<Ent>& ents) {
+            if (!m_->store) return;
+            m = m_;
+            layer = l.il;
+            for (const Ent& en : ents)
+                if ((l.ram.empty() || l.ram[(size_t) en.e] < 0) && std::find(es.begin(), es.end(), en.e) == es.end()) es.push_back(en.e);
+            m->store->begin(layer, es.data(), (int) es.size(), ok, sl);
+        }
+        int idx(int e) const {
+            for (size_t i = 0; i < es.size(); ++i)
+                if (es[i] == e) return (int) i;
+            return -1;
+        }
+        // expert e needs no waiting: not a store expert (RAM copy) or its reads are done
+        bool ready(int e) const {
+            if (!m) return true;
+            const int i = idx(e);
+            return i < 0 || m->store->loaded(sl[(size_t) i]);
+        }
+        void wait_expert(int e) {
+            if (!m) return;
+            const int i = idx(e);
+            if (i >= 0) m->store->wait_slots(sl, ok, i, i + 1);
+        }
+        void wait_all() {
+            if (m) m->store->wait_slots(sl, ok, 0, (int) es.size());
+        }
+        ~StoreHold() {
+            if (m) m->store->release(layer, es.data(), (int) es.size(), ok);
+        }
+    };
+    // DS4_MISS_SPLIT=0: the old order (wait for every read, then compute); default: the entries whose reads are done
+    // computed first, the others each as its read lands (the same bits: every entry's rows are independent)
+    void cpu_experts(const Layer& l, const float* x, const std::vector<Ent>& ents, size_t ldx = 0,
+                     const int* ord = nullptr) {
+        if (ldx == 0) ldx = (size_t) g.dim;
+        if (l.lay.fmt == gg::kFmtMXFP4) {
+            StoreHold hold(this, l, ents);
+            static const bool split = std::getenv("DS4_MISS_SPLIT") == nullptr || std::atoi(std::getenv("DS4_MISS_SPLIT")) != 0;
+            if (!split || ord != nullptr || !hold.m || ents.size() < 2) {
+                hold.wait_all();
+                return cpu_experts_mx(l, x, ents, ldx, ord);
+            }
+            std::vector<Ent> hot, cold;
+            for (const Ent& en : ents) (hold.ready(en.e) ? hot : cold).push_back(en);
+            if (cold.empty()) {
+                hold.wait_all();
+                return cpu_experts_mx(l, x, ents, ldx, ord);
+            }
+            for (const Ent& en : hot) hold.wait_expert(en.e);   // (done reading: only the bookkeeping)
+            if (!hot.empty()) cpu_experts_mx(l, x, hot, ldx, nullptr);
+            // the ones that came in meanwhile first, then the rest in the order they land
+            std::vector<char> done(cold.size(), 0);
+            for (size_t left = cold.size(); left > 0;) {
+                size_t pick = cold.size();
+                for (size_t i = 0; i < cold.size(); ++i)
+                    if (!done[i] && hold.ready(cold[i].e)) {
+                        pick = i;
+                        break;
+                    }
+                if (pick == cold.size())
+                    for (size_t i = 0; i < cold.size(); ++i)
+                        if (!done[i]) {
+                            pick = i;
+                            break;
+                        }
+                hold.wait_expert(cold[pick].e);
+                std::vector<Ent> one(1, cold[pick]);
+                cpu_experts_mx(l, x, one, ldx, nullptr);
+                done[pick] = 1;
+                --left;
+            }
+            return;
+        }
+        const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH, GQ = E / 256, DQ = FF / 128;
+        const int GB = FFh / 128, DB = Eh / 128, EB = E / 128, FB = FF / 128;
+        const int ne = (int) ents.size();
+        const float lim = g.lim;
+        auto part = [&](int e, int X, int r) {
+            const uint8_t* b = l.hh[(size_t) e][(size_t) X];
+            kc::Exl3Part p;
+            p.trellis = (const uint32_t*) (b + l.hl.trellis[r]);
+            p.suh = (const uint16_t*) (b + l.hl.suh[r]);
+            p.svh = (const uint16_t*) (b + l.hl.svh[r]);
+            p.k = l.hl.k[r];
+            p.n = l.hl.n[r];
+            p.K = l.lay.K[r];
+            return p;
+        };
+        auto xh = [&](int X, int sl, int r) { return c_xh.data() + ((size_t) (X * kSlots + sl) * 2 + r) * E; };
+        auto xsb = [&](int X, int sl, int r) { return c_xsb.data() + ((size_t) (X * kSlots + sl) * 2 + r) * EB; };
+        auto acc = [&](int X, int sl, int r, int q) {
+            return c_acc.data() + (((size_t) (X * kSlots + sl) * 2 + r) * GQ + q) * FFh;
+        };
+        auto xhd = [&](int sl) { return c_xhd.data() + (size_t) sl * FF; };
+        auto xsd = [&](int sl) { return c_xsd.data() + (size_t) sl * FB; };
+        auto accd = [&](int X, int sl, int q) { return c_accd.data() + ((size_t) (X * kSlots + sl) * DQ + q) * Eh; };
+        std::function<void(int)> f[4];
+        for (int X = 0; X < NH; ++X)
+            f[X] = [&, X](int j) {
+                const Ent& en = ents[(size_t) (j / (2 * GQ))];
+                const int r = (j / GQ) % 2, q = j % GQ;
+                const kc::Exl3Part p = part(en.e, X, r);
+                const float* xp[kc::kExl3CpuMaxN];
+                float* ap[kc::kExl3CpuMaxN];
+                for (int i = 0; i < en.n; ++i) {
+                    const int sl = en.slot0 + i;
+                    const float* xt = x + (size_t) en.tok[i] * ldx;
+                    for (int b = 2 * q; b < 2 * q + 2; ++b)
+                        xsb(X, sl, r)[b] = kc::exl3_cpu_prepare_block(p.suh + b * 128, xt + b * 128, xh(X, sl, r) + b * 128);
+                    xp[i] = xh(X, sl, r);
+                    ap[i] = acc(X, sl, r, q);
+                }
+                if (en.n == 1) kc::exl3_cpu_rows_acc(p, xp[0], q * 16, (q + 1) * 16, ap[0]);
+                else kc::exl3_cpu_rows_acc_n(p, xp, en.n, q * 16, (q + 1) * 16, ap);
+            };
+        run_nodes(ne * 2 * GQ, f);
+        for (int X = 0; X < NH; ++X)
+            f[X] = [&, X](int j) {
+                const Ent& en = ents[(size_t) (j / GB)];
+                const int b = j % GB;
+                const kc::Exl3Part pg = part(en.e, X, 0), pu = part(en.e, X, 1), pd = part(en.e, X, 2);
+                for (int i = 0; i < en.n; ++i) {
+                    const int sl = en.slot0 + i;
+                    float y[2][128], a[128], hb[128];
+                    for (int r = 0; r < 2; ++r) {
+                        for (int c = 0; c < 128; ++c) a[c] = 0.0f;
+                        for (int q = 0; q < GQ; ++q) {
+                            const float* aq = acc(X, sl, r, q) + b * 128;
+                            for (int c = 0; c < 128; ++c) a[c] += aq[c];
+                        }
+                        double xs = 0.0;
+                        for (int k = 0; k < EB; ++k) xs += xsb(X, sl, r)[k];
+                        kc::exl3_cpu_band_out(r == 0 ? pg : pu, a, (float) xs, b * 128, y[r]);
+                    }
+                    for (int c = 0; c < 128; ++c) {
+                        float gv = y[0][c], uv = y[1][c];
+                        if (lim > 0.0f) {
+                            gv = std::min(gv, lim);
+                            uv = std::min(std::max(uv, -lim), lim);
+                        }
+                        hb[c] = gv / (1.0f + std::exp(-gv)) * uv;
+                    }
+                    const int gb = X * GB + b;
+                    xsd(sl)[gb] = kc::exl3_cpu_prepare_block(pd.suh + gb * 128, hb, xhd(sl) + gb * 128);
+                }
+            };
+        run_nodes(ne * GB, f);
+        for (int X = 0; X < NH; ++X)
+            f[X] = [&, X](int j) {
+                const Ent& en = ents[(size_t) (j / DQ)];
+                const int q = j % DQ;
+                const kc::Exl3Part p = part(en.e, X, 2);
+                const float* xp[kc::kExl3CpuMaxN];
+                float* ap[kc::kExl3CpuMaxN];
+                for (int i = 0; i < en.n; ++i) {
+                    xp[i] = xhd(en.slot0 + i);
+                    ap[i] = accd(X, en.slot0 + i, q);
+                }
+                if (en.n == 1) kc::exl3_cpu_rows_acc(p, xp[0], q * 8, (q + 1) * 8, ap[0]);
+                else kc::exl3_cpu_rows_acc_n(p, xp, en.n, q * 8, (q + 1) * 8, ap);
+            };
+        run_nodes(ne * DQ, f);
+        for (int X = 0; X < NH; ++X)
+            f[X] = [&, X](int j) {
+                const Ent& en = ents[(size_t) (j / DB)];
+                const int b = j % DB;
+                const kc::Exl3Part pd = part(en.e, X, 2);
+                for (int i = 0; i < en.n; ++i) {
+                    const int sl = en.slot0 + i;
+                    float a[128];
+                    for (int c = 0; c < 128; ++c) a[c] = 0.0f;
+                    for (int q = 0; q < DQ; ++q) {
+                        const float* aq = accd(X, sl, q) + b * 128;
+                        for (int c = 0; c < 128; ++c) a[c] += aq[c];
+                    }
+                    double xs = 0.0;
+                    for (int k = 0; k < FB; ++k) xs += xsd(sl)[k];
+                    kc::exl3_cpu_band_out(pd, a, (float) xs, b * 128, c_yd.data() + (size_t) sl * E + (size_t) X * Eh + b * 128);
+                }
+            };
+        run_nodes(ne * DB, f);
+    }
+
+    // ---- the expert cache.  A swap moves a CPU-lane expert (`in`) into the layer's spare VRAM slot and the VRAM expert it
+    // replaces (`out`) into the spare host parts - both copies of weights that do not change, made while the model runs
+    // (the copy stream, the host's repacking) - and cache_tick switches the tables between windows, so the device's
+    // table and the host's view of a layer always agree within a window.  In place (file_experts) `out` needs no copy:
+    // the CPU lane reads it from the file again.
+    void ram_loop() {   // the RAM tier's moves in: an expert read from the file into a free slot
+        for (;;) {
+            RamSwap rs;
+            {
+                std::unique_lock<std::mutex> lk(sw_mu);
+                ram_cv.wait(lk, [&] { return quit.load() || !ram_queue.empty(); });
+                if (quit.load()) return;
+                rs = ram_queue.front();
+                ram_queue.pop_front();
+            }
+            const Layer& l = L[(size_t) rs.layer];
+            if (read_mx_file(l, rs.in, ram_slots[(size_t) rs.slot])) {
+                for (int r = 0; r < 3; ++r)   // (one copy of it in RAM)
+                    os::advise(pk.fds[(size_t) l.mx_file[r]], l.mx_off[r] + (uint64_t) rs.in * l.mx_stride[r],
+                               mx_part_bytes(l, r), false);
+            } else {
+                rs.in = -1;   // (failed: the slot goes back)
+            }
+            std::lock_guard<std::mutex> lk(sw_mu);
+            ram_ready.push_back(rs);
+        }
+    }
+
+    void cache_loop(SwapBufs& B) {
+        for (;;) {
+            Swap sw;
+            {
+                std::unique_lock<std::mutex> lk(sw_mu);
+                sw_cv.wait(lk, [&] { return quit.load() || !sw_queue.empty(); });
+                if (quit.load()) return;
+                sw = sw_queue.front();
+                sw_queue.pop_front();
+            }
+            Layer& l = L[(size_t) sw.layer];
+            if (l.lay.fmt == gg::kFmtMXFP4) {   // in: from the file; out: nothing to keep (the file has it)
+                swap_in_mx(l, sw, B);
+                std::lock_guard<std::mutex> lk(sw_mu);
+                sw_ready.push_back(sw);
+                continue;
+            }
+            parts_to_blob(l, l.hh[(size_t) sw.in], B.a);
+            if (l.nm == 1) {
+                const Dev& d = devs[(size_t) l.dev];
+                rt::set_device(d.id);
+                rt::Queue cs = B.st[(size_t) l.dev];
+                rt::copy_async(l.vram_base + (size_t) l.spare_vram * l.blob, B.a, l.blob, cs);
+                if (!file_experts)
+                    rt::copy_async(B.b, l.vram_base + (size_t) l.slot[(size_t) sw.out] * l.blob, l.blob, cs);
+                rt::stream_sync(cs);
+            } else {   // a group: each member's part in, each member's part out
+                for (int m = 0; m < l.nm; ++m) {
+                    const Layer& x = member(l, m);
+                    rt::set_device(devs[(size_t) x.dev].id);
+                    rt::Queue cs = B.st[(size_t) x.dev];
+                    blob_to_half(l, B.a, m, B.h);
+                    rt::copy_async(x.vram_base + (size_t) l.spare_vram * x.hblob, B.h, x.hblob, cs);
+                    rt::stream_sync(cs);
+                    if (file_experts) continue;
+                    rt::copy_async(B.h, x.vram_base + (size_t) l.slot[(size_t) sw.out] * x.hblob, x.hblob, cs);
+                    rt::stream_sync(cs);
+                    half_to_blob(l, B.h, m, B.b);
+                }
+            }
+            if (!file_experts)
+                for (int X = 0; X < NH; ++X) blob_to_part(l, B.b, X, l.spare_host[(size_t) X]);
+            if (check_swaps) {   // DS4_CHECK_SWAPS: both moves against the model file, byte for byte
+                std::vector<uint8_t> reg, blob(l.blob), part(l.hl.bytes);
+                bool ok = true;
+                for (int pass = 0; pass < (file_experts ? 1 : 2); ++pass) {   // (in place: no host copy of `out`)
+                    const int e = pass == 0 ? sw.in : sw.out;
+                    reg.resize(l.region_bytes[(size_t) e]);
+                    pk.read_at(l.region_file[(size_t) e], l.region_off[(size_t) e], reg.size(), reg.data());
+                    if (pass == 0) {
+                        repack(l, reg.data(), blob.data());
+                        std::vector<uint8_t> dev(l.blob);
+                        if (l.nm == 1)
+                            rt::copy(dev.data(), l.vram_base + (size_t) l.spare_vram * l.blob, l.blob);
+                        else
+                            for (int m = 0; m < l.nm; ++m) {   // (the members' parts, put together again)
+                                std::vector<uint8_t> h(member(l, m).hblob);
+                                rt::set_device(devs[(size_t) member(l, m).dev].id);
+                                rt::copy(h.data(), member(l, m).vram_base + (size_t) l.spare_vram * member(l, m).hblob, member(l, m).hblob);
+                                half_to_blob(l, h.data(), m, dev.data());
+                            }
+                        for (int r = 0; r < 3; ++r)
+                            ok = ok && std::memcmp(dev.data() + l.lay.trellis[r], blob.data() + l.lay.trellis[r], l.piece_bytes[r][0]) == 0 &&
+                                 std::memcmp(dev.data() + l.lay.suh[r], blob.data() + l.lay.suh[r], l.piece_bytes[r][1]) == 0 &&
+                                 std::memcmp(dev.data() + l.lay.svh[r], blob.data() + l.lay.svh[r], l.piece_bytes[r][2]) == 0;
+                    } else {
+                        for (int X = 0; X < NH; ++X) {
+                            repack_part(l, reg.data(), X, part.data());
+                            for (int r = 0; r < 3; ++r) {
+                                const size_t tb = (size_t) (l.hl.k[r] / 16) * (l.hl.n[r] / 16) * 32 * l.lay.K[r];
+                                ok = ok && std::memcmp(part.data() + l.hl.trellis[r], l.spare_host[(size_t) X] + l.hl.trellis[r], tb) == 0 &&
+                                     std::memcmp(part.data() + l.hl.suh[r], l.spare_host[(size_t) X] + l.hl.suh[r], (size_t) l.hl.k[r] * 2) == 0 &&
+                                     std::memcmp(part.data() + l.hl.svh[r], l.spare_host[(size_t) X] + l.hl.svh[r], (size_t) l.hl.n[r] * 2) == 0;
+                            }
+                        }
+                    }
+                }
+                std::fprintf(stderr, "ds4 cache: layer %d expert %d in, %d out: %s\n", l.il, sw.in, sw.out,
+                             ok ? "both match the model file" : "MISMATCH");
+            }
+            std::lock_guard<std::mutex> lk(sw_mu);
+            sw_ready.push_back(sw);
+        }
+    }
+
+    // a GGUF's swap: expert sw.in from the file (copy_mode: its copy) into the spare VRAM slot (each member its part);
+    // the expert it replaces goes back to the CPU lane, which reads it from the file's mapping - or (copy_mode, sw.ram)
+    // from the layer's spare RAM slot, which it is copied into from VRAM here
+    void swap_in_mx(Layer& l, Swap& sw, SwapBufs& B) {
+        uint8_t *sw_a = B.a, *sw_b = B.b, *sw_h = B.h;   // (this thread's)
+        const std::vector<rt::Queue>& copy_st = B.st;
+        bool ok = copy_mode ? read_mx(l, sw.in, sw_a) : read_mx_file(l, sw.in, sw_a);   // (a copy holds its slot till
+                                                                                          // this swap's switch)
+        for (int m = 0; m < l.nm && ok; ++m) {
+            const Layer& x = member(l, m);
+            rt::set_device(devs[(size_t) x.dev].id);
+            rt::Queue cs = copy_st[(size_t) x.dev];
+            if (l.nm > 1) blob_to_half(l, sw_a, m, sw_h);
+            ok = rt::copy_async(x.vram_base + (size_t) l.spare_vram * unit(l), l.nm > 1 ? sw_h : sw_a, unit(l), cs) == rt::Result::success &&
+                 rt::stream_sync(cs) == rt::Result::success;
+        }
+        if (sw.ram >= 0) {   // `out` from its VRAM slot (each member its part) into the spare RAM slot
+            bool got = ok;
+            for (int m = 0; m < l.nm && got; ++m) {
+                const Layer& x = member(l, m);
+                rt::set_device(devs[(size_t) x.dev].id);
+                rt::Queue cs = copy_st[(size_t) x.dev];
+                got = rt::copy_async(l.nm > 1 ? sw_h : sw_b, x.vram_base + (size_t) l.slot[(size_t) sw.out] * unit(l), unit(l), cs) == rt::Result::success &&
+                      rt::stream_sync(cs) == rt::Result::success;
+                if (got && l.nm > 1) half_to_blob(l, sw_h, m, sw_b);
+            }
+            if (got) blob_to_ram(l, sw_b, sw.ram);
+            else sw.ram = -1;   // (back to the file's pages then)
+        } else if (ok && store && l.nm == 1 && l.lay.fmt == gg::kFmtMXFP4 && strata::ds4::store_feature_default(env_tri("DS4_STORE_PUT"), defaults_026())) {
+            // `out` goes back to the CPU lane: its blob is in VRAM, so it is copied into a store slot now - the lane would otherwise read it from
+            // the SSD and wait for it (1-2 misses a token on the 251 GB R9700 box).  DS4_STORE_PUT=0: off.
+            uint8_t* dst = store->put_begin(l.il, sw.out);
+            if (dst != nullptr) {
+                const Layer& x = member(l, 0);
+                rt::set_device(devs[(size_t) x.dev].id);
+                rt::Queue cs = copy_st[(size_t) x.dev];
+                const bool got = rt::copy_async(dst, x.vram_base + (size_t) l.slot[(size_t) sw.out] * unit(l), l.blob, cs) ==
+                                     rt::Result::success &&
+                                 rt::stream_sync(cs) == rt::Result::success;
+                store->put_done(l.il, sw.out, got);
+            }
+        }
+        if (check_swaps) {   // DS4_CHECK_SWAPS: the slot (and `out`'s RAM copy) against the model file, byte for byte
+            std::vector<uint8_t> dev(l.blob), h(unit(l)), file(l.blob);
+            for (int m = 0; m < l.nm && ok; ++m) {
+                const Layer& x = member(l, m);
+                rt::set_device(devs[(size_t) x.dev].id);
+                rt::copy(l.nm > 1 ? h.data() : dev.data(), x.vram_base + (size_t) l.spare_vram * unit(l), unit(l));
+                if (l.nm > 1) half_to_blob(l, h.data(), m, dev.data());
+            }
+            ok = ok && read_mx_file(l, sw.in, file.data());
+            for (int r = 0; r < 3 && ok; ++r)
+                ok = std::memcmp(dev.data() + l.lay.trellis[r], file.data() + l.lay.trellis[r], mx_part_bytes(l, r)) == 0;
+            bool ok_out = true;
+            if (sw.ram >= 0) {
+                ok_out = read_mx_file(l, sw.out, file.data());
+                ram_to_blob(l, sw.ram, dev.data());
+                for (int r = 0; r < 3 && ok_out; ++r)
+                    ok_out = std::memcmp(dev.data() + l.lay.trellis[r], file.data() + l.lay.trellis[r], mx_part_bytes(l, r)) == 0;
+            }
+            std::fprintf(stderr, "ds4 cache: layer %d expert %d in, %d out%s: %s\n", l.il, sw.in, sw.out,
+                         sw.ram >= 0 ? " (into RAM)" : "", ok && ok_out ? "matches the model file" : "MISMATCH");
+        } else if (!ok) {
+            std::fprintf(stderr, "ds4 cache: layer %d expert %d: the move into VRAM failed\n", l.il, sw.in);
+        }
+    }
+
+    // after a chunked prompt: the expert cache catches up with what the prompt picked at once - a window prompt gets
+    // its swaps one tick at a time over its hundreds of windows, a chunked one has a single tick - so the decode that
+    // follows finds the hot experts in VRAM.  Rounds of the ordinary swap rule (the hottest CPU-lane pick of each layer
+    // in, its coldest VRAM expert out) until nothing is worth moving or DS4_SETTLE_MS (6000) is spent
+    void cache_settle() {
+        if (!o.expert_cache || cache_ths.empty()) return;
+        static const double budget = env_f("DS4_SETTLE_MS", 6000.0f);
+        if (budget <= 0.0) return;
+        const double t0 = now_ms();
+        const int64_t s0 = st.swaps;
+        while (now_ms() - t0 < budget) {
+            for (Layer& l : L) {
+                if (l.mtp || l.spare_vram < 0 || l.swap_pending) continue;
+                l.cpu_hits.clear();
+                for (int e = 0; e < l.n_exp; ++e)
+                    if (l.slot[(size_t) e] < 0 && l.heat[(size_t) e] >= 2.0f) l.cpu_hits.push_back(e);
+            }
+            cache_tick_swaps(0);
+            if (sw_inflight == 0) break;   // (nothing queued: every layer's best CPU-lane expert is not hotter than its coldest VRAM one)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        // The RAM store's preload after a chunked prompt is off by default: measured on Strix Halo (code fixture, prompt +
+        // 256 tokens, 3 runs a side) it costs the prompt 4.7 s and the decode that follows gains nothing (13.9/14.4 s with it
+        // against 14.2 s without).  The swaps above are what the decode actually uses; DS4_SETTLE_STORE=1 restores it.
+        if (store && env_f("DS4_SETTLE_STORE", strata::ds4::settle_store_default(defaults_026())) != 0.0f) {   // the RAM store too: a window prompt fills it through the CPU
+            // lane's picks, a chunked one streams past it - the hottest CPU-lane experts of the prompt into its free slots
+            // (copy_mode: an expert already in the CPU lane's RAM copy gains nothing from a second copy of the same bytes -
+            // measured on the R9700 12 GB cell: 4152 such experts, 40 GB read at 6.4 GB/s, 6.2 s of an 8K prompt, 0.0 store
+            // hits in the decode after it; the VRAM swaps above already read them from the copy)
+            std::vector<std::pair<float, std::pair<int, int>>> hot;
+            for (const Layer& l : L) {
+                if (l.mtp) continue;
+                for (int e = 0; e < l.n_exp; ++e)
+                    if (l.slot[(size_t) e] < 0 && !(strata::ds4::settle_skips_copy_experts(defaults_026()) && copy_mode && !l.ram.empty() && l.ram[(size_t) e] >= 0) &&
+                        l.heat[(size_t) e] >= 4.0f) hot.push_back({l.heat[(size_t) e], {l.il, e}});
+            }
+            std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+            std::vector<std::pair<int, int>> list;
+            for (const auto& h : hot) {
+                if (list.size() >= store->slots_max()) break;
+                list.push_back(h.second);
+            }
+            const double ts = now_ms();
+            const size_t n = store->preload(list, 0);
+            if (o.verbose) std::fprintf(stderr, "ds4: RAM store: %zu hot experts read after the prompt (%.0f ms)\n", n, now_ms() - ts);
+        }
+        if (o.verbose && st.swaps > s0)
+            std::fprintf(stderr, "ds4: expert cache: %lld swaps after the prompt (%.0f ms)\n", (long long) (st.swaps - s0),
+                         now_ms() - t0);
+    }
+    void cache_tick(int T) {
+        cache_tick_swaps(T);
+        store_sync();
+        store_watch();
+    }
+    // Relinquish whole store chunks until the same RAM reserve used at load is
+    // available again. The store determines each chunk's actual size.
+    void store_watch() {
+        if (!store || ram_margin_bytes == 0) return;
+        uint64_t avail = ram_avail();
+        size_t n = 0;
+        while (avail != ~uint64_t{0} && avail < ram_margin_bytes) {
+            const size_t freed = store->shrink_chunks(1);
+            if (!freed) break;
+            n += freed;
+            avail = ram_avail();
+        }
+        if (n > 0) std::fprintf(stderr, "ds4: RAM store: gave back %zu chunks (%zu slots left)\n", n, store->slots_allocated());
+    }
+    void cache_tick_swaps(int T) {
+        if (!o.expert_cache || cache_ths.empty()) return;
+        std::vector<Swap> ready;
+        std::vector<RamSwap> rready;
+        {
+            std::lock_guard<std::mutex> lk(sw_mu);
+            ready.swap(sw_ready);
+            rready.swap(ram_ready);
+        }
+        for (const RamSwap& rs : rready) {   // (nothing reads the tier between windows)
+            --ram_inflight;
+            Layer& l = L[(size_t) rs.layer];
+            if (rs.in < 0 || l.ram[(size_t) rs.in] >= 0 || l.slot[(size_t) rs.in] >= 0) {
+                ram_free.push_back(rs.slot);
+                continue;
+            }
+            l.ram[(size_t) rs.in] = rs.slot;
+            if (rs.out >= 0 && l.ram[(size_t) rs.out] >= 0) {
+                ram_free.push_back(l.ram[(size_t) rs.out]);
+                l.ram[(size_t) rs.out] = -1;
+            }
+            ++st.ram_moves;
+        }
+        for (const Swap& sw : ready) {
+            Layer& l = L[(size_t) sw.layer];
+            const int old_slot = l.slot[(size_t) sw.out];
+            const std::array<uint8_t*, 4> old_parts = l.hh[(size_t) sw.in];
+            if (copy_mode) {   // (`out` takes the RAM place `in` leaves: through the spare, which `in`'s slot becomes)
+                const int s_in = l.ram[(size_t) sw.in];
+                l.ram[(size_t) sw.in] = -1;
+                if (sw.ram >= 0) {
+                    l.ram[(size_t) sw.out] = sw.ram;
+                    copy_spare[(size_t) l.il] = s_in;
+                } else if (s_in >= 0) {   // (the move into RAM failed: `out` back to the file, one copy fewer)
+                    --ram_held;
+                    if (copy_spare[(size_t) l.il] < 0) copy_spare[(size_t) l.il] = s_in;
+                }
+            } else if (!l.ram.empty() && l.ram[(size_t) sw.in] >= 0) {   // (in VRAM now: its RAM slot for the next hottest)
+                ram_free.push_back(l.ram[(size_t) sw.in]);
+                l.ram[(size_t) sw.in] = -1;
+            }
+            l.slot[(size_t) sw.in] = l.spare_vram;
+            if (!l.zc.empty() && l.zc[(size_t) sw.in]) {   // (VRAM's now: not the store's to compute any more)
+                l.zc[(size_t) sw.in] = 0;
+                if (l.zc_tab != nullptr) {   // (the device's table too: its entry pointed into the slot the store now reuses - when `in` left VRAM later,
+                                             // zc_stage copied whatever lay there, another expert's blob, into the plan)
+                    rt::set_device(devs[0].id);
+                    rt::memset_async(l.zc_tab + sw.in, 0, 8, devs[0].st);
+                }
+                store->unmark(l.il, sw.in);
+            }
+            if (l.nm == 1) set_vm(l, sw.in, l.spare_vram);
+            l.hh[(size_t) sw.in] = {nullptr, nullptr, nullptr, nullptr};
+            l.host[(size_t) sw.in] = nullptr;
+            l.slot[(size_t) sw.out] = -1;
+            if (l.lay.fmt == gg::kFmtMXFP4) {   // (the file has it)
+                l.host[(size_t) sw.out] = (uint8_t*) mx_mat(l, sw.out, 0);
+            } else if (file_experts) {   // (back to its pages in the file)
+                l.hh[(size_t) sw.out] = {file_part(l, sw.out), nullptr, nullptr, nullptr};
+                l.host[(size_t) sw.out] = l.hh[(size_t) sw.out][0];
+            } else {
+                l.hh[(size_t) sw.out] = l.spare_host;
+                l.host[(size_t) sw.out] = l.spare_host[0];
+                l.spare_host = old_parts;
+            }
+            l.spare_vram = old_slot;
+            for (int m = 0; m < l.nm; ++m) {
+                Layer& x = member(l, m);
+                const Dev& dm = devs[(size_t) x.dev];
+                l.tab_pin[2 * m] = (unsigned long long) (x.vram_base + (size_t) l.slot[(size_t) sw.in] * unit(x));
+                l.tab_pin[2 * m + 1] = 0ull;
+                rt::set_device(dm.id);   // (stream order: before the next window)
+                rt::copy_async(x.vram_tab + sw.in, &l.tab_pin[2 * m], 8, dm.st);
+                rt::copy_async(x.vram_tab + sw.out, &l.tab_pin[2 * m + 1], 8, dm.st);
+            }
+            l.swap_pending = false;
+            --sw_inflight;
+            ++st.swaps;
+        }
+        decay_tokens += T;
+        if (decay_tokens >= 256) {   // older use counts less: x0.9 every 256 tokens
+            decay_tokens = 0;
+            for (Layer& l : L)
+                for (float& h : l.heat) h *= c_decay;
+        }
+        bool queued = false, rqueued = false;
+        for (Layer& l : L) {
+            if (l.cpu_hits.empty()) continue;
+            std::vector<int> hits;
+            hits.swap(l.cpu_hits);
+            int best = -1, vin = -1;
+            for (int e : hits)
+                if (l.slot[(size_t) e] < 0 && (best < 0 || l.heat[(size_t) e] > l.heat[(size_t) best])) best = e;
+            if (best >= 0 && l.spare_vram >= 0 && !l.swap_pending && sw_inflight < c_inflight) {   // VRAM: the hottest in
+                int cold = -1;
+                for (int e = 0; e < l.n_exp; ++e)
+                    if (l.slot[(size_t) e] >= 0 && (cold < 0 || l.heat[(size_t) e] < l.heat[(size_t) cold])) cold = e;
+                if (cold >= 0 && l.heat[(size_t) best] > l.heat[(size_t) cold] * c_margin + c_bonus) {
+                    l.swap_pending = true;
+                    ++sw_inflight;
+                    vin = best;
+                    Swap sw{l.il, best, cold};
+                    if (copy_mode && l.ram[(size_t) best] >= 0) sw.ram = copy_spare[(size_t) l.il];   // (-1: none)
+                    std::lock_guard<std::mutex> lk(sw_mu);
+                    sw_queue.push_back(sw);
+                    queued = true;
+                }
+            }
+            if (l.ram.empty() || ram_free.empty() || ram_inflight >= kMaxSwaps) continue;
+            int rb = -1;   // RAM: the hottest read from the file, in place of the layer's coldest held (or a free slot)
+            for (int e : hits)
+                if (e != vin && l.slot[(size_t) e] < 0 && l.ram[(size_t) e] < 0 &&
+                    (rb < 0 || l.heat[(size_t) e] > l.heat[(size_t) rb]))
+                    rb = e;
+            if (rb < 0) continue;
+            int rc = -1;
+            for (int e = 0; e < l.n_exp; ++e)
+                if (l.ram[(size_t) e] >= 0 && (rc < 0 || l.heat[(size_t) e] < l.heat[(size_t) rc])) rc = e;
+            const bool room = ram_free.size() > 1;   // (slots VRAM freed: filled at once)
+            if (!room && !(rc >= 0 && l.heat[(size_t) rb] > l.heat[(size_t) rc] * 1.25f + 1.0f)) continue;
+            RamSwap rs;
+            rs.layer = l.il;
+            rs.in = rb;
+            rs.out = room ? -1 : rc;
+            rs.slot = ram_free.back();
+            ram_free.pop_back();
+            ++ram_inflight;
+            std::lock_guard<std::mutex> lk(sw_mu);
+            ram_queue.push_back(rs);
+            rqueued = true;
+        }
+        if (queued) sw_cv.notify_all();
+        if (rqueued) ram_cv.notify_one();
+    }
+
+    // lookahead's thread: the ranges the CPU lane asked for, read in (os::prefetch) off the lane, which computes
+    void prefetch_loop() {
+        std::vector<std::pair<const void*, size_t>> b;
+        for (;;) {
+            {
+                std::unique_lock<std::mutex> lk(pf_mu);
+                pf_cv.wait(lk, [&] { return quit.load(std::memory_order_relaxed) || !pf_q.empty(); });
+                if (quit.load(std::memory_order_relaxed)) return;
+                b.swap(pf_q);
+            }
+            os::prefetch_cold(b);   // (the resident ones would only cost the page walk)
+            b.clear();
+        }
+    }
+    // an expert the CPU lane reads from the files (neither in VRAM nor in the RAM tier)
+    static bool file_read(const Layer& l, int e) {
+        return l.slot[(size_t) e] < 0 && (l.ram.empty() || l.ram[(size_t) e] < 0);
+    }
+    // the layer whose picks layer l0 guesses a layers ahead (1, 2): the next ones of its stack on its device, MXFP4
+    // experts read in place, some of them from the files now (none: nothing to read early - null)
+    const Layer* ahead_layer(const Layer& l0, int a) const {
+        const int j = l0.il + a, end = l0.mtp ? g.nl + g.n_mtp : g.nl;
+        if (j >= end || j >= (int) L.size()) return nullptr;
+        const Layer& n = L[(size_t) j];
+        if (n.dev != l0.dev || n.mtp != l0.mtp || n.lay.fmt != gg::kFmtMXFP4 || n.gate_w == nullptr || n.n_exp > 1024 ||
+            (int) n.slot.size() < n.n_exp)
+            return nullptr;
+        for (int e = 0; e < n.n_exp; ++e)
+            if (file_read(n, e)) return &n;
+        return nullptr;
+    }
+    // lookahead on the CPU lane: request r (layer li, seq) carries the device's guesses for the next layers - the
+    // guessed experts read from the files asked for now (each once a window), the guesses kept for the hit counts
+    std::vector<std::pair<const void*, size_t>> pf_want;
+    void ahead_ask(int li, const Req& r, unsigned seq, int T) {
+        pf_want.clear();
+        for (int a = 1; a <= 2; ++a) {
+            const int m = std::min(r.na[a - 1], a == 1 ? kAhead1 : kPicks), j = li + a;
+            if (m <= 0 || j >= (int) L.size()) continue;
+            const Layer& n = L[(size_t) j];
+            uint8_t* fl = ahead_fl.data() + (size_t) j * 1024;
+            uint8_t* rk = ahead_rank.data() + (size_t) j * 1024;
+            if (ahead_for[(size_t) j] != seq + (unsigned) a) {
+                std::memset(fl, 0, 1024);
+                std::memset(rk, 0, 1024);
+                ahead_for[(size_t) j] = seq + (unsigned) a;
+            }
+            for (int t = 0; t < T; ++t)
+                for (int i = 0; i < m; ++i) {
+                    const int e = r.ahead[t][(a - 1) * kAhead1 + i];
+                    if (e < 0 || e >= n.n_exp || e >= (int) n.slot.size()) continue;
+                    fl[e] |= a == 2 ? 4 : (i < n.k_exp ? 3 : 2);
+                    if (a == 1 && (rk[e] == 0 || rk[e] > i + 1)) rk[e] = (uint8_t) (i + 1);
+                    if ((fl[e] & 8) || !file_read(n, e)) continue;
+                    fl[e] |= 8;
+                    if (store) store->prefetch(j, e);
+                    else
+                        for (int q = 0; q < 3; ++q) pf_want.push_back({mx_mat(n, e, q), mx_part_bytes(n, q)});
+                    ++st.ahead_pf;
+                }
+        }
+        if (pf_want.empty()) return;
+        {
+            std::lock_guard<std::mutex> lk(pf_mu);
+            pf_q.insert(pf_q.end(), pf_want.begin(), pf_want.end());
+        }
+        pf_cv.notify_one();
+    }
+
+    // the decode path's host side: each published routing in turn - its CPU lane experts (if any) into the answer's
+    // part, then the answer's seq.  Spins while requests come (a token's 40 layers), naps after 2 ms without one.
+    void serve_lane() {
+        unsigned next = 1;
+        auto last = std::chrono::steady_clock::now();
+        std::vector<Ent> ents;
+        while (!lane_quit.load(std::memory_order_acquire) && !mailbox->stopped.load(std::memory_order_acquire)) {
+            Req& r = reqs[next % kRing];
+            if (std::atomic_ref<unsigned>(r.seq).load(std::memory_order_acquire) != next) {
+                cpu_relax();
+                if (std::chrono::steady_clock::now() - last > std::chrono::milliseconds(2))
+                    std::this_thread::sleep_for(std::chrono::microseconds(20));
+                continue;
+            }
+            const int li = layer_of[next % kRing].load(std::memory_order_acquire);
+            Resp& rp = resps[next % kRing];
+            const int T = std::max(1, std::min(kWin, r.T));
+            for (int t = 0; t < T; ++t) rp.cpu[t] = 0;
+            if (li >= 0 && li < (int) L.size()) {
+                Layer& l = L[(size_t) li];
+                uint32_t* pr = prof.data() + (size_t) li * g.n_exp;
+                ents.clear();
+                if (store && li > 0 && li < g.nl) store->cancel_stale(li - 1);   // (guesses for layers the token has passed: dropped unread)
+                // lookahead: the guesses made for this layer (when they are for this request), counted on decode
+                const uint8_t* fl = T == 1 && !ahead_for.empty() && ahead_for[(size_t) li] == next
+                                        ? ahead_fl.data() + (size_t) li * 1024 : nullptr;
+                // the window's CPU-lane picks by expert (up to 8 tokens an entry), their weights by entry row
+                float wv[kWin * kPicks];
+                int tok_of[kWin * kPicks];
+                int nslots = 0;
+                std::vector<std::pair<int, int>> picks;   // (expert, t * kPicks + i), CPU-lane only
+                if (trace_f != nullptr && !l.mtp) {   // DS4_TRACE=file: one record a route request: u8 layer, u8 T, T x k int16 expert ids
+                    // DS4_TRACE_AHEAD=1: T has bit 7 set and the guesses follow: u8 na1, u8 na2, T x (na1 + na2) int16 (the
+                    // next layer's likely picks by rank, then the one after's), as the lookahead made them for THIS layer's
+                    // predecessors (the request carries the guesses for the layers after it)
+                    static const bool with_ahead = std::getenv("DS4_TRACE_AHEAD") != nullptr;
+                    uint8_t hd[2] = {(uint8_t) li, (uint8_t) (T | (with_ahead ? 0x80 : 0))};
+                    std::fwrite(hd, 1, 2, trace_f);
+                    for (int t = 0; t < T; ++t)
+                        for (int i = 0; i < l.k_exp; ++i) {
+                            const int16_t v = (int16_t) r.ids[t][i];
+                            std::fwrite(&v, 2, 1, trace_f);
+                        }
+                    if (with_ahead) {
+                        const uint8_t na[2] = {(uint8_t) std::max(0, std::min(r.na[0], kAhead1)), (uint8_t) std::max(0, std::min(r.na[1], kPicks))};
+                        std::fwrite(na, 1, 2, trace_f);
+                        for (int t = 0; t < T; ++t) {
+                            for (int i = 0; i < na[0]; ++i) {
+                                const int16_t v = (int16_t) r.ahead[t][i];
+                                std::fwrite(&v, 2, 1, trace_f);
+                            }
+                            for (int i = 0; i < na[1]; ++i) {
+                                const int16_t v = (int16_t) r.ahead[t][kAhead1 + i];
+                                std::fwrite(&v, 2, 1, trace_f);
+                            }
+                        }
+                    }
+                }
+                const bool dsk = disk_skip_w > 0.0f && !l.mtp && li >= disk_skip_from && li < g.nl;
+                for (int t = 0; t < T; ++t) {
+                    float wsum = 0.0f;   // (DISK_SKIP_W: the token's route weights)
+                    if (dsk)
+                        for (int i = 0; i < l.k_exp; ++i)
+                            if (r.ids[t][i] >= 0 && r.ids[t][i] < l.n_exp) wsum += r.w[t][i];
+                    for (int i = 0; i < l.k_exp; ++i) {
+                        const int e = r.ids[t][i];
+                        if (e < 0 || e >= l.n_exp) continue;
+                        ++pr[e];
+                        l.heat[(size_t) e] += 1.0f;
+                        if (fl != nullptr) {
+                            ++st.ahead_picks;
+                            st.ahead_hit_k += fl[e] & 1;
+                            st.ahead_hit += (fl[e] & 6) != 0;
+                            st.ahead_hit2 += (fl[e] >> 2) & 1;
+                        }
+                        if (l.slot[(size_t) e] < 0) {
+                            l.cpu_hits.push_back(e);
+                            if (T == 1 && !l.zc.empty() && l.zc[(size_t) e]) {   // the device computed it from the store's slot
+                                store->touch(li, e);
+                                ++st.store_zc;
+                                continue;
+                            }
+                            if (dsk && r.w[t][i] < disk_skip_w * wsum && !in_ram(l, e)) {
+                                ++st.skipped;
+                                continue;
+                            }
+                            if (!l.ram.empty() && l.ram[(size_t) e] >= 0) ++st.ram_experts;
+                            else if (fl != nullptr) {
+                                ++st.ahead_cold;
+                                st.ahead_cold_hit += (fl[e] >> 3) & 1;
+                            }
+                            picks.push_back({e, t * kPicks + i});
+                        }
+                    }
+                }
+                if (fl != nullptr) {   // the guesses by rank: how many were picked
+                    const uint8_t* rk = ahead_rank.data() + (size_t) li * 1024;
+                    for (int e = 0; e < l.n_exp && e < 1024; ++e) {
+                        if (rk[e] == 0 || rk[e] > 16) continue;
+                        bool hit = false;
+                        for (int i = 0; i < l.k_exp; ++i) hit = hit || r.ids[0][i] == e;
+                        ++st.ahead_rank_n[rk[e] - 1];
+                        st.ahead_rank_hit[rk[e] - 1] += hit;
+                    }
+                }
+                if (ahead_mode > 0 && !ahead_for.empty()) ahead_ask(li, r, next, T);
+                std::sort(picks.begin(), picks.end());
+                for (size_t a = 0; a < picks.size();) {
+                    Ent en;
+                    en.e = picks[a].first;
+                    en.slot0 = nslots;
+                    en.n = 0;
+                    while (a < picks.size() && picks[a].first == en.e && en.n < ent_cap(l)) {
+                        const int t = picks[a].second / kPicks, i = picks[a].second % kPicks;
+                        en.tok[en.n++] = t;
+                        tok_of[nslots] = t;
+                        wv[nslots] = r.w[t][i];
+                        ++nslots;
+                        ++a;
+                    }
+                    ents.push_back(en);
+                }
+                // lookahead: the entries asked for early (or in the RAM tier) computed first, so the ones asked for
+                // only now get the others' time to come in from the SSD (their slots, so the sums, stay the same)
+                int ord[kWin * kPicks];
+                const int* po = nullptr;
+                if (ahead_order && !ahead_for.empty() && ahead_for[(size_t) li] == next && ents.size() > 1 &&
+                    ents.size() <= (size_t) (kWin * kPicks)) {
+                    const uint8_t* fa = ahead_fl.data() + (size_t) li * 1024;
+                    int n = 0;
+                    for (int pass = 0; pass < 2; ++pass)
+                        for (size_t q = 0; q < ents.size(); ++q) {
+                            const int e = ents[q].e;
+                            const bool early = !file_read(l, e) || (fa[e] & 8) != 0;
+                            if (early == (pass == 0)) ord[n++] = (int) q;
+                        }
+                    po = ord;
+                }
+                if (!ents.empty()) {
+                    const double tc = now_ms();
+                    cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, po);
+                    const int D = g.dim;
+                    for (int t = 0; t < T; ++t) {
+                        bool any = false;
+                        for (int sl = 0; sl < nslots; ++sl) any = any || tok_of[sl] == t;
+                        if (!any) continue;
+                        float* o = rp.part[t];
+                        for (int e = 0; e < D; ++e) o[e] = 0.0f;
+                        for (int sl = 0; sl < nslots; ++sl) {
+                            if (tok_of[sl] != t) continue;
+                            const float* y = c_yd.data() + (size_t) sl * D;
+                            for (int e = 0; e < D; ++e) o[e] += wv[sl] * y[e];
+                        }
+                        rp.cpu[t] = 1;
+                    }
+                    st.cpu_ms += now_ms() - tc;
+                    st.cpu_experts += nslots;
+                }
+            }
+            std::atomic_ref<unsigned>(rp.seq).store(next, std::memory_order_release);
+            ++next;
+            last = std::chrono::steady_clock::now();
+        }
+    }
+
+    // a GGUF's matrices (BF16 / MXFP4) to its own kernels, EXL3 ones to x3's
+    static bool mv_any(const x3::MvJob* j, int n, rt::Queue s) {
+        bool g = false;
+        for (int i = 0; i < n; ++i) g = g || j[i].m->fmt != 0;
+        return g ? gg::mv(j, n, s) : x3::mv(j, n, s);
+    }
+    bool mv(Dev& d, std::initializer_list<x3::MvJob> jobs, std::string& err) {
+        x3::MvJob j[x3::kMaxMvJobs];
+        int n = 0;
+        for (const x3::MvJob& x : jobs) j[n++] = x;
+        if (!mv_any(j, n, d.st)) {
+            err = "exl3 mv failed";
+            return false;
+        }
+        return true;
+    }
+    bool mv_n(Dev& d, x3::MvJob* j, int n, std::string& err) {
+        for (int a = 0; a < n; a += x3::kMaxMvJobs)
+            if (!mv_any(j + a, std::min(x3::kMaxMvJobs, n - a), d.st)) {
+                err = "exl3 mv failed";
+                return false;
+            }
+        return true;
+    }
+    // y[c] = x[c] W for the T activations x + c * x_cs (floats), into y + c * y_cs
+    static x3::MvJob job(const x3::Mat& m, const float* x, float* y, int T = 1, size_t x_cs = 0, size_t y_cs = 0,
+                         float alpha = 1.0f) {
+        x3::MvJob j;
+        j.m = &m;
+        j.xf = x;
+        j.y = y;
+        j.alpha = alpha;
+        j.ncol = T;
+        j.xf_cs = x_cs;
+        j.y_cs = y_cs;
+        return j;
+    }
+
+    // ---- the DSpark drafter (DeepSeek's DSparkBlock / forward_spec).  Its blocks' rings hold the trunk's main KV:
+    // seed() turns a window's taps (the streams' mean entering layers 37..39) into it, through main_proj / main_norm
+    // and each block's wkv / kv_norm / rope / FP8, for the positions the trunk kept.  draft() runs the block [y, noise x
+    // (block - 1)] at positions pos .. through the blocks (each query attending to the ring and to the whole block),
+    // the trunk's head, the markov bias token by token (greedy) and the confidence head.
 
 };
 
