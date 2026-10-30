@@ -225,7 +225,7 @@ RAM を読む速さが足りない PC では遅くなります（下の測定）
 
 `tools/split_serve_check.py` が、1 枚のエンジンの答えと split の答えをトークンと状態の指紋（`STRATA_STATE_HASH`）で比べ（`exact`）、層の分割・1 枚・split の速さを測ります（`bench`）。
 
-## 1 つの会話で複数の GPU を働かせる（`--pipeline-windows`、opt-in）
+## 1 つの会話で複数の GPU を働かせる（`--pipeline-windows`）
 
 分割では、検証の窓を GPU が交代で受け持ちます。
 最初の GPU が自分の層を計算して引き渡したあとは、最後の GPU が残りの層と head と下書きを計算する間、待っています。
@@ -239,6 +239,8 @@ RAM を読む速さが足りない PC では遅くなります（下の測定）
 `--pipeline-windows 1` は、検証の窓を通る短い prefill（`--short-read`）だけを重ねます。これは 2 段のときだけです。
 
 各段が自分の GPU を持つ 2 段以上の分割と、`--serve` のときに使えます。
+指定がなければ、Xe2（Battlemage）の GPU ちょうど 2 枚の分割で、`--serve` と下書きの層があり、`--batch` と補助のキャッシュがないときは `2` にします（upstream a6fd78856。upstream は Arc Pro B65 2 枚で decode が直列より 17〜28% 速く、1 時間の serve でトークンの違いがなかったと測っています）。
+`--pipeline-windows 0` か `STRATA_PIPELINE_AUTO=0` で切れます。ほかの構成は直列のままです。
 3 段以上で `--pipeline-windows 2` を使うときは、`--adapt-async` を切り、適応する段は判定のときに動かします。
 
 - **費用**: 各 GPU に 2 つ目の検証の窓。各 GPU のエキスパートのキャッシュから 160 MiB を外し、`2` では最後の段より前の各 GPU に再帰の状態のコピーを 2 つ置きます（その GPU の GDN の層 1 つあたり約 3 MiB）。

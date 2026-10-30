@@ -517,8 +517,9 @@ struct Options {
     /// 553b0b78): 1 = a prompt's
     /// short reads through the verify windows run with the stages overlapped (stage 0 reads window K+1 while stage 1
     /// reads window K); 2 = the decode windows too: stage 0 runs window K+1 speculatively while stage 1 verifies
-    /// window K (rolled back when K is not accepted as guessed).  0 = off (the stages take turns).
-    int pipeline_windows = 0;
+    /// window K (rolled back when K is not accepted as guessed).  0 = off (the stages take turns).  -1 (not given):
+    /// 2 for a split of exactly two Xe2 GPUs with --serve and the MTP drafter (upstream a6fd78856), else 0.
+    int pipeline_windows = -1;
     /// The suffix drafter (prompt lookup): when the text being written repeats an earlier stretch of the context (code
     /// edits, quoted input, tool-call JSON) by at least this many tokens, the window may be filled with what followed
     /// it there instead of the MTP's drafts, where the MTP's own first guess agrees and the draft policy expects it to
@@ -750,7 +751,8 @@ void usage() {
                  "  --batch-groups G|auto  with a layer split: the --batch slots in G groups pipelined through the\n"
                  "                       GPUs (each GPU on another group at once; G divides N; 1 = one window, GPU\n"
                  "                       after GPU); auto, the default with a layer split: one group per GPU\n"
-                 "  --pipeline-windows N --serve with a layer split on 2+ GPUs (opt-in): one conversation's windows\n"
+                 "  --pipeline-windows N --serve with a layer split on 2+ GPUs (default 2 on two Xe2 GPUs with the MTP\n"
+                 "                       drafter, else 0): one conversation's windows\n"
                  "                       with the GPUs overlapped - 1 = the prompt's short reads, 2 = decode as well\n"
                  "                       (stage 0 runs the next window while stage 1 verifies this one); docs/MULTIGPU.md\n"
                  "  --batch-cpu-split N0,N1  EXPERIMENTAL, with --batch-groups over two GPUs: the CPU expert workers\n"
@@ -2825,9 +2827,33 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: layer split across %zu GPUs: CUDA0, then CUDA%s (split %s)\n",
                      split_devs.size() + 1, devs.c_str(), o.layer_split.c_str());
     }
-    // --pipeline-windows (opt-in): one conversation's windows with the stages of a layer split overlapped.  Decided
+    // --pipeline-windows: one conversation's windows with the stages of a layer split overlapped.  Decided
     // here, before any stage sizes its expert cache (the second verifier per stage and the snapshots are allocated
     // after the caches, so their room is kept out of them).  What it does not support turns it off, said once.
+    // Not given: 2 for a split of exactly two GPUs that both report the Xe2 (Battlemage) architecture, with --serve and
+    // the MTP drafter, no --batch and no helper caches (upstream a6fd78856: on two Arc Pro B65 decode +17 to +28% over
+    // the serial windows, a 1 h serve of 1,082 requests with no token differences; not measured on XeStrata, which has
+    // no such pair).  Anything else stays serial and says nothing; --pipeline-windows 0 or STRATA_PIPELINE_AUTO=0 keeps
+    // it off.
+    if (o.pipeline_windows < 0) {
+        const char* ae = std::getenv("STRATA_PIPELINE_AUTO");
+        const auto xe2 = [](int d) {
+            namespace syclex = sycl::ext::oneapi::experimental;
+            try {
+                const auto a = strata::core::Runtime::at(d).device().get_info<syclex::info::device::architecture>();
+                return a == syclex::architecture::intel_gpu_bmg_g21 || a == syclex::architecture::intel_gpu_bmg_g31;
+            } catch (const std::exception&) {
+                return false;
+            }
+        };
+        const bool helpers = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
+        const bool on = o.serve && multi_gpu && split_devs.size() == 1 && !(ae != nullptr && std::atoi(ae) == 0) &&
+                        !o.mtp.empty() && o.spec >= 2 && o.batch == 0 && !helpers && xe2(0) && xe2(split_devs[0]);
+        o.pipeline_windows = on ? 2 : 0;
+        if (on)
+            std::fprintf(stderr, "strata generate: --pipeline-windows 2 is on by default for a layer split across two Xe2 "
+                                 "GPUs (--pipeline-windows 0 or STRATA_PIPELINE_AUTO=0 turns it off)\n");
+    }
     if (o.pipeline_windows > 0) {
         const bool helpers = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
         const char* off = !o.serve ? "it needs --serve"

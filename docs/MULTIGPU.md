@@ -225,7 +225,7 @@ Limits:
 
 `tools/split_serve_check.py` compares the answer of one engine with the split's, by tokens and by the state fingerprint (`STRATA_STATE_HASH`) (`exact`), and measures the layer split, one card and the split (`bench`).
 
-## One conversation with both cards busy (`--pipeline-windows`, opt-in)
+## One conversation with both cards busy (`--pipeline-windows`)
 
 With a split the GPUs take turns on a verify window.
 The first GPU computes its layers and hands off, then waits while the last GPU computes the rest, the head and the draft.
@@ -239,6 +239,8 @@ Only the last stage waits for the verdict.
 `--pipeline-windows 1` overlaps only the short prefills that go through the verify windows (`--short-read`), with two stages only.
 
 It works with a split of two or more stages, each on its own GPU, and `--serve`.
+When it is not given, it is `2` on a split of exactly two Xe2 (Battlemage) GPUs with `--serve` and the draft layer, and no `--batch` or helper caches (upstream a6fd78856: on two Arc Pro B65 upstream measured decode 17-28% faster than the serial windows, and a one-hour serve with no token differences).
+`--pipeline-windows 0` or `STRATA_PIPELINE_AUTO=0` turns it off; every other setup stays serial.
 With three or more stages `--pipeline-windows 2` turns `--adapt-async` off, and the adaptive tier runs at a verdict.
 
 - **Cost**: a second verify window on each GPU, 160 MiB more kept out of each GPU's expert cache, and with `2` two copies of the recurrent state on every GPU before the last stage (about 3 MiB per GDN layer of that GPU).
