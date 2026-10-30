@@ -323,7 +323,7 @@ A file's key has `diffusion_model.`, `transformer.` or `model.diffusion_model.` 
 - A DoRA's, an OFT's or a GLoRA's rows take no other adapter (the order would change the image); the other forms add up even on one weight.
 - A bias's delta acts only where the weight adds a bias of its own. Qwen-Image-2.1's DiT adds none, so Qwen takes no bias's delta. MOSS-Image's 42 blocks and `final_linear_video` add none, and every one of Mage-Flow's weights does.
 - MageTrail's low-rank modulation (F32 weights) takes no adapter (the key and the reason are returned).
-- An OFT cannot take a name that splits into more than one weight (MOSS-Image's `qkv` is q, k and v). Qwen-Image-2.1's `modulation.1` is written a band of rows at a time, so an OFT whose blocks do not divide that band is refused.
+- An OFT cannot take a name that splits into more than one weight (MOSS-Image's `qkv` is q, k and v). Qwen-Image-2.1's `modulation.1` is written a band of rows at a time, so an OFT on it is refused.
 - A LoHa's rank is `hada_w1_b`'s rows, and the metadata's `lora_alpha` is divided by that rank (as ComfyUI does); a file whose `lora_alpha` has nothing to do with its rank changes the strength.
 - A file with `use_rslora` is refused (its strength is alpha / √rank, not alpha / rank). PEFT's `rank_pattern` is not read: alpha alone.
 - A file with a text encoder's weight (`lora_te_`, `text_encoder.`, `te.`) is not applied: text encoder LoRAs are not done. The API has no `scale_text` field, and one sent is ignored as `style` and `user` are.

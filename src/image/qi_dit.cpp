@@ -996,12 +996,11 @@ bool QiDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                 drop_loras();
                 return false;
             }
-            if (oft && slot->name == "modulation.1" && C_ % e.oft.bs != 0) {
-                // the DiT writes that weight a band of C_ rows at a time: a rotation whose blocks a band cuts is not
-                // one the engine can apply to the band alone
-                err = "image engine: " + u.file->path() + ": " + e.key + ": an OFT of " + std::to_string(e.oft.bs) +
-                      "-row blocks, and the DiT writes the modulation " + std::to_string(C_) +
-                      " rows at a time (the blocks must divide it)";
+            if (oft && slot->name == "modulation.1") {
+                // the DiT writes that weight a band of C_ rows at a time (step_modulation), and a rotation turns the
+                // part's rows whole (LoraLayer::add): bound, it would be skipped on every band
+                err = "image engine: " + u.file->path() + ": " + e.key + ": an OFT of the modulation, which the DiT "
+                      "writes " + std::to_string(C_) + " rows at a time: the engine does not turn it";
                 drop_loras();
                 return false;
             }

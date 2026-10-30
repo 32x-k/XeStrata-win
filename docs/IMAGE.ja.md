@@ -323,7 +323,7 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 - DoRA・OFT・GLoRA の当たる行には、ほかのアダプターを重ねられません（重ねる順で絵が変わるため）。ほかの形式どうしは同じ行でも足し算になります。
 - バイアスの差分は、その重みが自分のバイアスを足すときだけ当たります。Qwen-Image-2.1 の DiT はバイアスを足さないので、Qwen では当たりません。MOSS-Image は 42 のブロックと `final_linear_video` が足さず、Mage-Flow はどの重みも足します。
 - MageTrail の低ランクの変調（F32 の重み）に当たるアダプターは当たりません（キーと理由を返します）。
-- OFT は 1 本の重みに分かれる名前に当てられません（MOSS-Image の `qkv` は q・k・v の 3 本です）。Qwen-Image-2.1 の `modulation.1` は決まった行数ずつの帯で書くので、その行数を割り切らないブロックの OFT は断ります。
+- OFT は 1 本の重みに分かれる名前に当てられません（MOSS-Image の `qkv` は q・k・v の 3 本です）。Qwen-Image-2.1 の `modulation.1` は決まった行数ずつの帯で書くので、そこに当たる OFT は断ります。
 - LoHa の rank は `hada_w1_b` の行で、メタデータの `lora_alpha` もその rank で割ります（ComfyUI と同じ）。rank と無関係な `lora_alpha` を持つファイルは、強さが変わります。
 - `use_rslora` のファイルは断ります（強さが alpha / √rank で、alpha / rank と違うため）。PEFT の `rank_pattern` は読まず、alpha だけを使います。
 - 文章エンコーダーの重み（`lora_te_`・`text_encoder.`・`te.`）を含むファイルは当てません。文章エンコーダー向けの LoRA はやらないことにしたためです。API に `scale_text` の欄はなく、送っても `style` や `user` と同じ知らない欄として無視します。

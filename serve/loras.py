@@ -582,6 +582,9 @@ class Folder:
                 _, why = _oft_shape(roles)
                 if why:
                     return f"{key}: {why}"
+                if self.family == "qwen-image" and kind_of(key) == "modulation.1":
+                    # the DiT writes the modulation a band of rows at a time, and a turn is of a part's rows whole
+                    return f"{key}: an OFT of the modulation, which the image engine does not turn"
             else:
                 a, b = roles.get("lora_A"), roles.get("lora_B")
                 if a is None or b is None:
