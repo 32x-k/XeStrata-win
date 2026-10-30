@@ -598,8 +598,30 @@ MfOut MfDit::product(const uint16_t* x16, const float* rs, const W& w, const uin
         // the delta is the input's own (x16 = x / rs): its rows' scales put it back in y's units, as rows_back does
         lora_scratch(T);
         lora->add(x16, T, y, w.n, 0, w.n, rs, gemm_, lora_f32_, lora16_, s_);
+        if (lora->has_glora())   // a GLoRA's own path: the weight's own product of its input, a band of tokens at a time
+            lora->add_glora(x16, T, 0, w.n, rs, gemm_, lora_f32_, lora16_, s_,
+                            [&](const uint16_t* v, int64_t t0, int64_t nt, int64_t r0, int64_t n2) {
+                                glora_weight(v, w, d, r0, n2, nt, t0, y);
+                            });
     }
     return out;
+}
+
+void MfDit::glora_weight(const uint16_t* v, const W& w, const uint8_t* d, int64_t r0, int64_t n, int64_t nt,
+                         int64_t t0, float* y) {
+    if (w.type == kTypeW8) {
+        // the input's own int8 quantization (its buffer, not the product's: that one's is the other products' input)
+        qi_rows_i8(v, false, nt, w.k, lora_glora_x8_, lora_glora_sx_, nullptr, s_);
+        const auto* sw = reinterpret_cast<const float*>(d + w.n * w.k) + r0;
+        prefill::Gemm::i8(lora_glora_x8_, reinterpret_cast<const int8_t*>(d) + r0 * w.k,
+                          reinterpret_cast<int32_t*>(lora_glora_y_), nt, n, w.k, n, s_);
+        qi_i8_scale(lora_glora_y_, nt, n, n, lora_glora_sx_, sw, nullptr, nullptr, s_);
+    } else if (w.type == kTypeF16) {
+        gemm_.f16(v, reinterpret_cast<const uint16_t*>(d) + r0 * w.k, lora_glora_y_, nt, n, w.k, n);
+    } else {
+        gemm_.native(v, w.type, d + (uint64_t) r0 * w.row_bytes, lora_glora_y_, nt, n, w.k, n);
+    }
+    lora_output_add(y + t0 * w.n, nt, w.n, r0, lora_glora_y_, n, s_);
 }
 
 void MfDit::modulation(const uint16_t* tsil, const W& w, const uint8_t* base, float* y, const float* bias) {
@@ -696,7 +718,8 @@ void MfDit::drop_activations() {
     for (void* p : {(void*) img_, (void*) txt_, (void*) q_, (void*) k_, (void*) v_, (void*) a_, (void*) gu_,
                     (void*) h16_, (void*) jq16_, (void*) jk16_, (void*) jv16_, (void*) jo16_, (void*) io16_,
                     (void*) to16_, (void*) cos_, (void*) sin_, (void*) cos_id_, (void*) sin_id_, (void*) attn_scratch_,
-                    (void*) b0_img_, (void*) b0_txt_, (void*) xin_, (void*) xq8_})
+                    (void*) b0_img_, (void*) b0_txt_, (void*) xin_, (void*) xq8_, (void*) lora_glora_y_,
+                    (void*) lora_glora_x8_, (void*) lora_glora_sx_})
         release(allocs_, p);
     xq8_ = nullptr;
     img_ = txt_ = q_ = k_ = v_ = a_ = gu_ = cos_ = sin_ = cos_id_ = sin_id_ = nullptr;
@@ -705,6 +728,9 @@ void MfDit::drop_activations() {
     lora_f32_ = nullptr;
     lora16_ = nullptr;
     lora_tmp_t_ = 0;
+    lora_glora_y_ = nullptr;
+    lora_glora_x8_ = nullptr;
+    lora_glora_sx_ = nullptr;
     cap_hw_ = cap_n_ = cap_text_ = 0;
 }
 
@@ -744,6 +770,8 @@ void MfDit::build_lora_targets() {
 
 void MfDit::lora_scratch(int64_t T) {
     if (lora_cols_ <= 0 || T <= 0) return;
+    // a GLoRA's own path's buffers are a band's, not the tokens': the activations' drop frees them, this gives them back
+    if (lora_glora_cols_ > 0 && lora_glora_y_ == nullptr) lora_glora_scratch();
     if (lora_f32_ != nullptr && T <= lora_tmp_t_) return;
     gpu::stream_sync(s_);   // the old buffers may still be read
     for (void** p : {reinterpret_cast<void**>(&lora_f32_), reinterpret_cast<void**>(&lora16_)})
@@ -754,6 +782,28 @@ void MfDit::lora_scratch(int64_t T) {
     lora_f32_ = alloc<float>(allocs_, T * lora_cols_);
     lora16_ = alloc<uint16_t>(allocs_, T * lora_cols_);
     lora_tmp_t_ = T;
+}
+
+// A GLoRA's own path's buffers: the table the weight's product of its input is added from (a band of tokens, the
+// weight's rows), and that input as a W8A8 product takes it (int8 values and a scale a row).  The deltas' scratch
+// (lora_scratch) holds the input's own two products.
+void MfDit::lora_glora_scratch() {
+    if (lora_glora_cols_ <= 0 || lora_glora_rows_ <= 0) return;
+    const size_t band = (size_t) kLoraGloraRows;
+    lora_glora_y_ = alloc<float>(allocs_, (int64_t) (band * (size_t) lora_glora_rows_));
+    lora_glora_x8_ = alloc<int8_t>(allocs_, (int64_t) (band * (size_t) lora_glora_cols_));
+    lora_glora_sx_ = alloc<float>(allocs_, (int64_t) band);
+}
+
+void MfDit::free_glora_scratch() {
+    for (void* p : {(void*) lora_glora_y_, (void*) lora_glora_x8_, (void*) lora_glora_sx_})
+        if (p != nullptr) {
+            gpu::stream_sync(s_);
+            release(allocs_, p);
+        }
+    lora_glora_y_ = nullptr;
+    lora_glora_x8_ = nullptr;
+    lora_glora_sx_ = nullptr;
 }
 
 bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
@@ -774,22 +824,26 @@ bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
     std::vector<std::string> unknown, text_encoder;
     for (const LoraUse& u : loras) {
         if (!u.file) continue;
-        for (const LoraEntry& e : u.file->entries()) {
-            if (is_text_encoder_key(e.key)) {
-                text_encoder.push_back(e.key);
+        for (const LoraEntry& entry : u.file->entries()) {
+            if (is_text_encoder_key(entry.key)) {
+                text_encoder.push_back(entry.key);
                 continue;
             }
             const LoraSlot* slot = nullptr;
             for (const LoraSlot& s : lora_slots_)
-                if (s.name == e.key) {
+                if (s.name == entry.key) {
                     slot = &s;
                     break;
                 }
             if (slot == nullptr) {
-                unknown.push_back(e.key);
+                unknown.push_back(entry.key);
                 continue;
             }
+            // a GLoRA's four tensors may fit both of its readings: the weight's rows and columns say which
+            LoraEntry alt;
+            const LoraEntry& e = *lora_glora_for_weight(entry, slot->rows, slot->w->k, alt);
             const bool oft = e.kind == LoraKind::oft;
+            const bool glora = e.kind == LoraKind::glora;
             if (e.kind == LoraKind::bias) {   // a bias's delta alone: its rows are the bias's, its columns none
                 if (e.rows != slot->rows) {
                     err = "image engine: " + u.file->path() + ": " + e.key + ": a bias's delta (diff_b/b_norm) of " +
@@ -832,7 +886,8 @@ bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                     return false;
                 }
             }
-            if (const LoraPart* clash = lora_dora_overlap(slot->w->lora, slot->row0, slot->rows, !coef.empty(), oft)) {
+            if (const LoraPart* clash = lora_dora_overlap(slot->w->lora, slot->row0, slot->rows, !coef.empty(), oft,
+                                                          glora)) {
                 err = "image engine: " + u.file->path() + ": " + e.key + ": the weight's rows " +
                       std::to_string(slot->row0) + " .. " + std::to_string(slot->row0 + slot->rows) +
                       " are another adapter's, and " + lora_patch_clash_why(*clash);
@@ -841,8 +896,8 @@ bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
             }
             if (e.replaces)   // a set_weight: the weight interpolates to the file's, W + s (S - W)
                 base.assign((size_t) slot->rows, 1.0f - u.scale);
-            auto entry = std::make_shared<LoraDeviceEntry>();
-            if (!entry->upload(e, s_, err, coef.empty() ? nullptr : coef.data())) {
+            auto dev = std::make_shared<LoraDeviceEntry>();
+            if (!dev->upload(e, s_, err, coef.empty() ? nullptr : coef.data())) {
                 drop_loras();
                 return false;
             }
@@ -851,7 +906,7 @@ bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                 slot->w->lora = lora_layers_.back().get();
             }
             LoraPart part;
-            part.entry = entry;
+            part.entry = dev;
             part.row0 = slot->row0;
             part.n = slot->rows;
             part.src_row = slot->src_row;
@@ -859,9 +914,14 @@ bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
             part.bias_scale = u.scale;   // a diff patch has no alpha: the request's strength only
             part.dora = !coef.empty();
             part.oft = oft;
+            part.glora = glora;
             part.base = std::move(base);
             slot->w->lora->parts.push_back(std::move(part));
             lora_cols_ = std::max(lora_cols_, lora_scratch_cols(e));
+            if (glora) {
+                lora_glora_cols_ = std::max(lora_glora_cols_, e.cols);
+                lora_glora_rows_ = std::max(lora_glora_rows_, e.rows);
+            }
         }
     }
     if (!text_encoder.empty()) {
@@ -884,6 +944,7 @@ bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
             drop_loras();
             return false;
         }
+    if (lora_glora_cols_ > 0) lora_glora_scratch();   // a GLoRA's own path's buffers, once every part is bound
     for (const LoraUse& u : loras)
         if (u.file) lora_files_.push_back(u.file);
     lora_key_ = key;
@@ -935,6 +996,8 @@ bool MfDit::dora_norms(const LoraSlot& slot, std::vector<float>& out, std::strin
 uint64_t MfDit::lora_bytes() const {
     uint64_t n = 0;
     for (const std::unique_ptr<LoraLayer>& l : lora_layers_) n += l->bytes();
+    if (lora_glora_y_ != nullptr)   // a GLoRA's own path's buffers
+        n += (uint64_t) kLoraGloraRows * ((uint64_t) lora_glora_rows_ * 4 + (uint64_t) lora_glora_cols_ + 4);
     return n;
 }
 
@@ -944,6 +1007,8 @@ void MfDit::drop_loras() {
     lora_files_.clear();
     lora_key_.clear();
     lora_cols_ = 0;
+    lora_glora_cols_ = lora_glora_rows_ = 0;
+    free_glora_scratch();
     if (lora_f32_ != nullptr || lora16_ != nullptr) {
         gpu::stream_sync(s_);
         for (void** p : {reinterpret_cast<void**>(&lora_f32_), reinterpret_cast<void**>(&lora16_)})

@@ -732,6 +732,140 @@ void selftest_oft(void* s, int64_t T, int64_t N, int64_t bs, int64_t stages, boo
     if (!ok) throw std::runtime_error(std::string("the turn of ") + label + " is not the reference's");
 }
 
+// a GLoRA: y = W x + scale (W v + B (A x)), v = p2 (p1 x) - the plain form's pair (A, B) and the weight's own product of
+// the input its two factors make, the second run by the caller (`output`, a band of tokens at a time: the engine's
+// add_glora), on the weight's FP16 rows the way a DiT's F16 product would.  The reference rounds where the engine does
+// (the plain pair's first product scaled into FP16, v into FP16), in FP64, from the same FP16 tensors.
+void selftest_glora(void* s, int64_t T, int64_t K, int64_t R, int64_t N, bool rows_scaled, bool lycoris, float scale,
+                    int64_t src_row = 0, int64_t row0 = 0, int64_t n = 0) {
+    namespace si = strata::image;
+    if (n <= 0) n = N - src_row;
+    std::mt19937 rng((uint32_t) (T * 131 + K * 17 + R * 7 + N * 3 + (lycoris ? 1u : 0u) + (rows_scaled ? 2u : 0u)));
+    std::normal_distribution<float> nd(0.0f, 0.5f);
+    std::vector<float> w((size_t) (N * K)), x((size_t) (T * K));
+    for (float& v : w) v = nd(rng);
+    for (float& v : x) v = nd(rng);
+    std::vector<float> rs((size_t) T);
+    for (int64_t t = 0; t < T; ++t) rs[(size_t) t] = std::exp2((float) (t % 3)) * 0.5f;   // 0.5, 1, 2
+    // the file's four tensors, in the reading its shapes take: LyCORIS's a1 [rank][cols], a2 [cols][rank], b1
+    // [rank][cols], b2 [rows][rank]; ComfyUI's own a1 [cols][rank], a2 [rank][cols], b1 [rows][rank], b2 [rank][cols]
+    si::LoraEntry e;
+    e.key = "selftest-glora";
+    e.kind = si::LoraKind::glora;
+    e.rows = N;
+    e.cols = K;
+    e.rank = R;
+    const auto make = [&rng, &nd](size_t n) {
+        std::vector<float> v(n);
+        for (float& x : v) x = nd(rng) * 0.1f;
+        return v;
+    };
+    // the file's four, the reading's shapes: ComfyUI's a1 [cols][rank], a2 [rank][cols], b1 [rows][rank], b2
+    // [rank][cols]; LyCORIS's a1 [rank][cols], a2 [cols][rank], b1 [rank][cols], b2 [rows][rank]
+    std::vector<float> t1 = make(lycoris ? (size_t) (R * K) : (size_t) (K * R));
+    std::vector<float> t2 = make(lycoris ? (size_t) (K * R) : (size_t) (R * K));
+    std::vector<float> t3 = make(lycoris ? (size_t) (R * K) : (size_t) (N * R));
+    std::vector<float> t4 = make(lycoris ? (size_t) (N * R) : (size_t) (R * K));
+    // (the input's first factor [rank][cols], its second [cols][rank], A [rank][cols], B [rows][rank]), the engine's
+    // four: LyCORIS's reading applies a1 [rank][cols] then a2 [cols][rank], the newer one a2 then a1
+    const std::vector<float>& in = lycoris ? t1 : t2;
+    const std::vector<float>& out = lycoris ? t2 : t1;
+    const std::vector<float>& A = lycoris ? t3 : t4;
+    const std::vector<float>& B = lycoris ? t4 : t3;
+    si::lora_to_f16(A, e.glora.a);
+    si::lora_to_f16(B, e.glora.b);
+    e.glora.rows = e.rows;
+    e.glora.cols = e.cols;
+    e.glora.rank = e.rank;
+    si::lora_to_f16(in, e.glora.in);    // [rank][cols], applied to x first
+    si::lora_to_f16(out, e.glora.out);  // [cols][rank]
+    auto entry = std::make_shared<si::LoraDeviceEntry>();
+    std::string err;
+    if (!entry->upload(e, s, err)) throw std::runtime_error(err);
+    strata::prefill::Gemm gemm;
+    if (!gemm.init(s, 0, err)) throw std::runtime_error(err);
+    const int64_t cols = std::max(R, K);   // the layers' scratch: the input's two products, then the weight's input
+    auto* dx = static_cast<uint16_t*>(gpu::alloc_device((size_t) (T * K) * 2));
+    auto* dw = static_cast<uint16_t*>(gpu::alloc_device((size_t) (N * K) * 2));
+    auto* dy = static_cast<float*>(gpu::alloc_device((size_t) (T * N) * 4));
+    auto* dg = static_cast<float*>(gpu::alloc_device((size_t) (T * N) * 4));
+    auto* tf = static_cast<float*>(gpu::alloc_device((size_t) (T * cols) * 4));
+    auto* t16 = static_cast<uint16_t*>(gpu::alloc_device((size_t) (T * cols) * 2));
+    auto* drs = rows_scaled ? static_cast<float*>(gpu::alloc_device((size_t) T * 4)) : nullptr;
+    std::vector<uint16_t> x16((size_t) (T * K)), w16((size_t) (N * K));
+    si::lora_to_f16(x, x16);
+    si::lora_to_f16(w, w16);
+    std::vector<float> zero((size_t) (T * N), 0.0f);
+    gpu::copy(dx, x16.data(), x16.size() * 2);
+    gpu::copy(dw, w16.data(), w16.size() * 2);
+    gpu::copy(dy, zero.data(), zero.size() * 4);
+    if (drs != nullptr) gpu::copy(drs, rs.data(), rs.size() * 4);
+    si::LoraLayer layer;
+    si::LoraPart part;
+    part.entry = entry;
+    part.row0 = row0;
+    part.n = n;
+    part.src_row = src_row;
+    part.scale = scale;
+    part.glora = true;
+    layer.parts.push_back(std::move(part));
+    // the whole weight's rows are the product's: the part's rows are its [row0, row0 + n)
+    layer.add(dx, T, dy, N, 0, N, drs, gemm, tf, t16, s);
+    layer.add_glora(dx, T, 0, N, drs, gemm, tf, t16, s,
+                    [&](const uint16_t* v, int64_t t0, int64_t nt, int64_t r0, int64_t n2) {
+                        gemm.f16(v, dw + r0 * K, dg, nt, n2, K, n2);
+                        si::lora_output_add(dy + t0 * N, nt, N, r0, dg, n2, s);   // the band is the whole weight
+                    });
+    if (!gpu::stream_sync(s)) throw std::runtime_error(gpu::last_error());
+    std::vector<float> got((size_t) (T * N));
+    gpu::copy(got.data(), dy, got.size() * 4);
+    // the reference, FP64 from the FP16 tensors, the roundings where the engine's are
+    std::vector<double> want((size_t) (T * N), 0.0), xd((size_t) (T * K));
+    std::vector<double> u((size_t) R), q((size_t) R), u16((size_t) R), q16((size_t) R), v16((size_t) K);
+    const auto f = [](uint16_t h) { return (double) strata::kernels::f32_from_f16(h); };
+    for (int64_t i = 0; i < T * K; ++i) xd[(size_t) i] = f(x16[(size_t) i]);
+    for (int64_t t = 0; t < T; ++t) {
+        const double r = rows_scaled ? (double) rs[(size_t) t] : 1.0;
+        // the plain pair: (x . A^T) scaled into FP16, then (it . B^T)
+        for (int64_t j = 0; j < R; ++j) {
+            double a = 0;
+            for (int64_t k = 0; k < K; ++k) a += xd[(size_t) (t * K + k)] * f(e.glora.a[(size_t) (j * K + k)]);
+            q16[(size_t) j] = f(strata::kernels::f16_from_f32((float) (a * (double) scale * r)));
+        }
+        // the input's own path: (x . p1^T) scaled into FP16, (it . p2^T) into FP16, then the weight's product
+        for (int64_t j = 0; j < R; ++j) {
+            double a = 0;
+            for (int64_t k = 0; k < K; ++k) a += xd[(size_t) (t * K + k)] * f(e.glora.in[(size_t) (j * K + k)]);
+            u16[(size_t) j] = f(strata::kernels::f16_from_f32((float) (a * (double) scale * r)));
+        }
+        for (int64_t k = 0; k < K; ++k) {
+            double a = 0;
+            for (int64_t j = 0; j < R; ++j) a += u16[(size_t) j] * f(e.glora.out[(size_t) (k * R + j)]);
+            v16[(size_t) k] = f(strata::kernels::f16_from_f32((float) a));
+        }
+        for (int64_t c = 0; c < n; ++c) {
+            const int64_t row = row0 + c;
+            double b = 0;
+            for (int64_t j = 0; j < R; ++j) b += q16[(size_t) j] * f(e.glora.b[(size_t) ((src_row + c) * R + j)]);
+            double a = 0;
+            for (int64_t k = 0; k < K; ++k) a += v16[(size_t) k] * f(w16[(size_t) (row * K + k)]);
+            want[(size_t) (t * N + row)] = a + b;
+        }
+    }
+    char label[96];
+    std::snprintf(label, sizeof label, "glora%s x%lld %lldx%lld r%lld s %.2f%s", lycoris ? " lycoris" : "", (long long) T,
+                  (long long) N, (long long) K, (long long) R, (double) scale, rows_scaled ? " rs" : "");
+    const bool ok = compare(label, got, want);
+    gpu::free(dx);
+    gpu::free(dw);
+    gpu::free(dy);
+    gpu::free(dg);
+    gpu::free(tf);
+    gpu::free(t16);
+    if (drs != nullptr) gpu::free(drs);
+    if (!ok) throw std::runtime_error(std::string("the GLoRA's delta of ") + label + " is not the reference's");
+}
+
 int selftest() {
     void* s = strata::core::Runtime::get().create_stream();
     try {
@@ -777,6 +911,14 @@ int selftest() {
         selftest_oft(s, 8, 64, 32, 1, true, false, 0.6f);
         selftest_oft(s, 8, 64, 4, 2, true, false, 1.0f);
         selftest_oft(s, 16, 64, 8, 3, true, true, 0.7f);
+        // a GLoRA: the plain form's pair and the weight's own product of the input its two factors make (ComfyUI's
+        // reading, then LyCORIS's older one), a W8A8 product's row scale, and the rows of a fused weight's half
+        selftest_glora(s, 8, 64, 8, 32, false, false, 0.7f);
+        selftest_glora(s, 8, 64, 8, 32, false, true, 1.0f);
+        selftest_glora(s, 8, 64, 8, 32, true, false, 0.7f);
+        selftest_glora(s, 8, 64, 8, 64, false, false, 1.0f, 32, 32, 32);
+        // the tokens a band at a time (the input's table, kLoraGloraRows)
+        selftest_glora(s, 200, 16, 4, 16, false, false, 0.6f);
     } catch (...) {
         strata::core::Runtime::get().destroy_stream(static_cast<sycl::queue*>(s));
         throw;
@@ -800,19 +942,24 @@ int map(const std::string& dit_path, const std::string& lora_path, float scale) 
     if (lora_path.empty()) return 0;
     const auto f = si::LoraFile::open(lora_path);
     size_t mapped = 0;
-    for (const auto& e : f->entries()) {
+    for (const auto& entry : f->entries()) {
         const si::QiDit::LoraTarget* t = nullptr;
         for (const auto& c : targets)
-            if (c.name == e.key) {
+            if (c.name == entry.key) {
                 t = &c;
                 break;
             }
         if (t == nullptr) {
-            std::printf("MISSING %-46s %-5s rank %-4lld %lld x %lld\n", e.key.c_str(), si::lora_kind_name(e.kind),
-                        (long long) e.rank, (long long) e.cols, (long long) e.rows);
-        } else if (e.rows != t->rows ||
-                   (e.kind != si::LoraKind::bias && e.kind != si::LoraKind::oft &&
-                    e.cols != t->cols)) {   // a bias's delta alone, an OFT's: their columns are none
+            std::printf("MISSING %-46s %-5s rank %-4lld %lld x %lld\n", entry.key.c_str(),
+                        si::lora_kind_name(entry.kind), (long long) entry.rank, (long long) entry.cols,
+                        (long long) entry.rows);
+            continue;
+        }
+        si::LoraEntry alt;   // a GLoRA's four tensors may fit both readings: the weight's rows and columns choose
+        const si::LoraEntry& e = *si::lora_glora_for_weight(entry, t->rows, t->cols, alt);
+        if (e.rows != t->rows ||
+            (e.kind != si::LoraKind::bias && e.kind != si::LoraKind::oft &&
+             e.cols != t->cols)) {   // a bias's delta alone, an OFT's: their columns are none
             std::printf("SHAPE   %-46s %lld x %lld, the weight %lld x %lld\n", e.key.c_str(), (long long) e.cols,
                         (long long) e.rows, (long long) t->cols, (long long) t->rows);
         } else {
@@ -914,17 +1061,22 @@ int moss_map(const std::string& dit_path, const std::string& lora_path, float sc
     if (lora_path.empty()) return 0;
     const auto f = si::LoraFile::open(lora_path);
     size_t mapped = 0;
-    for (const auto& e : f->entries()) {
+    for (const auto& entry : f->entries()) {
         const si::MossDit::LoraTarget* g = nullptr;
         for (const auto& c : groups)
-            if (c.name == e.key) {
+            if (c.name == entry.key) {
                 g = &c;
                 break;
             }
         if (g == nullptr) {
-            std::printf("MISSING %-46s %-5s rank %-4lld %lld x %lld\n", e.key.c_str(), si::lora_kind_name(e.kind),
-                        (long long) e.rank, (long long) e.cols, (long long) e.rows);
-        } else if (e.rows != g->rows ||
+            std::printf("MISSING %-46s %-5s rank %-4lld %lld x %lld\n", entry.key.c_str(),
+                        si::lora_kind_name(entry.kind), (long long) entry.rank, (long long) entry.cols,
+                        (long long) entry.rows);
+            continue;
+        }
+        si::LoraEntry alt;   // a GLoRA's four tensors may fit both readings: the weight's rows and columns choose
+        const si::LoraEntry& e = *si::lora_glora_for_weight(entry, g->rows, g->cols, alt);
+        if (e.rows != g->rows ||
                    (e.kind != si::LoraKind::bias && e.kind != si::LoraKind::oft &&
                     e.cols != g->cols)) {   // a bias's delta alone, an OFT's: their columns are none
             std::printf("SHAPE   %-46s %lld x %lld, the weight %lld x %lld\n", e.key.c_str(), (long long) e.cols,
@@ -1041,17 +1193,22 @@ int mf_map(const std::string& dit_path, const std::string& lora_path, float scal
     if (lora_path.empty()) return 0;
     const auto f = si::LoraFile::open(lora_path);
     size_t mapped = 0;
-    for (const auto& e : f->entries()) {
+    for (const auto& entry : f->entries()) {
         const si::MfDit::LoraTarget* t = nullptr;
         for (const auto& c : targets)
-            if (c.name == e.key) {
+            if (c.name == entry.key) {
                 t = &c;
                 break;
             }
         if (t == nullptr) {
-            std::printf("MISSING %-46s %-5s rank %-4lld %lld x %lld\n", e.key.c_str(), si::lora_kind_name(e.kind),
-                        (long long) e.rank, (long long) e.cols, (long long) e.rows);
-        } else if (e.rows != t->rows ||
+            std::printf("MISSING %-46s %-5s rank %-4lld %lld x %lld\n", entry.key.c_str(),
+                        si::lora_kind_name(entry.kind), (long long) entry.rank, (long long) entry.cols,
+                        (long long) entry.rows);
+            continue;
+        }
+        si::LoraEntry alt;   // a GLoRA's four tensors may fit both readings: the weight's rows and columns choose
+        const si::LoraEntry& e = *si::lora_glora_for_weight(entry, t->rows, t->cols, alt);
+        if (e.rows != t->rows ||
                    (e.kind != si::LoraKind::bias && e.kind != si::LoraKind::oft &&
                     e.cols != t->cols)) {   // a bias's delta alone, an OFT's: their columns are none
             std::printf("SHAPE   %-46s %lld x %lld, the weight %lld x %lld\n", e.key.c_str(), (long long) e.cols,

@@ -18,6 +18,11 @@
 // (`x.lokr_w1_a` [rows][rank] and `x.lokr_w1_b` [rank][cols]), w2's under a Tucker core (`x.lokr_t2`); the delta is
 // their Kronecker product, and the file's alpha is divided by the factorization's rank (comfy/weight_adapter/lokr.py).
 //
+// A GLoRA (a1/a2/b1/b2) writes its delta as a low rank of the weight on each side, W' = W + s (alpha / rank) (W a1
+// a2 + b1 b2), or LyCORIS's older W a2 a1 + b2 b1 (the shapes say which).  Its b pair is the plain form's (A = b2,
+// B = b1) and its a pair is the input the weight's own product is run on a second time (v = a2 (a1 x)): a product's
+// output is W x + s (W v + B (A x)), and the weight's delta itself is never made (that is the weight's size).
+//
 // A whole delta is the weight's own matrix: `x.diff` (LyCORIS's full form, a fine tune's difference from its base),
 // `x.w_norm` (the same role in ComfyUI's patch table) and `x.set_weight` (the weight itself).  ComfyUI patches them
 // as W += strength * diff and W = set_weight; the engine keeps the first and interpolates the second
@@ -493,6 +498,93 @@ void make_loha(LoraEntry& e, Group& g, const std::string& path) {
     e.rank = b1->shape[0];   // ComfyUI's dim: w1_b's rows, which the file's alpha is divided by
 }
 
+// One of a GLoRA's readings laid into an entry: the plain form's pair (A [rank][cols] and B [rows][rank]) and the
+// input's two factors as the file writes them (`in` [rank][cols], applied to x first, and `out` [cols][rank]: v =
+// out (in x), which are the two products' rows as they are), the entry's rows, columns and rank the reading's.
+void glora_reading(GloraReading& r, const RawTensor& in, const RawTensor& out, const RawTensor& a, const RawTensor& b,
+                   int64_t rank, int64_t cols) {
+    r.rank = rank;
+    r.cols = cols;
+    r.rows = b.shape[0];
+    lora_to_f16(a.v, r.a);
+    lora_to_f16(b.v, r.b);
+    lora_to_f16(in.v, r.in);
+    lora_to_f16(out.v, r.out);
+}
+
+// A GLoRA's four tensors -> its entry: W' = W + s (alpha / rank) (W a1 a2 + b1 b2) (comfy/weight_adapter/glora.py's
+// calculate_weight), whose b1 b2 is a plain LoRA's pair (A = b2 [rank][cols], B = b1 [rows][rank]) and whose a1 a2 is
+// the weight's own product's input (v = a1 (a2 x)).  LyCORIS's older form writes the four the other way round
+// (W a2 a1 + b2 b1: A = b1, B = b2, v = a2 (a1 x)); the shapes say which a file holds - ComfyUI's two tests - and a
+// file of neither is refused.  Where both fit (the four are the weight's rows' and columns' square, so each reading
+// makes a product of its own shape), the entry keeps the older one and the other in `glora_other`: a weight's rows and
+// columns choose at the bind (lora_glora_for_weight), as ComfyUI's calculate_weight asks its weight's shape.
+void make_glora(LoraEntry& e, Group& g, const std::string& path) {
+    const auto get = [&g](const char* r) -> const RawTensor* {
+        auto it = g.by_role.find(r);
+        return it == g.by_role.end() ? nullptr : &it->second;
+    };
+    const RawTensor* m1 = get("a1");
+    const RawTensor* m2 = get("a2");
+    const RawTensor* m3 = get("b1");
+    const RawTensor* m4 = get("b2");
+    if (m1 == nullptr || m2 == nullptr || m3 == nullptr || m4 == nullptr)
+        throw std::runtime_error(path_key_what(path, e.key, "a GLoRA weight needs a1, a2, b1 and b2"));
+    for (const RawTensor* t : {m1, m2, m3, m4})
+        if (t->shape.size() != 2)
+            throw std::runtime_error(path_key_what(path, e.key, "a1, a2, b1 and b2 must be matrices"));
+    const auto r = [](const RawTensor* t) { return t->shape[0]; };
+    const auto c = [](const RawTensor* t) { return t->shape[1]; };
+    // ComfyUI's two tests on the shapes as the file writes them: LyCORIS's older form (a1 [rank][cols], a2
+    // [cols][rank], b1 [rank][cols], b2 [rows][rank]) and the one ComfyUI's glora.py writes of its own (a1
+    // [cols][rank], a2 [rank][cols], b1 [rows][rank], b2 [rank][cols])
+    const bool old = c(m4) == r(m3) && r(m3) == r(m1) && r(m1) == c(m2);
+    const bool current = r(m4) == c(m3) && c(m3) == c(m1) && c(m1) == r(m2);
+    if (!old && !current)
+        throw std::runtime_error(path_key_what(path, e.key,
+                                               "a1/a2/b1/b2 of " + std::to_string(r(m1)) + " x " +
+                                                   std::to_string(c(m1)) + ", " + std::to_string(r(m2)) + " x " +
+                                                   std::to_string(c(m2)) + ", " + std::to_string(r(m3)) + " x " +
+                                                   std::to_string(c(m3)) + " and " + std::to_string(r(m4)) + " x " +
+                                                   std::to_string(c(m4)) +
+                                                   ": neither of a GLoRA's two readings (a1 [cols][rank], a2 "
+                                                   "[rank][cols], b1 [rows][rank], b2 [rank][cols], or LyCORIS's "
+                                                   "with a1/a2 and b1/b2 the other way round)"));
+    // the reading the entry holds first: the older one where both fit, as ComfyUI's calculate_weight keeps it for a
+    const bool first_old = old;
+    GloraReading& main = e.glora;
+    // the older reading's input path is a1 [rank][cols] then a2, its plain pair b1 [rank][cols] and b2 [rows][rank];
+    // the newer one's is a2 then a1, b2 and b1
+    if (first_old) glora_reading(main, *m1, *m2, *m3, *m4, r(m1), c(m1));
+    else glora_reading(main, *m2, *m1, *m4, *m3, c(m1), r(m1));
+    e.rank = main.rank;
+    e.cols = main.cols;
+    e.rows = main.rows;
+    if (old && current)   // the other reading, for a weight the first one's shapes are not
+        glora_reading(e.glora_other, *m2, *m1, *m4, *m3, c(m1), r(m1));
+    // the four must write the one product they are (A [rank][cols], B [rows][rank], p1 [cols][rank], p2 [rank][cols]):
+    // a file whose four fit neither shape is read no further
+    const auto shape_of = [&](const RawTensor& t, int64_t rows, int64_t cols, const char* role) {
+        if (t.shape[0] == rows && t.shape[1] == cols) return;
+        throw std::runtime_error(path_key_what(path, e.key,
+                                               std::string("its ") + role + " is " + std::to_string(t.shape[0]) +
+                                                   " x " + std::to_string(t.shape[1]) + ", not the " +
+                                                   std::to_string(rows) + " x " + std::to_string(cols) +
+                                                   " the form's other tensors take"));
+    };
+    if (first_old) {
+        shape_of(*m1, e.rank, e.cols, "a1");
+        shape_of(*m2, e.cols, e.rank, "a2");
+        shape_of(*m3, e.rank, e.cols, "b1");
+        shape_of(*m4, e.rows, e.rank, "b2");
+    } else {
+        shape_of(*m1, e.cols, e.rank, "a1");
+        shape_of(*m2, e.rank, e.cols, "a2");
+        shape_of(*m3, e.rows, e.rank, "b1");
+        shape_of(*m4, e.rank, e.cols, "b2");
+    }
+}
+
 // A LoHa entry's delta [rows][cols] in FP16: (w1a . w1b) * (w2a . w2b), each side's product made on its own (under its
 // Tucker core where the file has one), the weight's delta their element-wise product.  A tile of rows at a time, on the
 // host's threads: the delta is the weight's size and is made whenever a set is bound, so its temporaries stay a tile's
@@ -747,6 +839,9 @@ LoraEntry make_entry(Group& g, const std::string& path) {
     if (e.kind == LoraKind::loha) {
         make_loha(e, g, path);
     }
+    if (e.kind == LoraKind::glora) {
+        make_glora(e, g, path);
+    }
     if (e.kind == LoraKind::lora) {
         RawTensor* a = role("lora_A");
         RawTensor* b = role("lora_B");
@@ -789,9 +884,10 @@ LoraEntry make_entry(Group& g, const std::string& path) {
     if (e.kind == LoraKind::oft)   // its blocks and the file's alpha (a bound on them), the rotations
         make_oft(e, g, path);
     if (RawTensor* d = role("dora_scale"); d != nullptr) {
-        if (e.kind == LoraKind::oft)
-            throw std::runtime_error(path_key_what(path, e.key,
-                                                   "a dora_scale on an OFT: the engine's DoRA is the plain form's"));
+        if (e.kind == LoraKind::oft || e.kind == LoraKind::glora)
+            throw std::runtime_error(path_key_what(path, e.key, std::string("a dora_scale on ") +
+                                                                   (e.kind == LoraKind::oft ? "an OFT" : "a GLoRA") +
+                                                                   ": the engine's DoRA is the plain form's"));
         if (d->v.size() == (size_t) e.rows) {
             e.dora = d->v;
             e.dora_over_rows = true;
@@ -842,6 +938,7 @@ LoraEntry make_entry(Group& g, const std::string& path) {
         if (r.rfind("lokr_", 0) == 0) continue;
         if (r == "diff" || r == "set_weight" || r == "w_norm" || r == "diff_b" || r == "b_norm") continue;
         if (r == "oft_blocks" || r == "rescale") continue;   // an OFT's: read into its rotations above
+        if (r == "a1" || r == "a2" || r == "b1" || r == "b2") continue;   // a GLoRA's: read into its own fields above
         e.shapes[r] = t.shape;
         e.extra[r] = t.v;
     }
@@ -933,6 +1030,8 @@ uint64_t LoraFile::host_bytes() const {
     for (const LoraEntry& e : entries_) {
         n += e.a.size() * 2 + e.b.size() * 2 + e.dora.size() * 4 + e.delta.size() * 2 + e.bias.size() * 4 +
              e.rescale.size() * 4;
+        for (const GloraReading* g : {&e.glora, &e.glora_other})
+            n += (g->a.size() + g->b.size() + g->in.size() + g->out.size()) * 2;
         for (const auto& [role, v] : e.extra) n += v.size() * 4;
     }
     return n;
@@ -1031,6 +1130,18 @@ struct AddBias {
     }
 };
 
+// y[t][row0 + c] += src[t][c]: the weight's product of a GLoRA's input, made into a table of the product's rows
+struct AddRows {
+    const float* src;
+    float* y;
+    int64_t ldy, row0, n;
+    void operator()(sycl::id<1> id) const {
+        const int64_t at = (int64_t) id[0];
+        const int64_t t = at / n, c = at - t * n;
+        y[t * ldy + row0 + c] += src[at];
+    }
+};
+
 // One OFT (or BOFT) stage: a work-group a block of a token's output rows, its bs values through local memory (a stage
 // in place reads its own block's rows).  dst[t][row0 + row(b, i)] = sum_m r[b][i][m] * src[t][row0 + row(b, m)], the
 // row's place in the stage's order row(b, i) = m1 * group * k + j * r_b + i / group + (i % group) * k (m1 = block /
@@ -1077,7 +1188,7 @@ struct OftFinish {
 LoraDeviceEntry::~LoraDeviceEntry() { release(); }
 
 void LoraDeviceEntry::release() {
-    for (uint16_t** p : {&a_, &b_, &w1_, &w2_, &diff_}) {
+    for (uint16_t** p : {&a_, &b_, &w1_, &w2_, &diff_, &glora_in_, &glora_out_}) {
         if (*p != nullptr) strata::gpu::free(*p);
         *p = nullptr;
     }
@@ -1226,6 +1337,47 @@ bool LoraDeviceEntry::upload(const LoraEntry& e, void* stream, std::string& err,
         }
         return true;
     }
+    if (e.kind == LoraKind::glora) {
+        // the plain pair (A, B) and the input's two factors, the four on the GPU as FP16: the weight's own path is the
+        // caller's (its product of v), and what it needs here is v
+        const GloraReading& g = e.glora;
+        if (row_coef != nullptr) {
+            err = "the image engine: " + e.key + ": a DoRA (dora_scale) on a GLoRA: the engine's DoRA is the plain form's";
+            return false;
+        }
+        rank_ = e.rank;
+        cols_ = e.cols;
+        rows_ = e.rows;
+        if (rank_ <= 0 || cols_ <= 0 || rows_ <= 0 || g.empty() || g.rows != e.rows || g.cols != e.cols ||
+            g.rank != e.rank || g.a.size() != (size_t) (e.rank * e.cols) || g.b.size() != (size_t) (e.rows * e.rank) ||
+            g.in.size() != (size_t) (e.rank * e.cols) || g.out.size() != (size_t) (e.cols * e.rank)) {
+            err = "the image engine: " + e.key + ": the GLoRA's tensors do not match its rank and shape";
+            release();
+            return false;
+        }
+        if (!strata::gpu::alloc_device(&a_, g.a.size() * 2) || !strata::gpu::alloc_device(&b_, g.b.size() * 2) ||
+            !strata::gpu::alloc_device(&glora_in_, g.in.size() * 2) ||
+            !strata::gpu::alloc_device(&glora_out_, g.out.size() * 2)) {
+            err = "the image engine: the adapter " + e.key + " on the GPU: " + strata::gpu::last_error();
+            release();
+            return false;
+        }
+        strata::gpu::copy_async(a_, g.a.data(), g.a.size() * 2, stream);
+        strata::gpu::copy_async(b_, g.b.data(), g.b.size() * 2, stream);
+        strata::gpu::copy_async(glora_in_, g.in.data(), g.in.size() * 2, stream);
+        strata::gpu::copy_async(glora_out_, g.out.data(), g.out.size() * 2, stream);
+        if (!strata::gpu::stream_sync(stream)) {
+            err = "the image engine: the adapter " + e.key + " to the GPU: " + strata::gpu::last_error();
+            release();
+            return false;
+        }
+        bytes_ = (uint64_t) (g.a.size() + g.b.size() + g.in.size() + g.out.size()) * 2;
+        if (!bias_to_gpu()) {
+            release();
+            return false;
+        }
+        return true;
+    }
     if (e.kind == LoraKind::lokr) {
         if (row_coef != nullptr) {   // a LoKr's rows are its Kronecker product's: its DoRA is not folded into them
             err = "the image engine: " + e.key + ": a LoKr's rows are its factors' Kronecker product's";
@@ -1334,6 +1486,22 @@ void LoraDeviceEntry::add(const uint16_t* x16, int64_t T, float* y, int64_t ldy,
     gemm.f16(tmp16, b_ + src_row * rank_, y + row0, T, n, rank_, ldy, false, true);   // y[:, row0 ..] += t16 . B^T
 }
 
+void LoraDeviceEntry::glora_input(const uint16_t* x16, int64_t T, float scale, const float* row_scale,
+                                  prefill::Gemm& gemm, float* tmp_f32, uint16_t* tmp16, void* stream) const {
+    if (kind_ != LoraKind::glora || glora_in_ == nullptr || glora_out_ == nullptr || T <= 0 || rank_ <= 0 ||
+        cols_ <= 0 || scale == 0.0f)
+        return;
+    // u[t][j] = sum_c x[t][c] p1[c][j]: the input's first factor, scaled (the strength and a W8A8 product's row scale)
+    gemm.f16(x16, glora_in_, tmp_f32, T, rank_, cols_);
+    sycl::queue& q = strata::core::Runtime::get().stream(stream);
+    q.parallel_for(sycl::range<1>((size_t) (T * rank_)),
+                   lora_kernels::ScaleRows{tmp_f32, scale, row_scale, rank_, tmp16});
+    // v[t][c] = sum_j u[t][j] p2[j][c]: the input the weight's own product takes (FP16, as every product's input)
+    gemm.f16(tmp16, glora_out_, tmp_f32, T, cols_, rank_);
+    q.parallel_for(sycl::range<1>((size_t) (T * cols_)),
+                   lora_kernels::ScaleRows{tmp_f32, 1.0f, nullptr, cols_, tmp16});
+}
+
 void LoraDeviceEntry::add_bias(float* y, int64_t T, int64_t ldy, int64_t src_row, int64_t row0, int64_t n,
                                float scale, void* stream) const {
     if (bias_ == nullptr || T <= 0 || n <= 0 || scale == 0.0f) return;
@@ -1399,6 +1567,30 @@ bool LoraLayer::has_oft() const {
     for (const LoraPart& p : parts)
         if (p.oft) return true;
     return false;
+}
+
+bool LoraLayer::has_glora() const {
+    for (const LoraPart& p : parts)
+        if (p.glora) return true;
+    return false;
+}
+
+void LoraLayer::add_glora(const uint16_t* x16, int64_t T, int64_t w_row0, int64_t w_rows, const float* row_scale,
+                          prefill::Gemm& gemm, float* tmp_f32, uint16_t* tmp16, void* stream,
+                          const LoraGloraOutput& output) const {
+    if (!output || T <= 0 || w_rows <= 0) return;
+    for (const LoraPart& p : parts) {
+        if (!p.glora || !p.entry) continue;
+        const int64_t a = std::max(p.row0, w_row0), b = std::min(p.row0 + p.n, w_row0 + w_rows);
+        if (b <= a || p.scale == 0.0f) continue;
+        const int64_t cols = p.entry->cols();
+        for (int64_t t0 = 0; t0 < T; t0 += kLoraGloraRows) {
+            const int64_t rows = std::min(kLoraGloraRows, T - t0);
+            p.entry->glora_input(x16 + (size_t) (t0 * cols), rows, p.scale, row_scale == nullptr ? nullptr : row_scale + t0,
+                                 gemm, tmp_f32, tmp16, stream);
+            output(tmp16, t0, rows, a, b - a);
+        }
+    }
 }
 
 uint64_t LoraLayer::bytes() const {
@@ -1470,24 +1662,50 @@ void LoraLayer::add(const uint16_t* x16, int64_t T, float* y, int64_t ldy, int64
     }
 }
 
+const LoraEntry* lora_glora_for_weight(const LoraEntry& e, int64_t rows, int64_t cols, LoraEntry& alt) {
+    if (e.kind != LoraKind::glora || e.glora_other.empty()) return &e;
+    if (e.rows == rows && e.cols == cols) return &e;
+    const GloraReading& other = e.glora_other;
+    if (other.rows != rows || other.cols != cols) return &e;   // neither: the caller's check says so
+    alt = e;
+    alt.glora = other;
+    alt.glora_other = {};
+    alt.rows = other.rows;
+    alt.cols = other.cols;
+    alt.rank = other.rank;
+    return &alt;
+}
+
+void lora_output_add(float* y, int64_t T, int64_t ldy, int64_t row0, const float* src, int64_t n, void* stream) {
+    if (T <= 0 || n <= 0) return;
+    sycl::queue& q = strata::core::Runtime::get().stream(stream);
+    q.parallel_for(sycl::range<1>((size_t) (T * n)), lora_kernels::AddRows{src, y, ldy, row0, n});
+}
+
 int64_t lora_scratch_cols(const LoraEntry& e) {
     if (e.kind == LoraKind::bias) return 0;                                    // no weight's product: no scratch
     if (e.kind == LoraKind::lokr) return e.lokr.empty() ? 0 : e.lokr.in_m * e.lokr.out_k;
     if (e.kind == LoraKind::diff || e.kind == LoraKind::loha) return e.cols;   // a scaled input's rows: the weight's
                                                                               // columns
     if (e.kind == LoraKind::oft) return e.oft.rows();   // a stage's rows: the turned output's table
+    if (e.kind == LoraKind::glora) return std::max(e.rank, e.cols);   // the input's two products, then the weight's
     return e.rank;
 }
 
 uint64_t lora_gpu_bytes(const std::vector<LoraUse>& loras, int64_t T) {
     uint64_t bytes = 0;
-    int64_t cols = 0;
+    int64_t cols = 0, glora_cols = 0, glora_rows = 0;
     for (const LoraUse& u : loras) {
         if (!u.file) continue;
         for (const LoraEntry& e : u.file->entries()) {
             if (e.kind == LoraKind::lora)
                 bytes += 2 * (uint64_t) e.rank * (uint64_t) (e.rows + e.cols);   // A and B, FP16
-            else if (e.kind == LoraKind::lokr && !e.lokr.empty())
+            else if (e.kind == LoraKind::glora && e.rows > 0 && e.cols > 0) {
+                bytes += 2 * (uint64_t) e.rank * (uint64_t) (3 * e.cols + e.rows);   // its plain pair and the input's
+                                                                                     // two factors, FP16
+                glora_cols = std::max(glora_cols, e.cols);
+                glora_rows = std::max(glora_rows, e.rows);
+            } else if (e.kind == LoraKind::lokr && !e.lokr.empty())
                 bytes += 2 * (uint64_t) (e.lokr.out_l * e.lokr.in_m + e.lokr.out_k * e.lokr.in_n);   // w1 and w2
             else if ((e.kind == LoraKind::diff || e.kind == LoraKind::loha) && e.rows > 0 && e.cols > 0)
                 bytes += 2 * (uint64_t) e.rows * (uint64_t) e.cols;   // the whole delta (a LoHa's, made at the bind)
@@ -1502,6 +1720,9 @@ uint64_t lora_gpu_bytes(const std::vector<LoraUse>& loras, int64_t T) {
             cols = std::max(cols, lora_scratch_cols(e));
         }
     }
+    if (glora_cols > 0)   // a GLoRA's weight's product of its input: the table of a band's rows, and that input (an
+        // int8 one of a W8A8 product's, a packed Q8_0 one's, and the FP16 it is made in)
+        bytes += (uint64_t) kLoraGloraRows * ((uint64_t) glora_cols * 6 + (uint64_t) glora_rows * 4);
     return bytes + (uint64_t) std::max<int64_t>(T, 0) * (uint64_t) cols * 6;
 }
 
@@ -1533,11 +1754,11 @@ bool lora_dora_rows(const LoraEntry& e, int64_t src_row, int64_t row0, int64_t n
     return true;
 }
 
-const LoraPart* lora_dora_overlap(const LoraLayer* layer, int64_t row0, int64_t n, bool dora, bool oft) {
+const LoraPart* lora_dora_overlap(const LoraLayer* layer, int64_t row0, int64_t n, bool dora, bool oft, bool glora) {
     if (layer == nullptr) return nullptr;
     for (const LoraPart& p : layer->parts) {
-        // neither is a DoRA's or an OFT's: the two add up, whatever their rows
-        if (!dora && !p.dora && !oft && !p.oft) continue;
+        // neither is a DoRA's, an OFT's or a GLoRA's: the two add up, whatever their rows
+        if (!dora && !p.dora && !oft && !p.oft && !glora && !p.glora) continue;
         if (row0 < p.row0 + p.n && p.row0 < row0 + n) return &p;
     }
     return nullptr;
@@ -1546,6 +1767,8 @@ const LoraPart* lora_dora_overlap(const LoraLayer* layer, int64_t row0, int64_t 
 std::string lora_patch_clash_why(const LoraPart& p) {
     if (p.oft)
         return "an OFT turns the product's output, so the other patch's place against it would be the files'";
+    if (p.glora)
+        return "a GLoRA's own path is the weight's, so the other patch's place against it would be the files'";
     return "a DoRA's rows are the weight's before the other's patch";
 }
 

@@ -11,7 +11,8 @@ build_lora_targets, written here a second time; the record's check sets them aga
 name for name), in a form the engine applies today: a plain LoRA, LoKr or LoHa (a DoRA: a plain LoRA with a
 dora_scale over the weight's rows, ComfyUI's weight_decompose), a whole weight's difference (diff, set_weight,
 w_norm), or an OFT's turn of the weight's rows (oft_blocks, a BOFT's four dimensions too; the file's alpha is the
-constraint on the block's skew part, not a scale), and no GLoRA or text encoder's weight.  A bias's delta (diff_b, or b_norm beside w_norm) goes with any of
+constraint on the block's skew part, not a scale), and a GLoRA (a1/a2/b1/b2: the weight's own product on the input its factors make, beside a plain form's pair), and
+no text encoder's weight.  A bias's delta (diff_b, or b_norm beside w_norm) goes with any of
 them or alone, where the weight adds a bias of its own (BIASED: Mage-Flow's DiT's weights all do; MOSS-Image's outside
 its blocks and in its text embedder; Qwen-Image-2.1's none).  The engine refuses the forms it applies not when it binds
 a set (QiDit::set_loras, MossDit::set_loras, MfDit::set_loras), so no image is made with part of a file.
@@ -265,6 +266,50 @@ def _oft_shape(roles: dict[str, tuple[int, ...]]) -> tuple[int, str]:
     return b, ""
 
 
+def _glora_rank(roles: dict[str, tuple[int, ...]]) -> tuple[int, str]:
+    """A GLoRA weight's tensors -> (the rank the file's alpha is divided by, "") or (0, why they make no GLoRA): the
+    four matrices of one of the form's two readings - ComfyUI's a1 [cols][rank], a2 [rank][cols], b1 [rows][rank], b2
+    [rank][cols], or LyCORIS's older one (a1 [rank][cols], a2 [cols][rank], b1 [rank][cols], b2 [rows][rank]).  A
+    square weight's four fit both, and the weight's rows and columns choose between them in the engine (make_glora's
+    `glora_other`, the entry the DiT resolves with lora_glora_for_weight); the listing has no weight to ask, so it
+    reports the smaller of the two readings' ranks (the one a GLoRA of a weight that shape has: the other reading would
+    make the weight's rank its rows' count)."""
+    names = ("a1", "a2", "b1", "b2")
+    missing = [n for n in names if n not in roles]
+    if missing:
+        return 0, f"a GLoRA weight needs a1, a2, b1 and b2 ({missing[0]} is missing)"
+    a1, a2, b1, b2 = (roles[n] for n in names)
+    if any(len(t) != 2 for t in (a1, a2, b1, b2)):
+        return 0, "a1, a2, b1 and b2 must be matrices"
+    ranks = []
+    why = ""
+    # the older reading first, as the engine takes it where both fit
+    if b2[1] == b1[0] == a1[0] == a2[1]:
+        ranks.append(a1[0])
+        want = {"a1": (a1[0], a1[1]), "a2": (a1[1], a1[0]), "b1": (a1[0], a1[1]), "b2": (b2[0], a1[0])}
+        why = why or _glora_shapes(want, {"a1": a1, "a2": a2, "b1": b1, "b2": b2})
+    if b2[0] == b1[1] == a1[1] == a2[0]:
+        ranks.append(a1[1])
+        want = {"a1": (a1[0], a1[1]), "a2": (a1[1], a1[0]), "b1": (b1[0], a1[1]), "b2": (a1[1], a1[0])}
+        why = why or _glora_shapes(want, {"a1": a1, "a2": a2, "b1": b1, "b2": b2})
+    if not ranks:
+        return 0, (f"a1/a2/b1/b2 of {a1}, {a2}, {b1} and {b2}: neither of a GLoRA's two readings (a1 [cols][rank], a2 "
+                   f"[rank][cols], b1 [rows][rank], b2 [rank][cols], or LyCORIS's with a1/a2 and b1/b2 the other way "
+                   f"round)")
+    if why:
+        return 0, why
+    return min(ranks), ""
+
+
+def _glora_shapes(want: dict[str, tuple[int, int]], have: dict[str, tuple[int, ...]]) -> str:
+    """Why a reading's four are not the shapes it takes (the other tensors' rows and columns), "" where they are."""
+    for name, t in have.items():
+        if tuple(t) != want[name]:
+            return (f"its {name} is {t[0]} x {t[1]}, not the {want[name][0]} x {want[name][1]} the form's other "
+                    f"tensors take")
+    return ""
+
+
 def is_text_encoder(key: str) -> bool:
     """A weight of the text encoder rather than the DiT (the engine refuses these when it binds a set)."""
     return key.startswith(("lora_te", "text_encoder", "te."))
@@ -503,7 +548,7 @@ class Folder:
                     return f"{key} is not one of this image model's weights"
                 targets.add(kind_of(key))
                 continue
-            if form not in ("lora", "lokr", "loha", "diff", "oft"):
+            if form not in ("lora", "lokr", "loha", "glora", "diff", "oft"):
                 return f"{key}: a {form} adapter, which the image engine applies not yet"
             if "dora_scale" in roles and form != "lora":
                 return f"{key}: a DoRA (dora_scale) on a {form} adapter, which the image engine applies not yet"
@@ -522,6 +567,11 @@ class Folder:
                 rank = max(rank, r)
             elif form == "loha":
                 r, why = _loha_rank(roles)
+                if why:
+                    return f"{key}: {why}"
+                rank = max(rank, r)
+            elif form == "glora":
+                r, why = _glora_rank(roles)
                 if why:
                     return f"{key}: {why}"
                 rank = max(rank, r)

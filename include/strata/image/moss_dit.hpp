@@ -225,6 +225,18 @@ private:
     std::map<std::string, std::vector<float>> norm_cache_;   // DoRA's row norms, a file's tensor (open clears them)
     float* lora_f32_ = nullptr;
     uint16_t* lora16_ = nullptr;
+    // a GLoRA's own path: its input's columns, the weight's rows it is added over, and the buffers a band of its
+    // products takes (the rows' table, a W8A8 weight's int8 input and its scales)
+    int64_t lora_glora_cols_ = 0, lora_glora_rows_ = 0;
+    float* lora_glora_y_ = nullptr;
+    int8_t* lora_glora_x8_ = nullptr;
+    float* lora_glora_sx_ = nullptr;
+    void lora_glora_scratch();   // allocates them, once a set with a GLoRA is bound
+    void free_glora_scratch();
+    /// A GLoRA's own path: the weight's rows [r0, r0 + n) product of v (nt tokens, the first of them t0), added to
+    /// the product's output y at those rows (the weight's own path, as product takes it).
+    void glora_weight(const uint16_t* v, const W& w, const uint8_t* d, int64_t r0, int64_t n, int64_t nt, int64_t t0,
+                      float* y);
     bool dry_ = false, q8_ = true, w8_ = false, keep0_ = false, text_loaded_ = false;
     int64_t C_ = 3072, F_ = 8192, heads_ = 24, hd_ = 128, in_ch_ = 128, txt_dim_ = 4096, freq_ = 256;
     double rope_base_ = 10000.0;

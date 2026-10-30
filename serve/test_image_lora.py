@@ -219,6 +219,37 @@ class Listing(Tree):
         self.assertIn("convolution's kernel", f.skipped["kernel"])
         self.assertEqual(loras.field([{"name": "loha", "scale": 0.7}], f)[0]["scale"], 0.7)
 
+    def test_a_glora_is_listed_with_the_rank_its_reading_gives(self):
+        b = "transformer.transformer_blocks.0."
+        safetensors(self.d / "glora.safetensors", {
+            # to_q (256 of 256): ComfyUI's reading, a1 [cols][rank], a2 [rank][cols], b1 [rows][rank], b2
+            # [rank][cols]; every tensor square-or-not, the file's alpha divided by a1's columns
+            b + "attn.to_q.a1.weight": (256, 8), b + "attn.to_q.a2.weight": (8, 256),
+            b + "attn.to_q.b1.weight": (256, 8), b + "attn.to_q.b2.weight": (8, 256),
+            b + "attn.to_q.alpha": (1,),
+            # img_mlp.out (256 of 512): LyCORIS's older reading, a1 [rank][cols], a2 [cols][rank], b1 [rank][cols],
+            # b2 [rows][rank] (a weight of no square shape reads only one way)
+            b + "img_mlp.out.a1.weight": (4, 512), b + "img_mlp.out.a2.weight": (512, 4),
+            b + "img_mlp.out.b1.weight": (4, 512), b + "img_mlp.out.b2.weight": (256, 4)})
+        safetensors(self.d / "shapes.safetensors", {   # neither of the form's two readings
+            b + "attn.to_q.a1.weight": (256, 8), b + "attn.to_q.a2.weight": (8, 200),
+            b + "attn.to_q.b1.weight": (256, 8), b + "attn.to_q.b2.weight": (8, 256)})
+        safetensors(self.d / "missing.safetensors", {b + "attn.to_q.a1.weight": (256, 8)})
+        safetensors(self.d / "dora.safetensors", {   # the engine's DoRA is the plain form's
+            b + "attn.to_q.a1.weight": (256, 8), b + "attn.to_q.a2.weight": (8, 256),
+            b + "attn.to_q.b1.weight": (256, 8), b + "attn.to_q.b2.weight": (8, 256),
+            b + "attn.to_q.dora_scale": (256,)})
+        f = self.folder()
+        entries = f.listing()
+        self.assertEqual([e["name"] for e in entries], ["glora"], f.skipped)
+        e = entries[0]
+        self.assertEqual(e["rank"], 8, "a square weight's four fit both readings; the smaller rank is the file's")
+        self.assertEqual(e["targets"], ["attn.to_q", "img_mlp.out"])
+        self.assertIn("its a2 is 8 x 200", f.skipped["shapes"])
+        self.assertIn("needs a1, a2, b1 and b2", f.skipped["missing"])
+        self.assertIn("DoRA", f.skipped["dora"])
+        self.assertEqual(loras.field([{"name": "glora", "scale": 0.7}], f)[0]["scale"], 0.7)
+
     def test_an_oft_is_listed_and_the_blocks_it_cannot_apply_are_not(self):
         b = "transformer.transformer_blocks.0."
         safetensors(self.d / "oft.safetensors", {

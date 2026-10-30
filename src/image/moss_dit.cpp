@@ -638,8 +638,30 @@ MfOut MossDit::product(const uint16_t* x16, const float* rs, const W& w, const u
         // the delta is the input's own (x16 = x / rs): its rows' scales put it back in y's units, as rows_back does
         lora_scratch(T);
         lora->add(x16, T, y, w.n, 0, w.n, rs, gemm_, lora_f32_, lora16_, s_);
+        if (lora->has_glora())   // a GLoRA's own path: the weight's own product of its input, a band of tokens at a time
+            lora->add_glora(x16, T, 0, w.n, rs, gemm_, lora_f32_, lora16_, s_,
+                            [&](const uint16_t* v, int64_t t0, int64_t nt, int64_t r0, int64_t n2) {
+                                glora_weight(v, w, d, r0, n2, nt, t0, y);
+                            });
     }
     return out;
+}
+
+void MossDit::glora_weight(const uint16_t* v, const W& w, const uint8_t* d, int64_t r0, int64_t n, int64_t nt,
+                           int64_t t0, float* y) {
+    if (w.type == kTypeW8) {
+        // the input's own int8 quantization (its buffer, not the product's: that one's is the other products' input)
+        qi_rows_i8(v, false, nt, w.k, lora_glora_x8_, lora_glora_sx_, nullptr, s_);
+        const auto* sw = reinterpret_cast<const float*>(d + w.n * w.k) + r0;
+        prefill::Gemm::i8(lora_glora_x8_, reinterpret_cast<const int8_t*>(d) + r0 * w.k,
+                          reinterpret_cast<int32_t*>(lora_glora_y_), nt, n, w.k, n, s_);
+        qi_i8_scale(lora_glora_y_, nt, n, n, lora_glora_sx_, sw, nullptr, nullptr, s_);
+    } else if (w.type == kTypeF16) {
+        gemm_.f16(v, reinterpret_cast<const uint16_t*>(d) + r0 * w.k, lora_glora_y_, nt, n, w.k, n);
+    } else {
+        gemm_.native(v, w.type, d + (uint64_t) r0 * w.row_bytes, lora_glora_y_, nt, n, w.k, n);
+    }
+    lora_output_add(y + t0 * w.n, nt, w.n, r0, lora_glora_y_, n, s_);
 }
 
 uint64_t MossDit::activation_bytes(int64_t hw, int n, int64_t max_text, int64_t mlp_rows) const {
@@ -704,7 +726,8 @@ void MossDit::drop_activations() {
     for (void* p : {(void*) x_, (void*) q_, (void*) k_, (void*) v_, (void*) a_, (void*) gu_, (void*) h16_, (void*) rs_,
                     (void*) rs2_, (void*) rs_o_, (void*) hs_, (void*) vpart_, (void*) xq8_, (void*) pend_sw_,
                     (void*) jq16_, (void*) jk16_, (void*) jv16_, (void*) jo16_, (void*) o16_, (void*) attn_scratch_,
-                    (void*) b0_, (void*) lora_f32_, (void*) lora16_})
+                    (void*) b0_, (void*) lora_f32_, (void*) lora16_, (void*) lora_glora_y_,
+                    (void*) lora_glora_x8_, (void*) lora_glora_sx_})
         release(allocs_, p);
     x_ = q_ = k_ = v_ = a_ = gu_ = rs_ = rs2_ = rs_o_ = hs_ = vpart_ = attn_scratch_ = b0_ = pend_sw_ = nullptr;
     h16_ = jq16_ = jk16_ = jv16_ = jo16_ = o16_ = nullptr;
@@ -712,6 +735,9 @@ void MossDit::drop_activations() {
     lora_f32_ = nullptr;
     lora16_ = nullptr;
     lora_tmp_t_ = 0;
+    lora_glora_y_ = nullptr;
+    lora_glora_x8_ = nullptr;
+    lora_glora_sx_ = nullptr;
     cap_hw_ = cap_n_ = cap_text_ = 0;
 }
 
@@ -768,6 +794,8 @@ void MossDit::build_lora_targets() {
 
 void MossDit::lora_scratch(int64_t T) {
     if (lora_cols_ <= 0 || T <= 0) return;
+    // a GLoRA's own path's buffers are a band's, not the tokens': the activations' drop frees them, this gives them back
+    if (lora_glora_cols_ > 0 && lora_glora_y_ == nullptr) lora_glora_scratch();
     if (lora_f32_ != nullptr && T <= lora_tmp_t_) return;
     gpu::stream_sync(s_);   // the old buffers may still be read
     for (void** p : {reinterpret_cast<void**>(&lora_f32_), reinterpret_cast<void**>(&lora16_)})
@@ -798,22 +826,26 @@ bool MossDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
     std::vector<std::string> unknown, text_encoder;
     for (const LoraUse& u : loras) {
         if (!u.file) continue;
-        for (const LoraEntry& e : u.file->entries()) {
-            if (is_text_encoder_key(e.key)) {
-                text_encoder.push_back(e.key);
+        for (const LoraEntry& entry : u.file->entries()) {
+            if (is_text_encoder_key(entry.key)) {
+                text_encoder.push_back(entry.key);
                 continue;
             }
             // the slots of the entry's name: one weight, or the weights a fused one is split into
             std::vector<const LoraSlot*> slots;
             for (const LoraSlot& s : lora_slots_)
-                if (s.name == e.key) slots.push_back(&s);
+                if (s.name == entry.key) slots.push_back(&s);
             if (slots.empty()) {
-                unknown.push_back(e.key);
+                unknown.push_back(entry.key);
                 continue;
             }
             int64_t rows = 0;   // the entry's rows the weight takes
             for (const LoraSlot* s : slots) rows = std::max(rows, s->src_row + s->rows);
+            // a GLoRA's four tensors may fit both of its readings: the weight's rows and columns say which
+            LoraEntry alt;
+            const LoraEntry& e = *lora_glora_for_weight(entry, rows, slots[0]->w->k, alt);
             const bool oft = e.kind == LoraKind::oft;
+            const bool glora = e.kind == LoraKind::glora;
             if (oft && (slots.size() != 1 || slots[0]->src_row != 0)) {
                 // a rotation is one weight's rows, block by block: a name the DiT splits across weights' rows takes none
                 err = "image engine: " + u.file->path() + ": " + e.key +
@@ -876,7 +908,7 @@ bool MossDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                 }
                 if (e.replaces)   // a set_weight: the weight interpolates to the file's, W + s (S - W)
                     bases[i].assign((size_t) slot->rows, 1.0f - u.scale);
-                if (const LoraPart* clash = lora_dora_overlap(slot->w->lora, slot->row0, slot->rows, dora, oft)) {
+                if (const LoraPart* clash = lora_dora_overlap(slot->w->lora, slot->row0, slot->rows, dora, oft, glora)) {
                     err = "image engine: " + u.file->path() + ": " + e.key + ": the weight's rows " +
                           std::to_string(slot->row0) + " .. " + std::to_string(slot->row0 + slot->rows) +
                           " are another adapter's, and " + lora_patch_clash_why(*clash);
@@ -884,8 +916,8 @@ bool MossDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                     return false;
                 }
             }
-            auto entry = std::make_shared<LoraDeviceEntry>();
-            if (!entry->upload(e, s_, err, dora ? coef.data() : nullptr)) {
+            auto dev = std::make_shared<LoraDeviceEntry>();
+            if (!dev->upload(e, s_, err, dora ? coef.data() : nullptr)) {
                 drop_loras();
                 return false;
             }
@@ -896,7 +928,7 @@ bool MossDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                     slot->w->lora = lora_layers_.back().get();
                 }
                 LoraPart part;
-                part.entry = entry;
+                part.entry = dev;
                 part.row0 = slot->row0;
                 part.n = slot->rows;
                 part.src_row = slot->src_row;
@@ -904,10 +936,15 @@ bool MossDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                 part.bias_scale = u.scale;   // a diff patch has no alpha: the request's strength only
                 part.dora = dora;
                 part.oft = oft;
+                part.glora = glora;
                 part.base = std::move(bases[i]);
                 slot->w->lora->parts.push_back(std::move(part));
             }
             lora_cols_ = std::max(lora_cols_, lora_scratch_cols(e));
+            if (glora) {
+                lora_glora_cols_ = std::max(lora_glora_cols_, e.cols);
+                lora_glora_rows_ = std::max(lora_glora_rows_, e.rows);
+            }
         }
     }
     if (!text_encoder.empty()) {
@@ -930,6 +967,7 @@ bool MossDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
             drop_loras();
             return false;
         }
+    if (lora_glora_cols_ > 0) lora_glora_scratch();   // a GLoRA's own path's buffers, once every part is bound
     for (const LoraUse& u : loras)
         if (u.file) lora_files_.push_back(u.file);
     lora_key_ = key;
@@ -1004,6 +1042,8 @@ bool MossDit::dora_norms(const LoraSlot& slot, std::vector<float>& out, std::str
 uint64_t MossDit::lora_bytes() const {
     uint64_t n = 0;
     for (const std::unique_ptr<LoraLayer>& l : lora_layers_) n += l->bytes();
+    if (lora_glora_y_ != nullptr)   // a GLoRA's own path's buffers
+        n += (uint64_t) kLoraGloraRows * ((uint64_t) lora_glora_rows_ * 4 + (uint64_t) lora_glora_cols_ + 4);
     return n;
 }
 
@@ -1013,6 +1053,7 @@ void MossDit::drop_loras() {
     lora_files_.clear();
     lora_key_.clear();
     lora_cols_ = 0;
+    lora_glora_cols_ = lora_glora_rows_ = 0;
     if (lora_f32_ != nullptr || lora16_ != nullptr) {
         gpu::stream_sync(s_);
         for (void** p : {reinterpret_cast<void**>(&lora_f32_), reinterpret_cast<void**>(&lora16_)})
@@ -1022,6 +1063,29 @@ void MossDit::drop_loras() {
             }
         lora_tmp_t_ = 0;
     }
+    free_glora_scratch();
+}
+
+// A GLoRA's own path's buffers: the table the weight's product of its input is added from (a band of tokens, the
+// weight's rows), and that input as a W8A8 product takes it (int8 values and a scale a row).  The deltas' scratch
+// (lora_scratch) holds the input's own two products.
+void MossDit::lora_glora_scratch() {
+    if (lora_glora_cols_ <= 0 || lora_glora_rows_ <= 0) return;
+    const size_t band = (size_t) kLoraGloraRows;
+    lora_glora_y_ = alloc<float>(allocs_, (int64_t) (band * (size_t) lora_glora_rows_));
+    lora_glora_x8_ = alloc<int8_t>(allocs_, (int64_t) (band * (size_t) lora_glora_cols_));
+    lora_glora_sx_ = alloc<float>(allocs_, (int64_t) band);
+}
+
+void MossDit::free_glora_scratch() {
+    for (void* p : {(void*) lora_glora_y_, (void*) lora_glora_x8_, (void*) lora_glora_sx_})
+        if (p != nullptr) {
+            gpu::stream_sync(s_);
+            release(allocs_, p);
+        }
+    lora_glora_y_ = nullptr;
+    lora_glora_x8_ = nullptr;
+    lora_glora_sx_ = nullptr;
 }
 
 namespace {

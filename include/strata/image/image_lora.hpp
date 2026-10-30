@@ -31,6 +31,15 @@
 // the DiT adds the weight's bias (after the product's row scales and whatever its own bias's value is).  A file may
 // hold one alone (LoraKind::bias: it changes no weight) or beside the weight's own delta.
 //
+// A GLoRA (a1/a2/b1/b2, comfy/weight_adapter/glora.py) writes its delta as a low rank of the weight on each side:
+// W' = W + s (alpha / rank) (W a1 a2 + b1 b2) - LyCORIS's older form, whose a1/a2 and b1/b2 are the other way round
+// (W a2 a1 + b2 b1), is the same two products with the roles swapped, and the tensors' shapes say which one a file
+// holds.  So a product's output is y = W x + s c (W v + B (A x)) with v = a1 (a2 x): the file's b1 b2 is a plain
+// LoRA's pair (B = b1, A = b2) and adds to the delta as the plain form does, and the weight is applied a second time,
+// to another input (v), rather than the weight's delta being made (which is the weight's size, for a form whose two
+// sides are a few MiB).  A weight's own path is the weight's, so a GLoRA keeps to its rows as a DoRA and an OFT do
+// (another patch's rows must not overlap them: the files' order would decide how the two compose).
+//
 // An OFT (oft_blocks, comfy/weight_adapter/oft.py) turns a weight's output rows: the rows are cut into blocks of
 // `bs` rows, each block's rotation r = (I + Q) (I - Q)^-1 of its skew part Q = blocks - blocks^T (the file's alpha
 // clamped as Q's Frobenius norm where it is above 0), and the weight becomes r W: a product's output y is turned,
@@ -44,6 +53,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -64,7 +74,7 @@ enum class LoraKind : int {
     lora = 0,   // lora_A/B, lora.down/up, lora_down/up: y += scale * (x A^T) B^T
     lokr = 1,   // lokr_w1 (x) lokr_w2, or their a/b factors (Tucker's lokr_t2 too)
     loha = 2,   // (hada_w1_a hada_w1_b) * (hada_w2_a hada_w2_b)
-    glora = 3,  // a1/a2/b1/b2
+    glora = 3,  // a1/a2/b1/b2: the plain form's pair beside the weight's own product on the input a1 a2 x
     oft = 4,    // oft_blocks: the output's rows turned by a block-diagonal orthogonal matrix (BOFT: 4 dimensions)
     diff = 5,   // a whole delta (.diff, .set_weight, .w_norm): y += scale * x Delta^T
     bias = 6,   // a bias's delta alone (.diff_b, .b_norm): y += scale * Db, no weight changed
@@ -101,6 +111,15 @@ struct OftShape {
     int64_t k(int64_t stage) const { return boft ? (int64_t(1) << stage) * (bs / 2) : bs; }
 };
 
+/// A GLoRA's tensors in one of the form's two readings: the plain form's pair (a [rank][cols], b [rows][rank]) and the
+/// input's two factors as the file writes them - `in` [rank][cols], the one applied to x first, and `out` [cols][rank]
+/// (both the rows of the products that take them: v = out (in x)) - FP16, with the shapes the reading gives.
+struct GloraReading {
+    int64_t rows = 0, cols = 0, rank = 0;
+    std::vector<uint16_t> a, b, in, out;
+    bool empty() const { return rows <= 0 || cols <= 0 || rank <= 0; }
+};
+
 /// One weight's delta, on the host: the tensors the file gave, A and B in FP16 (half the RAM of FP32, which is what
 /// the GPU takes), the scales in FP32.  The other forms' tensors are kept in `extra` by their role (`hada_w1_a`,
 /// `oft_blocks`, `diff`, ...) and FP32, for the forms the engine learns to apply; a LoKr's materialized w1 and w2 are
@@ -117,6 +136,14 @@ struct LoraEntry {
     /// (ComfyUI divides the file's alpha by it, and by nothing where both of its matrices are whole).
     float scale() const { return alpha_set && rank > 0 ? alpha / static_cast<float>(rank) : 1.0f; }
     std::vector<uint16_t> a, b;       // lora: a [rank][cols], b [rows][rank], row-major
+    /// glora: the reading the file's shapes said (the older of the two where both fit), `rows`, `cols` and `rank` its
+    /// shapes; `a` and `b` above are the plain form's only.
+    GloraReading glora;
+    /// glora: the other reading, where the four tensors fit both - a GLoRA's two readings differ only in which of them
+    /// is the input's path and which the plain pair, and a square weight's tensors fit each, so the weight's rows and
+    /// columns choose between them (comfy/weight_adapter/glora.py's tie-break; `lora_glora_for_weight` does it here).
+    /// Empty: the file's shapes said one reading.
+    GloraReading glora_other;
     std::vector<uint16_t> delta;      // diff: the weight's own delta [rows][cols], row-major, FP16 (a set_weight's:
                                       // the weight it sets, what the strength interpolates towards); a LoHa's is
                                       // made from the factors in `extra` when it is bound (its delta is the weight's
@@ -165,9 +192,15 @@ uint64_t lora_gpu_bytes(const std::vector<LoraUse>& loras, int64_t T);
 
 /// The values an entry's delta holds for each row of the product's scratch (FP32): a plain LoRA's rank, LoKr's
 /// in_m * out_k (its product's intermediate [T][in_m][out_k]), a whole delta's (or a LoHa's) cols where the input's
-/// rows must be scaled before its product (a W8A8 product's row scale, or a strength other than 1).  A DiT sizes its
-/// deltas' scratch by the largest.
+/// rows must be scaled before its product (a W8A8 product's row scale, or a strength other than 1).  A GLoRA's is the
+/// more of its rank and its columns (its input's two products, then the weight's own product's input).  A DiT sizes
+/// its deltas' scratch by the largest.
 int64_t lora_scratch_cols(const LoraEntry& e);
+
+/// The tokens a GLoRA's own path takes at a time: the weight's product of its input is made a band of the product's
+/// rows at a time, so that the table it is added from stays a few MiB whatever the weight's rows (128 of the largest
+/// DiT weights' 24576 rows is 12 MiB).
+constexpr int64_t kLoraGloraRows = 128;
 
 /// One entry's tensors on the GPU (FP16: a plain LoRA's A and B, a LoKr's w1 and w2), and the entry's delta applied
 /// to a product's output.
@@ -203,6 +236,12 @@ public:
              float scale, const float* row_scale, prefill::Gemm& gemm, float* tmp_f32, uint16_t* tmp16,
              void* stream) const;
 
+    /// A GLoRA's own path: v16[t] = scale * row_scale[t] * (glora_out (glora_in x16[t])), [T][cols], the input the
+    /// weight's product is run on a second time (the caller's own product of it: the weight's path, added to y).
+    /// `tmp_f32` and `tmp16` hold T * lora_scratch_cols(e) values each; the input is left in `tmp16`'s first T * cols.
+    void glora_input(const uint16_t* x16, int64_t T, float scale, const float* row_scale, prefill::Gemm& gemm,
+                     float* tmp_f32, uint16_t* tmp16, void* stream) const;
+
     /// y[t][row0 + c] (row stride ldy) += scale * bias[src_row + c], t < T: the bias's delta (ComfyUI's "diff"
     /// patch of the weight's bias), added where the DiT adds the weight's own bias.  No bias: nothing.  A
     /// LoraKind::bias entry has no weight's delta: this is its whole patch.
@@ -228,6 +267,8 @@ private:
     uint16_t* b_ = nullptr;   // lora: B [rows][rank]
     uint16_t* w1_ = nullptr;  // lokr: w1 [out_l][in_m]
     uint16_t* w2_ = nullptr;  // lokr: w2 [out_k][in_n]
+    uint16_t* glora_in_ = nullptr;    // glora: glora_in [rank][cols]
+    uint16_t* glora_out_ = nullptr;   // glora: glora_out [cols][rank]
     uint16_t* diff_ = nullptr;   // diff: Delta [rows][cols]
     float* bias_ = nullptr;      // a bias's delta [rows], FP32
     float* rot_ = nullptr;       // oft: the rotations [stages][blocks][bs][bs], FP32
@@ -247,10 +288,17 @@ struct LoraPart {
     float bias_scale = 0.0f;   // the entry's bias's delta (none: 0), times the request's strength only (no alpha)
     bool dora = false;   // a DoRA's: its base factors are c's, which the weight's other patches do not know
     bool oft = false;    // an OFT's: it turns the product's output over the part's whole rows
+    bool glora = false;  // a GLoRA's: the weight's own product of its input, over the part's rows
     /// DoRA: the base product's factor of each of the part's rows, 1 + strength (c - 1); a set_weight's: 1 - the
     /// strength.  Empty: the rows as the weight has them.  A row of the weight takes one part's factors.
     std::vector<float> base;
 };
+
+/// The weight's own product of a GLoRA's input, added to the product's output: `output(v16, t0, rows, row0, n)` puts
+/// the weight's rows [row0, row0 + n) product of v16's [rows][cols] (the tokens t0 .. t0 + rows) into the product's
+/// output at those rows: the DiT writes it, its weight's own path (an FP16 or a quantized weight's) and its own table
+/// of the rows.
+using LoraGloraOutput = std::function<void(const uint16_t* v16, int64_t t0, int64_t rows, int64_t row0, int64_t n)>;
 
 /// The deltas one weight adds to its products, as the DiT bound them.  A weight without one has no layer.
 class LoraLayer {
@@ -264,6 +312,8 @@ public:
     /// True where a part turns the product's output (its bias is then added after the deltas: a rotation of the
     /// weight's rows is not one of the weight's bias).
     bool has_oft() const;
+    /// True where a part is a GLoRA's (the weight's product is run a second time, on its input).
+    bool has_glora() const;
     /// The GPU memory the parts' entries hold (and the base product's factors).
     uint64_t bytes() const;
 
@@ -278,6 +328,14 @@ public:
     void add(const uint16_t* x16, int64_t T, float* y, int64_t ldy, int64_t w_row0, int64_t w_rows,
              const float* row_scale, prefill::Gemm& gemm, float* tmp_f32, uint16_t* tmp16, void* stream) const;
 
+    /// The GLoRA parts' own path (their plain pair is `add`'s), a band of the tokens at a time (`kLoraGloraRows`): the
+    /// input v = scale * row_scale * (glora_out^T (glora_in^T x)), and `output` puts the weight's product of it over
+    /// the part's rows the product wrote (the caller's y, which its own callback adds to).  `tmp_f32` and `tmp16` as
+    /// `add`'s (the input is left in tmp16); `w_row0` and `w_rows` are the rows the product wrote.
+    void add_glora(const uint16_t* x16, int64_t T, int64_t w_row0, int64_t w_rows, const float* row_scale,
+                   prefill::Gemm& gemm, float* tmp_f32, uint16_t* tmp16, void* stream,
+                   const LoraGloraOutput& output) const;
+
     ~LoraLayer();
 
 private:
@@ -285,6 +343,15 @@ private:
     int64_t base_rows_ = 0;
     bool base_built_ = false;
 };
+
+/// The GLoRA entry as the reading a weight of `rows` x `cols` takes it: `&e` where its shapes are the weight's, or
+/// `&alt` filled with the other reading where the four tensors fit both (a square weight's), or `&e` where neither is
+/// (the caller's check of the shapes refuses it).  The entry's alpha divides the reading's own rank.
+const LoraEntry* lora_glora_for_weight(const LoraEntry& e, int64_t rows, int64_t cols, LoraEntry& alt);
+
+/// y[t][row0 + c] += src[t][c], t < T (row stride ldy): the weight's product of a GLoRA's input, made into a table of
+/// the product's rows, added to the product's output.
+void lora_output_add(float* y, int64_t T, int64_t ldy, int64_t row0, const float* src, int64_t n, void* stream);
 
 /// One DoRA part's rows: `norms` (the weight's rows' norms, FP32) -> the delta's factor of each of the part's rows
 /// [src_row, src_row + n) of the entry at the weight's rows [row0, row0 + n), c = dora_scale / (norm + eps) in `coef`,
@@ -294,10 +361,12 @@ private:
 bool lora_dora_rows(const LoraEntry& e, int64_t src_row, int64_t row0, int64_t n, const std::vector<float>& norms,
                     float strength, std::vector<float>& coef, std::vector<float>& base, std::string& err);
 
-/// The bound part whose rows overlap [row0, row0 + n) of a weight's, where one of the two is a DoRA's or an OFT's:
-/// the two cannot be composed (ComfyUI patches the weights in the file's order, so a DoRA's c, and an OFT's turning,
-/// would depend on that order), so the caller refuses the set.  null: no such part.
-const LoraPart* lora_dora_overlap(const LoraLayer* layer, int64_t row0, int64_t n, bool dora, bool oft = false);
+/// The bound part whose rows overlap [row0, row0 + n) of a weight's, where one of the two is a DoRA's, an OFT's or a
+/// GLoRA's: the two cannot be composed (ComfyUI patches the weights in the file's order, so a DoRA's c, an OFT's
+/// turning, and a GLoRA's read of the weight before its patch would depend on that order), so the caller refuses the
+/// set.  null: no such part.
+const LoraPart* lora_dora_overlap(const LoraLayer* layer, int64_t row0, int64_t n, bool dora, bool oft = false,
+                                  bool glora = false);
 
 /// Why a part's rows take no other adapter's (`lora_dora_overlap`'s part): the sentence a caller's error ends with.
 std::string lora_patch_clash_why(const LoraPart& p);
