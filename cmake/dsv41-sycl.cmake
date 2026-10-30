@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+# SPDX-License-Identifier: LGPL-3.0-or-later
+
+if(NOT STRATA_ENABLE_XE)
+    message(STATUS "DeepSeek: only the host components are enabled without SYCL")
+    return()
+endif()
+
+add_library(strata_dsv41_kernels STATIC
+    src/dsv41/ds4_kernels.cpp
+    src/dsv41/ds4_gguf.cpp
+    src/dsv41/ds4_iq.cpp
+    src/dsv41/ds4_tq.cpp
+    src/dsv41/vendor/exl3.cpp
+    src/dsv41/vendor/sampler.cpp
+    src/dsv41/vendor/moe_win.cpp)
+target_include_directories(strata_dsv41_kernels PUBLIC include src/dsv41 PRIVATE third_party/main/ggml)
+target_compile_features(strata_dsv41_kernels PUBLIC cxx_std_20)
+target_link_libraries(strata_dsv41_kernels PUBLIC strata_dsv41_host strata_prefill strata_sycl strata_warnings)
+
+if(STRATA_BUILD_TESTS)
+    foreach(_ds4_quant iq tq)
+        add_executable(ds4_${_ds4_quant}_test tests/dsv41/${_ds4_quant}_expert_test.cpp)
+        target_include_directories(ds4_${_ds4_quant}_test PRIVATE third_party/main/ggml tools/trellis)
+        target_link_libraries(ds4_${_ds4_quant}_test PRIVATE strata_dsv41_kernels)
+        add_test(NAME ds4_${_ds4_quant}_test COMMAND ds4_${_ds4_quant}_test)
+        set_tests_properties(ds4_${_ds4_quant}_test PROPERTIES LABELS "dsv41;gpu" SKIP_RETURN_CODE 77)
+    endforeach()
+    target_sources(ds4_tq_test PRIVATE tools/trellis/tqenc.cpp)
+    add_test(NAME ds4_tq_cpu_test COMMAND ds4_tq_test --host-only)
+    set_tests_properties(ds4_tq_cpu_test PROPERTIES LABELS "dsv41;host" TIMEOUT 120 SKIP_RETURN_CODE 77)
+    add_executable(ds4_numerics_test tests/dsv41/numerics_test.cpp)
+    target_include_directories(ds4_numerics_test PRIVATE src/dsv41)
+    target_compile_features(ds4_numerics_test PRIVATE cxx_std_20)
+    target_link_libraries(ds4_numerics_test PRIVATE strata_sycl strata_warnings)
+    add_test(NAME ds4_numerics_test COMMAND ds4_numerics_test)
+    set_tests_properties(ds4_numerics_test PROPERTIES LABELS "dsv41;host" TIMEOUT 60)
+    add_executable(ds4_mailbox_test tests/dsv41/mailbox_test.cpp)
+    target_include_directories(ds4_mailbox_test PRIVATE src/dsv41)
+    target_compile_features(ds4_mailbox_test PRIVATE cxx_std_20)
+    target_link_libraries(ds4_mailbox_test PRIVATE Threads::Threads strata_sycl strata_warnings)
+    add_test(NAME ds4_mailbox_test COMMAND ds4_mailbox_test)
+    set_tests_properties(ds4_mailbox_test PROPERTIES LABELS "dsv41;host" TIMEOUT 30)
+
+endif()

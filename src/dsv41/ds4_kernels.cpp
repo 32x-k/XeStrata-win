@@ -1,0 +1,744 @@
+// SPDX-FileCopyrightText: 2026 Peasant Smith and the Project Maya contributors
+// SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
+// Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
+// Ported into Strata (third_party/main/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
+#include "ds4_kernels.cuh"
+#include "ds4_numerics.cuh"
+#include "ds4_q6k.cuh"
+#include "ds4_mailbox.hpp"
+#include <algorithm>
+#include <atomic>
+#include <cfloat>
+#include <cstdio>
+#include <limits>
+#include <stdexcept>
+#include <thread>
+#include <unordered_map>
+
+namespace strata::ds4 {
+namespace {
+using sycl_detail::parallel;
+using sycl_detail::bf16_value;
+using sycl_detail::f16_value;
+
+struct MailboxRegistry {
+    std::mutex mutex;
+    std::unordered_map<const sycl::queue*, std::weak_ptr<MailboxControl>> queues;
+};
+MailboxRegistry& mailbox_registry() {
+    static MailboxRegistry registry;
+    return registry;
+}
+std::shared_ptr<MailboxControl> mailbox_for(const sycl::queue& queue) {
+    auto& registry = mailbox_registry();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    const auto found = registry.queues.find(&queue);
+    return found == registry.queues.end() ? nullptr : found->second.lock();
+}
+
+float pow2_ceil(float x) {
+    const uint32_t b = sycl::bit_cast<uint32_t>(x);
+    const int e = int((b >> 23) & 255u) + ((b & 0x7fffffu) != 0u);
+    return sycl::bit_cast<float>(uint32_t(e) << 23);
+}
+float e2m1_round(float v) {
+    const float a = sycl::fabs(v);
+    const float r = a <= .25f ? 0.f : a < .75f ? .5f : a <= 1.25f ? 1.f : a < 1.75f ? 1.5f :
+                    a <= 2.5f ? 2.f : a < 3.5f ? 3.f : a <= 5.f ? 4.f : 6.f;
+    return sycl::copysign(r, v);
+}
+uint8_t e2m1_code(float q) {
+    const float a = sycl::fabs(q);
+    const uint32_t m = a <= 1.5f ? uint32_t(a * 2.f) : a <= 2.f ? 4u : a <= 3.f ? 5u : a <= 4.f ? 6u : 7u;
+    return uint8_t(m | ((sycl::bit_cast<uint32_t>(q) >> 31) << 3));
+}
+uint8_t e4m3_code(float v, int k = 0) {
+    const uint32_t b = sycl::bit_cast<uint32_t>(v), sg = (b >> 24) & 128u, a = b & 0x7fffffffu;
+    if (!a) return uint8_t(sg);
+    const int e = int(a >> 23) - 127 - k;
+    if (e >= -6) return uint8_t(sg | (uint32_t(e + 7) << 3) | ((a >> 20) & 7u));
+    return uint8_t(sg | (((a & 0x7fffffu) | 0x800000u) >> (14 - e)));
+}
+float e2m1_value(uint8_t q) {
+    constexpr float values[] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    return q & 8 ? -values[q & 7] : values[q & 7];
+}
+float kv_value(const void* data, int fmt, int d, int e) {
+    const auto* b = static_cast<const uint8_t*>(data);
+    if (fmt == kKvBf16) return bf16_value(static_cast<const uint16_t*>(data)[e]);
+    if (fmt == kKvFp8) return e4m3_value(b[e]) * sycl::bit_cast<float>(uint32_t(b[d + e / 32]) << 23);
+    const float q = e2m1_value(uint8_t(b[e / 2] >> (4 * (e & 1))));
+    const float scale = fmt == kKvFp4 ? e4m3_value(b[d / 2 + e / 16]) :
+                        sycl::bit_cast<float>(uint32_t(b[d / 2 + e / 32]) << 23);
+    return q * scale;
+}
+void rows_at(const Rows& r, int t, int& n, int& k) {
+    if (!r.gen) { n = r.n[t]; k = r.k[t]; return; }
+    const int nn = int((r.p0 + t + 1) / r.R), cb = sycl::min(r.ccap, (nn + r.blk - 1) / r.blk);
+    switch (r.gen) {
+    case 1: n = nn; k = sycl::min(r.kcap, nn); break;
+    case 2: n = nn; k = cb; break;
+    case 3: n = cb * r.blk; k = sycl::min(r.kcap, nn); break;
+    default: n = (nn + r.blk - 1) / r.blk; k = r.kcap; break;
+    }
+}
+float route_score(float l) { return sycl::sqrt(l > 20.f ? l : sycl::log1p(sycl::exp(l))); }
+void route_row(const float* logits, const float* bias, int n, int k, float scale, int* ids, float* weights) {
+    float sum = 0.f;
+    for (int r = 0; r < k; ++r) {
+        float best = -FLT_MAX;
+        int ix = -1;
+        for (int i = 0; i < n; ++i) {
+            bool used = false;
+            for (int j = 0; j < r; ++j) used |= ids[j] == i;
+            const float v = route_score(logits[i]) + bias[i];
+            if (!used && (v > best || (v == best && (ix < 0 || i < ix)))) { best = v; ix = i; }
+        }
+        ids[r] = ix;
+        weights[r] = ix < 0 ? 0.f : route_score(logits[ix]);
+        sum += weights[r];
+    }
+    for (int r = 0; r < k; ++r) weights[r] = weights[r] / (sum + 1e-20f) * scale;
+}
+uint32_t ord_key(float v) {
+    const uint32_t u = sycl::bit_cast<uint32_t>(v);
+    return u ^ ((u & 0x80000000u) ? 0xffffffffu : 0x80000000u);
+}
+float iq4nl_value(const uint8_t* b, int e) {
+    constexpr int8_t values[] = {-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113};
+    const uint8_t q = b[2 + (e & 15)];
+    return f16_value(uint16_t(b[0] | uint16_t(b[1]) << 8)) * float(values[(e & 16) ? q >> 4 : q & 15]);
+}
+float engram_value(const uint8_t* row, const uint8_t* scales, int e, int fmt) {
+    if (fmt == 1) return q6k_value(row + size_t(e / 256) * kQ6kBytes, e % 256);
+    if (fmt == 2) return iq4nl_value(row + size_t(e / 32) * 18, e % 32);
+    const uint8_t b = scales[e / 32];
+    const float scale = b == 255 ? sycl::bit_cast<float>(0x7fc00000u) :
+                        b == 0 ? 5.877471754111438e-39f : sycl::bit_cast<float>(uint32_t(b) << 23);
+    return e4m3_value(row[e]) * scale;
+}
+}
+
+void bind_mailbox(sycl::queue& queue, const std::shared_ptr<MailboxControl>& control) {
+    auto& registry = mailbox_registry();
+    std::lock_guard<std::mutex> lock(registry.mutex);
+    registry.queues[&queue] = control;
+}
+void unbind_mailbox(const sycl::queue* queue) noexcept {
+    try {
+        auto& registry = mailbox_registry();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        registry.queues.erase(queue);
+    } catch (...) { std::fputs("ds4: mailbox registry cleanup failed\n", stderr); }
+}
+
+void embed(const uint16_t* rows, int T, float* h, int dim, int hc, sycl::queue& s) {
+    parallel(s, size_t(T) * dim, [=](size_t i) {
+        const size_t t = i / dim, e = i % dim;
+        const float v = bf16_value(rows[i]);
+        for (int j = 0; j < hc; ++j) h[(t * hc + j) * dim + e] = v;
+    });
+}
+
+void finish(float* x, int n_vec, int len, long long stride, const Finish& f, sycl::queue& s) {
+    if (n_vec <= 0) return;
+    if (len <= 0 || f.rd < 0 || f.rd > len || (f.rd & 1) || (f.rd && ((len - f.rd) & 1)) || f.vpp <= 0)
+        throw std::invalid_argument("ds4 finish: invalid vector or rotary dimensions");
+    if (f.pdst && (f.quant < 1 || f.quant > 3 || len % 32))
+        throw std::invalid_argument("ds4 finish: packed rows require whole quantization blocks");
+    parallel(s, size_t(n_vec), [=](size_t v) {
+        float* row = x + static_cast<long long>(v) * stride;
+        float ss = 0.f;
+        if (f.w) for (int e = 0; e < len; ++e) ss += row[e] * row[e];
+        const float inv = f.w ? sycl::rsqrt(ss / float(len) + f.eps) : 1.f;
+        const int g = f.quant == 2 ? 16 : 32;
+        const int r0 = len - f.rd, pos = f.pos + int(v / f.vpp) * f.pos_step;
+        uint8_t* packed = f.pdst ? f.pdst + static_cast<long long>(v) * f.pdst_stride : nullptr;
+        uint16_t* dst = f.dst ? f.dst + static_cast<long long>(v) * f.dst_stride : nullptr;
+        // These 32 values are a quantization block, independent of the device's subgroup width.
+        for (int start = 0; start < len; start += g) {
+            float vals[32];
+            const int count = sycl::min(g, len - start);
+            for (int j = 0; j < count; ++j) vals[j] = f.w ? row[start + j] * inv * f.w[start + j] : row[start + j];
+            for (int j = 0; j + 1 < count; j += 2) {
+                const int e = start + j;
+                if (e < r0) continue;
+                const float ang = float(pos) * f.freqs[(e - r0) / 2];
+                const float c = sycl::cos(ang), sn = (f.inverse ? -1.f : 1.f) * sycl::sin(ang);
+                const float a = vals[j], b = vals[j + 1];
+                vals[j] = a * c - b * sn;
+                vals[j + 1] = a * sn + b * c;
+            }
+            float amax = 0.f, scale = 1.f;
+            if (f.quant) {
+                for (int j = 0; j < count; ++j) amax = sycl::fmax(amax, sycl::fabs(vals[j]));
+                if (f.quant == 1) scale = pow2_ceil(sycl::fmax(amax, 1e-4f) / 448.f);
+                else if (f.quant == 2) scale = e4m3_round(sycl::fmax(amax, 6.f * .001953125f) / 6.f);
+                else scale = pow2_ceil(sycl::fmax(amax, 6.f * 1.1754943508222875e-38f) / 6.f);
+            }
+            for (int j = 0; j < count; ++j) {
+                const float q = f.quant == 1 ? e4m3_round(sycl::clamp(vals[j] / scale, -448.f, 448.f)) :
+                                f.quant ? e2m1_round(sycl::clamp(vals[j] / scale, -6.f, 6.f)) : vals[j];
+                vals[j] = q * scale;
+                const int e = start + j;
+                if (packed) {
+                    if (f.quant == 1) packed[e] = e4m3_code(q);
+                    else if (!(e & 1)) packed[e / 2] = e2m1_code(q);
+                    else packed[e / 2] |= uint8_t(e2m1_code(q) << 4);
+                }
+                if (dst) dst[e] = bf16_rn(vals[j]);
+                else if (!packed) row[e] = vals[j];
+            }
+            if (packed) packed[(f.quant == 1 ? len : len / 2) + start / g] =
+                f.quant == 2 ? e4m3_code(scale) : uint8_t(sycl::bit_cast<uint32_t>(scale) >> 23);
+        }
+    });
+}
+
+void hc_mix(const float* h, const float* fn, int hcdim, int n_mix, int T, float eps, float* mixes, sycl::queue& s) {
+    parallel(s, size_t(T) * n_mix, [=](size_t i) {
+        const int t = int(i / n_mix), m = int(i % n_mix);
+        float acc = 0.f, ss = 0.f;
+        for (int k = 0; k < hcdim; ++k) {
+            const float v = h[size_t(t) * hcdim + k];
+            acc += v * fn[size_t(m) * hcdim + k]; ss += v * v;
+        }
+        mixes[size_t(t) * 32 + m] = acc * sycl::rsqrt(ss / float(hcdim) + eps);
+    });
+}
+void hc_split(const float* mixes, const float* scale, const float* base, int hc, int iters, float eps, int T,
+              float* pre, float* post, float* comb, sycl::queue& s) {
+    if (hc <= 0 || hc > 8 || 2 * hc + hc * hc > 32) throw std::invalid_argument("ds4 hyper-connections: invalid mix shape");
+    parallel(s, size_t(T), [=](size_t t) {
+        const float* mx = mixes + t * 32;
+        float c[8][8];
+        for (int j = 0; j < hc; ++j) {
+            pre[t * 8 + j] = 1.f / (1.f + sycl::exp(-(mx[j] * scale[0] + base[j]))) + eps;
+            post[t * 8 + j] = 2.f / (1.f + sycl::exp(-(mx[hc + j] * scale[1] + base[hc + j])));
+            float m = -FLT_MAX;
+            for (int k = 0; k < hc; ++k) {
+                c[j][k] = mx[2 * hc + j * hc + k] * scale[2] + base[2 * hc + j * hc + k];
+                m = sycl::fmax(m, c[j][k]);
+            }
+            float sum = 0.f;
+            for (int k = 0; k < hc; ++k) { c[j][k] = sycl::exp(c[j][k] - m); sum += c[j][k]; }
+            for (int k = 0; k < hc; ++k) c[j][k] = c[j][k] / sum + eps;
+        }
+        for (int it = 0; it < sycl::max(iters, 1); ++it) {
+            if (it) for (int j = 0; j < hc; ++j) {
+                float sum = 0.f;
+                for (int k = 0; k < hc; ++k) sum += c[j][k];
+                for (int k = 0; k < hc; ++k) c[j][k] /= sum + eps;
+            }
+            for (int k = 0; k < hc; ++k) {
+                float sum = 0.f;
+                for (int j = 0; j < hc; ++j) sum += c[j][k];
+                for (int j = 0; j < hc; ++j) c[j][k] /= sum + eps;
+            }
+        }
+        for (int j = 0; j < hc; ++j) for (int k = 0; k < hc; ++k) comb[t * 64 + size_t(j) * hc + k] = c[j][k];
+    });
+}
+void hc_mix_split(const float* h, const float* fn, int hcdim, int n_mix, int T, float eps, float* mixes,
+                  const float* scale, const float* base, int hc, int iters, float hc_eps, float* pre,
+                  float* post, float* comb, sycl::queue& s) {
+    hc_mix(h, fn, hcdim, n_mix, T, eps, mixes, s);
+    hc_split(mixes, scale, base, hc, iters, hc_eps, T, pre, post, comb, s);
+}
+void hc_mix_split(const float* h, const float* fn, int hcdim, int n_mix, int T, float eps, float* mixes, unsigned* cnt,
+                  const float* scale, const float* base, int hc, int iters, float hc_eps, float* pre,
+                  float* post, float* comb, sycl::queue& s) {
+    hc_mix_split(h, fn, hcdim, n_mix, T, eps, mixes, scale, base, hc, iters, hc_eps, pre, post, comb, s);
+    if (cnt) s.memset(cnt, 0, size_t(T) * sizeof(unsigned));
+}
+void hc_pre_norm(const float* h, const float* mix, const float* w, int dim, int hc, int T, float eps, float* x, sycl::queue& s) {
+    parallel(s, size_t(T) * dim, [=](size_t i) {
+        const size_t t = i / dim, e = i % dim;
+        float v = 0.f;
+        for (int j = 0; j < hc; ++j) v += mix[t * 8 + j] * h[(t * hc + j) * dim + e];
+        x[i] = v;
+    });
+    if (w) { Finish f; f.w = w; f.eps = eps; finish(x, T, dim, dim, f, s); }
+}
+void hc_post(const float* y, const float* res, const float* post, const float* comb, int dim, int hc, int T,
+             float* out, sycl::queue& s) {
+    parallel(s, size_t(T) * hc * dim, [=](size_t i) {
+        const size_t e = i % dim, k = (i / dim) % hc, t = i / (size_t(hc) * dim);
+        float v = post[t * 8 + k] * y[t * dim + e];
+        for (int j = 0; j < hc; ++j) v += comb[t * 64 + size_t(j) * hc + k] * res[(t * hc + j) * dim + e];
+        out[i] = v;
+    });
+}
+void hc_post_inplace(const float* y, float* h, const float* post, const float* comb, int dim, int hc, int T, sycl::queue& s) {
+    if (hc > 8) throw std::invalid_argument("ds4 hyper-connections: too many streams");
+    parallel(s, size_t(T) * dim, [=](size_t i) {
+        const size_t t = i / dim, e = i % dim;
+        float vals[8];
+        for (int j = 0; j < hc; ++j) vals[j] = h[(t * hc + j) * dim + e];
+        for (int k = 0; k < hc; ++k) {
+            float v = post[t * 8 + k] * y[i];
+            for (int j = 0; j < hc; ++j) v += comb[t * 64 + size_t(j) * hc + k] * vals[j];
+            h[(t * hc + k) * dim + e] = v;
+        }
+    });
+}
+void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float* mixes, sycl::queue& s) {
+    parallel(s, size_t(T), [=](size_t t) {
+        float ss = 0.f;
+        for (int k = 0; k < hcdim; ++k) { const float v = h[t * hcdim + k]; ss += v * v; }
+        const float inv = sycl::rsqrt(ss / float(hcdim) + eps);
+        for (int k = 0; k < n_mix; ++k) mixes[t * 32 + k] *= inv;
+    });
+}
+void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, int T, float alpha,
+                   float* y, size_t ldy, sycl::queue& s) {
+    parallel(s, size_t(T) * n, [=](size_t i) {
+        const size_t t = i / n, r = i % n;
+        float sum = 0.f;
+        for (int j = 0; j < k; ++j) sum += f16_value(W[r * k + j]) * x[t * ldx + j];
+        y[t * ldy + r] = alpha * sum;
+    });
+}
+void gemv_f16(const uint16_t* W, const float* x, int n, int k, int T, float alpha, float* y, sycl::queue& s) {
+    gemv_f16_rows(W, x, k, n, k, T, alpha, y, n, s);
+}
+void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, sycl::queue& s) {
+    parallel(s, size_t(T) * n, [=](size_t i) {
+        const size_t t = i / n, r = i % n;
+        float sum = 0.f;
+        for (int j = 0; j < k; ++j) sum += W[r * k + j] * x[t * k + j];
+        y[t * ldy + r] = sum;
+    });
+}
+void route(const float* logits, const float* bias, int n, int k, int T, float scale, int* idx, float* w,
+           sycl::queue& s, const float* bias_vl, const VlBits* vl) {
+    if (k < 0 || k > kPicks || k > n) throw std::invalid_argument("ds4 route: invalid pick count");
+    const VlBits bits = vl ? *vl : VlBits{};
+    parallel(s, size_t(T), [=](size_t t) {
+        const float* b = bias_vl && ((bits.w[t >> 5] >> (t & 31)) & 1u) ? bias_vl : bias;
+        route_row(logits + t * 1024, b, n, k, scale, idx + t * kPicks, w + t * kPicks);
+    });
+}
+void swiglu(const float* g, const float* u, int n, float lim, float* h, sycl::queue& s) {
+    parallel(s, size_t(n), [=](size_t i) {
+        const float gv = lim > 0.f ? sycl::fmin(g[i], lim) : g[i];
+        const float uv = lim > 0.f ? sycl::clamp(u[i], -lim, lim) : u[i];
+        h[i] = gv / (1.f + sycl::exp(-gv)) * uv;
+    });
+}
+
+void compress_win(const float* kv, const float* score, float* kv_state, float* score_state, int ratio, int p0, int T,
+                  int d, const float* w, float eps, float* latent, sycl::queue& s) {
+    int g = 0;
+    for (int t = 0; t < T; ++t) {
+        const int slot = (p0 + t) % ratio;
+        parallel(s, size_t(d), [=](size_t e) {
+            kv_state[size_t(slot) * d + e] = kv[size_t(t) * d + e];
+            score_state[size_t(slot) * d + e] = score[size_t(t) * d + e];
+        });
+        if ((p0 + t + 1) % ratio) continue;
+        float* row = latent + size_t(g++) * d;
+        parallel(s, size_t(d), [=](size_t e) {
+            float m = -FLT_MAX, den = 0.f, v = 0.f;
+            for (int j = 0; j < ratio; ++j) m = sycl::fmax(m, score_state[size_t(j) * d + e]);
+            for (int j = 0; j < ratio; ++j) den += sycl::exp(score_state[size_t(j) * d + e] - m);
+            for (int j = 0; j < ratio; ++j) v += kv_state[size_t(j) * d + e] *
+                (sycl::exp(score_state[size_t(j) * d + e] - m) / den);
+            row[e] = v;
+        });
+        Finish f; f.w = w; f.eps = eps;
+        finish(row, 1, d, d, f, s);
+    }
+}
+void index_score(const float* q, const float* w, const void* k, int heads, int hd, int T, int n,
+                 const int* cand, int cand_stride, int blk, const Rows& lim, float* out, long long out_stride,
+                 sycl::queue& s, int kfmt) {
+    parallel(s, size_t(T) * n, [=](size_t z) {
+        const int t = int(z / n), i = int(z % n);
+        int ln, lk; rows_at(lim, t, ln, lk);
+        int p = i;
+        if (cand) p = i < lk * blk ? cand[size_t(t) * cand_stride + i / blk] * blk + i % blk : -1;
+        float result = -std::numeric_limits<float>::infinity();
+        if (p >= 0 && p < ln) {
+            const uint8_t* kr = static_cast<const uint8_t*>(k) + size_t(p) * kv_row_bytes(kfmt, hd);
+            result = 0.f;
+            for (int h = 0; h < heads; ++h) {
+                float dot = 0.f;
+                for (int e = 0; e < hd; ++e) dot += q[(size_t(t) * heads + h) * hd + e] * kv_value(kr, kfmt, hd, e);
+                result += sycl::fmax(dot, 0.f) * w[size_t(t) * 64 + h];
+            }
+        }
+        out[static_cast<long long>(t) * out_stride + i] = result;
+    });
+}
+void topk(const float* vals, long long stride, int T, const Rows& r, const int* cand, int cand_stride, int blk,
+          int* out, int out_stride, sycl::queue& s) {
+    parallel(s, size_t(T), [=](size_t t) {
+        int n, k; rows_at(r, int(t), n, k);
+        if (n <= 0 || k <= 0) return;
+        const float* v = vals + static_cast<long long>(t) * stride;
+        int* dst = out + t * out_stride;
+        const int* cd = cand ? cand + t * cand_stride : nullptr;
+        if (k >= n) {
+            for (int i = 0; i < n; ++i) dst[i] = cd ? cd[i / blk] * blk + i % blk : i;
+            return;
+        }
+        uint32_t prefix = 0, mask = 0;
+        int remaining = k;
+        // Radix selection preserves upstream's ordering: strictly greater values in
+        // position order, followed by the lowest positions equal to the threshold.
+        for (int shift = 24; shift >= 0; shift -= 8) {
+            unsigned hist[256] = {};
+            for (int i = 0; i < n; ++i) {
+                const uint32_t u = ord_key(v[i]);
+                if ((u & mask) == prefix) ++hist[(u >> shift) & 255u];
+            }
+            int cum = 0;
+            for (int digit = 255; digit >= 0; --digit) {
+                if (cum + int(hist[digit]) >= remaining) {
+                    prefix |= uint32_t(digit) << shift; mask |= 255u << shift;
+                    remaining -= cum; break;
+                }
+                cum += int(hist[digit]);
+            }
+        }
+        int greater = 0, equal = k - remaining;
+        for (int i = 0; i < n; ++i) {
+            const uint32_t u = ord_key(v[i]);
+            const int p = cd ? cd[i / blk] * blk + i % blk : i;
+            if (u > prefix) dst[greater++] = p;
+            else if (u == prefix && remaining > 0) { dst[equal++] = p; --remaining; }
+        }
+    });
+}
+void cand_blocks(const float* score, long long stride, int T, const Rows& r, int blk, float* bm, long long bm_stride,
+                 int* out, int out_stride, sycl::queue& s) {
+    Rows rb = r;
+    int max_blocks = 0;
+    if (r.gen) { rb.gen = 4; rb.blk = blk; max_blocks = (int((r.p0 + T) / r.R) + blk - 1) / blk; }
+    else for (int t = 0; t < T; ++t) {
+        rb.n[t] = (r.n[t] + blk - 1) / blk;
+        max_blocks = std::max(max_blocks, rb.n[t]);
+    }
+    parallel(s, size_t(T) * max_blocks, [=](size_t z) {
+        const int t = int(z / max_blocks), b = int(z % max_blocks);
+        int n, k; rows_at(r, t, n, k);
+        if (b >= (n + blk - 1) / blk) return;
+        float m = -std::numeric_limits<float>::infinity();
+        for (int j = b * blk; j < sycl::min(n, (b + 1) * blk); ++j)
+            m = sycl::fmax(m, score[static_cast<long long>(t) * stride + j]);
+        if (b == (n - 1) / blk) m = std::numeric_limits<float>::infinity();
+        bm[static_cast<long long>(t) * bm_stride + b] = m;
+    });
+    topk(bm, bm_stride, T, rb, nullptr, 0, 1, out, out_stride, s);
+}
+void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
+                 const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out,
+                 sycl::queue& s, int ckv_fmt, int heads_per_block, const AttnScratch* scr) {
+    (void)heads_per_block;
+    (void)scr;
+    sycl_detail::require_in_order(s);
+    if (T <= 0 || heads <= 0 || d <= 0) return;
+    // One work group per query/head. The reduction spans the group regardless of
+    // subgroup width; each item owns a strided subset of output components.
+    const auto device = s.get_device();
+    const size_t local = std::min({size_t(d), device.get_info<sycl::info::device::max_work_group_size>(),
+                                  device.get_info<sycl::info::device::max_work_item_sizes<1>>()[0]});
+    s.parallel_for(sycl::nd_range<1>(sycl::range<1>(size_t(T) * heads * local), sycl::range<1>(local)),
+                   [=](sycl::nd_item<1> item) {
+        const size_t group = item.get_group_linear_id(), lane = item.get_local_linear_id();
+        const int h = int(group % heads), t = int(group / heads);
+        int w0, nw, ns;
+        if (a.gen) {
+            const long long ta = a.t0 + t, pa = a.p0 + ta;
+            const long long first = sycl::max(static_cast<long long>(a.win) - a.p0, ta + 1);
+            w0 = int(first); nw = int(a.win + ta - first + 1);
+            ns = a.R > 0 ? int(sycl::min(static_cast<long long>(a.kcap), (pa + 1) / a.R)) : 0;
+        } else { w0 = a.win0[t]; nw = a.nwin[t]; ns = a.nsel[t]; }
+        const float* qr = q + group * d;
+        float* result = out + group * d;
+        for (size_t e = lane; e < size_t(d); e += local) result[e] = 0.f;
+        float m = sink[h], den = 1.f;
+        for (int j = 0; j < nw + ns; ++j) {
+            const int fmt = j < nw ? kKvBf16 : ckv_fmt;
+            const void* row = j < nw ? static_cast<const void*>(win + size_t(w0 + j) * d) :
+                static_cast<const void*>(static_cast<const uint8_t*>(ckv) +
+                    size_t(sel[size_t(t) * sel_stride + j - nw]) * kv_row_bytes(ckv_fmt, d));
+            float dot = 0.f;
+            for (size_t e = lane; e < size_t(d); e += local) dot += qr[e] * kv_value(row, fmt, d, int(e));
+            dot = sycl::reduce_over_group(item.get_group(), dot, sycl::plus<float>()) * scale;
+            const float next = sycl::fmax(m, dot), old_scale = sycl::exp(m - next), weight = sycl::exp(dot - next);
+            for (size_t e = lane; e < size_t(d); e += local)
+                result[e] = result[e] * old_scale + weight * kv_value(row, fmt, d, int(e));
+            den = den * old_scale + weight; m = next;
+        }
+        for (size_t e = lane; e < size_t(d); e += local) result[e] /= den;
+    });
+}
+void ring_to_ext(const uint8_t* ring, uint16_t* ext, int64_t p0, int n, int d, sycl::queue& s) {
+    parallel(s, size_t(n) * d, [=](size_t z) {
+        const int r = int(z / d), e = int(z % d);
+        const int64_t p = p0 - n + r;
+        ext[z] = p < 0 ? 0 : bf16_rn(kv_value(ring + size_t(p % n) * kv_row_bytes(kKvFp8, d), kKvFp8, d, e));
+    });
+}
+void ext_to_ring(const uint16_t* ext, uint8_t* ring, int64_t p0, int n, int T, int d, sycl::queue& s, uint8_t* backup) {
+    if (d % 32) throw std::invalid_argument("ds4 ring: incomplete FP8 block");
+    const size_t rb = kv_row_bytes(kKvFp8, d);
+    parallel(s, size_t(T), [=](size_t t) {
+        if (T - int(t) > n) return;
+        uint8_t* row = ring + size_t((p0 + t) % n) * rb;
+        if (backup) for (size_t j = 0; j < rb; ++j) backup[t * rb + j] = row[j];
+        for (int start = 0; start < d; start += 32) {
+            uint32_t a = 0;
+            for (int j = 0; j < 32; ++j) a = sycl::max(a,
+                sycl::bit_cast<uint32_t>(bf16_value(ext[(n + t) * d + start + j])) & 0x7fffffffu);
+            const int k = a == 0 ? 0 : int(a >> 23) - 135 + ((a & 0x7fffffu) > 0x600000u);
+            for (int j = 0; j < 32; ++j) row[start + j] = e4m3_code(bf16_value(ext[(n + t) * d + start + j]), k);
+            row[d + start / 32] = uint8_t(k + 127);
+        }
+    });
+}
+void ring_restore(uint8_t* ring, const uint8_t* backup, int64_t p0, int n, int keep, int T, int d, sycl::queue& s) {
+    const size_t rb = kv_row_bytes(kKvFp8, d);
+    if (T <= keep) return;
+    parallel(s, size_t(T - keep) * rb, [=](size_t z) {
+        const size_t t = keep + z / rb, e = z % rb;
+        ring[size_t((p0 + t) % n) * rb + e] = backup[t * rb + e];
+    });
+}
+void ring_restore_batch(const RingBatch& b, int64_t p0, int n, int keep, int T, int d, sycl::queue& s) {
+    for (int i = 0; i < b.n; ++i) ring_restore(b.ring[i], b.bak[i], p0, n, keep, T, d, s);
+}
+void engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, float* out, sycl::queue& s, int fmt) {
+    parallel(s, size_t(n) * hd, [=](size_t z) {
+        const size_t r = z / hd;
+        out[z] = engram_value(rows + r * hd, fmt ? nullptr : scales + r * (hd / 32), int(z % hd), fmt);
+    });
+}
+void engram_dequant_tok(const uint8_t* src, size_t per, int cols, int T, int hd, float* out, sycl::queue& s, int fmt) {
+    parallel(s, size_t(T) * cols * hd, [=](size_t z) {
+        const size_t r = z / hd, t = r / cols, c = r % cols;
+        out[z] = engram_value(src + t * per + c * hd, fmt ? nullptr : src + t * per + size_t(cols) * hd + c * (hd / 32),
+                              int(z % hd), fmt);
+    });
+}
+void engram_gate(float* h, const float* kv, const float* w, int hc, int dim, int T, float eps, sycl::queue& s) {
+    parallel(s, size_t(T) * hc, [=](size_t z) {
+        const size_t t = z / hc, k = z % hc;
+        float* row = h + z * dim;
+        const float* key = kv + (t * (hc + 1) + k) * dim;
+        const float* value = kv + (t * (hc + 1) + hc) * dim;
+        float sh = 0.f, sk = 0.f, sd = 0.f;
+        for (int e = 0; e < dim; ++e) { sh += row[e] * row[e]; sk += key[e] * key[e]; sd += row[e] * w[k * dim + e] * key[e]; }
+        const float dot = sd * sycl::rsqrt(sh / float(dim) + eps) * sycl::rsqrt(sk / float(dim) + eps) * sycl::rsqrt(float(dim));
+        const float sq = sycl::copysign(sycl::sqrt(sycl::fmax(sycl::fabs(dot), 1e-6f)), dot);
+        const float gate = 1.f / (1.f + sycl::exp(-sq));
+        for (int e = 0; e < dim; ++e) row[e] += gate * value[e];
+    });
+}
+void gather_rows(const float* x, const Gather& g, int n, int cols, float* out, sycl::queue& s) {
+    parallel(s, size_t(n) * cols, [=](size_t z) { out[z] = x[size_t(g.src[z / cols]) * cols + z % cols]; });
+}
+void combine(const float* ed, const float* cpu, const float* sh, const Combine& c, int T, int dim, float* out, sycl::queue& s) {
+    parallel(s, size_t(T) * dim, [=](size_t z) {
+        const size_t t = z / dim, e = z % dim;
+        float v = 0.f;
+        for (int j = 0; j < c.n[t]; ++j) v += c.w[t][j] * ed[size_t(c.row[t][j]) * dim + e];
+        if (cpu && c.cpu[t]) v += cpu[z];
+        if (sh) v += sh[z];
+        out[z] = v;
+    });
+}
+
+void route_publish(const float* logits, const float* bias, int n, int k, int T, float scale,
+                   const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
+                   unsigned long long* plan_ptr, Req* req, unsigned seq, sycl::queue& s,
+                   const float* bias_vl, unsigned vl, int na0, int na1) {
+    if (T > kWin || dim > kMaxDim || k < 0 || k > kPicks || k > n)
+        throw std::invalid_argument("ds4 route_publish: invalid request dimensions");
+    parallel(s, size_t(T), [=](size_t t) {
+        const float* b = bias_vl && ((vl >> t) & 1u) ? bias_vl : bias;
+        int* ids = idx + t * kPicks;
+        float* weights = w + t * kPicks;
+        route_row(logits + t * 1024, b, n, k, scale, ids, weights);
+        bool cpu = false;
+        for (int i = 0; i < k; ++i) {
+            plan_ptr[t * kPicks + i] = vram[ids[i]];
+            cpu |= vram[ids[i]] == 0;
+            if (req) { req->ids[t][i] = ids[i]; req->w[t][i] = weights[i]; }
+        }
+        if (req && cpu) for (int e = 0; e < dim; ++e) req->x[t][e] = x[t * dim + e];
+    });
+    if (req) s.submit([=](sycl::handler& h) {
+        // Completion of the preceding kernel makes its mailbox writes visible to
+        // this host task. The release store publishes the entire request at once.
+        h.host_task([=] {
+            req->na[0] = na0; req->na[1] = na1; req->T = T;
+            std::atomic_ref<unsigned>(req->seq).store(seq, std::memory_order_release);
+        });
+    });
+}
+void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, sycl::queue& s) {
+    if (T > kWin || off < 0 || off + m > kAhead) throw std::invalid_argument("ds4 route_ahead: invalid request dimensions");
+    parallel(s, size_t(T), [=](size_t t) {
+        int* ids = req->ahead[t] + off;
+        for (int r = 0; r < m; ++r) {
+            float best = -FLT_MAX;
+            int ix = -1;
+            for (int i = 0; i < n; ++i) {
+                bool used = false;
+                for (int j = 0; j < r; ++j) used |= ids[j] == i;
+                const float v = route_score(logits[t * 1024 + i]) + bias[i];
+                if (!used && (v > best || (v == best && (ix < 0 || i < ix)))) { best = v; ix = i; }
+            }
+            ids[r] = ix;
+        }
+    });
+}
+void zc_stage(unsigned long long* plan, const int* idx, const unsigned long long* zc_tab, int k,
+              uint8_t* stage, size_t stride, size_t bytes, sycl::queue& s) {
+    parallel(s, size_t(k) * bytes, [=](size_t z) {
+        const size_t i = z / bytes, e = z % bytes;
+        if (!plan[i] && zc_tab[idx[i]]) stage[i * stride + e] = reinterpret_cast<const uint8_t*>(zc_tab[idx[i]])[e];
+    });
+    parallel(s, size_t(k), [=](size_t i) {
+        if (!plan[i] && zc_tab[idx[i]]) plan[i] = reinterpret_cast<unsigned long long>(stage + i * stride);
+    });
+}
+void wait_seq(const unsigned* seq_ptr, unsigned seq, sycl::queue& s) {
+    sycl_detail::require_in_order(s);
+    // The mailbox is host-accessible USM. Waiting on the host avoids requiring
+    // system-scope atomics or forward progress between GPU work groups.
+    const auto control = mailbox_for(s);
+    s.submit([=](sycl::handler& h) { h.host_task([=] { wait_mailbox(seq_ptr, seq, false, control.get()); }); });
+}
+void moe_sort(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds, int* row_tok, int* pos, sycl::queue& s) {
+    parallel(s, size_t(n_vs), [=](size_t slot) {
+        int count = 0;
+        for (int t = 0; t < T; ++t) for (int i = 0; i < k; ++i) count += vs[idx[size_t(t) * kPicks + i]] == int(slot);
+        bounds[slot + 1] = count;
+    });
+    s.single_task([=] { bounds[0] = 0; for (int i = 0; i < n_vs; ++i) bounds[i + 1] += bounds[i]; });
+    parallel(s, size_t(n_vs), [=](size_t slot) {
+        int r = bounds[slot];
+        for (int t = 0; t < T; ++t) for (int i = 0; i < k; ++i) if (vs[idx[size_t(t) * kPicks + i]] == int(slot)) {
+            row_tok[r] = t; pos[size_t(t) * kPicks + i] = r++;
+        }
+    });
+}
+void moe_combine(float* acc, const float* y, const int* pos, const float* w, int T, int k, int r0, int r1, int dim, sycl::queue& s) {
+    parallel(s, size_t(T) * dim, [=](size_t z) {
+        const size_t t = z / dim, e = z % dim;
+        float v = acc[z];
+        for (int i = 0; i < k; ++i) {
+            const int r = pos[t * kPicks + i];
+            if (r >= r0 && r < r1) v = sycl::fma(w[t * kPicks + i], y[size_t(r - r0) * dim + e], v);
+        }
+        acc[z] = v;
+    });
+}
+void init_pre(float* pre, int T, sycl::queue& s) {
+    parallel(s, size_t(T) * 8, [=](size_t i) { pre[i] = (i % 8) == 0 ? 1.f : 0.f; });
+}
+void hc_mean(const float* h, int T, int hc, int dim, float* out, long long out_stride, sycl::queue& s) {
+    parallel(s, size_t(T) * dim, [=](size_t z) {
+        const size_t t = z / dim, e = z % dim;
+        float v = 0.f;
+        for (int j = 0; j < hc; ++j) v += h[(t * hc + j) * dim + e];
+        out[static_cast<long long>(t) * out_stride + e] = v / float(hc);
+    });
+}
+void iota_rows(int* out, int T, int n, int stride, sycl::queue& s) {
+    parallel(s, size_t(T) * n, [=](size_t z) { out[(z / n) * stride + z % n] = int(z % n); });
+}
+void markov_add(float* logits, const uint16_t* E, const uint16_t* H, const int* tok, int V, int R, sycl::queue& s) {
+    parallel(s, size_t(V), [=](size_t v) {
+        float sum = 0.f;
+        for (int i = 0; i < R; ++i) sum += bf16_value(E[size_t(*tok) * R + i]) * f16_value(H[v * R + i]);
+        logits[v] += sum;
+    });
+}
+void markov_add_q8(float* logits, const uint16_t* E, const uint8_t* Hq, const int* tok, int V, int R, sycl::queue& s) {
+    parallel(s, size_t(V), [=](size_t v) {
+        const uint8_t* row = Hq + v * (R / 32) * 34;
+        float sum = 0.f;
+        for (int i = 0; i < R; ++i) {
+            const uint8_t* block = row + size_t(i / 32) * 34;
+            const float scale = f16_value(uint16_t(block[0] | uint16_t(block[1]) << 8));
+            sum += bf16_value(E[size_t(*tok) * R + i]) * (scale * float(reinterpret_cast<const int8_t*>(block + 2)[i % 32]));
+        }
+        logits[v] += sum;
+    });
+}
+void markov_share(float* logits, const uint16_t* H, const uint16_t* erow, int vn, int R, sycl::queue& s) {
+    parallel(s, size_t(vn), [=](size_t v) {
+        float sum = 0.f;
+        for (int i = 0; i < R; ++i) sum += bf16_value(erow[i]) * f16_value(H[v * R + i]);
+        logits[v] += sum;
+    });
+}
+void argmax_share(const float* row, int vn, int v0, unsigned* slot, unsigned seq, sycl::queue& s) {
+    sycl_detail::require_in_order(s);
+    s.single_task([=] {
+        float best = -std::numeric_limits<float>::infinity();
+        int index = 0;
+        for (int i = 0; i < vn; ++i) if (row[i] > best) { best = row[i]; index = i; }
+        slot[0] = sycl::bit_cast<unsigned>(best); slot[1] = unsigned(v0 + index);
+    });
+    set_flag(slot + 2, seq, s);
+}
+void markov_pick(const unsigned* slots, int nm, unsigned seq, int* tok, const uint16_t* E, uint16_t* erow, int R, sycl::queue& s) {
+    if (nm != 1) throw std::invalid_argument("ds4: this build supports one GPU; distributed markov heads are unavailable");
+    wait_flags(slots + 2, 1, 4, seq, s);
+    parallel(s, size_t(R), [=](size_t i) {
+        const int index = int(slots[1]);
+        if (!i) *tok = index;
+        erow[i] = E[size_t(index) * R + i];
+    });
+}
+void confidence(const float* x, const uint16_t* E, const int* tok, const float* w, int T, int dim, int R, float* out, sycl::queue& s) {
+    parallel(s, size_t(T), [=](size_t t) {
+        float sum = 0.f;
+        for (int i = 0; i < dim; ++i) sum += w[i] * x[t * dim + i];
+        for (int i = 0; i < R; ++i) sum += w[dim + i] * bf16_value(E[size_t(tok[t]) * R + i]);
+        out[t] = 1.f / (1.f + sycl::exp(-sum));
+    });
+}
+void xfer_put(const Xfer& x, unsigned* flag, unsigned seq, unsigned* cnt, sycl::queue& s) {
+    sycl_detail::require_in_order(s);
+    for (int i = 0; i < x.n; ++i) if (x.bytes[i]) s.memcpy(x.dst[i], x.src[i], x.bytes[i]);
+    if (cnt) s.memset(cnt, 0, sizeof(unsigned));
+    if (flag) set_flag(flag, seq, s);
+}
+void win_submit(sycl::queue& s) {
+    // SYCL submissions are already enqueued; no vendor-specific flush is needed.
+    (void)s;
+}
+void xfer_get(const Xfer& x, const unsigned* flag, unsigned seq, sycl::queue& s) {
+    sycl_detail::require_in_order(s);
+    if (flag) wait_flags(flag, 1, 1, seq, s);
+    for (int i = 0; i < x.n; ++i) if (x.bytes[i]) s.memcpy(x.dst[i], x.src[i], x.bytes[i]);
+}
+void wait_flags(const unsigned* flags, int n, int stride, unsigned seq, sycl::queue& s) {
+    sycl_detail::require_in_order(s);
+    if (n <= 0) return;
+    const auto control = mailbox_for(s);
+    s.submit([=](sycl::handler& h) { h.host_task([=] {
+        for (int i = 0; i < n; ++i) wait_mailbox(flags + size_t(i) * stride, seq, true, control.get());
+    }); });
+}
+void set_flag(unsigned* flag, unsigned v, sycl::queue& s) {
+    sycl_detail::require_in_order(s);
+    s.submit([=](sycl::handler& h) { h.host_task([=] {
+        std::atomic_ref<unsigned>(*flag).store(v, std::memory_order_release);
+    }); });
+}
+void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, sycl::queue& s) {
+    (void)x; (void)n; (void)mi; (void)seq; (void)cnt; (void)s;
+    if (a.nm != 1) throw std::invalid_argument("ds4: this build supports one GPU; all-reduce is unavailable");
+}
+
+}  // namespace strata::ds4

@@ -1407,6 +1407,7 @@ endif()
 option(STRATA_BUILD_DSV41 "Build the DeepSeek-V4.1 SYCL prototype" OFF)
 if(STRATA_BUILD_DSV41)
   include(cmake/dsv41-host.cmake)
+  include(cmake/dsv41-sycl.cmake)
 endif()
 
 if(STRATA_PACKAGE)
