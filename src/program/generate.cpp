@@ -4326,6 +4326,7 @@ int main(int argc, char** argv) {
     // is a mapping of the ORIGINAL second GGUF shard, the six weights are already loaded in the arena, and the
     // three buffers are the only allocation.
     strata::kernels::PleTable ple_table;
+    bool ple_lock_by_policy = false;   // locked in RAM by the residency policy, not by --ple-io ram: #4518 may give it back
     std::vector<float> ple_emb_host((size_t) strata::kernels::NG_N_EMBD);
     float* ple_emb_dev = nullptr;
     float* ple_scratch = nullptr;
@@ -4379,6 +4380,7 @@ int main(int argc, char** argv) {
                 std::string ram_err;
                 if (ple_table.open(o.ple_gguf, ram_err, pio)) {
                     ple_auto_ram = true;
+                    ple_lock_by_policy = ple_table.locked();
                     std::fprintf(stderr, "strata generate: --ple-io ram chosen by the residency policy (the table is %.1f "
                                          "GiB, the expert arena %.1f GiB and %.1f GiB of RAM is available; "
                                          "STRATA_PLE_AUTO_RAM=1 asked for it)\n",
@@ -7595,9 +7597,24 @@ int main(int argc, char** argv) {
         // alternates a long conversation with shorter ones, and with the cache off each request read its whole prompt
         // again.  An explicit value, 0 included, is kept.
         if (o.conversation_cache_mib < 0) {
-            o.conversation_cache_mib = o.serve && o.prompt_cache > 0 && o.conversation_cache_slots > 0 && use_mtp
-                ? strata::core::auto_conversation_cache_mib(strata::core::available_host_bytes(),
-                                                            o.conversation_cache_min_free_mib)
+            const bool auto_cache = o.serve && o.prompt_cache > 0 && o.conversation_cache_slots > 0 && use_mtp;
+            auto cache_room = strata::core::available_host_bytes();
+            // #4518 (upstream 587a47443): the residency policy locked the PLE table before it knew what the rest of the
+            // load would take; if the lock is what leaves the automatic cache too little (or none), the lock is given
+            // back (the pages stay cached, the OS may reclaim them).  --ple-io ram asked for by hand is never touched.
+            if (auto_cache && ple_lock_by_policy && ple_table.locked() &&
+                strata::core::ple_lock_blocks_cache(cache_room, ple_table.table_bytes(), o.conversation_cache_min_free_mib)) {
+                const auto before = cache_room;
+                if (ple_table.unlock()) {
+                    cache_room = strata::core::available_host_bytes();
+                    std::fprintf(stderr, "strata serve: PLE table lock given back: the lock left %.1f GiB of RAM for the "
+                                         "conversation cache, %.1f GiB without it (the table stays cached)\n",
+                                 before ? (double) *before / (1ull << 30) : 0.0,
+                                 cache_room ? (double) *cache_room / (1ull << 30) : 0.0);
+                }
+            }
+            o.conversation_cache_mib = auto_cache
+                ? strata::core::auto_conversation_cache_mib(cache_room, o.conversation_cache_min_free_mib)
                 : 0;
             if (o.serve && o.conversation_cache_mib > 0)
                 std::fprintf(stderr, "strata serve: conversation cache sized from the free RAM: %lld MiB for up to %d "
