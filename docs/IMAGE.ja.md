@@ -398,7 +398,7 @@ HunyuanImage 3.0（`hunyuan-image-3-distil`、w4a8、1024x1024、8 ステップ�
 | `Image generation runs the image model at Q6_K instead of Q8_0 ...` | RAM が足りないので、setup が大きさを下げました（[大きさとメモリ](#大きさとメモリ)） |
 | `faster with NVIDIA's ... cuDNN for the image engine's attention`（setup） | cuDNN がないので、NVIDIA の GPU の注意を XeStrata のカーネルで計算します。示されたコマンドで入れると速くなります |
 | `lora: ...`（400） | 名前が一覧にないか、強さが範囲外か、4 本を超えています。メッセージに理由が続きます |
-| `image_generation_failed: image engine: ...` | エンジンがアダプターを当てられません。キーと理由（バイアスを足さない重み、rsLoRA、MageTrail の変調など）が続きます（[LoRA](#loraアダプター)） |
+| `lora_rejected: image engine: ...`（400） | エンジンがアダプターを当てられません。キーと理由（バイアスを足さない重み、rsLoRA、MageTrail の変調、同じ行に重なった DoRA・OFT・GLoRA・set_weight など）が続きます（[LoRA](#loraアダプター)） |
 | `strata.lora_unknown` | プロンプトのタグの名前が一覧になく、タグを外して画像を作りました |
 
 ## ライセンス

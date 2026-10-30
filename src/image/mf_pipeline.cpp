@@ -257,7 +257,7 @@ uint64_t MfPipeline::held() const {
 
 void MfPipeline::use_loras(const QiRequest& r) {
     std::string err;
-    if (!dit().set_loras(r.loras, err)) throw std::runtime_error(err);
+    if (!dit().set_loras(r.loras, err)) throw LoraRejected(err);
 }
 
 void MfPipeline::fit(uint64_t reserve) {

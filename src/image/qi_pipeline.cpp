@@ -186,7 +186,7 @@ void QiPipeline::release(bool all) {
 
 void QiPipeline::use_loras(const QiRequest& r) {
     std::string err;
-    if (!dit_->set_loras(r.loras, err)) throw std::runtime_error(err);
+    if (!dit_->set_loras(r.loras, err)) throw LoraRejected(err);
 }
 
 void QiPipeline::te_layers() {

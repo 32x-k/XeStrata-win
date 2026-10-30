@@ -398,7 +398,7 @@ HunyuanImage 3.0 (`hunyuan-image-3-distil`, w4a8, 1024x1024, 8 steps, one image 
 | `Image generation runs the image model at Q6_K instead of Q8_0 ...` | The RAM is short, so setup lowered the size ([Sizes and memory](#sizes-and-memory)) |
 | `faster with NVIDIA's ... cuDNN for the image engine's attention` (setup) | Without cuDNN, the attention on NVIDIA GPUs runs on XeStrata's own kernel. The command shown installs it, which is faster |
 | `lora: ...` (400) | The name is not listed, the strength is out of range, or more than 4 are named. The message says which |
-| `image_generation_failed: image engine: ...` | The engine cannot apply the adapter: the key and the reason (a weight that adds no bias, rsLoRA, MageTrail's modulation and the like) follow ([LoRA](#lora-adapters)) |
+| `lora_rejected: image engine: ...` (400) | The engine cannot apply the adapter: the key and the reason (a weight that adds no bias, rsLoRA, MageTrail's modulation, a DoRA, OFT, GLoRA or set_weight overlapping another's rows and the like) follow ([LoRA](#lora-adapters)) |
 | `strata.lora_unknown` | A prompt's tag named a file the listing has not, and the image was made without it |
 
 ## Licenses

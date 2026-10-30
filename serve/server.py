@@ -7111,6 +7111,10 @@ def make_handler(svc: Service):
                 figures["gpu_policy"] = policy
                 print(f"[strata] image done in {figures['seconds']:.1f} s ({policy})", flush=True)
                 body = gen.response(images, job, figures, f"{scheme}://{host}")   # cjxl may fail (jxl)
+            except images_api.LoraRejected as e:   # an adapter the request names, which the engine does not take
+                self._json(400, {"error": {"type": "invalid_request_error", "code": "lora_rejected", "param": "lora",
+                                           "message": str(e)}})
+                return
             except images_api.ImageJobFailed as e:
                 self._json(500, {"error": {"type": "server_error", "code": "image_generation_failed",
                                            "message": str(e)}})
@@ -7169,7 +7173,12 @@ def make_handler(svc: Service):
                                                    "created_at": int(time.time()), **common(),
                                                    "partial_image_index": index})
                 if "error" in result:
-                    err = {"type": "server_error", "code": "image_generation_failed", "message": str(result["error"])}
+                    if isinstance(result["error"], images_api.LoraRejected):   # the request's adapter: its own fault
+                        err = {"type": "invalid_request_error", "code": "lora_rejected", "param": "lora",
+                               "message": str(result["error"])}
+                    else:
+                        err = {"type": "server_error", "code": "image_generation_failed",
+                               "message": str(result["error"])}
                     self._note(error=err)
                     send("error", {"error": err})
                     return

@@ -216,6 +216,11 @@ class ImageJobFailed(RuntimeError):
     """The image engine did not make the images (500); the message says why."""
 
 
+class LoraRejected(ImageJobFailed):
+    """The image engine refused an adapter the request names - its file, its forms, its rows against the DiT's (the
+    engine's `ERROR lora:` line): the request's own fault (400); the message says why."""
+
+
 def parse_size(value, max_side: int) -> tuple[int, int]:
     """OpenAI's size, "1024x1024" (or "auto": 1024x1024) -> (width, height); each side from 256 to max_side."""
     if value is None or value == "auto":
@@ -1352,7 +1357,10 @@ class ImageEngine:
             elif got.startswith(want):
                 return _kv(got)
             elif got.startswith("ERROR"):
-                raise ImageJobFailed(got[6:] or "the image engine failed")
+                why = got[6:]
+                if why.startswith("lora: "):
+                    raise LoraRejected(why[6:])
+                raise ImageJobFailed(why or "the image engine failed")
 
     def close(self, shutdown: bool = False) -> None:
         """Leave the daemon (it stays for the next server); `shutdown`: end it and its engine."""
@@ -1779,7 +1787,7 @@ class ImageGen:
                         self.totals["failed"] += 1
                         why = "cancelled (the client left)" if str(e) == "stopped" else str(e)
                         self._say(f"image job failed: {why}")
-                        raise ImageJobFailed(why) from e
+                        raise (LoraRejected if isinstance(e, LoraRejected) else ImageJobFailed)(why) from e
                     images.append(png_rgba(out.read_bytes(), job["width"], job["height"], mw, mh))
                     parts.append(r)
                     self._measured(job, r)

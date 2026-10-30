@@ -192,7 +192,7 @@ bool MossPipeline::open(const std::string& dit, const std::string& vae, const st
 void MossPipeline::use_loras(const QiRequest& r) {
     std::string err;
     const std::string before = dit_->lora_key();
-    if (!dit_->set_loras(r.loras, err)) throw std::runtime_error(err);
+    if (!dit_->set_loras(r.loras, err)) throw LoraRejected(err);
     if (dit_->lora_key() != before) {   // the contexts' text rows were made with the other adapters' weights
         ctx_states_[0].clear();
         ctx_states_[1].clear();

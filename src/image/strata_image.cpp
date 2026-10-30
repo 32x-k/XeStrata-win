@@ -78,10 +78,12 @@
 //                            keep their blocks quantized in RAM for that)                                         -> RELEASE ok
 //   STOP                     (while an IMG runs) ends it after the step it is in               -> ERROR stopped
 //   QUIT                     ends the engine
-// A request that fails answers ERROR <message> and the engine goes on.  Before the first line it makes a small image
-// (its kernels built and the library's first products set up; skipped when the GPU has no room) and lets its buffers
-// go, then says READY budget_mib=<M>.  A model whose sequence has a shape of its own (HunyuanImage 3.0, whose ids
-// carry the image block) warms up with one of its own: the pipeline says so in warm_up_request.
+// A request that fails answers ERROR <message> and the engine goes on; ERROR lora: <message> when the fault is an
+// adapter it names (LoraRejected: its file, its forms, its rows against the DiT's, a model that takes none).  Before
+// the first line it makes a small image (its kernels built and the library's first products set up; skipped when the
+// GPU has no room) and lets its buffers go, then says READY budget_mib=<M>.  A model whose sequence has a shape of its
+// own (HunyuanImage 3.0, whose ids carry the image block) warms up with one of its own: the pipeline says so in
+// warm_up_request.
 
 #include "strata/core/gpu.hpp"
 #include "strata/image/hunyuanimage3_file.hpp"
@@ -168,8 +170,12 @@ struct Loras {
     std::shared_ptr<const si::LoraFile> get(const std::string& path) {
         const auto at = files.find(path);
         if (at != files.end()) return at->second;
-        auto f = si::LoraFile::open(path);
-        std::shared_ptr<const si::LoraFile> shared = std::move(f);
+        std::shared_ptr<const si::LoraFile> shared;
+        try {
+            shared = si::LoraFile::open(path);
+        } catch (const std::exception& e) {   // a file the engine cannot read or does not take: the request's
+            throw si::LoraRejected(e.what());
+        }
         files.emplace(path, shared);
         return shared;
     }
@@ -364,8 +370,8 @@ struct Lines {
 // a request that names adapters the model does not apply: refused, rather than an image made without them
 void no_loras(si::ImagePipeline& p) {
     if (dynamic_cast<si::HunyuanImage3Pipeline*>(&p) != nullptr)
-        throw std::invalid_argument("image engine: HunyuanImage 3.0 takes no adapters");
-    throw std::invalid_argument("image engine: this image model's DiT takes no adapters");
+        throw si::LoraRejected("image engine: HunyuanImage 3.0 takes no adapters");
+    throw si::LoraRejected("image engine: this image model's DiT takes no adapters");
 }
 
 // the pipelines whose DiT's products add the adapters a request names (image_lora.hpp)
@@ -494,7 +500,9 @@ int serve(si::ImagePipeline& p) {
             std::string m = e.what();
             for (char& c : m)
                 if (c == '\n') c = ' ';
-            std::printf("ERROR %s\n", m.c_str());
+            // an adapter the request names and the engine does not take is the request's fault (the server's 400)
+            const bool lora = dynamic_cast<const si::LoraRejected*>(&e) != nullptr;
+            std::printf("ERROR %s%s\n", lora ? "lora: " : "", m.c_str());
         }
         std::fflush(stdout);
     }

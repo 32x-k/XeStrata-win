@@ -56,6 +56,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -156,6 +157,12 @@ struct LoraEntry {
     std::vector<float> rescale;       // an OFT's rescale: the turned rows' factors, FP32; empty: none
     std::map<std::string, std::vector<float>> extra;   // the other forms' tensors, FP32, by role
     std::map<std::string, std::vector<int64_t>> shapes;   // their shapes, the file's order
+};
+
+/// An adapter a request names that the engine does not take - its file, its forms, its rows against the DiT's, a model
+/// that takes none: the request's own fault, which strata_image says as `ERROR lora: ...` and the server answers 400.
+struct LoraRejected : std::runtime_error {
+    using std::runtime_error::runtime_error;
 };
 
 /// An adapter file, read: its entries, its metadata.
@@ -289,6 +296,7 @@ struct LoraPart {
     bool dora = false;   // a DoRA's: its base factors are c's, which the weight's other patches do not know
     bool oft = false;    // an OFT's: it turns the product's output over the part's whole rows
     bool glora = false;  // a GLoRA's: the weight's own product of its input, over the part's rows
+    bool replaces = false;   // a set_weight's: the weight it sets, which a patch before or after it would not keep
     /// DoRA: the base product's factor of each of the part's rows, 1 + strength (c - 1); a set_weight's: 1 - the
     /// strength.  Empty: the rows as the weight has them.  A row of the weight takes one part's factors.
     std::vector<float> base;
@@ -296,7 +304,6 @@ struct LoraPart {
 
 /// The weight's own product of a GLoRA's input, added to the product's output: `output(v16, t0, rows, row0, n)` puts
 /// the weight's rows [row0, row0 + n) product of v16's [rows][cols] (the tokens t0 .. t0 + rows) into the product's
-    bool replaces = false;   // a set_weight's: the weight it sets, which a patch before or after it would not keep
 /// output at those rows: the DiT writes it, its weight's own path (an FP16 or a quantized weight's) and its own table
 /// of the rows.
 using LoraGloraOutput = std::function<void(const uint16_t* v16, int64_t t0, int64_t rows, int64_t row0, int64_t n)>;
