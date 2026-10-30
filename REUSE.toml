@@ -49,6 +49,11 @@ SPDX-License-Identifier = "LGPL-3.0-or-later"
 
 # free third-party material: under its own license
 [[annotations]]
+path = ["third_party/main/project-maya/**"]
+SPDX-FileCopyrightText = ["2026 Peasant Smith and the Project Maya contributors", "2026 Niko1221 and the Strata contributors"]
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
 path = ["third_party/main/ggml/**"]
 SPDX-FileCopyrightText = "2023-2026 The ggml authors"
 SPDX-License-Identifier = "MIT"
