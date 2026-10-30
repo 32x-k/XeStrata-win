@@ -32,6 +32,33 @@ Qwen3.8 の prompt は、xmx_gemm が動く GPU では FP16 の経路のまま�
 `STRATA_NO_XMX=1` は XMX を使わない経路を選ばせます。
 CPU 内蔵のグラフィックス（開発機では UHD 770）は、確認用の 2 つ目の実機として使います。
 
+## Strata 0.2.8 の取り込み
+
+upstream の Strata 0.2.7 から 0.2.8（`870aedd9`）までの変更を Xe に移しています。
+この間の upstream の変更の多くは、アプリ・ターミナル・Mac・DGX Spark のものと DeepSeek V4.1-Flash への対応（後の作業に回しました）で、移していません。
+
+移したものは次のとおりです。
+
+- route prior（`STRATA_ROUTE_PRIOR`）を既定で入れない。0.2.7 ではキャッシュに載る枠が 20% 未満の GPU 1 枚で自分で 1.5 にしていましたが、upstream が長いエージェントの作業で同じ文を繰り返し結果も落ちるとして既定を戻したので、XeStrata も opt-in に戻しました（`STRATA_ROUTE_PRIOR=1.5` で入る）。キャッシュの小さい GPU では decode が前の版より遅くなります。context 262144 の通常使用では RTX 4070 で 2〜3 割、RX 9060 XT（キャッシュは 16%）で 1〜2 割です。
+- serve のツール呼び出し: 壊れた引数、余分な思考の閉じタグ、`</function>` の抜けで呼び出しを失わない。呼び出しを丸ごと引く値や同じ引数名が続く値を、値の一部として読む。この直し（`tool_call_recovery`）を既定で入れ、`"tool_call_recovery": false` で切る。
+- 会話のキャッシュ: バッチの空いた枠の退避で、本体の写しと共有の根のチェックポイントを消さない。
+- エンジン: エキスパートの領域に要る RAM を最大 20 秒待ってから読み込む。PLE の表を RAM に固定する方針（`STRATA_PLE_AUTO_RAM=1`）で、その固定が会話のキャッシュの余地を奪うときは固定を返す。AVX-512 のない CPU で止まるときは、原因が CPU でなく `native_experts.txt` のないパックだと言う。
+- 層の分割: Xe2 の GPU ちょうど 2 枚では `--pipeline-windows 2` を既定にする（upstream と同じ。`--pipeline-windows 0` で切れる、[MULTIGPU](MULTIGPU.ja.md)）。
+- setup: 使わない APU に大きな BIOS の割り当てがあるときは、OS が失う RAM と直し方を言う。
+
+upstream v0.2.8 と 3 社の GPU で比べました（IQ3_XXS の generate の 1K と 32K、serve の 32K、通常使用）。
+B70 は upstream の `sycl/` 版より、generate の prefill が 2.1〜2.9 倍、decode が 35〜54% 速いです。serve の prompt は 2.1 倍、decode は 65〜66% 速いです。通常使用では、最初のトークンまで、prompt、出力のどれも速いです。
+RTX 4070 は generate の prefill が 17〜74%、decode が 38〜40% 速いです。serve の prompt は 74〜75%、decode は 12〜25% 速く、通常使用もどれも速いです。
+RX 9060 XT は generate の prefill が 2.1〜2.7 倍速く、decode は 0〜5% 速いです。serve の prompt は 2.5 倍速く、decode は greedy で 18% 速いです。温度 0.7 では 7% 遅いですが、これは XeStrata が書く答えが長いためで、同じ文をなぞる generate の 32K では並びます。通常使用では、最初のトークンまでと prompt は速く、出力は 1〜7% 遅いです。
+
+移していないのは、DeepSeek V4.1-Flash への対応、アプリとターミナル、Mac、DGX Spark、upstream の `sycl/` の項目です。
+次のものも移していません。
+
+- 検証とバッチの窓を最大 16 行にする HIP の既定: 層の分割で 1 組 8 枠を超えるバッチにしか効かず、保留しました。
+- prompt の注意の lane-cell と問いのまとめ: XeStrata の prompt の注意は自前の行列のカーネルです。
+- 自動のエキスパートキャッシュが読み込みの後の確保を見込む変更: XeStrata にはその警告がなく、キャッシュが小さくなるだけです。
+- setup が 2 枚の Xe2 に `--spec 2` を勧める変更。
+
 ## Strata 0.2.7 の取り込み
 
 upstream の Strata 0.2.6 から 0.2.7（`5e8a4cca`）までの変更を Xe に移しています。

@@ -30,6 +30,33 @@ A smaller card is checked by making the B70 look like one.
 `STRATA_NO_XMX=1` takes the paths without the matrix engines.
 The processor's own graphics (a UHD 770 on the development machine) is a second, real configuration for checks.
 
+## Integration through Strata 0.2.8
+
+The changes of upstream Strata 0.2.7 to 0.2.8 (`870aedd9`) are carried into Xe.
+Most of upstream's changes in this range are the app, the Terminal, the Mac, DGX Spark and DeepSeek V4.1-Flash (left for later work), which are not taken.
+
+What is taken:
+
+- Route prior (`STRATA_ROUTE_PRIOR`) is no longer on by default. In 0.2.7 XeStrata set it to 1.5 by itself on one GPU whose expert cache held less than 20% of the expert pairs; upstream took its default back because in long agent sessions it repeats itself and its results are weaker, and XeStrata made it opt-in again (`STRATA_ROUTE_PRIOR=1.5`). On a GPU with a small cache the decode is slower than in the previous version: in everyday use at a context of 262144, 20-30% on the RTX 4070 and 10-20% on the RX 9060 XT (whose cache holds 16% there).
+- Serve's tool calls: damaged arguments, a stray closing think tag and a missing `</function>` no longer cost the call; a value that quotes a whole call, or repeats an argument name, is read as part of the value. This repair (`tool_call_recovery`) is on by default; `"tool_call_recovery": false` turns it off.
+- The conversation cache: parking an idle batch slot no longer drops the main session's copy and the shared prefix's checkpoint.
+- The engine: it waits up to 20 s for the RAM the expert arena needs before it loads; under the PLE table's RAM policy (`STRATA_PLE_AUTO_RAM=1`) the pinned table is given back when it leaves the conversation cache too little RAM; a stop on a CPU without AVX-512 names the cause, a pack without `native_experts.txt`, not the CPU.
+- Layer split: on exactly two Xe2 GPUs `--pipeline-windows 2` is the default (as upstream; `--pipeline-windows 0` turns it off, [MULTIGPU](MULTIGPU.md)).
+- Setup: an unused APU with a large BIOS carve-out is reported with the RAM the OS loses and how to fix it.
+
+Compared with upstream v0.2.8 on the three makers' GPUs (IQ3_XXS: generate at 1K and 32K, serve at 32K, everyday use).
+The B70 reads prompts 2.1 to 2.9 times and decodes 35 to 54% faster than upstream's `sycl/` port through generate; through serve, prompts 2.1 times and decode 65 to 66% faster. In everyday use the time to the first token, the prompt and the output are all faster.
+The RTX 4070 reads prompts 17 to 74% and decodes 38 to 40% faster through generate; through serve, prompts 74 to 75% and decode 12 to 25% faster, and everyday use is faster in every measure.
+The RX 9060 XT reads prompts 2.1 to 2.7 times and decodes 0 to 5% faster through generate; through serve, prompts 2.5 times and the greedy decode 18% faster. At temperature 0.7 the decode is 7% slower, because XeStrata writes a longer answer; through generate at 32K, on the same text, the two are level. In everyday use the time to the first token and the prompt are faster, and the output is 1 to 7% slower.
+
+Not taken: DeepSeek V4.1-Flash, the app and the Terminal, the Mac, DGX Spark and upstream's `sycl/` items.
+These are not taken either:
+
+- HIP's default of verify and batch windows of up to 16 rows: it helps only batches of more than eight slots in one group under a layer split, and it is held.
+- The prompt attention's lane cells and query batch: XeStrata's prompt attention is its own matrix kernel.
+- The automatic expert cache allowing for what the load allocates after it: XeStrata has no warning for it, and it would only make the cache smaller.
+- Setup recommending `--spec 2` for two Xe2 GPUs.
+
 ## Integration through Strata 0.2.7
 
 The changes of upstream Strata 0.2.6 to 0.2.7 (`5e8a4cca`) are carried into Xe.
