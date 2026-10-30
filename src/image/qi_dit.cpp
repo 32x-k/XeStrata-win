@@ -1005,7 +1005,9 @@ bool QiDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                 return false;
             }
             const float scale = u.scale * e.scale();
-            if (scale == 0.0f) continue;   // a strength of 0 changes nothing: the weight keeps its product's path
+            // a strength of 0 changes nothing: the weight keeps its product's path (an alpha of 0 leaves a DoRA's base
+            // factors, as ComfyUI's weight_decompose scales the weight with no delta)
+            if (u.scale == 0.0f || (scale == 0.0f && e.dora.empty())) continue;
             std::vector<float> coef, base;   // a DoRA's: the delta's rows' c, the base product's factors
             if (!e.dora.empty()) {
                 std::vector<float> norms;

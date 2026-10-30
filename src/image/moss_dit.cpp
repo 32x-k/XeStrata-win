@@ -886,8 +886,9 @@ bool MossDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                     }
             }
             const float scale = u.scale * e.scale();
-            // a strength of 0 changes nothing: the weight keeps its product's path (an alpha of 0 leaves the bias's)
-            if (scale == 0.0f && (e.bias.empty() || u.scale == 0.0f)) continue;
+            // a strength of 0 changes nothing: the weight keeps its product's path (an alpha of 0 leaves the bias's
+            // delta and a DoRA's base factors, as ComfyUI's weight_decompose scales the weight with no delta)
+            if (u.scale == 0.0f || (scale == 0.0f && e.bias.empty() && e.dora.empty())) continue;
             // a DoRA's: the entry's rows' delta factors (its B's, by the entry's rows), and each part's base factors
             const bool dora = !e.dora.empty();
             std::vector<float> coef((size_t) e.rows, 1.0f);
