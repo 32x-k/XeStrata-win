@@ -1139,9 +1139,41 @@ bool QiDit::tensor_norms(const std::string& key, const std::vector<float>*& out,
             }
             norms[(size_t) r] = (float) std::sqrt(s);
         }
+    } else if (kernels::dequant_bf16_supported((int) t->type) && gemm_.scratch() != nullptr &&
+               gemm_.scratch_elems() >= 2 * k) {
+        // the other block formats (Q6_K, Q4_K, the i-quants): the GPU's dequantization (the one the products use) to
+        // FP32 in the products' scratch, a band of rows at a time (the scratch holds the largest weight in FP16, so
+        // half its rows in FP32), the rows' sums on the host
+        const uint64_t bytes = tensor_payload_bytes(*t);
+        uint8_t* blocks = nullptr;
+        if (!gpu::alloc_device(&blocks, (size_t) bytes)) {
+            err = "image engine: " + key + ": its blocks on the GPU for a DoRA's row norms: " + gpu::last_error();
+            return false;
+        }
+        const int64_t band = std::min<int64_t>(rows, gemm_.scratch_elems() / (2 * k));
+        auto* f = reinterpret_cast<float*>(gemm_.scratch());
+        std::vector<float> h((size_t) (band * k));
+        bool ok = gpu::copy_async(blocks, p, (size_t) bytes, s_);
+        for (int64_t r0 = 0; ok && r0 < rows; r0 += band) {
+            const int64_t nr = std::min(band, rows - r0);
+            kernels::dequant_f32((int) t->type, blocks, r0, nr, k, f, s_);
+            ok = gpu::copy_async(h.data(), f, (size_t) (nr * k) * 4, s_) && gpu::stream_sync(s_);
+            for (int64_t r = 0; ok && r < nr; ++r) {
+                double s = 0;
+                const float* row = h.data() + r * k;
+                for (int64_t c = 0; c < k; ++c) s += (double) row[c] * (double) row[c];
+                norms[(size_t) (r0 + r)] = (float) std::sqrt(s);
+            }
+        }
+        gpu::stream_sync(s_);
+        gpu::free(blocks);
+        if (!ok) {
+            err = "image engine: " + key + ": a DoRA's row norms on the GPU: " + gpu::last_error();
+            return false;
+        }
     } else {
-        err = "image engine: " + key + ": a " + t->type_name() +
-              " tensor: a DoRA's row norms are read from the file's F32, F16, BF16 and Q8_0 rows";
+        err = "image engine: " + key + ": a " + t->type_name() + " tensor: a DoRA's row norms are read from the "
+              "file's F32, F16, BF16 and Q8_0 rows, and the GPU's dequantization does not take this format";
         return false;
     }
     out = &norm_cache_.emplace(key, std::move(norms)).first->second;
