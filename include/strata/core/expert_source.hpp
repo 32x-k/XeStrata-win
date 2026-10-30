@@ -35,6 +35,7 @@
 #include <cstddef>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -95,6 +96,16 @@ bool host_available_memory(HostMemory& m, const std::string& meminfo = "/proc/me
 /// True when the RAM `available` before the copy, less the copy, still holds `headroom` and `in_place` (the bytes read
 /// from the files through the page cache); `why` gets the numbers either way, for the log.
 bool resident_pin_fits(uint64_t copy, uint64_t in_place, uint64_t headroom, uint64_t available, std::string& why);
+
+/// #4051 (upstream 07d5ecfac): wait for the RAM an arena needs to come back.  An engine that was still exiting (or a
+/// program that was ending) holds memory a few seconds longer than its process; loading into that shortfall sent a 60 GiB
+/// host into reclaim for good.  Calls `sample(available)` (false: the RAM cannot be read; the wait ends) every `step_s`
+/// seconds, through `sleep(step_s)`, until `available >= need` or `max_wait_s` seconds have gone.  `waited` gets the
+/// seconds waited, `available` the last reading.  True when the RAM is there.  `progress(waited, available)` is called
+/// about every `note_s` seconds while waiting.  `max_wait_s <= 0` is no wait at all.
+bool wait_for_ram(uint64_t need, double max_wait_s, double step_s, double note_s,
+                  const std::function<bool(uint64_t&)>& sample, const std::function<void(double)>& sleep,
+                  const std::function<void(double, uint64_t)>& progress, double& waited, uint64_t& available);
 
 /// Build compact offsets for experts absent from both the primary GPU cache and an optional second GPU tier.
 /// Kept CPU-only so selection and byte accounting can be tested without initializing a GPU.
