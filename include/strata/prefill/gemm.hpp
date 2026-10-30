@@ -35,6 +35,13 @@ public:
     /// Y = X . W^T with both in FP16 (bits).
     void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0);
 
+    /// Strided projections, including an output slice: Y = alpha X W^T + beta Y.
+    /// beta == 0 leaves the previous output unread.
+    void f16_strided(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K,
+                     int64_t ldx, int64_t ldw, int64_t ldy, float alpha = 1.0f, float beta = 0.0f);
+    void f32_strided(const float* X, const float* W, float* Y, int64_t T, int64_t N, int64_t K,
+                     int64_t ldx, int64_t ldw, int64_t ldy, float alpha = 1.0f, float beta = 0.0f);
+
     /// The experts' groups (FP16), one product each through oneMath: rows bounds[e] .. bounds[e + 1] (host values) of
     /// X and Y (row stride N) by W + e * w_stride, e < G.  False when oneMath does not take FP16 products on `stream`'s
     /// GPU: the caller runs kernels::xmx_gemm_grouped then.

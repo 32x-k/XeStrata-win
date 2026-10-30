@@ -10,9 +10,10 @@
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/xmx_gemm.hpp"
 #include "strata/core/gpu.hpp"
+#include "strata/core/runtime.hpp"
+#include <stdexcept>
 
 #if STRATA_ONEMATH
-#include "strata/core/runtime.hpp"
 #include "strata/kernels/matrix_report.hpp"
 #include <oneapi/math/blas.hpp>
 #include <filesystem>
@@ -424,6 +425,62 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
         strata::kernels::xmx_gemm(XmxType::f16, X, W, Y, T, N, K, ldy, stream_);
     else
         strata::kernels::gemm_rows(XmxType::f16, X, W, Y, T, N, K, ldy, stream_);
+}
+
+template <class E>
+static void strided_product(const E* X, const E* W, float* Y, int64_t T, int64_t N, int64_t K,
+                            int64_t ldx, int64_t ldw, int64_t ldy, float alpha, float beta, void* stream) {
+    if (T <= 0 || N <= 0) return;
+    if (K < 0 || ldx < K || ldw < K || ldy < N)
+        throw std::invalid_argument("strided GEMM: invalid matrix stride");
+    sycl::queue& q = core::Runtime::get().stream(stream);
+    if (K == 0 || alpha == 0.0f) {
+        if (beta == 1.0f) return;
+        q.parallel_for(sycl::range<2>((size_t) T, (size_t) N), [=](sycl::id<2> id) {
+            const int64_t at = (int64_t) id[0] * ldy + (int64_t) id[1];
+            Y[at] = beta == 0.0f ? 0.0f : beta * Y[at];
+        });
+        return;
+    }
+#if STRATA_ONEMATH
+    if (backend(q.get_device()).blas) {
+        namespace om = oneapi::math;
+        try {
+            om::blas::column_major::gemm(q, om::transpose::trans, om::transpose::nontrans, N, T, K,
+                                         alpha, W, ldw, X, ldx, beta, Y, ldy);
+            return;
+        } catch (const oneapi::math::exception& e) {
+            std::fprintf(stderr, "strata: oneMath: %s; strided projections take the own kernels\n", e.what());
+            std::lock_guard<std::mutex> lock(g_mutex);
+            g_backends[q.get_device()].blas = false;
+        }
+    }
+#endif
+    q.parallel_for(sycl::range<2>((size_t) T, (size_t) N), [=](sycl::id<2> id) {
+        const int64_t t = (int64_t) id[0], n = (int64_t) id[1];
+        float sum = 0.0f;
+        for (int64_t k = 0; k < K; ++k)
+            sum = sycl::fma((float) X[t * ldx + k], (float) W[n * ldw + k], sum);
+        Y[t * ldy + n] = beta == 0.0f ? alpha * sum : sycl::fma(beta, Y[t * ldy + n], alpha * sum);
+    });
+}
+
+void Gemm::f16_strided(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K,
+                       int64_t ldx, int64_t ldw, int64_t ldy, float alpha, float beta) {
+    if (T <= 0 || N <= 0) return;
+    if (K < 0 || ldx < K || ldw < K || ldy < N)
+        throw std::invalid_argument("strided GEMM: invalid matrix stride");
+    if (K > 0 && ldx == K && ldw == K && alpha == 1.0f && beta == 0.0f) {
+        f16(X, W, Y, T, N, K, ldy);
+        return;
+    }
+    strided_product(reinterpret_cast<const sycl::half*>(X), reinterpret_cast<const sycl::half*>(W),
+                    Y, T, N, K, ldx, ldw, ldy, alpha, beta, stream_);
+}
+
+void Gemm::f32_strided(const float* X, const float* W, float* Y, int64_t T, int64_t N, int64_t K,
+                       int64_t ldx, int64_t ldw, int64_t ldy, float alpha, float beta) {
+    strided_product(X, W, Y, T, N, K, ldx, ldw, ldy, alpha, beta, stream_);
 }
 
 bool Gemm::i8_usable(void* stream) {
