@@ -94,9 +94,42 @@ CHATGLM4_PATTERN = (
     r"|\s+"
 )
 
+# The `deepseek-v3` pre-tokenizer (DeepSeek-V3 / V4.1): llama.cpp LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM, as in
+# JoyAI and Hunyuan-dense).  UNLIKE the single-pattern families it is a SEQUENCE: each pattern splits the pieces the
+# one before it left (a span a pattern does not match stays a piece of its own), so digits (runs of 1..3) and CJK
+# runs are cut out before the general word / punctuation / whitespace pattern sees the rest.
+DEEPSEEK3_PATTERNS = (
+    r"\p{N}{1,3}",
+    "[一-龥぀-ゟ゠-ヿ]+",
+    r"[!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+"
+    r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+)
+
+
+def _sequence_findall(patterns, text: str) -> list[str]:
+    """llama.cpp's unicode_regex_split: the pieces of `text` after each pattern in turn splits every piece into its
+    matches and the unmatched spans between them."""
+    pieces = [text]
+    for pat in patterns:
+        nxt = []
+        for piece in pieces:
+            pos = 0
+            for m in pat.finditer(piece):
+                if m.start() > pos:
+                    nxt.append(piece[pos:m.start()])
+                nxt.append(m.group())
+                pos = m.end()
+            if pos < len(piece):
+                nxt.append(piece[pos:])
+        pieces = nxt
+    return pieces
+
+
 # The GGUF's `tokenizer.ggml.pre` -> (pattern, ignore_merges, where the pattern was transcribed from).  A `pre` not
 # listed is refused: tokenizing it with another type's pattern gives plausible tokens the model was not trained on.
 PRE_TYPES = {
+    "deepseek3": (DEEPSEEK3_PATTERNS, False, "llama.cpp LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM"),
+    "deepseek-v3": (DEEPSEEK3_PATTERNS, False, "llama.cpp LLAMA_VOCAB_PRE_TYPE_DEEPSEEK3_LLM"),
     "qwen35": (QWEN35_PATTERN, False, ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)"),
     "qwen2": (QWEN2_PATTERN, False, "llama.cpp de7fa0a3 src/llama-vocab.cpp L389 (LLAMA_VOCAB_PRE_TYPE_QWEN2)"),
     "glm4": (CHATGLM4_PATTERN, True, "llama.cpp de7fa0a3 src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4)"),
@@ -129,7 +162,12 @@ class Tokenizer:
         if pre not in PRE_TYPES:
             raise ValueError("pre-tokenizer %r is not supported (%s)" % (pre, ", ".join(sorted(PRE_TYPES))))
         pattern, self.ignore_merges, _ = PRE_TYPES[pre]
-        self._re = regex.compile(pattern)
+        if isinstance(pattern, tuple):
+            seq = [regex.compile(x) for x in pattern]
+            self._split = lambda text: _sequence_findall(seq, text)
+        else:
+            self._re = regex.compile(pattern)
+            self._split = self._re.findall
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
@@ -284,7 +322,7 @@ class Tokenizer:
         # A piece's ids depend on the piece alone, so repeated pieces (most of a resent conversation) are looked up
         # instead of merged again.  The ids are the ones _bpe gives: this only skips the work.
         cache = self._piece_ids
-        for piece in self._re.findall(text):
+        for piece in self._split(text):
             got = cache.get(piece)
             if got is None:
                 mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
@@ -370,6 +408,10 @@ class Tokenizer:
         if b is None:
             if i < 0 or i >= len(self.tokens):
                 raise IndexError("token id %d is outside the vocabulary (%d)" % (i, len(self.tokens)))
+            if self.token_types and i < len(self.token_types) and self.token_types[i] in (3, 4):
+                # Special tokens carry literal text, including characters outside the byte alphabet.
+                b = cache[i] = self.tokens[i].encode("utf-8")
+                return b
             raw = bytearray()
             for ch in self.tokens[i]:
                 v = UNICODE_TO_BYTE.get(ch)

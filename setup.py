@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Peasant Smith and the Project Maya contributors
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
@@ -91,6 +92,8 @@ SETUP_CMD = ("xestrata-cli" if WIN else "xestrata") if PACKAGED else "./setup.sh
 # on any day.  Every file has a fixed size and SHA-256 too (REPO_PINS); a revision the repository no longer has stops
 # the download (download()), unless a tester sets STRATA_ALLOW_UNPINNED=1.
 HF_REVISIONS = {
+    "unsloth/DeepSeek-V4.1-Flash-1017-GGUF": "f924b94f19c1fea02c06a65c8475b0a45e2b88b1",
+    "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF": "cb02422c900df489cea5833e8a92171224059b3c",
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",        # 2026-09-29
     # 2026-10-07: the commit that adds Swift's IQ3_S (upstream e193161de)
     "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d",
@@ -661,11 +664,145 @@ def plain_parts(d: dict) -> list[dict[str, Any]]:
     return d.get("parts") or [{"path": d["file"], "size": d["size"], "sha256": d["sha256"]}]
 
 
-# Every model file XeStrata downloads has a fixed size and SHA-256: (repository, file name) -> (bytes, sha256)
-# (upstream e193161de).  download() checks the file against it as soon as it is whole (a wrong file is deleted and
-# setup stops), and stops before the download when the server's size is not the pinned one.  The files are fetched
-# from the commits in HF_REVISIONS.
+# DeepSeek model pins and pack recipes from the fixed Strata 870aedd9 snapshot.
+DSV41_REPO = "unsloth/DeepSeek-V4.1-Flash-1017-GGUF"
+DSV41_SHARD = "DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-{i:05d}-of-00009.gguf"
+DSV41_FILES = {
+    "DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00001-of-00009.gguf": (
+        5780589, "cc15d470afcb030558bbc4d8e2ccd840182e2e95de1a95198138efe63a5fd99f"),
+    "DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00002-of-00009.gguf": (
+        50536121984, "9cb2047676bd20e448be2377b480080c97fb38fae117f4846e07de2c65bb8522"),
+    "DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00003-of-00009.gguf": (
+        50536121984, "17d398dd327e7ff1991b382677814db75d970b074661757564b6f2ac3d0c8d95"),
+    "DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00004-of-00009.gguf": (
+        50536122016, "7ea8da1143b9a6bf1424a361eb1b0d6f66c7ce79eac9711162f212cc4f39c319"),
+    "DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00005-of-00009.gguf": (
+        50536122016, "1952da19a841176b46f9681c99ea57c674f8a8861e16d76fb35cec4befe039b2"),
+    "DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00006-of-00009.gguf": (
+        50536122016, "d6711781d8effab79b410af9c40920bffcc0c28976e509bc1227ff0c6669c33a"),
+    "DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00007-of-00009.gguf": (
+        36097230048, "2ebc8d198d03a14865e8a85df637285ceb5dd79b1ffc78424bd3c3e06df57823"),
+    "DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00008-of-00009.gguf": (
+        202758032592, "12df293355efbd104b088a77e13ee22410fb1ec3f7ab3863947f09896e64bec7"),
+    "DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL-00009-of-00009.gguf": (
+        16835109952, "df33722d1dcf5ffe0347ed8406f7acb3b18061f4ded2c13c2b0a184b8d41c9ea"),
+    "dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf": (
+        7976914240, "6ba6ac1b331c540691a209e7fc97dec2a24e295acb1e755c84c7d24a4373927a"),
+    "mmproj-BF16.gguf": (972208288, "9a1ef7c40d0d702c7ed8c5f863f60abae64091387ba3fce0ad19ce9beeda3bf9"),
+}
+DSV41_ISTA_REPO = "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF"
+DSV41_ISTA_ENGRAM = "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf"
+DSV41_ISTA_SHARD = "DeepSeek-V4.1-Flash-1017-GSQ-RCO-{quant}-{i:05d}-of-00004.gguf"
+DSV41_DSPARK = "dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf"
+DSV41_ISTA_FILES = {
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00004.gguf": (
+        39358830464, "6e3f0d5ff53d00428ec32c079db9e8255cb410ccaa435e5342aaa8a47fe1339d"),
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00002-of-00004.gguf": (
+        39176113248, "34d68c99fdae9948f9f0af0dafe308e805ce0a78d2c48641b24cc57242fdc0af"),
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00003-of-00004.gguf": (
+        39997334720, "a08468c83955e0c4d3a9eb3f7b86c45b7bbac55d99c4640039a296a8a4b327ea"),
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00004-of-00004.gguf": (
+        2188841824, "b05f26a92325aa6845cebcb3ec1f93d2e65ebf89bdc3f805695960d2f0681832"),
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00004.gguf": (
+        39535776992, "4c65307992ab586c527ca1f6f64062aa96a33b23c02b7fed103f45f75e854798"),
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00002-of-00004.gguf": (
+        39494617536, "933461a974fcccee741bf2f9798201e72ab4aa3f8a952be56f849896ca6ea30e"),
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00003-of-00004.gguf": (
+        39423838496, "bbf91fa346a85ebaf32dd4fd5c456b534d780d381e54f46ac90783a481373240"),
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00004-of-00004.gguf": (
+        36771591232, "e5b2f8781fab688cd4bc3bc7a69651b5dbb90ed94965657c6bead8bb4774f3cf"),
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf": (
+        39075714624, "d46efb67ccffd8fb5d7f18b423896381b9e06d8491e161c370ddf3b05b07e050"),
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00002-of-00004.gguf": (
+        39388449504, "cec1b2c3da429dc768b8bb9bc4dc4403d81f74d34db660a6a34ee3e555bf2c70"),
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00003-of-00004.gguf": (
+        39246891616, "9d9c2140fcb134a0b9a74dedd0e5167e68077af6d08ce7f856bce112f0a35dd3"),
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00004-of-00004.gguf": (
+        20527837312, "9b790a2297ed3cdede379fc984f4a52bb95f3b23724c797af11d1fa6a69db059"),
+    "DeepSeek-V4.1-Flash-Engram-IQ4_NL.gguf": (
+        110595290816, "eb19f30d368d393784e1fc54fdfaffc427ebb2110bf3762fdf5a8fbb9a2d740a"),
+}
+DSV41_NEW_SHARD1 = {
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ1_M-00001-of-00004.gguf": (
+        39358841536, "a7be0d5a48e4d1c13c5535f9123d9131ab8964e5acf8a0c01d14970e4b7f4df9"),
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XS-00001-of-00004.gguf": (
+        39535788064, "d9b949d55e27242b8afc7c2928749b888372d4c39682f9a131670d1c2555155e"),
+    "DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-00001-of-00004.gguf": (
+        39075725728, "2dfe9711eac1f7814aa59154d11e8f27739f8b96875dc1e667eac9f8c756e1fe"),
+}
+DSV41_LEGACY_FILES = {
+    "model-2.00bpw-00001-of-00004.gguf": (
+        39075713728, "78ab9efc46a26647c3e94b322c99cd7e2af261dd28b38f2712e128562db1ef47"),
+    "model-2.00bpw-00002-of-00004.gguf": (
+        39388449504, "cec1b2c3da429dc768b8bb9bc4dc4403d81f74d34db660a6a34ee3e555bf2c70"),
+    "model-2.00bpw-00003-of-00004.gguf": (
+        39246891616, "9d9c2140fcb134a0b9a74dedd0e5167e68077af6d08ce7f856bce112f0a35dd3"),
+    "model-2.00bpw-00004-of-00004.gguf": (
+        20527837312, "9b790a2297ed3cdede379fc984f4a52bb95f3b23724c797af11d1fa6a69db059"),
+    "model-2.25bpw-00001-of-00004.gguf": (
+        39535776064, "ddd13aca16faa23b08f5196b5e0daddf90f04688a271f5889eb22fa7d7d65526"),
+    "model-2.25bpw-00002-of-00004.gguf": (
+        39494617536, "933461a974fcccee741bf2f9798201e72ab4aa3f8a952be56f849896ca6ea30e"),
+    "model-2.25bpw-00003-of-00004.gguf": (
+        39423838496, "bbf91fa346a85ebaf32dd4fd5c456b534d780d381e54f46ac90783a481373240"),
+    "model-2.25bpw-00004-of-00004.gguf": (
+        36771591232, "e5b2f8781fab688cd4bc3bc7a69651b5dbb90ed94965657c6bead8bb4774f3cf"),
+    "engram-IQ4_NL.gguf": (110595290720, "1f17d8ae37e9df3bb45f7ef1b4fcd1706d7b759af0413c117bf8e92aed459281"),
+}
+DSV41_LEGACY_NAMES = {
+    **{DSV41_ISTA_SHARD.format(quant="IQ2_XXS", i=i): "model-2.00bpw-%05d-of-00004.gguf" % i for i in range(1, 5)},
+    **{DSV41_ISTA_SHARD.format(quant="IQ2_XS", i=i): "model-2.25bpw-%05d-of-00004.gguf" % i for i in range(1, 5)},
+    DSV41_ISTA_ENGRAM: "engram-IQ4_NL.gguf",
+}
+DSV41_ALL_FILES = {**DSV41_FILES, **DSV41_ISTA_FILES, **DSV41_LEGACY_FILES}
+DSV41_PROFILES = ROOT / "data" / "dsv41"
+DSV41_CONTEXT = 8192
+DSV41_SHARED = {
+    DSV41_ISTA_ENGRAM: hf(DSV41_ISTA_REPO),
+    DSV41_SHARD.format(i=1): hf(DSV41_REPO) + "UD-Q8_K_XL/",
+    DSV41_DSPARK: hf(DSV41_REPO),
+}
+MULTI_FILE_FAMILIES: dict[str, dict[str, Any]] = {
+    "deepseek41": {
+        "title": "DeepSeek-V4.1-Flash", "by": "DeepSeek; GGUFs by IST-DAS and Unsloth", "arch": "deepseek41",
+        "about": "text-only DeepSeek with a separate engine and an Engram table read from the model files",
+        "hf": hf(DSV41_REPO) + "UD-Q8_K_XL/", "tag": "deepseek-v4.1-flash-", "name": "deepseek-v4.1-flash",
+        "license": "DeepSeek's model license: https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF",
+        "sha256": DSV41_ALL_FILES, "vision": False, "experimental": True, "multi_file": True,
+        "max_context": 1048576,
+        "models": {
+            "IST-DAS-2.00bpw": {
+                "about": "IQ2_XXS experts; 138 GB of model files, a shared 111 GB Engram table and 8 GB drafter",
+                "ram_gb": 40, "recipe": "ista", "legacy_subdir": "2.00bpw", "profile": "profile-2.00.bin",
+                "hf": hf(DSV41_ISTA_REPO),
+                "shards": [DSV41_ISTA_SHARD.format(quant="IQ2_XXS", i=i) for i in range(1, 5)],
+                "shared": [DSV41_ISTA_ENGRAM, DSV41_SHARD.format(i=1), DSV41_DSPARK]},
+            "IST-DAS-2.25bpw": {
+                "about": "IQ2_XS experts; 155 GB of model files, the shared Engram table and drafter",
+                "ram_gb": 44, "recipe": "ista", "legacy_subdir": "2.25bpw", "profile": "profile-2.25.bin",
+                "hf": hf(DSV41_ISTA_REPO),
+                "shards": [DSV41_ISTA_SHARD.format(quant="IQ2_XS", i=i) for i in range(1, 5)],
+                "shared": [DSV41_ISTA_ENGRAM, DSV41_SHARD.format(i=1), DSV41_DSPARK]},
+            "IST-DAS-1.75bpw": {
+                "about": "IQ1_M experts; 121 GB of model files, the shared Engram table and drafter",
+                "ram_gb": 34, "recipe": "ista", "profile": "profile-2.00.bin", "hf": hf(DSV41_ISTA_REPO),
+                "shards": [DSV41_ISTA_SHARD.format(quant="IQ1_M", i=i) for i in range(1, 5)],
+                "shared": [DSV41_ISTA_ENGRAM, DSV41_SHARD.format(i=1), DSV41_DSPARK]},
+            "UD-Q8_K_XL": {
+                "about": "MXFP4 experts and BF16 dense tensors; 508 GB of model files including the Engram table",
+                "ram_gb": 306, "recipe": "ud", "subdir": "UD-Q8_K_XL",
+                "shards": [DSV41_SHARD.format(i=i) for i in range(1, 10)], "shared": []},
+        },
+    },
+}
+FAMILIES.update(MULTI_FILE_FAMILIES)
+
+
+# Every model file XeStrata downloads has a fixed size and SHA-256: (repository, file name) -> (bytes, sha256).
+# download() verifies them, and rejects a different size before fetching. Revisions are fixed in HF_REVISIONS.
 REPO_PINS: dict[str, dict[str, tuple[int, str]]] = {
+    DSV41_REPO: DSV41_FILES,
+    DSV41_ISTA_REPO: DSV41_ISTA_FILES,
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF": ISTA_FILES,
     "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF": SWIFT_FILES,
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": CODER_FILES,
@@ -2870,6 +3007,8 @@ SUPPORTED_GGUFS = ("XeStrata runs ISTA-DASLab's GSQ-RCO files (Qwen3.8-Flash-Nex
 
 def gguf_unsupported(name: str) -> str | None:
     """#444: the quantization a GGUF's name says, when it is one XeStrata cannot run (not a setup size); else None."""
+    if any(name in md["shards"] for fam in MULTI_FILE_FAMILIES.values() for md in fam["models"].values()):
+        return None
     m = GGUF_QUANT.search(name)
     return m.group(1) if m and m.group(1).upper() not in MODELS and not name.lower().startswith("mmproj") else None
 
@@ -2877,6 +3016,10 @@ def gguf_unsupported(name: str) -> str | None:
 def gguf_choice(name: str) -> tuple | None:
     """#444: (--family, --model) whose published first shard this file is, or None (the Coder's IQ1_M is named like
     the original's sizes: the size tells them apart)."""
+    for f, d in MULTI_FILE_FAMILIES.items():
+        for m, md in d["models"].items():
+            if name in (md["shards"][0], DSV41_LEGACY_NAMES.get(md["shards"][0])):
+                return f, m
     for f, d in FAMILIES.items():
         for m in MODELS:
             if f in MODELS[m].get("families", ("qwen", "swift")) and name == model_file(d, m, 1):
@@ -4393,7 +4536,8 @@ def choices_from_config(cfg_path: Path) -> dict:
     cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
     tag = cfg_path.stem[len("xestrata-"):]
     family = next((f for f, d in FAMILIES.items() if d["tag"] and tag.startswith(d["tag"])), "qwen")
-    model = tag[len(FAMILIES[family]["tag"]):].upper()     # unsloth-ud-iq4_xs: UD-IQ4_XS
+    suffix = tag[len(FAMILIES[family]["tag"]):]
+    model = next((m for m in FAMILIES[family].get("models", MODELS) if m.lower() == suffix.lower()), None)
     a = cfg.get("args", [])
     val = lambda k: a[a.index(k) + 1] if k in a and a.index(k) + 1 < len(a) else None   # noqa: E731
     vis = cfg.get("vision")
@@ -4954,6 +5098,9 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
     --vram-reserve-mib)."""
     cfg = repoint_engine(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
     cfg = upgrade_config(cfg_path, cfg)
+    if cfg.get("arch") == "deepseek41" and (cfg.get("split_pci") or isinstance(gpu, list) and len(gpu) > 1):
+        fail("DeepSeek's SYCL prototype supports one GPU",
+             "choose a single --gpu or run --setup to replace a split config")
     missing = [p for p in [cfg["exe"], *[a for a in cfg["args"] if a.endswith(".gguf")]] if not Path(p).exists()]
     if missing:
         fail(f"{cfg_path.name} refers to missing files: {missing[0]}", "run it again with --setup to repair")
@@ -4961,10 +5108,11 @@ def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_
     reserve = keep.pop("vram_reserve_mib", None)       # #493: an engine argument, kept in the config's args
     if reserve is not None:
         args = cfg["args"]
-        if "--vram-reserve-mib" in args[:-1]:
-            args[args.index("--vram-reserve-mib") + 1] = str(reserve)
+        reserve_flag = "--reserve-mib" if cfg.get("arch") == "deepseek41" else "--vram-reserve-mib"
+        if reserve_flag in args[:-1]:
+            args[args.index(reserve_flag) + 1] = str(reserve)
         else:
-            args += ["--vram-reserve-mib", str(reserve)]
+            args += [reserve_flag, str(reserve)]
         write_config(cfg_path, cfg)
         ok(f"saved for this model: {reserve} MiB of VRAM kept free for other programs (--vram-reserve-mib)")
     if keep and any(cfg.get(k) != v for k, v in keep.items()):   # #179: a --host/--api-key on a start was ignored
@@ -5293,6 +5441,8 @@ def carry_over(old: dict, cfg: dict, gpus_chosen: bool = False) -> list[str]:
     first card: issue #12, --gpu 0 kept a split onto that same card, --gpu 1 a split it did not ask for."""
     kept = []
     for k, v in old.items():
+        if cfg.get("arch") == "deepseek41" and k in {"gpu", "cuda", "split_pci", "layer_split", "vision"}:
+            continue
         if k in SPLIT_KEYS and gpus_chosen:
             continue
         if k not in SETUP_KEYS and k not in cfg:
@@ -5464,6 +5614,275 @@ def prepare_engine(a, gpu: dict, vision: str) -> tuple[Path, Path, str, list]:
         lib_dirs = list(dict.fromkeys(comp["lib_dirs"] + nvidia_libs))
         ok(f"engine: {eng / EXE}")
     return llama, eng, enc, lib_dirs
+
+
+def dsv41_context_limit(pack: Path) -> int | None:
+    """The pack's positional limit, from Strata's dsv41_context.py and Project Maya's model metadata."""
+    try:
+        text = (pack / "ds4.txt").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    match = re.search(r"^max_position_embeddings\s+(\d+)\s*$", text, re.MULTILINE)
+    value = int(match.group(1)) if match else 0
+    return value if value >= 1024 else None
+
+
+def dsv41_context_problem(context: int, limit: int | None = None) -> str:
+    cap = min(limit or 1048576, 1048576)
+    if context < 1024:
+        return "DeepSeek context must be at least 1024 tokens."
+    if context > cap:
+        return f"DeepSeek context {context} exceeds the model's limit of {cap} tokens."
+    return ""
+
+
+def dsv41_exe(eng: Path) -> Path | None:
+    """An explicitly selected local build, or the SYCL executable beside XeStrata's other engines."""
+    own = (os.environ.get("STRATA_DSV41_EXE") or "").strip()
+    exe = Path(own).expanduser() if own else eng / ("strata-dsv41.exe" if WIN else "strata-dsv41")
+    return exe.resolve() if exe.is_file() else None
+
+
+def build_dsv41_engine(llama: Path, comp: dict, data: Path) -> Path:
+    """Build only the DeepSeek SYCL target with XeStrata's normal compiler and license selection."""
+    eng = ROOT / "engine"
+    eng.mkdir(exist_ok=True)
+    name = "strata-dsv41.exe" if WIN else "strata-dsv41"
+    stamp = eng / "BUILD-dsv41.json"
+    try:
+        meta = json.loads(stamp.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        meta = {}
+    fields = ("cxx", "version", "kind", "xmx", "license", "cuda_archs", "onemkl", "hip_archs")
+    used: dict[str, Any] = {k: comp.get(k) for k in fields}
+    extra = engine_cmake_args()
+    used["cmake_args"] = extra
+    src = source_hash(ENGINE_SOURCES)
+    if engine_is_xe(meta) and meta.get("src") == src and meta.get("compiler") == used and (eng / name).is_file():
+        return eng / name
+    check_build_tools(comp)
+    bdir = ROOT / "build" / ("contrib-llvm" if comp["license"] == "contrib" else "free")
+    defs = [f"-DCMAKE_CXX_COMPILER={comp['cxx']}", f"-DCMAKE_C_COMPILER={comp['cc']}",
+            f"-DSTRATA_LICENSE={comp['license']}", f"-DSTRATA_CUDA_ARCHS={'auto' if comp['cuda_archs'] else ''}",
+            f"-DSTRATA_HIP_ARCHS={';'.join(comp.get('hip_archs', []))}",
+            f"-DSTRATA_ONEMKL={'ON' if comp['onemkl'] else 'OFF'}",
+            *([f"-DMKL_ROOT={mkl_root()}"] if comp["onemkl"] else []), "-DSTRATA_ENABLE_XE=ON",
+            "-DSTRATA_NATIVE_EXPERTS=ON", "-DSTRATA_BUILD_TESTS=OFF", "-DSTRATA_PORTABLE=ON",
+            f"-DSTRATA_GGML_DIR={llama}", *(f"-D{x}" for x in extra), "-DSTRATA_BUILD_DSV41=ON"]
+    cmake_build(ROOT, bdir, "strata-dsv41", defs, comp["env"])
+    install_binary(bdir / name, eng / name)
+    record = {"source": "local", "backend": "xe", "version": source_version(),
+              "compiler": used, "src": src, "lib_dirs": comp["lib_dirs"]}
+    stamp.write_text(json.dumps(record, indent=1), encoding="utf-8")
+    return eng / name
+
+
+def prepare_dsv41_engine(a, gpu: dict) -> tuple[Path, list]:
+    """Use XeStrata's package or local SYCL build; no upstream CUDA/HIP engine packages are fetched."""
+    step(3, "Python packages")
+    if not PACKAGED:
+        pip_install(requirement_lines() if REQUIREMENTS.exists() else PY_PACKAGES,
+                    "numpy, jinja2, regex, pyyaml, tqdm, requests, pillow, psutil")
+    step(4, "the DeepSeek SYCL engine")
+    eng = packaged_engine_dir() if PACKAGED else ROOT / "engine"
+    exe = dsv41_exe(eng)
+    if os.environ.get("STRATA_DSV41_EXE"):
+        if exe is None:
+            fail("STRATA_DSV41_EXE does not name an executable file", "point it at your strata-dsv41 SYCL build")
+        return exe, []
+    if PACKAGED:
+        if exe is None:
+            fail("this XeStrata package does not include the DeepSeek engine",
+                 "use a XeStrata build with STRATA_BUILD_DSV41=ON, or set STRATA_DSV41_EXE to that executable")
+        meta = packaged_engine()
+        dirs = list(meta.get("lib_dirs", []))
+        if meta.get("license") == "contrib" and (mkl := mkl_root()):
+            dirs.append(str(Path(mkl) / "lib"))
+        if meta.get("license") == "contrib" and not WIN:
+            dirs += nvidia_lib_dirs(data_folder_path(a.data_dir, load_settings()))
+        return exe, dirs
+    comp = choose_compiler(a, gpu)
+    data = data_folder_path(a.data_dir, load_settings())
+    exe = build_dsv41_engine(get_llama_cpp(), comp, data)
+    dirs = list(comp["lib_dirs"])
+    if comp["license"] == "contrib":
+        dirs += nvidia_lib_dirs(data)
+    return exe, list(dict.fromkeys(dirs))
+
+
+def dsv41_folder(a, fam: dict, tag: str, model: str = "UD-Q8_K_XL") -> Path:
+    """The selected set, in --gguf-dir itself or its named subdirectory; otherwise its download folder."""
+    if not a.gguf_dir:
+        return Path(a.models_dir) / tag
+    folder = Path(a.gguf_dir)
+    md = fam["models"][model]
+    names = [n for s in md["shards"] for n in (s, DSV41_LEGACY_NAMES.get(s)) if n]
+    if any((folder / n).exists() for n in names):
+        return folder
+    return next((folder / sub for sub in (md.get("subdir"), md.get("legacy_subdir"), model)
+                 if sub and (folder / sub).is_dir()), folder)
+
+
+def dsv41_pick(folder: Path, name: str) -> Path:
+    """Keep an already present legacy filename; these files have their own pinned hashes."""
+    old = DSV41_LEGACY_NAMES.get(name)
+    return folder / old if old and not (folder / name).exists() and (folder / old).is_file() else folder / name
+
+
+def dsv41_shared_dir(a, fam: dict) -> Path:
+    return Path(a.models_dir) / (fam["tag"] + "shared")
+
+
+def dsv41_find_shared(a, name: str, folder: Path, shared: Path) -> Path:
+    """Find a complete shared Engram, metadata shard or drafter without copying it."""
+    names = [n for n in (name, DSV41_LEGACY_NAMES.get(name)) if n]
+    roots = [shared, folder]
+    if a.gguf_dir:
+        base = Path(a.gguf_dir)
+        roots += [base, base.parent, base.parent.parent]
+    for root in dict.fromkeys(roots):
+        try:
+            children = [root] + ([d for d in root.iterdir() if d.is_dir()] if a.gguf_dir and root != shared else [])
+        except OSError:
+            continue
+        for child in children:
+            for n in names:
+                f = child / n
+                try:
+                    if f.is_file() and f.stat().st_size == DSV41_ALL_FILES[n][0]:
+                        return f
+                except OSError:
+                    pass
+    return shared / name
+
+
+def dsv41_pack_cmd(folder: Path, shards: list, engram: Path, meta: Path, dspark: Path, pack: Path) -> list:
+    """The official IST-DAS recipe: explicit shards plus Engram metadata and DSpark's model constants."""
+    return [sys.executable, str(ROOT / "tools" / "dsv41" / "pack_gguf.py"), "--model", str(folder),
+            "--shards", *[Path(n).name for n in shards], "--engram", str(engram), "--engram-meta", str(meta),
+            "--dspark-gguf", str(dspark), "--dspark-noise-token", "128799", "--dspark-markov-rank", "256",
+            "--out", str(pack)]
+
+
+def dsv41_pack_info(exe: Path, pack: Path, lib_dirs: list) -> tuple[bool, str]:
+    """Inspect the pack's file references through the engine's host-only --pack-info mode."""
+    env = dict(os.environ)
+    key = "PATH" if WIN else "LD_LIBRARY_PATH"
+    if lib_dirs:
+        env[key] = os.pathsep.join([*map(str, lib_dirs), env.get(key, "")])
+    try:
+        result = subprocess.run([str(exe), "--pack-info", "--pack", str(pack)], capture_output=True, text=True,
+                                encoding="utf-8", errors="replace", timeout=300, env=env)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, str(exc)
+    text = (result.stdout or "") + (result.stderr or "")
+    return result.returncode == 0 and "MISSING" not in text and "all present" in text, text
+
+
+def dsv41_config(exe: Path, pack: Path, fam: dict, context: int, gpu: dict, lib_dirs: list, port: int) -> dict:
+    """The prototype's single GPU, text-only configuration; scheduling sizes stay with the engine."""
+    args = ["--pack", str(pack), "--max-context", str(context), "--eos", "1",
+            "--vision", "off", "--dspark", "auto", "--tp", "1", "--threads", "off"]
+    cfg = {"exe": str(exe), "args": args,
+           "cwd": str(STATE), "tokenizer": str(pack / "tokenizer"), "model_name": fam["name"],
+           "arch": "deepseek41", "backend": "xe", "env": {}, "log": str(STATE / f"xestrata-{pack.name}.log"),
+           "lib_dirs": lib_dirs, "port": port, "engine_ready_s": 3600}
+    if gpu.get("pci"):
+        cfg["gpu_pci"] = gpu["pci"]
+    return cfg
+
+
+def install_dsv41(a, family: str, gpu: dict, chosen: list, port: int, ram: float, adopted: Path | None) -> int:
+    """Download pinned model files, prepare their map and tokenizer, and configure the local SYCL engine."""
+    if len(chosen) != 1:
+        fail("DeepSeek's SYCL prototype supports one GPU", "choose a single --gpu")
+    fam = MULTI_FILE_FAMILIES[family]
+    names = list(fam["models"])
+    if a.model and a.model not in names:
+        fail(f"{fam['title']} has no {a.model} model file", "choose: " + ", ".join(names))
+    for i, m in enumerate(names, 1):
+        say(f"  {i}) {m}: {fam['models'][m]['about']}")
+    model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], "1", a.yes)) - 1]
+    md = fam["models"][model]
+    ctx = a.context or DSV41_CONTEXT
+    if why := dsv41_context_problem(ctx):
+        fail(why)
+    if a.vision not in (None, "no", "none"):
+        warn("DeepSeek's SYCL prototype reads text only: images are off")
+    if a.parallel and a.parallel > 1:
+        warn("DeepSeek's SYCL prototype serves one request at a time")
+    if ram < md["ram_gb"]:
+        warn("the model may read a large part of its experts from disk; the engine fits its cache to available memory")
+    tag = fam["tag"] + model
+    folder = dsv41_folder(a, fam, tag, model)
+    shards = [dsv41_pick(folder, name) for name in md["shards"]]
+    shared_dir = dsv41_shared_dir(a, fam)
+    shared = [dsv41_find_shared(a, name, folder, shared_dir) for name in md["shared"]]
+    own = {f: bool(a.gguf_dir) or f.parent != shared_dir for f in shared}
+    left = 0
+    for f in [*shards, *shared]:
+        if f.is_file():
+            continue
+        part = f.with_name(f.name + ".part")
+        left += max(0, fam["sha256"][f.name][0] - (part.stat().st_size if part.is_file() else 0))
+    if left and free_gb(folder) * 1e9 < left:
+        fail(f"not enough free disk space for {left / 1e9:.1f} GB of model files", "use --models-dir on a larger drive")
+    exe, lib_dirs = prepare_dsv41_engine(a, gpu)
+
+    step(5, f"downloading {fam['title']} {model}")
+    for f in shards:
+        if not f.is_file():
+            if a.gguf_dir:
+                fail(f"{f} is missing", "supply every shard in --gguf-dir")
+            download((md.get("hf") or fam["hf"]) + f.name, f)
+        pin = fam["sha256"][f.name]
+        newer = DSV41_NEW_SHARD1.get(f.name)
+        if newer and a.gguf_dir and f.stat().st_size == newer[0]:
+            pin = newer
+        verify_sha256(f, pin[0], pin[1], own=bool(a.gguf_dir) or f.name in DSV41_LEGACY_FILES)
+    for f in shared:
+        if not f.is_file():
+            download(DSV41_SHARED[f.name] + f.name, f)
+        pin = fam["sha256"][f.name]
+        verify_sha256(f, pin[0], pin[1], own=own[f])
+
+    step(6, "preparing the DeepSeek pack")
+    data = data_folder_path(a.data_dir, load_settings())
+    pack = data / "packs" / tag.lower()
+    ready = (pack / "tokenizer" / "vocab.json").is_file() and (pack / "tensors.txt").is_file()
+    if ready:
+        ready, _ = dsv41_pack_info(exe, pack, lib_dirs)
+    if not ready:
+        if md["recipe"] == "ista":
+            run(dsv41_pack_cmd(folder, [f.name for f in shards], shared[0], shared[1], shared[2], pack))
+        else:
+            run([sys.executable, str(ROOT / "tools" / "dsv41" / "pack_gguf.py"), "--model", str(folder),
+                 "--shards", *[f.name for f in shards], "--out", str(pack)])
+    if md.get("profile") and not (pack / "expert-profile.bin").exists():
+        profile = DSV41_PROFILES / md["profile"]
+        if profile.is_file():
+            shutil.copyfile(profile, pack / "expert-profile.bin")
+    good, why = dsv41_pack_info(exe, pack, lib_dirs)
+    if not good:
+        fail("the DeepSeek pack is incomplete: " + why[-600:], "check the model files and run setup again")
+    if why := dsv41_context_problem(ctx, dsv41_context_limit(pack)):
+        fail(why)
+
+    step(7, "writing the model's settings")
+    cfg = dsv41_config(exe, pack, fam, ctx, gpu, lib_dirs, port)
+    for name in ("host", "api_key"):
+        if getattr(a, name, None):
+            cfg[name] = getattr(a, name)
+    if a.browser is not None:
+        cfg["open_browser"] = a.browser
+    CONF.mkdir(parents=True, exist_ok=True)
+    STATE.mkdir(parents=True, exist_ok=True)
+    cfg_path = CONF / f"xestrata-{tag.lower()}.json"
+    write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None, True)
+    if not PACKAGED:
+        write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
+    ok(f"DeepSeek configuration: {cfg_path}")
+    return 0 if a.no_start else start(cfg_path, port)
 
 
 def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, found: list, gpu_chosen: bool,
@@ -5662,7 +6081,14 @@ def describe() -> dict:
     families = []
     for f, fam in FAMILIES.items():
         models = []
-        if fam.get("plain"):
+        if fam.get("multi_file"):
+            for m, d in fam["models"].items():
+                gb = sum(fam["sha256"][name][0] for name in [*d["shards"], *d["shared"]]) / 1e9
+                models.append({"id": m, "about": d["about"], "download_gb": round(gb, 1), "ram_gb": d["ram_gb"],
+                               "fits": "unknown", "tested": False, "experimental": True,
+                               "recommended": m == next(iter(fam["models"])), "context": DSV41_CONTEXT})
+            max_ctx = fam["max_context"]
+        elif fam.get("plain"):
             names = list(fam["models"])
             rec = next((m for m in names if fam["models"][m].get("tested")), names[0])
             for m in names:
@@ -5705,18 +6131,17 @@ def describe() -> dict:
 
 
 def main() -> int:
-    # Windows: the 7z's prebuilt engine only (PACKAGED); this folder compiles one on Linux only
-    if sys.platform != "linux" and not (WIN and PACKAGED):
-        fail("XeStrata runs on Linux, and on Windows from its 7z" if WIN else "XeStrata runs on Linux and Windows")
     if wsl_version() == 1:
         fail("Strata does not run on WSL 1 (it has no GPU access)", "use WSL 2, or a native Linux installation")
     if wsl_version() == 2:
         warn("WSL 2 has not been tested: XeStrata may work there, or not. If you get it working (or fix what stops "
              "it), a pull request is welcome")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--family", choices=list(FAMILIES), help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5")
+    ap.add_argument("--family", choices=list(FAMILIES),
+                    help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5, deepseek41 = DeepSeek-V4.1-Flash (text only)")
     plain_models = [m for f in PLAIN_FAMILIES.values() for m in f["models"]]
-    ap.add_argument("--model", choices=list(dict.fromkeys([*MODELS, *plain_models])))
+    multi_models = [m for f in MULTI_FILE_FAMILIES.values() for m in f["models"]]
+    ap.add_argument("--model", choices=list(dict.fromkeys([*MODELS, *plain_models, *multi_models])))
     ap.add_argument("--context", type=int)
     ap.add_argument("--rope-scaling", choices=["none", "linear", "yarn"],
                     help="the RoPE extension for a context past the model's trained 262144: linear (position "
@@ -5903,6 +6328,10 @@ def main() -> int:
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--image-text-encoder", help=argparse.SUPPRESS)   # removed: --images names the encoder
     a = ap.parse_args()
+    # A Windows source checkout can use an explicitly supplied DeepSeek SYCL prototype executable.
+    local_dsv41 = WIN and a.family == "deepseek41" and bool(os.environ.get("STRATA_DSV41_EXE"))
+    if sys.platform != "linux" and not (WIN and PACKAGED) and not local_dsv41:
+        fail("XeStrata runs on Linux, and on Windows from its 7z" if WIN else "XeStrata runs on Linux and Windows")
     if a.license == "contrib-icpx":
         fail("--license contrib-icpx: the contrib-icpx mode (Intel oneAPI's icpx) was removed",
              "use --license contrib (contrib-llvm: intel/llvm, for Intel, AMD and NVIDIA GPUs), or --license free")
@@ -6204,6 +6633,8 @@ def main() -> int:
     ok(f"model: {fam['title']}")
     if fam.get("license"):
         say(f"  Its license: {fam['license']}")
+    if fam.get("multi_file"):
+        return install_dsv41(a, family, gpu, chosen, port, ram, adopted)
     if fam.get("plain"):
         return setup_plain(a, family, fam, gpu, chosen, sel, found, gpu_chosen, ram, roots, elsewhere, port, adopted)
     say()
@@ -6212,7 +6643,7 @@ def main() -> int:
                    key=lambda m: bool(MODELS[m].get("experimental")))
     if a.model and a.model not in names:
         # upstream #444: say which family has that size, and (with --gguf-dir) which files XeStrata can run at all
-        elsewhere_fams = [f for f in FAMILIES if f in MODELS[a.model].get("families", ("qwen", "swift"))]
+        elsewhere_fams = [f for f in FAMILIES if f in MODELS.get(a.model, {}).get("families", ())]
         fail(f"{fam['title']} has no {a.model} model file", "choose one of: " + ", ".join(names)
              + (f" (or {a.model}: " + ", ".join(f"--family {f} --model {a.model}" for f in elsewhere_fams) + ")"
                 if elsewhere_fams else "")

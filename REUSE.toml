@@ -128,3 +128,9 @@ SPDX-License-Identifier = "OFL-1.1"
 path = ["third_party/nonfree/qwen3.8-flash-next/**", "third_party/nonfree/experimental-speed-projection/**"]
 SPDX-FileCopyrightText = "2026 Qwen"
 SPDX-License-Identifier = "LicenseRef-Qwen-Community-License-1.0"
+
+# DeepSeek-V4.1 pack data and prompt fixtures imported from the fixed source snapshot.
+[[annotations]]
+path = ["data/dsv41/**", "tools/dsv41/*.json", "serve/fixtures/deepseek41/**"]
+SPDX-FileCopyrightText = ["2026 Peasant Smith and the Project Maya contributors", "2026 Niko1221 and the Strata contributors", "2026 MistVVK and the XeStrata contributors"]
+SPDX-License-Identifier = "LGPL-3.0-or-later AND MIT"

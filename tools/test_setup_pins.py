@@ -54,6 +54,13 @@ def quiet(fn, *args, **kw):
 class HuggingFacePins(unittest.TestCase):
     def test_every_model_url_is_pinned(self):
         for name, fam in setup.FAMILIES.items():
+            if fam.get("multi_file"):
+                for version, m in fam["models"].items():
+                    with self.subTest(family=name, version=version):
+                        self.assertRegex(m.get("hf") or fam["hf"], SHA)
+                        for shared in m["shared"]:
+                            self.assertRegex(setup.DSV41_SHARED[shared], SHA)
+                continue
             if fam.get("plain"):   # Ornith-1.5, llm-jp-4.1: each version names its repository, pinned in HF_REVISIONS
                 for version, m in fam["models"].items():
                     with self.subTest(family=name, version=version):
