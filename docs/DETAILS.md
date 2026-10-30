@@ -923,6 +923,9 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   A name with `__` in it (`mcp__playwright__browser_navigate`) is also that call when the model writes every `__` as `_` (`mcp_playwright_browser_navigate`), unless two declared tools collapse to the same spelling.
   Names are never guessed: `bash` is not `shell`, and a reordered name (`server1_label_values` for `label_values_mcp_server1`) is not the declared one.
   A call whose envelope drifted by a token, `<=NAME>`, `<function:NAME>` or `<NAME>` instead of `<function=NAME>`, is read as the call when NAME is a declared tool.
+  So are the forms next to the template's (a call that opens with `<parameter=NAME>`, JSON inside `<tool_call>`, a `<function=NAME>` block without `<tool_call>`, a second call inside one `<tool_call>`) when the call is a declared tool's (the default since upstream 0.2.8).
+  On 1,462 agent turns 98.3% read as intended with it and 92.9% without.
+  `"tool_call_recovery": false` in `xestrata-<model>.json` turns it off.
   A `<tool_call>` block that still does not read as a call is counted in the server window.
 - **A call that came back as text because its name was not declared.** The text stays exactly as the model wrote it and `finish_reason` stays `stop` (`end_turn` on `/v1/messages`).
   Next to it the reply carries a list, only when there is something in it: `"strata_rejected_tool_calls": [{"name": "bash", "reason": "undeclared"}]` (at the top level of a Chat Completions reply, in its last streamed chunk, and in the `message_delta` event and the message of `/v1/messages`; up to five names).

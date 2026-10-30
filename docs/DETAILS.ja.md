@@ -886,6 +886,9 @@ print(r.choices[0].message.content)
   `__` を含む名前（`mcp__playwright__browser_navigate`）は、モデルが `__` を全部 `_` と書いたとき（`mcp_playwright_browser_navigate`）も、宣言した 2 つのツールが同じ綴りにつぶれない限り、その呼び出しになります。
   名前は推し量りません: `bash` は `shell` ではなく、順の入れ替わった名前（`label_values_mcp_server1` に対する `server1_label_values`）は宣言した名前になりません。
   囲みが 1 トークンずれた呼び出し（`<function=NAME>` でなく `<=NAME>`、`<function:NAME>`、`<NAME>`）は、NAME が宣言したツールなら呼び出しとして読みます。
+  テンプレートの形の隣の形（`<parameter=NAME>` で始まる呼び出し、`<tool_call>` の中の JSON、`<tool_call>` のない `<function=NAME>` の塊、1 つの `<tool_call>` の中の 2 つ目の呼び出し）も、宣言したツールの呼び出しなら読みます（upstream 0.2.8 から既定）。
+  エージェントの 1,462 ターンでは、意図どおりに読めたのがこれで 98.3%、なしで 92.9% でした。
+  `xestrata-<model>.json` に `"tool_call_recovery": false` を書くと、これを切ります。
   それでも呼び出しとして読めない `<tool_call>` の塊は、server のウィンドウで数を出します。
 - **宣言していない名前のために文として返した呼び出し**: 文はモデルが書いたままで、`finish_reason` は `stop`（`/v1/messages` では `end_turn`）のままです。
   その横に、中身があるときだけ、一覧 `"strata_rejected_tool_calls": [{"name": "bash", "reason": "undeclared"}]` を付けます（Chat Completions の返事の一番上と、ストリームの最後の塊、`/v1/messages` の `message_delta` のイベントとメッセージ。名前は 5 つまで）。
