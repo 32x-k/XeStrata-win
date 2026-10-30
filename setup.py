@@ -1251,6 +1251,19 @@ def amd_uma(carve_gb: float, gtt_gb: float, ram: float) -> dict:
     return {"carve_gb": max(0.0, carve_gb), "shared_gb": shared, "uma_gb": max(0.0, carve_gb) + shared}
 
 
+def unused_apu_notes(found, used, ram) -> list:
+    """upstream 30a67051d: an APU (a Strix Halo beside a card) that is NOT in the run: its BIOS carve-out is memory the OS
+    does not have, and it is the RAM the experts live in.  Nothing is changed: a "!" line says what is lost and what to set."""
+    out = []
+    for g in found:
+        if "uma_gb" in g and g["index"] not in used and g.get("carve_gb", 0.0) > 16:
+            out.append(f"!the BIOS gives {g['carve_gb']:.0f} GB of your memory to {g['name']}, which this run does not use: "
+                       f"the OS has {ram:.0f} GB left for the experts and the desktop, and the engine can run out of RAM. A "
+                       "small carve-out (512 MB - 2 GB, 'UMA Frame Buffer Size' in the BIOS) gives it back; the GPU reaches "
+                       "the shared memory anyway")
+    return out
+
+
 def strix_halo_notes(gpu, ram) -> list:
     """What setup tells a Strix Halo owner (a leading "!" = a warning): nothing is changed or refused."""
     notes = [f"  Strix Halo (gfx1151, Ryzen AI Max): the CPU and the GPU share one memory ({ram:.0f} GB seen by the "
@@ -6735,6 +6748,8 @@ def main() -> int:
     if gpu.get("gfx") == STRIX_HALO_GFX and "uma_gb" in gpu:
         for line in strix_halo_notes(gpu, ram_gb()):
             (warn if line.startswith("!") else say)(line.lstrip("!"))
+    for line in unused_apu_notes(found, set(sel), ram_gb()):
+        (warn if line.startswith("!") else say)(line.lstrip("!"))
     for i in sel[1:]:                                  # --gpus: the later layers' cards
         x = gpu_info(i)
         ok(f"then GPU {i}: {x['name']}, {x['vram_gb']:.0f} GB VRAM, PCI {x['pci']} (layer split, "
