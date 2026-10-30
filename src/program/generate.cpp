@@ -5544,27 +5544,10 @@ int main(int argc, char** argv) {
     if (o.expert_cache > 0) {
         std::fprintf(stderr, "strata generate: expert cache %lld slots, %.2f GiB of VRAM; policy is\n",
                      (long long) xcache.slots(), xcache.gib());
-        // Residency-biased routing (STRATA_ROUTE_PRIOR, upstream c30656aaf / 0afaaa399: the top-10 picked again with a
-        // bonus for the experts in this cache; it changes which experts run) on by itself at upstream's 1.5 when the
-        // cache holds less than 20% of the model's expert pairs, on one GPU; an explicit STRATA_ROUTE_PRIOR wins (0:
-        // off).  Measured 2026-10-28 on the serve path, where each run writes its own text (IQ3_XXS, decode against
-        // off, 1K and 32K, greedy and temperature 0.7): the B70 limited to 11% of the pairs +15..+80%, the RTX 4070 at
-        // 15% +6..+77%, the RX 9060 XT at 25% -2..-18% (one cell +5%), the B70 limited to 31% +0..+25%.  A text the runs
-        // share (spec-follow) read +30..+50% at 15..31% and on the RX 9060 XT too: the drafts it takes are not the
-        // drafts each engine makes.  upstream checked the quality of 1.5 on a 12 GB card with an 80-task check (no copy
-        // or code errors); the user chose this automatic switch over the card-size rule.
-        if (std::getenv("STRATA_ROUTE_PRIOR") == nullptr && o.layer_split.empty() && g.n_layers > 0 && g.n_expert > 0 &&
-            (double) xcache.slots() < 0.20 * (double) (g.n_layers * g.n_expert)) {
-#if defined(_WIN32)
-            _putenv_s("STRATA_ROUTE_PRIOR", "1.5");
-#else
-            setenv("STRATA_ROUTE_PRIOR", "1.5", 0);
-#endif
-            std::fprintf(stderr, "strata generate: the expert cache holds %.0f%% of the expert pairs: residency-biased "
-                                 "routing on (STRATA_ROUTE_PRIOR=1.5; it changes which experts run, "
-                                 "STRATA_ROUTE_PRIOR=0 turns it off)\n",
-                         100.0 * (double) xcache.slots() / (double) (g.n_layers * g.n_expert));
-        }
+        // Residency-biased routing (STRATA_ROUTE_PRIOR) is not turned on here: XeStrata set 1.5 by itself on one GPU whose
+        // cache held less than 20% of the expert pairs (serve decode +6..+80% there), and upstream took its own default back
+        // (20a63cf0f, #4402: repetition loops and weaker results in long agent sessions, 4.5 of 10 agent tasks on against 5.6
+        // off).  It stays opt-in: STRATA_ROUTE_PRIOR=1.5.
         mem_mark("opening the expert cache");
         xcache.set_per_layer_admission(o.expert_cache_per_layer);
         // Round 328 warned here that the GPU hit path was wrong (tokens diverged from a cache-off run from

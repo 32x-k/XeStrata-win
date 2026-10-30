@@ -101,9 +101,9 @@ Measured (IQ3_XXS):
 ranks 6-9 of the top 10 for resident ones whose logit is within the margin (`STRATA_ROUTE_RESIDENT_RANKS=lo-hi`).
 `STRATA_ROUTE_PRIOR=<lambda>` (upstream 2de9ae06) picks the top 10 again with lambda added to the resident
 experts' logits (the weights stay the router's).
-On one GPU whose expert cache holds less than 20% of the model's experts it is set to 1.5 by itself (the start log says
-so): there the serve path decodes 20-80% faster, and on a GPU that holds more of them it is no faster or slower.
-`STRATA_ROUTE_PRIOR=0` turns it off, and any other value is used as given. Both change the answers.
+It is off by default. On a GPU whose expert cache is small `STRATA_ROUTE_PRIOR=1.5` makes the serve path decode 20-80%
+faster, but in long agent sessions it repeats itself and its results are weaker (upstream #4402); on a GPU that holds
+more of the experts it is no faster or slower. Both change the answers.
 
 ### Small cards and GPUs without XMX
 
