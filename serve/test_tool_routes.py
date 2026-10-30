@@ -39,6 +39,9 @@ class Routes(unittest.TestCase):
         """{route: (finish, [(name, arguments)], answer text)} for the model's `script`, on every route."""
         tok = ByteTokenizer()
         svc = Service(MockEngine(tok, script, max_context=16384), tok, TEMPLATE)
+        # the scripts think first on every route: XeStrata's Anthropic route thinks unasked only with
+        # "anthropic_thinking": "model" (upstream's default)
+        svc.anthropic_think_unasked = True
         for k, v in service.items():
             setattr(svc, k, v)
         httpd = serve(svc, port=0)

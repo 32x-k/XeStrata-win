@@ -30,9 +30,10 @@ def tool(name, **props):
     return {"name": name, "parameters": {"type": "object", "properties": props}}
 
 
-S, I, A, O = {"type": "string"}, {"type": "integer"}, {"type": "array"}, {"type": "object"}
-TOOLS = [tool("todo_write", todos=A), tool("run_command", command=S, timeout=I), tool("write_file", path=S, content=S),
-         tool("read", path=S), tool("bash", command=S), tool("edit", path=S, edits=A, options=O)]
+S, INT, A, OBJ = {"type": "string"}, {"type": "integer"}, {"type": "array"}, {"type": "object"}
+TOOLS = [tool("todo_write", todos=A), tool("run_command", command=S, timeout=INT),
+         tool("write_file", path=S, content=S), tool("read", path=S), tool("bash", command=S),
+         tool("edit", path=S, edits=A, options=OBJ)]
 
 
 def qwen(name, **params):

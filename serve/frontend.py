@@ -1324,7 +1324,7 @@ class _Lenient:
     def string(self) -> str:
         s, q = self.s, self.s[self.i]
         self.i += 1
-        out = []
+        out: list[str] = []
         while self.i < len(s):
             c = s[self.i]
             if c == q:

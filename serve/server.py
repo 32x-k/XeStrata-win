@@ -5160,18 +5160,19 @@ class Service:
             self.totals["tool_calls_from_reasoning"] = self.totals.get("tool_calls_from_reasoning", 0) + parser.rescued
             print(f"[strata] tool calls inside the thinking: {parser.rescued} read as calls, {parser.refused} kept as "
                   f"reasoning (quoted, or the turn did not end on a stop)", flush=True)
-        if getattr(parser, "stray_think", 0):
+        stray = getattr(parser, "stray_think", 0)
+        if stray:
             # #4077: the model wrote a closing think tag while thinking; the reasoning after it was sent as the answer
             with self.status_lock:
-                self.totals["stray_think_closers"] = self.totals.get("stray_think_closers", 0) + parser.stray_think
-            print(f"[strata] {parser.stray_think} extra closing think tag(s) in the answer were dropped (the model "
+                self.totals["stray_think_closers"] = self.totals.get("stray_think_closers", 0) + stray
+            print(f"[strata] {stray} extra closing think tag(s) in the answer were dropped (the model "
                   "wrote one while thinking, so the rest of its reasoning went out as the answer; a call after it "
                   "still counts)", flush=True)
-        if getattr(parser, "notes", None):
+        notes = list(getattr(parser, "notes", None) or [])
+        if notes:
             with self.status_lock:
-                self.totals["tool_args_repaired"] = self.totals.get("tool_args_repaired", 0) + len(parser.notes)
-            print(f"[strata] {len(parser.notes)} tool call argument(s) repaired: "
-                  f"{'; '.join(sorted(set(parser.notes)))}", flush=True)
+                self.totals["tool_args_repaired"] = self.totals.get("tool_args_repaired", 0) + len(notes)
+            print(f"[strata] {len(notes)} tool call argument(s) repaired: {'; '.join(sorted(set(notes)))}", flush=True)
         unread = getattr(parser, "unread", 0)          # the Harmony reader keeps no such count
         rejected = []
         if unread:

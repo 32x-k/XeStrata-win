@@ -1302,8 +1302,9 @@ class ToolCallTagInProse(unittest.TestCase):
 
 class ToolCallRecovery(unittest.TestCase):
     """On by default in the server (config "tool_call_recovery": false turns it off): the model sometimes writes a
-    call in a form next to the template's.  These shapes are from a corpus of 1,462 agent turns (Qwen3.8 under Claude Code, signalnine/q27): with the switch on, a
-    declared tool's call in one of them is the call; anything else stays content, verbatim."""
+    call in a form next to the template's.  These shapes are from a corpus of 1,462 agent turns (Qwen3.8 under Claude
+    Code, signalnine/q27): with the switch on, a declared tool's call in one of them is the call; anything else stays
+    content, verbatim."""
     SCHEMA = ToolCallTerminators.SCHEMA
     PARAMS = "<parameter=path>\na.md\n</parameter>\n<parameter=content>\nhi\n</parameter>\n</function>"
     CALL = {"path": "a.md", "content": "hi"}
