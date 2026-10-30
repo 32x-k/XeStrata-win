@@ -7286,6 +7286,782 @@ struct Model::Impl {
     // and each block's wkv / kv_norm / rope / FP8, for the positions the trunk kept.  draft() runs the block [y, noise x
     // (block - 1)] at positions pos .. through the blocks (each query attending to the ring and to the whole block),
     // the trunk's head, the markov bias token by token (greedy) and the confidence head.
+    bool seed_drafter(int64_t p0, int n, int row0, std::string& err) {
+        if (g.n_mtp == 0 || n <= 0) return true;
+        if (n > kWin * kPicks) {
+            err = "seeding the drafter with " + std::to_string(n) + " rows";
+            return false;
+        }
+        Dev& d = devs[(size_t) d_dev];
+        rt::set_device(d.id);
+        const int nt = (int) g.d_targets.size(), D = g.dim, HD = g.hd;
+        if (dump_d != nullptr) {   // DS4_DSPARK_DUMP: 'S', the first position, the rows, then the taps
+            for (Dev& e : devs) {
+                rt::set_device(e.id);
+                CK(rt::stream_sync(e.st));
+            }
+            rt::set_device(d.id);
+            const int64_t hdr[4] = {'S', p0, n, (int64_t) nt * D};
+            std::fwrite(hdr, 8, 4, dump_d);
+            std::fwrite(h_taps + (size_t) row0 * nt * D, 4, (size_t) n * nt * D, dump_d);
+            std::fflush(dump_d);
+        }
+        for (int a = 0; a < n; a += kWin) {   // (a chunk's last 128 rows: 16 a GEMV)
+            const int na = std::min(kWin, n - a);
+            CK(rt::copy_async(d.xe, h_taps + (size_t) (row0 + a) * nt * D, (size_t) na * nt * D * 4, d.st));
+            if (!mv(d, {job(d_main_proj, d.xe, d.ed + (size_t) a * D, na, (size_t) nt * D, D)}, err)) return false;
+        }
+        CK(rt::event_record(ev_seed, d.st));
+        Finish fm;
+        fm.w = d_main_norm;
+        fm.eps = g.eps;
+        finish(d.ed, n, D, D, fm, d.st);
+        for (int i = 0; i < g.n_mtp; ++i) {
+            Layer& l = L[(size_t) (g.nl + i)];
+            if (l.dev != d_dev) {
+                err = "the DSpark blocks are split across devices";
+                return false;
+            }
+            for (int a = 0; a < n; a += kWin) {
+                const int na = std::min(kWin, n - a);
+                if (!mv(d, {job(l.wkv, d.ed + (size_t) a * D, d.kvr, na, D, HD)}, err)) return false;
+                Finish fk;
+                fk.w = l.kv_norm;
+                fk.eps = g.eps;
+                fk.rd = g.rd;
+                fk.pos = (int) (p0 + a);
+                fk.freqs = d.freqs_win;
+                fk.quant = 1;
+                fk.dst = d.ext + (size_t) g.win * HD;
+                fk.dst_stride = HD;
+                finish(d.kvr, na, HD, HD, fk, d.st);
+                ext_to_ring(d.ext, l.win, p0 + a, g.win, na, HD, d.st);
+            }
+        }
+        return true;
+    }
+
+    bool draft(int y, std::vector<int>& out, std::vector<float>& conf, std::string& err, float temperature, float top_p,
+               int top_k, float min_p, uint64_t seed, uint64_t counter) {
+        const double t0 = now_ms();
+        drafts_q = temperature > 0.0f && sample_drafts;
+        dq_temp = temperature;
+        dq_top_p = top_p;
+        dq_top_k = top_k;
+        dq_min_p = min_p;
+        dq_seed = seed;
+        dq_counter = counter;
+        const bool ok = draft_(y, out, conf, err);
+        if (!ok) drafts_q = false;
+        if (max_drafts > 0 && (int) out.size() > max_drafts) {
+            out.resize((size_t) max_drafts);
+            conf.resize((size_t) max_drafts);
+        }
+        st.draft_ms += now_ms() - t0;
+        ++st.drafts_rounds;
+        return ok;
+    }
+    bool draft_(int y, std::vector<int>& out, std::vector<float>& conf, std::string& err) {
+        out.clear();
+        conf.clear();
+        const int T = g.d_block, D = g.dim, H = g.hc, V = g.vocab, R = g.d_rank;
+        const int64_t p0 = pos;
+        if (g.n_mtp == 0 || T < 1 || T > kWin || p0 + T > o.max_context) return true;
+        int tk[kWin];
+        tk[0] = y;
+        for (int t = 1; t < T; ++t) tk[t] = g.d_noise;
+        Dev& d = devs[(size_t) d_dev];
+        rt::set_device(d.id);
+        for (int t = 0; t < T; ++t) std::memcpy(h_emb + (size_t) t * D, embed_pinned + (size_t) tk[t] * D, (size_t) D * 2);
+        CK(emb_upload(d.emb_rows, h_emb, (size_t) T * D * 2, d.st));
+        embed(d.emb_rows, T, d.h, D, H, d.st);
+        if (ds4_dbg("DS4_DBG_EMB")) {}
+        if (ds4_dbg("DS4_DBG_EMB")) {}
+        init_pre(d.pre, T, d.st);
+        WinPlan dp;   // (window attention alone: the mailbox seqs)
+        dp.async = !sync_decode && T <= async_max_t;
+        for (int i = 0; i < g.n_mtp && dp.async; ++i) {
+            const int il = g.nl + i;
+            dp.seq[il] = ++seq_issued;
+            layer_of[dp.seq[il] % kRing].store(il, std::memory_order_release);
+        }
+        const size_t hs = (size_t) T * H * D, rs = (size_t) g.win * g.hd;
+        if (dump_d != nullptr && h_dump == nullptr &&
+            (!halloc(h_dump, (size_t) g.n_mtp * kWin * H * D, err) || !halloc(h_dump_ring, (size_t) g.n_mtp * rs, err)))
+            return false;
+        for (int i = 0; i < g.n_mtp; ++i) {
+            Layer& l = L[(size_t) (g.nl + i)];
+            if (dump_d != nullptr) {   // (stream order: the ring the block reads - as BF16 rows - the stream it leaves)
+                ring_to_ext(l.win, d.ext, g.win, g.win, g.hd, d.st);
+                CK(rt::copy_async(h_dump_ring + (size_t) i * rs, d.ext, rs * 2, d.st));
+            }
+            if (!layer(l, 0, p0, T, dp, err)) return false;
+            if (dump_d != nullptr) {
+                rt::set_device(d.id);
+                CK(rt::copy_async(h_dump + (size_t) i * hs, d.h, hs * 4, d.st));
+            }
+        }
+        rt::set_device(d.id);
+        hc_pre_norm(d.h, d.pre, nullptr, D, H, T, g.eps, d.x, d.st);   // (the confidence head reads it before the norm)
+        Dev& hd = devs[(size_t) head_dev];
+        // (through the host to the head's device, and to the head group's other members - the drafter's device can be
+        // the head group's lead itself, a group of every GPU)
+        if (d_dev != head_dev || groups[(size_t) hd.grp].mem.size() > 1) {
+            CK(rt::copy_async(d.bounce, d.x, (size_t) T * D * 4, d.st));
+            CK(rt::event_record(d.ev_out, d.st));
+        }
+        if (d_dev != head_dev) {
+            rt::set_device(hd.id);
+            CK(rt::stream_wait_event(hd.st, d.ev_out));
+            CK(rt::copy_async(hd.x, d.bounce, (size_t) T * D * 4, hd.st));
+        }
+        // the drafter's final norm and the trunk's head, on every member of the head group (the others' shares first)
+        const std::vector<int>& hg = groups[(size_t) hd.grp].mem;
+        const bool mk = mk_split && !drafts_q;   // (sampled drafts: the lead's whole rows, gathered)
+        for (int m = (int) hg.size() - 1; m >= 0; --m) {
+            Dev& e = devs[(size_t) hg[(size_t) m]];
+            rt::set_device(e.id);
+            if (m > 0) {
+                CK(rt::stream_wait_event(e.st, d.ev_out));
+                CK(rt::copy_async(e.ao, d.bounce, (size_t) T * D * 4, e.st));
+            } else
+                CK(rt::copy_async(e.ao, e.x, (size_t) T * D * 4, e.st));
+            Finish fn;
+            fn.w = e.d_norm;
+            fn.eps = g.eps;
+            finish(e.ao, T, D, D, fn, e.st);
+            if (!head_share(e, m, e.ao, T, err, !mk)) return false;
+        }
+        h_idx[0] = y;
+        if (mk) {
+            // the markov steps over the group: each member its rows of the bias and its share's argmax, every member
+            // then the global one (the sampler's tie rule) and its E row - the same drafts as the lead's whole rows,
+            // each step ~1/nm of their 66 MB and no gather of the shares
+            const int nm = (int) hg.size();
+            const unsigned seq = ++mk_seq;
+            for (int m = 0; m < nm; ++m) {
+                Dev& e = devs[(size_t) hg[(size_t) m]];
+                rt::set_device(e.id);
+                CK(rt::copy_async(e.mk_ints, h_idx, 4, e.st));
+                CK(rt::copy_async(e.mk_erow, h_mk_embed + (size_t) y * R, (size_t) R * 2, e.st));
+            }
+            for (int i = 0; i < T; ++i)
+                for (int m = 0; m < nm; ++m) {
+                    Dev& e = devs[(size_t) hg[(size_t) m]];
+                    rt::set_device(e.id);
+                    float* row = m == 0 ? hd.logits + (size_t) i * V : e.logits_part + (size_t) i * e.mk_vn;
+                    markov_share(row, e.mk_share, e.mk_erow, e.mk_vn, R, e.st);
+                    argmax_share(row, e.mk_vn, e.mk_v0, mk_slots + ((size_t) i * nm + m) * 4, seq, e.st);
+                    markov_pick(mk_slots + (size_t) i * nm * 4, nm, seq, e.mk_ints + i + 1, h_mk_embed, e.mk_erow, R,
+                                e.st);
+                }
+            rt::set_device(hd.id);
+        } else {
+            CK(rt::copy_async(d_ints, h_idx, 4, hd.st));
+            strata::dsv41k::SamplerParams sp;
+            sp.greedy = true;
+            sp.temperature = 0.0f;
+            if (drafts_q) {   // the request's own chain: draft i drawn as the model's token i would be (verify's counter + i)
+                sp.greedy = false;
+                sp.temperature = dq_temp * (q_temp_scale > 0.0f ? q_temp_scale : 1.0f);
+                sp.top_p = dq_top_p;
+                sp.top_k = dq_top_k;
+                sp.min_p = dq_min_p;
+                sp.seed = dq_seed;
+            }
+            for (int i = 0; i < T; ++i) {   // the markov bias of the token before, then that position's draft
+                if (d_mk_head_q8 != nullptr) markov_add_q8(hd.logits + (size_t) i * V, d_mk_embed, d_mk_head_q8, d_ints + i, V, R, hd.st);
+                else markov_add(hd.logits + (size_t) i * V, d_mk_embed, d_mk_head, d_ints + i, V, R, hd.st);
+                if (drafts_q) {
+                    sp.counter = dq_counter + (uint64_t) i;
+                    strata::dsv41k::sample_draft(hd.logits + (size_t) i * V, 1, V, sp, d_specq + i, d_ints + i + 1, hd.st);
+                } else
+                    strata::dsv41k::sample_tokens(hd.logits + (size_t) i * V, 1, V, nullptr, 0, sp, d_ints + i + 1, hd.st);
+            }
+        }
+        confidence(hd.x, d_mk_embed, d_ints, d_conf, T, D, R, d_confv, hd.st);
+        int tok[kWin + 1];
+        float cf[kWin];
+        CK(rt::copy_async(h_idx, d_ints, (size_t) (T + 1) * 4, hd.st));
+        CK(rt::copy_async(h_w, d_confv, (size_t) T * 4, hd.st));
+        CK(rt::stream_sync(hd.st));
+        for (int i = 0; i <= T; ++i) tok[i] = h_idx[i];
+        for (int i = 0; i < T; ++i) cf[i] = h_w[i];
+        if (dump_d != nullptr) {   // 'D', the block's position, y, T, then the drafts, their confidences, the hidden
+            std::vector<float> xs((size_t) T * D);   // rows before the final norm; then each block's ring and stream
+            CK(rt::copy(xs.data(), hd.x, xs.size() * 4));
+            rt::set_device(d.id);
+            CK(rt::stream_sync(d.st));
+            const int64_t hdr[4] = {'D', p0, y, T};
+            std::fwrite(hdr, 8, 4, dump_d);
+            std::fwrite(tok + 1, 4, (size_t) T, dump_d);
+            std::fwrite(cf, 4, (size_t) T, dump_d);
+            std::fwrite(xs.data(), 4, xs.size(), dump_d);
+            for (int i = 0; i < g.n_mtp; ++i) {
+                std::fwrite(h_dump_ring + (size_t) i * rs, 2, rs, dump_d);
+                std::fwrite(h_dump + (size_t) i * hs, 4, hs, dump_d);
+            }
+            std::fflush(dump_d);
+            rt::set_device(hd.id);
+        }
+        for (int i = 0; i < T; ++i) {
+            out.push_back(tok[i + 1]);
+            conf.push_back(cf[i]);
+        }
+        return true;
+    }
+
+    int sample_row(int row, float temperature, float top_p, int top_k, float min_p, uint64_t seed, uint64_t counter,
+                   const float* bias) {
+        Dev& d = devs[(size_t) head_dev];
+        rt::set_device(d.id);
+        strata::dsv41k::SamplerParams sp;
+        sp.temperature = temperature;
+        sp.greedy = temperature <= 0.0f;
+        sp.top_p = top_p;
+        sp.top_k = top_k;
+        sp.min_p = min_p;
+        sp.seed = seed;
+        sp.counter = counter;
+        sp.logit_bias = bias;
+        strata::dsv41k::sample_tokens(d.logits + (size_t) row * g.vocab, 1, g.vocab, nullptr, 0, sp, d.tok, d.st);
+        int t = -1;
+        rt::copy_async(&t, d.tok, 4, d.st);
+        rt::stream_sync(d.st);
+        return t;
+    }
+
+    // [y, drafts] at positions pos ..: the trunk's verdict, its next token, and the state back to what it kept.
+    // Greedy: the drafts the trunk's argmax agrees with.  Sampled: the speculative-sampling rule over the request's own
+    // chain (top_k, top_p, min_p, temperature): draft d stands with probability min(1, p(d) / q(d)), q the distribution
+    // it was drawn from (the drafter's argmax: a point at d, so p(d)), a rejected one is replaced by a draw from the
+    // residual max(0, p - q) - so each kept token is distributed as the trunk's own draw.
+    bool verify(int y, const std::vector<int>& drafts, float temperature, float top_p, int top_k, float min_p,
+                uint64_t seed, uint64_t counter, int& accepted, int& next, std::string& err) {
+        const int n = (int) std::min<size_t>(drafts.size(), (size_t) kWin - 1);
+        const int T = n + 1, V = g.vocab;
+        const int64_t p0 = pos;
+        int tk[kWin];
+        tk[0] = y;
+        for (int i = 0; i < n; ++i) tk[i + 1] = drafts[(size_t) i];
+        spec_win = true;
+        const double tv = now_ms();
+        const bool ok = forward(tk, T, T, err, 0);
+        st.verify_ms += now_ms() - tv;
+        spec_win = false;
+        if (!ok) return false;
+        Dev& hd = devs[(size_t) head_dev];
+        rt::set_device(hd.id);
+        int m = 0;
+        if (temperature <= 0.0f) {
+            strata::dsv41k::SamplerParams sp;
+            sp.greedy = true;
+            sp.temperature = 0.0f;
+            strata::dsv41k::sample_tokens(hd.logits, T, V, nullptr, 0, sp, d_ints + 16, hd.st);   // (the T rows at once)
+            CK(rt::copy_async(h_idx, d_ints + 16, (size_t) T * 4, hd.st));
+            CK(rt::stream_sync(hd.st));
+            while (m < n && h_idx[m] == drafts[(size_t) m]) ++m;
+            next = h_idx[m];
+        } else {
+            // row i keeps draft i with probability min(1, p(d) / q(d)), else draws from the residual max(0, p - q)
+            // (never d itself): each row a token distributed as the model's own draw at that position, p through the
+            // request's chain - the top_k / top_p / min_p cut included (the drafter's argmax can lie outside it: p(d) 0,
+            // never kept); past the first rejection the rows do not count
+            const bool own = drafts_q && dq_temp == temperature && dq_top_p == top_p && dq_top_k == top_k &&
+                             dq_min_p == min_p && dq_seed == seed && dq_counter == counter;
+            if (!own) {   // the drafter's argmax: q a point at each draft
+                for (int i = 0; i < n; ++i) {
+                    h_specq[(size_t) i].n = 1;
+                    h_specq[(size_t) i].ids[0] = drafts[(size_t) i];
+                    h_specq[(size_t) i].p[0] = 1.0;
+                }
+                CK(rt::copy_async(d_specq, h_specq.data(), (size_t) n * sizeof(strata::dsv41k::SpecList), hd.st));
+            }
+            for (int i = 0; i < n; ++i) h_idx[i] = drafts[(size_t) i];
+            CK(rt::copy_async(d_ints + 32, h_idx, (size_t) n * 4, hd.st));
+            strata::dsv41k::SamplerParams sp;
+            sp.greedy = false;
+            sp.temperature = temperature;
+            sp.top_p = top_p;
+            sp.top_k = top_k;
+            sp.min_p = min_p;
+            sp.seed = seed;
+            sp.counter = counter;
+            strata::dsv41k::sample_verify(hd.logits, n, V, sp, d_specq, d_ints + 32, d_ints + 16, hd.st);
+            CK(rt::copy_async(h_idx, d_ints + 16, (size_t) n * 4, hd.st));
+            CK(rt::stream_sync(hd.st));
+            while (m < n && h_idx[m] == drafts[(size_t) m]) ++m;
+            next = m < n ? h_idx[m] : sample_row(n, temperature, top_p, top_k, min_p, seed, counter + (uint64_t) n, nullptr);
+        }
+        drafts_q = false;
+        rollback(p0, T, m + 1);
+        if (!seed_drafter(p0, m + 1, 0, err)) return false;
+        accepted = m;
+        st.drafts_offered += n;
+        st.drafts_accepted += m;
+        for (int i = 0; i < n && i <= m && i < 8; ++i) {
+            ++st.draft_reached[i];
+            if (i < m) ++st.draft_kept[i];
+        }
+        return true;
+    }
+
+    // a verified window keeps its first `keep` positions: the ring rows and the compressors' state of the rest undone
+    // (the compressed KV and the index keys past them are written again when those positions come)
+    void rollback(int64_t p0, int T, int keep) {
+        if (keep >= T) return;
+        // the ring rows: one launch a device for all its layers (a launch a layer and member was ~300 on 8-way tensor
+        // parallel, a millisecond of the host's before the next draft)
+        std::vector<RingBatch> rb(devs.size());
+        for (int il = 0; il < g.nl; ++il)
+            for (int m = 0; m < L[(size_t) il].nm; ++m) {
+                Layer& l = member(L[(size_t) il], m);
+                RingBatch& b = rb[(size_t) l.dev];
+                if (b.n == kMaxRingBatch) {   // (more layers on a device than a batch takes: this one alone)
+                    rt::set_device(devs[(size_t) l.dev].id);
+                    ring_restore(l.win, l.ring_bak, p0, g.win, keep, T, g.hd, devs[(size_t) l.dev].st);
+                    continue;
+                }
+                b.ring[b.n] = l.win;
+                b.bak[b.n++] = l.ring_bak;
+            }
+        for (size_t di = 0; di < devs.size(); ++di)
+            if (rb[di].n > 0) {
+                rt::set_device(devs[di].id);
+                ring_restore_batch(rb[di], p0, g.win, keep, T, g.hd, devs[di].st);
+            }
+        for (int il = 0; il < g.nl; ++il)
+            for (int m = 0; m < L[(size_t) il].nm; ++m) {
+                Layer& l = member(L[(size_t) il], m);
+                Dev& d = devs[(size_t) l.dev];
+                if (l.c_snap != nullptr) {
+                    rt::set_device(d.id);
+                    const size_t ns = (size_t) l.ratio * g.hd * 4;
+                    rt::copy_async(l.c_kv, l.c_snap, ns, d.st);
+                    rt::copy_async(l.c_score, l.c_snap + (size_t) l.ratio * g.hd, ns, d.st);
+                    compress_win(l.c_rows, l.c_rows + (size_t) kWin * g.hd, l.c_kv, l.c_score, l.ratio, (int) p0, keep,
+                                 g.hd, l.c_norm, g.eps, d.latent, d.st);
+                }
+            }
+        pos = p0 + keep;
+        toks.resize((size_t) pos);
+        ctoks.resize((size_t) pos);
+        slot_held = false;
+    }
+
+    // ---- a window: T tokens at positions pos .. pos + T - 1 through every layer; the logits of its last `logits` rows
+    bool step(int token, bool want_logits, std::string& err) { return forward(&token, 1, want_logits ? 1 : 0, err); }
+
+
+    // layer L0 for a chunk of T tokens at p0 as group member mi: layer()'s arithmetic over the chunk's rows (the
+    // projections as GEMMs, the attention and the indexer in slabs, the routed experts as sorted rows: the VRAM ones in
+    // place, the CPU lane's streamed in batches).  kv_only (a long prompt's first pass, Run::stop): only what the layers
+    // after it read of these rows - its compressed KV and index keys - and nothing of its own attention or experts
+    bool layer_chunk(Layer& L0, int mi, int64_t p0, int T, const WinPlan& wp, Streamer& S, std::string& err,
+                     bool kv_only = false) {
+        Layer& l = member(L0, mi);
+        Dev& d = devs[(size_t) l.dev];
+        Chunk& c = *chunks[(size_t) l.dev];
+        rt::set_device(d.id);
+        rt::Queue s = d.st;
+        prof_mark(d, 0);
+        const int nm = L0.nm;
+        const int D = g.dim, H = g.hc, HD = g.hd, NHL = l.ahn, HQ = NHL * HD, OG = l.ogn, FF = l.ffn;
+        const ArGroup& ab = groups[(size_t) L0.grp].arb;
+        const float* freqs = l.ratio ? d.freqs_comp : d.freqs_win;
+        // Engram projections use the slab that fitted this device's scratch budget.
+        if (l.eg >= 0) {
+            const int cols = (pk.eg_ngram - 1) * pk.eg_heads, ehd = pk.eg_hd;
+            const size_t per = (size_t) cols * (ehd + ehd / 32);
+            const int slot = wp.eg_slot >= 0 ? wp.eg_slot : wp.k % 2;   // (read ahead by the run: two in flight)
+            uint8_t* host = c.eg_host[slot] + (size_t) l.eg * c.C * per;
+            CK(rt::copy_async(c.eg_rows, host, (size_t) T * per, s));
+            CK(rt::event_record(c.eg_ev[slot], s));
+            for (int s0 = 0; s0 < T; s0 += c.eg_slab) {
+                const int ns = std::min(c.eg_slab, T - s0);
+                engram_dequant_tok(c.eg_rows + (size_t) s0 * per, per, cols, ns, ehd, c.eg_x, s, (int) eg_fmt[(size_t) l.eg]);
+                x3::rows_f16(c.eg_x, cols * ehd, nullptr, ns, cols * ehd, c.eg_x16, s);
+                if (!gemm(d, c, l.eg_wkv, c.eg_x16, cols * ehd, ns, c.eg_kv, (H + 1) * D, 0.0f, err)) return false;
+                engram_gate(c.h + (size_t) s0 * H * D, c.eg_kv, l.eg_w, H, D, ns, g.eps, s);
+            }
+        }
+        prof_mark(d, 4);
+        // attention
+        if (!hc_mix_chunk(d, c, c.h, l.hca_fn, T, c.mix, err)) return false;
+        hc_split(c.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, c.a_pre, c.a_post, c.a_comb, s);
+        dump_sub(d, "mix0", l.il, p0, T, c.mix, (size_t) T * 32 * 4);
+        hc_pre_norm(c.h, c.pre, l.attn_norm, D, H, T, g.eps, c.x, s);
+        dump_sub(d, "a_mix", l.il, p0, T, c.mix, (size_t) T * 32 * 4);
+        dump_sub(d, "a_pre", l.il, p0, T, c.a_pre, (size_t) T * 8 * 4);
+        dump_sub(d, "a_post", l.il, p0, T, c.a_post, (size_t) T * 8 * 4);
+        dump_sub(d, "a_comb", l.il, p0, T, c.a_comb, (size_t) T * 64 * 4);
+        dump_sub(d, "attn_x", l.il, p0, T, c.x, (size_t) T * D * 4);
+        x3::rows_f16(c.x, D, nullptr, T, D, c.x16, s);
+        prof_mark(d, 5);
+        if (!kv_only && (!gemm(d, c, l.wq_a, c.x16, D, T, c.qr, g.q_lora, 0.0f, err) ||
+                         !gemm(d, c, l.wkv, c.x16, D, T, c.kvr, HD, 0.0f, err)))
+            return false;
+        if (l.kv_src && !gemm(d, c, l.c_wkv, c.x16, D, T, c.ckr, HD, 0.0f, err)) return false;
+        if (l.kv_src && l.ratio > 1 && !gemm(d, c, l.c_wgate, c.x16, D, T, c.cgr, HD, 0.0f, err)) return false;
+        prof_mark(d, 6);
+        const bool snap = !kv_only && wp.snap_t >= 0 && mi == 0 && L0.snap_win != nullptr;
+        if (!kv_only) {
+            dump_sub(d, "qr_raw", l.il, p0, T, c.qr, (size_t) T * g.q_lora * 4);
+            dump_sub(d, "kvr_raw", l.il, p0, T, c.kvr, (size_t) T * HD * 4);
+            Finish fq;
+            fq.w = l.q_norm;
+            fq.eps = g.eps;
+            finish(c.qr, T, g.q_lora, g.q_lora, fq, s);
+            x3::rows_f16(c.qr, g.q_lora, nullptr, T, g.q_lora, c.qr16, s);
+            // the window rows: the ring's (positions p0 - win ..) then the chunk's
+            ring_to_ext(l.win, c.ext, p0, g.win, HD, s);
+            Finish fk;
+            fk.w = l.kv_norm;
+            fk.eps = g.eps;
+            fk.rd = g.rd;
+            fk.pos = (int) p0;
+            fk.freqs = freqs;
+            fk.quant = 1;
+            fk.dst = c.ext + (size_t) g.win * HD;
+            fk.dst_stride = HD;
+            finish(c.kvr, T, HD, HD, fk, s);
+            // feed_mark's checkpoint: the ring as it was before row snap_t - the old ring, then the chunk's rows before it
+            if (snap) {
+                CK(rt::copy_async(L0.snap_win, l.win, (size_t) g.win * win_rb(), s));
+                if (wp.snap_t > 0) ext_to_ring(c.ext, L0.snap_win, p0, g.win, wp.snap_t, HD, s, nullptr);
+            }
+            ext_to_ring(c.ext, l.win, p0, g.win, T, HD, s, nullptr);
+        }
+        const uint8_t* ckv = nullptr;
+        const long long ss = (long long) o.max_context + 64;
+        if (l.ratio > 0) {
+            Src& sr = srcs[(size_t) l.src];
+            const int R = l.ratio;
+            const int64_t g_first = p0 / R, g_end = (p0 + T) / R;
+            const int ng = (int) std::max<int64_t>(0, g_end - g_first);
+            const float* latent = c.latent;
+            if (l.kv_src) {
+                if (R == 1) {
+                    Finish fc;
+                    fc.w = l.c_norm;
+                    fc.eps = g.eps;
+                    finish(c.ckr, T, HD, HD, fc, s);
+                    latent = c.ckr;
+                } else {
+                    if (snap && L0.snap_kv != nullptr) {   // (each slot: the latest row before snap_t that holds it)
+                        const int64_t ps = p0 + wp.snap_t;
+                        for (int sl = 0; sl < R; ++sl) {
+                            const int64_t q = ps - 1 - (((ps - 1 - sl) % R) + R) % R;
+                            const float* kv = q >= p0 ? c.ckr + (size_t) (q - p0) * HD : l.c_kv + (size_t) sl * HD;
+                            const float* sc = q >= p0 ? c.cgr + (size_t) (q - p0) * HD : l.c_score + (size_t) sl * HD;
+                            CK(rt::copy_async(L0.snap_kv + (size_t) sl * HD, kv, (size_t) HD * 4, s));
+                            CK(rt::copy_async(L0.snap_sc + (size_t) sl * HD, sc, (size_t) HD * 4, s));
+                        }
+                    }
+                    compress_win(c.ckr, c.cgr, l.c_kv, l.c_score, R, (int) p0, T, HD, l.c_norm, g.eps, c.latent, s);
+                }
+            }
+            const int clen_max = (int) ((p0 + T) / R);
+            if (l.ix_src) {
+                Src& ks = srcs[(size_t) l.ik_src];
+                if (l.owns_k && ng > 0) {
+                    x3::rows_f16(latent, HD, nullptr, ng, HD, c.lat16, s);
+                    if (!gemm(d, c, l.i_wk, c.lat16, HD, ng, c.ikr, g.ix_hd, 0.0f, err)) return false;
+                    Finish fi;
+                    fi.w = l.ik_norm;
+                    fi.eps = g.eps;
+                    fi.rd = g.rd;
+                    fi.pos = (int) (g_first * R);
+                    fi.pos_step = R;
+                    fi.freqs = freqs;
+                    fi.quant = 3;
+                    fi.pdst = ks.ik[(size_t) l.dev] + (size_t) g_first * ik_rb();
+                    fi.pdst_stride = (long long) ik_rb();
+                    finish(c.ikr, ng, g.ix_hd, g.ix_hd, fi, s);
+                }
+                if (clen_max > 0 && !kv_only) {
+                    if (!gemm_f16w(c, l.i_wproj, g.ix_heads, D, c.x16, D, T,
+                                   1.0f / std::sqrt((float) g.ix_hd) / std::sqrt((float) g.ix_heads), c.iw, 64, err))
+                        return false;
+                    for (int a0 = 0; a0 < T; a0 += c.AI) {
+                        const int na = std::min(c.AI, T - a0);
+                        const int64_t pa = p0 + a0;
+                        if (!gemm(d, c, l.i_wq_b, c.qr16 + (size_t) a0 * g.q_lora, g.q_lora, na, c.iq,
+                                  g.ix_heads * g.ix_hd, 0.0f, err))
+                            return false;
+                        Finish fi;
+                        fi.rd = g.rd;
+                        fi.pos = (int) pa;
+                        fi.vpp = g.ix_heads;
+                        fi.freqs = freqs;
+                        fi.quant = 3;
+                        finish(c.iq, na * g.ix_heads, g.ix_hd, g.ix_hd, fi, s);
+                        Rows lim;
+                        lim.gen = 1;
+                        lim.p0 = pa;
+                        lim.R = R;
+                        lim.kcap = g.ix_topk;
+                        lim.ccap = g.cand_topk;
+                        lim.blk = std::max(1, g.cand_blk);
+                        const int nlast = (int) ((pa + na) / R);   // the slab's widest query
+                        int* tk = c.topk + (size_t) a0 * topk_stride();
+                        int* cd = c.cand + (size_t) a0 * cand_stride();
+                        const float* iw = c.iw + (size_t) a0 * 64;
+                        if (nlast <= 0) continue;
+                        if (l.uses_cand && (nlast + g.cand_blk - 1) / g.cand_blk > g.cand_topk) {
+                            Rows cl = lim;
+                            cl.gen = 2;
+                            index_score(c.iq, iw, ks.ik[(size_t) l.dev], g.ix_heads, g.ix_hd, na, g.cand_topk * g.cand_blk,
+                                        cd, (int) cand_stride(), g.cand_blk, cl, c.scores, ss, s);
+                            Rows tr = lim;
+                            tr.gen = 3;
+                            topk(c.scores, ss, na, tr, cd, (int) cand_stride(), g.cand_blk, tk, (int) topk_stride(), s);
+                        } else {
+                            index_score(c.iq, iw, ks.ik[(size_t) l.dev], g.ix_heads, g.ix_hd, na, nlast, nullptr, 0, 1,
+                                        lim, c.scores, ss, s);
+                            if (l.cand_src) {
+                                Rows cr = lim;
+                                cr.kcap = g.cand_topk;
+                                cand_blocks(c.scores, ss, na, cr, g.cand_blk, c.bm, (long long) bm_stride(), cd,
+                                            (int) cand_stride(), s);
+                            }
+                            topk(c.scores, ss, na, lim, nullptr, 0, 1, tk, (int) topk_stride(), s);
+                        }
+                    }
+                }
+            }
+            if (l.kv_src && ng > 0) {
+                Finish fc;
+                fc.rd = g.rd;
+                fc.pos = (int) (g_first * R);
+                fc.pos_step = R;
+                fc.freqs = freqs;
+                fc.quant = 2;
+                fc.pdst = sr.ckv[(size_t) l.dev] + (size_t) g_first * ckv_rb();
+                fc.pdst_stride = (long long) ckv_rb();
+                finish(const_cast<float*>(latent), ng, HD, HD, fc, s);
+                if (mi == 0 && sr.remote) {   // the new rows for the other groups' readers (slot k % 2, once
+                    const int slot = wp.k % 2;  // they took the chunk before last's)
+                    if (wp.k >= 2)
+                        for (int r : sr.readers) {
+                            host_wait_at_least(sr.x_ack + ((size_t) slot * devs.size() + r) * 32, wp.win - 2, *mailbox);
+                            wait_flags(sr.x_ack + ((size_t) slot * devs.size() + r) * 32, 1, 32, wp.win - 2, s);
+                        }
+                    Xfer x;
+                    x.src[0] = fc.pdst;
+                    x.dst[0] = sr.stage(slot);
+                    x.bytes[0] = (size_t) ng * ckv_rb();
+                    x.n = 1;
+                    if (l.owns_k && srcs[(size_t) l.ik_src].ik[(size_t) l.dev] != nullptr) {
+                        x.src[1] = srcs[(size_t) l.ik_src].ik[(size_t) l.dev] + (size_t) g_first * ik_rb();
+                        x.dst[1] = sr.stage(slot) + x_cap() * ckv_rb();
+                        x.bytes[1] = (size_t) ng * ik_rb();
+                        x.n = 2;
+                    }
+                    xfer_put(x, sr.flag(slot), wp.win, d.xcnt, s);
+                }
+            }
+            ckv = sr.ckv[(size_t) l.dev];
+        }
+        if (kv_only) return true;
+        prof_mark(d, 7);
+        // the attention in slabs: q, the sparse attention, wo_a, wo_b (this member's share) into acc
+        if (NHL == 0) CK(rt::memset_async(c.acc, 0, (size_t) T * D * sizeof(*c.acc), s));   // (no heads)
+        for (int a0 = 0; a0 < T && NHL > 0; a0 += c.A) {
+            const int na = std::min(c.A, T - a0);
+            if (!gemm(d, c, l.wq_b, c.qr16 + (size_t) a0 * g.q_lora, g.q_lora, na, c.q, HQ, 0.0f, err)) return false;
+            Finish fr;
+            fr.rd = g.rd;
+            fr.pos = (int) (p0 + a0);
+            fr.vpp = NHL;
+            fr.freqs = freqs;
+            finish(c.q, na * NHL, HD, HD, fr, s);
+            prof_mark(d, 8);
+            if (a0 == 0 && na == T) dump_sub(d, "q", l.il, p0, T, c.q, (size_t) T * HQ * 4);
+            AttnRows ar;
+            ar.gen = 1;
+            ar.p0 = p0;
+            ar.t0 = a0;
+            ar.win = g.win;
+            ar.R = l.ratio;
+            ar.kcap = g.ix_topk;
+            sparse_attn(c.q, c.ext, ckv, c.topk + (size_t) a0 * topk_stride(), (int) topk_stride(), ar, l.sink, NHL, HD,
+                        na, 1.0f / std::sqrt((float) HD), c.o, s, kKvFp4, 0, &d.attn_scr);   // (a short last slab)
+            prof_mark(d, 9);
+            if (a0 == 0 && na == T) dump_sub(d, "o", l.il, p0, T, c.o, (size_t) T * HQ * 4);
+            Finish fo;
+            fo.rd = g.rd;
+            fo.pos = (int) (p0 + a0);
+            fo.vpp = NHL;
+            fo.freqs = freqs;
+            fo.inverse = 1;
+            fo.quant = 1;
+            finish(c.o, na * NHL, HD, HD, fo, s);
+            if (a0 == 0 && na == T) dump_sub(d, "o_fin", l.il, p0, T, c.o, (size_t) T * HQ * 4);
+            x3::rows_f16(c.o, HQ, nullptr, na, HQ, c.o16, s);
+            const int per = HQ / OG;
+            for (int gi = 0; gi < OG; ++gi)
+                if (!gemm(d, c, l.wo_a[gi], c.o16 + (size_t) gi * per, HQ, na, c.oa + (size_t) gi * g.o_lora,
+                          OG * g.o_lora, 0.0f, err))
+                    return false;
+            x3::rows_f16(c.oa, OG * g.o_lora, nullptr, na, OG * g.o_lora, c.oa16, s);
+            if (!gemm(d, c, l.wo_b, c.oa16, OG * g.o_lora, na, c.acc + (size_t) a0 * D, D, 0.0f, err)) return false;
+            if (a0 == 0 && na == T) dump_sub(d, "ao", l.il, p0, T, c.acc, (size_t) T * D * 4);
+        }
+        if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
+        dump_sub(d, "h_in", l.il, p0, T, c.h, (size_t) T * H * D * 4);
+        hc_post_inplace(c.acc, c.h, c.a_post, c.a_comb, D, H, T, s);
+        if (dump_l != nullptr && mi == 0) dump_layer(d, c.h, 1000 + l.il, p0, T);   // (after the attention, as the window path)
+        prof_mark(d, 1);
+        // the MoE
+        if (!hc_mix_chunk(d, c, c.h, l.hcf_fn, T, c.mix, err)) return false;
+        hc_split(c.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, c.f_pre, c.f_post, c.f_comb, s);
+        hc_pre_norm(c.h, c.a_pre, l.ffn_norm, D, H, T, g.eps, c.x, s);
+        x3::rows_f16(c.x, D, nullptr, T, D, c.x16, s);
+        gemv_f32(l.gate_w, c.x, l.n_exp, D, T, c.glog, 1024, s);   // (F32 x: the token path's bits)
+        for (int r0 = 0; r0 < T; r0 += kVlRows) {   // (route()'s image bits cover kVlRows rows a call)
+            const int nr = std::min(kVlRows, T - r0);
+            VlBits vb;
+            const bool vl = l.gate_bias_vl != nullptr && vl_bits(p0 + r0, nr, vb);
+            route(c.glog + (size_t) r0 * 1024, l.gate_bias, l.n_exp, l.k_exp, nr, g.route_scale,
+                  c.ridx + (size_t) r0 * kPicks, c.rw + (size_t) r0 * kPicks, s, l.gate_bias_vl, vl ? &vb : nullptr);
+        }
+        const int n_vs = L0.n_slots + (int) L0.host_list.size();
+        CK(rt::copy_async(l.vs_dev, l.vs_pin, (size_t) l.n_exp * 4, s));   // (this member's)
+        moe_sort(c.ridx, T, l.k_exp, l.vs_dev, n_vs, c.bounds, c.row_tok, c.pos, s);
+        CK(rt::copy_async(c.bounds_pin, c.bounds, (size_t) (n_vs + 1) * 4, s));
+        prof_mark(d, 10);
+        // the shared expert into acc while the host waits for the bounds
+        if (!gemm(d, c, l.s1, c.x16, D, T, c.sg, FF, 0.0f, err) || !gemm(d, c, l.s3, c.x16, D, T, c.su, FF, 0.0f, err))
+            return false;
+        swiglu(c.sg, c.su, T * FF, g.lim, c.sg, s);
+        x3::rows_f16(c.sg, FF, nullptr, T, FF, c.sh16, s);
+        if (!gemm(d, c, l.s2, c.sh16, FF, T, c.acc, D, 0.0f, err)) return false;
+        prof_mark(d, 2);
+        // the expert stream's copies keep going while the device runs this layer's attention, routing and shared expert:
+        // the next items (this layer's likely experts, queued when the layer before routed) go out as they are ready and
+        // ring slots free, not only once the bounds are back (Project Maya #360; DS4_FLOW_PUMP_WAIT=0: wait as before)
+        static const bool pump_wait = std::getenv("DS4_FLOW_PUMP_WAIT") == nullptr ||
+                                      std::atoi(std::getenv("DS4_FLOW_PUMP_WAIT")) != 0;
+        if (c.flow && pump_wait)
+            while (rt::stream_status(s) == rt::Result::pending) {
+                if (!flow_pump(c, err)) return false;
+                std::this_thread::yield();
+            }
+        CK(rt::stream_sync(s));
+        std::vector<int> b(c.bounds_pin, c.bounds_pin + n_vs + 1);
+        if (dump_r != nullptr && mi == 0) {
+            const size_t nk = (size_t) T * l.k_exp, np = (size_t) T * kPicks;
+            std::vector<int> ri(np), rt(nk);
+            std::vector<float> gl((size_t) T * l.n_exp), gb((size_t) l.n_exp);
+            CK(rt::copy(ri.data(), c.ridx, np * 4));
+            CK(rt::copy(rt.data(), c.row_tok, nk * 4));
+            CK(rt::copy2d(gl.data(), (size_t) l.n_exp * 4, c.glog, 1024 * 4, (size_t) l.n_exp * 4, (size_t) T));
+            CK(rt::copy(gb.data(), l.gate_bias, gb.size() * 4));
+            std::lock_guard<std::mutex> lk(dump_mu);
+            const int64_t hdr[8] = {l.il, p0, T, l.k_exp, l.n_exp, n_vs, L0.n_slots, kPicks};
+            std::fwrite(hdr, 8, 8, dump_r);
+            std::fwrite(ri.data(), 4, np, dump_r);
+            std::fwrite(L0.vs_pin, 4, (size_t) l.n_exp, dump_r);
+            std::fwrite(b.data(), 4, b.size(), dump_r);
+            std::fwrite(rt.data(), 4, nk, dump_r);
+            std::fwrite(gl.data(), 4, gl.size(), dump_r);
+            std::fwrite(gb.data(), 4, gb.size(), dump_r);
+            std::fflush(dump_r);
+        }
+        if (mi == 0 && !l.mtp && (pred_f != nullptr || xin_f != nullptr)) {
+            std::lock_guard<std::mutex> lk(dump_mu);
+            if (pred_f != nullptr) {
+                float* dp = nullptr;
+                CK(rt::alloc_device(&dp, (size_t) T * 256 * 4));
+                pred_proj(c.x, (int) D, dp, T, s);
+                std::vector<float> hp((size_t) T * 256), hl((size_t) T * l.n_exp);
+                CK(rt::copy_async(hp.data(), dp, hp.size() * 4, s));
+                CK(rt::copy2d_async(hl.data(), (size_t) l.n_exp * 4, c.glog, 1024 * 4, (size_t) l.n_exp * 4, (size_t) T, s));
+                CK(rt::stream_sync(s));
+                CK(rt::free(dp));
+                std::vector<uint16_t> o(hp.size() + hl.size());
+                for (size_t i = 0; i < hl.size(); ++i) o[i] = strata::kernels::f16_from_f32(hl[i]);
+                for (size_t i = 0; i < hp.size(); ++i) o[hl.size() + i] = strata::kernels::f16_from_f32(hp[i]);
+                const uint8_t hd[3] = {(uint8_t) l.il, (uint8_t) (T & 255), (uint8_t) (T >> 8)};
+                std::fwrite(hd, 1, 3, pred_f);
+                std::fwrite(o.data(), 2, o.size(), pred_f);
+            }
+            if (xin_f != nullptr && xin_got[(size_t) l.il] < xin_n) {   // up to 32 evenly spaced tokens of the chunk
+                const int tk = std::min(std::min(T, 32), xin_n - xin_got[(size_t) l.il]);
+                const int stride = std::max(1, T / tk);
+                std::vector<float> hx((size_t) T * D);
+                CK(rt::copy_async(hx.data(), c.x, hx.size() * 4, s));
+                CK(rt::stream_sync(s));
+                const uint8_t hd[3] = {(uint8_t) l.il, (uint8_t) (tk & 255), (uint8_t) (tk >> 8)};
+                std::fwrite(hd, 1, 3, xin_f);
+                for (int i = 0; i < tk; ++i) std::fwrite(hx.data() + (size_t) std::min(T - 1, i * stride) * D, 4, (size_t) D, xin_f);
+                xin_got[(size_t) l.il] += tk;
+            }
+        }
+        if (mi == 0 && trace_f != nullptr && !l.mtp) {   // DS4_TRACE: a chunk's picks, u8 (layer | 0x80), u16 T, T x k int16 ids
+            std::vector<int> ri((size_t) T * kPicks);
+            CK(rt::copy(ri.data(), c.ridx, ri.size() * 4));
+            std::lock_guard<std::mutex> lk(dump_mu);
+            const uint8_t hd[3] = {(uint8_t) (l.il | 0x80), (uint8_t) (T & 255), (uint8_t) (T >> 8)};
+            std::fwrite(hd, 1, 3, trace_f);
+            for (int t = 0; t < T; ++t)
+                for (int i = 0; i < l.k_exp; ++i) {
+                    const int16_t v = (int16_t) ri[(size_t) t * kPicks + i];
+                    std::fwrite(&v, 2, 1, trace_f);
+                }
+        }
+        if (mi == 0) {   // the profile (the CPU lane's experts: by the plan's order)
+            uint32_t* pr = prof.data() + (size_t) l.il * g.n_exp;
+            for (int e = 0; e < l.n_exp; ++e) {
+                const int v = L0.vs_pin[e];
+                const int cnt = b[(size_t) v + 1] - b[(size_t) v];
+                pr[e] += (uint32_t) cnt;
+                if (cnt > 0) {   // (the expert cache learns from a chunked prompt as from windows: heat, and the CPU lane's hits)
+                    l.heat[(size_t) e] += (float) cnt;
+                    if (l.slot[(size_t) e] < 0) l.cpu_hits.push_back(e);
+                }
+            }
+            st.experts += (int64_t) T * l.k_exp;
+        }
+        if (c.flow) {
+            if (!flow_layer(d, c, L0, mi, wp.k, T, b, err)) return false;
+            if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
+            hc_post_inplace(c.acc, c.h, c.f_post, c.f_comb, D, H, T, s);
+            CK(rt::copy_async(c.pre, c.f_pre, (size_t) T * 8 * 4, s));
+            prof_mark(d, 3);
+            return true;
+        }
+        // the streamed experts as their batches arrive (each batch's slots freed for the copies at once), the VRAM ones
+        // in shares between them (the device works while the copies run)
+        const int di = l.dev, P = c.parts;
+        int nb = 0;
+        for (size_t q = S.kp; q < S.b.size() && S.b[q].il == L0.il && S.b[q].k == wp.k; ++q) ++nb;
+        int v_done = 0;
+        for (int bi = 0; bi < nb; ++bi) {
+            const Batch& bt = S.b[S.kp];
+            const int half = (int) (S.kp % P);
+            CK(rt::stream_wait_event(s, c.filled[half]));
+            const int v0 = L0.n_slots + bt.j0;
+            if (!run_set(d, c, l, c.ring + (size_t) half * (c.ring_n / P) * c.ring_stride, v0, c.ring_stride, c.bounds,
+                         b.data(), v0, v0 + bt.n, T, err))
+                return false;
+            CK(rt::event_record(c.freed[half], s));
+            ++S.kp;
+            if (!copy_ahead(d, c, S, di, err)) return false;
+            const int v_to = (int) ((int64_t) L0.n_slots * (bi + 1) / nb);
+            if (!run_set(d, c, l, l.vram_base, 0, unit(l), c.bounds, b.data(), v_done, v_to, T, err)) return false;
+            v_done = v_to;
+        }
+        if (!run_set(d, c, l, l.vram_base, 0, unit(l), c.bounds, b.data(), v_done, L0.n_slots, T, err)) return false;
+        if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
+        hc_post_inplace(c.acc, c.h, c.f_post, c.f_comb, D, H, T, s);
+        CK(rt::copy_async(c.pre, c.f_pre, (size_t) T * 8 * 4, s));
+        prof_mark(d, 3);
+        return true;
+    }
+
+    // the CPU lane's experts of every layer, in index order, and each expert's virtual slot (before a chunk)
 
 };
 
