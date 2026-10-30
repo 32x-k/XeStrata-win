@@ -927,6 +927,13 @@ on easy questions all three think briefly, on hard ones `high` thinks longest an
   On 1,462 agent turns 98.3% read as intended with it and 92.9% without.
   `"tool_call_recovery": false` in `xestrata-<model>.json` turns it off.
   A `<tool_call>` block that still does not read as a call is counted in the server window.
+- **What the parser repairs, and what it leaves.** A string argument that quotes a whole tool call, or repeats its own `</parameter><parameter=NAME>`, stays exact (upstream #4078).
+  A call whose `</function>` was left out is read as the call (upstream #4427), in the answer and inside the thinking.
+  An argument the tool declares as an array or an object, or declares nothing for, is read as written when it has a slip in it: a trailing or doubled comma, single quotes or `True`/`False`/`None`, a bare string between two members of an object (`"status": "pending", "in_progress", "pending": false`), brackets left open at the end.
+  The server window says `N tool call argument(s) repaired` and `/metrics/prometheus` counts them in `strata:tool_args_repaired_total`.
+  Text that is not an array or an object, a string cut short and a string-typed parameter are never touched.
+  After the thinking has ended at a closing think tag, a second one at the start of a line in the answer is dropped (the model quoted the tag while thinking, upstream #4077); the call that follows is kept.
+  The reasoning between the two went out as the answer already, because a stream cannot take text back.
 - **A call that came back as text because its name was not declared.** The text stays exactly as the model wrote it and `finish_reason` stays `stop` (`end_turn` on `/v1/messages`).
   Next to it the reply carries a list, only when there is something in it: `"strata_rejected_tool_calls": [{"name": "bash", "reason": "undeclared"}]` (at the top level of a Chat Completions reply, in its last streamed chunk, and in the `message_delta` event and the message of `/v1/messages`; up to five names).
   A client that wants to recover can answer the model with the tool names it does have and ask again; XeStrata never runs or forwards a call for a tool the request did not declare.
@@ -1119,6 +1126,12 @@ A chat and an agent's subagent can then alternate without re-reading each other.
    For a container that cannot see its own limit: the total, in MiB, it may use.
 
 Started with `--serve`, the engine prints this breakdown in one `memory guard:` line.
+
+**When the expert arena does not fit in the RAM that is free** (upstream #4051): the engine checks the RAM before it reads the experts into the arena.
+A memory limit below the arena (a container) stops the start with the numbers.
+Less free RAM than the arena (an engine that was still exiting, another program) is waited for up to 20 s, and the log says so (`STRATA_ARENA_RAM_WAIT_S` changes the seconds, `0` loads at once).
+If it is still short, the load goes on with a warning that says how much, never a refusal.
+Below half of the arena the warning adds that the whole PC can stall in memory reclaim, and that a systemd `MemoryHigh=` below the RAM keeps one program from taking all of it.
 
 Measured on the B70 with IQ2_XS: a 970-token conversation (8K context, FP16 KV) is 251 MiB parked, copied out in 70–104 ms and back in 21–23 ms.
 Its answers and state match a run without parking byte for byte:
