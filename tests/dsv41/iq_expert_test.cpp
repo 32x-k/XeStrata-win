@@ -34,7 +34,7 @@ template <typename T> static T* up(const std::vector<T>& v) {
     T* d; device_alloc(d, std::max<size_t>(1, v.size() * sizeof(T))); queue().memcpy(d, v.data(), v.size() * sizeof(T)).wait_and_throw(); return d;
 }
 template <typename T> static std::vector<T> down_(const T* d, size_t n) {
-    std::vector<T> v(n); queue().memcpy(v.data(), d, n * sizeof(T)).wait_and_throw(); return v;
+    std::vector<T> v(n); strata::core::readback(queue(), v.data(), d, n * sizeof(T)); return v;
 }
 static float h2f(uint16_t h) {
     const int s = h >> 15, e = (h >> 10) & 31, m = h & 1023;
@@ -175,8 +175,6 @@ static void light_contract(int type, const std::vector<Mat>& g, const std::vecto
             throw std::runtime_error("light gate/up accepted a missing FP32 input");
         const bool accepted = phase == 0 ? iq::light_gate_up(a, queue()) : iq::set_gate_up(a, queue());
         if (!accepted) throw std::runtime_error("light/set gate/up refused the regression fixture");
-        // Match the legacy parity tests' explicit launch completion before reading their numeric results.
-        queue().wait_and_throw();
         const auto actual = down_(a.h, initial.size());
         double worst = 0;
         int worst_row = -1, worst_col = -1;
@@ -251,7 +249,6 @@ static void light_contract(int type, const std::vector<Mat>& g, const std::vecto
         queue().memcpy(a.y, initial_y.data(), initial_y.size() * sizeof(float)).wait_and_throw();
         const bool accepted = phase == 0 ? iq::light_down(a, queue()) : iq::set_down(a, queue());
         if (!accepted) throw std::runtime_error("light/set down refused the regression fixture");
-        queue().wait_and_throw();
         const auto actual = down_(a.y, initial_y.size());
         double worst = 0;
         int worst_row = -1, worst_col = -1;

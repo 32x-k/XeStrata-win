@@ -32,7 +32,7 @@ template <typename T> static T* up(const std::vector<T>& v) {
     T* d; device_alloc(d, std::max<size_t>(1, v.size() * sizeof(T))); queue().memcpy(d, v.data(), v.size() * sizeof(T)).wait_and_throw(); return d;
 }
 template <typename T> static std::vector<T> down_(const T* d, size_t n) {
-    std::vector<T> v(n); queue().memcpy(v.data(), d, n * sizeof(T)).wait_and_throw(); return v;
+    std::vector<T> v(n); strata::core::readback(queue(), v.data(), d, n * sizeof(T)); return v;
 }
 static float h2f(uint16_t h) {
     const int s = h >> 15, e = (h >> 10) & 31, m = h & 1023;

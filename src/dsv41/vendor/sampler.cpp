@@ -8,6 +8,7 @@
 // Keep the upstream double-precision sampling chain on the host. SYCL transfers are ordered on the supplied queue;
 // this path also supports devices without fp64, and waits before its temporary host buffers leave scope.
 #include "strata/dsv41/sampler.hpp"
+#include "strata/core/readback.hpp"
 #include "../ds4_sycl.hpp"
 #include <algorithm>
 #include <cmath>
@@ -43,14 +44,15 @@ void host_sample(const float* dlogits, int n_tokens, int n_vocab, const int* dhi
     std::vector<float> hlogits((size_t) n_tokens * n_vocab), hbias(p.logit_bias ? (size_t) n_vocab : 0);
     std::vector<int> hhistory(use_history ? (size_t) n_tokens * history_len : 0), hout((size_t) n_tokens), hdraft;
     std::vector<SpecList> hq(dql ? (size_t) n_tokens : 0);
-    stream.memcpy(hlogits.data(), dlogits, hlogits.size() * sizeof(float)).wait_and_throw();
-    if (use_history) stream.memcpy(hhistory.data(), dhistory, hhistory.size() * sizeof(int)).wait_and_throw();
-    if (p.logit_bias) stream.memcpy(hbias.data(), p.logit_bias, hbias.size() * sizeof(float)).wait_and_throw();
-    if constexpr (MODE == 2) {
-        hdraft.resize((size_t) n_tokens);
-        stream.memcpy(hq.data(), dql, hq.size() * sizeof(SpecList)).wait_and_throw();
-        stream.memcpy(hdraft.data(), ddraft, hdraft.size() * sizeof(int)).wait_and_throw();
-    }
+    if constexpr (MODE == 2) hdraft.resize((size_t) n_tokens);
+    const core::ReadbackSpan copies[] = {
+        {hlogits.data(), dlogits, hlogits.size() * sizeof(float)},
+        {hhistory.data(), dhistory, hhistory.size() * sizeof(int)},
+        {hbias.data(), p.logit_bias, hbias.size() * sizeof(float)},
+        {hq.data(), dql, MODE == 2 ? hq.size() * sizeof(SpecList) : 0},
+        {hdraft.data(), ddraft, hdraft.size() * sizeof(int)},
+    };
+    core::readback(stream, copies);
     const float* logits = hlogits.data();
     const int* history = use_history ? hhistory.data() : nullptr;
     int* out = hout.data();

@@ -115,7 +115,7 @@ bool check_product(rt::Dense& dense, rt::Queue queue, bool padded, int k, float 
     require(project<E>(dense, rows, n, k, alpha, empty_product ? nullptr : static_cast<const E*>(dw.data), ldw,
                         empty_product ? nullptr : static_cast<const E*>(dx.data), ldx, beta,
                         static_cast<float*>(dy.data) + offset, ldy));
-    require(rt::copy_async(y.data(), dy.data, y.size() * sizeof(float), queue));
+    require(rt::readback_async(y.data(), dy.data, y.size() * sizeof(float), queue));
     require(rt::stream_sync(queue));
     if constexpr (std::is_same_v<E, uint16_t>) {
         if (dp4a) std::printf("DP4a reference quantization vs FP16: max_abs=%g max_rel=%g\n", quant_abs, quant_rel);

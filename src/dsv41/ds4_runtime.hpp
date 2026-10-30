@@ -5,7 +5,9 @@
 #include "strata/core/gpu.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/readback.hpp"
 #include "strata/prefill/gemm.hpp"
+#include <limits>
 #include <memory>
 
 constexpr bool ds4_dbg(const char*) { return false; }
@@ -84,11 +86,48 @@ inline Result copy(void* d, const void* s, size_t n) { return result(gpu::copy(d
 inline Result copy_async(void* d, const void* s, size_t n, Queue q) {
     return result(gpu::copy_async(d, s, n, q.handle));
 }
+inline Result readback(void* d, const void* s, size_t n, Queue q = nullptr) {
+    if (n == 0) return result(true);
+    return checked("readback", [&] { core::readback(q, d, s, n); return result(true); });
+}
+inline Result readback_async(void* d, const void* s, size_t n, Queue q) {
+    if (n == 0) return result(true);
+    return checked("readback_async", [&] { core::readback_async(q, d, s, n); return result(true); });
+}
+inline Result readback2d_async(void* d, size_t dp, const void* s, size_t sp, size_t w, size_t h, Queue q) {
+    if (w == 0 || h == 0) return result(true);
+    return checked("readback2d_async", [&] { core::readback2d_async(q, d, dp, s, sp, w, h); return result(true); });
+}
+inline Result readback2d(void* d, size_t dp, const void* s, size_t sp, size_t w, size_t h, Queue q = nullptr) {
+    if (w == 0 || h == 0) return result(true);
+    return checked("readback2d", [&] { core::readback2d(q, d, dp, s, sp, w, h); return result(true); });
+}
 inline Result copy2d_async(void* d, size_t dp, const void* s, size_t sp, size_t w, size_t h, Queue q) {
-    return result(gpu::copy2d_async(d, dp, s, sp, w, h, q.handle));
+    if (w == 0 || h == 0) return result(true);
+    return checked("copy2d_async", [&] {
+        if (!d || !s || w > dp || w > sp)
+            throw std::invalid_argument("copy2d requires valid buffers and pitches");
+        const size_t room = std::numeric_limits<size_t>::max() - w;
+        if (h - 1 > room / dp || h - 1 > room / sp)
+            throw std::invalid_argument("copy2d offset overflows size_t");
+        sycl::queue& queue = q;
+        const auto context = queue.get_context();
+        // Copy registration does not make an ordinary host pointer safe for a kernel to dereference.
+        if (sycl::get_pointer_type(d, context) == sycl::usm::alloc::unknown ||
+            sycl::get_pointer_type(s, context) == sycl::usm::alloc::unknown) {
+            auto* dst = static_cast<std::byte*>(d);
+            const auto* src = static_cast<const std::byte*>(s);
+            for (size_t row = 0; row < h; ++row)
+                if (!gpu::copy_async(dst + row * dp, src + row * sp, w, q.handle)) return result(false);
+            return result(true);
+        }
+        return result(gpu::copy2d_async(d, dp, s, sp, w, h, q.handle));
+    });
 }
 inline Result copy2d(void* d, size_t dp, const void* s, size_t sp, size_t w, size_t h) {
-    return result(gpu::copy2d_async(d, dp, s, sp, w, h, nullptr) && gpu::stream_sync(nullptr));
+    if (w == 0 || h == 0) return result(true);
+    const auto status = copy2d_async(d, dp, s, sp, w, h, nullptr);
+    return status == Result::success ? result(gpu::stream_sync(nullptr)) : status;
 }
 inline Result memset(void* d, int value, size_t n) { return result(gpu::memset(d, value, n)); }
 inline Result memset_async(void* d, int value, size_t n, Queue q) {

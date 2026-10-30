@@ -1377,7 +1377,7 @@ struct Model::Impl {
     void dump_layer(Dev& d, const float* h, int il, int64_t p0, int T) {
         std::vector<float> v((size_t) T * g.hc * g.dim);
         rt::set_device(d.id);
-        rt::copy_async(v.data(), h, v.size() * 4, d.st);
+        rt::readback_async(v.data(), h, v.size() * 4, d.st);
         rt::stream_sync(d.st);
         std::lock_guard<std::mutex> lk(dump_mu);
         const int64_t hdr[3] = {il, p0, T};
@@ -1400,7 +1400,7 @@ struct Model::Impl {
         if (!dump_s_on(il) || !dump_s_name(name)) return;
         std::vector<uint8_t> v(nbytes);
         rt::set_device(d.id);
-        rt::copy_async(v.data(), dev, nbytes, d.st);
+        rt::readback_async(v.data(), dev, nbytes, d.st);
         rt::stream_sync(d.st);
         dump_sub_host(name, il, p0, T, v.data(), nbytes);
     }
@@ -4230,8 +4230,8 @@ struct Model::Impl {
                     std::vector<uint16_t> hv((size_t) nrows * FF);
                     std::vector<float> yv((size_t) nrows * D);
                     CK(rt::stream_sync(d.st));
-                    CK(rt::copy(hv.data(), c.h16, hv.size() * 2));
-                    CK(rt::copy(yv.data(), c.y, yv.size() * 4));
+                    CK(rt::readback(hv.data(), c.h16, hv.size() * 2, d.st));
+                    CK(rt::readback(yv.data(), c.y, yv.size() * 4, d.st));
                     std::lock_guard<std::mutex> lk(dump_mu);
                     const int64_t hdr[6] = {l.il, a, nrows, j - i0, wbase == c.ring || (wbase > c.ring &&
                                             wbase < c.ring + (size_t) c.ring_n * c.ring_stride) ? 1 : 0, max_rows};
@@ -4310,8 +4310,8 @@ struct Model::Impl {
                     if (!f32(d, P + "engram.q_weight", qw, err, acct) || !f32(d, P + "engram.k_weight", kw, err, acct))
                         return false;
                     std::vector<float> a((size_t) g.hc * g.dim), b(a.size());
-                    CK(rt::copy(a.data(), qw, a.size() * 4));
-                    CK(rt::copy(b.data(), kw, b.size() * 4));
+                    CK(rt::readback(a.data(), qw, a.size() * 4));
+                    CK(rt::readback(b.data(), kw, b.size() * 4));
                     for (size_t i = 0; i < a.size(); ++i) a[i] *= b[i];   // only ever used as a product
                     CK(rt::copy(qw, a.data(), a.size() * 4));
                     l.eg_w = qw;
@@ -5581,12 +5581,12 @@ struct Model::Impl {
             Dev& d = devs[(size_t) l.dev];
             rt::set_device(d.id);
             c.win[i].resize((size_t) g.win * win_rb());
-            rt::copy_async(c.win[i].data(), l.win, c.win[i].size(), d.st);
+            rt::readback_async(c.win[i].data(), l.win, c.win[i].size(), d.st);
             if (l.c_kv) {
                 c.comp[2 * i].resize((size_t) l.ratio * g.hd);
                 c.comp[2 * i + 1].resize((size_t) l.ratio * g.hd);
-                rt::copy_async(c.comp[2 * i].data(), l.c_kv, c.comp[2 * i].size() * 4, d.st);
-                rt::copy_async(c.comp[2 * i + 1].data(), l.c_score, c.comp[2 * i + 1].size() * 4, d.st);
+                rt::readback_async(c.comp[2 * i].data(), l.c_kv, c.comp[2 * i].size() * 4, d.st);
+                rt::readback_async(c.comp[2 * i + 1].data(), l.c_score, c.comp[2 * i + 1].size() * 4, d.st);
             }
         }
         for (Dev& d : devs) {
@@ -5724,7 +5724,7 @@ struct Model::Impl {
             rt::set_device(d.id);
             const uint64_t wb = (uint64_t) g.win * win_rb();
             put(&wb, 8);
-            if (rt::copy(p + off, l.win, (size_t) wb) != rt::Result::success) {
+            if (rt::readback(p + off, l.win, (size_t) wb, d.st) != rt::Result::success) {
                 err = l.name + "window ring: " + rt::error_string(rt::last_error());
                 return 0;
             }
@@ -5733,8 +5733,8 @@ struct Model::Impl {
             put(&cn, 8);
             if (cn > 0) {
                 const size_t cb = (size_t) cn * 4;
-                if (rt::copy(p + off, l.c_kv, cb) != rt::Result::success ||
-                    rt::copy(p + off + cb, l.c_score, cb) != rt::Result::success) {
+                if (rt::readback(p + off, l.c_kv, cb, d.st) != rt::Result::success ||
+                    rt::readback(p + off + cb, l.c_score, cb, d.st) != rt::Result::success) {
                     err = l.name + "compressor's group: " + rt::error_string(rt::last_error());
                     return 0;
                 }
@@ -5754,8 +5754,8 @@ struct Model::Impl {
             }
             const size_t cb = (size_t) rows * ckv_rb(), ib = (size_t) rows * ik_rb();
             rt::set_device(devs[(size_t) di].id);
-            if (rt::copy(p + off, ckv, cb) != rt::Result::success ||
-                (ik != nullptr && rt::copy(p + off + cb, ik, ib) != rt::Result::success)) {
+            if (rt::readback(p + off, ckv, cb, devs[(size_t) di].st) != rt::Result::success ||
+                (ik != nullptr && rt::readback(p + off + cb, ik, ib, devs[(size_t) di].st) != rt::Result::success)) {
                 err = "source layer " + std::to_string(s.layer) + "'s compressed KV: " + rt::error_string(rt::last_error());
                 return 0;
             }
@@ -6677,7 +6677,7 @@ struct Model::Impl {
                 rt::Queue cs = B.st[(size_t) l.dev];
                 rt::copy_async(l.vram_base + (size_t) l.spare_vram * l.blob, B.a, l.blob, cs);
                 if (!file_experts)
-                    rt::copy_async(B.b, l.vram_base + (size_t) l.slot[(size_t) sw.out] * l.blob, l.blob, cs);
+                    rt::readback_async(B.b, l.vram_base + (size_t) l.slot[(size_t) sw.out] * l.blob, l.blob, cs);
                 rt::stream_sync(cs);
             } else {   // a group: each member's part in, each member's part out
                 for (int m = 0; m < l.nm; ++m) {
@@ -6688,7 +6688,7 @@ struct Model::Impl {
                     rt::copy_async(x.vram_base + (size_t) l.spare_vram * x.hblob, B.h, x.hblob, cs);
                     rt::stream_sync(cs);
                     if (file_experts) continue;
-                    rt::copy_async(B.h, x.vram_base + (size_t) l.slot[(size_t) sw.out] * x.hblob, x.hblob, cs);
+                    rt::readback_async(B.h, x.vram_base + (size_t) l.slot[(size_t) sw.out] * x.hblob, x.hblob, cs);
                     rt::stream_sync(cs);
                     half_to_blob(l, B.h, m, B.b);
                 }
@@ -6706,12 +6706,13 @@ struct Model::Impl {
                         repack(l, reg.data(), blob.data());
                         std::vector<uint8_t> dev(l.blob);
                         if (l.nm == 1)
-                            rt::copy(dev.data(), l.vram_base + (size_t) l.spare_vram * l.blob, l.blob);
+                            rt::readback(dev.data(), l.vram_base + (size_t) l.spare_vram * l.blob, l.blob, B.st[(size_t) l.dev]);
                         else
                             for (int m = 0; m < l.nm; ++m) {   // (the members' parts, put together again)
                                 std::vector<uint8_t> h(member(l, m).hblob);
                                 rt::set_device(devs[(size_t) member(l, m).dev].id);
-                                rt::copy(h.data(), member(l, m).vram_base + (size_t) l.spare_vram * member(l, m).hblob, member(l, m).hblob);
+                                rt::readback(h.data(), member(l, m).vram_base + (size_t) l.spare_vram * member(l, m).hblob,
+                                             member(l, m).hblob, B.st[(size_t) member(l, m).dev]);
                                 half_to_blob(l, h.data(), m, dev.data());
                             }
                         for (int r = 0; r < 3; ++r)
@@ -6760,7 +6761,7 @@ struct Model::Impl {
                 const Layer& x = member(l, m);
                 rt::set_device(devs[(size_t) x.dev].id);
                 rt::Queue cs = copy_st[(size_t) x.dev];
-                got = rt::copy_async(l.nm > 1 ? sw_h : sw_b, x.vram_base + (size_t) l.slot[(size_t) sw.out] * unit(l), unit(l), cs) == rt::Result::success &&
+                got = rt::readback_async(l.nm > 1 ? sw_h : sw_b, x.vram_base + (size_t) l.slot[(size_t) sw.out] * unit(l), unit(l), cs) == rt::Result::success &&
                       rt::stream_sync(cs) == rt::Result::success;
                 if (got && l.nm > 1) half_to_blob(l, sw_h, m, sw_b);
             }
@@ -6774,7 +6775,7 @@ struct Model::Impl {
                 const Layer& x = member(l, 0);
                 rt::set_device(devs[(size_t) x.dev].id);
                 rt::Queue cs = copy_st[(size_t) x.dev];
-                const bool got = rt::copy_async(dst, x.vram_base + (size_t) l.slot[(size_t) sw.out] * unit(l), l.blob, cs) ==
+                const bool got = rt::readback_async(dst, x.vram_base + (size_t) l.slot[(size_t) sw.out] * unit(l), l.blob, cs) ==
                                      rt::Result::success &&
                                  rt::stream_sync(cs) == rt::Result::success;
                 store->put_done(l.il, sw.out, got);
@@ -6785,7 +6786,8 @@ struct Model::Impl {
             for (int m = 0; m < l.nm && ok; ++m) {
                 const Layer& x = member(l, m);
                 rt::set_device(devs[(size_t) x.dev].id);
-                rt::copy(l.nm > 1 ? h.data() : dev.data(), x.vram_base + (size_t) l.spare_vram * unit(l), unit(l));
+                rt::readback(l.nm > 1 ? h.data() : dev.data(), x.vram_base + (size_t) l.spare_vram * unit(l),
+                             unit(l), copy_st[(size_t) x.dev]);
                 if (l.nm > 1) half_to_blob(l, h.data(), m, dev.data());
             }
             ok = ok && read_mx_file(l, sw.in, file.data());
@@ -7393,12 +7395,12 @@ struct Model::Impl {
             Layer& l = L[(size_t) (g.nl + i)];
             if (dump_d != nullptr) {   // (stream order: the ring the block reads - as BF16 rows - the stream it leaves)
                 ring_to_ext(l.win, d.ext, g.win, g.win, g.hd, d.st);
-                CK(rt::copy_async(h_dump_ring + (size_t) i * rs, d.ext, rs * 2, d.st));
+                CK(rt::readback_async(h_dump_ring + (size_t) i * rs, d.ext, rs * 2, d.st));
             }
             if (!layer(l, 0, p0, T, dp, err)) return false;
             if (dump_d != nullptr) {
                 rt::set_device(d.id);
-                CK(rt::copy_async(h_dump + (size_t) i * hs, d.h, hs * 4, d.st));
+                CK(rt::readback_async(h_dump + (size_t) i * hs, d.h, hs * 4, d.st));
             }
         }
         rt::set_device(d.id);
@@ -7407,7 +7409,7 @@ struct Model::Impl {
         // (through the host to the head's device, and to the head group's other members - the drafter's device can be
         // the head group's lead itself, a group of every GPU)
         if (d_dev != head_dev || groups[(size_t) hd.grp].mem.size() > 1) {
-            CK(rt::copy_async(d.bounce, d.x, (size_t) T * D * 4, d.st));
+            CK(rt::readback_async(d.bounce, d.x, (size_t) T * D * 4, d.st));
             CK(rt::event_record(d.ev_out, d.st));
         }
         if (d_dev != head_dev) {
@@ -7482,14 +7484,14 @@ struct Model::Impl {
         confidence(hd.x, d_mk_embed, d_ints, d_conf, T, D, R, d_confv, hd.st);
         int tok[kWin + 1];
         float cf[kWin];
-        CK(rt::copy_async(h_idx, d_ints, (size_t) (T + 1) * 4, hd.st));
-        CK(rt::copy_async(h_w, d_confv, (size_t) T * 4, hd.st));
+        CK(rt::readback_async(h_idx, d_ints, (size_t) (T + 1) * 4, hd.st));
+        CK(rt::readback_async(h_w, d_confv, (size_t) T * 4, hd.st));
         CK(rt::stream_sync(hd.st));
         for (int i = 0; i <= T; ++i) tok[i] = h_idx[i];
         for (int i = 0; i < T; ++i) cf[i] = h_w[i];
         if (dump_d != nullptr) {   // 'D', the block's position, y, T, then the drafts, their confidences, the hidden
             std::vector<float> xs((size_t) T * D);   // rows before the final norm; then each block's ring and stream
-            CK(rt::copy(xs.data(), hd.x, xs.size() * 4));
+            CK(rt::readback(xs.data(), hd.x, xs.size() * 4, hd.st));
             rt::set_device(d.id);
             CK(rt::stream_sync(d.st));
             const int64_t hdr[4] = {'D', p0, y, T};
@@ -7526,7 +7528,7 @@ struct Model::Impl {
         sp.logit_bias = bias;
         strata::dsv41k::sample_tokens(d.logits + (size_t) row * g.vocab, 1, g.vocab, nullptr, 0, sp, d.tok, d.st);
         int t = -1;
-        rt::copy_async(&t, d.tok, 4, d.st);
+        rt::readback_async(&t, d.tok, 4, d.st);
         rt::stream_sync(d.st);
         return t;
     }
@@ -7558,7 +7560,7 @@ struct Model::Impl {
             sp.greedy = true;
             sp.temperature = 0.0f;
             strata::dsv41k::sample_tokens(hd.logits, T, V, nullptr, 0, sp, d_ints + 16, hd.st);   // (the T rows at once)
-            CK(rt::copy_async(h_idx, d_ints + 16, (size_t) T * 4, hd.st));
+            CK(rt::readback_async(h_idx, d_ints + 16, (size_t) T * 4, hd.st));
             CK(rt::stream_sync(hd.st));
             while (m < n && h_idx[m] == drafts[(size_t) m]) ++m;
             next = h_idx[m];
@@ -7588,7 +7590,7 @@ struct Model::Impl {
             sp.seed = seed;
             sp.counter = counter;
             strata::dsv41k::sample_verify(hd.logits, n, V, sp, d_specq, d_ints + 32, d_ints + 16, hd.st);
-            CK(rt::copy_async(h_idx, d_ints + 16, (size_t) n * 4, hd.st));
+            CK(rt::readback_async(h_idx, d_ints + 16, (size_t) n * 4, hd.st));
             CK(rt::stream_sync(hd.st));
             while (m < n && h_idx[m] == drafts[(size_t) m]) ++m;
             next = m < n ? h_idx[m] : sample_row(n, temperature, top_p, top_k, min_p, seed, counter + (uint64_t) n, nullptr);
@@ -7929,7 +7931,7 @@ struct Model::Impl {
         const int n_vs = L0.n_slots + (int) L0.host_list.size();
         CK(rt::copy_async(l.vs_dev, l.vs_pin, (size_t) l.n_exp * 4, s));   // (this member's)
         moe_sort(c.ridx, T, l.k_exp, l.vs_dev, n_vs, c.bounds, c.row_tok, c.pos, s);
-        CK(rt::copy_async(c.bounds_pin, c.bounds, (size_t) (n_vs + 1) * 4, s));
+        CK(rt::readback_async(c.bounds_pin, c.bounds, (size_t) (n_vs + 1) * 4, s));
         prof_mark(d, 10);
         // the shared expert into acc while the host waits for the bounds
         if (!gemm(d, c, l.s1, c.x16, D, T, c.sg, FF, 0.0f, err) || !gemm(d, c, l.s3, c.x16, D, T, c.su, FF, 0.0f, err))
@@ -7954,10 +7956,10 @@ struct Model::Impl {
             const size_t nk = (size_t) T * l.k_exp, np = (size_t) T * kPicks;
             std::vector<int> ri(np), rt(nk);
             std::vector<float> gl((size_t) T * l.n_exp), gb((size_t) l.n_exp);
-            CK(rt::copy(ri.data(), c.ridx, np * 4));
-            CK(rt::copy(rt.data(), c.row_tok, nk * 4));
-            CK(rt::copy2d(gl.data(), (size_t) l.n_exp * 4, c.glog, 1024 * 4, (size_t) l.n_exp * 4, (size_t) T));
-            CK(rt::copy(gb.data(), l.gate_bias, gb.size() * 4));
+            CK(rt::readback(ri.data(), c.ridx, np * 4, s));
+            CK(rt::readback(rt.data(), c.row_tok, nk * 4, s));
+            CK(rt::readback2d(gl.data(), (size_t) l.n_exp * 4, c.glog, 1024 * 4, (size_t) l.n_exp * 4, (size_t) T, s));
+            CK(rt::readback(gb.data(), l.gate_bias, gb.size() * 4, s));
             std::lock_guard<std::mutex> lk(dump_mu);
             const int64_t hdr[8] = {l.il, p0, T, l.k_exp, l.n_exp, n_vs, L0.n_slots, kPicks};
             std::fwrite(hdr, 8, 8, dump_r);
@@ -7976,8 +7978,8 @@ struct Model::Impl {
                 CK(rt::alloc_device(&dp, (size_t) T * 256 * 4));
                 pred_proj(c.x, (int) D, dp, T, s);
                 std::vector<float> hp((size_t) T * 256), hl((size_t) T * l.n_exp);
-                CK(rt::copy_async(hp.data(), dp, hp.size() * 4, s));
-                CK(rt::copy2d_async(hl.data(), (size_t) l.n_exp * 4, c.glog, 1024 * 4, (size_t) l.n_exp * 4, (size_t) T, s));
+                CK(rt::readback_async(hp.data(), dp, hp.size() * 4, s));
+                CK(rt::readback2d_async(hl.data(), (size_t) l.n_exp * 4, c.glog, 1024 * 4, (size_t) l.n_exp * 4, (size_t) T, s));
                 CK(rt::stream_sync(s));
                 CK(rt::free(dp));
                 std::vector<uint16_t> o(hp.size() + hl.size());
@@ -7991,7 +7993,7 @@ struct Model::Impl {
                 const int tk = std::min(std::min(T, 32), xin_n - xin_got[(size_t) l.il]);
                 const int stride = std::max(1, T / tk);
                 std::vector<float> hx((size_t) T * D);
-                CK(rt::copy_async(hx.data(), c.x, hx.size() * 4, s));
+                CK(rt::readback_async(hx.data(), c.x, hx.size() * 4, s));
                 CK(rt::stream_sync(s));
                 const uint8_t hd[3] = {(uint8_t) l.il, (uint8_t) (tk & 255), (uint8_t) (tk >> 8)};
                 std::fwrite(hd, 1, 3, xin_f);
@@ -8001,7 +8003,7 @@ struct Model::Impl {
         }
         if (mi == 0 && trace_f != nullptr && !l.mtp) {   // DS4_TRACE: a chunk's picks, u8 (layer | 0x80), u16 T, T x k int16 ids
             std::vector<int> ri((size_t) T * kPicks);
-            CK(rt::copy(ri.data(), c.ridx, ri.size() * 4));
+            CK(rt::readback(ri.data(), c.ridx, ri.size() * 4, s));
             std::lock_guard<std::mutex> lk(dump_mu);
             const uint8_t hd[3] = {(uint8_t) (l.il | 0x80), (uint8_t) (T & 255), (uint8_t) (T >> 8)};
             std::fwrite(hd, 1, 3, trace_f);
@@ -8209,7 +8211,7 @@ struct Model::Impl {
                         const int nr = std::min(T, tap_cap);
                         hc_mean(c.h + (size_t) (T - nr) * H * D, nr, H, D, d.tap, D, s);
                         CK(rt::stream_wait_event(s, ev_seed));
-                        CK(rt::copy2d_async(h_taps + j * D, nt * D * 4, d.tap, (size_t) D * 4, (size_t) D * 4, (size_t) nr, s));
+                        CK(rt::readback2d_async(h_taps + j * D, nt * D * 4, d.tap, (size_t) D * 4, (size_t) D * 4, (size_t) nr, s));
                     }
                 }
                 const bool kvo = run.kv_only(k, il);
@@ -8219,7 +8221,7 @@ struct Model::Impl {
                 if (!last_l) {   // the chunk's state kept for the next layer
                     const Xfer x = chunk_xfer(c.lm_state + (size_t) k * hb, c, T, true);
                     for (int i = 0; i < x.n; ++i)
-                        CK(rt::copy_async(x.dst[i], x.src[i], x.bytes[i], s));
+                        CK(rt::readback_async(x.dst[i], x.src[i], x.bytes[i], s));
                     continue;
                 }
                 // through every layer: the chunk's end, and the logits
@@ -8233,7 +8235,7 @@ struct Model::Impl {
                         const int nr = std::min(kWin, T - r0);
                         hc_pre_norm(c.h + (size_t) r0 * H * D, c.pre + (size_t) r0 * 8, d.norm_w, D, H, nr, g.eps, d.x, s);
                         if (!head_share(d, d.mi, d.x, nr, err)) return false;
-                        CK(rt::copy_async(chunk_logits.data() + base + (size_t) r0 * g.vocab, d.logits, (size_t) nr * g.vocab * 4, s));
+                        CK(rt::readback_async(chunk_logits.data() + base + (size_t) r0 * g.vocab, d.logits, (size_t) nr * g.vocab * 4, s));
                         CK(rt::stream_sync(s));
                     }
                 } else if (last_k && n_logits > 0) {   // (the last rows' logits, into the window path's buffers)
@@ -8405,7 +8407,7 @@ struct Model::Impl {
                         const int nr = std::min(T, tap_cap);
                         hc_mean(c.h + (size_t) (T - nr) * H * D, nr, H, D, d.tap, D, s);
                         CK(rt::stream_wait_event(s, ev_seed));
-                        CK(rt::copy2d_async(h_taps + j * D, nt * D * 4, d.tap, (size_t) D * 4, (size_t) D * 4, (size_t) nr, s));
+                        CK(rt::readback2d_async(h_taps + j * D, nt * D * 4, d.tap, (size_t) D * 4, (size_t) D * 4, (size_t) nr, s));
                     }
                 }
                 if (!run_layer(L0, mi, p0, T, wp, S, err, run, k, il)) return false;
@@ -8433,7 +8435,7 @@ struct Model::Impl {
                         hc_pre_norm(c.h + (size_t) r0 * H * D, c.pre + (size_t) r0 * 8, d.norm_w, D, H, nr, g.eps, d.x, s);
                         if (!head_share(d, d.mi, d.x, nr, err)) return false;
                         if (di != head_dev) continue;
-                        CK(rt::copy_async(chunk_logits.data() + base + (size_t) r0 * g.vocab, d.logits, (size_t) nr * g.vocab * 4, s));
+                        CK(rt::readback_async(chunk_logits.data() + base + (size_t) r0 * g.vocab, d.logits, (size_t) nr * g.vocab * 4, s));
                         CK(rt::stream_sync(s));
                     }
                 } else if (last_k && n_logits > 0) {   // (the last rows' logits, into the window path's buffers)
@@ -9110,12 +9112,12 @@ struct Model::Impl {
                 rt::set_device(dv.id);
                 const bool kept = !l.mtp && l.snap_win != nullptr;
                 ckp.win[i].resize((size_t) g.win * win_rb());
-                CK(rt::copy_async(ckp.win[i].data(), kept ? l.snap_win : l.win, ckp.win[i].size(), dv.st));
+                CK(rt::readback_async(ckp.win[i].data(), kept ? l.snap_win : l.win, ckp.win[i].size(), dv.st));
                 if (l.c_kv) {
                     ckp.comp[2 * i].resize((size_t) l.ratio * g.hd);
                     ckp.comp[2 * i + 1].resize((size_t) l.ratio * g.hd);
-                    CK(rt::copy_async(ckp.comp[2 * i].data(), kept && l.snap_kv ? l.snap_kv : l.c_kv, ckp.comp[2 * i].size() * 4, dv.st));
-                    CK(rt::copy_async(ckp.comp[2 * i + 1].data(), kept && l.snap_sc ? l.snap_sc : l.c_score, ckp.comp[2 * i + 1].size() * 4, dv.st));
+                    CK(rt::readback_async(ckp.comp[2 * i].data(), kept && l.snap_kv ? l.snap_kv : l.c_kv, ckp.comp[2 * i].size() * 4, dv.st));
+                    CK(rt::readback_async(ckp.comp[2 * i + 1].data(), kept && l.snap_sc ? l.snap_sc : l.c_score, ckp.comp[2 * i + 1].size() * 4, dv.st));
                 }
             }
             for (Dev& dv : devs) {
@@ -9244,7 +9246,7 @@ struct Model::Impl {
         rt::set_device(d.id);
         hc_mean(d.h, T, g.hc, D, d.tap, D, d.st);
         CK(rt::stream_wait_event(d.st, ev_seed));
-        CK(rt::copy2d_async(h_taps + j * D, nt * D * 4, d.tap, (size_t) D * 4, (size_t) D * 4, (size_t) T, d.st));
+        CK(rt::readback2d_async(h_taps + j * D, nt * D * 4, d.tap, (size_t) D * 4, (size_t) D * 4, (size_t) T, d.st));
         return true;
     }
 
@@ -9307,10 +9309,10 @@ struct Model::Impl {
     }
 
     // one thread: the layers device after device, the hand-offs through pinned memory and events
-    void dbg_nf(const char* tag, int il, const float* dev, size_t n) {   // DBG: non-finite count of a device buffer
+    void dbg_nf(const char* tag, int il, const float* dev, size_t n, rt::Queue s) {   // DBG: non-finite count of a device buffer
         rt::device_sync();
         std::vector<float> host(n);
-        if (rt::copy(host.data(), dev, n * sizeof(float)) != rt::Result::success) return;
+        if (rt::readback(host.data(), dev, n * sizeof(float), s) != rt::Result::success) return;
         const float* hp = host.data();
         size_t nf = 0, first = 0; float mx = 0.0f;
         for (size_t i = 0; i < n; ++i) { const float v = hp[i]; if (!(v == v)) { if (!nf) first = i; ++nf; } else if (std::fabs(v) > mx) mx = std::fabs(v); }
@@ -9322,7 +9324,7 @@ struct Model::Impl {
         float mx = 0.0f; size_t nf = 0;
         const size_t n = (size_t) T * g.hc * g.dim;
         std::vector<float> host(n);
-        if (rt::copy(host.data(), d.h, n * sizeof(float)) != rt::Result::success) return;
+        if (rt::readback(host.data(), d.h, n * sizeof(float), d.st) != rt::Result::success) return;
         const float* hp = host.data();
         for (size_t i = 0; i < n; ++i) { const float v = hp[i]; if (!(v == v)) ++nf; else if (std::fabs(v) > mx) mx = std::fabs(v); }
         std::fprintf(stderr, "DBG hmax %s T=%d max=%.4g nonfinite=%zu h0=%g\n", tag, T, mx, nf, hp[0]);
@@ -9351,10 +9353,10 @@ struct Model::Impl {
                 const size_t nh = (size_t) T * H * D * 4, np = (size_t) T * 8 * 4, nk = (size_t) T * topk_stride() * 4,
                              nc = (size_t) T * cand_stride() * 4;
                 uint8_t* bb = a.bounce;
-                CK(rt::copy_async(bb, a.h, nh, a.st));
-                CK(rt::copy_async(bb + nh, a.pre, np, a.st));
-                CK(rt::copy_async(bb + nh + np, a.topk, nk, a.st));
-                CK(rt::copy_async(bb + nh + np + nk, a.cand, nc, a.st));
+                CK(rt::readback_async(bb, a.h, nh, a.st));
+                CK(rt::readback_async(bb + nh, a.pre, np, a.st));
+                CK(rt::readback_async(bb + nh + np, a.topk, nk, a.st));
+                CK(rt::readback_async(bb + nh + np + nk, a.cand, nc, a.st));
                 CK(rt::event_record(a.ev_out, a.st));
                 rt::set_device(b.id);
                 CK(rt::stream_wait_event(b.st, a.ev_out));
@@ -9371,7 +9373,7 @@ struct Model::Impl {
                 Dev& dd = devs[(size_t) l.dev];
                 std::vector<float> hv((size_t) T * H * D);
                 rt::set_device(dd.id);
-                CK(rt::copy_async(hv.data(), dd.h, hv.size() * 4, dd.st));
+                CK(rt::readback_async(hv.data(), dd.h, hv.size() * 4, dd.st));
                 CK(rt::stream_sync(dd.st));
                 for (int t = 0; t < T; ++t)
                     std::memcpy(dump.data() + ((size_t) t * g.nl + l.il) * H * D, hv.data() + (size_t) t * H * D,
@@ -9495,7 +9497,7 @@ struct Model::Impl {
         for (size_t od = 0; od < devs.size(); ++od) any = any || (copies[od] != nullptr && (int) od != from);
         if (!any) return true;
         Dev& d = devs[(size_t) from];
-        CK(rt::copy_async(stage, src, bytes, d.st));
+        CK(rt::readback_async(stage, src, bytes, d.st));
         CK(rt::event_record(ev, d.st));
         for (size_t od = 0; od < devs.size(); ++od) {
             if (copies[od] == nullptr || (int) od == from) continue;
@@ -9539,13 +9541,13 @@ struct Model::Impl {
             dump_sub(d, "eg_x", l.il, p0, T, d.eg_x, (size_t) T * cols * ehd * 4);
             if (ds4_dbg("DS4_DBG_EG")) {}
             if (!mv(d, {job(l.eg_wkv, d.eg_x, d.eg_kv, T, (size_t) cols * ehd, (size_t) (H + 1) * D)}, err)) return false;
-            if (ds4_dbg("DS4_DBG_EG")) dbg_nf("eg_kv", l.il, d.eg_kv, (size_t) T * (H + 1) * D);
+            if (ds4_dbg("DS4_DBG_EG")) dbg_nf("eg_kv", l.il, d.eg_kv, (size_t) T * (H + 1) * D, s);
             dump_sub(d, "eg_kv", l.il, p0, T, d.eg_kv, (size_t) T * (H + 1) * D * 4);
             dump_sub(d, "eg_h0", l.il, p0, T, d.h, (size_t) T * H * D * 4);
             dump_sub(d, "eg_w", l.il, p0, 1, l.eg_w, (size_t) H * D * 4);
             engram_gate(d.h, d.eg_kv, l.eg_w, H, D, T, g.eps, s);
             dump_sub(d, "eg_h", l.il, p0, T, d.h, (size_t) T * H * D * 4);
-            if (ds4_dbg("DS4_DBG_EG")) dbg_nf("h_after_gate", l.il, d.h, (size_t) T * H * D);
+            if (ds4_dbg("DS4_DBG_EG")) dbg_nf("h_after_gate", l.il, d.h, (size_t) T * H * D, s);
         }
         dump_sub(d, "h_in", l.il, p0, T, d.h, (size_t) T * H * D * 4);
         dump_sub(d, "ring_in", l.il, p0, T, l.win, (size_t) g.win * kv_row_bytes(kKvFp8, HD));
@@ -9916,15 +9918,15 @@ struct Model::Impl {
         vb.w[0] = l.mtp ? 0u : wp.vl;
         route(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, d.ridx, d.rw, s, l.gate_bias_vl,
               vb.w[0] != 0 ? &vb : nullptr);
-        CK(rt::copy_async(h_idx, d.ridx, (size_t) T * kPicks * 4, s));
-        CK(rt::copy_async(h_w, d.rw, (size_t) T * kPicks * 4, s));
-        CK(rt::copy_async(h_x, d.x, (size_t) T * D * 4, s));
+        CK(rt::readback_async(h_idx, d.ridx, (size_t) T * kPicks * 4, s));
+        CK(rt::readback_async(h_w, d.rw, (size_t) T * kPicks * 4, s));
+        CK(rt::readback_async(h_x, d.x, (size_t) T * D * 4, s));
         CK(rt::event_record(d.ev, s));
         // the shared expert while the host looks at the picks
         if (!mv(d, {job(l.s1, d.x, d.sg, T, D, g.ff), job(l.s3, d.x, d.su, T, D, g.ff)}, err)) return false;
         if (ds4_dbg("DS4_DBG_MOE")) {}
         swiglu(d.sg, d.su, T * g.ff, g.lim, d.sh, s);
-        if (ds4_dbg("DS4_DBG_MOE")) dbg_nf("sh", l.il, d.sh, (size_t) T * g.ff);
+        if (ds4_dbg("DS4_DBG_MOE")) dbg_nf("sh", l.il, d.sh, (size_t) T * g.ff, s);
         if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, g.ff, D)}, err)) return false;
         const double tw = now_ms();
         CK(rt::event_sync(d.ev));
@@ -10069,7 +10071,7 @@ struct Model::Impl {
         strata::dsv41k::sample_tokens(d.logits + (size_t) std::max(0, n_logits - 1) * g.vocab, 1, g.vocab, nullptr, 0,
                                        sp, d.tok, d.st);
         int t = -1;
-        rt::copy_async(&t, d.tok, 4, d.st);
+        rt::readback_async(&t, d.tok, 4, d.st);
         rt::stream_sync(d.st);
         return t;
     }
@@ -10082,7 +10084,7 @@ struct Model::Impl {
         Dev& d = devs[(size_t) head_dev];
         rt::set_device(d.id);
         out.resize((size_t) std::max(1, n_logits) * g.vocab);
-        return rt::copy_async(out.data(), d.logits, out.size() * 4, d.st) == rt::Result::success &&
+        return rt::readback_async(out.data(), d.logits, out.size() * 4, d.st) == rt::Result::success &&
                rt::stream_sync(d.st) == rt::Result::success;
     }
 

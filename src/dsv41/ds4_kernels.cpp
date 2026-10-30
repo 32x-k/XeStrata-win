@@ -8,6 +8,7 @@
 #include "ds4_numerics.cuh"
 #include "ds4_q6k.cuh"
 #include "ds4_mailbox.hpp"
+#include "strata/core/readback.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cfloat>
@@ -709,7 +710,10 @@ void confidence(const float* x, const uint16_t* E, const int* tok, const float* 
 }
 void xfer_put(const Xfer& x, unsigned* flag, unsigned seq, unsigned* cnt, sycl::queue& s) {
     sycl_detail::require_in_order(s);
-    for (int i = 0; i < x.n; ++i) if (x.bytes[i]) s.memcpy(x.dst[i], x.src[i], x.bytes[i]);
+    if (x.n < 0 || x.n > 4) throw std::invalid_argument("xfer_put segment count");
+    core::ReadbackSpan copies[4]{};
+    for (int i = 0; i < x.n; ++i) copies[i] = {x.dst[i], x.src[i], x.bytes[i]};
+    core::readback_async(s, std::span<const core::ReadbackSpan>(copies, size_t(x.n)));
     if (cnt) s.memset(cnt, 0, sizeof(unsigned));
     if (flag) set_flag(flag, seq, s);
 }

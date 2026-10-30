@@ -383,6 +383,7 @@ if(STRATA_ENABLE_XE)
   endif()
 
   add_library(strata_core STATIC src/core/device.cpp src/core/pinned.cpp src/core/gpu.cpp src/core/graph.cpp
+                                 src/core/readback.cpp
                                  src/core/weights.cpp src/core/layout.cpp)
   target_include_directories(strata_core PUBLIC include)
   target_link_libraries(strata_core PUBLIC strata_sycl strata_warnings strata_plan strata_platform)
