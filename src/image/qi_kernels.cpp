@@ -511,9 +511,11 @@ void qi_i8_scale(float* y, int64_t T, int64_t N, int64_t ldy, const float* sx, c
     if (T <= 0 || N <= 0) return;
     const auto e = queue_for(stream).parallel_for(sycl::range<2>((size_t) T, (size_t) N), [=](sycl::id<2> i) {
         float& v = y[(int64_t) i[0] * ldy + (int64_t) i[1]];
+        // without a DoRA's factors (col) the expression the product had before them, so its rounding stays the same
         const int64_t n = (int64_t) i[1];
-        v = (float) sycl::bit_cast<int32_t>(v) * sx[i[0]] * sw[n] * (col != nullptr ? col[n] : 1.f) +
-            (bias != nullptr ? bias[n] : 0.f);
+        const float s = (float) sycl::bit_cast<int32_t>(v) * sx[i[0]];
+        v = col != nullptr ? s * sw[n] * col[n] + (bias != nullptr ? bias[n] : 0.f)
+                           : s * sw[n] + (bias != nullptr ? bias[n] : 0.f);
     });
     finish(stream, e, "qi_i8_scale");
 }
