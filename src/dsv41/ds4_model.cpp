@@ -9510,7 +9510,754 @@ struct Model::Impl {
 
     // layer L0 for the window, as group member mi (its share of the heads, of the output projection and of the FFNs;
     // the partial sums all-reduced across the group)
+    bool layer(Layer& L0, int mi, int64_t p0, int T, const WinPlan& wp, std::string& err) {
+        Layer& l = member(L0, mi);
+        Dev& d = devs[(size_t) l.dev];
+        rt::set_device(d.id);
+        rt::Queue s = d.st;
+        const int nm = L0.nm;
+        const int D = g.dim, H = g.hc, HD = g.hd, NHL = l.ahn, HQ = NHL * HD, OG = l.ogn, FF = l.ffn;
+        const ArGroup& ag = groups[(size_t) L0.grp].ar;
+        const float* freqs = l.ratio ? d.freqs_comp : d.freqs_win;
+        if (ds4_dbg("DS4_DBG_SLOTS") && l.il < 2 && l.lay.fmt == gg::kFmtMXFP4) {}
+        if (ds4_dbg("DS4_TRACE_DISP")) std::fprintf(stderr, "TRACE layer %d p0=%lld T=%d\n", l.il, (long long) p0, T);
+        if (ds4_dbg("DS4_DBG_H") && mi == 0 && (l.il < 2 || ds4_dbg("DS4_DBG_ALL"))) {}
+        prof_mark(d, 0);
+        // Engram
+        if (l.eg >= 0) {
+            const int cols = (pk.eg_ngram - 1) * pk.eg_heads, ehd = pk.eg_hd;
+            const size_t per = (size_t) cols * (ehd + ehd / 32);
+            eg_finish(*eg_win[(size_t) l.eg]);   // (asked for when the window began)
+            uint8_t* src = h_eg + (size_t) l.eg * eg_cap * per;
+            for (int t = 0; t < T; ++t)   // [token][rows | scales] -> [all rows][all scales]
+                CK(rt::copy_async(d.eg_rows + (size_t) t * cols * ehd, src + (size_t) t * per, (size_t) cols * ehd, s));
+            uint8_t* sc = d.eg_rows + (size_t) T * cols * ehd;
+            for (int t = 0; t < T; ++t)
+                CK(rt::copy_async(sc + (size_t) t * cols * (ehd / 32), src + (size_t) t * per + (size_t) cols * ehd, (size_t) cols * (ehd / 32), s));
+            engram_dequant(d.eg_rows, sc, T * cols, ehd, d.eg_x, s, (int) eg_fmt[(size_t) l.eg]);
+            dump_sub(d, "eg_rows", l.il, p0, T, d.eg_rows, (size_t) T * cols * ehd);
+            dump_sub(d, "eg_x", l.il, p0, T, d.eg_x, (size_t) T * cols * ehd * 4);
+            if (ds4_dbg("DS4_DBG_EG")) {}
+            if (!mv(d, {job(l.eg_wkv, d.eg_x, d.eg_kv, T, (size_t) cols * ehd, (size_t) (H + 1) * D)}, err)) return false;
+            if (ds4_dbg("DS4_DBG_EG")) dbg_nf("eg_kv", l.il, d.eg_kv, (size_t) T * (H + 1) * D);
+            dump_sub(d, "eg_kv", l.il, p0, T, d.eg_kv, (size_t) T * (H + 1) * D * 4);
+            dump_sub(d, "eg_h0", l.il, p0, T, d.h, (size_t) T * H * D * 4);
+            dump_sub(d, "eg_w", l.il, p0, 1, l.eg_w, (size_t) H * D * 4);
+            engram_gate(d.h, d.eg_kv, l.eg_w, H, D, T, g.eps, s);
+            dump_sub(d, "eg_h", l.il, p0, T, d.h, (size_t) T * H * D * 4);
+            if (ds4_dbg("DS4_DBG_EG")) dbg_nf("h_after_gate", l.il, d.h, (size_t) T * H * D);
+        }
+        dump_sub(d, "h_in", l.il, p0, T, d.h, (size_t) T * H * D * 4);
+        dump_sub(d, "ring_in", l.il, p0, T, l.win, (size_t) g.win * kv_row_bytes(kKvFp8, HD));
+        // attention
+        hc_mix_split(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, d.hccnt, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps,
+                     d.a_pre, d.a_post, d.a_comb, s);
+        dump_sub(d, "a_mix", l.il, p0, T, d.mix, (size_t) T * 32 * 4);
+        dump_sub(d, "a_pre", l.il, p0, T, d.a_pre, (size_t) T * 8 * 4);
+        dump_sub(d, "a_post", l.il, p0, T, d.a_post, (size_t) T * 8 * 4);
+        dump_sub(d, "a_comb", l.il, p0, T, d.a_comb, (size_t) T * 64 * 4);
+        hc_pre_norm(d.h, d.pre, l.attn_norm, D, H, T, g.eps, d.x, s);
+        dump_sub(d, "pre_in", l.il, p0, T, d.pre, (size_t) T * 8 * 4);
+        dump_sub(d, "attn_x", l.il, p0, T, d.x, (size_t) T * D * 4);
+        {
+            x3::MvJob j[4];
+            int nj = 0;
+            j[nj++] = job(l.wq_a, d.x, d.qr, T, D, g.q_lora);
+            j[nj++] = job(l.wkv, d.x, d.kvr, T, D, HD);
+            if (l.kv_src) j[nj++] = job(l.c_wkv, d.x, d.ckr, T, D, HD);
+            if (l.kv_src && l.ratio > 1) j[nj++] = job(l.c_wgate, d.x, d.cgr, T, D, HD);
+            if (!mv_n(d, j, nj, err)) return false;
+        }
+        dump_sub(d, "qr_raw", l.il, p0, T, d.qr, (size_t) T * g.q_lora * 4);
+        dump_sub(d, "kvr_raw", l.il, p0, T, d.kvr, (size_t) T * HD * 4);
+        Finish fq;
+        fq.w = l.q_norm;
+        fq.eps = g.eps;
+        finish(d.qr, T, g.q_lora, g.q_lora, fq, s);
+        dump_sub(d, "qr", l.il, p0, T, d.qr, (size_t) T * g.q_lora * 4);
+        if (NHL > 0) {
+            if (!mv(d, {job(l.wq_b, d.qr, d.q, T, g.q_lora, HQ)}, err)) return false;
+            Finish fr;
+            fr.rd = g.rd;
+            fr.pos = (int) p0;
+            fr.vpp = NHL;
+            fr.freqs = freqs;
+            finish(d.q, T * NHL, HD, HD, fr, s);
+        }
+        if (NHL > 0) dump_sub(d, "q", l.il, p0, T, d.q, (size_t) T * HQ * 4);
+        // the window rows: the ring's (positions p0 - win ..) then this window's, each query its own 128.  A DSpark
+        // block's ring holds the trunk's main KV (positions <= p0 - 1, seeded); its block of drafts attends to all of
+        // that ring and to the whole block, and leaves the ring as it was
+        ring_to_ext(l.win, d.ext, l.mtp ? (int64_t) g.win : p0, g.win, HD, s);   // (a block's ring: its rows as they lie)
+        Finish fk;
+        fk.w = l.kv_norm;
+        fk.eps = g.eps;
+        fk.rd = g.rd;
+        fk.pos = (int) p0;
+        fk.freqs = freqs;
+        fk.quant = 1;
+        fk.dst = d.ext + (size_t) g.win * HD;
+        fk.dst_stride = HD;
+        finish(d.kvr, T, HD, HD, fk, s);
+        if (!l.mtp) ext_to_ring(d.ext, l.win, p0, g.win, T, HD, s, spec_win ? l.ring_bak : nullptr);
+        dump_sub(d, "kv_win", l.il, p0, T, d.ext + (size_t) g.win * HD, (size_t) T * HD * 4);
+        dump_sub(d, "ext", l.il, p0, T, d.ext, ((size_t) g.win + T) * HD * 2);   // (BF16 rows: the ring's, then this window's)
+        AttnRows ar;
+        for (int t = 0; t < T; ++t) {
+            if (l.mtp) {
+                ar.win0[t] = 0;
+                ar.nwin[t] = (int) std::min<int64_t>(g.win, p0);
+                ar.nsel[t] = T;
+                continue;
+            }
+            const int first = (int) std::max<int64_t>(g.win - p0, t + 1);   // ext row of position max(0, p - win + 1)
+            ar.win0[t] = first;
+            ar.nwin[t] = g.win + t - first + 1;
+            ar.nsel[t] = 0;
+        }
+        const void* ckv = nullptr;
+        int ckv_fmt = kKvFp4;
+        if (l.ratio > 0) {
+            Src& sr = srcs[(size_t) l.src];
+            const int R = l.ratio;
+            // the groups this window completes: g_first .. g_first + ng - 1
+            const int64_t g_first = p0 / R;              // the first group whose last position is >= p0
+            const int64_t g_end = (p0 + T) / R;          // groups completed by p0 + T - 1
+            const int ng = (int) std::max<int64_t>(0, g_end - g_first);
+            if (l.kv_src) {
+                if (R == 1) {
+                    Finish fc;
+                    fc.w = l.c_norm;
+                    fc.eps = g.eps;
+                    finish(d.ckr, T, HD, HD, fc, s);
+                    CK(rt::copy_async(d.latent, d.ckr, (size_t) T * HD * 4, s));
+                } else {
+                    if (spec_win && l.c_snap != nullptr) {   // to replay the accepted rows if drafts are rejected
+                        const size_t ns = (size_t) R * HD * 4, nr = (size_t) T * HD * 4;
+                        CK(rt::copy_async(l.c_snap, l.c_kv, ns, s));
+                        CK(rt::copy_async(l.c_snap + (size_t) R * HD, l.c_score, ns, s));
+                        CK(rt::copy_async(l.c_rows, d.ckr, nr, s));
+                        CK(rt::copy_async(l.c_rows + (size_t) kWin * HD, d.cgr, nr, s));
+                    }
+                    compress_win(d.ckr, d.cgr, l.c_kv, l.c_score, R, (int) p0, T, HD, l.c_norm, g.eps, d.latent, s);
+                    dump_sub(d, "ckr", l.il, p0, T, d.ckr, (size_t) T * HD * 4);
+                    dump_sub(d, "cgr", l.il, p0, T, d.cgr, (size_t) T * HD * 4);
+                }
+            }
+            Rows lim;
+            int clen_max = 0;
+            for (int t = 0; t < T; ++t) {
+                lim.n[t] = (int) ((p0 + t + 1) / R);
+                lim.k[t] = std::min(g.ix_topk, lim.n[t]);
+                clen_max = std::max(clen_max, lim.n[t]);
+            }
+            if (l.ix_src) {
+                Src& ks = srcs[(size_t) l.ik_src];
+                if (l.owns_k && ng > 0) {
+                    if (!mv(d, {job(l.i_wk, d.latent, d.ikr, ng, HD, g.ix_hd)}, err)) return false;
+                    Finish fi;
+                    fi.w = l.ik_norm;
+                    fi.eps = g.eps;
+                    fi.rd = g.rd;
+                    fi.pos = (int) (g_first * R);
+                    fi.pos_step = R;
+                    fi.freqs = freqs;
+                    fi.quant = 3;
+                    fi.pdst = ks.ik[(size_t) l.dev] + (size_t) g_first * ik_rb();
+                    fi.pdst_stride = (long long) ik_rb();
+                    finish(d.ikr, ng, g.ix_hd, g.ix_hd, fi, s);
+                    if (!wp.par && !replicate(ks.ik, ks.h_ik, ks.ev_ik, fi.pdst, (size_t) g_first * ik_rb(),
+                                              (size_t) ng * ik_rb(), l.dev, err))
+                        return false;
+                }
+                if (clen_max > 0) {
+                    if (!mv(d, {job(l.i_wq_b, d.qr, d.iq, T, g.q_lora, (size_t) g.ix_heads * g.ix_hd)}, err)) return false;
+                    Finish fi;
+                    fi.rd = g.rd;
+                    fi.pos = (int) p0;
+                    fi.vpp = g.ix_heads;
+                    fi.freqs = freqs;
+                    fi.quant = 3;
+                    finish(d.iq, T * g.ix_heads, g.ix_hd, g.ix_hd, fi, s);
+                    // (iw rows are 64 apart)
+                    gemv_f16_rows(l.i_wproj, d.x, (size_t) D, g.ix_heads, D, T,
+                                  1.0f / std::sqrt((float) g.ix_hd) / std::sqrt((float) g.ix_heads), d.iw, 64, s);
+                    const long long ss = (long long) o.max_context + 64;
+                    bool restrict_ = false;
+                    for (int t = 0; t < T; ++t)
+                        restrict_ = restrict_ || (lim.n[t] + g.cand_blk - 1) / g.cand_blk > g.cand_topk;
+                    if (l.uses_cand && restrict_) {
+                        Rows cl;   // the candidate positions of each query: its blocks x blk
+                        int nmax = 0;
+                        for (int t = 0; t < T; ++t) {
+                            cl.n[t] = lim.n[t];
+                            cl.k[t] = wp.cand[l.il][t];
+                            nmax = std::max(nmax, wp.cand[l.il][t] * g.cand_blk);
+                        }
+                        index_score(d.iq, d.iw, ks.ik[(size_t) l.dev], g.ix_heads, g.ix_hd, T, nmax, d.cand,
+                                    (int) cand_stride(), g.cand_blk, cl, d.scores, ss, s);
+                        Rows tr;
+                        for (int t = 0; t < T; ++t) {
+                            tr.n[t] = wp.cand[l.il][t] * g.cand_blk;
+                            tr.k[t] = lim.k[t];
+                        }
+                        topk(d.scores, ss, T, tr, d.cand, (int) cand_stride(), g.cand_blk, d.topk, (int) topk_stride(), s);
+                    } else {
+                        index_score(d.iq, d.iw, ks.ik[(size_t) l.dev], g.ix_heads, g.ix_hd, T, clen_max, nullptr, 0, 1,
+                                    lim, d.scores, ss, s);
+                        if (l.cand_src) {
+                            Rows cr;
+                            for (int t = 0; t < T; ++t) {
+                                cr.n[t] = lim.n[t];
+                                cr.k[t] = g.cand_topk;
+                            }
+                            cand_blocks(d.scores, ss, T, cr, g.cand_blk, d.bm, (long long) bm_stride(), d.cand,
+                                        (int) cand_stride(), s);
+                        }
+                        topk(d.scores, ss, T, lim, nullptr, 0, 1, d.topk, (int) topk_stride(), s);
+                    }
+                }
+            }
+            if (l.kv_src && ng > 0) {
+                Finish fc;
+                fc.rd = g.rd;
+                fc.pos = (int) (g_first * R);
+                fc.pos_step = R;
+                fc.freqs = freqs;
+                fc.quant = 2;
+                fc.pdst = sr.ckv[(size_t) l.dev] + (size_t) g_first * ckv_rb();
+                fc.pdst_stride = (long long) ckv_rb();
+                finish(d.latent, ng, HD, HD, fc, s);
+                if (!wp.par && !replicate(sr.ckv, sr.h_ckv, sr.ev_ckv, fc.pdst, (size_t) g_first * ckv_rb(),
+                                          (size_t) ng * ckv_rb(), l.dev, err))
+                    return false;
+                if (wp.par && mi == 0 && sr.remote) {   // the new rows for the other groups' readers
+                    Xfer x;
+                    x.src[0] = fc.pdst;
+                    x.dst[0] = sr.x_stage;
+                    x.bytes[0] = (size_t) ng * ckv_rb();
+                    x.n = 1;
+                    if (l.owns_k && srcs[(size_t) l.ik_src].ik[(size_t) l.dev] != nullptr) {
+                        x.src[1] = srcs[(size_t) l.ik_src].ik[(size_t) l.dev] + (size_t) g_first * ik_rb();
+                        x.dst[1] = sr.x_stage + x_cap() * ckv_rb();
+                        x.bytes[1] = (size_t) ng * ik_rb();
+                        x.n = 2;
+                    }
+                    xfer_put(x, sr.x_flag, wp.win, d.xcnt, s);
+                }
+            }
+            if (ng > 0) dump_sub(d, "latent", l.il, p0, ng, d.latent, (size_t) ng * HD * 4);
+            dump_sub(d, "topk", l.il, p0, T, d.topk, (size_t) T * topk_stride() * 4);
+            for (int t = 0; t < T; ++t) ar.nsel[t] = lim.n[t] > 0 ? wp.topk[l.il][t] : 0;
+            ckv = sr.ckv[(size_t) l.dev];
+        }
+        if (l.mtp) {   // the block's rows (BF16), after the ring's in ext, as every query's selection
+            ckv = d.ext + (size_t) g.win * HD;
+            ckv_fmt = kKvBf16;
+            iota_rows(d.topk, T, T, (int) topk_stride(), s);
+        }
+        if (NHL > 0) {
+            sparse_attn(d.q, d.ext, ckv, d.topk, (int) topk_stride(), ar, l.sink, NHL, HD, T,
+                        1.0f / std::sqrt((float) HD), d.o, s, ckv_fmt, 0, &d.attn_scr);
+            dump_sub(d, "o", l.il, p0, T, d.o, (size_t) T * HQ * 4);
+            Finish fo;
+            fo.rd = g.rd;
+            fo.pos = (int) p0;
+            fo.vpp = NHL;
+            fo.freqs = freqs;
+            fo.inverse = 1;
+            fo.quant = 1;
+            finish(d.o, T * NHL, HD, HD, fo, s);
+            dump_sub(d, "o_fin", l.il, p0, T, d.o, (size_t) T * HQ * 4);
+            x3::MvJob j[16];
+            const int per = HQ / OG;
+            for (int gi = 0; gi < OG; ++gi)
+                j[gi] = job(l.wo_a[gi], d.o + (size_t) gi * per, d.oa + (size_t) gi * g.o_lora, T, HQ, (size_t) OG * g.o_lora);
+            if (!mv_n(d, j, OG, err)) return false;
+            if (!mv(d, {job(l.wo_b, d.oa, d.ao, T, (size_t) OG * g.o_lora, D)}, err)) return false;
+        } else CK(rt::memset_async(d.ao, 0, (size_t) T * D * sizeof(*d.ao), s));   // (no heads: nothing to add)
+        dump_sub(d, "ao", l.il, p0, T, d.ao, (size_t) T * D * 4);
+        if (nm > 1) allreduce(d.ao, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
+        hc_post(d.ao, d.h, d.a_post, d.a_comb, D, H, T, d.h2, s);
+        std::swap(d.h, d.h2);
+        if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, 1000 + l.il, p0, T);   // (DS4_DUMP_L: after the attention)
+        dump_sub(d, "h_attn", l.il, p0, T, d.h, (size_t) T * H * D * 4);
+        prof_mark(d, 1);
+        // the MoE
+        hc_mix_split(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, d.hccnt, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps,
+                     d.f_pre, d.f_post, d.f_comb, s);
+        hc_pre_norm(d.h, d.a_pre, l.ffn_norm, D, H, T, g.eps, d.x, s);
+        dump_sub(d, "f_pre", l.il, p0, T, d.f_pre, (size_t) T * 8 * 4);
+        dump_sub(d, "f_post", l.il, p0, T, d.f_post, (size_t) T * 8 * 4);
+        dump_sub(d, "f_comb", l.il, p0, T, d.f_comb, (size_t) T * 64 * 4);
+        dump_sub(d, "ffn_x", l.il, p0, T, d.x, (size_t) T * D * 4);
+        if (wp.async) {
+            // the routing goes to the service thread through the mailbox (a group's lead publishes it, the members
+            // make the same plan) while the device runs the shared expert and the VRAM experts (from the plan the
+            // router made), and waits for the answer only before the experts' sum
+            gemv_f32(l.gate_w, d.x, l.n_exp, D, T, d.glog, 1024, s);
+            const unsigned sq = wp.seq[l.il];
+            const int slot = (int) (sq % kRing);
+            const bool lead = mi == 0;
+            int na[2] = {0, 0};   // lookahead: the next layers' guesses (their gate on this FFN input), published below
+            for (int a = 1; lead && a <= std::min(2, ahead_mode); ++a) {
+                const Layer* nx = ahead_layer(L0, a);
+                if (nx == nullptr) break;
+                const int m = a == 1 ? std::max(1, std::min(kAhead1, nx->k_exp + ahead_extra)) : std::min(kPicks, nx->k_exp);
+                float* gl = d.glog_a + (size_t) (a - 1) * kWin * 1024;
+                gemv_f32(nx->gate_w, d.x, nx->n_exp, D, T, gl, 1024, s);   // (normed with the next layer's FFN
+                                                                         // weights instead: the same hit rate)
+                route_ahead(gl, nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s);
+                na[a - 1] = m;
+            }
+            route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
+                          d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
+                          na[1]);
+            if (!mv(d, {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)}, err)) return false;
+            swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
+            if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, FF, D)}, err)) return false;
+            prof_mark(d, 2);
+            const x3::ExpertLayout& lay = nm > 1 ? l.hlay : l.lay;
+            if (T == 1 && moe_token_path) {
+                x3::MoeArgs ma;
+                ma.plan_ptr = d.plan_ptr;
+                ma.plan_w = d.rw;
+                ma.cpu_part = lead ? resps[slot].part[0] : nullptr;
+                ma.cpu_flag = lead ? &resps[slot].cpu[0] : nullptr;
+                ma.lay = lay;
+                ma.k = l.k_exp;
+                ma.n_embd = D;
+                ma.n_ff = FF;
+                ma.limit = g.lim;
+                const bool mx = lay.fmt == gg::kFmtMXFP4;
+                if (zc_stage_buf != nullptr && l.zc_tab != nullptr)   // (the store's experts copied to VRAM at the PCIe rate first)
+                    zc_stage(d.plan_ptr, d.ridx, l.zc_tab, l.k_exp, zc_stage_buf, zc_stride, l.blob, s);
+                // DS4_TLOG2: the expert stage's three host spans (gate/up issue, the CPU-lane wait, down issue)
+                static const bool tlog2 = ds4_dbg("DS4_TLOG2");
+                static double t_moe_gu = 0, t_moe_wait = 0, t_moe_dn = 0; static long t_moe_n = 0; static bool t_moe_reg = false;
+                if (tlog2 && !t_moe_reg) {
+                    t_moe_reg = true;
+                    std::atexit([] {
+                        std::fprintf(stderr, "tlog2: %ld stages | host ms a stage: gate_up %.2f  cpu_wait %.2f  down %.2f\n",
+                                     t_moe_n, t_moe_n ? t_moe_gu / (double) t_moe_n : 0.0,
+                                     t_moe_n ? t_moe_wait / (double) t_moe_n : 0.0,
+                                     t_moe_n ? t_moe_dn / (double) t_moe_n : 0.0);
+                    });
+                }
+                const double m0 = tlog2 ? now_ms() : 0.0;
+                if (mx) gg::moe_gate_up(ma, d.x, d.xg, s);
+                else x3::moe_gate_up(ma, d.x, d.xg, s);
+                const double m1 = tlog2 ? now_ms() : 0.0;
+                prof_mark(d, 3);
+                if (lead) wait_seq(&resps[slot].seq, sq, s);
+                const double m2 = tlog2 ? now_ms() : 0.0;
+                prof_mark(d, 4);
+                if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
+                else x3::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
+                if (tlog2) { t_moe_gu += m1 - m0; t_moe_wait += m2 - m1; t_moe_dn += now_ms() - m2; ++t_moe_n; }
+            } else {   // each distinct expert read once for the window's tokens
+                gf::MoeWin mw;
+                mw.plan_ptr = d.plan_ptr;
+                mw.T = T;
+                mw.k = l.k_exp;
+                mw.grp_ptr = d.grp_ptr;
+                mw.grp_start = d.grp_start;
+                mw.grp_ent = d.grp_ent;
+                mw.n_groups = d.n_groups;
+                gf::moe_win_group(mw, s);
+                x3::WinArgs wa;
+                wa.grp_ptr = d.grp_ptr;
+                wa.grp_start = d.grp_start;
+                wa.grp_ent = d.grp_ent;
+                wa.n_groups = d.n_groups;
+                wa.plan_ptr = d.plan_ptr;
+                wa.plan_w = d.rw;
+                wa.cpu_part = lead ? &resps[slot].part[0][0] : nullptr;
+                wa.cpu_stride = kMaxDim;
+                wa.cpu_flag = lead ? resps[slot].cpu : nullptr;
+                wa.wait_ptr = lead ? &resps[slot].seq : nullptr;
+                wa.wait_val = sq;
+                wa.x = d.x;
+                wa.x_stride = (size_t) D;
+                wa.h = d.xg;
+                wa.part = d.ed;
+                wa.sh_out = d.sh_out;
+                wa.out = d.moe_out;
+                wa.out_stride = (size_t) D;
+                wa.lay = lay;
+                wa.T = T;
+                wa.k = l.k_exp;
+                wa.n_embd = D;
+                wa.n_ff = FF;
+                wa.limit = g.lim;
+                if (!(lay.fmt == gg::kFmtMXFP4 ? gg::win_experts(wa, s) : x3::win_experts(wa, s))) {
+                    err = "exl3 win_experts failed";
+                    return false;
+                }
+            }
+            if (lead) st.experts += (int64_t) T * l.k_exp;
+            if (nm > 1) allreduce(d.moe_out, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
+            hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
+            std::swap(d.h, d.h2);
+            CK(rt::copy_async(d.pre, d.f_pre, (size_t) T * 8 * 4, s));
+            prof_mark(d, 5);
+            return true;
+        }
+        if (nm > 1) {
+            err = "a tensor-parallel layer on the host-routed path";
+            return false;
+        }
+        // (glog rows are 1024 apart: route reads them so)
+        static const bool phases = ds4_dbg("DS4_PHASES");   // debugging: where a decode layer's host time goes
+        static double ph[8] = {0}, ph_prev = 0; static long ph_n = 0;
+        const double ph0 = phases ? now_ms() : 0.0;
+        gemv_f32(l.gate_w, d.x, l.n_exp, D, T, d.glog, 1024, s);
+        VlBits vb = {};
+        vb.w[0] = l.mtp ? 0u : wp.vl;
+        route(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, d.ridx, d.rw, s, l.gate_bias_vl,
+              vb.w[0] != 0 ? &vb : nullptr);
+        CK(rt::copy_async(h_idx, d.ridx, (size_t) T * kPicks * 4, s));
+        CK(rt::copy_async(h_w, d.rw, (size_t) T * kPicks * 4, s));
+        CK(rt::copy_async(h_x, d.x, (size_t) T * D * 4, s));
+        CK(rt::event_record(d.ev, s));
+        // the shared expert while the host looks at the picks
+        if (!mv(d, {job(l.s1, d.x, d.sg, T, D, g.ff), job(l.s3, d.x, d.su, T, D, g.ff)}, err)) return false;
+        if (ds4_dbg("DS4_DBG_MOE")) {}
+        swiglu(d.sg, d.su, T * g.ff, g.lim, d.sh, s);
+        if (ds4_dbg("DS4_DBG_MOE")) dbg_nf("sh", l.il, d.sh, (size_t) T * g.ff);
+        if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, g.ff, D)}, err)) return false;
+        const double tw = now_ms();
+        CK(rt::event_sync(d.ev));
+        st.gpu_wait_ms += now_ms() - tw;
+        const double ph2 = phases ? now_ms() : 0.0;
+        dump_sub(d, "glog", l.il, p0, T, d.glog, (size_t) T * 1024 * 4);
+        dump_sub_host("ridx", l.il, p0, T, h_idx, (size_t) T * kPicks * 4);
+        dump_sub_host("rw", l.il, p0, T, h_w, (size_t) T * kPicks * 4);
+        dump_sub(d, "sh_out", l.il, p0, T, d.sh_out, (size_t) T * D * 4);
+        // the picks by expert: the VRAM ones' rows (gathered inputs, one GEMV per matrix for all their tokens), the
+        // CPU lane's entries
+        Combine cm;
+        Gather ga;
+        uint32_t* pr = prof.data() + (size_t) l.il * g.n_exp;
+        int vex[kWin * kPicks], vrow0[kWin * kPicks], vn[kWin * kPicks];
+        int nvex = 0, nrows = 0;
+        std::vector<Ent> ents;
+        std::vector<std::pair<int, float>> cpu_rows;   // slot -> (token, weight)
+        std::vector<std::vector<std::pair<int, int>>> per((size_t) l.n_exp);   // expert -> (token, pick)
+        for (int t = 0; t < T; ++t) {
+            cm.n[t] = 0;
+            cm.cpu[t] = 0;
+            for (int i = 0; i < l.k_exp; ++i) {
+                const int e = h_idx[t * kPicks + i];
+                if (e < 0 || e >= l.n_exp) {
+                    err = "router picked expert " + std::to_string(e) + " (layer " + std::to_string(l.il) + ", token " + std::to_string(t) + ", pick " + std::to_string(i) + ", of " + std::to_string(l.k_exp) + ")";
+                    return false;
+                }
+                ++pr[e];
+                l.heat[(size_t) e] += 1.0f;
+                if (l.slot[(size_t) e] < 0) l.cpu_hits.push_back(e);
+                per[(size_t) e].push_back({t, i});
+            }
+        }
+        int nslots = 0;
+        for (int e = 0; e < l.n_exp; ++e) {
+            const auto& pe = per[(size_t) e];
+            if (pe.empty()) continue;
+            const bool on_gpu = l.slot[(size_t) e] >= 0;
+            if (on_gpu) {
+                vex[nvex] = e;
+                vrow0[nvex] = nrows;
+                vn[nvex] = (int) pe.size();
+                for (const auto& tp : pe) {
+                    ga.src[nrows] = tp.first;
+                    const int t = tp.first;
+                    cm.row[t][cm.n[t]] = nrows;
+                    cm.w[t][cm.n[t]] = h_w[t * kPicks + tp.second];
+                    ++cm.n[t];
+                    ++nrows;
+                }
+                ++nvex;
+            } else {
+                for (size_t a = 0; a < pe.size(); a += (size_t) ent_cap(l)) {
+                    Ent en;
+                    en.e = e;
+                    en.slot0 = nslots;
+                    en.n = (int) std::min<size_t>((size_t) ent_cap(l), pe.size() - a);
+                    for (int i = 0; i < en.n; ++i) {
+                        en.tok[i] = pe[a + (size_t) i].first;
+                        cpu_rows.push_back({pe[a + (size_t) i].first, h_w[pe[a + (size_t) i].first * kPicks + pe[a + (size_t) i].second]});
+                        cm.cpu[en.tok[i]] = 1;
+                    }
+                    nslots += en.n;
+                    ents.push_back(en);
+                }
+            }
+        }
+        st.experts += (int64_t) T * l.k_exp;
+        st.cpu_experts += nslots;
+        if (nrows > 0) {
+            gather_rows(d.x, ga, nrows, D, d.xe, s);
+            dump_sub(d, "xe", l.il, p0, nrows, d.xe, (size_t) nrows * D * 4);
+            if (dump_s != nullptr) { std::vector<int> vmap; for (int i = 0; i < nvex; ++i) { vmap.push_back(vex[i]); vmap.push_back(vrow0[i]); vmap.push_back(vn[i]); }
+              dump_sub_host("vmap", l.il, p0, nvex, vmap.data(), vmap.size() * 4); }
+            x3::MvJob j[2 * kWin * kPicks];
+            int nj = 0;
+            for (int i = 0; i < nvex; ++i) {
+                const auto& vm = l.vm[(size_t) vex[i]];
+                j[nj++] = job(vm[0], d.xe + (size_t) vrow0[i] * D, d.xg + (size_t) vrow0[i] * g.ff, vn[i], D, g.ff);
+                j[nj++] = job(vm[1], d.xe + (size_t) vrow0[i] * D, d.xu + (size_t) vrow0[i] * g.ff, vn[i], D, g.ff);
+            }
+            if (!mv_n(d, j, nj, err)) return false;
+            dump_sub(d, "xg", l.il, p0, nrows, d.xg, (size_t) nrows * g.ff * 4);
+            dump_sub(d, "xu", l.il, p0, nrows, d.xu, (size_t) nrows * g.ff * 4);
+            swiglu(d.xg, d.xu, nrows * g.ff, g.lim, d.xhh, s);
+            dump_sub(d, "xhh", l.il, p0, nrows, d.xhh, (size_t) nrows * g.ff * 4);
+            nj = 0;
+            for (int i = 0; i < nvex; ++i)
+                j[nj++] = job(l.vm[(size_t) vex[i]][2], d.xhh + (size_t) vrow0[i] * g.ff, d.ed + (size_t) vrow0[i] * D,
+                              vn[i], g.ff, D);
+            if (!mv_n(d, j, nj, err)) return false;
+            dump_sub(d, "ed", l.il, p0, nrows, d.ed, (size_t) nrows * D * 4);
+        }
+        const double ph3 = phases ? now_ms() : 0.0;
+        if (!ents.empty()) {
+            const double tc = now_ms();
+            static const bool skip_cpu = ds4_dbg("DS4_SKIP_CPU");   // (timing only: the CPU lane's experts left out)
+            if (!skip_cpu) cpu_experts(l, h_x, ents);
+            else if (ds4_dbg("DS4_FAKE_CPU_US")) std::this_thread::sleep_for(std::chrono::microseconds(std::atoi(std::getenv("DS4_FAKE_CPU_US"))));   // (timing only)
+            std::fill(h_part, h_part + (size_t) T * D, 0.0f);
+            for (int sl = 0; sl < nslots; ++sl) {
+                float* o = h_part + (size_t) cpu_rows[(size_t) sl].first * D;
+                const float wv = cpu_rows[(size_t) sl].second;
+                const float* y = c_yd.data() + (size_t) sl * D;
+                for (int e = 0; e < D; ++e) o[e] += wv * y[e];
+            }
+            if (ds4_dbg("DS4_CPU_LOG")) {}
+            st.cpu_ms += now_ms() - tc;
+            dump_sub_host("cpu_part", l.il, p0, T, h_part, (size_t) T * D * 4);
+            CK(rt::copy_async(d.cpu_part, h_part, (size_t) T * D * 4, s));
+        }
+        combine(d.ed, ents.empty() ? nullptr : d.cpu_part, d.sh_out, cm, T, D, d.moe_out, s);
+        dump_sub(d, "moe_out", l.il, p0, T, d.moe_out, (size_t) T * D * 4);
+        if (ds4_dbg("DS4_DBG_MOE")) {}
+        hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
+        std::swap(d.h, d.h2);
+        dump_sub(d, "h_out", l.il, p0, T, d.h, (size_t) T * H * D * 4);
+        if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, l.il, p0, T);   // (post-layer residual, as the chunk path writes it)
+        CK(rt::copy_async(d.pre, d.f_pre, (size_t) T * 8 * 4, s));
+        if (phases && T == 1) {
+            const double ph4 = now_ms();
+            ph[0] += ph2 - ph0; ph[1] += ph3 - ph2; ph[2] += ph4 - ph3; if (ph_prev > 0 && ph0 - ph_prev < 5.0) ph[3] += ph0 - ph_prev; ph_prev = ph4; ++ph_n;
+            static bool reg = false;
+            if (!reg) { reg = true; std::atexit([] { std::fprintf(stderr, "phases per layer call (%ld): route enqueue + shared expert + wait %.3f ms, routing analysis + GPU experts enqueue %.3f ms, CPU lane + combine + hc_post %.3f ms, attention enqueue %.3f ms%s", ph_n, ph[0] / ph_n, ph[1] / ph_n, ph[2] / ph_n, ph[3] / ph_n, "\n"); }); }
+        }
+        // (h_part / h_x are written again only after the next layer's route has synchronized, which follows these)
+        return true;
+    }
 
+    int sample(float temperature, float top_p, int top_k, float min_p, uint64_t seed, uint64_t counter) {
+        Dev& d = devs[(size_t) head_dev];
+        rt::set_device(d.id);
+        strata::dsv41k::SamplerParams sp;
+        sp.temperature = temperature;
+        sp.greedy = temperature <= 0.0f;
+        sp.top_p = top_p;
+        sp.top_k = top_k;
+        sp.min_p = min_p;
+        sp.seed = seed;
+        sp.counter = counter;
+        strata::dsv41k::sample_tokens(d.logits + (size_t) std::max(0, n_logits - 1) * g.vocab, 1, g.vocab, nullptr, 0,
+                                       sp, d.tok, d.st);
+        int t = -1;
+        rt::copy_async(&t, d.tok, 4, d.st);
+        rt::stream_sync(d.st);
+        return t;
+    }
+
+    bool logits(std::vector<float>& out) {
+        if (logits_all) {
+            out = chunk_logits;
+            return true;
+        }
+        Dev& d = devs[(size_t) head_dev];
+        rt::set_device(d.id);
+        out.resize((size_t) std::max(1, n_logits) * g.vocab);
+        return rt::copy_async(out.data(), d.logits, out.size() * 4, d.st) == rt::Result::success &&
+               rt::stream_sync(d.st) == rt::Result::success;
+    }
+
+    void save_profile() const {
+        if (o.profile.empty() || o.profile_readonly) return;   // (--profile-readonly: a test keeps the file it read)
+        const std::string tmp = o.profile + ".tmp";
+        std::FILE* f = std::fopen(tmp.c_str(), "wb");
+        if (f == nullptr) return;
+        const bool ok = std::fwrite(prof.data(), 4, prof.size(), f) == prof.size();
+        std::fclose(f);
+        // (the old profile replaced: std::rename does not replace an existing file on Windows, so there the profile
+        // never moved on and only .tmp files were left)
+        if (!ok || !os::replace_file(tmp, o.profile)) std::remove(tmp.c_str());
+    }
+
+    std::vector<std::string> info_lines() const {
+        std::vector<std::string> v;
+        int nh = 0;
+        for (const Layer& l : L) nh += l.n_exp - l.n_vram;
+        char b[512];
+        // kv=fp4: DeepSeek's own cache layout (the compressed KV and the index keys FP4, the window FP8)
+        std::snprintf(b, sizeof b, "INFO context=%lld kv=fp4 kv_resident=%lld expert_slots=%d engine_kind=ds4 "
+                                   "cpu_experts=%d ram_experts=%d engine=ds4-0.1",
+                      (long long) o.max_context, (long long) o.max_context, g.nl * g.n_exp - nh, nh, ram_held);
+        v.push_back(b);
+        if (commit_kept > 0) {   // (Windows, an integrated GPU: the commit kept experts off the GPU - the server says so)
+            std::snprintf(b, sizeof b,
+                          "NOTE experts: %.0f GB stay off the GPU - Windows' page file is too small to hold them there; "
+                          "a page file of %.0f GB keeps them on the GPU (System > About > Advanced system settings > "
+                          "Performance > Advanced > Virtual memory), then restart XeStrata", commit_kept / 1e9, pagefile_hint);
+            v.push_back(b);
+            std::snprintf(b, sizeof b, "INFO gpu_commit_capped_gb=%.0f pagefile_hint_gb=%.0f", std::ceil(commit_kept / 1e9),
+                          pagefile_hint);
+            v.push_back(b);
+        }
+        if (pk.eg_layers > 0) {   // the n-gram memory's (Engram's) table rows a token reads, for the Monitor
+            std::snprintf(b, sizeof b, "INFO engram_layers=%d engram_lookups=%d", pk.eg_layers,
+                          pk.eg_layers * (pk.eg_ngram - 1) * pk.eg_heads);
+            v.push_back(b);
+        }
+        v.push_back("INFO vision=off");
+        return v;
+    }
 };
+
+Model::Model() : p_(new Impl) {}
+Model::~Model() = default;
+bool Model::load(const Options& o, std::string& err) try {
+    if (!p_->mailbox->ready(err)) return false;
+    return p_->complete(p_->load(o, err), err);
+} catch (const std::exception& e) { p_->mailbox->stop(e.what()); err = e.what(); return false; }
+bool Model::step(int token, bool logits, std::string& err) try {
+    if (!p_->mailbox->ready(err)) return false;
+    if (!p_->validate_input(&token, 1, err)) return false;
+    return p_->complete(p_->step(token, logits, err), err);
+} catch (const std::exception& e) { p_->mailbox->stop(e.what()); err = e.what(); return false; }
+bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) try {
+    Impl& p = *p_;
+    if (!p.mailbox->ready(err)) return false;
+    if (!p.validate_input(tokens, n, err)) return false;
+    p.pm.last = -1;
+    p.halted = false;
+    if (ds4_dbg("DS4_DBG_CHUNK")) std::fprintf(stderr, "feed n %d chunk %d chunk_min %d\n", n, p.chunk, p.chunk_min);
+    if (p.chunk > 0 && n >= p.chunk_min) {   // a long run - or one the flow could take, if it is the faster path here
+        const double t0 = now_ms();   // (every row's logits (tests): the chunked path, which keeps them all)
+        const bool ok = logits_rows > kWin || p.pick_path(n) ? p.forward_chunks(tokens, n, logits_rows, err)
+                                                             : p.feed_windows(tokens, n, logits_rows, err);
+        if (ok) p.path_done(now_ms() - t0);
+        return p.complete(ok, err);
+    }
+    return p.complete(p.feed_windows(tokens, n, logits_rows, err), err);
+} catch (const std::exception& e) { p_->mailbox->stop(e.what()); err = e.what(); return false; }
+bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::string& err) try {
+    Impl& p = *p_;
+    if (!p.mailbox->ready(err)) return false;
+    if (!p.validate_input(tokens, n, err)) return false;
+    p.pm.last = -1;
+    p.halted = false;
+    const double t0 = now_ms();
+    if (n >= 2 && p.chunk > 0 && n >= p.chunk_min && p.pick_path(n)) {   // (the last token rides along; its layers
+        const bool ok = p.forward_chunks(tokens, n, logits_rows, err, slot);   // keep the state before it)
+        if (ok) p.path_done(now_ms() - t0);
+        return p.complete(ok, err);
+    }
+    if (n > 1 && !p.feed_windows(tokens, n - 1, 0, err)) return p.complete(false, err);
+    p.checkpoint(slot);
+    const bool ok = n < 1 || p.feed_windows(tokens + n - 1, 1, logits_rows, err);
+    if (ok) p.path_done(now_ms() - t0);   // (windows, when pick_path chose them)
+    return p.complete(ok, err);
+} catch (const std::exception& e) { p_->mailbox->stop(e.what()); err = e.what(); return false; }
+int Model::feed_unit() const { return p_->chunk > 0 ? std::max(p_->chunk, (int) p_->o.max_context) : kWin; }
+void Model::set_progress(std::function<void(int64_t)> f) { p_->progress = std::move(f); }
+void Model::set_cancel(std::function<bool()> f) { p_->cancel = std::move(f); }
+bool Model::cancelled() const { return p_->halted; }
+int Model::sample(float t, float tp, int tk, float mp, uint64_t seed, uint64_t counter) {
+    return p_->sample(t, tp, tk, mp, seed, counter);
+}
+bool Model::logits(std::vector<float>& out) try {
+    std::string err;
+    return p_->mailbox->ready(err) && p_->complete(p_->logits(out), err);
+} catch (const std::exception& e) { p_->mailbox->stop(e.what()); return false; }
+int Model::image_token() const { return p_->img_tok; }
+int Model::dim() const { return p_->g.dim; }
+bool Model::encode_image(const uint8_t* rgb, int width, int height, std::vector<uint16_t>& span, std::string& err) try {
+    if (!p_->mailbox->ready(err)) return false;
+    return p_->encode_image(rgb, width, height, span, err);
+} catch (const std::exception& e) { p_->mailbox->stop(e.what()); err = e.what(); return false; }
+void Model::set_images(std::vector<Image> images) {
+    std::sort(images.begin(), images.end(), [](const Image& a, const Image& b) { return a.start < b.start; });
+    p_->imgs = std::move(images);
+}
+int Model::draft_block() const { return p_->g.n_mtp > 0 ? p_->g.d_block : 0; }
+bool Model::has_matrix_engines() const { return p_->matrix_capable(); }
+bool Model::draft(int y, std::vector<int>& d, std::vector<float>& c, std::string& err, float t, float tp, int tk,
+                  float mp, uint64_t seed, uint64_t counter) try {
+    if (!p_->mailbox->ready(err)) return false;
+    if (!p_->validate_input(&y, 1, err, false)) return false;
+    return p_->complete(p_->draft(y, d, c, err, t, tp, tk, mp, seed, counter), err);
+} catch (const std::exception& e) { p_->mailbox->stop(e.what()); err = e.what(); return false; }
+bool Model::verify(int y, const std::vector<int>& d, float t, float tp, int tk, float mp, uint64_t seed, uint64_t counter,
+                   int& accepted, int& next, std::string& err) try {
+    if (!p_->mailbox->ready(err)) return false;
+    int tokens[kWin];
+    tokens[0] = y;
+    const int count = (int) std::min<size_t>(d.size(), kWin - 1);
+    for (int i = 0; i < count; ++i) tokens[i + 1] = d[(size_t) i];
+    if (!p_->validate_input(tokens, count + 1, err)) return false;
+    return p_->complete(p_->verify(y, d, t, tp, tk, mp, seed, counter, accepted, next, err), err);
+} catch (const std::exception& e) { p_->mailbox->stop(e.what()); err = e.what(); return false; }
+int64_t Model::pos() const { return p_->pos; }
+int64_t Model::max_context() const { return p_->o.max_context; }
+int Model::vocab() const { return p_->g.vocab; }
+const std::vector<int32_t>& Model::tokens() const { return p_->toks; }
+void Model::reset() { p_->reset(); }
+void Model::checkpoint(int slot) { p_->checkpoint(slot); }
+bool Model::restore(int64_t limit) { return p_->restore(limit); }
+void Model::pin() { p_->pin(); }
+std::vector<int64_t> Model::check_positions() const { return p_->check_positions(); }
+int64_t Model::restorable(int64_t limit) const { return p_->restorable(limit); }
+uint64_t Model::slot_save(std::vector<uint8_t>& out, std::string& err) try {
+    if (!p_->mailbox->ready(err)) return 0;
+    const uint64_t saved = p_->slot_save(out, err);
+    return p_->mailbox->ready(err) ? saved : 0;
+} catch (const std::exception& e) { p_->mailbox->stop(e.what()); err = e.what(); return 0; }
+bool Model::slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err) try {
+    if (!p_->mailbox->ready(err)) return false;
+    if (!data || p_->devs.empty()) { err = "invalid saved conversation input"; return false; }
+    // slot_load already resets partially imported state on malformed input; only
+    // its explicit runtime failures stop the mailbox service.
+    const bool ok = p_->slot_load(data, bytes, n_pos, err);
+    return p_->mailbox->ready(err) && ok;
+} catch (const std::exception& e) { p_->mailbox->stop(e.what()); err = e.what(); return false; }
+std::string Model::slot_identity() const { return p_->slot_identity(); }
+void Model::save_profile() const { p_->save_profile(); }
+const Stats& Model::stats() const {
+    Stats& st = p_->st;
+    if (p_->store) {   // (the store keeps its own counters: copied in when asked)
+        const ExpertStore& x = *p_->store;
+        st.store_hits = x.stats().hits.load();
+        st.store_misses = x.stats().misses.load();
+        st.store_prefetched = x.stats().prefetched.load();
+        st.store_pf_used = x.stats().prefetch_used.load();
+        st.store_pf_wasted = x.stats().prefetch_wasted.load();
+        st.store_evictions = x.stats().evictions.load();
+        st.store_bytes = x.stats().bytes_read.load();
+        st.store_fails = x.stats().fails.load();
+        st.store_wait_ms = x.stats().wait_ns.load() / 1e6;
+        st.store_busy_ms = x.busy_ms();
+        st.store_zc_visible = (int64_t) x.visible_count();
+        st.store_slots = (int64_t) x.slots_allocated();
+        st.store_slots_max = (int64_t) x.slots_max();
+    }
+    return st;
+}
+std::string Model::describe() const { return p_->describe(); }
+std::vector<std::string> Model::info_lines() const { return p_->info_lines(); }
 
 }  // namespace strata::ds4
