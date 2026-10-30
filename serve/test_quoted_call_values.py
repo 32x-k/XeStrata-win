@@ -1,6 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
+# SPDX-License-Identifier: MIT
 """#4078: a string argument that quotes a whole tool call, or reopens its own parameter, stays exact.
 
     python -m unittest serve.test_quoted_call_values -v
