@@ -1252,15 +1252,16 @@ def amd_uma(carve_gb: float, gtt_gb: float, ram: float) -> dict:
 
 
 def unused_apu_notes(found, used, ram) -> list:
-    """upstream 30a67051d: an APU (a Strix Halo beside a card) that is NOT in the run: its BIOS carve-out is memory the OS
-    does not have, and it is the RAM the experts live in.  Nothing is changed: a "!" line says what is lost and what to set."""
+    """upstream 30a67051d: an APU (a Strix Halo beside a card) that is NOT in the run: its BIOS carve-out is memory
+    the OS does not have, and it is the RAM the experts live in.  Nothing is changed: a "!" line says what is lost and
+    what to set."""
     out = []
     for g in found:
         if "uma_gb" in g and g["index"] not in used and g.get("carve_gb", 0.0) > 16:
-            out.append(f"!the BIOS gives {g['carve_gb']:.0f} GB of your memory to {g['name']}, which this run does not use: "
-                       f"the OS has {ram:.0f} GB left for the experts and the desktop, and the engine can run out of RAM. A "
-                       "small carve-out (512 MB - 2 GB, 'UMA Frame Buffer Size' in the BIOS) gives it back; the GPU reaches "
-                       "the shared memory anyway")
+            out.append(f"!the BIOS gives {g['carve_gb']:.0f} GB of your memory to {g['name']}, which this run does "
+                       f"not use: the OS has {ram:.0f} GB left for the experts and the desktop, and the engine can "
+                       "run out of RAM. A small carve-out (512 MB - 2 GB, 'UMA Frame Buffer Size' in the BIOS) gives "
+                       "it back; the GPU reaches the shared memory anyway")
     return out
 
 
