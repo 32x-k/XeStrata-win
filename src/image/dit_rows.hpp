@@ -474,6 +474,16 @@ inline void rows_back(float* y, const float* rs, const float* b, int64_t T, int6
     });
 }
 
+// y[t] += b (the weight's own bias, after a product whose output an OFT turned: a rotation of the weight's rows is
+// not one of its bias's)
+inline void bias_add(float* y, const float* b, int64_t T, int64_t N, void* s) {
+    if (T <= 0 || b == nullptr) return;
+    q_of(s).parallel_for(sycl::range<1>((size_t) (T * N)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        y[i] += b[i % N];
+    });
+}
+
 // x[t] += gate * h[t] (per channel; gate null: 1)
 inline void gate_add(float* x, const MfOut& h, const float* gate, int64_t T, int64_t C, void* s) {
     if (T <= 0) return;

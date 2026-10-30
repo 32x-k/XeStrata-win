@@ -566,7 +566,17 @@ MfOut MfDit::product(const uint16_t* x16, const float* rs, const W& w, const uin
             out.b = bias;
             return out;
         }
-        qi_i8_scale(y, T, w.n, w.n, sx, sw, bias, col, s_);   // sx carries the rows' scales: y is in the input's units
+        // an OFT turns the weight's rows: the weight's own bias goes after it (the delta is the input's own, x16 =
+        // x / rs, and the turn is of x16's units too)
+        const bool oft = lora != nullptr && lora->has_oft();   // (a layer there: defer is off above)
+        qi_i8_scale(y, T, w.n, w.n, sx, sw, oft ? nullptr : bias, col, s_);   // sx carries the rows' scales: y is in
+                                                                            // the input's units
+        if (oft) {
+            lora_scratch(T);
+            lora->add(x16, T, y, w.n, 0, w.n, rs, gemm_, lora_f32_, lora16_, s_);
+            if (bias != nullptr) dit_rows::bias_add(y, bias, T, w.n, s_);
+            return out;
+        }
     } else {
         if (w.type == kTypeF16) gemm_.f16(x16, reinterpret_cast<const uint16_t*>(d), y, T, w.n, w.k);
         else gemm_.native(x16, w.type, d, y, T, w.n, w.k);
@@ -575,7 +585,14 @@ MfOut MfDit::product(const uint16_t* x16, const float* rs, const W& w, const uin
             out.b = bias;
             return out;
         }
-        if (rs != nullptr || bias != nullptr || col != nullptr) rows_back(y, rs, bias, T, w.n, s_, col);
+        const bool oft = lora != nullptr && lora->has_oft();
+        if (rs != nullptr || bias != nullptr || col != nullptr) rows_back(y, rs, oft ? nullptr : bias, T, w.n, s_, col);
+        if (oft) {
+            lora_scratch(T);
+            lora->add(x16, T, y, w.n, 0, w.n, rs, gemm_, lora_f32_, lora16_, s_);
+            if (bias != nullptr) dit_rows::bias_add(y, bias, T, w.n, s_);
+            return out;
+        }
     }
     if (lora != nullptr) {
         // the delta is the input's own (x16 = x / rs): its rows' scales put it back in y's units, as rows_back does
@@ -772,6 +789,7 @@ bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                 unknown.push_back(e.key);
                 continue;
             }
+            const bool oft = e.kind == LoraKind::oft;
             if (e.kind == LoraKind::bias) {   // a bias's delta alone: its rows are the bias's, its columns none
                 if (e.rows != slot->rows) {
                     err = "image engine: " + u.file->path() + ": " + e.key + ": a bias's delta (diff_b/b_norm) of " +
@@ -779,7 +797,7 @@ bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                     drop_loras();
                     return false;
                 }
-            } else if (e.rows != slot->rows || e.cols != slot->w->k) {
+            } else if (e.rows != slot->rows || (oft ? e.cols != 0 : e.cols != slot->w->k)) {
                 err = "image engine: " + u.file->path() + ": " + e.key + " is " + std::to_string(e.cols) + " x " +
                       std::to_string(e.rows) + ", not the DiT's " + std::to_string(slot->w->k) + " x " +
                       std::to_string(slot->rows);
@@ -814,10 +832,10 @@ bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                     return false;
                 }
             }
-            if (lora_dora_overlap(slot->w->lora, slot->row0, slot->rows, !coef.empty()) != nullptr) {
+            if (const LoraPart* clash = lora_dora_overlap(slot->w->lora, slot->row0, slot->rows, !coef.empty(), oft)) {
                 err = "image engine: " + u.file->path() + ": " + e.key + ": the weight's rows " +
                       std::to_string(slot->row0) + " .. " + std::to_string(slot->row0 + slot->rows) +
-                      " are another adapter's, and a DoRA's rows are the weight's before the other's patch";
+                      " are another adapter's, and " + lora_patch_clash_why(*clash);
                 drop_loras();
                 return false;
             }
@@ -840,6 +858,7 @@ bool MfDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
             part.scale = scale;
             part.bias_scale = u.scale;   // a diff patch has no alpha: the request's strength only
             part.dora = !coef.empty();
+            part.oft = oft;
             part.base = std::move(base);
             slot->w->lora->parts.push_back(std::move(part));
             lora_cols_ = std::max(lora_cols_, lora_scratch_cols(e));

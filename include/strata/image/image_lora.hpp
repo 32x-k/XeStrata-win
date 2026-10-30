@@ -30,6 +30,17 @@
 // key, on the weight's bias: b' = b + s * Db, the request's strength only - a diff patch has no alpha - added where
 // the DiT adds the weight's bias (after the product's row scales and whatever its own bias's value is).  A file may
 // hold one alone (LoraKind::bias: it changes no weight) or beside the weight's own delta.
+//
+// An OFT (oft_blocks, comfy/weight_adapter/oft.py) turns a weight's output rows: the rows are cut into blocks of
+// `bs` rows, each block's rotation r = (I + Q) (I - Q)^-1 of its skew part Q = blocks - blocks^T (the file's alpha
+// clamped as Q's Frobenius norm where it is above 0), and the weight becomes r W: a product's output y is turned,
+// (1 - s) y + s * rescale * (r y) - interpolated once, so the strength 1 is ComfyUI's patch (which, as its second
+// multiplication shows, applies s twice: the engine takes the interpolation, as its set_weight's) and 0 leaves the
+// weight as it was.  `rescale`, where the file holds one, scales the turned rows (LyCORIS's form; ComfyUI's OFT drops
+// the tensor, its BOFT takes it).  A bias is not turned (ComfyUI's patch is the weight's).  A BOFT (four dimensions)
+// applies `stages` of such rotations, each stage's blocks over the rows their own way (boft.py's butterfly),
+// composed before the one interpolation.  The rows are the weight's own, so an OFT keeps to them: another adapter's
+// rows must not overlap its own (the files' order would decide how the two compose).
 #pragma once
 
 #include <cstdint>
@@ -72,6 +83,24 @@ struct LokrShape {
     bool empty() const { return out_l <= 0 || in_m <= 0 || out_k <= 0 || in_n <= 0; }
 };
 
+/// OFT's geometry, a BOFT's too: the output's rows are turned by `blocks` block-diagonal rotations of `bs` rows each,
+/// `stages` of them one after another (an OFT file's one).  The weight's rows are blocks * bs.
+struct OftShape {
+    int64_t blocks = 0;   // the rotations of one stage
+    int64_t bs = 0;       // a rotation's rows
+    int64_t stages = 0;   // a BOFT's stages; an OFT file's one
+    bool boft = false;    // the file's crossing of the rows is a BOFT's (four dimensions), not an OFT's
+    bool empty() const { return blocks <= 0 || bs <= 0 || stages <= 0; }
+    int64_t rows() const { return empty() ? 0 : blocks * bs; }
+    /// A stage's rows in the order it turns them: the block's rows are read and written `bs` at a time from the
+    /// weight's rows m1 * group * k + j * r_b + i / group + (i % group) * k, with m1 = block / steps, j = block %
+    /// steps and steps = k / r_b (comfy/weight_adapter/boft.py's four dimensions' reshapes; an OFT's group 1, k = r_b
+    /// = bs reads them in place).  A BOFT's m = 1 crosses them too: it is not an OFT.
+    int64_t group() const { return boft ? 2 : 1; }
+    int64_t r_b() const { return boft ? bs / 2 : bs; }
+    int64_t k(int64_t stage) const { return boft ? (int64_t(1) << stage) * (bs / 2) : bs; }
+};
+
 /// One weight's delta, on the host: the tensors the file gave, A and B in FP16 (half the RAM of FP32, which is what
 /// the GPU takes), the scales in FP32.  The other forms' tensors are kept in `extra` by their role (`hada_w1_a`,
 /// `oft_blocks`, `diff`, ...) and FP32, for the forms the engine learns to apply; a LoKr's materialized w1 and w2 are
@@ -81,8 +110,9 @@ struct LoraEntry {
     LoraKind kind = LoraKind::lora;
     int64_t rows = 0, cols = 0, rank = 0;
     bool alpha_set = false;
-    float alpha = 0.0f;               // from ".alpha" (ComfyUI's rule: none, 1.0)
+    float alpha = 0.0f;               // from ".alpha" (ComfyUI's rule: none, 1.0); an OFT's: its Q's largest norm
     LokrShape lokr;                   // LoraKind::lokr: the factors' shape, `rows` and `cols` their product's
+    OftShape oft;                     // LoraKind::oft: the blocks' shape, `rows` their rows * bs and `cols` 0
     /// alpha / rank, the file's own scale (the caller's strength multiplies it).  LoKr's rank is the factorization's
     /// (ComfyUI divides the file's alpha by it, and by nothing where both of its matrices are whole).
     float scale() const { return alpha_set && rank > 0 ? alpha / static_cast<float>(rank) : 1.0f; }
@@ -96,6 +126,7 @@ struct LoraEntry {
     bool dora_over_rows = true;
     std::vector<float> bias;          // a bias's delta (.diff_b/.b_norm): `rows` values, FP32; empty: none.  A
                                       // LoraKind::bias entry's whole delta is this (its `cols` is 0)
+    std::vector<float> rescale;       // an OFT's rescale: the turned rows' factors, FP32; empty: none
     std::map<std::string, std::vector<float>> extra;   // the other forms' tensors, FP32, by role
     std::map<std::string, std::vector<int64_t>> shapes;   // their shapes, the file's order
 };
@@ -179,6 +210,13 @@ public:
                   void* stream) const;
     bool has_bias() const { return bias_ != nullptr; }
 
+    /// y[t][row0 + c] (row stride ldy) = (1 - scale) y[t][row0 + c] + scale * rescale[src_row + c] * (r y)[t][row0
+    /// + c], t < T, over the entry's own rows (an OFT's, or a BOFT's stages one after another): the product's output
+    /// turned, ComfyUI's patch of the weight interpolated once.  `tmp` holds T * rows values (the turned rows' own
+    /// table: the engine's scratch).  The part's rows must be the entry's (n == rows()).
+    void rotate(float* y, int64_t T, int64_t ldy, int64_t src_row, int64_t row0, int64_t n, float scale, float* tmp,
+                void* stream) const;
+
 private:
     void add_lokr(const uint16_t* x16, int64_t T, float* y, int64_t ldy, int64_t src_row, int64_t row0, int64_t n,
                   float scale, const float* row_scale, prefill::Gemm& gemm, float* tmp_f32, void* stream) const;
@@ -192,7 +230,10 @@ private:
     uint16_t* w2_ = nullptr;  // lokr: w2 [out_k][in_n]
     uint16_t* diff_ = nullptr;   // diff: Delta [rows][cols]
     float* bias_ = nullptr;      // a bias's delta [rows], FP32
+    float* rot_ = nullptr;       // oft: the rotations [stages][blocks][bs][bs], FP32
+    float* rescale_ = nullptr;   // oft: the turned rows' factors [rows], FP32
     LokrShape lokr_;
+    OftShape oft_;
     int64_t rank_ = 0, cols_ = 0, rows_ = 0;
     uint64_t bytes_ = 0;
 };
@@ -205,6 +246,7 @@ struct LoraPart {
     float scale = 1.0f;
     float bias_scale = 0.0f;   // the entry's bias's delta (none: 0), times the request's strength only (no alpha)
     bool dora = false;   // a DoRA's: its base factors are c's, which the weight's other patches do not know
+    bool oft = false;    // an OFT's: it turns the product's output over the part's whole rows
     /// DoRA: the base product's factor of each of the part's rows, 1 + strength (c - 1); a set_weight's: 1 - the
     /// strength.  Empty: the rows as the weight has them.  A row of the weight takes one part's factors.
     std::vector<float> base;
@@ -219,6 +261,9 @@ public:
 
     std::vector<LoraPart> parts;
     bool empty() const { return parts.empty(); }
+    /// True where a part turns the product's output (its bias is then added after the deltas: a rotation of the
+    /// weight's rows is not one of the weight's bias).
+    bool has_oft() const;
     /// The GPU memory the parts' entries hold (and the base product's factors).
     uint64_t bytes() const;
 
@@ -249,10 +294,13 @@ private:
 bool lora_dora_rows(const LoraEntry& e, int64_t src_row, int64_t row0, int64_t n, const std::vector<float>& norms,
                     float strength, std::vector<float>& coef, std::vector<float>& base, std::string& err);
 
-/// The bound part whose rows overlap [row0, row0 + n) of a weight's, where one of the two is a DoRA's: the two cannot
-/// be composed (ComfyUI patches the weights in the file's order, and a DoRA's c is the weight's as it was before the
-/// other's patch), so the caller refuses the set.  null: no such part.
-const LoraPart* lora_dora_overlap(const LoraLayer* layer, int64_t row0, int64_t n, bool dora);
+/// The bound part whose rows overlap [row0, row0 + n) of a weight's, where one of the two is a DoRA's or an OFT's:
+/// the two cannot be composed (ComfyUI patches the weights in the file's order, so a DoRA's c, and an OFT's turning,
+/// would depend on that order), so the caller refuses the set.  null: no such part.
+const LoraPart* lora_dora_overlap(const LoraLayer* layer, int64_t row0, int64_t n, bool dora, bool oft = false);
+
+/// Why a part's rows take no other adapter's (`lora_dora_overlap`'s part): the sentence a caller's error ends with.
+std::string lora_patch_clash_why(const LoraPart& p);
 
 /// The host tensors of `e` as FP16 (a file's BF16, F16 or F32), for a test or a form built by hand.
 void lora_to_f16(const std::vector<float>& f32, std::vector<uint16_t>& out);

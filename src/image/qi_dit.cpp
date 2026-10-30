@@ -927,10 +927,20 @@ bool QiDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                 drop_loras();
                 return false;
             }
-            if (e.rows != slot->rows || e.cols != slot->w->k) {
+            const bool oft = e.kind == LoraKind::oft;
+            if (e.rows != slot->rows || (oft ? e.cols != 0 : e.cols != slot->w->k)) {
                 err = "image engine: " + u.file->path() + ": " + e.key + " is " + std::to_string(e.cols) + " x " +
                       std::to_string(e.rows) + ", not the DiT's " + std::to_string(slot->w->k) + " x " +
                       std::to_string(slot->rows);
+                drop_loras();
+                return false;
+            }
+            if (oft && slot->name == "modulation.1" && C_ % e.oft.bs != 0) {
+                // the DiT writes that weight a band of C_ rows at a time: a rotation whose blocks a band cuts is not
+                // one the engine can apply to the band alone
+                err = "image engine: " + u.file->path() + ": " + e.key + ": an OFT of " + std::to_string(e.oft.bs) +
+                      "-row blocks, and the DiT writes the modulation " + std::to_string(C_) +
+                      " rows at a time (the blocks must divide it)";
                 drop_loras();
                 return false;
             }
@@ -955,10 +965,10 @@ bool QiDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
                     return false;
                 }
             }
-            if (lora_dora_overlap(slot->w->lora, slot->row0, slot->rows, !coef.empty()) != nullptr) {
+            if (const LoraPart* clash = lora_dora_overlap(slot->w->lora, slot->row0, slot->rows, !coef.empty(), oft)) {
                 err = "image engine: " + u.file->path() + ": " + e.key + ": the weight's rows " +
                       std::to_string(slot->row0) + " .. " + std::to_string(slot->row0 + slot->rows) +
-                      " are another adapter's, and a DoRA's rows are the weight's before the other's patch";
+                      " are another adapter's, and " + lora_patch_clash_why(*clash);
                 drop_loras();
                 return false;
             }
@@ -979,6 +989,7 @@ bool QiDit::set_loras(const std::vector<LoraUse>& loras, std::string& err) {
             part.n = slot->rows;
             part.scale = scale;
             part.dora = !coef.empty();
+            part.oft = oft;
             part.base = std::move(base);
             slot->w->lora->parts.push_back(std::move(part));
             lora_cols_ = std::max(lora_cols_, lora_scratch_cols(e));

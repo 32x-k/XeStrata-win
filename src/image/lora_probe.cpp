@@ -72,11 +72,16 @@ int list(const std::string& path) {
                 (double) f->host_bytes() / 1048576.0);
     for (const auto& [k, v] : f->metadata()) std::printf("  meta %s = %s\n", k.c_str(), clip(v).c_str());
     for (const auto& e : f->entries()) {
-        std::printf("  %-56s %-5s rank %-4lld %s %lld x %lld scale %.4f%s%s%s%s\n", e.key.c_str(),
+        char oft[64] = "";
+        if (e.kind == strata::image::LoraKind::oft && !e.oft.empty())
+            std::snprintf(oft, sizeof oft, "%s %lld x %lld%s", e.oft.stages > 1 ? " boft" : " oft",
+                          (long long) e.oft.blocks, (long long) e.oft.bs,
+                          e.oft.stages > 1 ? (" x " + std::to_string(e.oft.stages)).c_str() : "");
+        std::printf("  %-56s %-5s rank %-4lld %s %lld x %lld scale %.4f%s%s%s%s%s\n", e.key.c_str(),
                     strata::image::lora_kind_name(e.kind), (long long) e.rank, "in/out", (long long) e.cols,
                     (long long) e.rows, e.scale(), e.dora.empty() ? "" : " dora",
                     e.delta.empty() ? "" : (e.replaces ? " set_weight" : " diff"),
-                    e.bias.empty() ? "" : " +bias", e.extra.empty() ? "" : " +tensors");
+                    e.bias.empty() ? "" : " +bias", e.extra.empty() ? "" : " +tensors", oft);
     }
     return 0;
 }
@@ -637,6 +642,96 @@ void selftest_bias(void* s, int64_t T, int64_t N, bool with_weight, int64_t src_
     if (!ok) throw std::runtime_error(std::string("the bias's delta of ") + label + " is not the reference's");
 }
 
+// an OFT's (a BOFT's) turn: y = (1 - s) y + s * rescale * (the stages' rotations of y), the rotations' blocks over the
+// weight's rows (an OFT file's one stage reads them as they are, a BOFT's four dimensions in 2^i-row groups)
+void selftest_oft(void* s, int64_t T, int64_t N, int64_t bs, int64_t stages, bool boft, bool with_rescale,
+                  float strength) {
+    namespace si = strata::image;
+    const int64_t blocks = N / bs;
+    if (bs < 2 || blocks < 2 || N % bs != 0) throw std::runtime_error("selftest_oft: a block size the rows do not take");
+    std::mt19937 rng((uint32_t) (T * 131 + N * 17 + bs * 7 + stages * 3 + (with_rescale ? 1 : 0)));
+    std::normal_distribution<float> nd(0.0f, 0.5f);
+    si::LoraEntry e;
+    e.key = "selftest-oft";
+    e.kind = si::LoraKind::oft;
+    e.oft.stages = stages;
+    e.oft.blocks = blocks;
+    e.oft.bs = bs;
+    e.oft.boft = boft;
+    e.rows = N;
+    e.cols = 0;
+    // the rotations: a random matrix a block, its rows orthonormalized in FP64 (a rotation, as the Cayley transform's is)
+    std::vector<float> rot((size_t) (stages * blocks * bs * bs));
+    std::vector<double> g((size_t) (bs * bs));
+    for (int64_t b = 0; b < stages * blocks; ++b) {
+        for (double& v : g) v = (double) nd(rng);
+        for (int64_t i = 0; i < bs; ++i) {
+            for (int64_t j = 0; j < i; ++j) {
+                double d = 0;
+                for (int64_t k = 0; k < bs; ++k) d += g[(size_t) (i * bs + k)] * g[(size_t) (j * bs + k)];
+                for (int64_t k = 0; k < bs; ++k) g[(size_t) (i * bs + k)] -= d * g[(size_t) (j * bs + k)];
+            }
+            double norm = 0;
+            for (int64_t k = 0; k < bs; ++k) norm += g[(size_t) (i * bs + k)] * g[(size_t) (i * bs + k)];
+            norm = std::sqrt(norm);
+            for (int64_t k = 0; k < bs; ++k) g[(size_t) (i * bs + k)] /= norm;
+        }
+        for (int64_t i = 0; i < bs * bs; ++i) rot[(size_t) (b * bs * bs + i)] = (float) g[(size_t) i];
+    }
+    e.extra["oft_r"] = rot;
+    std::vector<float> rescale((size_t) N);
+    for (int64_t i = 0; i < N; ++i) rescale[(size_t) i] = std::exp2((float) (i % 3)) * 0.5f;   // 0.5, 1, 2
+    if (with_rescale) e.rescale = rescale;
+
+    si::LoraDeviceEntry dev;
+    std::string err;
+    if (!dev.upload(e, s, err)) throw std::runtime_error(err);
+    auto* dy = static_cast<float*>(gpu::alloc_device((size_t) (T * N) * 4));
+    auto* tf = static_cast<float*>(gpu::alloc_device((size_t) (T * N) * 4));
+    std::vector<float> y0((size_t) (T * N));
+    for (float& v : y0) v = nd(rng);
+    gpu::copy(dy, y0.data(), y0.size() * 4);
+    dev.rotate(dy, T, N, 0, 0, N, strength, tf, s);
+    if (!gpu::stream_sync(s)) throw std::runtime_error(gpu::last_error());
+    std::vector<float> got((size_t) (T * N));
+    gpu::copy(got.data(), dy, got.size() * 4);
+    // the reference, FP64: the stages one after another, then the one interpolation and the rescale
+    std::vector<double> cur((size_t) N), next((size_t) N);
+    std::vector<double> want((size_t) (T * N));
+    const int64_t group = boft ? 2 : 1, r_b = boft ? bs / 2 : bs;
+    for (int64_t t = 0; t < T; ++t) {
+        for (int64_t i = 0; i < N; ++i) cur[(size_t) i] = y0[(size_t) (t * N + i)];
+        for (int64_t st = 0; st < stages; ++st) {
+            const int64_t k = boft ? (int64_t(1) << st) * (bs / 2) : bs;
+            const int64_t steps = k / r_b;
+            for (int64_t b = 0; b < blocks; ++b) {
+                const int64_t m1 = b / steps, j = b - m1 * steps, base = m1 * group * k + j * r_b;
+                for (int64_t i = 0; i < bs; ++i) {
+                    double v = 0;
+                    for (int64_t m = 0; m < bs; ++m)
+                        v += (double) rot[(size_t) ((st * blocks + b) * bs * bs + i * bs + m)] *
+                             cur[(size_t) (base + m / group + (m % group) * k)];
+                    next[(size_t) (base + i / group + (i % group) * k)] = v;
+                }
+            }
+            cur.swap(next);
+        }
+        for (int64_t i = 0; i < N; ++i) {
+            const double r = with_rescale ? rescale[(size_t) i] : 1.0;
+            want[(size_t) (t * N + i)] =
+                (1.0 - (double) strength) * y0[(size_t) (t * N + i)] + (double) strength * r * cur[(size_t) i];
+        }
+    }
+    char label[64];
+    std::snprintf(label, sizeof label, "%s x%lld %lldx%lld bs %lld s %.2f%s", boft ? "boft" : "oft", (long long) stages,
+                  (long long) T,
+                  (long long) N, (long long) bs, (double) strength, with_rescale ? " rescale" : "");
+    const bool ok = compare(label, got, want);
+    gpu::free(dy);
+    gpu::free(tf);
+    if (!ok) throw std::runtime_error(std::string("the turn of ") + label + " is not the reference's");
+}
+
 int selftest() {
     void* s = strata::core::Runtime::get().create_stream();
     try {
@@ -673,6 +768,15 @@ int selftest() {
         selftest_bias(s, 8, 32, false);
         selftest_bias(s, 8, 32, true);
         selftest_bias(s, 8, 64, true, 32, 32, 32);
+        // an OFT's turn: the rows turned in place (a block a work-group), the one interpolation, its rescale; a BOFT's
+        // stages one after another, an m = 1 one's rows crossed too (the four dimensions)
+        selftest_oft(s, 8, 64, 4, 1, false, false, 1.0f);
+        selftest_oft(s, 8, 64, 4, 1, false, false, 0.5f);
+        selftest_oft(s, 8, 64, 4, 1, false, false, 0.0f);
+        selftest_oft(s, 8, 64, 16, 1, false, true, 0.8f);
+        selftest_oft(s, 8, 64, 32, 1, true, false, 0.6f);
+        selftest_oft(s, 8, 64, 4, 2, true, false, 1.0f);
+        selftest_oft(s, 16, 64, 8, 3, true, true, 0.7f);
     } catch (...) {
         strata::core::Runtime::get().destroy_stream(static_cast<sycl::queue*>(s));
         throw;
@@ -707,7 +811,8 @@ int map(const std::string& dit_path, const std::string& lora_path, float scale) 
             std::printf("MISSING %-46s %-5s rank %-4lld %lld x %lld\n", e.key.c_str(), si::lora_kind_name(e.kind),
                         (long long) e.rank, (long long) e.cols, (long long) e.rows);
         } else if (e.rows != t->rows ||
-                   (e.kind != si::LoraKind::bias && e.cols != t->cols)) {   // a bias's delta alone: its columns are none
+                   (e.kind != si::LoraKind::bias && e.kind != si::LoraKind::oft &&
+                    e.cols != t->cols)) {   // a bias's delta alone, an OFT's: their columns are none
             std::printf("SHAPE   %-46s %lld x %lld, the weight %lld x %lld\n", e.key.c_str(), (long long) e.cols,
                         (long long) e.rows, (long long) t->cols, (long long) t->rows);
         } else {
@@ -820,7 +925,8 @@ int moss_map(const std::string& dit_path, const std::string& lora_path, float sc
             std::printf("MISSING %-46s %-5s rank %-4lld %lld x %lld\n", e.key.c_str(), si::lora_kind_name(e.kind),
                         (long long) e.rank, (long long) e.cols, (long long) e.rows);
         } else if (e.rows != g->rows ||
-                   (e.kind != si::LoraKind::bias && e.cols != g->cols)) {   // a bias's delta alone: its columns are none
+                   (e.kind != si::LoraKind::bias && e.kind != si::LoraKind::oft &&
+                    e.cols != g->cols)) {   // a bias's delta alone, an OFT's: their columns are none
             std::printf("SHAPE   %-46s %lld x %lld, the weight %lld x %lld\n", e.key.c_str(), (long long) e.cols,
                         (long long) e.rows, (long long) g->cols, (long long) g->rows);
         } else {
@@ -946,7 +1052,8 @@ int mf_map(const std::string& dit_path, const std::string& lora_path, float scal
             std::printf("MISSING %-46s %-5s rank %-4lld %lld x %lld\n", e.key.c_str(), si::lora_kind_name(e.kind),
                         (long long) e.rank, (long long) e.cols, (long long) e.rows);
         } else if (e.rows != t->rows ||
-                   (e.kind != si::LoraKind::bias && e.cols != t->cols)) {   // a bias's delta alone: its columns are none
+                   (e.kind != si::LoraKind::bias && e.kind != si::LoraKind::oft &&
+                    e.cols != t->cols)) {   // a bias's delta alone, an OFT's: their columns are none
             std::printf("SHAPE   %-46s %lld x %lld, the weight %lld x %lld\n", e.key.c_str(), (long long) e.cols,
                         (long long) e.rows, (long long) t->cols, (long long) t->rows);
         } else {

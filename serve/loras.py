@@ -9,8 +9,9 @@ the file's prefix off, ".weight" off, the role's suffix off), and a file is this
 is one the DiT's products take (TARGETS: the names of qi_dit.cpp's, moss_dit.cpp's and mf_dit.cpp's
 build_lora_targets, written here a second time; the record's check sets them against the probe's `map` on the models,
 name for name), in a form the engine applies today: a plain LoRA, LoKr or LoHa (a DoRA: a plain LoRA with a
-dora_scale over the weight's rows, ComfyUI's weight_decompose), or a whole weight's difference (diff, set_weight,
-w_norm), and no GLoRA, OFT or text encoder's weight.  A bias's delta (diff_b, or b_norm beside w_norm) goes with any of
+dora_scale over the weight's rows, ComfyUI's weight_decompose), a whole weight's difference (diff, set_weight,
+w_norm), or an OFT's turn of the weight's rows (oft_blocks, a BOFT's four dimensions too; the file's alpha is the
+constraint on the block's skew part, not a scale), and no GLoRA or text encoder's weight.  A bias's delta (diff_b, or b_norm beside w_norm) goes with any of
 them or alone, where the weight adds a bias of its own (BIASED: Mage-Flow's DiT's weights all do; MOSS-Image's outside
 its blocks and in its text embedder; Qwen-Image-2.1's none).  The engine refuses the forms it applies not when it binds
 a set (QiDit::set_loras, MossDit::set_loras, MfDit::set_loras), so no image is made with part of a file.
@@ -236,6 +237,32 @@ def _loha_rank(roles: dict[str, tuple[int, ...]]) -> tuple[int, str]:
         return 0, (f"its two sides' products are {sides[0][0]} x {sides[0][1]} and {sides[1][0]} x {sides[1][1]}: "
                    f"not the weight's one shape")
     return roles["hada_w1_b"][0], ""
+
+
+def _oft_shape(roles: dict[str, tuple[int, ...]]) -> tuple[int, str]:
+    """An OFT weight's tensors -> (a block's rows, "") or (0, why they make no turn): oft_blocks [blocks][b][b] (an
+    OFT) or [stages][blocks][b][b] (a BOFT, whose stage i reads the rows 2^(i-1) blocks at a time), the blocks squares,
+    and a rescale of the weight's rows where the file has one.  The engine reads them the same way
+    (src/image/image_lora.cpp's make_oft), and checks the rows against the weight it binds them to."""
+    bl = roles["oft_blocks"]
+    if len(bl) == 3:
+        stages, blocks, b = 1, bl[0], bl[1]
+    elif len(bl) == 4:
+        stages, blocks, b = bl[0], bl[1], bl[2]
+    else:
+        return 0, f"oft_blocks must be [blocks][b][b] (an OFT) or [stages][blocks][b][b] (a BOFT), not {len(bl)} dimensions"
+    if b <= 0 or blocks <= 0 or stages <= 0 or bl[-1] != b:
+        return 0, f"oft_blocks' blocks are {b} x {bl[-1]}: not squares"
+    if stages > 1:
+        if b % 2 != 0:
+            return 0, f"a BOFT's block of {b} rows: not an even number"
+        for i in range(stages):
+            if blocks % (2 ** i) != 0:
+                return 0, (f"a BOFT's stage {i} reads the rows {blocks} blocks at a time: not a multiple of {2 ** i}")
+    rs = roles.get("rescale")
+    if rs is not None and tuple(rs) != (blocks * b,):
+        return 0, f"a rescale of {rs} values, not the weight's {blocks * b} rows"
+    return b, ""
 
 
 def is_text_encoder(key: str) -> bool:
@@ -476,7 +503,7 @@ class Folder:
                     return f"{key} is not one of this image model's weights"
                 targets.add(kind_of(key))
                 continue
-            if form not in ("lora", "lokr", "loha", "diff"):
+            if form not in ("lora", "lokr", "loha", "diff", "oft"):
                 return f"{key}: a {form} adapter, which the image engine applies not yet"
             if "dora_scale" in roles and form != "lora":
                 return f"{key}: a DoRA (dora_scale) on a {form} adapter, which the image engine applies not yet"
@@ -498,6 +525,11 @@ class Folder:
                 if why:
                     return f"{key}: {why}"
                 rank = max(rank, r)
+            elif form == "oft":
+                # a block's rows (the listing's rank is the blocks' factorization's, which is none)
+                _, why = _oft_shape(roles)
+                if why:
+                    return f"{key}: {why}"
             else:
                 a, b = roles.get("lora_A"), roles.get("lora_B")
                 if a is None or b is None:

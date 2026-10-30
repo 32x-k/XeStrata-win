@@ -219,6 +219,32 @@ class Listing(Tree):
         self.assertIn("convolution's kernel", f.skipped["kernel"])
         self.assertEqual(loras.field([{"name": "loha", "scale": 0.7}], f)[0]["scale"], 0.7)
 
+    def test_an_oft_is_listed_and_the_blocks_it_cannot_apply_are_not(self):
+        b = "transformer.transformer_blocks.0."
+        safetensors(self.d / "oft.safetensors", {
+            # to_q: an OFT's blocks over the weight's 256 rows, with the file's alpha (the constraint, not a scale)
+            b + "attn.to_q.oft_blocks": (32, 8, 8), b + "attn.to_q.alpha": (1,),
+            # img_mlp.out: a BOFT's four dimensions, a rescale of the weight's rows beside them
+            b + "img_mlp.out.oft_blocks": (2, 16, 16, 16), b + "img_mlp.out.rescale": (256,)})
+        safetensors(self.d / "stages.safetensors", {   # 2^1 of the 3 blocks: a BOFT's stage 1 cannot read them
+            b + "attn.to_q.oft_blocks": (2, 3, 16, 16)})
+        safetensors(self.d / "squares.safetensors", {b + "attn.to_q.oft_blocks": (32, 8, 4)})
+        safetensors(self.d / "rescale.safetensors", {
+            b + "attn.to_q.oft_blocks": (32, 8, 8), b + "attn.to_q.rescale": (128,)})
+        safetensors(self.d / "dora.safetensors", {   # the engine's DoRA is the plain form's
+            b + "attn.to_q.oft_blocks": (32, 8, 8), b + "attn.to_q.dora_scale": (256,)})
+        f = self.folder()
+        entries = f.listing()
+        self.assertEqual([e["name"] for e in entries], ["oft"], f.skipped)
+        e = entries[0]
+        self.assertEqual(e["rank"], 0, "a turn of the rows has no rank")
+        self.assertEqual(e["targets"], ["attn.to_q", "img_mlp.out"])
+        self.assertIn("not a multiple of 2", f.skipped["stages"])
+        self.assertIn("not squares", f.skipped["squares"])
+        self.assertIn("not the weight's 256 rows", f.skipped["rescale"])
+        self.assertIn("DoRA", f.skipped["dora"])
+        self.assertEqual(loras.field([{"name": "oft", "scale": 0.7}], f)[0]["scale"], 0.7)
+
     def test_a_whole_delta_is_listed_and_this_models_bias_delta_is_not(self):
         b = "transformer.transformer_blocks.0."
         safetensors(self.d / "diff.safetensors", {
