@@ -331,11 +331,11 @@ A file's key has `diffusion_model.`, `transformer.` or `model.diffusion_model.` 
 
 ### Quantized weights and memory
 
-- It works with the weights at Q8_0, and at W8A8 on a GPU with int8 products. In a W8A8 layer the products an adapter takes run the 16-bit path, and only those layers.
+- It works with the weights at Q8_0, and at W8A8 on a GPU with int8 products. In a W8A8 layer the weight's product stays int8, and the adapter's delta is added to its output.
 - A request with no adapter (and a strength of 0) runs the path it did, and makes the image it did (byte for byte).
 - The adapters are kept in VRAM (A/B and GLoRA's factors in FP16; a DoRA's coefficients, a bias and an OFT's rotation in FP32). `strata.lora_mib` says how much, and an image whose budget they do not fit is refused with the VRAM it needs. A rank-64 Qwen-Image-2.1 LoRA's A/B is about 320 MiB.
 - From the second image of the same set the bound adapters are used as they are (and each file is read once). A new set makes Qwen-Image-2.1 rebuild the prompt's prefix (the text's rows and K and V), and MOSS-Image rebuild the context it read the text embeddings into; the same set keeps them.
-- The products an adapter takes run the 16-bit path, so those layers are slower.
+- A layer an adapter takes is slower by the delta's products. In MOSS-Image's W8A8 blocks, making the 16-bit rows the delta's input needs adds to it.
 
 ## Sharing the GPU's memory
 

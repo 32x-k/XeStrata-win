@@ -20,7 +20,7 @@
 //
 // A GLoRA (a1/a2/b1/b2) writes its delta as a low rank of the weight on each side, W' = W + s (alpha / rank) (W a1
 // a2 + b1 b2), or LyCORIS's older W a2 a1 + b2 b1 (the shapes say which).  Its b pair is the plain form's (A = b2,
-// B = b1) and its a pair is the input the weight's own product is run on a second time (v = a2 (a1 x)): a product's
+// B = b1) and its a pair is the input the weight's own product is run on a second time (v = a1 (a2 x)): a product's
 // output is W x + s (W v + B (A x)), and the weight's delta itself is never made (that is the weight's size).
 //
 // A whole delta is the weight's own matrix: `x.diff` (LyCORIS's full form, a fine tune's difference from its base),
