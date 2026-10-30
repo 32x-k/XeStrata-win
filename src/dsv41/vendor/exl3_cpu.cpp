@@ -54,11 +54,34 @@ constexpr int kGemmK = 256;
 #endif
 
 namespace strata::dsv41k::cpu {
-// Strata's cpu_avx2_ok lives in strata_kernels_cpu, which this path does not link: AVX2 + FMA here
+// Keep feature detection available when STRATA_NATIVE_EXPERTS is off as well.
 static bool cpu_avx2_ok() {
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-    __builtin_cpu_init();
-    return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+#if defined(EXL3_X86)
+    unsigned r[4] = {};
+    auto cpuid = [&](unsigned leaf, unsigned sub) {
+#if defined(_MSC_VER)
+        int x[4];
+        __cpuidex(x, (int) leaf, (int) sub);
+        for (int i = 0; i < 4; ++i) r[i] = (unsigned) x[i];
+#else
+        __cpuid_count(leaf, sub, r[0], r[1], r[2], r[3]);
+#endif
+    };
+    cpuid(0, 0);
+    if (r[0] < 7) return false;
+    cpuid(1, 0);
+    const unsigned need = (1u << 12) | (1u << 27) | (1u << 28);   // FMA, OSXSAVE, AVX
+    if ((r[2] & need) != need) return false;
+#if defined(_MSC_VER)
+    const unsigned long long xcr0 = _xgetbv(0);
+#else
+    unsigned lo = 0, hi = 0;
+    __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+    const unsigned long long xcr0 = ((unsigned long long) hi << 32) | lo;
+#endif
+    if ((xcr0 & 0x6) != 0x6) return false;   // the OS saves the SSE and AVX state
+    cpuid(7, 0);
+    return ((r[1] >> 5) & 1u) != 0;
 #else
     return false;
 #endif

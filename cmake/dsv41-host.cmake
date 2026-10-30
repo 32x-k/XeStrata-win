@@ -24,7 +24,7 @@ endif()
 
 if(STRATA_BUILD_TESTS)
     enable_testing()
-    foreach(_ds4_host_test slot experts_rule pick_rule store)
+    foreach(_ds4_host_test slot experts_rule pick_rule store pool)
         add_executable(ds4_${_ds4_host_test}_test tests/dsv41/${_ds4_host_test}_test.cpp)
         target_link_libraries(ds4_${_ds4_host_test}_test PRIVATE strata_dsv41_host)
         if(_ds4_host_test STREQUAL "store")

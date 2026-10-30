@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -61,11 +62,13 @@ public:
     }
     /// The batch goes to the workers; the caller may help() and must wait() before fn goes out of scope.  (Two pools
     /// - one a NUMA node - run at once this way: start both, help one, wait for both.)
+    /// A failed job is still completed; help() keeps going and wait() rethrows after every job has finished.
     void start(int n, const std::function<void(int)>& fn) {
         n_ = n;
         if (n <= 0) return;
         const uint64_t g = (gen_.load(std::memory_order_relaxed) + 1) & 0xffffffffu;
         ticket_.store((g << 32) | 0x7fffffffu, std::memory_order_seq_cst);
+        error_ = nullptr;
         fn_ = &fn;
         total_.store(n, std::memory_order_release);
         done_.store(0, std::memory_order_relaxed);
@@ -83,6 +86,11 @@ public:
         if (n_ <= 0) return;
         while (done_.load(std::memory_order_acquire) < n_) cpu_relax();
         n_ = 0;
+        // Every exception write precedes its job's done increment. The acquire above observes all of them, and
+        // no callback can still be using the caller's buffers when an exception leaves wait().
+        const std::exception_ptr error = error_;
+        error_ = nullptr;
+        if (error) std::rethrow_exception(error);
     }
 
 private:
@@ -93,12 +101,16 @@ private:
             const int n = total_.load(std::memory_order_acquire);
             if ((int) (t & 0xffffffffu) >= n) return;
             if (!ticket_.compare_exchange_weak(t, t + 1, std::memory_order_acq_rel)) continue;
-            (*fn_)((int) (t & 0xffffffffu));
+            try { (*fn_)((int) (t & 0xffffffffu)); }
+            catch (...) {
+                std::lock_guard<std::mutex> lk(error_mu_);
+                if (!error_) error_ = std::current_exception();
+            }
             done_.fetch_add(1, std::memory_order_acq_rel);
         }
     }
     void loop() {
-        uint64_t seen = gen_.load();
+        uint64_t seen = 0;   // a worker starting after start() must still take that first batch
         for (;;) {
             const auto t0 = std::chrono::steady_clock::now();
             uint64_t g;
@@ -130,6 +142,8 @@ private:
     std::atomic<int> sleeping_{0};
     std::atomic<bool> quit_{false};
     std::mutex mu_;
+    std::mutex error_mu_;
+    std::exception_ptr error_;
     std::condition_variable cv_;
 };
 
