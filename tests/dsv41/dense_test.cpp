@@ -42,6 +42,25 @@ template <class E> float value(E e) {
     else return e;
 }
 
+float dp4a_reference(const uint16_t* x, const uint16_t* w, int k) {
+    float sum = 0.0f;
+    // The non-matrix fallback quantizes each 32-value block to signed int8.
+    for (int first = 0; first < k; first += 32) {
+        float xm = 0.0f, wm = 0.0f;
+        for (int j = first; j < first + 32; ++j) {
+            xm = std::max(xm, std::abs(value(x[j])));
+            wm = std::max(wm, std::abs(value(w[j])));
+        }
+        const float xi = xm == 0.0f ? 0.0f : 127.0f / xm;
+        const float wi = wm == 0.0f ? 0.0f : 127.0f / wm;
+        int dot = 0;
+        for (int j = first; j < first + 32; ++j)
+            dot += (int) std::round(value(x[j]) * xi) * (int) std::round(value(w[j]) * wi);
+        sum = std::fma((float) dot, (xm / 127.0f) * (wm / 127.0f), sum);
+    }
+    return sum;
+}
+
 template <class E>
 rt::Result project(rt::Dense& dense, int rows, int n, int k, float alpha, const E* w, int ldw,
                     const E* x, int ldx, float beta, float* y, int ldy) {
@@ -51,11 +70,11 @@ rt::Result project(rt::Dense& dense, int rows, int n, int k, float alpha, const 
 }
 
 template <class E>
-bool check_product(rt::Dense& dense, rt::Queue queue, bool padded, int k, float alpha, float beta) {
-    constexpr int rows = 3, n = 5;
-    constexpr size_t offset = 2;
+bool check_product(rt::Dense& dense, rt::Queue queue, bool padded, int k, float alpha, float beta,
+                    int rows = 3, int n = 5, bool aligned = false) {
+    const size_t offset = aligned ? 16 : 2;
     constexpr float guard = 12345.0f;
-    const int ldx = k + (padded ? 3 : 0), ldw = k + (padded ? 5 : 0), ldy = n + 4;
+    const int ldx = k + (padded ? 3 : 0), ldw = k + (padded ? 5 : 0), ldy = aligned ? n : n + 4;
     const bool empty_product = k == 0 || alpha == 0.0f;
     std::vector<E> x((size_t) rows * ldx, input<E>(std::numeric_limits<float>::quiet_NaN()));
     std::vector<E> w((size_t) n * ldw, input<E>(std::numeric_limits<float>::quiet_NaN()));
@@ -64,6 +83,9 @@ bool check_product(rt::Dense& dense, rt::Queue queue, bool padded, int k, float 
     for (int c = 0; c < n; ++c)
         for (int j = 0; j < k; ++j) w[(size_t) c * ldw + j] = input<E>((float) (c + j - 3) / 8.0f);
     std::vector<float> y(offset + (size_t) rows * ldy + 3, guard), expected = y;
+    const bool dp4a = aligned && !padded && alpha == 1.0f && beta == 0.0f &&
+        std::string(strata::prefill::Gemm::path()) == "XeStrata's own kernels (DP4a)";
+    float quant_abs = 0.0f, quant_rel = 0.0f;
     for (int t = 0; t < rows; ++t) {
         for (int c = 0; c < n; ++c) {
             const size_t at = offset + (size_t) t * ldy + c;
@@ -72,6 +94,14 @@ bool check_product(rt::Dense& dense, rt::Queue queue, bool padded, int k, float 
             if (!empty_product)
                 for (int j = 0; j < k; ++j)
                     sum = std::fma(value(x[(size_t) t * ldx + j]), value(w[(size_t) c * ldw + j]), sum);
+            if constexpr (std::is_same_v<E, uint16_t>) {
+                if (dp4a) {
+                    const float quant = dp4a_reference(x.data() + (size_t) t * ldx, w.data() + (size_t) c * ldw, k);
+                    quant_abs = std::max(quant_abs, std::abs(quant - sum));
+                    quant_rel = std::max(quant_rel, std::abs(quant - sum) / std::max(1.0f, std::abs(sum)));
+                    sum = quant;
+                }
+            }
             expected[at] = beta == 0.0f ? alpha * sum : std::fma(beta, y[at], alpha * sum);
         }
     }
@@ -87,8 +117,11 @@ bool check_product(rt::Dense& dense, rt::Queue queue, bool padded, int k, float 
                         static_cast<float*>(dy.data) + offset, ldy));
     require(rt::copy_async(y.data(), dy.data, y.size() * sizeof(float), queue));
     require(rt::stream_sync(queue));
+    if constexpr (std::is_same_v<E, uint16_t>) {
+        if (dp4a) std::printf("DP4a reference quantization vs FP16: max_abs=%g max_rel=%g\n", quant_abs, quant_rel);
+    }
     for (size_t i = 0; i < y.size(); ++i) {
-        const bool padding = i < offset || i >= offset + (size_t) rows * ldy || (i - offset) % ldy >= n;
+        const bool padding = i < offset || i >= offset + (size_t) rows * ldy || (i - offset) % ldy >= (size_t) n;
         const bool ok = padding ? y[i] == guard :
             std::isfinite(y[i]) && std::abs(y[i] - expected[i]) <= 1e-5f * std::max(1.0f, std::abs(expected[i]));
         if (!ok) {
@@ -103,6 +136,8 @@ bool check_product(rt::Dense& dense, rt::Queue queue, bool padded, int k, float 
 
 template <class E> int check_type(rt::Dense& dense, rt::Queue queue) {
     int failed = 0;
+    // Aligned rows and dimensions exercise the matrix path where the device supports it.
+    failed += !check_product<E>(dense, queue, false, 256, 1.0f, 0.0f, 32, 128, true);
     failed += !check_product<E>(dense, queue, false, 7, 1.0f, 0.0f);
     failed += !check_product<E>(dense, queue, true, 7, 1.0f, 0.0f);
     failed += !check_product<E>(dense, queue, true, 7, 1.25f, -0.5f);
@@ -144,6 +179,15 @@ int main() {
         require(rt::dense_create(&dense));
         require(rt::dense_stream(dense, stream.queue));
         auto& runtime = strata::core::Runtime::get();
+        size_t available = 0, total = 0;
+        require(rt::mem_info(&available, &total));
+        const uint64_t limit = strata::core::vram_limit_bytes();
+        const uint64_t max_alloc = strata::core::max_alloc_bytes();
+        const uint64_t alloc_limit = strata::core::max_alloc_limit_bytes();
+        if ((limit && total > limit) || (alloc_limit && max_alloc > alloc_limit))
+            throw std::runtime_error("dense adapter ignored the memory limits");
+        std::printf("dense path: %s; memory=%zu max_allocation=%llu\n", strata::prefill::Gemm::path(),
+                    total, (unsigned long long) max_alloc);
         if (&static_cast<sycl::queue&>(stream.queue) != &runtime.stream(stream.queue.handle))
             throw std::runtime_error("dense adapter and runtime selected different queues");
         const int failed = check_type<uint16_t>(dense, stream.queue) + check_type<float>(dense, stream.queue);
