@@ -11,7 +11,7 @@ The images are made by XeStrata's own image engine, `strata-image`. It runs on t
 It goes with any version of Qwen3.8-Flash-Next (not yet with the BETA models), and is used from the web page's Images tab, from the chat and through the API (vLLM-Omni-compatible, so OpenAI-compatible).
 
 > **Contents:** [Choosing a model](#choosing-a-model) · [Installing](#installing) · [Sizes and memory](#sizes-and-memory) · [Options](#options) ·
-> [The web page and the chat](#the-web-page-and-the-chat) · [API](#api) · [Sharing the GPU's memory](#sharing-the-gpus-memory) · [Speed](#speed) ·
+> [The web page and the chat](#the-web-page-and-the-chat) · [API](#api) · [LoRA](#lora-adapters) · [Sharing the GPU's memory](#sharing-the-gpus-memory) · [Speed](#speed) ·
 > [When something goes wrong](#when-something-goes-wrong) · [Licenses](#licenses)
 
 ## Choosing a model
@@ -132,6 +132,7 @@ The config file's (`xestrata-<model>.json`) `"images"` also has entries to set b
 | `daemon_idle_s` | 1800 | The seconds an image engine no server is connected to waits before it ends |
 | `keep_files` | 64 | How many `response_format: "url"` images are kept |
 | `out_dir` | a temporary folder | The folder for the images and the engine's log (`strata-image.log`) |
+| `lora_dir` | `loras` beside the image model's file | The folder the LoRA files go in (setup writes the data folder's `models/loras`; the four models share one folder, and each one's listing is narrowed to what its DiT takes. [LoRA](#lora-adapters)) |
 
 HunyuanImage 3.0's `"images"` also has `steps` (8), `guidance` (2.5), `resolutions` (the resolution buckets' parameters), `vision` (the shard with SigLIP2) and `ratio_head` (what it chooses its size with; without it `auto` is 1024x1024); its `max_refs` defaults to 3.
 
@@ -152,6 +153,7 @@ HunyuanImage 3.0's `"images"` also has `steps` (8), `guidance` (2.5), `resolutio
 - Attaching an image makes it an edit with a model that edits, and img2img from that one image with a model that does not (MageTrail and the like) (PNG, JPEG, GIF, BMP, WebP). HunyuanImage 3.0 takes up to 3 reference images.
 - With an image attached, the part of the first image to draw again can be painted on it (brush size, eraser, clear). Only the painted part is drawn again, and the rest keeps the image's pixels (the API's `mask`). Unpainted, it is the whole image.
 - With an image attached, the Strength field appears (the API's `strength`): the lower, the more of the image it keeps. Empty is the model's default: 1 for an edit (no start from the image's latent: the edits as before), 0.87 for img2img (lowered for a model of few steps, so that it skips one step at least).
+- The LoRA row chooses among the files this model applies ([LoRA](#lora-adapters)); each choice is a chip whose strength (-2 to 2) can be changed, whose `trigger` words a "Trigger" button puts at the end of the prompt, and which × takes off. 4 at most, and the browser keeps each model's choice and strengths. As in the API, the name goes in the request's field (no tag is written).
 - Images are made one at a time. A chat request that comes while several are made runs after the image being made, and the rest follow it (under `unload`, which takes the text model off, the images are all made first).
 - MOSS-Image has more:
    - "Write the prompt out" has the chat's model write the short prompt out (off, a detailed description, or a layout of boxes: the API's `enhance`). The prompt or layout it wrote is shown under the image, and a layout can be loaded into the boxes with "Edit this layout" and changed.
@@ -187,6 +189,7 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 | `steps` (`num_inference_steps`) | the model's steps | 2 to 100 for Qwen-Image-2.1's base model, 1 to 100 for Mage-Flow, HunyuanImage 3.0 and MOSS-Image (8 by default for HunyuanImage 3.0, 50 for MOSS-Image); Turbo stays at 8 |
 | `quality` | `auto` | The steps of Qwen-Image-2.1's base model: `low` 20, `medium` (`standard`) 30, `high`, `hd` and `auto` the default 40 (`steps`, when given, wins). Mage-Flow and HunyuanImage 3.0 do not use it |
 | `negative_prompt` | none (one space for Mage-Flow, empty for MOSS-Image) | CFG's negative prompt. HunyuanImage 3.0 does not use it (its guidance is one token: there is nothing to steer) |
+| `lora` | none | The adapters to apply ([LoRA](#lora-adapters)): `{"name", "scale"}` in a list, or one alone. `scale` is -2 to 2 (1 when left out). 4 at most |
 | `true_cfg_scale`, `guidance_scale` | the config's for Mage-Flow, HunyuanImage 3.0 and MOSS-Image | CFG's strength (0 to 30; 1 is no CFG). Qwen-Image-2.1 applies it only when `true_cfg_scale` is above 1 and there is a `negative_prompt` (it does not use `guidance_scale`); Mage-Flow and MOSS-Image take `true_cfg_scale`, else `guidance_scale` (3 by default for MOSS-Image). HunyuanImage 3.0 takes it as the guidance's strength (`guidance_scale`, else `true_cfg_scale`, else the config's 2.5) and applies no CFG |
 | `background` | `auto` | `transparent` makes a transparent background (the prompt wrapped as Qwen recommends; png, webp or jxl only); `opaque` flattens the alpha onto white. Mage-Flow and HunyuanImage 3.0 refuse `transparent` |
 | `output_format` | `png` | `png`, `jpeg`, `webp`, `jxl` (JPEG XL; only with libjxl's cjxl) |
@@ -245,13 +248,14 @@ A model without edits (MageTrail, Mage-Flow without its edit model, MOSS-Image) 
 - **strength:** above 0 and at most 1: how much of the first image to change; the lower, the more of it is kept. As diffusers' img2img, it skips the first floor(steps × (1 − strength)) of the schedule and starts from the image's latent with that point's share of noise (fewer steps run, so it is faster too).
   The default is 1 for an edit (the edits as before; the default denoise of ComfyUI's KSampler), 0.87 for img2img (the denoise of ComfyUI's own img2img example, but no more than 1 − 1/steps, so that it skips one step at least: 0.75 at 4 steps), and 1 for img2img with a mask alone. A value that runs no step is refused. ComfyUI's `denoise` is not taken (`denoise` 0.5 at 20 steps is `strength` 0.5 at 40).
 - **The steps:** for Qwen-Image-2.1, HunyuanImage 3.0 and MOSS-Image the same as for generating; for Mage-Flow's edits 4 for Turbo, 30 for the other two, and for its img2img those of generating.
+- **LoRA:** the same `lora` (and the prompts' tags) as generating, applied to the image made from reference images too ([LoRA](#lora-adapters)).
 - A reference image's alpha goes to the image model as it is. The other fields are those of generating.
 
 ### The answer
 
-- `data[]`: the images (`b64_json` or `url`), with `revised_prompt` and `seed`.
+- `data[]`: the images (`b64_json` or `url`), with `revised_prompt` and `seed`; `lora` (each adapter's `name` and `scale`) when adapters were applied.
 - `usage`: counted in the image engine's tokens (the prompt's tokens, and one token for each 16x16 pixels of the reference images and the image made). For HunyuanImage 3.0: the prompt's ids, one for each 16x16 pixels of the image made, and a reference image's VAE tokens and 1,024 SigLIP2 slots.
-- `strata`: the seconds taken, the steps (those a strength ran), `strength` (when below 1), whether it was img2img (`img2img`) and took a mask (`mask`), whether it took a layout (`layout`), what the prompt's writing out made (`enhance`), CFG's strength, the text encoder's, the sampling's and the VAE's times, and what happened to the text model (`gpu_policy`). For HunyuanImage 3.0 it also has the guidance's strength (`guidance`), the bucket's number (`ratio`), when the size asked for was another, that size (`requested_size`), and when the model chose the size, the seconds the choice took (`size_choice_s`).
+- `strata`: the seconds taken, the steps (those a strength ran), `strength` (when below 1), whether it was img2img (`img2img`) and took a mask (`mask`), whether it took a layout (`layout`), what the prompt's writing out made (`enhance`), CFG's strength, the text encoder's, the sampling's and the VAE's times, and what happened to the text model (`gpu_policy`); when adapters were applied, their count (`lora_n`), their VRAM (`lora_mib`) and the names a prompt's tag left out (`lora_unknown`). For HunyuanImage 3.0 it also has the guidance's strength (`guidance`), the bucket's number (`ratio`), when the size asked for was another, that size (`requested_size`), and when the model chose the size, the seconds the choice took (`size_choice_s`).
 - The image model is listed in `/v1/models` too.
 
 ### From the chat
@@ -261,6 +265,77 @@ A model without edits (MageTrail, Mage-Flow without its edit model, MOSS-Image) 
 - With MOSS-Image, `generate_image` takes a layout too (`layout`, as the API's), so the chat's model can draft its boxes.
 - `/v1/responses` does the same with OpenAI's built-in `image_generation` tool, and returns the image in an `image_generation_call` item (`result`, the image in base64, with `size`, `quality`, `background`, `output_format` and `revised_prompt`).
   The tool's `size`, `quality`, `output_format`, `output_compression` and `background` are used for the images it makes (`size` `auto`: the size the model asks for).
+  Neither tool has a LoRA field: an image made from the chat applies no adapter.
+
+## LoRA (adapters)
+
+An image model can apply a LoRA that ComfyUI and the like distribute, each time it makes an image.
+The models that take one are Qwen-Image-2.1 (Turbo and the base model), MOSS-Image, Mage-Flow and MageTrail. HunyuanImage 3.0 takes none (a request with `lora`, or a prompt's tag, is a 400).
+
+### Where they go and the listing
+
+- Setup writes `"lora_dir"` in the config's `"images"` (the data folder's `models/loras`). The four models share the one folder, and each one's listing is narrowed to what its DiT takes. Create the folder when it is not there.
+  The files are `.safetensors` and `.gguf`, and subfolders are read too (a name is its path there, `style/gouache`).
+- The folder is read again at once when it changes, and a listing is kept up to 10 seconds. The server need not be stopped.
+- `/health`'s `image_defaults` and `image_models`, and the image models' `defaults.loras` in `/v1/models`, list the files that model can apply. Each has `name` (without the extension; a subfolder by its path), `path` (from the folder), `rank` (0 for an OFT and a whole difference), `scale` (the strength the file's metadata recommends, else 1), `trigger` (its trigger words), `targets` (the kinds of weight it changes) and `size_mib` (the file's size).
+- A file with a key that is not this model's weight, or in a form it does not apply, is not listed. Asking for that name is a 400 whose message says why.
+
+```sh
+curl -s http://127.0.0.1:8095/health | python3 -c 'import json,sys; print(*[e["name"] for e in json.load(sys.stdin)["image_defaults"]["loras"]], sep="\n")'
+```
+
+### Applying one
+
+**API:** the `lora` field, on both `/v1/images/generations` and `/v1/images/edits`, in JSON and in a multipart form.
+
+```sh
+curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/json' \
+  -d '{"prompt": "a red fox in the snow, watercolor", "lora": [{"name": "gouache", "scale": 0.8}, "fox-ears"]}'
+```
+
+- `lora` is a list of `{"name", "scale"}`. One alone may be that object, and a name alone a string. In a multipart form, the field's value is that JSON as text.
+- `scale` is -2 to 2 and 1.0 when left out (the listing's `scale` is the file's recommendation, not the API's default). Instead of `name`, `local_path` names a file inside the folder (outside it is a 400; the web page does not show it).
+- Up to 4 stack at once. A name given twice is a 400.
+- The prompt's tags `<lora:name:strength>` are read too (in the positive and the negative prompt; the strength may be left out, and is 1.0 then). A tag is taken out of the prompt; when the listing has not the name, that tag is left out of the image and the name is said in the answer's `strata.lora_unknown` and the server's log. A tag's third field (`<lora:name:strength:strength>`) is A1111's text encoder's strength: it is not read (the tag is taken out). A prompt that is only a tag is a 400.
+- The field and the tags together take 4 at most, and a name twice uses the first only (the field, then the positive prompt's tags, then the negative prompt's).
+- Each image of the answer's `data[]` carries `lora` (the `name` and `scale` applied), and `strata` has `lora_n` (their count), `lora_mib` (the VRAM they take) and `lora_unknown` (the names a tag left out).
+
+**The web page:** the Images tab has a LoRA row (not for a model whose listing is empty). "Add a LoRA…" adds one from the listing, which shows as a chip: its strength can be changed in the chip's number field (-2 to 2, steps of 0.05), a file with `trigger` words has a "Trigger" button that puts them at the end of the prompt (it writes no tag), and × takes it off. 4 at most, and the browser keeps each model's choice and strengths.
+
+**Models that take none:** HunyuanImage 3.0 refuses the `lora` field and a prompt's tag alike (400). The chat's tools (`generate_image`, `edit_image`) and the Responses API's `image_generation` have no LoRA field.
+
+### The forms applied
+
+A file's key has `diffusion_model.`, `transformer.` or `model.diffusion_model.` taken off, and is the DiT's weight's name. PEFT's, ComfyUI's and ai-toolkit's names (`lora_A`/`lora_B`, `lora_down`/`lora_up`, `lora_A.default`) are read.
+
+| Form | The file's tensors | How it is applied |
+| --- | --- | --- |
+| LoRA, LoCon | `lora_A`/`lora_B` (down and up), and `.alpha` or the metadata's `lora_alpha` | strength × alpha / rank; alpha 1 when there is none |
+| LoKr | `lokr_w1` and `lokr_w2` (whole, or each from two factors), and a linear weight's Tucker core `lokr_t2` | two products; the rank as ComfyUI takes it (w2's factors, else w1's) |
+| DoRA | a plain LoRA and the weight's rows' `dora_scale` | rows only: `c = dora_scale / the weight's row norms`, which scales the base's rows and the delta's |
+| A whole difference | `.diff`, `.set_weight`, `.w_norm` | the difference is added; at a strength of 1 `set_weight` is that weight, and between, an interpolation (ComfyUI reads no strength) |
+| LoHa | `hada_w1_a/b` and `hada_w2_a/b`, and a linear Tucker core | the element-wise product of two products; the rank is `hada_w1_b`'s rows |
+| A bias's delta | `.diff_b`, or `.b_norm` beside `.w_norm` | added to the weight's bias; alpha is not applied, only the request's strength |
+| OFT, BOFT | `oft_blocks` (3-dimensional for an OFT, 4 for a BOFT) and `rescale` | the weight's rows turned by a block-diagonal orthogonal matrix; the strength interpolates once (ComfyUI, twice) |
+| GLoRA | `a1`, `a2`, `b1`, `b2` | `W (a1 a2)` and `b1 b2` added, the weight's product run once more; both ComfyUI's reading and old LyCORIS's |
+
+- A file with two forms on one weight is refused when read (ComfyUI drops one of them silently).
+- A DoRA's, an OFT's or a GLoRA's rows take no other adapter (the order would change the image); the other forms add up even on one weight.
+- A bias's delta acts only where the weight adds a bias of its own. Qwen-Image-2.1's DiT adds none, so Qwen takes no bias's delta. MOSS-Image's 42 blocks and `final_linear_video` add none, and every one of Mage-Flow's weights does.
+- MageTrail's low-rank modulation (F32 weights) takes no adapter (the key and the reason are returned).
+- An OFT cannot take a name that splits into more than one weight (MOSS-Image's `qkv` is q, k and v). Qwen-Image-2.1's `modulation.1` is written a band of rows at a time, so an OFT whose blocks do not divide that band is refused.
+- A LoHa's rank is `hada_w1_b`'s rows, and the metadata's `lora_alpha` is divided by that rank (as ComfyUI does); a file whose `lora_alpha` has nothing to do with its rank changes the strength.
+- A file with `use_rslora` is refused (its strength is alpha / √rank, not alpha / rank). PEFT's `rank_pattern` is not read: alpha alone.
+- A file with a text encoder's weight (`lora_te_`, `text_encoder.`, `te.`) is not applied: text encoder LoRAs are not done. The API has no `scale_text` field, and one sent is ignored as `style` and `user` are.
+- sd-scripts' `lora_unet_` names are read, but they name none of these models' weights.
+
+### Quantized weights and memory
+
+- It works with the weights at Q8_0, and at W8A8 on a GPU with int8 products. In a W8A8 layer the products an adapter takes run the 16-bit path, and only those layers.
+- A request with no adapter (and a strength of 0) runs the path it did, and makes the image it did (byte for byte).
+- The adapters are kept in VRAM (A/B and GLoRA's factors in FP16; a DoRA's coefficients, a bias and an OFT's rotation in FP32). `strata.lora_mib` says how much, and an image whose budget they do not fit is refused with the VRAM it needs. A rank-64 Qwen-Image-2.1 LoRA's A/B is about 320 MiB.
+- From the second image of the same set the bound adapters are used as they are (and each file is read once). A new set makes Qwen-Image-2.1 rebuild the prompt's prefix (the text's rows and K and V), and MOSS-Image rebuild the context it read the text embeddings into; the same set keeps them.
+- The products an adapter takes run the 16-bit path, so those layers are slower.
 
 ## Sharing the GPU's memory
 
@@ -322,6 +397,9 @@ HunyuanImage 3.0 (`hunyuan-image-3-distil`, w4a8, 1024x1024, 8 steps, one image 
 | `the image engine did not start ...`, `the image engine ended` | The image engine did not start, or stopped. See the log the message names (`strata-image.log`) |
 | `Image generation runs the image model at Q6_K instead of Q8_0 ...` | The RAM is short, so setup lowered the size ([Sizes and memory](#sizes-and-memory)) |
 | `faster with NVIDIA's ... cuDNN for the image engine's attention` (setup) | Without cuDNN, the attention on NVIDIA GPUs runs on XeStrata's own kernel. The command shown installs it, which is faster |
+| `lora: ...` (400) | The name is not listed, the strength is out of range, or more than 4 are named. The message says which |
+| `image_generation_failed: image engine: ...` | The engine cannot apply the adapter: the key and the reason (a weight that adds no bias, rsLoRA, MageTrail's modulation and the like) follow ([LoRA](#lora-adapters)) |
+| `strata.lora_unknown` | A prompt's tag named a file the listing has not, and the image was made without it |
 
 ## Licenses
 

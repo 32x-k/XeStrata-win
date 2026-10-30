@@ -459,15 +459,28 @@ inline void head_scale(const float* part, int64_t rows, int64_t heads, float* hs
     });
 }
 
-// y[t] = y[t] * rs[t] + b (rs null: 1; b null: none)
-inline void rows_back(float* y, const float* rs, const float* b, int64_t T, int64_t N, void* s) {
+// y[t] = y[t] * rs[t] * col + b (rs null: 1; b null: none; col null: 1, a DoRA's factor of the weight's row, the
+// bias not scaled)
+inline void rows_back(float* y, const float* rs, const float* b, int64_t T, int64_t N, void* s,
+                      const float* col = nullptr) {
     q_of(s).parallel_for(sycl::range<1>((size_t) (T * N)), [=](sycl::id<1> id) {
         const auto i = static_cast<int64_t>(id[0]);
-        const int64_t t = i / N;
+        const int64_t t = i / N, r = i - t * N;
         float v = y[i];
         if (rs != nullptr) v *= rs[t];
-        if (b != nullptr) v += b[i - t * N];
+        if (col != nullptr) v *= col[r];
+        if (b != nullptr) v += b[r];
         y[i] = v;
+    });
+}
+
+// y[t] += b (the weight's own bias, after a product whose output an OFT turned: a rotation of the weight's rows is
+// not one of its bias's)
+inline void bias_add(float* y, const float* b, int64_t T, int64_t N, void* s) {
+    if (T <= 0 || b == nullptr) return;
+    q_of(s).parallel_for(sycl::range<1>((size_t) (T * N)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        y[i] += b[i % N];
     });
 }
 

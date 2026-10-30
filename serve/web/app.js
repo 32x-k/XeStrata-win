@@ -1914,7 +1914,7 @@ function imgDefaults() {
 // it takes, chosen here, with a strength each (the API's -2 to 2, starting from the listing's recommended one) and,
 // where the file names them, its trigger words, which a button puts into the prompt.  The choice is kept in this
 // browser for each model (xestrata.img_loras.<model>) and comes back with it.  A model whose listing is empty takes no
-// adapter (HunyuanImage 3.0; Mage-Flow and MOSS-Image until their stage): the block is hidden and none is sent.
+// adapter (HunyuanImage 3.0, whose config names none: the DiT is not one of TARGETS): the block is hidden and none is sent.
 const IMG_LORA_COUNT = 4, IMG_LORA_SCALE = 2;   // serve/loras.py's MAX_LORA, and its SCALE_MIN..SCALE_MAX
 let imgLoraSel = [];   // [{name, scale}]: the adapters the next request applies, in the order they were chosen
 function imgLoras() {

@@ -45,6 +45,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <utility>
@@ -77,6 +78,7 @@ struct MfOut {
 };
 
 class MappedFile;
+class SafeTensors;
 
 class MfDit {
 public:
@@ -190,7 +192,8 @@ private:
                  b_imlp1 = 0, b_imlp2 = 0, b_tmlp1 = 0, b_tmlp2 = 0;   // the FP32 biases' offsets
         uint64_t nq = 0, nk = 0, ntq = 0, ntk = 0;                     // the FP32 q / k norms' offsets
     };
-    /// A weight and the rows of a file's entry it takes.
+    /// A weight and the rows of a file's entry it takes (Mage-Flow's DiT has no fused or split weight: one name is one
+    /// weight, all of them with a bias, which an entry's bias's delta is added beside).
     struct LoraSlot {
         std::string name;
         W* w = nullptr;
@@ -210,12 +213,18 @@ private:
     void modulation(const uint16_t* tsil, const W& w, const uint8_t* base, float* y, const float* bias);
     void build_lora_targets();
     void lora_scratch(int64_t T);
+    /// A DoRA's row norms: the norms of a slot's weight, one a row of it, from the file's tensor, cached a tensor
+    /// (open drops the cache).
+    bool dora_norms(const LoraSlot& slot, std::vector<float>& out, std::string& err);
+    /// One of the file's tensors' row norms, FP32, cached (`name`: the file's own name).
+    bool tensor_norms(const std::string& name, const std::vector<float>*& out, std::string& err);
     void ensure(int64_t hw, int n, int64_t max_text);
     void rope_tables(int64_t h, int64_t w);
     void drop_refs();
     void time_embedding(float sigma);
 
     std::unique_ptr<MappedFile> file_;
+    std::unique_ptr<SafeTensors> st_;   // the file's header (a DoRA's row norms read its tensors)
     std::vector<std::vector<uint8_t>> host_;   // the blocks' Q8_0 (and every block's FP32 vectors), when not in place
     void* s_ = nullptr;
     prefill::Gemm gemm_;
@@ -262,9 +271,22 @@ private:
     std::vector<std::unique_ptr<LoraLayer>> lora_layers_;
     std::vector<std::shared_ptr<const LoraFile>> lora_files_;
     std::string lora_key_;
-    int64_t lora_rank_ = 0, lora_tmp_t_ = 0;
+    int64_t lora_cols_ = 0, lora_tmp_t_ = 0;   // the deltas' scratch's columns and rows (the largest lora_scratch_cols)
+    std::map<std::string, std::vector<float>> norm_cache_;   // DoRA's row norms, a file's tensor (open clears them)
     float* lora_f32_ = nullptr;
     uint16_t* lora16_ = nullptr;
+    // a GLoRA's own path: its input's columns, the weight's rows it is added over, and the buffers a band of its
+    // products takes (the rows' table, a W8A8 weight's int8 input and its scales)
+    int64_t lora_glora_cols_ = 0, lora_glora_rows_ = 0;
+    float* lora_glora_y_ = nullptr;
+    int8_t* lora_glora_x8_ = nullptr;
+    float* lora_glora_sx_ = nullptr;
+    void lora_glora_scratch();   // allocates them, once a set with a GLoRA is bound
+    void free_glora_scratch();
+    /// A GLoRA's own path: the weight's rows [r0, r0 + n) product of v (nt tokens, the first of them t0), added to
+    /// the product's output y at those rows (the weight's own path, as product takes it).
+    void glora_weight(const uint16_t* v, const W& w, const uint8_t* d, int64_t r0, int64_t n, int64_t nt, int64_t t0,
+                      float* y);
 };
 
 }  // namespace strata::image

@@ -8,10 +8,15 @@ and shape and the file's string metadata.  A key is brought to the DiT's name th
 the file's prefix off, ".weight" off, the role's suffix off), and a file is this model's when every weight it changes
 is one the DiT's products take (TARGETS: the names of qi_dit.cpp's, moss_dit.cpp's and mf_dit.cpp's
 build_lora_targets, written here a second time; the record's check sets them against the probe's `map` on the models,
-name for name), in a form the engine
-applies today: a plain LoRA, not a DoRA (dora_scale), LoKr, LoHa, GLoRA, OFT or a whole weight's difference, and no text
-encoder's weight.  The engine refuses those when it binds a set (QiDit::set_loras, MossDit::set_loras,
-MfDit::set_loras), so no image is made with part of a file.
+name for name), in a form the engine applies today: a plain LoRA, LoKr or LoHa (a DoRA: a plain LoRA with a
+dora_scale over the weight's rows, ComfyUI's weight_decompose), a whole weight's difference (diff, set_weight,
+w_norm), or an OFT's turn of the weight's rows (oft_blocks, a BOFT's four dimensions too; the file's alpha is the
+constraint on the block's skew part, not a scale), and a GLoRA (a1/a2/b1/b2: the weight's own product on the input
+its factors make, beside a plain form's pair), and no text encoder's weight.  A bias's delta (diff_b, or b_norm beside
+w_norm) goes with any of them or alone, where the weight adds a bias of its own (BIASED: Mage-Flow's DiT's weights all
+do; MOSS-Image's outside its blocks and in its text embedder; Qwen-Image-2.1's none).  The engine refuses the forms it
+does not apply when it binds a set (QiDit::set_loras, MossDit::set_loras, MfDit::set_loras), so no image is made with
+part of a file.
 
 A listing entry - ImageGen.defaults' "loras" (the engine's capabilities: /health's image_defaults and image_models,
 /v1/models' image model):
@@ -26,8 +31,9 @@ A listing entry - ImageGen.defaults' "loras" (the engine's capabilities: /health
 A request's adapters come from the "lora" field - a list of {"name", "scale"} or one such object (vLLM-Omni's shape), a
 name alone, or one of those as JSON text (a multipart form's field) - and from the prompt's tags, <lora:name:0.8> in
 A1111's and Forge's form, in the positive prompt and the negative one.  "local_path" names a file inside the folder,
-and no other path is taken (a path is not a capability); "scale_text" is taken and not applied (the engine applies no
-text encoder's adapter yet), and the response says so.  A name the listing does not have is refused where the field
+and no other path is taken (a path is not a capability).  A text encoder's adapter is not applied (the human's
+decision of 2026-10-29): "scale_text" and a tag's third field, A1111's text encoder's weight, are taken as the
+engine's other unknown fields are, ignored.  A name the listing does not have is refused where the field
 gives it, and taken out of the prompt with a warning where a tag gives it (the response's strata.lora_unknown and the
 server's log; the human's decision of 2026-10-29, as A1111 and Forge do).  A model whose DiT takes no adapter at all
 takes neither the field nor a tag: both are refused, so no image is made without what was asked for.
@@ -85,6 +91,17 @@ TARGETS: dict[str, tuple[str, ...]] = {
     "mage-flow": (_MAGE_OUTSIDE + tuple("transformer_blocks.{b}." + n for n in _MAGE_BLOCKS)),
 }
 
+# The weights that add a bias of their own, where a bias's delta (diff_b, or b_norm beside w_norm) goes: Mage-Flow's
+# DiT adds one under every product, MOSS-Image's outside the blocks and in its text embedder (the 42 blocks' shift is
+# their modulation's), and Qwen-Image-2.1's DiT has none (the engine refuses a bias's delta for it).
+_BIASED_NAMES: dict[str, tuple[str, ...]] = {
+    "qwen-image": (),
+    "moss-image": ("video_embedder", "time_embedding.0", "time_embedding.2", "shared_block_modulation",
+                   "video_head_modulation", "text_embedder.proj") + tuple(
+                       "text_embedder.blocks.{b}." + n for n in _MOSS_TEXT_BLOCKS),
+    "mage-flow": TARGETS["mage-flow"],
+}
+
 
 def _target_pattern(name: str) -> re.Pattern[str]:
     """A TARGETS name as the pattern a file's key is matched with ("{b}" a block's number)."""
@@ -92,6 +109,7 @@ def _target_pattern(name: str) -> re.Pattern[str]:
 
 
 _MATCH = {family: tuple(_target_pattern(n) for n in names) for family, names in TARGETS.items()}
+_BIASED = {family: tuple(_target_pattern(n) for n in names) for family, names in _BIASED_NAMES.items()}
 
 # A file's key -> the DiT's weight and the tensor's role, as the engine reads them (src/image/image_lora.cpp's
 # split_key): the longest prefix first, ".weight" off every form but PEFT's bare lora_A and lora_B, then the role's
@@ -147,14 +165,150 @@ def split_key(raw: str) -> tuple[str, str]:
 
 
 def form_of(roles) -> str:
-    """The form a weight's tensors are in, as the engine's kind_of reads them: lora, lokr, loha, glora, oft, diff; ""
-    when they are none of those."""
+    """The form a weight's tensors are in, as the engine's kind_of reads them: lora, lokr, loha, glora, oft, diff (a
+    whole delta: diff, set_weight or w_norm); "" when they are none of those."""
     for role, form in (("lora_A", "lora"), ("lora_B", "lora"), ("lokr_w1", "lokr"), ("lokr_w2", "lokr"),
                        ("lokr_w1_a", "lokr"), ("lokr_w2_a", "lokr"), ("hada_w1_a", "loha"), ("hada_w2_a", "loha"),
                        ("a1", "glora"), ("b1", "glora"), ("oft_blocks", "oft"), ("diff", "diff"),
-                       ("set_weight", "diff")):
+                       ("set_weight", "diff"), ("w_norm", "diff")):
         if role in roles:
             return form
+    return ""
+
+
+def _lokr_rank(roles: dict[str, tuple[int, ...]]) -> tuple[int, str]:
+    """A LoKr weight's tensors -> (the factorization's rank, "") or (0, why they make no Kronecker product): its
+    two matrices whole (lokr_w1 and lokr_w2) or each from two factors (lokr_w1_a [rows][rank] and lokr_w1_b
+    [rank][cols]), w2's under a Tucker core (lokr_t2, a linear product's: a kernel of 1 x 1).  The rank is the one
+    ComfyUI divides the file's alpha by (w2's factors' rows, else w1's); the engine reads the tensors the same way
+    (src/image/image_lora.cpp's make_lokr)."""
+    rank = 0
+    for name in ("w1", "w2"):
+        whole, fa, fb = f"lokr_{name}", f"lokr_{name}_a", f"lokr_{name}_b"
+        if whole in roles:   # the whole matrix: a Tucker core beside w2 stays unread, as ComfyUI leaves it
+            if fa in roles or fb in roles:
+                return 0, f"both {whole} and its factors {fa}/{fb}"
+            if len(roles[whole]) != 2:
+                return 0, f"{whole} must be a matrix"
+            continue
+        if fa not in roles or fb not in roles:
+            return 0, f"a LoKr weight needs {whole} or both {fa} and {fb}"
+        a, b = roles[fa], roles[fb]
+        if len(a) != 2 or len(b) != 2:
+            return 0, f"{fa} and {fb} must be matrices"
+        if name == "w2" and "lokr_t2" in roles:
+            t2 = roles["lokr_t2"]
+            if not (len(t2) == 2 or (len(t2) == 4 and t2[2] == 1 and t2[3] == 1)):
+                return 0, "a LoKr Tucker core with a convolution's kernel dimensions"
+            if a[0] != t2[0] or b[0] != t2[1]:
+                return 0, f"the Tucker core is {t2[0]} x {t2[1]}; w2_a's rows {a[0]}, w2_b's {b[0]}"
+        elif a[1] != b[0]:
+            return 0, f"{fb} is {b[0]} x {b[1]}, not the rank its {fa} has ({a[1]})"
+        rank = b[0]
+    return rank, ""
+
+
+def _loha_rank(roles: dict[str, tuple[int, ...]]) -> tuple[int, str]:
+    """A LoHa weight's tensors -> (the rank ComfyUI divides the file's alpha by, "") or (0, why they make no delta):
+    two low-rank products, (hada_w1_a . hada_w1_b) * (hada_w2_a . hada_w2_b), each side's under a Tucker core
+    (hada_t1/hada_t2; a linear product's, a kernel of 1 x 1), which writes the side's factors the core's way (w_a
+    [core][out], w_b [rank][in]).  The rank is w1_b's rows, as ComfyUI takes it; the engine makes the delta when it
+    binds the entry (src/image/image_lora.cpp's make_loha and loha_delta)."""
+    if ("hada_t1" in roles) != ("hada_t2" in roles):
+        return 0, "a LoHa with one Tucker core (hada_t1/hada_t2): both or neither"
+    sides = []
+    for name in ("w1", "w2"):
+        fa, fb, tc = f"hada_{name}_a", f"hada_{name}_b", f"hada_t{name[-1]}"
+        if fa not in roles or fb not in roles:
+            return 0, f"a LoHa weight needs {fa} and {fb}"
+        a, b = roles[fa], roles[fb]
+        if len(a) != 2 or len(b) != 2:
+            return 0, f"{fa} and {fb} must be matrices"
+        if tc in roles:
+            t = roles[tc]
+            if not (len(t) == 2 or (len(t) == 4 and t[2] == 1 and t[3] == 1)):
+                return 0, f"a {tc} with a convolution's kernel dimensions"
+            if t[0] != a[0] or t[1] != b[0]:
+                return 0, f"{tc} is {t[0]} x {t[1]}; {fa}'s rows {a[0]}, {fb}'s {b[0]}"
+            sides.append((a[1], b[1]))
+        else:
+            if a[1] != b[0]:
+                return 0, f"{fb} is {b[0]} x {b[1]}, not the rank its {fa} has ({a[1]})"
+            sides.append((a[0], b[1]))
+    if sides[0] != sides[1]:
+        return 0, (f"its two sides' products are {sides[0][0]} x {sides[0][1]} and {sides[1][0]} x {sides[1][1]}: "
+                   f"not the weight's one shape")
+    return roles["hada_w1_b"][0], ""
+
+
+def _oft_shape(roles: dict[str, tuple[int, ...]]) -> tuple[int, str]:
+    """An OFT weight's tensors -> (a block's rows, "") or (0, why they make no turn): oft_blocks [blocks][b][b] (an
+    OFT) or [stages][blocks][b][b] (a BOFT, whose stage i reads the rows 2^(i-1) blocks at a time), the blocks squares,
+    and a rescale of the weight's rows where the file has one.  The engine reads them the same way
+    (src/image/image_lora.cpp's make_oft), and checks the rows against the weight it binds them to."""
+    bl = roles["oft_blocks"]
+    if len(bl) == 3:
+        stages, blocks, b = 1, bl[0], bl[1]
+    elif len(bl) == 4:
+        stages, blocks, b = bl[0], bl[1], bl[2]
+    else:
+        return 0, (f"oft_blocks must be [blocks][b][b] (an OFT) or [stages][blocks][b][b] (a BOFT), not {len(bl)} "
+                   f"dimensions")
+    if b <= 0 or blocks <= 0 or stages <= 0 or bl[-1] != b:
+        return 0, f"oft_blocks' blocks are {b} x {bl[-1]}: not squares"
+    if stages > 1:
+        if b % 2 != 0:
+            return 0, f"a BOFT's block of {b} rows: not an even number"
+        for i in range(stages):
+            if blocks % (2 ** i) != 0:
+                return 0, (f"a BOFT's stage {i} reads the rows {blocks} blocks at a time: not a multiple of {2 ** i}")
+    rs = roles.get("rescale")
+    if rs is not None and tuple(rs) != (blocks * b,):
+        return 0, f"a rescale of {rs} values, not the weight's {blocks * b} rows"
+    return b, ""
+
+
+def _glora_rank(roles: dict[str, tuple[int, ...]]) -> tuple[int, str]:
+    """A GLoRA weight's tensors -> (the rank the file's alpha is divided by, "") or (0, why they make no GLoRA): the
+    four matrices of one of the form's two readings - ComfyUI's a1 [cols][rank], a2 [rank][cols], b1 [rows][rank], b2
+    [rank][cols], or LyCORIS's older one (a1 [rank][cols], a2 [cols][rank], b1 [rank][cols], b2 [rows][rank]).  A
+    square weight's four fit both, and the weight's rows and columns choose between them in the engine (make_glora's
+    `glora_other`, the entry the DiT resolves with lora_glora_for_weight); the listing has no weight to ask, so it
+    reports the smaller of the two readings' ranks (the one a GLoRA of a weight that shape has: the other reading would
+    make the weight's rank its rows' count)."""
+    names = ("a1", "a2", "b1", "b2")
+    missing = [n for n in names if n not in roles]
+    if missing:
+        return 0, f"a GLoRA weight needs a1, a2, b1 and b2 ({missing[0]} is missing)"
+    a1, a2, b1, b2 = (roles[n] for n in names)
+    if any(len(t) != 2 for t in (a1, a2, b1, b2)):
+        return 0, "a1, a2, b1 and b2 must be matrices"
+    ranks = []
+    why = ""
+    # the older reading first, as the engine takes it where both fit
+    if b2[1] == b1[0] == a1[0] == a2[1]:
+        ranks.append(a1[0])
+        want = {"a1": (a1[0], a1[1]), "a2": (a1[1], a1[0]), "b1": (a1[0], a1[1]), "b2": (b2[0], a1[0])}
+        why = why or _glora_shapes(want, {"a1": a1, "a2": a2, "b1": b1, "b2": b2})
+    if b2[0] == b1[1] == a1[1] == a2[0]:
+        ranks.append(a1[1])
+        want = {"a1": (a1[0], a1[1]), "a2": (a1[1], a1[0]), "b1": (b1[0], a1[1]), "b2": (a1[1], a1[0])}
+        why = why or _glora_shapes(want, {"a1": a1, "a2": a2, "b1": b1, "b2": b2})
+    if not ranks:
+        return 0, (f"a1/a2/b1/b2 of {a1}, {a2}, {b1} and {b2}: neither of a GLoRA's two readings (a1 [cols][rank], a2 "
+                   f"[rank][cols], b1 [rows][rank], b2 [rank][cols], or LyCORIS's with a1/a2 and b1/b2 the other way "
+                   f"round)")
+    if why:
+        return 0, why
+    return min(ranks), ""
+
+
+def _glora_shapes(want: dict[str, tuple[int, int]], have: dict[str, tuple[int, ...]]) -> str:
+    """Why a reading's four are not the shapes it takes (the other tensors' rows and columns), "" where they are."""
+    for name, t in have.items():
+        if tuple(t) != want[name]:
+            return (f"its {name} is {t[0]} x {t[1]}, not the {want[name][0]} x {want[name][1]} the form's other "
+                    f"tensors take")
     return ""
 
 
@@ -375,23 +529,74 @@ class Folder:
         targets: set[str] = set()
         rank = 0
         for key, roles in sorted(weights.items()):
-            form = form_of(roles)
-            if form != "lora":
-                return f"{key}: a {form or 'non-LoRA'} adapter, which the image engine applies not yet"
-            if "dora_scale" in roles:
-                return f"{key}: a DoRA (dora_scale) adapter, which the image engine applies not yet"
             if is_text_encoder(key):
                 return f"{key}: a text encoder's weight, which the image engine applies not yet"
+            # a bias's delta (ComfyUI's .diff_b, or .b_norm beside the weight's w_norm, which .diff_b overrides): the
+            # engine adds it where the DiT adds the weight's own bias, and only the weights that add one take it
+            bias = roles.get("diff_b", roles.get("b_norm"))
+            if bias is not None:
+                if len(bias) != 1:
+                    return f"{key}: a bias's delta (diff_b/b_norm) must be the bias's vector"
+                if "diff_b" not in roles and "w_norm" not in roles:
+                    return (f"{key}: a bias's delta (b_norm) without the weight's w_norm, beside which ComfyUI's "
+                            f"load_lora reads it")
+                if not any(m.match(key) for m in _BIASED[self.family]):
+                    return f"{key}: a bias's delta (diff_b/b_norm), and this model's weight adds no bias"
+            form = form_of(roles)
+            if not form:
+                if bias is None:
+                    return f"{key}: a non-LoRA adapter, which the image engine applies not yet"
+                if not any(m.match(key) for m in _MATCH[self.family]):   # a bias's delta alone: it changes no weight
+                    return f"{key} is not one of this image model's weights"
+                targets.add(kind_of(key))
+                continue
+            if form not in ("lora", "lokr", "loha", "glora", "diff", "oft"):
+                return f"{key}: a {form} adapter, which the image engine applies not yet"
+            if "dora_scale" in roles and form != "lora":
+                return f"{key}: a DoRA (dora_scale) on a {form} adapter, which the image engine applies not yet"
             if not any(m.match(key) for m in _MATCH[self.family]):
                 return f"{key} is not one of this image model's weights"
-            a, b = roles.get("lora_A"), roles.get("lora_B")
-            if a is None or b is None:
-                return f"{key}: a LoRA weight needs both lora_A (down) and lora_B (up)"
-            if len(a) != 2 or len(b) != 2:
-                return f"{key}: lora_A and lora_B must be matrices"
-            if b[1] != a[0]:
-                return f"{key}: lora_B is {b[0]} x {b[1]}, not the rank its lora_A has ({a[0]})"
-            rank = max(rank, a[0])
+            if form == "diff":
+                # the weight's own matrix (set_weight is the weight itself, diff and w_norm a delta), as ComfyUI's
+                # patch table takes one a key; its rows and columns are the DiT's, which the engine checks
+                whole = roles.get("set_weight", roles.get("diff", roles.get("w_norm")))
+                if whole is None or len(whole) != 2:
+                    return f"{key}: a whole delta (diff/set_weight) must be the weight's matrix"
+            elif form == "lokr":
+                r, why = _lokr_rank(roles)
+                if why:
+                    return f"{key}: {why}"
+                rank = max(rank, r)
+            elif form == "loha":
+                r, why = _loha_rank(roles)
+                if why:
+                    return f"{key}: {why}"
+                rank = max(rank, r)
+            elif form == "glora":
+                r, why = _glora_rank(roles)
+                if why:
+                    return f"{key}: {why}"
+                rank = max(rank, r)
+            elif form == "oft":
+                # a block's rows (the listing's rank is the blocks' factorization's, which is none)
+                _, why = _oft_shape(roles)
+                if why:
+                    return f"{key}: {why}"
+            else:
+                a, b = roles.get("lora_A"), roles.get("lora_B")
+                if a is None or b is None:
+                    return f"{key}: a LoRA weight needs both lora_A (down) and lora_B (up)"
+                if len(a) != 2 or len(b) != 2:
+                    return f"{key}: lora_A and lora_B must be matrices"
+                if b[1] != a[0]:
+                    return f"{key}: lora_B is {b[0]} x {b[1]}, not the rank its lora_A has ({a[0]})"
+                if "dora_scale" in roles and tuple(roles["dora_scale"]) != (b[0],):
+                    # the engine's DoRA scales the weight's output rows, c = dora_scale / (|W| a row + eps)
+                    if tuple(roles["dora_scale"]) == (a[1],):
+                        return (f"{key}: a DoRA (dora_scale) over the weight's columns, which the engine's DoRA "
+                                f"does not take (it scales a product's rows)")
+                    return f"{key}: dora_scale is neither the weight's rows nor its columns"
+                rank = max(rank, a[0])
             targets.add(kind_of(key))
         return {"name": name, "path": rel, "rank": rank, "scale": _recommended(meta), "trigger": _trigger(meta),
                 "targets": sorted(targets), "size_mib": round(path.stat().st_size / 1048576, 1)}
@@ -498,8 +703,7 @@ def _items(value) -> list:
 
 
 def one(item, f: Folder) -> dict:
-    """One adapter a request names -> {"name", "path", "scale"} ("path": its file, absolute; "scale_text" kept where
-    it is given)."""
+    """One adapter a request names -> {"name", "path", "scale"} ("path": its file, absolute)."""
     if isinstance(item, str):
         item = {"name": item}
     if not isinstance(item, dict):
@@ -520,8 +724,6 @@ def one(item, f: Folder) -> dict:
         raise LoraError('lora: each adapter needs a "name" (one the model lists) or a "local_path"')
     use = {"name": entry["name"], "path": f.file_of(entry),
            "scale": _strength(item.get("scale"), f"lora: {entry['name']}: scale", 1.0)}
-    if item.get("scale_text") is not None:
-        use["scale_text"] = _strength(item["scale_text"], f"lora: {entry['name']}: scale_text", 1.0)
     return use
 
 
@@ -554,8 +756,9 @@ def field(value, f: Folder) -> list[dict]:
 def strip_tags(text: str, f: Folder) -> tuple[str, list[dict], list[str]]:
     """A prompt's <lora:name:weight> tags out of `text` -> (the text, the adapters the tags name in order - the first
     naming of a name wins, one()'s dicts - and the names the model does not list, which are left out and said in the
-    response).  <lora:name:weight:weight> is A1111's text encoder's weight: taken, not applied.  A weight that is not a
-    number, or a tag on a model that takes no adapter at all: LoraError."""
+    response).  <lora:name:weight:weight> is A1111's text encoder's weight: not applied, and taken as the engine's other
+    unknown fields are (the human's decision of 2026-10-29).  A weight that is not a number, or a tag on a model that
+    takes no adapter at all: LoraError."""
     if "<" not in text:
         return text, [], []
     found = list(TAG.finditer(text))
@@ -569,14 +772,10 @@ def strip_tags(text: str, f: Folder) -> tuple[str, list[dict], list[str]]:
         name = m.group(1).strip()
         entry = f.find(name)
         scale = _strength(m.group(2), f"<lora:{name}:weight>", 1.0)
-        text_scale = m.group(3)
         if entry is None:
             unknown.append(name)
             continue
         if any(u["name"] == entry["name"] for u in uses):
             continue
-        use = {"name": entry["name"], "path": f.file_of(entry), "scale": scale}
-        if text_scale is not None:
-            use["scale_text"] = _strength(text_scale, f"<lora:{name}:weight:weight>", 1.0)
-        uses.append(use)
+        uses.append({"name": entry["name"], "path": f.file_of(entry), "scale": scale})
     return TAG.sub("", text), uses, unknown

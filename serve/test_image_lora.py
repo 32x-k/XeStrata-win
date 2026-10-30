@@ -89,7 +89,8 @@ def qwen_lora(rank: int = 4, blocks: tuple[int, ...] = (0, 1), prefix: str = "tr
 
 
 def mage_lora(rank: int = 4, blocks: tuple[int, ...] = (0, 1),
-              prefix: str = "diffusion_model.") -> dict[str, tuple[int, ...]]:
+              prefix: str = "diffusion_model.",
+              extra: dict[str, tuple[int, ...]] | None = None) -> dict[str, tuple[int, ...]]:
     """Mage-Flow's adapter's tensors, as ai-toolkit's mageflow form and ComfyUI's saves name them
     (transformer_blocks.N.attn.to_q and the like), at `rank` and that prefix."""
     out: dict[str, tuple[int, ...]] = {}
@@ -99,6 +100,7 @@ def mage_lora(rank: int = 4, blocks: tuple[int, ...] = (0, 1),
                                  ("img_mod.1", 256, 1536)):
             out[f"{prefix}transformer_blocks.{b}.{name}.lora_A.weight"] = (rank, cols)
             out[f"{prefix}transformer_blocks.{b}.{name}.lora_B.weight"] = (rows, rank)
+    out.update(extra or {})
     return out
 
 
@@ -153,12 +155,184 @@ class Listing(Tree):
         self.assertEqual(entries[0]["scale"], 1.0, "no recommended strength: 1.0")
         self.assertIsNone(entries[0]["trigger"])
 
+    def test_a_lokr_is_listed_with_its_factorizations_rank(self):
+        b = "transformer.transformer_blocks.0."
+        safetensors(self.d / "lokr.safetensors", {
+            # to_q: w1 from its two factors, w2 whole (the file's alpha divides w1's factorization's rank)
+            b + "attn.to_q.lokr_w1_a.weight": (16, 8), b + "attn.to_q.lokr_w1_b.weight": (8, 16),
+            b + "attn.to_q.lokr_w2": (16, 16),
+            b + "attn.to_q.alpha": (1,),
+            # to_out.0: both from factors, w2's under a linear Tucker core
+            b + "attn.to_out.0.lokr_w1_a.weight": (16, 8), b + "attn.to_out.0.lokr_w1_b.weight": (8, 16),
+            b + "attn.to_out.0.lokr_w2_a.weight": (16, 16), b + "attn.to_out.0.lokr_w2_b.weight": (16, 16),
+            b + "attn.to_out.0.lokr_t2": (16, 16, 1, 1),
+        })
+        f = self.folder()
+        entries = f.listing()
+        self.assertEqual([e["name"] for e in entries], ["lokr"], f.skipped)
+        e = entries[0]
+        self.assertEqual(e["rank"], 16, "the rank of w2's factors where w2 is decomposed (ComfyUI's dim)")
+        self.assertEqual(e["targets"], ["attn.to_out.0", "attn.to_q"])
+        self.assertEqual(loras.field([{"name": "lokr", "scale": 0.7}], f)[0]["scale"], 0.7)
+
+    def test_a_dora_is_listed_and_one_over_the_columns_is_not(self):
+        b = "transformer.transformer_blocks.0.attn.to_q"
+        safetensors(self.d / "dora.safetensors", qwen_lora(
+            extra={b + ".dora_scale": (256,)}))   # the weight's rows: ComfyUI's weight_decompose
+        safetensors(self.d / "columns.safetensors", qwen_lora(
+            extra={"transformer.transformer_blocks.0.img_mlp.out.dora_scale": (512,)}))   # the weight's columns
+        f = self.folder()
+        self.assertEqual([e["name"] for e in f.listing()], ["dora"], f.skipped)
+        self.assertIn("columns", f.skipped["columns"], "a DoRA over the weight's columns is not the engine's")
+        self.assertIn("DoRA", f.skipped["columns"])
+        self.assertEqual(loras.field([{"name": "dora", "scale": 0.7}], f)[0]["scale"], 0.7)
+
+    def test_a_loha_is_listed_with_its_factors_rank(self):
+        b = "transformer.transformer_blocks.0."
+        safetensors(self.d / "loha.safetensors", {
+            # attn.to_q: the plain form, the file's alpha's divisor w1_b's rows
+            b + "attn.to_q.hada_w1_a.weight": (256, 8), b + "attn.to_q.hada_w1_b.weight": (8, 256),
+            b + "attn.to_q.hada_w2_a.weight": (256, 4), b + "attn.to_q.hada_w2_b.weight": (4, 256),
+            b + "attn.to_q.alpha": (1,),
+            # img_mlp.out: both sides under linear Tucker cores, their factors written the core's way (a core of one
+            # dimension, w_a [1][out], is a rank of 1; both cores come together, as ComfyUI reads them)
+            b + "img_mlp.out.hada_w1_a.weight": (1, 256), b + "img_mlp.out.hada_w1_b.weight": (8, 512),
+            b + "img_mlp.out.hada_t1": (1, 8, 1, 1),
+            b + "img_mlp.out.hada_w2_a.weight": (5, 256), b + "img_mlp.out.hada_w2_b.weight": (4, 512),
+            b + "img_mlp.out.hada_t2": (5, 4, 1, 1),
+        })
+        safetensors(self.d / "sides.safetensors", {   # the two sides' products are not one weight's shape
+            b + "attn.to_q.hada_w1_a.weight": (256, 8), b + "attn.to_q.hada_w1_b.weight": (8, 256),
+            b + "attn.to_q.hada_w2_a.weight": (256, 4), b + "attn.to_q.hada_w2_b.weight": (4, 128)})
+        safetensors(self.d / "kernel.safetensors", {   # a convolution's core
+            b + "attn.to_q.hada_w1_a.weight": (256, 8), b + "attn.to_q.hada_w1_b.weight": (8, 256),
+            b + "attn.to_q.hada_t1": (3, 8, 3, 3),
+            b + "attn.to_q.hada_t2": (3, 8, 1, 1),
+            b + "attn.to_q.hada_w2_a.weight": (256, 4), b + "attn.to_q.hada_w2_b.weight": (4, 256)})
+        f = self.folder()
+        entries = f.listing()
+        self.assertEqual([e["name"] for e in entries], ["loha"], f.skipped)
+        e = entries[0]
+        self.assertEqual(e["rank"], 8, "the file's alpha is divided by w1_b's rows")
+        self.assertEqual(e["targets"], ["attn.to_q", "img_mlp.out"])
+        self.assertIn("products are 256 x 256 and 256 x 128", f.skipped["sides"])
+        self.assertIn("convolution's kernel", f.skipped["kernel"])
+        self.assertEqual(loras.field([{"name": "loha", "scale": 0.7}], f)[0]["scale"], 0.7)
+
+    def test_a_glora_is_listed_with_the_rank_its_reading_gives(self):
+        b = "transformer.transformer_blocks.0."
+        safetensors(self.d / "glora.safetensors", {
+            # to_q (256 of 256): ComfyUI's reading, a1 [cols][rank], a2 [rank][cols], b1 [rows][rank], b2
+            # [rank][cols]; every tensor square-or-not, the file's alpha divided by a1's columns
+            b + "attn.to_q.a1.weight": (256, 8), b + "attn.to_q.a2.weight": (8, 256),
+            b + "attn.to_q.b1.weight": (256, 8), b + "attn.to_q.b2.weight": (8, 256),
+            b + "attn.to_q.alpha": (1,),
+            # img_mlp.out (256 of 512): LyCORIS's older reading, a1 [rank][cols], a2 [cols][rank], b1 [rank][cols],
+            # b2 [rows][rank] (a weight of no square shape reads only one way)
+            b + "img_mlp.out.a1.weight": (4, 512), b + "img_mlp.out.a2.weight": (512, 4),
+            b + "img_mlp.out.b1.weight": (4, 512), b + "img_mlp.out.b2.weight": (256, 4)})
+        safetensors(self.d / "shapes.safetensors", {   # neither of the form's two readings
+            b + "attn.to_q.a1.weight": (256, 8), b + "attn.to_q.a2.weight": (8, 200),
+            b + "attn.to_q.b1.weight": (256, 8), b + "attn.to_q.b2.weight": (8, 256)})
+        safetensors(self.d / "missing.safetensors", {b + "attn.to_q.a1.weight": (256, 8)})
+        safetensors(self.d / "dora.safetensors", {   # the engine's DoRA is the plain form's
+            b + "attn.to_q.a1.weight": (256, 8), b + "attn.to_q.a2.weight": (8, 256),
+            b + "attn.to_q.b1.weight": (256, 8), b + "attn.to_q.b2.weight": (8, 256),
+            b + "attn.to_q.dora_scale": (256,)})
+        f = self.folder()
+        entries = f.listing()
+        self.assertEqual([e["name"] for e in entries], ["glora"], f.skipped)
+        e = entries[0]
+        self.assertEqual(e["rank"], 8, "a square weight's four fit both readings; the smaller rank is the file's")
+        self.assertEqual(e["targets"], ["attn.to_q", "img_mlp.out"])
+        self.assertIn("its a2 is 8 x 200", f.skipped["shapes"])
+        self.assertIn("needs a1, a2, b1 and b2", f.skipped["missing"])
+        self.assertIn("DoRA", f.skipped["dora"])
+        self.assertEqual(loras.field([{"name": "glora", "scale": 0.7}], f)[0]["scale"], 0.7)
+
+    def test_an_oft_is_listed_and_the_blocks_it_cannot_apply_are_not(self):
+        b = "transformer.transformer_blocks.0."
+        safetensors(self.d / "oft.safetensors", {
+            # to_q: an OFT's blocks over the weight's 256 rows, with the file's alpha (the constraint, not a scale)
+            b + "attn.to_q.oft_blocks": (32, 8, 8), b + "attn.to_q.alpha": (1,),
+            # img_mlp.out: a BOFT's four dimensions, a rescale of the weight's rows beside them
+            b + "img_mlp.out.oft_blocks": (2, 16, 16, 16), b + "img_mlp.out.rescale": (256,)})
+        safetensors(self.d / "stages.safetensors", {   # 2^1 of the 3 blocks: a BOFT's stage 1 cannot read them
+            b + "attn.to_q.oft_blocks": (2, 3, 16, 16)})
+        safetensors(self.d / "squares.safetensors", {b + "attn.to_q.oft_blocks": (32, 8, 4)})
+        safetensors(self.d / "rescale.safetensors", {
+            b + "attn.to_q.oft_blocks": (32, 8, 8), b + "attn.to_q.rescale": (128,)})
+        safetensors(self.d / "dora.safetensors", {   # the engine's DoRA is the plain form's
+            b + "attn.to_q.oft_blocks": (32, 8, 8), b + "attn.to_q.dora_scale": (256,)})
+        f = self.folder()
+        entries = f.listing()
+        self.assertEqual([e["name"] for e in entries], ["oft"], f.skipped)
+        e = entries[0]
+        self.assertEqual(e["rank"], 0, "a turn of the rows has no rank")
+        self.assertEqual(e["targets"], ["attn.to_q", "img_mlp.out"])
+        self.assertIn("not a multiple of 2", f.skipped["stages"])
+        self.assertIn("not squares", f.skipped["squares"])
+        self.assertIn("not the weight's 256 rows", f.skipped["rescale"])
+        self.assertIn("DoRA", f.skipped["dora"])
+        self.assertEqual(loras.field([{"name": "oft", "scale": 0.7}], f)[0]["scale"], 0.7)
+
+    def test_a_whole_delta_is_listed_and_this_models_bias_delta_is_not(self):
+        b = "transformer.transformer_blocks.0."
+        safetensors(self.d / "diff.safetensors", {
+            b + "attn.to_q.diff": (256, 256), b + "img_mlp.out.diff": (256, 512)})
+        safetensors(self.d / "set.safetensors", {b + "attn.to_q.set_weight": (256, 256)})
+        safetensors(self.d / "norm.safetensors", {b + "attn.to_q.w_norm": (256, 256)})
+        # Qwen-Image-2.1's DiT weights add no bias: its file's bias's delta has no place, and the engine refuses it
+        safetensors(self.d / "bias.safetensors", {
+            b + "attn.to_q.diff": (256, 256), b + "attn.to_q.diff_b": (256,)})
+        safetensors(self.d / "bias-only.safetensors", {b + "attn.to_q.diff_b": (256,)})
+        f = self.folder()
+        self.assertEqual([e["name"] for e in f.listing()], ["diff", "norm", "set"], f.skipped)
+        diff = [e for e in f.listing() if e["name"] == "diff"][0]
+        self.assertEqual(diff["targets"], ["attn.to_q", "img_mlp.out"])
+        self.assertEqual(diff["rank"], 0, "a whole delta has no rank")
+        self.assertIn("adds no bias", f.skipped["bias"], "the model's weights have no bias to add it beside")
+        self.assertIn("adds no bias", f.skipped["bias-only"])
+        self.assertEqual(loras.field([{"name": "set", "scale": 0.7}], f)[0]["scale"], 0.7)
+
+    def test_a_bias_delta_is_listed_where_the_weight_adds_a_bias(self):
+        # Mage-Flow's DiT: every weight of the table has a bias, so a file may hold one beside a LoRA's or alone
+        b = "diffusion_model.transformer_blocks.0."
+        safetensors(self.d / "with.safetensors", mage_lora(extra={
+            b + "attn.to_q.diff_b": (256,), b + "img_mod.1.diff_b": (1536,)}))
+        safetensors(self.d / "alone.safetensors", {b + "attn.to_q.diff_b": (256,)})
+        safetensors(self.d / "norm.safetensors", {   # b_norm beside the weight's w_norm: the same bias's patch
+            b + "attn.to_q.w_norm": (256, 256), b + "attn.to_q.b_norm": (256,)})
+        safetensors(self.d / "loose.safetensors", {   # b_norm without w_norm: ComfyUI reads it beside w_norm only
+            b + "attn.to_q.b_norm": (256,)})
+        f = self.folder("mage-flow")
+        self.assertEqual([e["name"] for e in f.listing()], ["alone", "norm", "with"], f.skipped)
+        listed = {e["name"]: e for e in f.listing()}
+        self.assertEqual(listed["alone"]["targets"], ["attn.to_q"])
+        self.assertEqual(listed["alone"]["rank"], 0, "a bias's delta alone changes no weight")
+        self.assertIn("img_mod.1", listed["with"]["targets"], "the file's other tensors are its rank's")
+        self.assertEqual(listed["norm"]["targets"], ["attn.to_q"])
+        self.assertIn("w_norm", f.skipped["loose"])
+
+    def test_a_moss_images_bias_delta_and_the_blocks_that_add_none(self):
+        # MOSS-Image: its text embedder and the weights outside the blocks add biases; the 42 blocks' shift is their
+        # modulation's, and the engine refuses a bias's delta there
+        safetensors(self.d / "text.safetensors", {
+            "transformer.text_embedder.blocks.0.qkv.diff_b": (384,)})
+        safetensors(self.d / "block.safetensors", {"transformer.layers.0.proj.q.diff_b": (128,)})
+        f = self.folder("moss-image")
+        self.assertEqual([e["name"] for e in f.listing()], ["text"], f.skipped)
+        self.assertEqual(f.listing()[0]["targets"], ["qkv"])
+        self.assertIn("adds no bias", f.skipped["block"])
+
     def test_another_models_file_and_the_forms_not_applied_are_left_out(self):
         self.qwen("qwen")
         safetensors(self.d / "moss.safetensors", {
             "layers.0.proj.q.lora_A.weight": (8, 256), "layers.0.proj.q.lora_B.weight": (256, 8)})
-        safetensors(self.d / "dora.safetensors", qwen_lora(
-            extra={"transformer.transformer_blocks.0.attn.to_q.dora_scale": (256,)}))
+        safetensors(self.d / "dora.safetensors", {
+            "transformer.transformer_blocks.0.attn.to_q.lokr_w1": (256, 256),
+            "transformer.transformer_blocks.0.attn.to_q.lokr_w2": (256, 256),
+            "transformer.transformer_blocks.0.attn.to_q.dora_scale": (256,)})
         safetensors(self.d / "lokr.safetensors", {
             "transformer.transformer_blocks.0.attn.to_q.lokr_w1": (256, 256),
             "transformer.transformer_blocks.0.attn.to_q.lokr_w2_a": (4, 64),
@@ -175,8 +349,9 @@ class Listing(Tree):
         f = self.folder()
         self.assertEqual([e["name"] for e in f.listing()], ["qwen"])
         self.assertEqual(f.skipped["moss"], "layers.0.proj.q is not one of this image model's weights")
-        self.assertIn("DoRA", f.skipped["dora"])
-        self.assertIn("lokr", f.skipped["lokr"])
+        self.assertIn("DoRA", f.skipped["dora"], "a DoRA on a LoKr is not the engine's")
+        self.assertIn("lokr_w2_b is 4 x 64, not the rank its lokr_w2_a has (64)", f.skipped["lokr"],
+                      "a LoKr's factors that do not meet are not one")
         self.assertIn("text encoder", f.skipped["text-encoder"])
         self.assertIn("not one of this image model's weights", f.skipped["a-norm"])
         self.assertIn("header", f.skipped["broken"])
@@ -257,7 +432,7 @@ class Requests(Tree):
             loras.field([{"name": "nope"}], self.f)
         self.assertIn("nope", str(e.exception))
         self.assertIn("style/gouache", str(e.exception))
-        scale = {"transformer.transformer_blocks.0.attn.to_q.dora_scale": (256,)}
+        scale = {"transformer.transformer_blocks.0.img_mlp.out.dora_scale": (512,)}   # the columns: not the engine's
         safetensors(self.d / "dora.safetensors", qwen_lora(extra=scale))
         with self.assertRaises(loras.LoraError) as e:
             loras.field([{"name": "dora"}], self.f)
@@ -299,11 +474,14 @@ class Requests(Tree):
             loras.field([{"local_path": str(self.d / "style/gouache.safetensors")}],
                         loras.Folder({"lora_dir": str(self.d), "family": "moss-image"}))
 
-    def test_a_scale_text_is_taken_and_said_not_applied(self):
+    def test_a_scale_text_is_ignored_like_an_unknown_field(self):
+        # a text encoder's adapter is not applied (the human's decision of 2026-10-29): the field is no field of the
+        # engine's, and its value is not checked (an unknown field's is not either)
         use = loras.field([{"name": "style/gouache", "scale_text": 0.4}], self.f)[0]
-        self.assertEqual(use["scale_text"], 0.4)
-        with self.assertRaises(loras.LoraError):
-            loras.field([{"name": "style/gouache", "scale_text": -3}], self.f)
+        self.assertEqual(set(use), {"name", "path", "scale"})
+        self.assertEqual(use["scale"], 1.0)
+        use = loras.field([{"name": "style/gouache", "scale_text": -3}], self.f)[0]
+        self.assertEqual(use["scale"], 1.0)
 
     def test_tags_come_out_and_unknown_ones_are_left_out(self):
         text, uses, unknown = loras.strip_tags("a cat <lora:style/gouache:0.5> in <lora:nope:1> snow", self.f)
@@ -313,14 +491,15 @@ class Requests(Tree):
         text, uses, unknown = loras.strip_tags("<lora:style/gouache>", self.f)
         self.assertEqual((text, uses[0]["scale"], unknown), ("", 1.0, []))
         text, uses, unknown = loras.strip_tags("<lora:style/gouache:1:0.5>", self.f)
-        self.assertEqual((text, uses[0]["scale_text"]), ("", 0.5), "A1111's text encoder's weight: taken, not applied")
+        self.assertEqual((text, uses[0]["scale"], unknown), ("", 1.0, []),
+                         "A1111's text encoder's weight (the third field): not applied, and no field of the engine's")
         text, uses, unknown = loras.strip_tags("<lora:style/gouache:0.3> and <lora:style/gouache:0.9>", self.f)
         self.assertEqual([u["scale"] for u in uses], [0.3], "the first naming of a name wins")
         self.assertEqual(loras.strip_tags("no tags here", self.f), ("no tags here", [], []))
         with self.assertRaises(loras.LoraError):
             loras.strip_tags("<lora:style/gouache:heavy>", self.f)
-        with self.assertRaises(loras.LoraError):
-            loras.strip_tags("<lora:style/gouache:1:heavy>", self.f)
+        text, uses, unused = loras.strip_tags("<lora:style/gouache:1:heavy>", self.f)
+        self.assertEqual((text, uses[0]["scale"]), ("", 1.0), "the text encoder's field is not the engine's either")
 
     def test_a_model_that_takes_no_adapter_refuses_both(self):
         f = self.folder("hunyuan-image-3")
@@ -428,13 +607,17 @@ class Job(Tree):
             images.parse_request({"prompt": "a cat <lora:style/gouache:1>"}, hunyuan)
         self.assertIn("HunyuanImage 3.0", str(e.exception))
 
-    def test_a_scale_text_is_said_not_applied(self):
-        job = images.parse_request({"prompt": "a cat", "lora": [{"name": "style/gouache", "scale_text": 0.6}]},
-                                   self.cfg)
-        self.assertNotIn("scale_text", job["loras"][0])
-        self.assertTrue(job["lora_text"])
+    def test_a_scale_text_is_ignored(self):
+        job = images.parse_request({"prompt": "a cat", "size": "256x256",
+                                    "lora": [{"name": "style/gouache", "scale_text": 0.6}]}, self.cfg)
+        self.assertEqual(set(job["loras"][0]), {"name", "path", "scale"})
+        self.assertEqual(job["loras"][0]["scale"], 1.0, "the strength is the one given, else the default")
+        self.assertNotIn("lora_text", job)
+        self.gen.need(job)
+        word = f" LORA:1.0:{loras.encode_path(str(self.d / 'style/gouache.safetensors'))}"
+        self.assertTrue(self.gen.engine.lines[-1].endswith(word), self.gen.engine.lines[-1])
         made, figures = self.gen.run(job)
-        self.assertEqual(figures["lora_text"], "not applied (the image engine applies no text encoder's adapter)")
+        self.assertNotIn("lora_text", figures)
 
     def test_the_words_the_engine_is_sent_and_the_response(self):
         job = images.parse_request({"prompt": "a cat", "size": "256x256", "seed": 3,

@@ -11,7 +11,7 @@ XeStrata は、文章のモデルとは別に、画像を作るモデルを入�
 Qwen3.8-Flash-Next のどの版とも組み合わせられ（BETA のモデルとはまだ組み合わせられません）、Web のページの Images のタブ、チャット、API（vLLM-Omni 互換（OpenAI 互換））から使えます。
 
 > **目次:** [モデルの選び方](#モデルの選び方) · [入れ方](#入れ方) · [大きさとメモリ](#大きさとメモリ) · [オプション](#オプション) ·
-> [Web のページとチャット](#web-のページとチャット) · [API](#api) · [GPU のメモリの分け合い](#gpu-のメモリの分け合い) · [速さ](#速さ) ·
+> [Web のページとチャット](#web-のページとチャット) · [API](#api) · [LoRA](#loraアダプター) · [GPU のメモリの分け合い](#gpu-のメモリの分け合い) · [速さ](#速さ) ·
 > [困ったとき](#困ったとき) · [ライセンス](#ライセンス)
 
 ## モデルの選び方
@@ -132,6 +132,7 @@ Qwen-Image-2.1 の画像のモデルも、int8 の積がある GPU では同じ�
 | `daemon_idle_s` | 1800 | どのサーバーもつながっていない画像のエンジンが終わるまでの秒数 |
 | `keep_files` | 64 | `response_format: "url"` の画像を残す数 |
 | `out_dir` | 一時フォルダー | 画像とエンジンのログ（`strata-image.log`）を置くフォルダー |
+| `lora_dir` | 画像のモデルのファイルの隣の `loras` | LoRA のファイルを置くフォルダー（setup はデータのフォルダーの `models/loras` を書きます。4 つのモデルで 1 つを共有し、一覧はモデルごとに絞ります。[LoRA](#loraアダプター)） |
 
 HunyuanImage 3.0 の `"images"` には、このほかに `steps`（8）・`guidance`（2.5）・`resolutions`（大きさのバケットのパラメータ）・`vision`（SigLIP2 の入ったシャード）・`ratio_head`（大きさを選ぶ重み。ないと `auto` は 1024x1024 になります）が入り、`max_refs` の既定は 3 です。
 
@@ -152,6 +153,7 @@ HunyuanImage 3.0 の `"images"` には、このほかに `steps`（8）・`guida
 - 画像を添付すると、編集のあるモデルでは編集に、編集のないモデル（MageTrail など）では 1 枚の画像から始める img2img になります（PNG、JPEG、GIF、BMP、WebP）。HunyuanImage 3.0 の参照画像は 3 枚までです。
 - 画像を添付すると、1 枚目の画像の上で描き直す部分を塗れます（ブラシの大きさ、消しゴム、全部消す）。塗った部分だけを描き直し、残りは元の画素のまま残します（API の `mask`）。塗らなければ、画像全体です。
 - 画像を添付すると Strength の欄が出ます（API の `strength`）。小さいほど元の画像を多く残します。空欄はモデルの既定で、編集は 1（元の画像の潜在から始めない、今までの編集）、img2img は 0.87 です（ステップ数の少ないモデルでは、少なくとも 1 ステップ飛ばす値まで下げます）。
+- LoRA の行で、そのモデルが当てられるファイルを選べます（[LoRA](#loraアダプター)）。選んだものはチップになり、強さ（-2〜2）を変えられ、`trigger` のあるファイルは「トリガー」のボタンでその語をプロンプトの末尾に足せます。4 本までで、選んだものと強さはモデルごとにブラウザーが覚えます。API と同じく、名前は要求の欄で出します（タグは書きません）。
 - 画像は 1 枚ずつ作ります。何枚も作る途中でチャットの要求が来ると、いまの 1 枚の後にそちらを先に動かし、終わってから残りを作ります（文章のモデルを外す `unload` のときは、外したまま最後まで作ります）。
 - MOSS-Image では、さらに次のものが出ます。
    - 「Write the prompt out」で、チャットのモデルに短いプロンプトを書き広げさせられます（オフ、詳しい説明、枠の配置。API の `enhance`）。書いたプロンプトや配置は画像の下に出て、配置は「Edit this layout」で枠の編集に読み込んで直せます。
@@ -187,6 +189,7 @@ curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/j
 | `steps`（`num_inference_steps`） | モデルのステップ数 | Qwen-Image-2.1 の元のモデルは 2〜100、Mage-Flow、HunyuanImage 3.0、MOSS-Image は 1〜100（HunyuanImage 3.0 の既定は 8、MOSS-Image は 50）。Turbo は 8 のままです |
 | `quality` | `auto` | Qwen-Image-2.1 の元のモデルのステップ数: `low` 20、`medium`（`standard`）30、`high`・`hd`・`auto` は既定の 40（`steps` を付けたときはそちら）。Mage-Flow と HunyuanImage 3.0 では使いません |
 | `negative_prompt` | なし（Mage-Flow は空白 1 文字、MOSS-Image は空） | CFG のネガティブのプロンプト。HunyuanImage 3.0 では使いません（ガイダンスはトークン 1 個で、掛けるものがありません） |
+| `lora` | なし | 当てるアダプター（[LoRA](#loraアダプター)）: `{"name", "scale"}` の配列か、その 1 つ。`scale` は -2〜2 で、省略すると 1。4 本まで |
 | `true_cfg_scale`、`guidance_scale` | Mage-Flow、HunyuanImage 3.0、MOSS-Image は設定の値 | CFG の強さ（0〜30、1 なら CFG なし）。Qwen-Image-2.1 は `true_cfg_scale` が 1 より大きく `negative_prompt` があるときだけ掛け（`guidance_scale` は使いません）、Mage-Flow と MOSS-Image は `true_cfg_scale`、なければ `guidance_scale`（MOSS-Image の既定は 3）。HunyuanImage 3.0 はガイダンスの強さとして `guidance_scale`（なければ `true_cfg_scale`、どちらも無ければ設定の 2.5）を使い、CFG は掛けません |
 | `background` | `auto` | `transparent` で透明な背景（Qwen の推奨する形でプロンプトを包みます。png、webp、jxl だけ）、`opaque` でアルファを白の上に重ねて消す。Mage-Flow と HunyuanImage 3.0 は `transparent` を断ります |
 | `output_format` | `png` | `png`、`jpeg`、`webp`、`jxl`（JPEG XL。libjxl の cjxl があるときだけ） |
@@ -245,13 +248,14 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
 - **strength**: 0 より大きく 1 以下。1 枚目の画像からどれだけ変えるかで、小さいほど元の画像を多く残します。diffusers の img2img と同じく、ステップの表の先頭 floor(ステップ数 × (1 − strength)) を飛ばし、元の画像の潜在にその時点の分のノイズを混ぜて始めます（回すステップ数が減るので、その分速くなります）。
   既定は、編集では 1（今までの編集。ComfyUI の KSampler の denoise の既定）、img2img では 0.87（ComfyUI の公式の img2img の例の denoise。ただし少なくとも 1 ステップ飛ばすよう、1 − 1/ステップ数 を超えない。4 ステップなら 0.75）、マスクだけの img2img では 1 です。1 ステップも回らない値は断ります。ComfyUI の `denoise` は受けません（`denoise` 0.5 の 20 ステップは、`strength` 0.5 の 40 ステップと同じです）。
 - **ステップ数**: Qwen-Image-2.1、HunyuanImage 3.0、MOSS-Image は生成と同じです。Mage-Flow の編集は Turbo が 4、ほかの 2 つは 30 で、img2img は生成と同じです。
+- **LoRA**: 生成と同じ `lora`（とプロンプトのタグ）を受け、参照画像を使う画像にも同じアダプターを当てます（[LoRA](#loraアダプター)）。
 - 参照画像のアルファも、そのまま画像のモデルに渡します。ほかの項目は生成と同じです。
 
 ### 応答
 
-- `data[]`: 画像（`b64_json` か `url`）と、`revised_prompt`、`seed`。
+- `data[]`: 画像（`b64_json` か `url`）と、`revised_prompt`、`seed`。アダプターを当てたときは `lora`（当てたものの `name` と `scale`）も。
 - `usage`: 画像のエンジンのトークンで数えます（プロンプトのトークンと、参照画像と作った画像の 16x16 ピクセルで 1 つのトークン）。HunyuanImage 3.0 では、プロンプトの ids と、作った画像の 16x16 画素ごとの 1 個で、参照画像は VAE のトークンと SigLIP2 の 1,024 スロットを数えます。
-- `strata`: かかった秒数、ステップ数（strength で回した数）、`strength`（1 未満のとき）、img2img か（`img2img`）とマスクを使ったか（`mask`）、配置を使ったか（`layout`）、書き広げの結果（`enhance`）、CFG の強さ、文の読み手・サンプリング・VAE のそれぞれの時間、文章のモデルの扱い（`gpu_policy`）。HunyuanImage 3.0 では、ガイダンスの強さ（`guidance`）、バケットの番号（`ratio`）、頼んだ大きさが別のときはそれ（`requested_size`）、モデルが大きさを選んだときはそれにかかった秒数（`size_choice_s`）も。
+- `strata`: かかった秒数、ステップ数（strength で回した数）、`strength`（1 未満のとき）、img2img か（`img2img`）とマスクを使ったか（`mask`）、配置を使ったか（`layout`）、書き広げの結果（`enhance`）、CFG の強さ、文の読み手・サンプリング・VAE のそれぞれの時間、文章のモデルの扱い（`gpu_policy`）、アダプターを当てたときはその本数（`lora_n`）、VRAM（`lora_mib`）、プロンプトのタグで飛ばした名前（`lora_unknown`）。HunyuanImage 3.0 では、ガイダンスの強さ（`guidance`）、バケットの番号（`ratio`）、頼んだ大きさが別のときはそれ（`requested_size`）、モデルが大きさを選んだときはそれにかかった秒数（`size_choice_s`）も。
 - 画像のモデルは `/v1/models` にも出ます。
 
 ### チャットから
@@ -261,6 +265,77 @@ MOSS-Image は、公式のパイプラインと同じ名前の項目も受けま
 - MOSS-Image では、`generate_image` に配置（`layout`、API と同じ形）も渡し、チャットのモデルが枠の下書きを書けます。
 - `/v1/responses` では、OpenAI の組み込みの `image_generation` の道具を付けると同じことをし、作った画像を `image_generation_call` の項目（`result` に画像の base64、`size`・`quality`・`background`・`output_format`・`revised_prompt` も）で返します。
   道具の `size`・`quality`・`output_format`・`output_compression`・`background` は、その道具で作る画像に使います（`size` が `auto` ならモデルの指定した大きさ）。
+  どちらの道具も LoRA の欄を持たず、会話から作る画像にはアダプターを当てません。
+
+## LoRA（アダプター）
+
+画像のモデルに、ComfyUI などが配っている LoRA を、画像を作るたびに当てられます。
+当てられるのは Qwen-Image-2.1（Turbo と元のモデル）、MOSS-Image、Mage-Flow、MageTrail です。HunyuanImage 3.0 は当てられません（`lora` を付けた要求も、プロンプトのタグも 400 です）。
+
+### 置き場所と一覧
+
+- setup は設定の `"images"` に `"lora_dir"` を書きます（データのフォルダーの `models/loras`）。1 つのフォルダーを 4 つのモデルが共有し、一覧はモデルごとに絞ります。フォルダーが無ければ自分で作ります。
+  ファイルは `.safetensors` と `.gguf` で、サブフォルダーも読めます（名前は `style/gouache` のように道になります）。
+- フォルダーは 10 秒まで覚え、フォルダーが更新されるとすぐ読み直します。サーバーを止める必要はありません。
+- `/health` の `image_defaults`・`image_models` と、`/v1/models` の画像モデルの項目の `defaults.loras` に、そのモデルが当てられるファイルが並びます。1 本ごとに、`name`（拡張子を除いた名前。サブフォルダーは道）、`path`（フォルダーからの道）、`rank`（OFT と全体差分は 0）、`scale`（ファイルのメタデータが勧める強さ。無ければ 1）、`trigger`（トリガーの語）、`targets`（変える重みの種類）、`size_mib`（ファイルの大きさ）です。
+- そのモデルの重みではないキーを持つファイルや、当てられない形式のファイルは一覧に出ません。その名前で頼むと、理由の付いた 400 が返ります。
+
+```sh
+curl -s http://127.0.0.1:8095/health | python3 -c 'import json,sys; print(*[e["name"] for e in json.load(sys.stdin)["image_defaults"]["loras"]], sep="\n")'
+```
+
+### 当てる
+
+**API**: `lora` の欄を、`/v1/images/generations` と `/v1/images/edits` の両方が受けます（JSON と multipart のどちらでも）。
+
+```sh
+curl http://127.0.0.1:8095/v1/images/generations -H 'Content-Type: application/json' \
+  -d '{"prompt": "a red fox in the snow, watercolor", "lora": [{"name": "gouache", "scale": 0.8}, "fox-ears"]}'
+```
+
+- `lora` は `{"name", "scale"}` の配列です。1 つだけならその object、名前だけの文字列でも構いません。multipart では欄の値に JSON の文字列を書きます。
+- `scale` は -2〜2 で、省略すると 1.0 です（一覧の `scale` はファイルの勧める値で、API の既定ではありません）。`name` の代わりに `local_path` でフォルダーの中のファイルを名指せます（フォルダーの外は 400。Web には出しません）。
+- 1 回に重ねられるのは 4 本までです。同じ名前を 2 回書くと 400 です。
+- プロンプトのタグ `<lora:名前:強さ>` も読みます（肯定と否定の両方。強さは省略でき、省略すると 1.0 です）。タグはプロンプトから取り除き、名前が一覧にないときは、そのタグを外して画像を作り、応答の `strata.lora_unknown` とサーバーのログに名前を出します。`<lora:名前:強さ:強さ>` の 3 つ目は A1111 の文章エンコーダー側の強さで、読みません（タグは取り除きます）。タグだけのプロンプトは 400 です。
+- 欄とタグを合わせて 4 本までで、同じ名前は最初の 1 つだけを使います（欄、肯定のタグ、否定のタグの順）。
+- 応答の `data[]` の各画像に `lora`（当てたものの `name` と `scale`）が付き、`strata` に `lora_n`（本数）、`lora_mib`（アダプターが VRAM で使う量）、`lora_unknown`（タグで飛ばした名前）が入ります。
+
+**Web**: Images のタブに LoRA の行が出ます（一覧が空のモデルでは出ません）。「LoRA を追加…」で一覧から選ぶと、選んだもののチップが出ます。チップの数値の欄で強さ（-2〜2、0.05 刻み）を変えられ、`trigger` を持つファイルには「トリガー」のボタンが出て、押すとその語をプロンプトの末尾に足します（タグは書きません）。× で外します。4 本で上限です。選んだものと強さはモデルごとにブラウザーが覚えます。
+
+**当てないモデル**: HunyuanImage 3.0 は `lora` の欄もタグも 400 で断ります。会話の道具（`generate_image`・`edit_image`）と Responses API の `image_generation` は LoRA の欄を持ちません。
+
+### 当てる形式
+
+ファイルのキーは、`diffusion_model.`・`transformer.`・`model.diffusion_model.` の接頭辞を外して、このモデルの重みの名前にします。PEFT・ComfyUI・ai-toolkit の名前（`lora_A`/`lora_B`、`lora_down`/`lora_up`、`lora_A.default`）を読みます。
+
+| 形式 | ファイルのテンソル | 当て方 |
+| --- | --- | --- |
+| LoRA・LoCon | `lora_A`/`lora_B`（下と上）と `.alpha` かメタデータの `lora_alpha` | 強さ × alpha / rank。alpha が無ければ 1 |
+| LoKr | `lokr_w1`・`lokr_w2`（丸ごと、または 2 つの因子）と、線形の重みの Tucker の核 `lokr_t2` | 2 段の積。rank は ComfyUI と同じ（w2 の因子、無ければ w1 の因子） |
+| DoRA | 素の LoRA と、重みの行の `dora_scale` | 行方向だけ。`c = dora_scale / 重みの行のノルム` で、土台とデルタの行を掛ける |
+| 全体差分 | `.diff`・`.set_weight`・`.w_norm` | 差分を足す。`set_weight` は強さ 1 でその重みになり、その間は補間（ComfyUI は強さを読まない） |
+| LoHa | `hada_w1_a/b`・`hada_w2_a/b` と、線形の Tucker の核 | 2 組の積の要素ごとの積。rank は `hada_w1_b` の行 |
+| バイアスの差分 | `.diff_b`、または `.w_norm` の隣の `.b_norm` | 重みのバイアスに足す。alpha は掛からず、要求の強さだけ |
+| OFT・BOFT | `oft_blocks`（OFT は 3 次元、BOFT は 4 次元）と `rescale` | 重みの行をブロック対角の直交行列で回す。強さは 1 回だけ補間（ComfyUI は 2 回） |
+| GLoRA | `a1`・`a2`・`b1`・`b2` | `W (a1 a2)` と `b1 b2` の和。重みの積をもう一度通す。ComfyUI の読みと古い LyCORIS の読みの両方 |
+
+- 1 つの重みに 2 つの形式が並ぶファイルは、読むときに断ります（ComfyUI は片方を黙って落とします）。
+- DoRA・OFT・GLoRA の当たる行には、ほかのアダプターを重ねられません（重ねる順で絵が変わるため）。ほかの形式どうしは同じ行でも足し算になります。
+- バイアスの差分は、その重みが自分のバイアスを足すときだけ当たります。Qwen-Image-2.1 の DiT はバイアスを足さないので、Qwen では当たりません。MOSS-Image は 42 のブロックと `final_linear_video` が足さず、Mage-Flow はどの重みも足します。
+- MageTrail の低ランクの変調（F32 の重み）に当たるアダプターは当たりません（キーと理由を返します）。
+- OFT は 1 本の重みに分かれる名前に当てられません（MOSS-Image の `qkv` は q・k・v の 3 本です）。Qwen-Image-2.1 の `modulation.1` は決まった行数ずつの帯で書くので、その行数を割り切らないブロックの OFT は断ります。
+- LoHa の rank は `hada_w1_b` の行で、メタデータの `lora_alpha` もその rank で割ります（ComfyUI と同じ）。rank と無関係な `lora_alpha` を持つファイルは、強さが変わります。
+- `use_rslora` のファイルは断ります（強さが alpha / √rank で、alpha / rank と違うため）。PEFT の `rank_pattern` は読まず、alpha だけを使います。
+- 文章エンコーダーの重み（`lora_te_`・`text_encoder.`・`te.`）を含むファイルは当てません。文章エンコーダー向けの LoRA はやらないことにしたためです。API に `scale_text` の欄はなく、送っても `style` や `user` と同じ知らない欄として無視します。
+- sd-scripts の `lora_unet_` の名前は読みますが、これらのモデルの重みの名前には当たりません。
+
+### 量子化した重みとメモリ
+
+- Q8_0 と、int8 の積がある GPU の W8A8 の重みのままで動きます。W8A8 の層では、アダプターの当たる積を 16 ビットの経路にして、その層だけ計算します。
+- アダプターを当てない要求（と強さ 0）は、今までと同じ道を通り、今までと同じ画像（ビット単位）になります。
+- アダプターは VRAM に置きます（A/B と GLoRA の因子は FP16、DoRA の係数・バイアス・OFT の回転は FP32）。要る量は `strata.lora_mib` に出て、画像の予算に入らないときは要る VRAM を添えて断ります。rank 64 の Qwen-Image-2.1 の LoRA の A/B で約 320 MiB です。
+- 同じ組の 2 枚目からは、結んだアダプターをそのまま使います（ファイルも 1 度だけ読みます）。組が変わると、Qwen-Image-2.1 はプロンプトの前置き（文の行と K・V）を作り直し、MOSS-Image はテキスト埋め込みを通した文脈を作り直します。同じ組なら残ります。
+- アダプターの当たる積は 16 ビットの経路になるので、その層だけ遅くなります。
 
 ## GPU のメモリの分け合い
 
@@ -322,6 +397,9 @@ HunyuanImage 3.0（`hunyuan-image-3-distil`、w4a8、1024x1024、8 ステップ�
 | `the image engine did not start ...`、`the image engine ended` | 画像のエンジンが起動しないか、止まりました。表示にあるログ（`strata-image.log`）を見てください |
 | `Image generation runs the image model at Q6_K instead of Q8_0 ...` | RAM が足りないので、setup が大きさを下げました（[大きさとメモリ](#大きさとメモリ)） |
 | `faster with NVIDIA's ... cuDNN for the image engine's attention`（setup） | cuDNN がないので、NVIDIA の GPU の注意を XeStrata のカーネルで計算します。示されたコマンドで入れると速くなります |
+| `lora: ...`（400） | 名前が一覧にないか、強さが範囲外か、4 本を超えています。メッセージに理由が続きます |
+| `image_generation_failed: image engine: ...` | エンジンがアダプターを当てられません。キーと理由（バイアスを足さない重み、rsLoRA、MageTrail の変調など）が続きます（[LoRA](#loraアダプター)） |
+| `strata.lora_unknown` | プロンプトのタグの名前が一覧になく、タグを外して画像を作りました |
 
 ## ライセンス
 

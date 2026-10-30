@@ -62,9 +62,8 @@ the same as a form's JSON text - and the prompt's tags, <lora:name:0.8> in A1111
 and negative; they go to the engine as IMG's and NEED's LORA:<strength>:<path> words (the path's whitespace %XX'd:
 the engine splits the line on it).  A name the model's LoRA folder ("lora_dir") does not offer is refused where the
 field gives it and taken out of the prompt with a warning where a tag does (the response's strata.lora_unknown).
-"local_path" is a file inside that folder only; "scale_text" is taken and not applied, and the response's strata
-says so (lora_text).  The response's data[] items carry the adapters applied as "lora": [{"name", "scale"}], and
-strata their count and VRAM (lora_n, lora_mib, the IMAGE line's).
+"local_path" is a file inside that folder only.  The response's data[] items carry the adapters applied as "lora":
+[{"name", "scale"}], and strata their count and VRAM (lora_n, lora_mib, the IMAGE line's).
 
 The GPU is shared with the text engine one job at a time: an image job takes the service's turn (the FIFO every chat
 request takes), so no chat turn runs on the GPU meanwhile.  The image engine works in the VRAM it is given: what it
@@ -318,8 +317,9 @@ def parse_request(req: dict, cfg: dict) -> dict:
     its config has the ratio head (job["choose_size"]: ImageGen.run asks the engine first, the 1024 x 1024 bucket
     standing for it until then - no bucket has more tokens).  The adapters it applies come from "lora" and from the
     two prompts' <lora:name:0.8> tags (serve/loras.py): job["loras"], and for a tag's name the model does not offer
-    job["lora_unknown"] (the response's strata.lora_unknown), for a scale_text taken and not applied
-    job["lora_text"]."""
+    job["lora_unknown"] (the response's strata.lora_unknown).  A text encoder's adapter is not applied (the human's
+    decision of 2026-10-29): "scale_text" and a tag's third field are no fields of the image engine's, and are taken
+    as its other unknown fields are, style and user, ignored."""
     prompt = req.get("prompt")
     if not isinstance(prompt, str) or not prompt.strip():
         raise ImageRequestError("prompt: a non-empty string")
@@ -347,9 +347,6 @@ def parse_request(req: dict, cfg: dict) -> dict:
         raise ImageRequestError(str(e)) from None
     if loras and not prompt.strip():
         raise ImageRequestError('prompt: a non-empty string (its LoRA tags are taken out: the "lora" field names them)')
-    text_scale = any("scale_text" in use for use in loras)
-    for use in loras:
-        use.pop("scale_text", None)
     fmt = req.get("response_format") or "b64_json"
     if fmt not in ("b64_json", "url"):
         raise ImageRequestError("response_format: b64_json or url")
@@ -407,8 +404,6 @@ def parse_request(req: dict, cfg: dict) -> dict:
         job["loras"] = loras
     if unknown:
         job["lora_unknown"] = list(dict.fromkeys(unknown))   # a name in both prompts said once
-    if text_scale:
-        job["lora_text"] = True
     if cfg.get("family") == "moss-image":
         job.update(moss_request(req, cfg))
         if req.get("layout") is not None:
@@ -1820,8 +1815,6 @@ class ImageGen:
             figures.update(lora_n=int(parts[-1].get("lora_n") or 0), lora_mib=parts[-1].get("lora_mib"))
         if job.get("lora_unknown"):
             figures["lora_unknown"] = list(job["lora_unknown"])
-        if job.get("lora_text"):                           # a scale_text was given: there is no text encoder's adapter
-            figures["lora_text"] = "not applied (the image engine applies no text encoder's adapter)"
         if first + len(images) == job["n"]:
             self.totals["jobs"] += 1
         self.totals["images"] += len(images)
