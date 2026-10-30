@@ -574,6 +574,7 @@ MfOut MfDit::product(const uint16_t* x16, const float* rs, const W& w, const uin
         if (oft) {
             lora_scratch(T);
             lora->add(x16, T, y, w.n, 0, w.n, rs, gemm_, lora_f32_, lora16_, s_);
+            add_glora(lora, x16, rs, w, d, T, y);   // a GLoRA on the weight's other rows
             if (bias != nullptr) dit_rows::bias_add(y, bias, T, w.n, s_);
             return out;
         }
@@ -590,6 +591,7 @@ MfOut MfDit::product(const uint16_t* x16, const float* rs, const W& w, const uin
         if (oft) {
             lora_scratch(T);
             lora->add(x16, T, y, w.n, 0, w.n, rs, gemm_, lora_f32_, lora16_, s_);
+            add_glora(lora, x16, rs, w, d, T, y);   // a GLoRA on the weight's other rows
             if (bias != nullptr) dit_rows::bias_add(y, bias, T, w.n, s_);
             return out;
         }
@@ -598,13 +600,19 @@ MfOut MfDit::product(const uint16_t* x16, const float* rs, const W& w, const uin
         // the delta is the input's own (x16 = x / rs): its rows' scales put it back in y's units, as rows_back does
         lora_scratch(T);
         lora->add(x16, T, y, w.n, 0, w.n, rs, gemm_, lora_f32_, lora16_, s_);
-        if (lora->has_glora())   // a GLoRA's own path: the weight's own product of its input, a band of tokens at a time
-            lora->add_glora(x16, T, 0, w.n, rs, gemm_, lora_f32_, lora16_, s_,
-                            [&](const uint16_t* v, int64_t t0, int64_t nt, int64_t r0, int64_t n2) {
-                                glora_weight(v, w, d, r0, n2, nt, t0, y);
-                            });
+        add_glora(lora, x16, rs, w, d, T, y);
     }
     return out;
+}
+
+void MfDit::add_glora(const LoraLayer* lora, const uint16_t* x16, const float* rs, const W& w, const uint8_t* d,
+                         int64_t T, float* y) {
+    if (lora == nullptr || !lora->has_glora()) return;
+    // a GLoRA's own path: the weight's own product of its input, a band of tokens at a time
+    lora->add_glora(x16, T, 0, w.n, rs, gemm_, lora_f32_, lora16_, s_,
+                    [&](const uint16_t* v, int64_t t0, int64_t nt, int64_t r0, int64_t n2) {
+                        glora_weight(v, w, d, r0, n2, nt, t0, y);
+                    });
 }
 
 void MfDit::glora_weight(const uint16_t* v, const W& w, const uint8_t* d, int64_t r0, int64_t n, int64_t nt,

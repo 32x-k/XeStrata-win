@@ -237,6 +237,9 @@ private:
     /// the product's output y at those rows (the weight's own path, as product takes it).
     void glora_weight(const uint16_t* v, const W& w, const uint8_t* d, int64_t r0, int64_t n, int64_t nt, int64_t t0,
                       float* y);
+    /// The layer's GLoRAs on the product's T rows of y (none: nothing), through glora_weight.
+    void add_glora(const LoraLayer* lora, const uint16_t* x16, const float* rs, const W& w, const uint8_t* d,
+                   int64_t T, float* y);
     bool dry_ = false, q8_ = true, w8_ = false, keep0_ = false, text_loaded_ = false;
     int64_t C_ = 3072, F_ = 8192, heads_ = 24, hd_ = 128, in_ch_ = 128, txt_dim_ = 4096, freq_ = 256;
     double rope_base_ = 10000.0;
