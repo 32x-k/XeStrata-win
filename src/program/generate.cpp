@@ -9274,6 +9274,13 @@ int main(int argc, char** argv) {
             const bool in_main = live_ok && cvec_cached == sl.cvec && prefix_of(live) &&
                                  imgs_below(live_imgs, (int64_t) sl.ids.size()).empty();
             if (in_main || conversations.holds(sl.ids, {}, sl.cvec)) return;
+            if (conversations.supersedes_richer(sl.ids, {}, sl.checks, sl.cvec)) {
+                // its park would drop the main session's copy of this conversation, and with it the checkpoints the slot does
+                // not hold (upstream c7a0cef13, #4420)
+                std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (a parked copy "
+                                     "of its conversation holds checkpoints the slot does not; it stays)\n", b);
+                return;
+            }
             if (use_mtp && !batch_mtp) {   // no draft K/V of its own: an image without it would not restore beside the drafter
                 std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (its %zu "
                                      "tokens have no per-slot draft K/V without --batch-mtp)\n", b, sl.ids.size());

@@ -371,6 +371,26 @@ public:
         superseded_ += dropped;
         return dropped;
     }
+    // upstream c7a0cef13 (#4420): a batch slot's chain holds one checkpoint (the one its admission copied in), while the main
+    // session's parked copy of the same conversation keeps the whole chain, the root at the end of an agent's system prompt among
+    // them.  Parking the slot would drop that copy as superseded (above) and the root with it, and every sibling would read the
+    // shared prefix again.  True when drop_superseded(ids, images, checkpoints, cvec) would drop an entry that has a checkpoint the
+    // given chain does not hold.  Nothing is changed.
+    bool supersedes_richer(const std::vector<int32_t>& ids, const std::vector<ConversationImageKey>& images,
+                           const std::vector<ConversationCheckpoint>& checkpoints, bool cvec) const {
+        for (size_t i = 0; i < entries_.size(); ++i) {
+            const auto& e = entries_[i];
+            const ConversationCheckpoint* deepest = nullptr;
+            for (const auto& c : e.checkpoints)
+                if (!deepest || c.ids.size() > deepest->ids.size()) deepest = &c;
+            if (e.cvec != cvec || !deepest || deepest->ids.empty() ||
+                !conversation_chain_holds(*deepest, ids, images, checkpoints) || (guarded_ != 0 && serials_[i] == guarded_))
+                continue;
+            for (const auto& c : e.checkpoints)
+                if (!conversation_chain_holds(c, ids, images, checkpoints)) return true;
+        }
+        return false;
+    }
     size_t superseded() const { return superseded_; }
     const std::deque<SavedConversation>& entries() const { return entries_; }
     /// --conversation-cache-park-gain N: the longest parked entry this conversation's outgoing state supersedes, in
