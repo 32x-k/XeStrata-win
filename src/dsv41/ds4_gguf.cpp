@@ -218,24 +218,28 @@ TokenScratch* token_scratch(const x3::MoeArgs& a, const TokenCaps& caps, sycl::q
 // Upstream mv's BF16/Q8_0 job partition and quant_add/quant_flush. Keep unsupported
 // formats or column counts on the existing path; all metadata below is copied by value.
 // A set of jobs is independent, as in upstream's batching by format rather than job order.
+// Q5_K matrices (the dense attention outputs and shared expert) take upstream's
+// low-bit GEMV on the same int8 activations as Q8_0.
+bool mv_q5(const x3::Mat& m) { return m.fmt == kFmtGG && m.K == iq::kQ5_K && m.k % 256 == 0; }
 unsigned mv_batch(const x3::MvJob* jobs, int n, sycl::queue& s) {
     bool any = false;
     for (int i = 0; i < n; ++i)
-        any = any || ((jobs[i].m->fmt == kFmtBF16 || jobs[i].m->fmt == kFmtQ8_0) && jobs[i].ncol <= x3::kMaxMvCols);
+        any = any || ((jobs[i].m->fmt == kFmtBF16 || jobs[i].m->fmt == kFmtQ8_0 || mv_q5(*jobs[i].m)) &&
+                      jobs[i].ncol <= x3::kMaxMvCols);
     if (!any) return 0;
     const auto& caps = token_caps(s);
     if (!caps.subgroup) return 0;
-    mv_detail::Jobs batch[2];
+    mv_detail::Jobs batch[3];
     mv_detail::QuantItems items;
-    int counts[2] = {}, max_n[2] = {}, max_cols[2] = {};
-    bool aligned[2] = {true, true};
+    int counts[3] = {}, max_n[3] = {}, max_cols[3] = {};
+    bool aligned[3] = {true, true, true};
     size_t offsets[x3::kMaxMvJobs] = {}, code_count = 0;
     unsigned accepted = 0;
     for (int i = 0; i < n; ++i) {
         const auto& job = jobs[i];
         const auto& m = *job.m;
-        if ((m.fmt != kFmtBF16 && m.fmt != kFmtQ8_0) || job.ncol > x3::kMaxMvCols) continue;
-        const int kind = m.fmt == kFmtQ8_0 ? 1 : 0;
+        if ((m.fmt != kFmtBF16 && m.fmt != kFmtQ8_0 && !mv_q5(m)) || job.ncol > x3::kMaxMvCols) continue;
+        const int kind = m.fmt == kFmtQ8_0 ? 1 : m.fmt == kFmtGG ? 2 : 0;
         auto& b = batch[kind].j[counts[kind]++];
         b.w = m.raw; b.ld = row_stride(m); b.x = job.xf; b.xcs = job.xf_cs ? job.xf_cs : size_t(m.k);
         b.y = job.y; b.ycs = job.y_cs ? job.y_cs : size_t(m.n); b.bias = job.bias; b.alpha = job.alpha;
@@ -259,14 +263,16 @@ unsigned mv_batch(const x3::MvJob* jobs, int n, sycl::queue& s) {
                 items.x[item] = b.x; items.ldx[item] = ldx; items.k[item] = b.k; items.rows[item] = b.ncol;
                 ++items.n;
             }
-            aligned[1] = aligned[1] && b.ld % 4 == 0 && (reinterpret_cast<uintptr_t>(b.w) & 3u) == 0 &&
-                         (b.k / 32) % 2 == 0;
+            if (kind == 1)
+                aligned[1] = aligned[1] && b.ld % 4 == 0 && (reinterpret_cast<uintptr_t>(b.w) & 3u) == 0 &&
+                             (b.k / 32) % 2 == 0;
         }
         accepted |= 1u << i;
     }
     if (!accepted) return 0;
     sycl_detail::require_in_order(s);
-    size_t warps[2] = {caps.quant_group / caps.subgroup, caps.quant_group / caps.subgroup};
+    size_t warps[3] = {caps.quant_group / caps.subgroup, caps.quant_group / caps.subgroup,
+                       caps.quant_group / caps.subgroup};
     if (aligned[1]) {
         const size_t fits = caps.local_bytes / (caps.subgroup * kQ8Bytes);
         if (fits) warps[1] = std::min(warps[1], fits);
@@ -281,14 +287,15 @@ unsigned mv_batch(const x3::MvJob* jobs, int n, sycl::queue& s) {
             items.d[j] = scratch->scales + offsets[j] / 32;
             max_k = std::max(max_k, items.k[j]); max_rows = std::max(max_rows, items.rows[j]);
         }
-        for (int j = 0; j < counts[1]; ++j) {
-            auto& b = batch[1].j[j];
-            const size_t ldx = b.ncol == 1 ? size_t(b.k) : b.xcs;
-            for (int item = 0; item < items.n; ++item)
-                if (items.x[item] == b.x && items.ldx[item] == ldx && items.k[item] == b.k && items.rows[item] == b.ncol) {
-                    b.xq = items.q[item]; b.xd = items.d[item]; break;
-                }
-        }
+        for (int kind = 1; kind < 3; ++kind)
+            for (int j = 0; j < counts[kind]; ++j) {
+                auto& b = batch[kind].j[j];
+                const size_t ldx = b.ncol == 1 ? size_t(b.k) : b.xcs;
+                for (int item = 0; item < items.n; ++item)
+                    if (items.x[item] == b.x && items.ldx[item] == ldx && items.k[item] == b.k && items.rows[item] == b.ncol) {
+                        b.xq = items.q[item]; b.xd = items.d[item]; break;
+                    }
+            }
         if (caps.subgroup == 32) mv_detail::quantize<32>(items, max_k, max_rows, warps[0], s);
         else mv_detail::quantize<16>(items, max_k, max_rows, warps[0], s);
     }
@@ -297,6 +304,8 @@ unsigned mv_batch(const x3::MvJob* jobs, int n, sycl::queue& s) {
             mv_detail::launch<32>(kind != 0, batch[kind], counts[kind], max_n[kind], max_cols[kind], aligned[kind], warps[kind], s);
         else mv_detail::launch<16>(kind != 0, batch[kind], counts[kind], max_n[kind], max_cols[kind], aligned[kind], warps[kind], s);
     }
+    if (caps.subgroup == 32) mv_detail::launch_iq<iq::kQ5_K, 32>(batch[2], counts[2], max_n[2], max_cols[2], warps[2], s);
+    else mv_detail::launch_iq<iq::kQ5_K, 16>(batch[2], counts[2], max_n[2], max_cols[2], warps[2], s);
     return accepted;
 }
 

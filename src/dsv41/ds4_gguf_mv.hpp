@@ -7,6 +7,7 @@
 #pragma once
 
 #include "ds4_gguf.cuh"
+#include "ds4_iq_token.hpp"
 #include "ds4_sycl.hpp"
 #include "../kernels/xe/cuda_intrinsics.hpp"
 
@@ -254,6 +255,47 @@ void q8_kernel(const Jobs& jobs, int count, int max_n, size_t warps, sycl::queue
             }
         });
     });
+}
+
+// Upstream ds4_iq.cu mv_kernel<T,NC>: one subgroup/output row, the lanes over the
+// row's 32-value sub-blocks, each sub-block's exact integer dot with the int8
+// activations, then its F32 scale and FMA, and the subgroup's sum.
+template <int T, int NC, int SG>
+void iq_kernel(const Jobs& jobs, int count, int max_n, size_t warps, sycl::queue& q) {
+    const size_t tiles = (size_t(max_n) + warps - 1) / warps, threads = warps * SG;
+    submit_body<SG>(q, sycl::nd_range<1>(tiles * count * threads, threads), warps,
+                   [=](sycl::nd_item<1> it) {
+        const Job& b = jobs.j[it.get_group_linear_id() / tiles];
+        const size_t row = it.get_group_linear_id() % tiles * warps + it.get_local_linear_id() / SG;
+        const int lane = int(it.get_local_linear_id() % SG);
+        if (row >= size_t(b.n)) return;
+        const auto* w = static_cast<const uint8_t*>(b.w) + row * b.ld;
+        const int blocks = b.k / 32;
+        float acc[NC] = {};
+        for (int kb = lane; kb < blocks; kb += SG) {
+            iq::sycl_decode::Sub sub{};
+            iq::sycl_decode::decode<T>(w, kb, nullptr, sub);
+#pragma unroll
+            for (int c = 0; c < NC; ++c) if (c < b.ncol) {
+                const int8_t* xp = b.xq + size_t(c) * b.k + size_t(kb) * 32;
+                const auto xa = load<sycl::int4, 16>(xp), xb = load<sycl::int4, 16>(xp + 16);
+                acc[c] = sycl::fma(b.xd[size_t(c) * blocks + kb], iq::token_detail::sub_dot<T>(sub, xa, xb), acc[c]);
+            }
+        }
+#pragma unroll
+        for (int c = 0; c < NC; ++c) if (c < b.ncol) {
+            const float value = warp_sum<SG>(it.get_sub_group(), acc[c]);
+            if (lane == 0) b.y[size_t(c) * b.ycs + row] = b.alpha * value + (b.bias ? b.bias[row] : 0.f);
+        }
+    });
+}
+template <int T, int SG>
+void launch_iq(const Jobs& jobs, int count, int max_n, int max_cols, size_t warps, sycl::queue& q) {
+    if (count == 0) return;
+    // Upstream mv_nc's activation-count specializations.
+    if (max_cols <= 1) iq_kernel<T, 1, SG>(jobs, count, max_n, warps, q);
+    else if (max_cols <= 4) iq_kernel<T, 4, SG>(jobs, count, max_n, warps, q);
+    else iq_kernel<T, 16, SG>(jobs, count, max_n, warps, q);
 }
 
 template <int NC, int SG>
