@@ -12666,6 +12666,16 @@ int main(int argc, char** argv) {
             }
         }
         if (final_r != nullptr) {
+#if defined(_WIN32)
+            // The direct no-pool session can return with work still on main_cs. The common copy helper
+            // orders its own queue only; this diagnostic reads through the separate default compute queue.
+            if (strata::core::Runtime::get().device().get_backend() == sycl::backend::ext_oneapi_hip &&
+                !strata::gpu::stream_sync(main_cs)) {
+                std::fprintf(stderr, "strata generate: waiting for the final residual failed: %s\n",
+                             strata::gpu::last_error());
+                return 1;
+            }
+#endif
             strata::gpu::copy(final_r_host.data(), ss.R, final_r_host.size() * sizeof(float));
             const int64_t posrec[2] = {pos, tok};
             std::fwrite(posrec, sizeof posrec, 1, final_r);
