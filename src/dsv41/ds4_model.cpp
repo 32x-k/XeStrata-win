@@ -902,7 +902,8 @@ struct WinPlan {
     int snap_t = -1;        // (a run of chunks) the chunk's row whose state before it the layers keep (-1: none)
     int eg_slot = -1;       // (a run of chunks, layer-major) the Engram rows' slot (-1: k % 2)
     unsigned vl = 0;        // (a window) bit t: token t is inside a picture's span (routed with the image bias)
-    unsigned seq[kMaxL] = {};
+    unsigned seq[kMaxL] = {};   // (a window) layer il's mailbox request (0: none, plan_request)
+    bool wait[kMaxL] = {};      // (a window) the device waits for layer il's answer (the CPU lane computes some picks)
     int topk[kMaxL][kWin] = {}, cand[kMaxL][kWin] = {};
 };
 
@@ -7042,6 +7043,21 @@ struct Model::Impl {
             if (file_read(n, e)) return &n;
         return nullptr;
     }
+    // a window's mailbox request for layer l: where the CPU lane computes some of its picks (an expert outside VRAM),
+    // the device waits for the answer; where every expert is in VRAM, the request is published only for the lookahead
+    // (a later layer's guesses for the lane to read early), unanswered on the device, and otherwise not at all (the
+    // profile then counts none of that layer's decode picks).  A lookahead's layer is a lane layer and waits within
+    // two layers, so the device never runs a ring ahead of the lane.
+    void plan_request(const Layer& l, WinPlan& wp) {
+        const bool lane = (int) l.slot.size() < l.n_exp ||
+                          std::any_of(l.slot.begin(), l.slot.begin() + l.n_exp, [](int v) { return v < 0; });
+        bool ahead = false;
+        for (int a = 1; !lane && !ahead && a <= std::min(2, ahead_mode); ++a) ahead = ahead_layer(l, a) != nullptr;
+        if (!lane && !ahead) return;
+        wp.seq[l.il] = ++seq_issued;
+        wp.wait[l.il] = lane;
+        layer_of[wp.seq[l.il] % kRing].store(l.il, std::memory_order_release);
+    }
     // lookahead on the CPU lane: request r (layer li, seq) carries the device's guesses for the next layers - the
     // guessed experts read from the files asked for now (each once a window), the guesses kept for the hit counts
     std::vector<std::pair<const void*, size_t>> pf_want;
@@ -7382,11 +7398,7 @@ struct Model::Impl {
         init_pre(d.pre, T, d.st);
         WinPlan dp;   // (window attention alone: the mailbox seqs)
         dp.async = !sync_decode && T <= async_max_t;
-        for (int i = 0; i < g.n_mtp && dp.async; ++i) {
-            const int il = g.nl + i;
-            dp.seq[il] = ++seq_issued;
-            layer_of[dp.seq[il] % kRing].store(il, std::memory_order_release);
-        }
+        for (int i = 0; i < g.n_mtp && dp.async; ++i) plan_request(L[(size_t) g.nl + (size_t) i], dp);
         const size_t hs = (size_t) T * H * D, rs = (size_t) g.win * g.hd;
         if (dump_d != nullptr && h_dump == nullptr &&
             (!halloc(h_dump, (size_t) g.n_mtp * kWin * H * D, err) || !halloc(h_dump_ring, (size_t) g.n_mtp * rs, err)))
@@ -9153,10 +9165,7 @@ struct Model::Impl {
                 }
                 for (int t = 0; t < T; ++t) wp.topk[il][t] = cur_topk_n[t];
             }
-            if (wp.async) {
-                wp.seq[il] = ++seq_issued;
-                layer_of[wp.seq[il] % kRing].store(il, std::memory_order_release);
-            }
+            if (wp.async) plan_request(l, wp);
         }
     }
 
@@ -9800,7 +9809,7 @@ struct Model::Impl {
             gemv_f32(l.gate_w, d.x, l.n_exp, D, T, d.glog, 1024, s);
             const unsigned sq = wp.seq[l.il];
             const int slot = (int) (sq % kRing);
-            const bool lead = mi == 0;
+            const bool lead = mi == 0 && sq != 0, wait = lead && wp.wait[l.il];   // (plan_request)
             int na[2] = {0, 0};   // lookahead: the next layers' guesses (their gate on this FFN input), published below
             for (int a = 1; lead && a <= std::min(2, ahead_mode); ++a) {
                 const Layer* nx = ahead_layer(L0, a);
@@ -9824,8 +9833,8 @@ struct Model::Impl {
                 x3::MoeArgs ma;
                 ma.plan_ptr = d.plan_ptr;
                 ma.plan_w = d.rw;
-                ma.cpu_part = lead ? resps[slot].part[0] : nullptr;
-                ma.cpu_flag = lead ? &resps[slot].cpu[0] : nullptr;
+                ma.cpu_part = wait ? resps[slot].part[0] : nullptr;
+                ma.cpu_flag = wait ? &resps[slot].cpu[0] : nullptr;
                 ma.lay = lay;
                 ma.k = l.k_exp;
                 ma.n_embd = D;
@@ -9851,7 +9860,7 @@ struct Model::Impl {
                 else x3::moe_gate_up(ma, d.x, d.xg, s);
                 const double m1 = tlog2 ? now_ms() : 0.0;
                 prof_mark(d, 3);
-                if (lead) wait_seq(&resps[slot].seq, sq, s);
+                if (wait) wait_seq(&resps[slot].seq, sq, s);
                 const double m2 = tlog2 ? now_ms() : 0.0;
                 prof_mark(d, 4);
                 if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
@@ -9874,10 +9883,10 @@ struct Model::Impl {
                 wa.n_groups = d.n_groups;
                 wa.plan_ptr = d.plan_ptr;
                 wa.plan_w = d.rw;
-                wa.cpu_part = lead ? &resps[slot].part[0][0] : nullptr;
+                wa.cpu_part = wait ? &resps[slot].part[0][0] : nullptr;
                 wa.cpu_stride = kMaxDim;
-                wa.cpu_flag = lead ? resps[slot].cpu : nullptr;
-                wa.wait_ptr = lead ? &resps[slot].seq : nullptr;
+                wa.cpu_flag = wait ? resps[slot].cpu : nullptr;
+                wa.wait_ptr = wait ? &resps[slot].seq : nullptr;
                 wa.wait_val = sq;
                 wa.x = d.x;
                 wa.x_stride = (size_t) D;
@@ -9897,7 +9906,7 @@ struct Model::Impl {
                     return false;
                 }
             }
-            if (lead) st.experts += (int64_t) T * l.k_exp;
+            if (mi == 0) st.experts += (int64_t) T * l.k_exp;
             if (nm > 1) allreduce(d.moe_out, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
             hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
             std::swap(d.h, d.h2);
