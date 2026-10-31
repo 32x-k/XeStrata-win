@@ -10,10 +10,14 @@
 #include "ds4_iq_decode.hpp"
 #include "ds4_tq_decode.hpp"
 #include "ds4_numerics.cuh"
+#include "strata/core/device.hpp"
 #include "strata/core/per_device.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <exception>
+#include <limits>
+#include <memory>
 #include <stdexcept>
 #include <vector>
 
@@ -106,6 +110,168 @@ iq::SetArgs light_args(const x3::SetArgs& a) {
 bool iq_tiled_set_type(int type) {
     return type == iq::kIQ1_S || type == iq::kIQ1_M || type == iq::kIQ2_XXS ||
            type == iq::kIQ2_XS || type == iq::kIQ2_S || type == iq::kIQ3_XXS || type == kTypeMXFP4;
+}
+
+struct TokenCaps {
+    size_t subgroup = 0, quant_group = 0, combine_group = 0;
+    size_t max_alloc = 0, memory = 0;
+};
+const TokenCaps& token_caps(sycl::queue& s) {
+    static core::PerDevice<TokenCaps> cache;
+    const auto device = s.get_device();
+    return cache.get(device, [&] {
+        TokenCaps caps;
+        const size_t max_group = std::min(device.get_info<sycl::info::device::max_work_group_size>(),
+                                         device.get_info<sycl::info::device::max_work_item_sizes<1>>()[0]);
+        const auto subgroups = device.get_info<sycl::info::device::sub_group_sizes>();
+        for (const size_t width : {size_t(32), size_t(16)})
+            if (width <= max_group && std::find(subgroups.begin(), subgroups.end(), width) != subgroups.end()) {
+                caps.subgroup = width;
+                break;
+            }
+        // upstream q8_quant_kernel: up to eight independent 32-value quantization blocks per work-group.
+        if (caps.subgroup) caps.quant_group = std::min<size_t>(8, max_group / caps.subgroup) * caps.subgroup;
+        // upstream mx_combine_kernel: one output per work-item, at most 128 per work-group.
+        caps.combine_group = std::min<size_t>(128, max_group);
+        const auto max_size = uint64_t(std::numeric_limits<size_t>::max());
+        caps.max_alloc = size_t(std::min<uint64_t>(device.get_info<sycl::info::device::max_mem_alloc_size>(), max_size));
+        caps.memory = size_t(std::min<uint64_t>(device.get_info<sycl::info::device::global_mem_size>(), max_size));
+        if (const auto limit = core::max_alloc_limit_bytes()) caps.max_alloc = size_t(std::min<uint64_t>(caps.max_alloc, limit));
+        if (const auto limit = core::vram_limit_bytes()) caps.memory = size_t(std::min<uint64_t>(caps.memory, limit));
+        return caps;
+    });
+}
+
+// Token-only counterpart of upstream Scratch. Keep the queue/context alive with the allocations. Each host thread
+// has its own entries: concurrent callers cannot interleave quantization and consumption of the same scratch.
+// Equal devices or contexts alone are insufficient: reuse requires the exact in-order queue.
+struct TokenScratch {
+    sycl::queue queue;
+    int8_t* codes = nullptr;
+    float *scales = nullptr, *part = nullptr;
+    size_t code_capacity = 0, part_capacity = 0;
+    explicit TokenScratch(const sycl::queue& s) : queue(s) {}
+    TokenScratch(const TokenScratch&) = delete;
+    TokenScratch& operator=(const TokenScratch&) = delete;
+    ~TokenScratch() {
+        if (!codes && !scales && !part) return;
+        try {
+            queue.wait(); // Destruction only; every submitted reader must finish before its storage is released.
+            if (codes) sycl::free(codes, queue);
+            if (scales) sycl::free(scales, queue);
+            if (part) sycl::free(part, queue);
+        } catch (...) { std::terminate(); }
+    }
+    bool reserve(size_t nc, size_t np, const TokenCaps& caps) {
+        if (nc <= code_capacity && np <= part_capacity) return true;
+        nc = std::max(nc, code_capacity);
+        np = std::max(np, part_capacity);
+        if (nc > caps.max_alloc || nc / 32 > caps.max_alloc / sizeof(float) ||
+            np > caps.max_alloc / sizeof(float)) return false;
+        const size_t scale_bytes = (nc / 32) * sizeof(float), part_bytes = np * sizeof(float);
+        if (nc > caps.memory || scale_bytes > caps.memory - nc || part_bytes > caps.memory - nc - scale_bytes)
+            return false;
+        int8_t* next_codes = nullptr;
+        float *next_scales = nullptr, *next_part = nullptr;
+        const auto release_next = [&] {
+            if (next_codes) { auto* old = next_codes; next_codes = nullptr; sycl::free(old, queue); }
+            if (next_scales) { auto* old = next_scales; next_scales = nullptr; sycl::free(old, queue); }
+            if (next_part) { auto* old = next_part; next_part = nullptr; sycl::free(old, queue); }
+        };
+        try {
+            next_codes = sycl::malloc_device<int8_t>(nc, queue);
+            next_scales = sycl::malloc_device<float>(nc / 32, queue);
+            next_part = sycl::malloc_device<float>(np, queue);
+            if (!next_codes || !next_scales || !next_part) { release_next(); return false; }
+            // Growth may retire outstanding work. The steady-state path above has neither a wait nor allocation.
+            if (codes || scales || part) queue.wait_and_throw();
+            code_capacity = 0; part_capacity = 0;
+            if (codes) { auto* old = codes; codes = nullptr; sycl::free(old, queue); }
+            if (scales) { auto* old = scales; scales = nullptr; sycl::free(old, queue); }
+            if (part) { auto* old = part; part = nullptr; sycl::free(old, queue); }
+        } catch (...) { release_next(); throw; }
+        codes = next_codes; scales = next_scales; part = next_part;
+        code_capacity = nc; part_capacity = np;
+        return true;
+    }
+};
+
+TokenScratch* token_scratch(const x3::MoeArgs& a, const TokenCaps& caps, sycl::queue& s) {
+    const size_t picks = size_t(a.k), embd = size_t(a.n_embd), ff = size_t(a.n_ff);
+    if (!picks || ff > std::numeric_limits<size_t>::max() / picks ||
+        embd > std::numeric_limits<size_t>::max() / picks) return nullptr;
+    const size_t nc = std::max(embd, picks * ff), np = picks * embd;
+    thread_local std::vector<std::unique_ptr<TokenScratch>> entries;
+    for (auto& entry : entries)
+        if (entry->queue == s) return entry->reserve(nc, np, caps) ? entry.get() : nullptr;
+    auto entry = std::make_unique<TokenScratch>(s);
+    if (!entry->reserve(nc, np, caps)) return nullptr;
+    auto* result = entry.get();
+    entries.push_back(std::move(entry));
+    return result;
+}
+
+template<int SG>
+void q8_quant_token(const float* x, size_t ldx, int rows, int k, int8_t* q, float* d,
+                    size_t local, sycl::queue& s) {
+    const size_t blocks = size_t(k) / 32, warps = local / SG;
+    const size_t groups_per_row = (blocks + warps - 1) / warps;
+    // Upstream q8_quant_kernel: one subgroup per storage block. SG16 holds the two halves of that same block;
+    // its first max is exactly the SG32 xor-16 step, followed by the remaining xor reductions.
+    s.parallel_for(sycl::nd_range<1>(sycl::range<1>(size_t(rows) * groups_per_row * local), sycl::range<1>(local)),
+                   [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
+        const size_t row = item.get_group_linear_id() / groups_per_row;
+        const size_t block = (item.get_group_linear_id() % groups_per_row) * warps + item.get_local_linear_id() / SG;
+        if (block >= blocks) return; // Uniform within each subgroup; no work-group barrier follows.
+        const auto subgroup = item.get_sub_group();
+        const size_t lane = subgroup.get_local_linear_id();
+        const float v0 = x[row * ldx + block * 32 + lane];
+        float v1 = 0.f, amax = sycl::fabs(v0);
+        if constexpr (SG == 16) {
+            v1 = x[row * ldx + block * 32 + lane + 16];
+            amax = sycl::fmax(amax, sycl::fabs(v1));
+        }
+        for (int offset = SG / 2; offset > 0; offset /= 2)
+            amax = sycl::fmax(amax, sycl::permute_group_by_xor(subgroup, amax, offset));
+        const float scale = amax / 127.f;
+        q[row * size_t(k) + block * 32 + lane] = int8_t(amax > 0.f ? sycl::rint(v0 / scale) : 0.f);
+        if constexpr (SG == 16)
+            q[row * size_t(k) + block * 32 + lane + 16] = int8_t(amax > 0.f ? sycl::rint(v1 / scale) : 0.f);
+        if (lane == 0) d[row * blocks + block] = scale;
+    });
+}
+void q8_quant_token(const float* x, int rows, int k, TokenScratch& scratch, const TokenCaps& caps, sycl::queue& s) {
+    if (caps.subgroup == 32)
+        q8_quant_token<32>(x, size_t(k), rows, k, scratch.codes, scratch.scales, caps.quant_group, s);
+    else q8_quant_token<16>(x, size_t(k), rows, k, scratch.codes, scratch.scales, caps.quant_group, s);
+}
+
+bool token_iq_args(const x3::MoeArgs& a, iq::Args& q) {
+    const int tg = expert_type(a.lay, 0), tu = expert_type(a.lay, 1), td = expert_type(a.lay, 2);
+    if (a.k <= 0 || tg != tu || tg == kTypeMXFP4 || td == kTypeMXFP4 ||
+        iq::is_tq(tg) || iq::is_tq(td) || !iq::supported(tg) || !iq::supported(td)) return false;
+    q.plan_ptr = a.plan_ptr;
+    for (int r = 0; r < 3; ++r) q.tr[r] = a.lay.trellis[r];
+    q.n_embd = a.n_embd; q.n_ff = a.n_ff; q.limit = a.limit; q.tg = tg; q.td = td;
+    return true;
+}
+
+void token_combine(const x3::MoeArgs& a, const float* part, const float* shared, float* out,
+                   size_t local, sycl::queue& s) {
+    const size_t groups = (size_t(a.n_embd) + local - 1) / local;
+    // Upstream mx_combine_kernel (T=1): plan-order FMA, then the CPU lane and shared expert as separate additions.
+    s.parallel_for(sycl::nd_range<1>(sycl::range<1>(groups * local), sycl::range<1>(local)),
+                   [=](sycl::nd_item<1> item) {
+        const size_t row = item.get_global_linear_id();
+        if (row >= size_t(a.n_embd)) return;
+        float sum = 0.f;
+        for (int e = 0; e < a.k; ++e) {
+            const float value = a.plan_ptr[e] ? part[size_t(e) * a.n_embd + row] : 0.f;
+            sum = sycl::fma(a.plan_w[e], value, sum);
+        }
+        if (a.cpu_part && a.cpu_flag && *a.cpu_flag) sum += a.cpu_part[row];
+        out[row] = sum + (shared ? shared[row] : 0.f);
+    });
 }
 
 struct RowCaps {
@@ -259,7 +425,7 @@ int type_block(int type) { return type == kTypeMXFP4 ? kMxBlock : iq::known(type
 const char* type_name(int type) { return type == kTypeMXFP4 ? "MXFP4" : iq::name(type); }
 bool type_on_device(int type) { return type == kTypeMXFP4 || iq::supported(type); }
 bool type_on_chunk(int type) { return type_on_device(type); }
-bool prepare(sycl::queue& s) { return s.has_property<sycl::property::queue::in_order>(); } // No persistent scratch.
+bool prepare(sycl::queue& s) { return s.has_property<sycl::property::queue::in_order>(); } // Scratch grows from actual token shapes.
 int launch_errors() { return errors.load(std::memory_order_relaxed); }
 
 x3::Mat view(const x3::Mat& m, int c0, int nc) {
@@ -327,6 +493,17 @@ void rows(const x3::Mat& m, uint16_t* dst, bool bf16, sycl::queue& s) {
 }
 void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, sycl::queue& s) {
     if (a.k < 0 || a.k > kPicks || !layout_ok(a.lay, a.n_embd, a.n_ff)) { fail("invalid expert layout"); return; }
+    sycl_detail::require_in_order(s);
+    iq::Args q;
+    if (token_iq_args(a, q)) {
+        const auto& caps = token_caps(s);
+        if (caps.subgroup) if (auto* scratch = token_scratch(a, caps, s)) {
+            q.h = h; q.xq = scratch->codes; q.xd = scratch->scales;
+            q8_quant_token(x, 1, a.n_embd, *scratch, caps, s);
+            if (!iq::gate_up(q, a.k, 1, s)) fail("unsupported IQ token gate/up");
+            return;
+        }
+    }
     const int tg = expert_type(a.lay, 0), tu = expert_type(a.lay, 1);
     const size_t rg = type_row_bytes(tg, a.n_embd), ru = type_row_bytes(tu, a.n_embd);
     parallel(s, size_t(a.k) * a.n_ff, [=](size_t z) {
@@ -340,6 +517,18 @@ void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, sycl::queue& s)
 }
 void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, sycl::queue& s) {
     if (a.k < 0 || a.k > kPicks || !layout_ok(a.lay, a.n_embd, a.n_ff)) { fail("invalid expert layout"); return; }
+    sycl_detail::require_in_order(s);
+    iq::Args q;
+    if (token_iq_args(a, q)) {
+        const auto& caps = token_caps(s);
+        if (caps.subgroup) if (auto* scratch = token_scratch(a, caps, s)) {
+            q.part = scratch->part; q.hq = scratch->codes; q.hd = scratch->scales;
+            q8_quant_token(h, a.k, a.n_ff, *scratch, caps, s);
+            if (!iq::down(q, a.k, 1, s)) { fail("unsupported IQ token down"); return; }
+            token_combine(a, scratch->part, sh_out, out, caps.combine_group, s);
+            return;
+        }
+    }
     const int td = expert_type(a.lay, 2);
     const size_t rd = type_row_bytes(td, a.n_ff);
     parallel(s, size_t(a.n_embd), [=](size_t c) {

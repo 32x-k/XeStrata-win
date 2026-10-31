@@ -9,6 +9,7 @@
 // must equal ggml's weights times the same activations.
 //   iq_expert_test [--type 16,17,18,21,22,23,29] [--bench] [--iq256 0|1]
 #include "../../src/dsv41/ds4_gguf_cpu.hpp"
+#include "../../src/dsv41/ds4_gguf.cuh"
 #include "../../src/dsv41/ds4_iq.cuh"
 #include "../../src/dsv41/ds4_sycl.hpp"
 
@@ -127,6 +128,142 @@ static Mat make_mat(std::mt19937_64& rng, int type, int rows, int k) {
     const size_t rb = (size_t) (k / bv) * (size_t) bb;
     for (int r = 0; r < rows; ++r) tr->to_float(&m.bytes[(size_t) r * rb], &m.w[(size_t) r * k], k);
     return m;
+}
+
+// Exercise the public token APIs with a missing expert and independent ggml-decoded
+// references. A byte-offset Q8 input is legal for the portable path but cannot use
+// the upstream token kernel's 16-byte activation load.
+template <class Report>
+static void token_contract(int type, const std::vector<Mat>& g, const std::vector<Mat>& u,
+                           const std::vector<Mat>& d, const std::vector<float>& x,
+                           uint8_t* blobs, size_t stride, const size_t* offsets,
+                           float limit, Report report) {
+    if (type != iq::kIQ1_S && type != iq::kIQ1_M && type != iq::kIQ2_XXS &&
+        type != iq::kIQ2_XS && type != iq::kIQ2_S && type != iq::kIQ3_XXS) return;
+    const int k = g[0].k, ff = g[0].rows, entries = 3;
+    constexpr size_t edge = 8;
+    constexpr float sentinel = -123456.0f;
+    const int expert[entries] = {1, -1, 0};
+    const std::vector<unsigned long long> plan = {
+        reinterpret_cast<unsigned long long>(blobs + stride), 0,
+        reinterpret_cast<unsigned long long>(blobs)};
+    const auto* device_plan = up(plan);
+    const auto input = quant(x.data(), k);
+    std::vector<float> hidden((size_t) entries * ff), hscale((size_t) entries * ff / 32);
+    std::vector<int8_t> hcodes(hidden.size());
+    std::vector<Q8> hquant(entries);
+    for (int e = 0; e < entries; ++e) {
+        std::copy_n(x.data() + (size_t) e * k, ff, hidden.data() + (size_t) e * ff);
+        hquant[e] = quant(hidden.data() + (size_t) e * ff, ff);
+        std::copy(hquant[e].q.begin(), hquant[e].q.end(), hcodes.data() + (size_t) e * ff);
+        std::copy(hquant[e].d.begin(), hquant[e].d.end(), hscale.data() + (size_t) e * ff / 32);
+    }
+    std::vector<int8_t> unaligned_x(input.q.size() + 1), unaligned_h(hcodes.size() + 1);
+    std::copy(input.q.begin(), input.q.end(), unaligned_x.begin() + 1);
+    std::copy(hcodes.begin(), hcodes.end(), unaligned_h.begin() + 1);
+    const auto* xcodes = up(input.q);
+    const auto* hcodes_device = up(hcodes);
+    const auto* xcodes_offset = up(unaligned_x) + 1;
+    const auto* hcodes_offset = up(unaligned_h) + 1;
+    const auto* xscale = up(input.d);
+    const auto* hscale_device = up(hscale);
+    const std::vector<float> initial_h((size_t) entries * ff + 2 * edge, sentinel);
+    const std::vector<float> initial_p((size_t) entries * k + 2 * edge, sentinel);
+    auto* hstorage = up(initial_h);
+    auto* pstorage = up(initial_p);
+    auto intact = [&](const std::vector<float>& values) {
+        return std::all_of(values.begin(), values.begin() + edge, [&](float v) { return v == sentinel; }) &&
+               std::all_of(values.end() - edge, values.end(), [&](float v) { return v == sentinel; });
+    };
+    auto ratio = [](double actual, double expected, double scale) {
+        const double error = std::fabs(actual - expected) / (scale + 1e-30);
+        return std::isfinite(actual) && std::isfinite(error) ? error : 1e30;
+    };
+    auto gate_error = [&](const std::vector<float>& values, bool check_skipped) {
+        double worst = 0.0;
+        for (int e = 0; e < entries; ++e) for (int r = 0; r < ff; ++r) {
+            const float actual = values[edge + (size_t) e * ff + r];
+            if (expert[e] < 0) {
+                if (check_skipped) worst = std::max(worst, actual == sentinel ? 0.0 : 1e30);
+                continue;
+            }
+            double ga, ua;
+            const double gv = dotd(g[expert[e]].w.data() + (size_t) r * k, input.xhat.data(), k, &ga);
+            const double uv = dotd(u[expert[e]].w.data() + (size_t) r * k, input.xhat.data(), k, &ua);
+            worst = std::max(worst, ratio(actual, swiglu(gv, uv, limit), ga + ua));
+        }
+        return worst;
+    };
+    iq::Args a{};
+    a.plan_ptr = device_plan; a.n_embd = k; a.n_ff = ff; a.limit = limit; a.tg = a.td = type;
+    a.xd = xscale; a.hd = hscale_device; a.h = hstorage + edge; a.part = pstorage + edge;
+    std::copy_n(offsets, 3, a.tr);
+    for (bool offset : {false, true}) {
+        a.xq = offset ? xcodes_offset : xcodes;
+        a.hq = offset ? hcodes_offset : hcodes_device;
+        queue().memcpy(hstorage, initial_h.data(), initial_h.size() * sizeof(float)).wait_and_throw();
+        queue().memcpy(pstorage, initial_p.data(), initial_p.size() * sizeof(float)).wait_and_throw();
+        if (!iq::gate_up(a, entries, 1, queue()) || !iq::down(a, entries, 1, queue()))
+            throw std::runtime_error("token contract fixture refused");
+        const auto actual_h = down_(hstorage, initial_h.size());
+        const auto actual_p = down_(pstorage, initial_p.size());
+        double worst = 0.0;
+        for (int e = 0; e < entries; ++e) for (int r = 0; r < k; ++r) {
+            const float actual = actual_p[edge + (size_t) e * k + r];
+            if (expert[e] < 0) { worst = std::max(worst, actual == sentinel ? 0.0 : 1e30); continue; }
+            double scale;
+            const double expected = dotd(d[expert[e]].w.data() + (size_t) r * ff,
+                                         hquant[e].xhat.data(), ff, &scale);
+            worst = std::max(worst, ratio(actual, expected, scale));
+        }
+        report(offset ? "token offset gate/up" : "token aligned gate/up", type, gate_error(actual_h, true), 1e-5);
+        report(offset ? "token offset down" : "token aligned down", type, worst, 1e-6);
+        report(offset ? "token offset guards" : "token aligned guards", type,
+               intact(actual_h) && intact(actual_p) ? 0.0 : 1.0, 0.0);
+    }
+
+    const std::vector<float> weights = {0.25f, 0.5f, 0.25f};
+    std::vector<float> cpu(k), shared(k);
+    for (int r = 0; r < k; ++r) { cpu[r] = x[r] * 0.125f; shared[r] = x[k + r] * 0.25f; }
+    const auto* cpu_device = up(cpu);
+    const auto* shared_device = up(shared);
+    auto* flag = up(std::vector<int>{0});
+    const auto* xf = up(x);
+    const auto* hf = up(hidden);
+    const std::vector<float> initial_y((size_t) k + 2 * edge, sentinel);
+    auto* ystorage = up(initial_y);
+    strata::dsv41k::exl3::MoeArgs ma{};
+    ma.plan_ptr = device_plan; ma.plan_w = up(weights); ma.k = entries;
+    ma.n_embd = k; ma.n_ff = ff; ma.limit = limit; ma.lay.fmt = gg::kFmtMXFP4;
+    for (int role = 0; role < 3; ++role) { ma.lay.K[role] = type; ma.lay.trellis[role] = offsets[role]; }
+    ma.cpu_part = cpu_device; ma.cpu_flag = flag;
+    queue().memcpy(hstorage, initial_h.data(), initial_h.size() * sizeof(float)).wait_and_throw();
+    gg::moe_gate_up(ma, xf, hstorage + edge, queue());
+    const auto wrapper_h = down_(hstorage, initial_h.size());
+    // The wrapper does not consume an absent expert's h; its contents are not an
+    // output contract. The raw IQ API above must leave that skipped slot untouched.
+    report("moe gate/up reference", type, gate_error(wrapper_h, false), 1e-5);
+    report("moe gate/up guard", type, intact(wrapper_h) ? 0.0 : 1.0, 0.0);
+    for (int active : {0, 1}) {
+        queue().memcpy(flag, &active, sizeof(active)).wait_and_throw();
+        queue().memcpy(ystorage, initial_y.data(), initial_y.size() * sizeof(float)).wait_and_throw();
+        gg::moe_down(ma, hf, active ? shared_device : nullptr, ystorage + edge, queue());
+        const auto actual_y = down_(ystorage, initial_y.size());
+        double worst = 0.0;
+        for (int r = 0; r < k; ++r) {
+            double expected = 0.0, scale = 0.0;
+            for (int e = 0; e < entries; ++e) if (expert[e] >= 0) {
+                double sa;
+                expected += weights[e] * dotd(d[expert[e]].w.data() + (size_t) r * ff,
+                                               hquant[e].xhat.data(), ff, &sa);
+                scale += weights[e] * sa;
+            }
+            if (active) { expected += (double) cpu[r] + shared[r]; scale += std::fabs(cpu[r]) + std::fabs(shared[r]); }
+            worst = std::max(worst, ratio(actual_y[edge + r], expected, scale));
+        }
+        report(active ? "moe down CPU/shared" : "moe down CPU disabled", type, worst, 1e-6);
+        report("moe down guard", type, intact(actual_y) ? 0.0 : 1.0, 0.0);
+    }
 }
 
 // Default upstream runr declines N=64/192 although the vector-load alignment is
@@ -581,7 +718,8 @@ int main(int argc, char** argv) try {
     if (sycl::device::get_devices(sycl::info::device_type::gpu).empty()) {
         std::puts("SKIP: no SYCL GPU"); return 77;
     }
-    std::vector<int> types = {16, 17, 22, 18, 21, 23, 29};
+    // Append new types: the existing fixtures share one RNG stream in this order.
+    std::vector<int> types = {16, 17, 22, 18, 21, 23, 29, 19};
     std::vector<int> devs;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--bench-tiles") {   // [types] [n_exp] [rows list]: the prompt sets' optional matrix-engine tiles
@@ -723,6 +861,7 @@ int main(int argc, char** argv) try {
                     worst = std::max(worst, std::fabs(part[(size_t) e * E + r] - ref) / (sa + 1e-30));
                 }
             report("token down", type, worst, 1e-6);
+            token_contract(type, G, U, D, x, dblob, blob, off, lim, report);
             light_contract(type, G, U, D, x, dblob, blob, off, lim, report);
 
             // ---- the prompt sets: expert 0 owns rows [0, 37), expert 2 [37, 42)

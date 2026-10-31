@@ -12,6 +12,7 @@
 #include "ds4_numerics.cuh"
 #include "ds4_iq_decode.hpp"
 #include "ds4_iq_matrix.hpp"
+#include "ds4_iq_token.hpp"
 #include "strata/core/per_device.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -19,6 +20,17 @@
 
 namespace strata::ds4::gguf::iq {
 using namespace sycl_decode;
+
+const token_detail::Caps& token_detail::caps(const sycl::queue& q) {
+    static core::PerDevice<Caps> cache;
+    const auto device = q.get_device();
+    return cache.get(device, [&] {
+        return Caps{std::min(device.get_info<sycl::info::device::max_work_group_size>(),
+                             device.get_info<sycl::info::device::max_work_item_sizes<1>>()[0]),
+                    size_t(device.get_info<sycl::info::device::local_mem_size>()),
+                    device.get_info<sycl::info::device::sub_group_sizes>()};
+    });
+}
 
 namespace {
 bool light_on() {
@@ -349,12 +361,20 @@ bool launch_light(const SetArgs& a, sycl::queue& s) {
 bool gate_up(const Args& a, int groups, int ne_max, sycl::queue& s) {
     if (is_tq(a.tg)) return tq::gate_up(a, groups, ne_max, s);
     return dispatch(a.tg, [&](auto t) {
+        if constexpr (t.value == kIQ1_S || t.value == kIQ1_M || t.value == kIQ2_XXS ||
+                      t.value == kIQ2_XS || t.value == kIQ2_S || t.value == kIQ3_XXS) {
+            if (token_detail::launch<t.value, true>(a, groups, ne_max, s)) return;
+        }
         portable::token<true>(a, groups, ne_max, row_bytes_t<t.value>(a.n_embd), Decoder<t.value>{}, s);
     });
 }
 bool down(const Args& a, int groups, int ne_max, sycl::queue& s) {
     if (is_tq(a.td)) return tq::down(a, groups, ne_max, s);
     return dispatch(a.td, [&](auto t) {
+        if constexpr (t.value == kIQ1_S || t.value == kIQ1_M || t.value == kIQ2_XXS ||
+                      t.value == kIQ2_XS || t.value == kIQ2_S || t.value == kIQ3_XXS) {
+            if (token_detail::launch<t.value, false>(a, groups, ne_max, s)) return;
+        }
         portable::token<false>(a, groups, ne_max, row_bytes_t<t.value>(a.n_ff), Decoder<t.value>{}, s);
     });
 }
