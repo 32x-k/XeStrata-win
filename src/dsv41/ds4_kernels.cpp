@@ -371,6 +371,160 @@ float engram_value(const uint8_t* row, const uint8_t* scales, int e, int fmt) {
                         b == 0 ? 5.877471754111438e-39f : sycl::bit_cast<float>(uint32_t(b) << 23);
     return e4m3_value(row[e]) * scale;
 }
+
+struct GroupCaps {
+    size_t max_group = 0, local = 0;
+};
+const GroupCaps& group_caps(const sycl::queue& q) {
+    const auto device = q.get_device();
+    static core::PerDevice<GroupCaps> cache;
+    return cache.get(device, [&] {
+        return GroupCaps{std::min(device.get_info<sycl::info::device::max_work_group_size>(),
+                                  device.get_info<sycl::info::device::max_work_item_sizes<1>>()[0]),
+                         size_t(device.get_info<sycl::info::device::local_mem_size>())};
+    });
+}
+
+// Upstream index_score_kernel<128, KF>: a work-item a position, the token's queries and head weights in local
+// memory, each key row decoded once for every head. Upstream's 256-item launch bound is used only where the
+// device reports that group size and the local memory.
+template <int KF>
+bool index_score_group(const float* q, const float* w, const uint8_t* kc, int heads, int T, int n, const int* cand,
+                       int cand_stride, int blk, const Rows& lim, float* out, long long out_stride, sycl::queue& s) {
+    constexpr int HD = 128, WG = 256;
+    const auto& caps = group_caps(s);
+    const size_t qn = size_t(heads) * HD + size_t(heads);
+    if (caps.max_group < size_t(WG) || caps.local < qn * sizeof(float)) return false;
+    const size_t groups = (size_t(n) + WG - 1) / WG;
+    s.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> qs(sycl::range<1>(qn), h);
+        h.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(T), groups * WG), sycl::range<2>(1, WG)),
+                       [=](sycl::nd_item<2> item) {
+            const int t = int(item.get_group(0)), tid = int(item.get_local_id(1));
+            for (int i = tid; i < heads * HD; i += WG) qs[i] = q[size_t(t) * heads * HD + i];
+            for (int i = tid; i < heads; i += WG) qs[heads * HD + i] = w[size_t(t) * 64 + i];
+            item.barrier(sycl::access::fence_space::local_space);
+            const int i = int(item.get_group(1)) * WG + tid;
+            if (i >= n) return;
+            float* o = out + static_cast<long long>(t) * out_stride;
+            int ln, lk;
+            rows_at(lim, t, ln, lk);
+            int p = i;
+            if (cand) {
+                if (i >= lk * blk) { o[i] = -std::numeric_limits<float>::infinity(); return; }
+                p = cand[size_t(t) * cand_stride + i / blk] * blk + i % blk;
+            }
+            if (p >= ln) { o[i] = -std::numeric_limits<float>::infinity(); return; }
+            const uint8_t* kr = kc + size_t(p) * kv_row_bytes(KF, HD);
+            float acc[32];
+#pragma unroll
+            for (int hh = 0; hh < 32; ++hh) acc[hh] = 0.f;
+#pragma unroll 2
+            for (int c = 0; c < HD; c += 8) {
+                float kv[8];
+                if constexpr (KF == kKvFp4p) {
+                    const float ks = sycl::bit_cast<float>(uint32_t(kr[HD / 2 + c / 32]) << 23);
+#pragma unroll
+                    for (int x = 0; x < 8; ++x) kv[x] = e2m1_value(uint8_t(kr[(c + x) / 2] >> (4 * (x & 1)))) * ks;
+                } else {
+                    const auto* b = reinterpret_cast<const uint16_t*>(kr) + c;
+#pragma unroll
+                    for (int x = 0; x < 8; ++x) kv[x] = bf16_value(b[x]);
+                }
+#pragma unroll
+                for (int hh = 0; hh < 32; ++hh) {
+                    if (hh >= heads) break;
+#pragma unroll
+                    for (int x = 0; x < 8; ++x) acc[hh] += qs[hh * HD + c + x] * kv[x];
+                }
+            }
+            float sum = 0.f;
+#pragma unroll
+            for (int hh = 0; hh < 32; ++hh) {
+                if (hh >= heads) break;
+                sum += sycl::fmax(acc[hh], 0.f) * qs[heads * HD + hh];
+            }
+            o[i] = sum;
+        });
+    });
+    return true;
+}
+
+// Upstream topk_kernel: a work-group a row, the k-th largest key by four 8-bit radix passes over a local
+// histogram, then the picks in index order (strictly greater first, then the lowest equal positions). The ranks
+// are integer scans over the work-group, so the result does not depend on the group or sub-group size; the size
+// is upstream's 1024, or the device's largest group where that is smaller.
+bool topk_group(const float* vals, long long stride, int T, const Rows& r, const int* cand, int cand_stride, int blk,
+                int* out, int out_stride, sycl::queue& s) {
+    const auto& caps = group_caps(s);
+    const size_t wg = std::min<size_t>(1024, caps.max_group);
+    if (wg < 32 || caps.local < 256 * sizeof(unsigned) + 4 * sizeof(uint32_t)) return false;
+    s.submit([&](sycl::handler& h) {
+        sycl::local_accessor<unsigned, 1> hist(sycl::range<1>(256), h);
+        sycl::local_accessor<uint32_t, 1> state(sycl::range<1>(3), h);   // prefix, mask, remaining
+        h.parallel_for(sycl::nd_range<1>(size_t(T) * wg, wg), [=](sycl::nd_item<1> item) {
+            const auto group = item.get_group();
+            const int t = int(item.get_group_linear_id()), tid = int(item.get_local_linear_id()), step = int(wg);
+            int n, k;
+            rows_at(r, t, n, k);
+            if (n <= 0 || k <= 0) return;
+            const float* v = vals + static_cast<long long>(t) * stride;
+            int* dst = out + size_t(t) * out_stride;
+            const int* cd = cand ? cand + size_t(t) * cand_stride : nullptr;
+            if (k >= n) {
+                for (int i = tid; i < n; i += step) dst[i] = cd ? cd[i / blk] * blk + i % blk : i;
+                return;
+            }
+            if (tid == 0) { state[0] = 0u; state[1] = 0u; state[2] = uint32_t(k); }
+            item.barrier(sycl::access::fence_space::local_space);
+            for (int shift = 24; shift >= 0; shift -= 8) {
+                for (int i = tid; i < 256; i += step) hist[i] = 0u;
+                item.barrier(sycl::access::fence_space::local_space);
+                const uint32_t prefix = state[0], mask = state[1];
+                for (int i = tid; i < n; i += step) {
+                    const uint32_t u = ord_key(v[i]);
+                    if ((u & mask) == prefix)
+                        sycl::atomic_ref<unsigned, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                         sycl::access::address_space::local_space>(hist[(u >> shift) & 255u])
+                            .fetch_add(1u);
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+                if (tid == 0) {
+                    const int rem = int(state[2]);
+                    int cum = 0;
+                    for (int digit = 255; digit >= 0; --digit) {
+                        const int count = int(hist[digit]);
+                        if (cum + count >= rem) {
+                            state[0] = prefix | (uint32_t(digit) << shift);
+                            state[1] = mask | (255u << shift);
+                            state[2] = uint32_t(rem - cum);
+                            break;
+                        }
+                        cum += count;
+                    }
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+            }
+            const uint32_t thr = state[0];
+            const int remaining = int(state[2]), n_gt = k - remaining;
+            int cnt_gt = 0, cnt_eq = 0;
+            for (int i0 = 0; i0 < n; i0 += step) {
+                const int i = i0 + tid;
+                const uint32_t u = i < n ? ord_key(v[i]) : 0u;
+                const int gt = i < n && u > thr, eq = i < n && u == thr;
+                const int rank_gt = sycl::exclusive_scan_over_group(group, gt, sycl::plus<int>());
+                const int rank_eq = sycl::exclusive_scan_over_group(group, eq, sycl::plus<int>());
+                int slot = -1;
+                if (gt) slot = cnt_gt + rank_gt;
+                else if (eq && cnt_eq + rank_eq < remaining) slot = n_gt + cnt_eq + rank_eq;
+                if (slot >= 0) dst[slot] = cd ? cd[i / blk] * blk + i % blk : i;
+                cnt_gt += sycl::reduce_over_group(group, gt, sycl::plus<int>());
+                cnt_eq += sycl::reduce_over_group(group, eq, sycl::plus<int>());
+            }
+        });
+    });
+    return true;
+}
 }
 
 void bind_mailbox(sycl::queue& queue, const std::shared_ptr<MailboxControl>& control) {
@@ -609,6 +763,15 @@ void compress_win(const float* kv, const float* score, float* kv_state, float* s
 void index_score(const float* q, const float* w, const void* k, int heads, int hd, int T, int n,
                  const int* cand, int cand_stride, int blk, const Rows& lim, float* out, long long out_stride,
                  sycl::queue& s, int kfmt) {
+    sycl_detail::require_in_order(s);
+    if (T <= 0 || n <= 0) return;
+    if (hd == 128 && heads > 0 && heads <= 32) {
+        const auto* kc = static_cast<const uint8_t*>(k);
+        if (kfmt == kKvFp4p &&
+            index_score_group<kKvFp4p>(q, w, kc, heads, T, n, cand, cand_stride, blk, lim, out, out_stride, s)) return;
+        if (kfmt == kKvBf16 &&
+            index_score_group<kKvBf16>(q, w, kc, heads, T, n, cand, cand_stride, blk, lim, out, out_stride, s)) return;
+    }
     parallel(s, size_t(T) * n, [=](size_t z) {
         const int t = int(z / n), i = int(z % n);
         int ln, lk; rows_at(lim, t, ln, lk);
@@ -629,6 +792,9 @@ void index_score(const float* q, const float* w, const void* k, int heads, int h
 }
 void topk(const float* vals, long long stride, int T, const Rows& r, const int* cand, int cand_stride, int blk,
           int* out, int out_stride, sycl::queue& s) {
+    sycl_detail::require_in_order(s);
+    if (T <= 0) return;
+    if (topk_group(vals, stride, T, r, cand, cand_stride, blk, out, out_stride, s)) return;
     parallel(s, size_t(T), [=](size_t t) {
         int n, k; rows_at(r, int(t), n, k);
         if (n <= 0 || k <= 0) return;
