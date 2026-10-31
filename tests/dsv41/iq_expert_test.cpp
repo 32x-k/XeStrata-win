@@ -129,6 +129,82 @@ static Mat make_mat(std::mt19937_64& rng, int type, int rows, int k) {
     return m;
 }
 
+// Default upstream runr declines N=64/192 although the vector-load alignment is
+// valid. These 17-row sets must retain FP32 inputs/weights in the FMA fallback.
+template <class Report>
+static void matrix_precision_boundary(Report report) {
+    constexpr int type = iq::kIQ2_XXS, k = 256, rows = 17;
+    constexpr float limit = 7.0f, guard_y = -321.0f;
+    constexpr uint16_t guard_h = 0x3555;
+    // Fixed seed keeps the boundary fixture reproducible.
+    std::mt19937_64 rng(8164);  // NOLINT(bugprone-random-generator-seed)
+    std::uniform_real_distribution<float> values(-0.25f, 0.25f);
+    for (const int n : {64, 192}) {
+        const int ldo = n + 2;   // even, so the old matrix eligibility would accept it
+        const Mat gate = make_mat(rng, type, n, k), up_mat = make_mat(rng, type, n, k);
+        std::vector<uint8_t> blob = gate.bytes;
+        blob.insert(blob.end(), up_mat.bytes.begin(), up_mat.bytes.end());
+        std::vector<float> xf(size_t(rows) * k), half_values(xf.size());
+        std::vector<uint16_t> xh(xf.size()), zeros(xf.size(), 0);
+        for (size_t j = 0; j < xf.size(); ++j) {
+            xf[j] = values(rng);
+            xh[j] = strata::ds4::sycl_detail::f16_bits(xf[j]);
+            half_values[j] = h2f(xh[j]);
+        }
+        std::vector<int> bounds{7, 7 + rows}, indices(rows);
+        for (int r = 0; r < rows; ++r) indices[r] = rows - 1 - r;
+        const std::vector<uint16_t> initial_h(size_t(rows + 1) * ldo, guard_h);
+        const std::vector<float> initial_y(initial_h.size(), guard_y);
+        iq::SetArgs a{};
+        a.wbase = up(blob); a.stride = blob.size(); a.tr[1] = gate.bytes.size();
+        a.bounds = up(bounds); a.row0 = 7; a.n_exp = 1; a.max_rows = rows;
+        a.n_embd = k; a.n_ff = n; a.tg = a.td = type; a.limit = limit;
+        a.idx = up(indices); a.xf = up(xf); a.xf16 = up(zeros); a.xh = up(xh);
+        a.ldx = k; a.ldo = ldo; a.h = up(initial_h); a.y = up(initial_y);
+        if (!iq::set_gate_up(a, queue())) throw std::runtime_error("precision-boundary gate/up refused");
+        const auto actual_h = down_(a.h, initial_h.size());
+        double gate_worst = 0;
+        bool gate_guard = true;
+        for (int r = 0; r <= rows; ++r) {
+            for (int c = 0; c < ldo; ++c) {
+                const size_t at = size_t(r) * ldo + c;
+                if (r == rows || c >= n) { gate_guard = gate_guard && actual_h[at] == guard_h; continue; }
+                const float* input = xf.data() + size_t(indices[r]) * k;
+                const float g = dot_fma(gate.w.data() + size_t(c) * k, input, k);
+                const float u = dot_fma(up_mat.w.data() + size_t(c) * k, input, k);
+                const double expected = swiglu_f32(g, u, limit);
+                const double error = std::abs(h2f(actual_h[at]) - expected) / (1e-4 + 1e-3 * std::abs(expected));
+                gate_worst = std::max(gate_worst, std::isfinite(error) ? error : 1e30);
+            }
+        }
+        char label[64];
+        std::snprintf(label, sizeof(label), "set gate N%d FMA", n); report(label, type, gate_worst, 1.0);
+        std::snprintf(label, sizeof(label), "set gate N%d guard", n); report(label, type, gate_guard ? 0.0 : 1.0, 0.0);
+        // Only down's N-by-K weights are used. Reuse gate's decoded matrix and
+        // avoid constructing unused opposite-projection rows with K=64/192.
+        a.n_embd = n; a.n_ff = k;
+        if (!iq::set_down(a, queue())) throw std::runtime_error("precision-boundary down refused");
+        const auto actual_y = down_(a.y, initial_y.size());
+        double down_worst = 0;
+        bool down_guard = true;
+        for (int r = 0; r <= rows; ++r) {
+            for (int c = 0; c < ldo; ++c) {
+                const size_t at = size_t(r) * ldo + c;
+                if (r == rows || c >= n) { down_guard = down_guard && actual_y[at] == guard_y; continue; }
+                const float* weight = gate.w.data() + size_t(c) * k;
+                const float* input = half_values.data() + size_t(r) * k;
+                double scale;
+                dotd(weight, input, k, &scale);
+                const double expected = dot_fma(weight, input, k);
+                const double error = std::abs(actual_y[at] - expected) / (1e-7 + 1e-6 * scale);
+                down_worst = std::max(down_worst, std::isfinite(error) ? error : 1e30);
+            }
+        }
+        std::snprintf(label, sizeof(label), "set down N%d FMA", n); report(label, type, down_worst, 1.0);
+        std::snprintf(label, sizeof(label), "set down N%d guard", n); report(label, type, down_guard ? 0.0 : 1.0, 0.0);
+    }
+}
+
 // The 16-row boundary changes the activations' numerical representation, independently of the device's tiles.
 // CPU references use ggml's decoded weights and the host quantizer above, never the device decoder.
 template <class Report>
@@ -164,7 +240,7 @@ static void light_contract(int type, const std::vector<Mat>& g, const std::vecto
     const uint16_t* dx16 = up(x16), *dzero = up(zeros);
     std::vector<uint16_t> initial((size_t) nr * ldh, guard_h);
     a.h = up(initial);
-    const char* labels[] = {"light gate FP32 priority", "set gate 16/17", "set gate FP32 only",
+    const char* labels[] = {"light gate FP32 priority", "set gate FP32 priority 16/17", "set gate FP32 only",
                             "set gate FP16 only", "set gate max_rows=16"};
     for (int phase = 0; phase < 5; ++phase) {
         a.n_exp = phase == 4 ? 2 : 3; a.max_rows = phase == 4 ? 16 : 17;
@@ -204,8 +280,7 @@ static void light_contract(int type, const std::vector<Mat>& g, const std::vecto
                 double gate_abs, up_abs;
                 const double gate = dotd(wg, input, k, &gate_abs), up_value = dotd(wu, input, k, &up_abs);
                 double expected = swiglu(gate, up_value, limit);
-                if (phase == 1 && r >= 16) expected = 0.0;  // The supplied FP16 copy is zero in this phase.
-                else if (phase == 3 || r >= 16) {
+                if (phase == 3 || r >= 16) {
                     const float gate_fma = dot_fma(wg, input, k), up_fma = dot_fma(wu, input, k);
                     const double h_fma = swiglu_f32(gate_fma, up_fma, limit);
                     const double difference = std::abs(h_fma - expected) / (1e-4 + 1e-3 * std::abs(expected));
@@ -574,6 +649,7 @@ int main(int argc, char** argv) try {
     };
     for (int type : types) {
         if (!iq::supported(type) && !iq::known(type)) { std::printf("%-7s not a type this engine knows\n", iq::name(type)); ++fails; continue; }
+        if (type == iq::kIQ2_XXS) matrix_precision_boundary(report);
         const bool dev = iq::supported(type);   // (IQ1_S / IQ1_M / IQ4_NL: a known layout, no device kernel - CPU lane only)
         const int E = 512, FF = 256, NEXP = 3, T = 4;
         const float lim = 7.0f;

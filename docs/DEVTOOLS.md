@@ -47,6 +47,11 @@ mkdir -p .lint/bin && curl -sSL https://github.com/lycheeverse/lychee/releases/l
 
 `tools/lint/run.sh` uses the distribution's `reuse` when there is one and `.lint/venv/bin/reuse` otherwise.
 
+On Windows, extract the zip from the [official gitleaks releases](https://github.com/gitleaks/gitleaks/releases) into `.lint/`.
+When an [official cppcheck release](https://github.com/cppcheck-opensource/cppcheck/releases) provides an MSI, use 7-Zip to extract the MSI and then its CAB to use the CLI without running the installer.
+Verify the download's SHA-256, place the CAB's DLLs under the names the executable imports, and put the library configurations in `cfg/`.
+Pass each tool its configuration from `tools/lint/`. Record the installed versions, locations and environment setup in `LOCAL.md`.
+
 ## intel/llvm from source
 
 The free build compiles the engine with intel/llvm's DPC++ ([BUILD.md](BUILD.md#build-and-run)).

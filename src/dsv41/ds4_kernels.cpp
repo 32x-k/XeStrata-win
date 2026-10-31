@@ -8,6 +8,7 @@
 #include "ds4_numerics.cuh"
 #include "ds4_q6k.cuh"
 #include "ds4_mailbox.hpp"
+#include "strata/core/per_device.hpp"
 #include "strata/core/readback.hpp"
 #include <algorithm>
 #include <atomic>
@@ -17,6 +18,7 @@
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 namespace strata::ds4 {
 namespace {
@@ -85,6 +87,45 @@ void rows_at(const Rows& r, int t, int& n, int& k) {
     default: n = (nn + r.blk - 1) / r.blk; k = r.kcap; break;
     }
 }
+struct GemvCaps {
+    size_t max_group = 0;
+    std::vector<size_t> sub_groups;
+};
+size_t gemv_group_size(const sycl::queue& q, int k) {
+    const auto device = q.get_device();
+    static core::PerDevice<GemvCaps> cache;
+    const auto& caps = cache.get(device, [&] {
+        return GemvCaps{std::min(device.get_info<sycl::info::device::max_work_group_size>(),
+                                device.get_info<sycl::info::device::max_work_item_sizes<1>>()[0]),
+                        device.get_info<sycl::info::device::sub_group_sizes>()};
+    });
+    const size_t limit = std::min(size_t(std::max(k, 1)), caps.max_group);
+    size_t local = 1;
+    for (const auto width : caps.sub_groups)
+        if (width <= limit) local = std::max(local, width);
+    return local;
+}
+float gemv_weight(float v) { return v; }
+float gemv_weight(uint16_t v) { return f16_value(v); }
+template <class Weight>
+void gemv_rows(const Weight* W, const float* x, size_t ldx, int n, int k, int T, float alpha,
+               float* y, size_t ldy, sycl::queue& s) {
+    sycl_detail::require_in_order(s);
+    if (T <= 0 || n <= 0) return;
+    // One output uses a reported sub-group's extent, rather than the device's
+    // entire work-group. A group reduction also works if the compiler chooses
+    // a narrower sub-group, and the shape is independent of the token count.
+    const size_t local = gemv_group_size(s, k), columns = size_t(std::max(k, 0));
+    s.parallel_for(sycl::nd_range<1>(sycl::range<1>(size_t(T) * n * local), sycl::range<1>(local)),
+                   [=](sycl::nd_item<1> item) {
+        const size_t i = item.get_group_linear_id(), t = i / n, r = i % n;
+        float sum = 0.f;
+        for (size_t j = item.get_local_linear_id(); j < columns; j += local)
+            sum += gemv_weight(W[r * columns + j]) * x[t * ldx + j];
+        sum = sycl::reduce_over_group(item.get_group(), sum, sycl::plus<float>());
+        if (item.get_local_linear_id() == 0) y[t * ldy + r] = alpha * sum;
+    });
+}
 float route_score(float l) { return sycl::sqrt(l > 20.f ? l : sycl::log1p(sycl::exp(l))); }
 void route_row(const float* logits, const float* bias, int n, int k, float scale, int* ids, float* weights) {
     float sum = 0.f;
@@ -98,10 +139,218 @@ void route_row(const float* logits, const float* bias, int n, int k, float scale
             if (!used && (v > best || (v == best && (ix < 0 || i < ix)))) { best = v; ix = i; }
         }
         ids[r] = ix;
-        weights[r] = ix < 0 ? 0.f : route_score(logits[ix]);
-        sum += weights[r];
+        if (weights) {
+            weights[r] = ix < 0 ? 0.f : route_score(logits[ix]);
+            sum += weights[r];
+        }
     }
-    for (int r = 0; r < k; ++r) weights[r] = weights[r] / (sum + 1e-20f) * scale;
+    if (weights) for (int r = 0; r < k; ++r) weights[r] = weights[r] / (sum + 1e-20f) * scale;
+}
+struct RouteCaps { size_t max_group, local_bytes; };
+template <class F>
+bool route_groups(sycl::queue& s, int T, int n, F f) {
+    sycl_detail::require_in_order(s);
+    if (T <= 0) return true;
+    if (n <= 0) return false;
+    const auto device = s.get_device();
+    static core::PerDevice<RouteCaps> cache;
+    const auto& caps = cache.get(device, [&] {
+        return RouteCaps{std::min(device.get_info<sycl::info::device::max_work_group_size>(),
+                                 device.get_info<sycl::info::device::max_work_item_sizes<1>>()[0]),
+                         size_t(device.get_info<sycl::info::device::local_mem_size>())};
+    });
+    const size_t bytes = size_t(n) * 2 * sizeof(float);
+    if (bytes >= caps.local_bytes) return false;
+    // Cache both scores and reserve a score/ID pair per item for the reductions.
+    // A small device can use fewer items, or the serial path if the row will not fit.
+    const size_t local = std::min({size_t(n), caps.max_group,
+                                   (caps.local_bytes - bytes) / (sizeof(float) + sizeof(int))});
+    if (!local) return false;
+    s.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> scores(size_t(n), h), biased(size_t(n), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(size_t(T) * local), sycl::range<1>(local)),
+                       [=](sycl::nd_item<1> item) { f(item, scores, biased); });
+    });
+    return true;
+}
+void route_group(sycl::nd_item<1> item, sycl::local_accessor<float, 1> scores,
+                 sycl::local_accessor<float, 1> biased, const float* logits, const float* bias,
+                 int n, int k, float scale, int* ids, float* weights) {
+    const size_t lane = item.get_local_linear_id(), local = item.get_local_range(0);
+    const auto group = item.get_group();
+    for (size_t i = lane; i < size_t(n); i += local) {
+        scores[i] = route_score(logits[i]);
+        biased[i] = scores[i] + bias[i];
+    }
+    sycl::group_barrier(group);
+    float sum = 0.f;
+    for (int r = 0; r < k; ++r) {
+        float best = -FLT_MAX;
+        int ix = std::numeric_limits<int>::max();
+        for (size_t i = lane; i < size_t(n); i += local) {
+            const float v = biased[i];
+            if (v > best || (v == best && int(i) < ix)) { best = v; ix = int(i); }
+        }
+        const float top = sycl::reduce_over_group(group, best, sycl::maximum<float>());
+        ix = sycl::reduce_over_group(group, best == top ? ix : std::numeric_limits<int>::max(), sycl::minimum<int>());
+        if (lane == 0) {
+            const bool valid = ix < n;
+            ids[r] = valid ? ix : -1;
+            if (weights) { weights[r] = valid ? scores[ix] : 0.f; sum += weights[r]; }
+            if (valid) biased[ix] = -std::numeric_limits<float>::infinity();
+        }
+        sycl::group_barrier(group);
+    }
+    if (lane == 0 && weights)
+        for (int r = 0; r < k; ++r) weights[r] = weights[r] / (sum + 1e-20f) * scale;
+}
+struct AttnCounts { int first, window, selected; };
+AttnCounts attn_counts(const AttnRows& a, int t) {
+    if (!a.gen) return {a.win0[t], a.nwin[t], a.nsel[t]};
+    const long long ta = a.t0 + t, pa = a.p0 + ta;
+    const long long first = sycl::max(static_cast<long long>(a.win) - a.p0, ta + 1);
+    return {int(first), int(a.win + ta - first + 1),
+            a.R > 0 ? int(sycl::min(static_cast<long long>(a.kcap), (pa + 1) / a.R)) : 0};
+}
+struct AttnCaps { size_t max_group, local_bytes, subgroup, units; };
+struct AttnTile { size_t local = 0, heads = 0, rows = 0; };
+AttnTile attn_tile(const sycl::queue& q, int heads, int d, int T, int requested_heads) {
+    const auto device = q.get_device();
+    static core::PerDevice<AttnCaps> cache;
+    const auto& caps = cache.get(device, [&] {
+        AttnCaps c{std::min(device.get_info<sycl::info::device::max_work_group_size>(),
+                            device.get_info<sycl::info::device::max_work_item_sizes<1>>()[0]),
+                   size_t(device.get_info<sycl::info::device::local_mem_size>()), 1,
+                   size_t(device.get_info<sycl::info::device::max_compute_units>())};
+        for (const auto width : device.get_info<sycl::info::device::sub_group_sizes>())
+            if (width <= c.max_group) c.subgroup = std::max(c.subgroup, width);
+        return c;
+    });
+    const size_t dim = size_t(d), units = std::max(size_t(1), caps.units);
+    const size_t head_limit = std::min(size_t(heads), requested_heads > 0 ? size_t(requested_heads) :
+                                      std::max(size_t(1), size_t(T) * heads / units));
+    AttnTile best;
+    for (size_t g = 1; g <= head_limit; ++g) {
+        size_t local = std::min(g * dim, caps.max_group);
+        if (local >= caps.subgroup) local -= local % caps.subgroup;
+        if (!local) continue;
+        // Queries and outputs stay local across all KV tiles. Leave two floats
+        // per item for implementations that need local scratch for reductions.
+        const size_t fixed = (2 * g * dim + 3 * g + 2 * local) * sizeof(float);
+        if (fixed >= caps.local_bytes) continue;
+        const size_t rows = std::min(std::max(size_t(1), local / caps.subgroup),
+                                      (caps.local_bytes - fixed) / ((dim + g) * sizeof(float)));
+        if (!rows) continue;
+        // Automatic grouping maximizes head/row pairs in the available tile,
+        // while head_limit leaves work groups for the reported compute units.
+        if (requested_heads > 0 || g * rows > best.heads * best.rows) best = {local, g, rows};
+    }
+    return best;
+}
+bool sparse_attn_tiled(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
+                       const AttnRows& a, const float* sink, int heads, int d, int T, float scale,
+                       float* out, sycl::queue& s, int ckv_fmt, int heads_per_block, const AttnScratch* scratch) {
+    const auto tile = attn_tile(s, heads, d, T, heads_per_block);
+    if (!tile.local) return false;
+    const size_t dim = size_t(d), G = tile.heads, R = tile.rows, local = tile.local;
+    const size_t head_tiles = (size_t(heads) + G - 1) / G, row_bytes = kv_row_bytes(ckv_fmt, d);
+    uint16_t* decoded = nullptr;
+    size_t decoded_stride = 0;
+    // Scratch rows have the public 512-component model layout. Predecode when
+    // requested, or when multiple head blocks would repeat the packed decode.
+    if (ckv_fmt == kKvFp4 && d == 512 && sel_stride > 0 && scratch && scratch->rows &&
+        T <= scratch->max_t && sel_stride <= scratch->cap &&
+        (heads_per_block == -1 || (heads_per_block == 0 && head_tiles > 1))) {
+        decoded = scratch->rows;
+        decoded_stride = size_t(scratch->cap);
+        parallel(s, size_t(T) * sel_stride * dim, [=](size_t i) {
+            const size_t row = i / dim, t = row / sel_stride, j = row % sel_stride, e = i % dim;
+            const int selected = attn_counts(a, int(t)).selected;
+            if (selected <= 0 || j >= size_t(selected)) return;
+            const auto* source = static_cast<const uint8_t*>(ckv) + size_t(sel[t * sel_stride + j]) * row_bytes;
+            // E2M1 times E4M3 has at most eight significant bits, exact in BF16.
+            decoded[(t * decoded_stride + j) * dim + e] = bf16_rn(kv_value(source, kKvFp4, d, int(e)));
+        });
+    }
+    s.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> query(G * dim, h), accum(G * dim, h), values(R * dim, h);
+        sycl::local_accessor<float, 1> scores(G * R, h), maximum(G, h), denominator(G, h), old_scale(G, h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(size_t(T) * head_tiles * local), sycl::range<1>(local)),
+                       [=](sycl::nd_item<1> item) {
+            const size_t group = item.get_group_linear_id(), lane = item.get_local_linear_id();
+            const size_t t = group / head_tiles, hb = (group % head_tiles) * G;
+            const size_t active_heads = sycl::min(G, size_t(heads) - hb);
+            const auto ar = attn_counts(a, int(t));
+            const int total = ar.window + ar.selected;
+            const size_t base = (t * heads + hb) * dim;
+            if (total <= 0) {
+                for (size_t i = lane; i < active_heads * dim; i += local) out[base + i] = 0.f;
+                return;
+            }
+            for (size_t i = lane; i < G * dim; i += local) {
+                query[i] = i < active_heads * dim ? q[base + i] : 0.f;
+                accum[i] = 0.f;
+            }
+            for (size_t g = lane; g < G; g += local) {
+                maximum[g] = g < active_heads ? sink[hb + g] : 0.f;
+                denominator[g] = 1.f;
+            }
+            const auto sg = item.get_sub_group();
+            const size_t sl = sg.get_local_linear_id(), sw = sg.get_local_linear_range();
+            const size_t si = sg.get_group_linear_id(), sn = sg.get_group_linear_range();
+            for (int start = 0; start < total; start += int(R)) {
+                const size_t nr = sycl::min(R, size_t(total - start));
+                for (size_t i = lane; i < nr * dim; i += local) {
+                    const int j = start + int(i / dim), e = int(i % dim);
+                    const int fmt = j < ar.window || decoded ? kKvBf16 : ckv_fmt;
+                    const void* row = j < ar.window ? static_cast<const void*>(win + size_t(ar.first + j) * dim) :
+                        decoded ? static_cast<const void*>(decoded + (t * decoded_stride + size_t(j - ar.window)) * dim) :
+                        static_cast<const void*>(static_cast<const uint8_t*>(ckv) +
+                            size_t(sel[t * sel_stride + j - ar.window]) * row_bytes);
+                    values[i] = kv_value(row, fmt, d, e);
+                }
+                sycl::group_barrier(item.get_group());
+                // The actual sub-groups cover pairs independently of the host's
+                // shape hint; neither their width nor their count is assumed.
+                for (size_t pair = si; pair < G * nr; pair += sn) {
+                    const size_t g = pair / nr, r = pair % nr;
+                    float dot = 0.f;
+                    for (size_t e = sl; e < dim; e += sw) dot += query[g * dim + e] * values[r * dim + e];
+                    dot = sycl::reduce_over_group(sg, dot, sycl::plus<float>());
+                    if (sl == 0) scores[g * R + r] = dot * scale;
+                }
+                sycl::group_barrier(item.get_group());
+                for (size_t g = si; g < G; g += sn) {
+                    float top = -std::numeric_limits<float>::infinity();
+                    for (size_t r = sl; r < nr; r += sw) top = sycl::fmax(top, scores[g * R + r]);
+                    top = sycl::reduce_over_group(sg, top, sycl::maximum<float>());
+                    const float next = sycl::fmax(maximum[g], top), keep = sycl::exp(maximum[g] - next);
+                    float sum = 0.f;
+                    for (size_t r = sl; r < nr; r += sw) {
+                        const float weight = sycl::exp(scores[g * R + r] - next);
+                        scores[g * R + r] = weight;
+                        sum += weight;
+                    }
+                    sum = sycl::reduce_over_group(sg, sum, sycl::plus<float>());
+                    if (sl == 0) {
+                        maximum[g] = next;
+                        denominator[g] = denominator[g] * keep + sum;
+                        old_scale[g] = keep;
+                    }
+                }
+                sycl::group_barrier(item.get_group());
+                for (size_t i = lane; i < G * dim; i += local) {
+                    const size_t g = i / dim, e = i % dim;
+                    float value = accum[i] * old_scale[g];
+                    for (size_t r = 0; r < nr; ++r) value = sycl::fma(scores[g * R + r], values[r * dim + e], value);
+                    accum[i] = value;
+                }
+                sycl::group_barrier(item.get_group());
+            }
+            for (size_t i = lane; i < active_heads * dim; i += local) out[base + i] = accum[i] / denominator[i / dim];
+        });
+    });
+    return true;
 }
 uint32_t ord_key(float v) {
     const uint32_t u = sycl::bit_cast<uint32_t>(v);
@@ -295,29 +544,24 @@ void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float*
 }
 void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, int T, float alpha,
                    float* y, size_t ldy, sycl::queue& s) {
-    parallel(s, size_t(T) * n, [=](size_t i) {
-        const size_t t = i / n, r = i % n;
-        float sum = 0.f;
-        for (int j = 0; j < k; ++j) sum += f16_value(W[r * k + j]) * x[t * ldx + j];
-        y[t * ldy + r] = alpha * sum;
-    });
+    gemv_rows(W, x, ldx, n, k, T, alpha, y, ldy, s);
 }
 void gemv_f16(const uint16_t* W, const float* x, int n, int k, int T, float alpha, float* y, sycl::queue& s) {
     gemv_f16_rows(W, x, k, n, k, T, alpha, y, n, s);
 }
 void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, sycl::queue& s) {
-    parallel(s, size_t(T) * n, [=](size_t i) {
-        const size_t t = i / n, r = i % n;
-        float sum = 0.f;
-        for (int j = 0; j < k; ++j) sum += W[r * k + j] * x[t * k + j];
-        y[t * ldy + r] = sum;
-    });
+    gemv_rows(W, x, size_t(k), n, k, T, 1.f, y, size_t(ldy), s);
 }
 void route(const float* logits, const float* bias, int n, int k, int T, float scale, int* idx, float* w,
            sycl::queue& s, const float* bias_vl, const VlBits* vl) {
     if (k < 0 || k > kPicks || k > n) throw std::invalid_argument("ds4 route: invalid pick count");
     const VlBits bits = vl ? *vl : VlBits{};
-    parallel(s, size_t(T), [=](size_t t) {
+    const bool launched = route_groups(s, T, n, [=](sycl::nd_item<1> item, auto scores, auto biased) {
+        const size_t t = item.get_group_linear_id();
+        const float* b = bias_vl && ((bits.w[t >> 5] >> (t & 31)) & 1u) ? bias_vl : bias;
+        route_group(item, scores, biased, logits + t * 1024, b, n, k, scale, idx + t * kPicks, w + t * kPicks);
+    });
+    if (!launched) parallel(s, size_t(T), [=](size_t t) {
         const float* b = bias_vl && ((bits.w[t >> 5] >> (t & 31)) & 1u) ? bias_vl : bias;
         route_row(logits + t * 1024, b, n, k, scale, idx + t * kPicks, w + t * kPicks);
     });
@@ -438,10 +682,10 @@ void cand_blocks(const float* score, long long stride, int T, const Rows& r, int
 void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
                  const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out,
                  sycl::queue& s, int ckv_fmt, int heads_per_block, const AttnScratch* scr) {
-    (void)heads_per_block;
-    (void)scr;
     sycl_detail::require_in_order(s);
     if (T <= 0 || heads <= 0 || d <= 0) return;
+    if (sparse_attn_tiled(q, win, ckv, sel, sel_stride, a, sink, heads, d, T, scale,
+                          out, s, ckv_fmt, heads_per_block, scr)) return;
     // One work group per query/head. The reduction spans the group regardless of
     // subgroup width; each item owns a strided subset of output components.
     const auto device = s.get_device();
@@ -451,13 +695,8 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
                    [=](sycl::nd_item<1> item) {
         const size_t group = item.get_group_linear_id(), lane = item.get_local_linear_id();
         const int h = int(group % heads), t = int(group / heads);
-        int w0, nw, ns;
-        if (a.gen) {
-            const long long ta = a.t0 + t, pa = a.p0 + ta;
-            const long long first = sycl::max(static_cast<long long>(a.win) - a.p0, ta + 1);
-            w0 = int(first); nw = int(a.win + ta - first + 1);
-            ns = a.R > 0 ? int(sycl::min(static_cast<long long>(a.kcap), (pa + 1) / a.R)) : 0;
-        } else { w0 = a.win0[t]; nw = a.nwin[t]; ns = a.nsel[t]; }
+        const auto ar = attn_counts(a, t);
+        const int w0 = ar.first, nw = ar.window, ns = ar.selected;
         const float* qr = q + group * d;
         float* result = out + group * d;
         for (size_t e = lane; e < size_t(d); e += local) result[e] = 0.f;
@@ -560,17 +799,31 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
                    const float* bias_vl, unsigned vl, int na0, int na1) {
     if (T > kWin || dim > kMaxDim || k < 0 || k > kPicks || k > n)
         throw std::invalid_argument("ds4 route_publish: invalid request dimensions");
-    parallel(s, size_t(T), [=](size_t t) {
-        const float* b = bias_vl && ((vl >> t) & 1u) ? bias_vl : bias;
-        int* ids = idx + t * kPicks;
-        float* weights = w + t * kPicks;
-        route_row(logits + t * 1024, b, n, k, scale, ids, weights);
+    const auto publish = [=](size_t t) {
+        const int* ids = idx + t * kPicks;
+        const float* weights = w + t * kPicks;
         bool cpu = false;
         for (int i = 0; i < k; ++i) {
             plan_ptr[t * kPicks + i] = vram[ids[i]];
             cpu |= vram[ids[i]] == 0;
             if (req) { req->ids[t][i] = ids[i]; req->w[t][i] = weights[i]; }
         }
+        return cpu;
+    };
+    const bool launched = route_groups(s, T, n, [=](sycl::nd_item<1> item, auto scores, auto biased) {
+        const size_t t = item.get_group_linear_id(), lane = item.get_local_linear_id();
+        const float* b = bias_vl && ((vl >> t) & 1u) ? bias_vl : bias;
+        route_group(item, scores, biased, logits + t * 1024, b, n, k, scale, idx + t * kPicks, w + t * kPicks);
+        bool cpu = lane == 0 ? publish(t) : false;
+        cpu = sycl::group_broadcast(item.get_group(), cpu, 0);
+        if (req && cpu)
+            for (size_t e = lane; e < size_t(std::max(dim, 0)); e += item.get_local_range(0))
+                req->x[t][e] = x[t * dim + e];
+    });
+    if (!launched) parallel(s, size_t(T), [=](size_t t) {
+        const float* b = bias_vl && ((vl >> t) & 1u) ? bias_vl : bias;
+        route_row(logits + t * 1024, b, n, k, scale, idx + t * kPicks, w + t * kPicks);
+        const bool cpu = publish(t);
         if (req && cpu) for (int e = 0; e < dim; ++e) req->x[t][e] = x[t * dim + e];
     });
     if (req) s.submit([=](sycl::handler& h) {
@@ -584,19 +837,12 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
 }
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, sycl::queue& s) {
     if (T > kWin || off < 0 || off + m > kAhead) throw std::invalid_argument("ds4 route_ahead: invalid request dimensions");
-    parallel(s, size_t(T), [=](size_t t) {
-        int* ids = req->ahead[t] + off;
-        for (int r = 0; r < m; ++r) {
-            float best = -FLT_MAX;
-            int ix = -1;
-            for (int i = 0; i < n; ++i) {
-                bool used = false;
-                for (int j = 0; j < r; ++j) used |= ids[j] == i;
-                const float v = route_score(logits[t * 1024 + i]) + bias[i];
-                if (!used && (v > best || (v == best && (ix < 0 || i < ix)))) { best = v; ix = i; }
-            }
-            ids[r] = ix;
-        }
+    const bool launched = route_groups(s, T, n, [=](sycl::nd_item<1> item, auto scores, auto biased) {
+        const size_t t = item.get_group_linear_id();
+        route_group(item, scores, biased, logits + t * 1024, bias, n, m, 1.f, req->ahead[t] + off, nullptr);
+    });
+    if (!launched) parallel(s, size_t(T), [=](size_t t) {
+        route_row(logits + t * 1024, bias, n, m, 1.f, req->ahead[t] + off, nullptr);
     });
 }
 void zc_stage(unsigned long long* plan, const int* idx, const unsigned long long* zc_tab, int k,

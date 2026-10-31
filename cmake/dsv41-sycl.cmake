@@ -10,11 +10,12 @@ add_library(strata_dsv41_kernels STATIC
     src/dsv41/ds4_kernels.cpp
     src/dsv41/ds4_gguf.cpp
     src/dsv41/ds4_iq.cpp
+    src/dsv41/ds4_iq_matrix.cpp
     src/dsv41/ds4_tq.cpp
     src/dsv41/vendor/exl3.cpp
     src/dsv41/vendor/sampler.cpp
     src/dsv41/vendor/moe_win.cpp)
-target_include_directories(strata_dsv41_kernels PUBLIC include src/dsv41 PRIVATE third_party/main/ggml)
+target_include_directories(strata_dsv41_kernels PUBLIC include src/dsv41 PRIVATE src third_party/main/ggml)
 target_compile_features(strata_dsv41_kernels PUBLIC cxx_std_20)
 target_link_libraries(strata_dsv41_kernels PUBLIC strata_dsv41_host strata_prefill strata_sycl strata_warnings)
 
@@ -69,4 +70,16 @@ if(STRATA_BUILD_TESTS)
     target_link_libraries(ds4_readback_test PRIVATE strata_dsv41_kernels)
     add_test(NAME ds4_readback_test COMMAND ds4_readback_test)
     set_tests_properties(ds4_readback_test PROPERTIES LABELS "dsv41;gpu" TIMEOUT 120 SKIP_RETURN_CODE 77)
+    add_executable(ds4_core_test tests/dsv41/core_test.cpp)
+    target_link_libraries(ds4_core_test PRIVATE strata_dsv41_kernels)
+    add_test(NAME ds4_core_test COMMAND ds4_core_test)
+    set_tests_properties(ds4_core_test PROPERTIES LABELS "dsv41;gpu" TIMEOUT 120 SKIP_RETURN_CODE 77)
+    add_executable(ds4_sampler_gpu_test tests/dsv41/sampler_gpu_test.cpp)
+    target_link_libraries(ds4_sampler_gpu_test PRIVATE strata_dsv41_kernels Threads::Threads)
+    add_test(NAME ds4_sampler_gpu_test COMMAND ds4_sampler_gpu_test)
+    set_tests_properties(ds4_sampler_gpu_test PROPERTIES LABELS "dsv41;gpu" TIMEOUT 120 SKIP_RETURN_CODE 77)
+    add_executable(ds4_q5_rows_test tests/dsv41/q5_rows_test.cpp)
+    target_link_libraries(ds4_q5_rows_test PRIVATE strata_dsv41_kernels ggml-base)
+    add_test(NAME ds4_q5_rows_test COMMAND ds4_q5_rows_test)
+    set_tests_properties(ds4_q5_rows_test PROPERTIES LABELS "dsv41;gpu" TIMEOUT 120 SKIP_RETURN_CODE 77)
 endif()

@@ -47,6 +47,11 @@ mkdir -p .lint/bin && curl -sSL https://github.com/lycheeverse/lychee/releases/l
 
 `tools/lint/run.sh` は、ディストリビューションの `reuse` があればそれを使い、なければ `.lint/venv/bin/reuse` を使います。
 
+Windows では、[gitleaks の公式リリース](https://github.com/gitleaks/gitleaks/releases)の zip を `.lint/` に展開できます。
+[cppcheck の公式リリース](https://github.com/cppcheck-opensource/cppcheck/releases)が MSI の場合は、7-Zip で MSI と中の CAB を順に展開すれば、インストーラーを実行せずに CLI を使えます。
+配布物の SHA-256 を照合し、CAB 内の DLL を実行ファイルが要求する名前で配置し、ライブラリ設定を `cfg/` に置きます。
+各ツールには `tools/lint/` の設定を渡します。導入した版、場所、環境初期化の手順は `LOCAL.md` に記録します。
+
 ## intel/llvm をソースからビルドする
 
 free のビルドは、intel/llvm の DPC++ でエンジンをコンパイルします（[BUILD.ja.md](BUILD.ja.md#ビルド)）。

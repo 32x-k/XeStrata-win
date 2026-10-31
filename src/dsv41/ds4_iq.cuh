@@ -51,7 +51,7 @@ bool down(const Args& a, int groups, int ne_max, sycl::queue& s);
 /// The prompt path's expert sets (ds4_gguf.cu's SetK): expert i's blob at wbase + i stride owns the sorted rows
 /// [bounds[i], bounds[i + 1]) (local row = sorted row - row0); gate / up: h16[local] = F16 swiglu over x[idx[local]]
 /// (F32 rows, ldx); down: y[local] = down(h16[local]) (F16 rows in, ldx; F32 out, ldo).
-/// The portable path decodes each weight and accumulates FMA products, with FP16 input rounding.
+/// The FMA paths decode each weight and read xf when present; otherwise they read the optional FP16 copy.
 struct SetArgs {
     const uint8_t* wbase = nullptr;
     size_t stride = 0;
@@ -63,8 +63,7 @@ struct SetArgs {
     const float* xf = nullptr;
     const int* idx = nullptr;
     const uint16_t* xh = nullptr;
-    // gate / up from the caller's F16 copy of the activations (the same rounding the tiles make themselves: the same
-    // bits), so the F32 rows are not read 18+ times a prompt (MarLin's "keep the small operand in its cheap format")
+    // Optional F16 copy for half-operand matrix tiles. The FMA paths use it only when xf is absent.
     const uint16_t* xf16 = nullptr;
     int ldx = 0;
     uint16_t* h = nullptr;
@@ -76,8 +75,8 @@ struct SetArgs {
 };
 bool set_gate_up(const SetArgs& a, sycl::queue& s);
 bool set_down(const SetArgs& a, sycl::queue& s);
-/// Compatibility test hooks for optional matrix-engine prompt tiles. The portable path has no optimized tiles:
-/// hipk_force returns false and hipk_launches returns -1.
+/// Compatibility test hooks for upstream's HIP matrix-engine prompt tiles. The SYCL shared-memory tiles do not
+/// use these hooks: hipk_force returns false and hipk_launches returns -1.
 bool hipk_force(int mode);
 long long hipk_launches();
 /// The busy experts' path (a prompt's experts of many rows): one expert's matrix - n rows of k values, row_bytes(k)

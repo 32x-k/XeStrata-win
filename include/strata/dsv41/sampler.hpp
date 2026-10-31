@@ -45,8 +45,9 @@ struct SamplerParams {
 
 // logits (n_tokens, n_vocab) -> one sampled token id per row in `out`.
 //
-// `logits` and `out` are USM device pointers. The portable implementation transfers the inputs to the host,
-// evaluates the double-precision chain there, and waits for the output copy before returning.
+// `logits` and `out` are USM device pointers. Greedy selection writes the IDs directly on the device; sampling
+// evaluates the double-precision chain on the host after device candidate selection. Both finish before returning.
+// A device without enough local memory for selection uses the same host chain with the full logits instead.
 //
 // `history` is (n_tokens, history_len) int32 - ONE ROW PER TOKEN ROW, at a stride of `history_len` - the most
 // recent tokens that row's pick follows, with any unused slots set to -1; only the last `p.penalty_last_n` of
