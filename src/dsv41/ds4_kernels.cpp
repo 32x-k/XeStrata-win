@@ -9,6 +9,7 @@
 #include "ds4_q6k.cuh"
 #include "ds4_mailbox.hpp"
 #include "ds4_finish.hpp"
+#include "ds4_hc.hpp"
 #include "strata/core/per_device.hpp"
 #include "strata/core/readback.hpp"
 #include <algorithm>
@@ -450,6 +451,7 @@ void finish(float* x, int n_vec, int len, long long stride, const Finish& f, syc
 }
 
 void hc_mix(const float* h, const float* fn, int hcdim, int n_mix, int T, float eps, float* mixes, sycl::queue& s) {
+    if (hc_detail::mix(h, fn, hcdim, n_mix, T, eps, mixes, s)) return;
     parallel(s, size_t(T) * n_mix, [=](size_t i) {
         const int t = int(i / n_mix), m = int(i % n_mix);
         float acc = 0.f, ss = 0.f;
@@ -463,6 +465,8 @@ void hc_mix(const float* h, const float* fn, int hcdim, int n_mix, int T, float 
 void hc_split(const float* mixes, const float* scale, const float* base, int hc, int iters, float eps, int T,
               float* pre, float* post, float* comb, sycl::queue& s) {
     if (hc <= 0 || hc > 8 || 2 * hc + hc * hc > 32) throw std::invalid_argument("ds4 hyper-connections: invalid mix shape");
+    const hc_detail::Split args{scale, base, hc, iters, eps, pre, post, comb};
+    if (hc_detail::split(mixes, T, args, s)) return;
     parallel(s, size_t(T), [=](size_t t) {
         const float* mx = mixes + t * 32;
         float c[8][8];
@@ -502,10 +506,13 @@ void hc_mix_split(const float* h, const float* fn, int hcdim, int n_mix, int T, 
 void hc_mix_split(const float* h, const float* fn, int hcdim, int n_mix, int T, float eps, float* mixes, unsigned* cnt,
                   const float* scale, const float* base, int hc, int iters, float hc_eps, float* pre,
                   float* post, float* comb, sycl::queue& s) {
+    const hc_detail::Split args{scale, base, hc, iters, hc_eps, pre, post, comb};
+    if (hc_detail::mix(h, fn, hcdim, n_mix, T, eps, mixes, s, cnt, &args)) return;
     hc_mix_split(h, fn, hcdim, n_mix, T, eps, mixes, scale, base, hc, iters, hc_eps, pre, post, comb, s);
     if (cnt) s.memset(cnt, 0, size_t(T) * sizeof(unsigned));
 }
 void hc_pre_norm(const float* h, const float* mix, const float* w, int dim, int hc, int T, float eps, float* x, sycl::queue& s) {
+    if (hc_detail::pre_norm(h, mix, w, dim, hc, T, eps, x, s)) return;
     parallel(s, size_t(T) * dim, [=](size_t i) {
         const size_t t = i / dim, e = i % dim;
         float v = 0.f;
