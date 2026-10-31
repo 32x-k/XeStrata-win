@@ -23,7 +23,7 @@ struct Caps {
 };
 inline const Caps& caps(const sycl::queue& q) {
     const auto device = q.get_device();
-    static core::PerDevice<Caps> cache;
+    static core::PerDevice<Caps> cache; // NOLINT(bugprone-dynamic-static-initializers)
     return cache.get(device, [&] {
         const auto orders = device.get_info<sycl::info::device::atomic_memory_order_capabilities>();
         const auto scopes = device.get_info<sycl::info::device::atomic_memory_scope_capabilities>();
@@ -183,7 +183,7 @@ void mix_kernel(const float* h, const float* fn, int hcdim, int n_mix, int token
             const float* x = h + token * hcdim;
             const float* w = fn + mix * hcdim;
             float acc = 0.f, ss = 0.f;
-            for (size_t k = tid * 4; k < size_t(hcdim); k += WG * 4) {
+            for (size_t k = tid * 4; k < size_t(hcdim); k += size_t(WG) * 4) {
                 const auto hv = load4(x + k), wv = load4(w + k);
                 acc += hv.x() * wv.x() + hv.y() * wv.y() + hv.z() * wv.z() + hv.w() * wv.w();
                 ss += hv.x() * hv.x() + hv.y() * hv.y() + hv.z() * hv.z() + hv.w() * hv.w();
