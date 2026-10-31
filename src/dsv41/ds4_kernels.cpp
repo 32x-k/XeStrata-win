@@ -249,6 +249,19 @@ AttnTile attn_tile(const sycl::queue& q, int heads, int d, int T, int requested_
     }
     return best;
 }
+// Upstream unpack_sel_kernel: each query's selected packed rows decoded once into the scratch (rows decoded_stride apart).
+void unpack_selected(const void* ckv, const int* sel, int sel_stride, const AttnRows& a, int T, int d,
+                     uint16_t* decoded, size_t decoded_stride, sycl::queue& s) {
+    const size_t dim = size_t(d), row_bytes = kv_row_bytes(kKvFp4, d);
+    parallel(s, size_t(T) * sel_stride * dim, [=](size_t i) {
+        const size_t row = i / dim, t = row / sel_stride, j = row % sel_stride, e = i % dim;
+        const int selected = attn_counts(a, int(t)).selected;
+        if (selected <= 0 || j >= size_t(selected)) return;
+        const auto* source = static_cast<const uint8_t*>(ckv) + size_t(sel[t * sel_stride + j]) * row_bytes;
+        // E2M1 times E4M3 has at most eight significant bits, exact in BF16.
+        decoded[(t * decoded_stride + j) * dim + e] = bf16_rn(kv_value(source, kKvFp4, d, int(e)));
+    });
+}
 bool sparse_attn_tiled(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
                        const AttnRows& a, const float* sink, int heads, int d, int T, float scale,
                        float* out, sycl::queue& s, int ckv_fmt, int heads_per_block, const AttnScratch* scratch) {
@@ -265,14 +278,7 @@ bool sparse_attn_tiled(const float* q, const uint16_t* win, const void* ckv, con
         (heads_per_block == -1 || (heads_per_block == 0 && head_tiles > 1))) {
         decoded = scratch->rows;
         decoded_stride = size_t(scratch->cap);
-        parallel(s, size_t(T) * sel_stride * dim, [=](size_t i) {
-            const size_t row = i / dim, t = row / sel_stride, j = row % sel_stride, e = i % dim;
-            const int selected = attn_counts(a, int(t)).selected;
-            if (selected <= 0 || j >= size_t(selected)) return;
-            const auto* source = static_cast<const uint8_t*>(ckv) + size_t(sel[t * sel_stride + j]) * row_bytes;
-            // E2M1 times E4M3 has at most eight significant bits, exact in BF16.
-            decoded[(t * decoded_stride + j) * dim + e] = bf16_rn(kv_value(source, kKvFp4, d, int(e)));
-        });
+        unpack_selected(ckv, sel, sel_stride, a, T, d, decoded, decoded_stride, s);
     }
     s.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> query(G * dim, h), accum(G * dim, h), values(R * dim, h);
@@ -374,6 +380,7 @@ float engram_value(const uint8_t* row, const uint8_t* scales, int e, int fmt) {
 
 struct GroupCaps {
     size_t max_group = 0, local = 0;
+    std::vector<size_t> subgroups;
 };
 const GroupCaps& group_caps(const sycl::queue& q) {
     const auto device = q.get_device();
@@ -381,8 +388,116 @@ const GroupCaps& group_caps(const sycl::queue& q) {
     return cache.get(device, [&] {
         return GroupCaps{std::min(device.get_info<sycl::info::device::max_work_group_size>(),
                                   device.get_info<sycl::info::device::max_work_item_sizes<1>>()[0]),
-                         size_t(device.get_info<sycl::info::device::local_mem_size>())};
+                         size_t(device.get_info<sycl::info::device::local_mem_size>()),
+                         device.get_info<sycl::info::device::sub_group_sizes>()};
     });
+}
+bool has_subgroup(const GroupCaps& caps, size_t width) {
+    return std::find(caps.subgroups.begin(), caps.subgroups.end(), width) != caps.subgroups.end();
+}
+template <int SG>
+float subgroup_sum(sycl::sub_group sg, float v) {
+#pragma unroll
+    for (int o = SG / 2; o > 0; o >>= 1) v += sycl::permute_group_by_xor(sg, v, o);
+    return v;
+}
+template <int SG>
+float subgroup_max(sycl::sub_group sg, float v) {
+#pragma unroll
+    for (int o = SG / 2; o > 0; o >>= 1) v = sycl::fmax(v, sycl::permute_group_by_xor(sg, v, o));
+    return v;
+}
+
+// Upstream sparse_attn_kernel<kContig>: a work-group a (head, query), its rows in tiles of 64, a subgroup a row's
+// dot (each lane d / SG components), the running max and denominator on subgroup 0, two output values a work-item,
+// the sink added at the end. With Contig the selected rows are the query's rows of the decoded scratch (rows apart
+// sel_stride), otherwise BF16 rows indexed by sel. Upstream's 256-item group (d = 512, two values a work-item) is
+// taken only where the device reports it and the subgroup width.
+template <bool Contig, int SG>
+void sparse_rows(const float* q, const uint16_t* win, const uint16_t* rows_base, const int* sel, int sel_stride,
+                 const AttnRows& a, const float* sink, int heads, int T, float scale, float* out, sycl::queue& s) {
+    constexpr int WG = 256, Tile = 64, D = 512, Per = D / SG;
+    s.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> qs(sycl::range<1>(D), h), sc(sycl::range<1>(Tile), h), st(sycl::range<1>(3), h);
+        // A tile's rows as element offsets: a window row from win, a selected row from rows_base (negated, less one).
+        sycl::local_accessor<long long, 1> rows(sycl::range<1>(Tile), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(size_t(T) * heads * WG), sycl::range<1>(WG)),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
+            const int g = int(it.get_group_linear_id()), t = g / heads, hh = g % heads;
+            const int tid = int(it.get_local_linear_id());
+            const auto c = attn_counts(a, t);
+            auto row = [&](int j) { const long long o = rows[j]; return o >= 0 ? win + o : rows_base + (-1 - o); };
+            const int* sl = sel + size_t(t) * sel_stride;
+            for (int i = tid; i < D; i += WG) qs[i] = q[(size_t(t) * heads + hh) * D + i];
+            if (tid == 0) { st[0] = -1e30f; st[2] = 0.f; }
+            it.barrier(sycl::access::fence_space::local_space);
+            const auto sg = it.get_sub_group();
+            const int lane = int(sg.get_local_linear_id()), wp = tid / SG, nw = WG / SG;
+            float o0 = 0.f, o1 = 0.f;
+            const int total = c.window + c.selected;
+            for (int t0 = 0; t0 < total; t0 += Tile) {
+                const int nt = sycl::min(Tile, total - t0);
+                if (tid < nt) {
+                    const int j = t0 + tid;
+                    rows[tid] = j < c.window ? (static_cast<long long>(c.first) + j) * D :
+                        -1 - static_cast<long long>(Contig ? size_t(t) * sel_stride + size_t(j - c.window) :
+                                                    size_t(sl[j - c.window])) * D;
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+                for (int jj = wp; jj < nt; jj += nw) {
+                    const uint16_t* rr = row(jj) + lane * Per;
+                    float dot = 0.f;
+#pragma unroll
+                    for (int x = 0; x < Per; ++x) dot += qs[lane * Per + x] * bf16_value(rr[x]);
+                    dot = subgroup_sum<SG>(sg, dot);
+                    if (lane == 0) sc[jj] = dot * scale;
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+                if (wp == 0) {
+                    float m = -std::numeric_limits<float>::infinity();
+                    for (int j = lane; j < nt; j += SG) m = sycl::fmax(m, sc[j]);
+                    m = subgroup_max<SG>(sg, m);
+                    const float m_old = st[0], m_new = sycl::fmax(m_old, m);
+                    float sum = 0.f;
+                    for (int j = lane; j < nt; j += SG) {
+                        const float p = sycl::exp(sc[j] - m_new);
+                        sc[j] = p;
+                        sum += p;
+                    }
+                    // Every lane read st[0] before this convergent reduction, so lane 0 may update it without a
+                    // subgroup barrier: on the HIP backend that barrier is the work-group's, and in this branch it
+                    // would pair with the other subgroups' barrier below, which then read the old values.
+                    sum = subgroup_sum<SG>(sg, sum);
+                    if (lane == 0) {
+                        st[1] = sycl::exp(m_old - m_new);
+                        st[2] = st[2] * st[1] + sum;
+                        st[0] = m_new;
+                    }
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+                const float cs = st[1];
+                o0 *= cs;
+                o1 *= cs;
+                const int col = tid * 2;
+                for (int j = 0; j < nt; ++j) {
+                    const uint16_t* rr = row(j);
+                    o0 += sc[j] * bf16_value(rr[col]);
+                    o1 += sc[j] * bf16_value(rr[col + 1]);
+                }
+                it.barrier(sycl::access::fence_space::local_space);
+            }
+            const float den = st[2] + sycl::exp(sink[hh] - st[0]);
+            float* ov = out + (size_t(t) * heads + hh) * D;
+            ov[size_t(tid) * 2] = o0 / den;
+            ov[size_t(tid) * 2 + 1] = o1 / den;
+        });
+    });
+}
+// The subgroup width the rows kernel can take on this device, or 0.
+int sparse_rows_width(const sycl::queue& s) {
+    const auto& caps = group_caps(s);
+    if (caps.max_group < 256 || caps.local < 579 * sizeof(float) + 64 * sizeof(long long)) return 0;
+    return has_subgroup(caps, 32) ? 32 : has_subgroup(caps, 16) ? 16 : 0;
 }
 
 // Upstream index_score_kernel<128, KF>: a work-item a position, the token's queries and head weights in local
@@ -859,6 +974,26 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
                  sycl::queue& s, int ckv_fmt, int heads_per_block, const AttnScratch* scr) {
     sycl_detail::require_in_order(s);
     if (T <= 0 || heads <= 0 || d <= 0) return;
+    // Upstream's BF16 rows and few-query packed rows (decoded once a query into the scratch) take sparse_attn_kernel.
+    if (const int width = d == 512 ? sparse_rows_width(s) : 0) {
+        const uint16_t* rows = nullptr;
+        bool contig = false;
+        if (ckv_fmt == kKvBf16) rows = static_cast<const uint16_t*>(ckv);
+        else if (ckv_fmt == kKvFp4 && scr && scr->rows && sel_stride > 0 && T <= scr->max_t &&
+                 sel_stride <= scr->cap && (heads_per_block == -1 || (heads_per_block == 0 && T <= kAttnScratchT))) {
+            unpack_selected(ckv, sel, sel_stride, a, T, d, scr->rows, size_t(scr->cap), s);
+            rows = scr->rows;
+            contig = true;
+        }
+        if (rows) {
+            const int stride = contig ? scr->cap : sel_stride;
+            if (width == 32 && contig) sparse_rows<true, 32>(q, win, rows, sel, stride, a, sink, heads, T, scale, out, s);
+            else if (width == 32) sparse_rows<false, 32>(q, win, rows, sel, stride, a, sink, heads, T, scale, out, s);
+            else if (contig) sparse_rows<true, 16>(q, win, rows, sel, stride, a, sink, heads, T, scale, out, s);
+            else sparse_rows<false, 16>(q, win, rows, sel, stride, a, sink, heads, T, scale, out, s);
+            return;
+        }
+    }
     if (sparse_attn_tiled(q, win, ckv, sel, sel_stride, a, sink, heads, d, T, scale,
                           out, s, ckv_fmt, heads_per_block, scr)) return;
     // One work group per query/head. The reduction spans the group regardless of
