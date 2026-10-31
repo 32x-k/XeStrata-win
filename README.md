@@ -7,6 +7,15 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 
 English | [日本語](README.ja.md)
 
+## About this branch (porting DeepSeek-V4.1-Flash to SYCL)
+
+> This section was added on the `feature/dsv41-sycl` branch. Everything below the rule is the upstream XeStrata README, unchanged.
+
+This branch ports upstream Strata's DeepSeek-V4.1-Flash engine (`strata-dsv41`, upstream commit `870aedd9`) to SYCL.
+**It is unverified test code**. It has not been run with the real model. All that has been checked is GPU tests that use no model and synthetic tests comparing its outputs with upstream's HIP build (Radeon AI PRO R9700, Windows, free mode).
+
+---
+
 Run a 125-billion-parameter AI model on one Intel Arc, AMD Radeon or NVIDIA GPU and an ordinary PC.
 
 XeStrata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**, a large AI model that

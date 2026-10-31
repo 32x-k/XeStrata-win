@@ -7,6 +7,15 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 
 [English](README.md) | 日本語
 
+## このブランチについて（DeepSeek-V4.1-Flash の SYCL 移植）
+
+> この節は `feature/dsv41-sycl` ブランチで足したものです。区切り線から下は本家 XeStrata の README のままです。
+
+このブランチは上流 Strata の DeepSeek-V4.1-Flash 用のエンジン（`strata-dsv41`、上流のコミット `870aedd9`）を SYCL に移したものです。
+**未検証のテストコードです**。実物のモデルでは動かしていません。確かめたのは、モデルを使わない GPU のテストと、上流の HIP 版と出力を比べる合成の試験だけです（Radeon AI PRO R9700、Windows、free モード）。
+
+---
+
 1,250 億パラメーターの AI モデルを、Intel Arc、AMD Radeon、NVIDIA のどれかの GPU 1 枚と普通の PC で動かします。
 
 XeStrata は、ふつうはサーバーで動かす大きな AI モデル
