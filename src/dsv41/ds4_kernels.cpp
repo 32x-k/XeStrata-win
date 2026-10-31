@@ -392,6 +392,17 @@ const GroupCaps& group_caps(const sycl::queue& q) {
                          device.get_info<sycl::info::device::sub_group_sizes>()};
     });
 }
+// Whether a kernel can release host-visible data to the host: atomics on host allocations and a
+// system-scope fence ahead of the flag's store.
+bool system_publish(const sycl::queue& q) {
+    const auto device = q.get_device();
+    static core::PerDevice<bool> cache;
+    return cache.get(device, [&] {
+        const auto fences = device.get_info<sycl::info::device::atomic_fence_scope_capabilities>();
+        return device.has(sycl::aspect::usm_atomic_host_allocations) &&
+               std::find(fences.begin(), fences.end(), sycl::memory_scope::system) != fences.end();
+    });
+}
 bool has_subgroup(const GroupCaps& caps, size_t width) {
     return std::find(caps.subgroups.begin(), caps.subgroups.end(), width) != caps.subgroups.end();
 }
@@ -1137,6 +1148,20 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
         const bool cpu = publish(t);
         if (req && cpu) for (int e = 0; e < dim; ++e) req->x[t][e] = x[t * dim + e];
     });
+    if (req && system_publish(s)) {
+        // Upstream publishes the request from the device. Where the device reports system-scope fences and
+        // atomics, a one-item kernel behind the routing kernel writes the counts and releases the sequence to
+        // the host; this spares a host task's round trip.
+        s.single_task([=] {
+            req->na[0] = na0; req->na[1] = na1; req->T = T;
+            // The system-scope fence orders the request ahead of the flag for the host; the flag itself is an
+            // atomic on the host allocation (the device need not report system-scope atomic operations).
+            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+            sycl::atomic_ref<unsigned, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                             sycl::access::address_space::generic_space>(req->seq).store(seq);
+        });
+        return;
+    }
     if (req) s.submit([=](sycl::handler& h) {
         // Completion of the preceding kernel makes its mailbox writes visible to
         // this host task. The release store publishes the entire request at once.
