@@ -504,6 +504,91 @@ void sparse_rows(const float* q, const uint16_t* win, const uint16_t* rows_base,
         });
     });
 }
+// The subgroup width for upstream's warp-a-row GEMVs (eight rows a group), or 0.
+int gemv_warp_width(const sycl::queue& s) {
+    const auto& caps = group_caps(s);
+    for (const int sg : {32, 16}) if (caps.max_group >= 8 * size_t(sg) && has_subgroup(caps, size_t(sg))) return sg;
+    return 0;
+}
+// The vector loads need 16-byte aligned rows: `per` values a 16-byte load.
+template <class Weight>
+bool gemv_warp_ready(const sycl::queue& s, const Weight* W, const float* x, size_t ldx, int k, int per) {
+    return gemv_warp_width(s) && k > 0 && k % per == 0 && ldx % 4 == 0 &&
+           reinterpret_cast<uintptr_t>(W) % 16 == 0 && reinterpret_cast<uintptr_t>(x) % 16 == 0;
+}
+template <class T, size_t N>
+T load_aligned(const void* p) {
+    T value;
+    __builtin_memcpy(&value, __builtin_assume_aligned(p, N), sizeof(value));
+    return value;
+}
+// Upstream gemv_f16_rows_kernel (gemv_f16_kernel's sums for each activation): a subgroup a row, eight rows a
+// group, each lane eight F16 weights and the activations' float4s a step, two activations a group.
+template <int SG>
+void gemv_f16_warp(const uint16_t* W, const float* x, size_t ldx, int n, int k, int T, float alpha,
+                   float* y, size_t ldy, sycl::queue& s) {
+    constexpr int Rows = 8, RowsT = 2, WG = Rows * SG;
+    const size_t gx = (size_t(n) + Rows - 1) / Rows, gy = (size_t(T) + RowsT - 1) / RowsT;
+    s.parallel_for(sycl::nd_range<1>(sycl::range<1>(gx * gy * WG), sycl::range<1>(WG)),
+                   [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
+        const size_t g = it.get_group_linear_id();
+        const int tid = int(it.get_local_linear_id()), lane = tid % SG;
+        const int row = int(g % gx) * Rows + tid / SG, t0 = int(g / gx) * RowsT, nt = sycl::min(RowsT, T - t0);
+        if (row >= n) return;
+        const uint16_t* w = W + size_t(row) * k;
+        float acc[RowsT] = {};
+        for (int c = lane * 8; c < k; c += SG * 8) {
+            const auto q = load_aligned<sycl::vec<uint16_t, 8>, 16>(w + c);
+            float xv[RowsT][8] = {};
+#pragma unroll
+            for (int t = 0; t < RowsT; ++t)
+                if (t < nt) {
+                    const float* xp = x + size_t(t0 + t) * ldx + c;
+                    const auto a = load_aligned<sycl::float4, 16>(xp), b = load_aligned<sycl::float4, 16>(xp + 4);
+                    xv[t][0] = a.x(); xv[t][1] = a.y(); xv[t][2] = a.z(); xv[t][3] = a.w();
+                    xv[t][4] = b.x(); xv[t][5] = b.y(); xv[t][6] = b.z(); xv[t][7] = b.w();
+                }
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const float f0 = f16_value(q[2 * i]), f1 = f16_value(q[2 * i + 1]);
+#pragma unroll
+                for (int t = 0; t < RowsT; ++t)
+                    if (t < nt) acc[t] += f0 * xv[t][size_t(2) * i] + f1 * xv[t][size_t(2) * i + 1];
+            }
+        }
+#pragma unroll
+        for (int t = 0; t < RowsT; ++t)
+            if (t < nt) {
+                const float a = subgroup_sum<SG>(it.get_sub_group(), acc[t]);
+                if (lane == 0) y[size_t(t0 + t) * ldy + row] = alpha * a;
+            }
+    });
+}
+// Upstream gemv_f32_kernel (the router): a subgroup a row, eight rows a group, the lanes over float4s.
+template <int SG>
+void gemv_f32_warp(const float* W, const float* x, int n, int k, int T, float* y, size_t ldy, sycl::queue& s) {
+    constexpr int Rows = 8, WG = Rows * SG;
+    const size_t gx = (size_t(n) + Rows - 1) / Rows;
+    s.parallel_for(sycl::nd_range<1>(sycl::range<1>(gx * size_t(T) * WG), sycl::range<1>(WG)),
+                   [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
+        const size_t g = it.get_group_linear_id();
+        const int tid = int(it.get_local_linear_id()), lane = tid % SG;
+        const int row = int(g % gx) * Rows + tid / SG, t = int(g / gx);
+        if (row >= n) return;
+        const float* w = W + size_t(row) * k;
+        const float* xv = x + size_t(t) * k;
+        float acc = 0.f;
+        for (int c = lane; c < k / 4; c += SG) {
+            const auto a = load_aligned<sycl::float4, 16>(w + size_t(4) * c), b = load_aligned<sycl::float4, 16>(xv + size_t(4) * c);
+            acc = sycl::fma(a.x(), b.x(), acc);
+            acc = sycl::fma(a.y(), b.y(), acc);
+            acc = sycl::fma(a.z(), b.z(), acc);
+            acc = sycl::fma(a.w(), b.w(), acc);
+        }
+        acc = subgroup_sum<SG>(it.get_sub_group(), acc);
+        if (lane == 0) y[size_t(t) * ldy + row] = acc;
+    });
+}
 // The subgroup width the rows kernel can take on this device, or 0.
 int sparse_rows_width(const sycl::queue& s) {
     const auto& caps = group_caps(s);
@@ -833,12 +918,24 @@ void hc_mix_scale(const float* h, int hcdim, int n_mix, int T, float eps, float*
 }
 void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, int T, float alpha,
                    float* y, size_t ldy, sycl::queue& s) {
+    if (T > 0 && n > 0 && gemv_warp_ready(s, W, x, ldx, k, 8)) {
+        sycl_detail::require_in_order(s);
+        if (gemv_warp_width(s) == 32) gemv_f16_warp<32>(W, x, ldx, n, k, T, alpha, y, ldy, s);
+        else gemv_f16_warp<16>(W, x, ldx, n, k, T, alpha, y, ldy, s);
+        return;
+    }
     gemv_rows(W, x, ldx, n, k, T, alpha, y, ldy, s);
 }
 void gemv_f16(const uint16_t* W, const float* x, int n, int k, int T, float alpha, float* y, sycl::queue& s) {
     gemv_f16_rows(W, x, k, n, k, T, alpha, y, n, s);
 }
 void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, sycl::queue& s) {
+    if (T > 0 && n > 0 && gemv_warp_ready(s, W, x, size_t(k), k, 4)) {
+        sycl_detail::require_in_order(s);
+        if (gemv_warp_width(s) == 32) gemv_f32_warp<32>(W, x, n, k, T, y, size_t(ldy), s);
+        else gemv_f32_warp<16>(W, x, n, k, T, y, size_t(ldy), s);
+        return;
+    }
     gemv_rows(W, x, size_t(k), n, k, T, 1.f, y, size_t(ldy), s);
 }
 void route(const float* logits, const float* bias, int n, int k, int T, float scale, int* idx, float* w,
