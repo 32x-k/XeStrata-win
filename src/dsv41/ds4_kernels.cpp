@@ -8,6 +8,7 @@
 #include "ds4_numerics.cuh"
 #include "ds4_q6k.cuh"
 #include "ds4_mailbox.hpp"
+#include "ds4_finish.hpp"
 #include "strata/core/per_device.hpp"
 #include "strata/core/readback.hpp"
 #include <algorithm>
@@ -398,6 +399,7 @@ void finish(float* x, int n_vec, int len, long long stride, const Finish& f, syc
         throw std::invalid_argument("ds4 finish: invalid vector or rotary dimensions");
     if (f.pdst && (f.quant < 1 || f.quant > 3 || len % 32))
         throw std::invalid_argument("ds4 finish: packed rows require whole quantization blocks");
+    if (finish_detail::finish(x, n_vec, len, stride, f, s)) return;
     parallel(s, size_t(n_vec), [=](size_t v) {
         float* row = x + static_cast<long long>(v) * stride;
         float ss = 0.f;
@@ -726,6 +728,7 @@ void ring_to_ext(const uint8_t* ring, uint16_t* ext, int64_t p0, int n, int d, s
 }
 void ext_to_ring(const uint16_t* ext, uint8_t* ring, int64_t p0, int n, int T, int d, sycl::queue& s, uint8_t* backup) {
     if (d % 32) throw std::invalid_argument("ds4 ring: incomplete FP8 block");
+    if (finish_detail::ext_to_ring(ext, ring, p0, n, T, d, s, backup)) return;
     const size_t rb = kv_row_bytes(kKvFp8, d);
     parallel(s, size_t(T), [=](size_t t) {
         if (T - int(t) > n) return;

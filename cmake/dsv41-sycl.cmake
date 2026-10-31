@@ -83,6 +83,11 @@ if(STRATA_BUILD_TESTS)
     add_test(NAME ds4_q5_rows_test COMMAND ds4_q5_rows_test)
     set_tests_properties(ds4_q5_rows_test PROPERTIES LABELS "dsv41;gpu" TIMEOUT 120 SKIP_RETURN_CODE 77)
 
+  add_executable(ds4_finish_test tests/dsv41/finish_test.cpp)
+  target_link_libraries(ds4_finish_test PRIVATE strata_dsv41_kernels)
+  add_test(NAME ds4_finish_test COMMAND ds4_finish_test)
+  set_tests_properties(ds4_finish_test PROPERTIES LABELS "dsv41;gpu" TIMEOUT 120 SKIP_RETURN_CODE 77)
+
   add_executable(ds4_gguf_mv_test tests/dsv41/gguf_mv_test.cpp)
   target_link_libraries(ds4_gguf_mv_test PRIVATE strata_dsv41_kernels)
   add_test(NAME ds4_gguf_mv_test COMMAND ds4_gguf_mv_test)
