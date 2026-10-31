@@ -399,8 +399,8 @@ void host_sample(const float* dlogits, int n_tokens, int n_vocab, const int* dhi
             out[t] = pick;
         }
     }
-    stream.memcpy(dout, hout.data(), hout.size() * sizeof(int)).wait_and_throw();
-    if constexpr (MODE == 1) stream.memcpy(dql, hq.data(), hq.size() * sizeof(SpecList)).wait_and_throw();
+    core::copy_async(stream, dout, hout.data(), hout.size() * sizeof(int)).wait_and_throw();
+    if constexpr (MODE == 1) core::copy_async(stream, dql, hq.data(), hq.size() * sizeof(SpecList)).wait_and_throw();
 }
 
 void spec_check(const SamplerParams& p, int n_vocab) {

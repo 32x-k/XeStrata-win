@@ -970,7 +970,7 @@ void win_submit(sycl::queue& s) {
 void xfer_get(const Xfer& x, const unsigned* flag, unsigned seq, sycl::queue& s) {
     sycl_detail::require_in_order(s);
     if (flag) wait_flags(flag, 1, 1, seq, s);
-    for (int i = 0; i < x.n; ++i) if (x.bytes[i]) s.memcpy(x.dst[i], x.src[i], x.bytes[i]);
+    for (int i = 0; i < x.n; ++i) if (x.bytes[i]) core::copy_async(s, x.dst[i], x.src[i], x.bytes[i]);
 }
 void wait_flags(const unsigned* flags, int n, int stride, unsigned seq, sycl::queue& s) {
     sycl_detail::require_in_order(s);
