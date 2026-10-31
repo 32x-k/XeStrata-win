@@ -118,7 +118,7 @@ void gemv_rows(const Weight* W, const float* x, size_t ldx, int n, int k, int T,
     // entire work-group. A group reduction also works if the compiler chooses
     // a narrower sub-group, and the shape is independent of the token count.
     const size_t local = gemv_group_size(s, k), columns = size_t(std::max(k, 0));
-    s.parallel_for(sycl::nd_range<1>(sycl::range<1>(size_t(T) * n * local), sycl::range<1>(local)),
+    sycl_detail::launch(s, sycl::nd_range<1>(sycl::range<1>(size_t(T) * n * local), sycl::range<1>(local)),
                    [=](sycl::nd_item<1> item) {
         const size_t i = item.get_group_linear_id(), t = i / n, r = i % n;
         float sum = 0.f;
@@ -168,7 +168,7 @@ bool route_groups(sycl::queue& s, int T, int n, F f) {
     const size_t local = std::min({size_t(n), caps.max_group,
                                    (caps.local_bytes - bytes) / (sizeof(float) + sizeof(int))});
     if (!local) return false;
-    s.submit([&](sycl::handler& h) {
+    sycl_detail::submit(s, [&](sycl::handler& h) {
         sycl::local_accessor<float, 1> scores(size_t(n), h), biased(size_t(n), h);
         h.parallel_for(sycl::nd_range<1>(sycl::range<1>(size_t(T) * local), sycl::range<1>(local)),
                        [=](sycl::nd_item<1> item) { f(item, scores, biased); });
@@ -280,7 +280,7 @@ bool sparse_attn_tiled(const float* q, const uint16_t* win, const void* ckv, con
         decoded_stride = size_t(scratch->cap);
         unpack_selected(ckv, sel, sel_stride, a, T, d, decoded, decoded_stride, s);
     }
-    s.submit([&](sycl::handler& h) {
+    sycl_detail::submit(s, [&](sycl::handler& h) {
         sycl::local_accessor<float, 1> query(G * dim, h), accum(G * dim, h), values(R * dim, h);
         sycl::local_accessor<float, 1> scores(G * R, h), maximum(G, h), denominator(G, h), old_scale(G, h);
         h.parallel_for(sycl::nd_range<1>(sycl::range<1>(size_t(T) * head_tiles * local), sycl::range<1>(local)),
@@ -428,7 +428,7 @@ template <bool Contig, int SG>
 void sparse_rows(const float* q, const uint16_t* win, const uint16_t* rows_base, const int* sel, int sel_stride,
                  const AttnRows& a, const float* sink, int heads, int T, float scale, float* out, sycl::queue& s) {
     constexpr int WG = 256, Tile = 64, D = 512, Per = D / SG;
-    s.submit([&](sycl::handler& h) {
+    sycl_detail::submit(s, [&](sycl::handler& h) {
         sycl::local_accessor<float, 1> qs(sycl::range<1>(D), h), sc(sycl::range<1>(Tile), h), st(sycl::range<1>(3), h);
         // A tile's rows as element offsets: a window row from win, a selected row from rows_base (negated, less one).
         sycl::local_accessor<long long, 1> rows(sycl::range<1>(Tile), h);
@@ -529,7 +529,7 @@ void gemv_f16_warp(const uint16_t* W, const float* x, size_t ldx, int n, int k, 
                    float* y, size_t ldy, sycl::queue& s) {
     constexpr int Rows = 8, RowsT = 2, WG = Rows * SG;
     const size_t gx = (size_t(n) + Rows - 1) / Rows, gy = (size_t(T) + RowsT - 1) / RowsT;
-    s.parallel_for(sycl::nd_range<1>(sycl::range<1>(gx * gy * WG), sycl::range<1>(WG)),
+    sycl_detail::launch(s, sycl::nd_range<1>(sycl::range<1>(gx * gy * WG), sycl::range<1>(WG)),
                    [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
         const size_t g = it.get_group_linear_id();
         const int tid = int(it.get_local_linear_id()), lane = tid % SG;
@@ -569,7 +569,7 @@ template <int SG>
 void gemv_f32_warp(const float* W, const float* x, int n, int k, int T, float* y, size_t ldy, sycl::queue& s) {
     constexpr int Rows = 8, WG = Rows * SG;
     const size_t gx = (size_t(n) + Rows - 1) / Rows;
-    s.parallel_for(sycl::nd_range<1>(sycl::range<1>(gx * size_t(T) * WG), sycl::range<1>(WG)),
+    sycl_detail::launch(s, sycl::nd_range<1>(sycl::range<1>(gx * size_t(T) * WG), sycl::range<1>(WG)),
                    [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
         const size_t g = it.get_group_linear_id();
         const int tid = int(it.get_local_linear_id()), lane = tid % SG;
@@ -607,7 +607,7 @@ bool index_score_group(const float* q, const float* w, const uint8_t* kc, int he
     const size_t qn = size_t(heads) * HD + size_t(heads);
     if (caps.max_group < size_t(WG) || caps.local < qn * sizeof(float)) return false;
     const size_t groups = (size_t(n) + WG - 1) / WG;
-    s.submit([&](sycl::handler& h) {
+    sycl_detail::submit(s, [&](sycl::handler& h) {
         sycl::local_accessor<float, 1> qs(sycl::range<1>(qn), h);
         h.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(T), groups * WG), sycl::range<2>(1, WG)),
                        [=](sycl::nd_item<2> item) {
@@ -670,7 +670,7 @@ bool topk_group(const float* vals, long long stride, int T, const Rows& r, const
     const auto& caps = group_caps(s);
     const size_t wg = std::min<size_t>(1024, caps.max_group);
     if (wg < 32 || caps.local < 256 * sizeof(unsigned) + 4 * sizeof(uint32_t)) return false;
-    s.submit([&](sycl::handler& h) {
+    sycl_detail::submit(s, [&](sycl::handler& h) {
         sycl::local_accessor<unsigned, 1> hist(sycl::range<1>(256), h);
         sycl::local_accessor<uint32_t, 1> state(sycl::range<1>(3), h);   // prefix, mask, remaining
         h.parallel_for(sycl::nd_range<1>(size_t(T) * wg, wg), [=](sycl::nd_item<1> item) {
@@ -1109,7 +1109,7 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
     const auto device = s.get_device();
     const size_t local = std::min({size_t(d), device.get_info<sycl::info::device::max_work_group_size>(),
                                   device.get_info<sycl::info::device::max_work_item_sizes<1>>()[0]});
-    s.parallel_for(sycl::nd_range<1>(sycl::range<1>(size_t(T) * heads * local), sycl::range<1>(local)),
+    sycl_detail::launch(s, sycl::nd_range<1>(sycl::range<1>(size_t(T) * heads * local), sycl::range<1>(local)),
                    [=](sycl::nd_item<1> item) {
         const size_t group = item.get_group_linear_id(), lane = item.get_local_linear_id();
         const int h = int(group % heads), t = int(group / heads);
@@ -1249,7 +1249,7 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
         // Upstream publishes the request from the device. Where the device reports system-scope fences and
         // atomics, a one-item kernel behind the routing kernel writes the counts and releases the sequence to
         // the host; this spares a host task's round trip.
-        s.single_task([=] {
+        sycl_detail::single(s, [=] {
             req->na[0] = na0; req->na[1] = na1; req->T = T;
             // The system-scope fence orders the request ahead of the flag for the host; the flag itself is an
             // atomic on the host allocation (the device need not report system-scope atomic operations).
@@ -1301,7 +1301,7 @@ void moe_sort(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds
         for (int t = 0; t < T; ++t) for (int i = 0; i < k; ++i) count += vs[idx[size_t(t) * kPicks + i]] == int(slot);
         bounds[slot + 1] = count;
     });
-    s.single_task([=] { bounds[0] = 0; for (int i = 0; i < n_vs; ++i) bounds[i + 1] += bounds[i]; });
+    sycl_detail::single(s, [=] { bounds[0] = 0; for (int i = 0; i < n_vs; ++i) bounds[i + 1] += bounds[i]; });
     parallel(s, size_t(n_vs), [=](size_t slot) {
         int r = bounds[slot];
         for (int t = 0; t < T; ++t) for (int i = 0; i < k; ++i) if (vs[idx[size_t(t) * kPicks + i]] == int(slot)) {
@@ -1362,7 +1362,7 @@ void markov_share(float* logits, const uint16_t* H, const uint16_t* erow, int vn
 }
 void argmax_share(const float* row, int vn, int v0, unsigned* slot, unsigned seq, sycl::queue& s) {
     sycl_detail::require_in_order(s);
-    s.single_task([=] {
+    sycl_detail::single(s, [=] {
         float best = -std::numeric_limits<float>::infinity();
         int index = 0;
         for (int i = 0; i < vn; ++i) if (row[i] > best) { best = row[i]; index = i; }

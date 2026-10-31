@@ -111,7 +111,7 @@ bool light_set_tiled(const SetArgs& a, size_t rb, sycl::queue& s) {
     const size_t groups = size_t(a.n_exp) * nc * nr;
     // Keep the Q8 sub-block arithmetic and ascending-K accumulation. Only the
     // repeated activation quantizers and weight decoders are shared by the tile.
-    s.submit([&](sycl::handler& h) {
+    sycl_detail::submit(s, [&](sycl::handler& h) {
         sycl::local_accessor<uint32_t, 1> tab(sycl::range<1>(Ty<T>::TAB > 0 ? Ty<T>::TAB : 1), h);
         sycl::local_accessor<Sub, 1> weights(sycl::range<1>(bn * (GU ? 2 : 1)), h);
         sycl::local_accessor<int8_t, 1> codes(sycl::range<1>(rm * 32), h);
@@ -218,7 +218,7 @@ bool busy_set(const SetArgs& a, size_t rb, sycl::queue& s) {
     const int skip = std::max(a.skip_le, kLightRows);
     // Upstream's set_kernel shares decoded K sub-blocks and gathered inputs across a tile.
     // The tile dimensions follow device limits; each output retains the scalar path's ascending-K FP32 FMAs.
-    s.submit([&](sycl::handler& h) {
+    sycl_detail::submit(s, [&](sycl::handler& h) {
         sycl::local_accessor<uint32_t, 1> tab(sycl::range<1>(Ty<T>::TAB > 0 ? Ty<T>::TAB : 1), h);
         sycl::local_accessor<float, 1> weights(sycl::range<1>(32 * (bn + 1) * (GU ? 2 : 1)), h);
         sycl::local_accessor<float, 1> inputs(sycl::range<1>(rm * 33), h);

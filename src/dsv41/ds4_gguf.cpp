@@ -316,7 +316,7 @@ void q8_quant_token(const float* x, size_t ldx, int rows, int k, int8_t* q, floa
     const size_t groups_per_row = (blocks + warps - 1) / warps;
     // Upstream q8_quant_kernel: one subgroup per storage block. SG16 holds the two halves of that same block;
     // its first max is exactly the SG32 xor-16 step, followed by the remaining xor reductions.
-    s.parallel_for(sycl::nd_range<1>(sycl::range<1>(size_t(rows) * groups_per_row * local), sycl::range<1>(local)),
+    sycl_detail::launch(s, sycl::nd_range<1>(sycl::range<1>(size_t(rows) * groups_per_row * local), sycl::range<1>(local)),
                    [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
         const size_t row = item.get_group_linear_id() / groups_per_row;
         const size_t block = (item.get_group_linear_id() % groups_per_row) * warps + item.get_local_linear_id() / SG;
@@ -358,7 +358,7 @@ void token_combine(const x3::MoeArgs& a, const float* part, const float* shared,
                    size_t local, sycl::queue& s) {
     const size_t groups = (size_t(a.n_embd) + local - 1) / local;
     // Upstream mx_combine_kernel (T=1): plan-order FMA, then the CPU lane and shared expert as separate additions.
-    s.parallel_for(sycl::nd_range<1>(sycl::range<1>(groups * local), sycl::range<1>(local)),
+    sycl_detail::launch(s, sycl::nd_range<1>(sycl::range<1>(groups * local), sycl::range<1>(local)),
                    [=](sycl::nd_item<1> item) {
         const size_t row = item.get_global_linear_id();
         if (row >= size_t(a.n_embd)) return;
@@ -428,7 +428,7 @@ bool q5_mv(const x3::MvJob& job, sycl::queue& s) {
     for (const size_t width : caps.sub_groups) if (width <= limit) local = std::max(local, width);
     const size_t groups_per_col = (size_t(m.n) + local - 1) / local;
     const size_t groups = size_t(j.ncol) * groups_per_col;
-    s.submit([&](sycl::handler& h) {
+    sycl_detail::submit(s, [&](sycl::handler& h) {
         // Float codes preserve the previous behavior for nonfinite inputs; no integer conversion is introduced.
         sycl::local_accessor<float, 1> activation(shared_values, h);
         h.parallel_for(sycl::nd_range<1>(sycl::range<1>(groups * local), sycl::range<1>(local)),
@@ -485,7 +485,7 @@ bool q5_rows(const x3::Mat& m, size_t ld, uint16_t* dst, bool bf16, sycl::queue&
     const size_t local = std::max<size_t>(1, target / subgroup * subgroup);
     const size_t groups = (blocks + local - 1) / local;
     const auto* raw = static_cast<const uint8_t*>(m.raw);
-    s.submit([&](sycl::handler& h) {
+    sycl_detail::submit(s, [&](sycl::handler& h) {
         sycl::local_accessor<uint16_t, 1> staging(local * local_pitch, h);
         h.parallel_for(sycl::nd_range<1>(sycl::range<1>(groups * local), sycl::range<1>(local)),
                        [=](sycl::nd_item<1> item) {

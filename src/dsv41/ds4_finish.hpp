@@ -161,7 +161,7 @@ inline float quant_value(float value, float scale, int quant) {
 // register rows, two-level XOR norm, adjacent RoPE and 16/32-value quantization.
 template <int SG, bool Pack>
 void finish_kernel(float* x, int vectors, int len, long long stride, Finish f, sycl::queue& q) {
-    q.submit([&](sycl::handler& handler) {
+    sycl_detail::submit(q, [&](sycl::handler& handler) {
         sycl::local_accessor<float, 1> red(sycl::range<1>(kThreads / 32 + 1), handler);
         sycl::local_accessor<uint32_t, 1> exchange(sycl::range<1>(SG == 16 ? kThreads : 1), handler);
         auto body = [=](sycl::nd_item<1> item) {
@@ -266,7 +266,7 @@ template <int SG>
 void ext_to_ring_kernel(const uint16_t* ext, uint8_t* ring, int64_t p0, int n, int tokens, int dim,
                         sycl::queue& q, uint8_t* backup) {
     const size_t row_bytes = kv_row_bytes(kKvFp8, dim);
-    q.submit([&](sycl::handler& handler) {
+    sycl_detail::submit(q, [&](sycl::handler& handler) {
         sycl::local_accessor<uint32_t, 1> exchange(sycl::range<1>(SG == 16 ? kThreads : 1), handler);
         auto body = [=](sycl::nd_item<1> item) {
             const size_t token = item.get_group_linear_id(), tid = item.get_local_linear_id();

@@ -94,7 +94,7 @@ void gate_up_kernel(const Args& a, int groups, size_t warps, sycl::queue& q) {
     static_assert(LPR % BPS == 0);
     const size_t threads = warps * SG, tiles = size_t(a.n_ff) / warps;
     const size_t rb = row_bytes_t<T>(a.n_embd);
-    q.submit([&](sycl::handler& h) {
+    sycl_detail::submit(q, [&](sycl::handler& h) {
         sycl::local_accessor<uint32_t, 1> tab(sycl::range<1>(Ty<T>::TAB > 0 ? Ty<T>::TAB : 1), h);
         sycl::local_accessor<int, 1> entries(sycl::range<1>(NE), h), inputs(sycl::range<1>(NE), h);
         h.parallel_for(sycl::nd_range<1>(size_t(groups) * tiles * threads, threads),
@@ -156,7 +156,7 @@ void down_kernel(const Args& a, int groups, size_t warps, sycl::queue& q) {
     static_assert(LPR % BPS == 0);
     const size_t threads = warps * SG, tiles = size_t(a.n_embd) / (warps * RW);
     const size_t rb = row_bytes_t<T>(a.n_ff);
-    q.submit([&](sycl::handler& h) {
+    sycl_detail::submit(q, [&](sycl::handler& h) {
         sycl::local_accessor<uint32_t, 1> tab(sycl::range<1>(Ty<T>::TAB > 0 ? Ty<T>::TAB : 1), h);
         sycl::local_accessor<int, 1> entries(sycl::range<1>(NE), h);
         h.parallel_for(sycl::nd_range<1>(size_t(groups) * tiles * threads, threads),

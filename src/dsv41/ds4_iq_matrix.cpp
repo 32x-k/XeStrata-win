@@ -97,7 +97,7 @@ bool launch(const SetArgs& a, sycl::queue& s) {
     const size_t nc = (size_t(n) + bn - 1) / bn, nr = (size_t(a.max_rows) + MM - 1) / MM;
     const size_t rb = row_bytes_t<T>(k), groups = size_t(a.n_exp) * nc * nr;
     const int skip = std::max(a.skip_le, kLightRows);
-    s.submit([&](sycl::handler& h) {
+    sycl_detail::submit(s, [&](sycl::handler& h) {
         sycl::local_accessor<uint32_t, 1> table_data(sycl::range<1>(table_words), h);
         sycl::local_accessor<int, 1> source(sycl::range<1>(MM), h);
         sycl::local_accessor<sycl::half, 1> xs(sycl::range<1>(MM * QK), h), ws(sycl::range<1>(roles * bn * QK), h);

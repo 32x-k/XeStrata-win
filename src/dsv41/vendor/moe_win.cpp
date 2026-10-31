@@ -14,7 +14,7 @@ void moe_win_group(const MoeWin& w, sycl::queue& s) {
     strata::ds4::sycl_detail::require_in_order(s);
     if (w.T < 0 || w.k < 0 || w.k > 8) throw std::invalid_argument("dsv41: invalid expert window");
     // Scratch is supplied by the caller. A single task preserves first-appearance order without private tables.
-    s.single_task([=] {
+    strata::ds4::sycl_detail::single(s, [=] {
         int ng = 0, entries = 0;
         for (int t = 0; t < w.T; ++t)
             for (int i = 0; i < w.k; ++i) {

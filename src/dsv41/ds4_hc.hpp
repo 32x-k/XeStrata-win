@@ -173,7 +173,7 @@ template <int SG, bool Fused>
 void mix_kernel(const float* h, const float* fn, int hcdim, int n_mix, int tokens, float eps,
                 float* mixes, unsigned* counters, const Split& split, sycl::queue& q) {
     constexpr int WG = 256;
-    q.submit([&](sycl::handler& handler) {
+    sycl_detail::submit(q, [&](sycl::handler& handler) {
         sycl::local_accessor<float, 1> red(sycl::range<1>(WG / SG + 1), handler);
         sycl::local_accessor<float, 1> smx(sycl::range<1>(Fused ? 32 : 1), handler);
         sycl::local_accessor<unsigned, 1> last(sycl::range<1>(1), handler);
@@ -252,7 +252,7 @@ void split_kernel(const float* mixes, int tokens, const Split& args, sycl::queue
         const size_t token = item.get_group_linear_id();
         split_body<SG>(item.get_sub_group(), mixes + token * 32, token, args);
     };
-    q.parallel_for(sycl::nd_range<1>(size_t(tokens) * SG, SG), BoundBody<SG, SG, decltype(body)>{body});
+    sycl_detail::launch(q, sycl::nd_range<1>(size_t(tokens) * SG, SG), BoundBody<SG, SG, decltype(body)>{body});
 }
 inline bool split(const float* mixes, int tokens, const Split& args, sycl::queue& q) {
     sycl_detail::require_in_order(q);
@@ -274,7 +274,7 @@ template <int SG>
 void pre_norm_kernel(const float* h, const float* mix, const float* w, int dim, int hc, int tokens,
                      float eps, float* x, sycl::queue& q) {
     constexpr int WG = 1024;
-    q.submit([&](sycl::handler& handler) {
+    sycl_detail::submit(q, [&](sycl::handler& handler) {
         sycl::local_accessor<float, 1> red(sycl::range<1>(WG / SG + 1), handler);
         auto body = [=](sycl::nd_item<1> item) {
             const size_t token = item.get_group_linear_id(), tid = item.get_local_linear_id();

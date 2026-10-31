@@ -210,7 +210,7 @@ struct Fetch {
 template <int NC, bool ST, int SG>
 void q8_kernel(const Jobs& jobs, int count, int max_n, size_t warps, sycl::queue& q) {
     const size_t tiles = (size_t(max_n) + warps - 1) / warps, threads = warps * SG;
-    q.submit([&](sycl::handler& h) {
+    sycl_detail::submit(q, [&](sycl::handler& h) {
         sycl::local_accessor<uint32_t, 1> storage(ST ? warps * SG * kQ8Bytes / 4 : 1, h);
         submit_body<SG>(h, sycl::nd_range<1>(tiles * count * threads, threads), warps,
                        [=](sycl::nd_item<1> it) {
