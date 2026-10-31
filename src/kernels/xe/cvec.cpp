@@ -10,6 +10,7 @@
 #include "strata/kernels/cvec.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/readback.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_cvec
 #include "strata/kernels/device_arch_tag.hpp"
 
@@ -67,9 +68,9 @@ bool upload_here(std::string& err) {
         return false;
     }
     auto& q = rt.compute();
-    q.memcpy(t.dir, g_dir_host.data(), g_dir_host.size() * sizeof(float));
-    q.memcpy(t.s, g_s_host.data(), g_s_host.size() * sizeof(float));
-    q.memcpy(t.on, &flag, sizeof(int));
+    core::copy_async(q, t.dir, g_dir_host.data(), g_dir_host.size() * sizeof(float));
+    core::copy_async(q, t.s, g_s_host.data(), g_s_host.size() * sizeof(float));
+    core::copy_async(q, t.on, &flag, sizeof(int));
     rt.finish(q);
     return true;
 }
@@ -120,7 +121,7 @@ void cvec_set_enabled(bool on) {
         if (g_devs[(size_t) d].on == nullptr) continue;
         auto& rt = core::Runtime::at(d);
         rt.finish();   // nothing in flight may still read the flag
-        rt.wait(rt.compute().memcpy(g_devs[(size_t) d].on, &v, sizeof(int)), "cvec_set_enabled");
+        rt.wait(core::copy_async(rt.compute(), g_devs[(size_t) d].on, &v, sizeof(int)), "cvec_set_enabled");
     }
     g_on_host = on;
 }

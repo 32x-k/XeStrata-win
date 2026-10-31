@@ -23,6 +23,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/xmx_gemm.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/readback.hpp"
 #include "strata/core/per_device.hpp"
 #include "device_target.hpp"
 #include "mma_gemm.hpp"
@@ -1038,7 +1039,7 @@ bool ptx_attn_built(sycl::queue& queue) {
         int got = 0;
         try {
             queue.single_task([=] { *flag = STRATA_PA_PTX; });
-            queue.memcpy(&got, flag, sizeof(int)).wait();
+            core::copy_async(queue, &got, flag, sizeof(int)).wait();
         } catch (const sycl::exception&) { got = 0; }
         sycl::free(flag, queue);
         return got == 1;

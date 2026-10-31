@@ -12,6 +12,7 @@
 #include "strata/kernels/verify_kernels.hpp"
 #include "strata/kernels/gdn.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/readback.hpp"
 #include "device_caps.hpp"
 #include "q8_1_finite.hpp"
 #include "strata/core/per_device.hpp"
@@ -1023,8 +1024,8 @@ void fetch_blobs_tune(void* stream) {
         std::memset(host, 1, (size_t) nb * blob);
         unsigned long long tab[nb];
         for (int k = 0; k < nb; ++k) tab[k] = (unsigned long long) (host + (size_t) k * blob);
-        q.memcpy(src, tab, sizeof tab);
-        q.memcpy(n, &nb, sizeof nb).wait();
+        core::copy_async(q, src, tab, sizeof tab);
+        core::copy_async(q, n, &nb, sizeof nb).wait();
         std::vector<int> counts;
         for (int g = 4; g < most; g = g < 8 ? g + 2 : g + g / 2) counts.push_back(g);
         counts.push_back(most);

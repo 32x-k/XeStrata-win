@@ -37,6 +37,7 @@
 #include "strata/core/on_device.hpp"
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/readback.hpp"
 #include "cuda_intrinsics.hpp"
 #include "device_target.hpp"
 #include "iq_bits.hpp"
@@ -2099,7 +2100,7 @@ const float* hadamard_device_signs(const float* host, int width) {
         d = sycl::malloc_device<float>((size_t) width, rt.device(), rt.context());
         if (d == nullptr) throw core::DeviceError("hadamard_device_signs: device allocation failed");
         auto& q = rt.compute();
-        q.memcpy(d, host, (size_t) width * sizeof(float));
+        core::copy_async(q, d, host, (size_t) width * sizeof(float));
         rt.finish(q);
     }
     return d;

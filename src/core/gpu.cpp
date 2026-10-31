@@ -5,6 +5,7 @@
 #include "strata/core/device.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/readback.hpp"
 #include "strata/platform/memory.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU core_gpu
 #include "strata/kernels/device_arch_tag.hpp"
@@ -381,7 +382,7 @@ bool kernels_read_registered() { return rt().device().get_backend() != sycl::bac
 
 bool copy(void* dst, const void* src, size_t bytes) {
     if (bytes == 0) return true;
-    try { rt().wait(rt().compute().memcpy(dst, src, bytes), "synchronous copy"); return true; }
+    try { rt().wait(core::copy_async(rt().compute(), dst, src, bytes), "synchronous copy"); return true; }
     catch (const std::exception& e) { return fail("copy", e); }
 }
 
@@ -390,8 +391,8 @@ bool copy_async(void* dst, const void* src, size_t bytes, Stream s) {
     try {
         // without an event: on HIP an event recorded after each copy cut the copies between pinned host memory and
         // the device from 6.6 to 3.7 GB/s (expert blobs of 1.3 MB, R9700 on Windows); the in-order queue keeps the
-        // order, and stream_idle asks the queue itself
-        sx::memcpy(q(s), dst, src, bytes);
+        // order through the common copy helper, and stream_idle asks the queue itself
+        core::copy_async_no_event(q(s), dst, src, bytes);
         return true;
     } catch (const std::exception& e) { return fail("copy_async", e); }
 }
@@ -399,10 +400,10 @@ bool copy_async(void* dst, const void* src, size_t bytes, Stream s) {
 bool copy_async_after(void* dst, const void* src, size_t bytes, Stream s, const Event* after, Event* done) {
     try {
         auto& queue = q(s);
-        const sycl::event e = queue.submit([&](sycl::handler& h) {
-            if (after != nullptr && after->ev) h.depends_on(*after->ev);
-            if (bytes > 0) h.memcpy(dst, src, bytes);
-        });
+        const std::vector<sycl::event> dependencies = after != nullptr && after->ev ?
+            std::vector<sycl::event>{*after->ev} : std::vector<sycl::event>{};
+        // Even an empty transfer's completion marks prior work on this stream, as the old empty submission did.
+        const sycl::event e = core::copy_async(queue, dst, src, bytes, dependencies);
         if (done != nullptr) done->ev = e;
         return true;
     } catch (const std::exception& e) { return fail("copy_async_after", e); }
@@ -524,12 +525,12 @@ bool device_speed(int device, int* units, int* khz) {
 }
 
 bool host_register(void* p, size_t bytes) {
-    try { sx::prepare_for_device_copy(p, bytes, rt().context()); return true; }
+    try { core::prepare_for_device_copy(p, bytes, rt().context()); return true; }
     catch (const std::exception& e) { return fail("host_register", e); }
 }
 
 bool host_register_on(int device, void* p, size_t bytes) {
-    try { sx::prepare_for_device_copy(p, bytes, core::Runtime::at(device).context()); return true; }
+    try { core::prepare_for_device_copy(p, bytes, core::Runtime::at(device).context()); return true; }
     catch (const std::exception& e) { return fail("host_register_on", e); }
 }
 
@@ -556,12 +557,12 @@ std::string device_name(int device) {
 }
 
 void host_unregister_on(int device, void* p) {
-    try { sx::release_from_device_copy(p, core::Runtime::at(device).context()); }
+    try { core::release_from_device_copy(p, core::Runtime::at(device).context()); }
     catch (const std::exception& e) { fail("host_unregister_on", e); }
 }
 
 void host_unregister(void* p) {
-    try { sx::release_from_device_copy(p, rt().context()); }
+    try { core::release_from_device_copy(p, rt().context()); }
     catch (const std::exception& e) { fail("host_unregister", e); }
 }
 

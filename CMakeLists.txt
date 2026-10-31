@@ -992,6 +992,11 @@ if(STRATA_ENABLE_XE)
     target_link_libraries(elementwise_parity PRIVATE strata_kernels)
     target_compile_options(elementwise_parity PRIVATE -fno-fast-math -ffp-contract=off)
     add_test(NAME elementwise_parity COMMAND elementwise_parity --selftest)
+    add_executable(copy_order_test tests/core/copy_order_test.cpp)
+    target_link_libraries(copy_order_test PRIVATE strata_core Threads::Threads)
+    target_compile_options(copy_order_test PRIVATE -fno-fast-math -ffp-contract=off)
+    add_test(NAME copy_order_test COMMAND copy_order_test)
+    set_tests_properties(copy_order_test PROPERTIES LABELS "core;gpu" SKIP_RETURN_CODE 77 TIMEOUT 120)
     # plan v0.3 P6: the i-quant kernels against gguf-py on real rows; needs logs/iq_fixture (tools/iq_fixture.py), so
     # it is built but not registered, as in the CUDA build.
     add_executable(iq_parity src/kernels/iq_parity.cpp)

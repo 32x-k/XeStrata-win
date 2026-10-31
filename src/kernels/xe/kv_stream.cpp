@@ -10,6 +10,7 @@
 #include "strata/kernels/kv_q4.hpp"
 #include "strata/kernels/kv_q8.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/readback.hpp"
 #include "device_caps.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_kv_stream
 #include "strata/kernels/device_arch_tag.hpp"
@@ -261,7 +262,8 @@ void kv_ring_restore(const QsaAttnPools& slots, const KvHostPools& host, int fmt
     for (int64_t b = b0; b < b1;) {
         const int64_t sl = b % n_slots, run = std::min<int64_t>(b1 - b, n_slots - sl);   // up to the ring's end
         for (int a = 0; a < r.n; ++a)
-            e = queue.memcpy(r.dst[a] + sl * r.len[a], r.src[a] + b * r.len[a], (size_t) (run * r.len[a]));
+            e = core::copy_async(queue, r.dst[a] + sl * r.len[a], r.src[a] + b * r.len[a],
+                                 (size_t) (run * r.len[a]));
         b += run;
     }
     if (!stream) core::Runtime::get().finish(queue);
@@ -272,7 +274,8 @@ void kv_stage_from_host(const QsaAttnPools& stage, const KvHostPools& host, int 
     if (n_blocks <= 0) return;
     const Runs r = runs_of(stage, host, fmt, s);
     auto& queue = queue_for(stream);
-    for (int a = 0; a < r.n; ++a) queue.memcpy(r.dst[a], r.src[a], (size_t) (n_blocks * r.len[a]));
+    for (int a = 0; a < r.n; ++a)
+        core::copy_async(queue, r.dst[a], r.src[a], (size_t) (n_blocks * r.len[a]));
     if (!stream) core::Runtime::get().finish(queue);
 }
 
@@ -281,7 +284,7 @@ KvStreamCounters kv_stream_counters(const KvStreamMap& m) {
     KvStreamCounters r;
     if (m.ctl == nullptr) return r;
     auto& rt = core::Runtime::get();
-    rt.wait(rt.compute().memcpy(c, m.ctl, sizeof(c)), "kv_stream_counters");
+    rt.wait(core::copy_async(rt.compute(), c, m.ctl, sizeof(c)), "kv_stream_counters");
     const unsigned long long* u = reinterpret_cast<const unsigned long long*>(c + 4);
     r.misses = u[0];
     r.lookups = u[1];

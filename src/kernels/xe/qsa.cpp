@@ -17,6 +17,7 @@
 #include "strata/kernels/mrope.hpp"
 #include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/readback.hpp"
 #include "device_caps.hpp"
 
 #include <cfloat>
@@ -85,7 +86,7 @@ int32_t* step_scratch() {
 // waiting for it keeps the host array alive until it has been read.
 void step_upload_raw(const int32_t* h_step) {
     auto& rt = core::Runtime::get();
-    rt.wait(rt.compute().memcpy(step_scratch(), h_step, qsa_step_bytes()), "qsa step upload");
+    rt.wait(core::copy_async(rt.compute(), step_scratch(), h_step, qsa_step_bytes()), "qsa step upload");
 }
 
 const int32_t* step_upload(int64_t pos, int64_t n_kv_hint, const QsaShapes& s) {

@@ -27,6 +27,7 @@
 #include "device_target.hpp"
 #include "amd_wmma.hpp"
 #include "strata/core/per_device.hpp"
+#include "strata/core/readback.hpp"
 #include "iq_bits.hpp"
 #include "cuda_intrinsics.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_iq_mmq
@@ -1046,7 +1047,7 @@ bool intel_layout_ok(sycl::queue& q) {
             sycl::local_accessor<int32_t, 1> pi(sycl::range<1>((size_t) 8 * IntelLayoutCheck<IS>::N), h);
             h.parallel_for(sycl::nd_range<1>(IntelLayoutCheck<IS>::N, IntelLayoutCheck<IS>::N), IntelLayoutCheck<IS>{pi, out});
         });
-        q.memcpy(&res, out, sizeof(int)).wait();
+        core::copy_async(q, &res, out, sizeof(int)).wait();
     } catch (const sycl::exception& e) {
         std::fprintf(stderr, "strata: the int8 XMX layout check did not run (%s)\n", e.what());
         res = 0;
@@ -1226,7 +1227,7 @@ bool iq_mmq_usable(sycl::queue& q) {
                 sycl::local_accessor<float, 1> pf(sycl::range<1>((size_t) TM * TN), h);
                 h.parallel_for(sycl::nd_range<1>(SG, SG), LayoutCheck{pi, pf, out});
             });
-            q.memcpy(&res, out, sizeof(int)).wait();
+            core::copy_async(q, &res, out, sizeof(int)).wait();
         } catch (const sycl::exception& e) {
             std::fprintf(stderr, "strata: the int8 expert products' layout check did not run (%s)\n", e.what());
             res = 0;

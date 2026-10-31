@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #include "strata/core/on_device.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/readback.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU core_device
 #include "strata/kernels/device_arch_tag.hpp"
 
@@ -585,7 +586,7 @@ void Runtime::check_async() {
 sycl::event Runtime::copy_async(void* dst, const void* src, uint64_t bytes,
                                const std::vector<sycl::event>& dependencies) {
     check_async();
-    return transfer_.memcpy(dst, src, bytes, dependencies);
+    return core::copy_async(transfer_, dst, src, bytes, dependencies);
 }
 
 sycl::event Runtime::compute_after(const std::vector<sycl::event>& dependencies) {

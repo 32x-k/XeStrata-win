@@ -5,6 +5,7 @@
 #include "strata/prefill/moe_mmq.hpp"
 #include "strata/kernels/swiglu_clamp.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/readback.hpp"
 #include "strata/kernels/iq_mmq.hpp"
 #include "strata/kernels/xmx_gemm.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU prefill_moe_mmq
@@ -66,9 +67,9 @@ void gather_native(const void* gate, const void* up, size_t gu_half_bytes, const
     const auto a16 = [](const void* p) { return ((uintptr_t) p & 15) == 0; };
     if (!a16(gate) || !a16(up) || !a16(down) || !a16(gu_dst) || !a16(d_dst) || gu_half_bytes % 16 != 0 ||
         d_bytes % 16 != 0) {
-        q.memcpy(gu_dst, gate, gu_half_bytes);
-        q.memcpy(static_cast<uint8_t*>(gu_dst) + gu_half_bytes, up, gu_half_bytes);
-        q.memcpy(d_dst, down, d_bytes);
+        core::copy_async(q, gu_dst, gate, gu_half_bytes);
+        core::copy_async(q, static_cast<uint8_t*>(gu_dst) + gu_half_bytes, up, gu_half_bytes);
+        core::copy_async(q, d_dst, down, d_bytes);
         return;
     }
     using u32x4 = uint32_t __attribute__((ext_vector_type(4)));   // one 16-byte access (sycl::uint4 is split on NVPTX)

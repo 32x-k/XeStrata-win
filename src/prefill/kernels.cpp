@@ -12,6 +12,7 @@
 #include "strata/kernels/rope_scaling.hpp"
 #include "strata/kernels/router_top10.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/readback.hpp"
 #include "strata/core/per_device.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU prefill_kernels
 #include "strata/kernels/device_arch_tag.hpp"
@@ -964,7 +965,7 @@ struct Gdn {
                     auto time = [&](auto&& launch) {   // the second run: the first may compile the kernel
                         double us = 0;
                         for (int r = 0; r < 2; ++r) {
-                            q.copy(state, st, ns).wait();
+                            core::copy_async(q, st, state, ns * sizeof(float)).wait();
                             const auto t0 = std::chrono::steady_clock::now();
                             launch(st, yy);
                             q.wait();

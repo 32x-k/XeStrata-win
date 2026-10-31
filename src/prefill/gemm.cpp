@@ -11,6 +11,7 @@
 #include "strata/kernels/xmx_gemm.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/readback.hpp"
 #include <stdexcept>
 
 #if STRATA_ONEMATH
@@ -507,7 +508,7 @@ bool Gemm::i8_usable(void* stream) {
                                                n * n, x + n * n, n, n * n, 0.0f, y, n, n * n, 1);
             t.wait_and_throw();
             int32_t v = 0;
-            t.memcpy(&v, y, sizeof v).wait();
+            core::copy_async(t, &v, y, sizeof v).wait();
             ok = !*failed && v == n;
         } catch (const std::exception&) {
             ok = false;

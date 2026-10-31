@@ -4,6 +4,7 @@
 // scale, the softmax, . V fused into one partition), a partition compiled once a shape and kept.
 
 #include "qi_sdpa.hpp"
+#include "strata/core/readback.hpp"
 
 #include <oneapi/dnnl/dnnl_graph.hpp>
 #include <oneapi/dnnl/dnnl_graph_sycl.hpp>
@@ -100,7 +101,7 @@ bool onednn(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint
         if (sc == nullptr) {
             sc = sycl::malloc_device<sycl::half>(1, q);
             const sycl::half v = 1.0f / std::sqrt((float) head_dim);
-            q.memcpy(sc, &v, sizeof v).wait();
+            core::copy_async(q, sc, &v, sizeof v).wait();
         }
         dnnl::stream strm = dnnl::sycl_interop::make_stream(*d.eng, q);
         const lt& Q = it->second.query_logical_tensor(0);

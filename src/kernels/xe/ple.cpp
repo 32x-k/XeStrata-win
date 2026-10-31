@@ -16,6 +16,7 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/native_ple_postops.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/readback.hpp"
 #include "device_caps.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_ple
 #include "strata/kernels/device_arch_tag.hpp"
@@ -226,7 +227,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
     // ---- key = grouped_norm(ple_key @ emb): the optional native projection follows pinned CUDA Q8_1 MMVQ; the
     // default keeps its canonical Q8_0 path
     if (w.pre_key != nullptr) {
-        q.memcpy(d_key, w.pre_key, (size_t) hc_dim * sizeof(float));
+        core::copy_async(q, d_key, w.pre_key, (size_t) hc_dim * sizeof(float));
     } else if (w.key_bf16 != nullptr) {
         bf16_gemv_fp32_mmvf(emb, w.key_bf16, d_key, n_embd, hc_dim, st);
     } else if (native_key) {
@@ -243,7 +244,7 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
 
     // the value projection's independent option leaves the nonlinear PLE operations unchanged
     if (w.pre_value != nullptr) {
-        q.memcpy(d_value, w.pre_value, (size_t) n_embd * sizeof(float));
+        core::copy_async(q, d_value, w.pre_value, (size_t) n_embd * sizeof(float));
     } else if (native_bf16) {
         bf16_gemv_fp32_mmvf(emb, w.value_bf16, d_value, n_embd, n_embd, st);
     } else {
@@ -286,12 +287,12 @@ void ple_block(const float* emb, const float* hidden, const float* hist_rows, co
 
     // the intermediates the oracle comparison needs: `key` is the NORMALISED key, `value` the projection before
     // the gate
-    if (out.key) q.memcpy(out.key, normalized_key, hc_dim * sizeof(float));
-    if (out.value) q.memcpy(out.value, d_value, n_embd * sizeof(float));
-    if (out.gate) q.memcpy(out.gate, d_gate, hc * sizeof(float));
-    if (out.gated) q.memcpy(out.gated, d_gated, hc_dim * sizeof(float));
-    if (out.normalized) q.memcpy(out.normalized, d_norm, hc_dim * sizeof(float));
-    if (out.conv) q.memcpy(out.conv, d_conv, hc_dim * sizeof(float));
+    if (out.key) core::copy_async(q, out.key, normalized_key, hc_dim * sizeof(float));
+    if (out.value) core::copy_async(q, out.value, d_value, n_embd * sizeof(float));
+    if (out.gate) core::copy_async(q, out.gate, d_gate, hc * sizeof(float));
+    if (out.gated) core::copy_async(q, out.gated, d_gated, hc_dim * sizeof(float));
+    if (out.normalized) core::copy_async(q, out.normalized, d_norm, hc_dim * sizeof(float));
+    if (out.conv) core::copy_async(q, out.conv, d_conv, hc_dim * sizeof(float));
     // no synchronisation here: inside a capture it is an error, and the engine's caller does not want it
 }
 

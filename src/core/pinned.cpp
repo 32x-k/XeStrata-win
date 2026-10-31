@@ -2,6 +2,7 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 #include "strata/core/pinned.hpp"
+#include "strata/core/readback.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/core/device.hpp"
 
@@ -76,8 +77,7 @@ void register_pieces(uint8_t* base, uint64_t bytes, const std::vector<uint64_t>&
     }
     uint64_t start = 0;
     for (uint64_t end : ends) {
-        sycl::ext::oneapi::experimental::prepare_for_device_copy(base + start, (size_t) (end - start),
-                                                                 Runtime::get().context());
+        prepare_for_device_copy(base + start, (size_t) (end - start), Runtime::get().context());
         reg.push_back(base + start);
         pieces.emplace_back(base + start, (size_t) (end - start));
         start = end;
@@ -183,7 +183,7 @@ PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice, const std::vector<uint6
     try {
         register_pieces((uint8_t*) base, bytes, cuts, reg_, pieces_);
     } catch (const std::exception& e) {
-        for (void* r : reg_) sycl::ext::oneapi::experimental::release_from_device_copy(r, Runtime::get().context());
+        for (void* r : reg_) release_from_device_copy(r, Runtime::get().context());
         reg_.clear();
         pieces_.clear();
         unmap(false);
@@ -382,7 +382,7 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds, ui
         note = "shared file mapping registered in device-sized slices; no mlock";
         unlock(shared_fd_); shared_locked_ = false;
     } catch (...) {
-        for (void* r : reg_) sycl::ext::oneapi::experimental::release_from_device_copy(r, Runtime::get().context());
+        for (void* r : reg_) release_from_device_copy(r, Runtime::get().context());
         reg_.clear();
         unmap(true);
         close_file(shared_fd_); shared_fd_ = -1;
@@ -426,16 +426,15 @@ bool PinnedArena::to_host_usm(uint64_t pad, std::string& err, const std::functio
         return false;
     }
     auto& runtime = Runtime::get();
-    namespace sx = sycl::ext::oneapi::experimental;
     try {   // no copy may read the mapping while it moves, and its registrations go
         runtime.finish();
         for (auto& o : other_reg_) {
             auto& r = Runtime::at(o.first);
             r.finish();
-            for (void* q : o.second) sx::release_from_device_copy(q, r.context());
+            for (void* q : o.second) release_from_device_copy(q, r.context());
         }
         other_reg_.clear();
-        for (void* r : reg_) sx::release_from_device_copy(r, runtime.context());
+        for (void* r : reg_) release_from_device_copy(r, runtime.context());
         reg_.clear();
     } catch (const std::exception& e) {
         err = std::string("releasing the arena's registrations: ") + e.what();
@@ -462,7 +461,7 @@ bool PinnedArena::to_host_usm(uint64_t pad, std::string& err, const std::functio
             }
             try {
                 for (const auto& pc : pieces_) {
-                    sx::prepare_for_device_copy(pc.first, pc.second, runtime.context());
+                    prepare_for_device_copy(pc.first, pc.second, runtime.context());
                     reg_.push_back(pc.first);
                 }
             } catch (const std::exception& e) {
@@ -519,7 +518,7 @@ bool PinnedArena::register_on(int device, std::string& err) {
     try {
         const sycl::context ctx = Runtime::at(device).context();
         for (const auto& p : pieces_) {
-            sycl::ext::oneapi::experimental::prepare_for_device_copy(p.first, p.second, ctx);
+            prepare_for_device_copy(p.first, p.second, ctx);
             regs.push_back(p.first);
         }
         // Copies through the registration are read back once, both ends of every piece: on the UHD 770 beside a B70
@@ -547,7 +546,7 @@ bool PinnedArena::register_on(int device, std::string& err) {
         if (!wrong.empty()) throw std::runtime_error(wrong);
     } catch (const std::exception& e) {
         for (void* r : regs)
-            sycl::ext::oneapi::experimental::release_from_device_copy(r, Runtime::at(device).context());
+            release_from_device_copy(r, Runtime::at(device).context());
         err = std::string("registering the expert arena on GPU ") + std::to_string(device) + ": " + e.what();
         return false;
     }
@@ -575,7 +574,7 @@ PinnedArena::~PinnedArena() {
         try {
             auto& r = Runtime::at(o.first);
             r.finish();   // no copy may still read the mapping
-            for (void* p : o.second) sycl::ext::oneapi::experimental::release_from_device_copy(p, r.context());
+            for (void* p : o.second) release_from_device_copy(p, r.context());
         } catch (const std::exception& e) {
             // The driver can refuse the release itself when it is in the state that refused the allocations
             // (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY, the B70's xe driver, 2026-10-22).  The exit goes on: the
@@ -593,7 +592,7 @@ PinnedArena::~PinnedArena() {
     auto& runtime = Runtime::get();
     try {
         runtime.finish();   // no copy may still read the mapping
-        for (void* r : reg_) sycl::ext::oneapi::experimental::release_from_device_copy(r, runtime.context());
+        for (void* r : reg_) release_from_device_copy(r, runtime.context());
     } catch (const std::exception& e) {
         // as above: the driver can refuse the release in the state that refused the allocations - report it and
         // let the exit finish, the process's end reclaims the mapping

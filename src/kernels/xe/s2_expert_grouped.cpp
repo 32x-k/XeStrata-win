@@ -15,6 +15,7 @@
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/core/runtime.hpp"
+#include "strata/core/readback.hpp"
 #include "cuda_intrinsics.hpp"
 #define STRATA_DEVICE_ARCH_TAG_TU xe_s2_expert_grouped
 #include "strata/kernels/device_arch_tag.hpp"
@@ -948,7 +949,8 @@ void moe_hit_grouped_s2_cpu_order(const uint8_t* blob_base, const int32_t* slot_
         xh[c] = x_scales[c] * (float) sum;
     });
     cpu_order_projection<false>(q, blob_base, slot_index, dst_index, blob_bytes, x_q8_0, x_scales, xh, gu, (int) n_hits);
-    if (gate_up_trace != nullptr) q.memcpy(gate_up_trace, gu, (size_t) n_hits * 2 * FF * sizeof(float));
+    if (gate_up_trace != nullptr)
+        core::copy_async(q, gate_up_trace, gu, (size_t) n_hits * 2 * FF * sizeof(float));
     const int pairs = (int) n_hits * FF;
     q.parallel_for(sycl::range<1>((size_t) pairs), [=](sycl::id<1> id) {
         const int i = (int) id[0];
