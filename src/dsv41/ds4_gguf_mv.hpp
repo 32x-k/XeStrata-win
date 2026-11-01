@@ -87,6 +87,7 @@ void quantize(const QuantItems& items, int max_k, int max_rows, size_t warps, sy
     const size_t tiles = (size_t(max_k) / 32 + warps - 1) / warps, threads = warps * SG;
     submit_body<SG>(q, sycl::nd_range<1>(tiles * max_rows * items.n * threads, threads), warps,
                    [=](sycl::nd_item<1> it) {
+        // NOLINTNEXTLINE(clang-analyzer-core.UndefinedBinaryOperatorResult): the analyzer's host call has no nd_item
         const size_t group = it.get_group_linear_id(), tile = group % tiles;
         const int row = int(group / tiles % size_t(max_rows)), item = int(group / (tiles * max_rows));
         const size_t block = tile * warps + it.get_local_linear_id() / SG;
@@ -213,54 +214,72 @@ struct Fetch {
 // Upstream q8_mv_kernel<NC,ST>: one subgroup/output row, one complete Q8_0
 // block/lane/step, exact integer dot then F32 scale and FMA. ST retains Fetch's
 // register prefetch/local stage; unaligned rows use the upstream byte-load path.
+// A local_accessor makes the compiler copy the kernel's arguments, the jobs among
+// them, to private memory (760 bytes on gfx1201), so the eight-subgroup stage is
+// group-local memory of a fixed size and only other shapes take an accessor.
 template <int NC, bool ST, int SG>
 void q8_kernel(const Jobs& jobs, int count, int max_n, size_t warps, sycl::queue& q) {
     const size_t tiles = (size_t(max_n) + warps - 1) / warps, threads = warps * SG;
-    sycl_detail::submit(q, [&](sycl::handler& h) {
-        sycl::local_accessor<uint32_t, 1> storage(ST ? warps * SG * kQ8Bytes / 4 : 1, h);
-        submit_body<SG>(h, sycl::nd_range<1>(tiles * count * threads, threads), warps,
-                       [=](sycl::nd_item<1> it) {
-            const Job& b = jobs.j[it.get_group_linear_id() / tiles];
-            const size_t warp = it.get_local_linear_id() / SG;
-            const size_t row = it.get_group_linear_id() % tiles * warps + warp;
-            const int lane = int(it.get_local_linear_id() % SG);
-            if (row >= size_t(b.n)) return;
-            const auto* w = static_cast<const uint8_t*>(b.w) + row * b.ld;
-            const int blocks = b.k / 32;
-            auto* stage = storage.template get_multi_ptr<sycl::access::decorated::no>().get();
-            if constexpr (ST) stage += warp * SG * kQ8Bytes / 4;
-            const auto sg = it.get_sub_group();
-            float acc[NC] = {};
-            Fetch<SG> fetch;
-            if constexpr (ST) fetch.read(w, 0, sycl::min(SG, blocks), lane);
-            for (int first = 0; first < blocks; first += SG) {
-                const int count_blocks = sycl::min(SG, blocks - first), block = first + lane;
-                if constexpr (ST) {
-                    fetch.store(stage, lane, sg);
-                    if (first + SG < blocks) fetch.read(w, first + SG, sycl::min(SG, blocks - first - SG), lane);
-                }
-                if (lane >= count_blocks) continue;
-                int v[8];
-                const float dw = ST ? q8_words_local(stage, lane, v) : q8_words_global(w + size_t(block) * kQ8Bytes, v);
-#pragma unroll
-                for (int c = 0; c < NC; ++c) if (c < b.ncol) {
-                    const int8_t* xp = b.xq + size_t(c) * b.k + size_t(block) * 32;
-                    const auto xa = load<sycl::int4, 16>(xp), xb = load<sycl::int4, 16>(xp + 16);
-                    using strata::kernels::xe::dp4a;
-                    int sum = dp4a(v[0], xa.x(), 0);
-                    sum = dp4a(v[1], xa.y(), sum); sum = dp4a(v[2], xa.z(), sum); sum = dp4a(v[3], xa.w(), sum);
-                    sum = dp4a(v[4], xb.x(), sum); sum = dp4a(v[5], xb.y(), sum);
-                    sum = dp4a(v[6], xb.z(), sum); sum = dp4a(v[7], xb.w(), sum);
-                    acc[c] = sycl::fma(dw * b.xd[size_t(c) * blocks + block], float(sum), acc[c]);
-                }
+    const sycl::nd_range<1> range(tiles * count * threads, threads);
+    const auto body = [=](sycl::nd_item<1> it, uint32_t* stage) {
+        const Job& b = jobs.j[it.get_group_linear_id() / tiles];
+        const size_t warp = it.get_local_linear_id() / SG;
+        const size_t row = it.get_group_linear_id() % tiles * warps + warp;
+        const int lane = int(it.get_local_linear_id() % SG);
+        if (row >= size_t(b.n)) return;
+        const auto* w = static_cast<const uint8_t*>(b.w) + row * b.ld;
+        const int blocks = b.k / 32;
+        if constexpr (ST) stage += warp * SG * kQ8Bytes / 4;
+        const auto sg = it.get_sub_group();
+        float acc[NC] = {};
+        Fetch<SG> fetch;
+        if constexpr (ST) fetch.read(w, 0, sycl::min(SG, blocks), lane);
+        for (int first = 0; first < blocks; first += SG) {
+            const int count_blocks = sycl::min(SG, blocks - first), block = first + lane;
+            if constexpr (ST) {
+                fetch.store(stage, lane, sg);
+                if (first + SG < blocks) fetch.read(w, first + SG, sycl::min(SG, blocks - first - SG), lane);
             }
+            if (lane >= count_blocks) continue;
+            int v[8];
+            const float dw = ST ? q8_words_local(stage, lane, v) : q8_words_global(w + size_t(block) * kQ8Bytes, v);
 #pragma unroll
             for (int c = 0; c < NC; ++c) if (c < b.ncol) {
-                const float value = warp_sum<SG>(sg, acc[c]);
-                if (lane == 0) b.y[size_t(c) * b.ycs + row] = b.alpha * value + (b.bias ? b.bias[row] : 0.f);
+                const int8_t* xp = b.xq + size_t(c) * b.k + size_t(block) * 32;
+                const auto xa = load<sycl::int4, 16>(xp), xb = load<sycl::int4, 16>(xp + 16);
+                using strata::kernels::xe::dp4a;
+                int sum = dp4a(v[0], xa.x(), 0);
+                sum = dp4a(v[1], xa.y(), sum); sum = dp4a(v[2], xa.z(), sum); sum = dp4a(v[3], xa.w(), sum);
+                sum = dp4a(v[4], xb.x(), sum); sum = dp4a(v[5], xb.y(), sum);
+                sum = dp4a(v[6], xb.z(), sum); sum = dp4a(v[7], xb.w(), sum);
+                acc[c] = sycl::fma(dw * b.xd[size_t(c) * blocks + block], float(sum), acc[c]);
             }
+        }
+#pragma unroll
+        for (int c = 0; c < NC; ++c) if (c < b.ncol) {
+            const float value = warp_sum<SG>(sg, acc[c]);
+            if (lane == 0) b.y[size_t(c) * b.ycs + row] = b.alpha * value + (b.bias ? b.bias[row] : 0.f);
+        }
+    };
+    if constexpr (!ST) {
+        submit_body<SG>(q, range, warps, [=](sycl::nd_item<1> it) { body(it, nullptr); });
+    } else {
+#if defined(SYCL_EXT_ONEAPI_LOCAL_MEMORY)
+        if (warps == 8) {
+            submit_body<SG>(q, range, warps, [=](sycl::nd_item<1> it) {
+                auto stage = sycl::ext::oneapi::group_local_memory_for_overwrite<uint32_t[8 * SG * kQ8Bytes / 4]>(it.get_group());
+                body(it, *stage.get());
+            });
+            return;
+        }
+#endif
+        sycl_detail::submit(q, [&](sycl::handler& h) {
+            sycl::local_accessor<uint32_t, 1> storage(warps * SG * kQ8Bytes / 4, h);
+            submit_body<SG>(h, range, warps, [=](sycl::nd_item<1> it) {
+                body(it, storage.template get_multi_ptr<sycl::access::decorated::no>().get());
+            });
         });
-    });
+    }
 }
 
 // Upstream ds4_iq.cu mv_kernel<T,NC>: one subgroup/output row, the lanes over the
