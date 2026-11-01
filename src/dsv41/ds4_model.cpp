@@ -1342,6 +1342,7 @@ struct Model::Impl {
     void prof_mark(const Dev& d, int stage) {
         if (ds4_dbg("DS4_TLOG")) {}
         if (!prof_window && !prof_chunk) return;
+        if (stage < 0 || size_t(stage) >= (prof_chunk ? std::size(cprof_ms) : std::size(st.prof_ms))) return;
         if (prof_window && !prof_chunk && prof_sync_on) {   // decode: the stream drained at each mark, host clock (events hang the driver on gfx1151 Windows)
             std::lock_guard<std::mutex> lk(prof_mu);
             rt::set_device(d.id);
@@ -1372,6 +1373,7 @@ struct Model::Impl {
             std::lock_guard<std::mutex> lk(prof_mu);
             prof_sync_t = 0;
             ++st.prof_tokens;
+            prof_window = false;
             return;
         }
         std::lock_guard<std::mutex> lk(prof_mu);
@@ -1391,6 +1393,7 @@ struct Model::Impl {
         for (const ProfMark& m : prof_marks) prof_pool[m.d->id].push_back(m.ev);
         prof_marks.clear();
         if (!prof_chunk) ++st.prof_tokens;
+        prof_window = false;
     }
     void dump_layer(Dev& d, const float* h, int il, int64_t p0, int T) {
         std::vector<float> v((size_t) T * g.hc * g.dim);
@@ -8998,6 +9001,9 @@ struct Model::Impl {
             chunk_rec.reset(new std::atomic<int>[chunk_done.size()]);
             for (size_t i = 0; i < chunk_done.size(); ++i) chunk_rec[i].store(0);
         }
+        // A previous decode (including an interrupted one) must not profile prompt stages as decode stages.
+        prof_window = false;
+        prof_sync_t = 0;
         prof_chunk = prof_on && !prof_sync_on;   // (DS4_PROF_SYNC: the decode profile only; the prompt events hang the driver)
         const bool lm = lm_begin(run);
         struct LmEnd {   // (every way out: its host memory freed once the device is done with it)
