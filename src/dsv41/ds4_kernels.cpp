@@ -9,6 +9,7 @@
 #include "ds4_q6k.cuh"
 #include "ds4_mailbox.hpp"
 #include "ds4_finish.hpp"
+#include "ds4_compress.hpp"
 #include "ds4_hc.hpp"
 #include "strata/core/per_device.hpp"
 #include "strata/core/readback.hpp"
@@ -962,6 +963,7 @@ void swiglu(const float* g, const float* u, int n, float lim, float* h, sycl::qu
 
 void compress_win(const float* kv, const float* score, float* kv_state, float* score_state, int ratio, int p0, int T,
                   int d, const float* w, float eps, float* latent, sycl::queue& s) {
+    if (compress_detail::compress(kv, score, kv_state, score_state, ratio, p0, T, d, w, eps, latent, s)) return;
     int g = 0;
     for (int t = 0; t < T; ++t) {
         const int slot = (p0 + t) % ratio;
