@@ -6880,6 +6880,31 @@ struct Model::Impl {
             std::fprintf(stderr, "ds4: expert cache: %lld swaps after the prompt (%.0f ms)\n", (long long) (st.swaps - s0),
                          now_ms() - t0);
     }
+    // WP-8's option (1): the same swap rounds, run on a thread while the server has no request in flight, stopped by `cancel`.
+    // The prompt path keeps its 800 ms (a run with no server has no idle to use), so this is pure addition: an agent's turn
+    // ends, the swaps go in while it runs its tool, and the next turn's answer finds them.  Interrupting costs one round (a
+    // swap of ~9 MB, a millisecond or two) because cancel is tested between rounds, and cache_tick_swaps is the same call the
+    // prompt path makes, so the state it leaves is the state a decode window already handles.
+    void cache_settle_idle(const std::atomic<bool>& cancel) {
+        if (!o.expert_cache || cache_ths.empty()) return;
+        static const double budget = env_f("DS4_SETTLE_IDLE_MS", 6000.0f);
+        const double t0 = now_ms();
+        const int64_t s0 = st.swaps;
+        while (!cancel.load(std::memory_order_acquire) && now_ms() - t0 < budget) {
+            for (Layer& l : L) {
+                if (l.mtp || l.spare_vram < 0 || l.swap_pending) continue;
+                l.cpu_hits.clear();
+                for (int e = 0; e < l.n_exp; ++e)
+                    if (l.slot[(size_t) e] < 0 && l.heat[(size_t) e] >= 2.0f) l.cpu_hits.push_back(e);
+            }
+            cache_tick_swaps(0);
+            if (sw_inflight == 0) break;   // (nothing queued: no layer's best CPU-lane expert is hotter than its coldest VRAM one)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (o.verbose)
+            std::fprintf(stderr, "ds4: expert cache: %lld swaps in the idle (%.0f ms, cancelled %d)\n",
+                         (long long) (st.swaps - s0), now_ms() - t0, cancel.load() ? 1 : 0);
+    }
     void cache_tick(int T) {
         cache_tick_swaps(T);
         store_sync();
@@ -10287,6 +10312,7 @@ bool Model::slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::str
     return p_->mailbox->ready(err) && ok;
 } catch (const std::exception& e) { p_->mailbox->stop(e.what()); err = e.what(); return false; }
 std::string Model::slot_identity() const { return p_->slot_identity(); }
+void Model::settle_idle(const std::atomic<bool>& cancel) { p_->cache_settle_idle(cancel); }
 void Model::save_profile() const { p_->save_profile(); }
 const Stats& Model::stats() const {
     Stats& st = p_->st;
