@@ -10,6 +10,7 @@
 #include "ds4_iq_token.hpp"
 #include "ds4_sycl.hpp"
 #include "../kernels/xe/cuda_intrinsics.hpp"
+#include <type_traits>
 
 namespace strata::ds4::gguf::mv_detail {
 
@@ -31,8 +32,13 @@ struct DynamicBody {
 };
 template <int SG, class Submitter, class Body>
 void submit_body(Submitter& submitter, sycl::nd_range<1> range, size_t warps, Body body) {
-    if (warps == 8) submitter.parallel_for(range, BoundBody<SG, Body>{body});
-    else submitter.parallel_for(range, DynamicBody<SG, Body>{body});
+    if constexpr (std::is_same_v<Submitter, sycl::queue>) {   // (no event: sycl_detail::launch)
+        if (warps == 8) sycl_detail::launch(submitter, range, BoundBody<SG, Body>{body});
+        else sycl_detail::launch(submitter, range, DynamicBody<SG, Body>{body});
+    } else {
+        if (warps == 8) submitter.parallel_for(range, BoundBody<SG, Body>{body});
+        else submitter.parallel_for(range, DynamicBody<SG, Body>{body});
+    }
 }
 
 // Upstream 870aedd9 ds4_gguf.cu BfJob/BfJobs and QuantItems. Job metadata is copied
