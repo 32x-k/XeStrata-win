@@ -694,7 +694,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     std::thread settle_th;
     const bool settle_idle_on = [] {
         const char* v = std::getenv("DS4_SETTLE_IDLE");
-        return v == nullptr || std::atoi(v) != 0;
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     const auto settle_stop = [&] {
         if (!settle_th.joinable()) return;

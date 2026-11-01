@@ -7144,7 +7144,7 @@ struct Model::Impl {
     }
 
     // the decode path's host side: each published routing in turn - its CPU lane experts (if any) into the answer's
-    // part, then the answer's seq.  Spins while requests come (a token's 40 layers), naps after 2 ms without one.
+    // part, then the answer's seq.  Spins while requests come (a token's 40 layers), then naps after DS4_LANE_SPIN_MS.
     void serve_lane() {
         unsigned next = 1;
         auto last = std::chrono::steady_clock::now();
@@ -7156,7 +7156,7 @@ struct Model::Impl {
                 // (a decode layer takes ~2.8 ms on a Strix Halo, longer than the old 2 ms spin window, so the thread slept
                 // before every request and Windows' sleep_for(20 us) wakes after ~1 ms or more: the lane's round trip.  Now it
                 // spins for DS4_LANE_SPIN_MS (default 250) after its last answer, i.e. through a whole decode token.)
-                static const long spin_ms = std::getenv("DS4_LANE_SPIN_MS") ? std::atol(std::getenv("DS4_LANE_SPIN_MS")) : 250;
+                static const long spin_ms = std::getenv("DS4_LANE_SPIN_MS") ? std::strtol(std::getenv("DS4_LANE_SPIN_MS"), nullptr, 10) : 250;
                 if (std::chrono::steady_clock::now() - last > std::chrono::milliseconds(spin_ms)) {
 #if defined(_WIN32)
                     // DS4_LANE_NAP=sleep turns it off: a high-resolution waitable timer (Windows 10 1803+) instead of sleep_for's timer tick
