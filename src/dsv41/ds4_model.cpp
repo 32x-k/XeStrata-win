@@ -1310,6 +1310,8 @@ struct Model::Impl {
     std::vector<ProfMark> prof_marks;
     std::map<int, std::vector<rt::Event>> prof_pool;   // by device: an event belongs to the device it was made on
     bool prof_window = false;   // (decode windows only: T == 1)
+    const bool prof_sync_on = std::getenv("DS4_PROF_SYNC") != nullptr;
+    double prof_sync_t = 0;     // DS4_PROF_SYNC: the host clock at the last mark
     // ... and a run of chunks' (prof_chunk): a layer's start, after its attention, after the routing and the shared
     // expert, after its experts (the streamed ones' waits for their reads in it); printed after the run
     bool prof_chunk = false;
@@ -1340,6 +1342,15 @@ struct Model::Impl {
     void prof_mark(const Dev& d, int stage) {
         if (ds4_dbg("DS4_TLOG")) {}
         if (!prof_window && !prof_chunk) return;
+        if (prof_window && !prof_chunk && prof_sync_on) {   // decode: the stream drained at each mark, host clock (events hang the driver on gfx1151 Windows)
+            std::lock_guard<std::mutex> lk(prof_mu);
+            rt::set_device(d.id);
+            rt::stream_sync(d.st);
+            const double t = now_ms();
+            if (prof_sync_t > 0) st.prof_ms[stage] += t - prof_sync_t;
+            prof_sync_t = now_ms();
+            return;
+        }
         std::lock_guard<std::mutex> lk(prof_mu);
         int cur = 0;
         rt::get_device(&cur);
@@ -1357,6 +1368,12 @@ struct Model::Impl {
     }
     void prof_collect() {
         if (!prof_window && !prof_chunk) return;
+        if (prof_window && !prof_chunk && prof_sync_on) {
+            std::lock_guard<std::mutex> lk(prof_mu);
+            prof_sync_t = 0;
+            ++st.prof_tokens;
+            return;
+        }
         std::lock_guard<std::mutex> lk(prof_mu);
         std::vector<std::pair<const Dev*, rt::Event>> last;
         for (const ProfMark& m : prof_marks) {
@@ -7106,8 +7123,24 @@ struct Model::Impl {
             Req& r = reqs[next % kRing];
             if (std::atomic_ref<unsigned>(r.seq).load(std::memory_order_acquire) != next) {
                 cpu_relax();
-                if (std::chrono::steady_clock::now() - last > std::chrono::milliseconds(2))
+                // (a decode layer takes ~2.8 ms on a Strix Halo, longer than the old 2 ms spin window, so the thread slept
+                // before every request and Windows' sleep_for(20 us) wakes after ~1 ms or more: the lane's round trip.  Now it
+                // spins for DS4_LANE_SPIN_MS (default 250) after its last answer, i.e. through a whole decode token.)
+                static const long spin_ms = std::getenv("DS4_LANE_SPIN_MS") ? std::atol(std::getenv("DS4_LANE_SPIN_MS")) : 250;
+                if (std::chrono::steady_clock::now() - last > std::chrono::milliseconds(spin_ms)) {
+#if defined(_WIN32)
+                    // DS4_LANE_NAP=sleep turns it off: a high-resolution waitable timer (Windows 10 1803+) instead of sleep_for's timer tick
+                    static const bool hires = !(std::getenv("DS4_LANE_NAP") != nullptr && std::string(std::getenv("DS4_LANE_NAP")) == "sleep");
+                    static HANDLE tmr = hires ? CreateWaitableTimerExW(nullptr, nullptr, 0x2 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */, TIMER_ALL_ACCESS) : nullptr;
+                    if (tmr != nullptr) {
+                        LARGE_INTEGER due;
+                        due.QuadPart = -200;   // 20 us in 100 ns units
+                        SetWaitableTimer(tmr, &due, 0, nullptr, nullptr, FALSE);
+                        WaitForSingleObject(tmr, 5);
+                    } else
+#endif
                     std::this_thread::sleep_for(std::chrono::microseconds(20));
+                }
                 continue;
             }
             const int li = layer_of[next % kRing].load(std::memory_order_acquire);
@@ -7234,7 +7267,9 @@ struct Model::Impl {
                         }
                     po = ord;
                 }
-                if (!ents.empty()) {
+                static const bool lane_skip = std::getenv("DS4_LANE_SKIP") != nullptr;   // (timing oracle: the lane's compute left out; rp.cpu stays 0)
+                if (!ents.empty() && lane_skip) { for (int t = 0; t < T; ++t) rp.cpu[t] = 0; }
+                else if (!ents.empty()) {
                     const double tc = now_ms();
                     cpu_experts(l, &r.x[0][0], ents, (size_t) kMaxDim, po);
                     const int D = g.dim;
@@ -8933,7 +8968,7 @@ struct Model::Impl {
             chunk_rec.reset(new std::atomic<int>[chunk_done.size()]);
             for (size_t i = 0; i < chunk_done.size(); ++i) chunk_rec[i].store(0);
         }
-        prof_chunk = prof_on;
+        prof_chunk = prof_on && !prof_sync_on;   // (DS4_PROF_SYNC: the decode profile only; the prompt events hang the driver)
         const bool lm = lm_begin(run);
         struct LmEnd {   // (every way out: its host memory freed once the device is done with it)
             Impl* p;
