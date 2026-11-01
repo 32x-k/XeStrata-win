@@ -6828,10 +6828,15 @@ struct Model::Impl {
     // after a chunked prompt: the expert cache catches up with what the prompt picked at once - a window prompt gets
     // its swaps one tick at a time over its hundreds of windows, a chunked one has a single tick - so the decode that
     // follows finds the hot experts in VRAM.  Rounds of the ordinary swap rule (the hottest CPU-lane pick of each layer
-    // in, its coldest VRAM expert out) until nothing is worth moving or DS4_SETTLE_MS (6000) is spent
+    // in, its coldest VRAM expert out) until nothing is worth moving or DS4_SETTLE_MS is spent.
+    // The budget was 6,000 ms, and it sits inside the prompt's own time ("prompt: N tokens in X ms"): measured on Strix Halo
+    // 2026-10-28, the same p4k fixture took 26.6 s with it and 20.4 s without, +30.5% on the prompt (153.9 -> 200.8 tok/s).
+    // What the swaps buy is decode: about 10% on a 256-token answer, i.e. 6.2 s of prompt against 1.6 s of decode on that
+    // answer and nothing at all on a 50-300-token tool-call answer.  800 ms keeps the hottest of them and gives the prompt
+    // back about 5 s (the plan's own table: prompt + 256 tokens, 27.2 s at 6,000 ms, 23.9 s at 800, 23.4 s at 0).
     void cache_settle() {
         if (!o.expert_cache || cache_ths.empty()) return;
-        static const double budget = env_f("DS4_SETTLE_MS", 6000.0f);
+        static const double budget = env_f("DS4_SETTLE_MS", 800.0f);
         if (budget <= 0.0) return;
         const double t0 = now_ms();
         const int64_t s0 = st.swaps;
