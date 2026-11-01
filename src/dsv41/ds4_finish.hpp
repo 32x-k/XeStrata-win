@@ -62,7 +62,9 @@ inline int subgroup(const Caps& c, bool norm) {
 template <int SG, class Body>
 struct BoundBody {
     Body body;
-    [[sycl::reqd_work_group_size(kThreads), sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]]
+    // Inlined into the kernel as upstream's __global__ body is: left a call (the body is past the inliner's size
+    // limit), the kernel copied its arguments to private memory and read Finish from there (R9700, HIP backend).
+    [[sycl::reqd_work_group_size(kThreads), sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] [[gnu::always_inline]]
     void operator()(sycl::nd_item<1> item) const { body(item); }
 };
 
@@ -170,29 +172,23 @@ void finish_kernel(float* x, int vectors, int len, long long stride, Finish f, s
             float* row = x + static_cast<long long>(vector) * stride;
             float r[kValues], ss = 0.f;
             const int count = (len + kThreads - 1) / kThreads;
-            static_for<kValues>([&](auto index) {
-                constexpr int j = decltype(index)::value;
-                if (j >= count) return;
+            for (int j = 0; j < count; ++j) {
                 const int e = tid + j * kThreads;
                 r[j] = e < len ? row[e] : 0.f;
                 ss += r[j] * r[j];
-            });
+            }
             if (f.w) {
                 const float total = block_sum<SG>(item, ss, red, exchange);
                 const float inv = sycl::rsqrt(total / float(len) + f.eps);
-                static_for<kValues>([&](auto index) {
-                    constexpr int j = decltype(index)::value;
-                    if (j >= count) return;
+                for (int j = 0; j < count; ++j) {
                     const int e = tid + j * kThreads;
                     if (e < len) r[j] = r[j] * inv * f.w[e];
-                });
+                }
             }
             if (f.rd > 0) {
                 const int r0 = len - f.rd;
                 const int pos = f.pos + int(vector / size_t(f.vpp)) * f.pos_step;
-                static_for<kValues>([&](auto index) {
-                    constexpr int j = decltype(index)::value;
-                    if (j >= count) return;
+                for (int j = 0; j < count; ++j) {
                     const int e = tid + j * kThreads;
                     const float other = sycl::permute_group_by_xor(item.get_sub_group(), r[j], 1);
                     if (e >= r0 && e < len) {
@@ -201,14 +197,12 @@ void finish_kernel(float* x, int vectors, int len, long long stride, Finish f, s
                         if (((e - r0) & 1) == 0) r[j] = r[j] * c - other * sn;
                         else r[j] = other * sn + r[j] * c;
                     }
-                });
+                }
             }
             uint8_t* packed = Pack ? f.pdst + static_cast<long long>(vector) * f.pdst_stride : nullptr;
             if (f.quant != 0 || Pack) {
                 const int group = f.quant == 2 ? 16 : 32;
-                static_for<kValues>([&](auto index) {
-                    constexpr int j = decltype(index)::value;
-                    if (j >= count) return;
+                for (int j = 0; j < count; ++j) {
                     const int e = tid + j * kThreads;
                     const float a = group_max<SG>(item, e < len ? sycl::fabs(r[j]) : 0.f, group, exchange);
                     float rounded = 0.f, scale = 1.f;
@@ -229,17 +223,15 @@ void finish_kernel(float* x, int vectors, int len, long long stride, Finish f, s
                             packed[(f.quant == 1 ? len : len / 2) + e / group] = f.quant == 2 ?
                                 e4m3_code(scale) : uint8_t(sycl::bit_cast<uint32_t>(scale) >> 23);
                     }
-                });
+                }
             }
             uint16_t* dst = f.dst ? f.dst + static_cast<long long>(vector) * f.dst_stride : nullptr;
-            static_for<kValues>([&](auto index) {
-                constexpr int j = decltype(index)::value;
-                if (j >= count) return;
+            for (int j = 0; j < count; ++j) {
                 const int e = tid + j * kThreads;
-                if (e >= len) return;
+                if (e >= len) continue;
                 if (dst) dst[e] = bf16_rn(r[j]);
                 else if (!Pack) row[e] = r[j];
-            });
+            }
         };
         handler.parallel_for(sycl::nd_range<1>(size_t(vectors) * kThreads, kThreads), BoundBody<SG, decltype(body)>{body});
     });
