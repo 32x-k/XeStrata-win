@@ -266,6 +266,67 @@ static void token_contract(int type, const std::vector<Mat>& g, const std::vecto
     }
 }
 
+// gg::win_experts on a window of T tokens (moe_win_group's groups: each distinct expert once, its entries t * 8 + i)
+// against the same tokens one at a time through gg::moe_gate_up / moe_down: the same int8 rows and kernels.
+template <class Report>
+static void window_contract(int type, const std::vector<float>& x, int k, int ff, uint8_t* blobs, size_t stride,
+                            const size_t* offsets, float limit, Report report) {
+    if (type != iq::kIQ1_S && type != iq::kIQ1_M && type != iq::kIQ2_XXS &&
+        type != iq::kIQ2_XS && type != iq::kIQ2_S && type != iq::kIQ3_XXS) return;
+    constexpr int T = 4, K = 3, P = 8;
+    const int pick[T][K] = {{0, 2, -1}, {2, 1, 0}, {1, -1, 2}, {0, 1, 2}};
+    std::vector<unsigned long long> plan((size_t) T * P, 0);
+    std::vector<float> weights((size_t) T * P, 0.0f), shared((size_t) T * k);
+    std::vector<unsigned long long> gp;
+    std::vector<int> gs{0}, ge;
+    for (int e = 0; e < 3; ++e) {
+        for (int t = 0; t < T; ++t) for (int i = 0; i < K; ++i) if (pick[t][i] == e) ge.push_back(t * P + i);
+        if ((int) ge.size() > gs.back()) { gp.push_back(reinterpret_cast<unsigned long long>(blobs + e * stride)); gs.push_back((int) ge.size()); }
+    }
+    for (int t = 0; t < T; ++t) for (int i = 0; i < K; ++i) {
+        if (pick[t][i] >= 0) plan[(size_t) t * P + i] = reinterpret_cast<unsigned long long>(blobs + pick[t][i] * stride);
+        weights[(size_t) t * P + i] = 0.125f * (float) (i + 1 + t);
+    }
+    for (size_t j = 0; j < shared.size(); ++j) shared[j] = x[j % x.size()] * 0.25f;
+    const auto* dplan = up(plan);
+    const auto* dw = up(weights);
+    const auto* dshared = up(shared);
+    const auto* dx = up(x);
+    strata::dsv41k::exl3::WinArgs w{};
+    w.grp_ptr = up(gp); w.grp_start = up(gs); w.grp_ent = up(ge); w.n_groups = up(std::vector<int>{(int) gp.size()});
+    w.plan_ptr = dplan; w.plan_w = dw; w.x = dx; w.x_stride = (size_t) k; w.sh_out = dshared;
+    float *h, *part, *out;
+    device_alloc(h, (size_t) T * P * ff * 4); device_alloc(part, (size_t) T * P * k * 4); device_alloc(out, (size_t) T * k * 4);
+    w.h = h; w.part = part; w.out = out; w.out_stride = (size_t) k;
+    w.lay.fmt = gg::kFmtMXFP4;
+    for (int role = 0; role < 3; ++role) { w.lay.K[role] = type; w.lay.trellis[role] = offsets[role]; }
+    w.T = T; w.k = K; w.n_embd = k; w.n_ff = ff; w.limit = limit;
+    if (!gg::win_experts(w, queue())) throw std::runtime_error("window contract fixture refused");
+    const auto window = down_(out, (size_t) T * k);
+    double worst = 0.0;
+    bool same = true;
+    float *th, *tout;
+    device_alloc(th, (size_t) K * ff * 4); device_alloc(tout, (size_t) k * 4);
+    for (int t = 0; t < T; ++t) {
+        strata::dsv41k::exl3::MoeArgs ma{};
+        ma.plan_ptr = dplan + (size_t) t * P; ma.plan_w = dw + (size_t) t * P; ma.k = K;
+        ma.n_embd = k; ma.n_ff = ff; ma.limit = limit; ma.lay = w.lay;
+        gg::moe_gate_up(ma, dx + (size_t) t * k, th, queue());
+        gg::moe_down(ma, th, dshared + (size_t) t * k, tout, queue());
+        const auto token = down_(tout, (size_t) k);
+        for (int r = 0; r < k; ++r) {
+            const float a = window[(size_t) t * k + r], b = token[r];
+            uint32_t ab, bb;
+            std::memcpy(&ab, &a, 4);
+            std::memcpy(&bb, &b, 4);
+            same = same && ab == bb;
+            worst = std::max(worst, std::isfinite(a) ? std::fabs((double) a - b) / (std::fabs((double) b) + 1e-6) : 1e30);
+        }
+    }
+    report("window against tokens", type, worst, 1e-5);
+    std::printf("%-7s window against tokens: %s\n", iq::name(type), same ? "bit-equal" : "within tolerance only");
+}
+
 // Default upstream runr declines N=64/192 although the vector-load alignment is
 // valid. These 17-row sets must retain FP32 inputs/weights in the FMA fallback.
 template <class Report>
@@ -862,6 +923,7 @@ int main(int argc, char** argv) try {
                 }
             report("token down", type, worst, 1e-6);
             token_contract(type, G, U, D, x, dblob, blob, off, lim, report);
+            window_contract(type, x, E, FF, dblob, blob, off, lim, report);
             light_contract(type, G, U, D, x, dblob, blob, off, lim, report);
 
             // ---- the prompt sets: expert 0 owns rows [0, 37), expert 2 [37, 42)

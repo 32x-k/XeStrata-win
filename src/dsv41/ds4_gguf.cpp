@@ -647,6 +647,46 @@ bool win_experts(const x3::WinArgs& a, sycl::queue& s) {
         !layout_ok(a.lay, a.n_embd, a.n_ff)) return fail("invalid expert window");
     const int tg = expert_type(a.lay, 0), tu = expert_type(a.lay, 1), td = expert_type(a.lay, 2);
     const size_t rg = type_row_bytes(tg, a.n_embd), ru = type_row_bytes(tu, a.n_embd), rd = type_row_bytes(td, a.n_ff);
+    const size_t cpu_stride = a.cpu_stride ? a.cpu_stride : size_t(a.n_embd);
+    const auto combine = [&] {
+        if (a.wait_ptr) wait_seq(a.wait_ptr, a.wait_val, s);
+        parallel(s, size_t(a.T) * a.n_embd, [=](size_t z) {
+            const size_t t = z / a.n_embd, c = z % a.n_embd;
+            float result = 0.f;
+            for (int i = 0; i < a.k; ++i) if (a.plan_ptr[t * kPicks + i])
+                result += a.plan_w[t * kPicks + i] * a.part[(t * kPicks + i) * a.n_embd + c];
+            if (a.cpu_part && a.cpu_flag && a.cpu_flag[t]) result += a.cpu_part[t * cpu_stride + c];
+            if (a.sh_out) result += a.sh_out[z];
+            a.out[t * a.out_stride + c] = result;
+        });
+    };
+    // Upstream win_experts for low-bit experts: the window's distinct experts as moe_win_group's groups, each read once
+    // for its tokens by ds4_iq's kernels on int8 rows (x, then h, through the same scratch on the in-order queue).
+    x3::MoeArgs ma;
+    ma.plan_ptr = a.plan_ptr; ma.lay = a.lay; ma.k = a.k; ma.n_embd = a.n_embd; ma.n_ff = a.n_ff; ma.limit = a.limit;
+    iq::Args q;
+    if (a.grp_ptr && a.grp_start && a.grp_ent && a.n_groups && token_iq_args(ma, q)) {
+        const auto& caps = token_caps(s);
+        const size_t entries = size_t(a.T) * kPicks;
+        TokenScratch* scratch = caps.subgroup ?
+            quant_scratch(std::max(size_t(a.T) * a.n_embd, entries * a.n_ff), 0, caps, s) : nullptr;
+        if (scratch) {
+            sycl_detail::require_in_order(s);
+            q.grp_ptr = a.grp_ptr; q.grp_start = a.grp_start; q.grp_ent = a.grp_ent; q.n_groups = a.n_groups;
+            q.h = a.h; q.part = a.part;
+            q.xq = scratch->codes; q.xd = scratch->scales;
+            q.hq = scratch->codes; q.hd = scratch->scales;
+            const int groups = a.T * a.k;   // at most (the groups past the real count return at once)
+            if (caps.subgroup == 32)
+                q8_quant_token<32>(a.x, a.x_stride, a.T, a.n_embd, scratch->codes, scratch->scales, caps.quant_group, s);
+            else q8_quant_token<16>(a.x, a.x_stride, a.T, a.n_embd, scratch->codes, scratch->scales, caps.quant_group, s);
+            if (!iq::gate_up(q, groups, a.T, s)) return fail("unsupported IQ window gate/up");
+            q8_quant_token(a.h, int(entries), a.n_ff, *scratch, caps, s);
+            if (!iq::down(q, groups, a.T, s)) return fail("unsupported IQ window down");
+            combine();
+            return true;
+        }
+    }
     parallel(s, size_t(a.T) * kPicks * a.n_ff, [=](size_t z) {
         const size_t entry = z / a.n_ff, t = entry / kPicks, pick = entry % kPicks, c = z % a.n_ff;
         const auto* blob = pick < size_t(a.k) ? reinterpret_cast<const uint8_t*>(a.plan_ptr[entry]) : nullptr;
@@ -661,17 +701,7 @@ bool win_experts(const x3::WinArgs& a, sycl::queue& s) {
         const auto* blob = pick < size_t(a.k) ? reinterpret_cast<const uint8_t*>(a.plan_ptr[entry]) : nullptr;
         a.part[z] = blob ? quant_dot(td, blob + a.lay.trellis[2] + c * rd, a.h + entry * a.n_ff, a.n_ff) : 0.f;
     });
-    if (a.wait_ptr) wait_seq(a.wait_ptr, a.wait_val, s);
-    const size_t cpu_stride = a.cpu_stride ? a.cpu_stride : size_t(a.n_embd);
-    parallel(s, size_t(a.T) * a.n_embd, [=](size_t z) {
-        const size_t t = z / a.n_embd, c = z % a.n_embd;
-        float result = 0.f;
-        for (int i = 0; i < a.k; ++i) if (a.plan_ptr[t * kPicks + i])
-            result += a.plan_w[t * kPicks + i] * a.part[(t * kPicks + i) * a.n_embd + c];
-        if (a.cpu_part && a.cpu_flag && a.cpu_flag[t]) result += a.cpu_part[t * cpu_stride + c];
-        if (a.sh_out) result += a.sh_out[z];
-        a.out[t * a.out_stride + c] = result;
-    });
+    combine();
     return true;
 }
 void set_gate_up(const x3::SetArgs& a, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh, sycl::queue& s) {
