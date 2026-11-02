@@ -362,7 +362,7 @@ bool gate_up(const Args& a, int groups, int ne_max, sycl::queue& s) {
     if (is_tq(a.tg)) return tq::gate_up(a, groups, ne_max, s);
     return dispatch(a.tg, [&](auto t) {
         if constexpr (t.value == kIQ1_S || t.value == kIQ1_M || t.value == kIQ2_XXS ||
-                      t.value == kIQ2_XS || t.value == kIQ2_S || t.value == kIQ3_XXS) {
+                      t.value == kIQ2_XS || t.value == kIQ2_S || t.value == kIQ3_XXS || t.value == kMXFP4) {
             if (token_detail::launch<t.value, true>(a, groups, ne_max, s)) return;
         }
         portable::token<true>(a, groups, ne_max, row_bytes_t<t.value>(a.n_embd), Decoder<t.value>{}, s);
@@ -372,7 +372,7 @@ bool down(const Args& a, int groups, int ne_max, sycl::queue& s) {
     if (is_tq(a.td)) return tq::down(a, groups, ne_max, s);
     return dispatch(a.td, [&](auto t) {
         if constexpr (t.value == kIQ1_S || t.value == kIQ1_M || t.value == kIQ2_XXS ||
-                      t.value == kIQ2_XS || t.value == kIQ2_S || t.value == kIQ3_XXS) {
+                      t.value == kIQ2_XS || t.value == kIQ2_S || t.value == kIQ3_XXS || t.value == kMXFP4) {
             if (token_detail::launch<t.value, false>(a, groups, ne_max, s)) return;
         }
         portable::token<false>(a, groups, ne_max, row_bytes_t<t.value>(a.n_ff), Decoder<t.value>{}, s);

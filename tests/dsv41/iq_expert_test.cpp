@@ -272,7 +272,7 @@ template <class Report>
 static void window_contract(int type, const std::vector<float>& x, int k, int ff, uint8_t* blobs, size_t stride,
                             const size_t* offsets, float limit, Report report) {
     if (type != iq::kIQ1_S && type != iq::kIQ1_M && type != iq::kIQ2_XXS &&
-        type != iq::kIQ2_XS && type != iq::kIQ2_S && type != iq::kIQ3_XXS) return;
+        type != iq::kIQ2_XS && type != iq::kIQ2_S && type != iq::kIQ3_XXS && type != 39) return;
     constexpr int T = 4, K = 3, P = 8;
     const int pick[T][K] = {{0, 2, -1}, {2, 1, 0}, {1, -1, 2}, {0, 1, 2}};
     std::vector<unsigned long long> plan((size_t) T * P, 0);
@@ -325,6 +325,7 @@ static void window_contract(int type, const std::vector<float>& x, int k, int ff
     }
     report("window against tokens", type, worst, 1e-5);
     std::printf("%-7s window against tokens: %s\n", iq::name(type), same ? "bit-equal" : "within tolerance only");
+    if (type == 39) return;
     // The host-routed prompt's public matvec, against independently quantized
     // activation rows consumed by the established IQ entry point.
     std::vector<int8_t> codes(size_t(T) * k);
@@ -354,6 +355,64 @@ static void window_contract(int type, const std::vector<float>& x, int k, int ff
     for (size_t j = 0; j < actual.size(); ++j)
         mv_error = std::max(mv_error, std::fabs(double(actual[j]) - expected[j]) / (std::fabs(double(expected[j])) + 1e-6));
     report("prompt matvec", type, mv_error, 1e-5);
+}
+
+template <class Report>
+static void mx_contract(Report report) {
+    constexpr int type = 39, k = 512, ff = 256, experts = 3;
+    const size_t rb = gg::type_row_bytes(type, k), rd = gg::type_row_bytes(type, ff);
+    const size_t offsets[3] = {0, size_t(ff) * rb, size_t(2 * ff) * rb};
+    const size_t stride = offsets[2] + size_t(k) * rd;
+    std::vector<uint8_t> blob(stride * experts);
+    for (size_t b = 0; b < blob.size() / 17; ++b) {
+        blob[b * 17] = 125;
+        for (int j = 1; j < 17; ++j) blob[b * 17 + j] = uint8_t(b * 37 + size_t(j) * 13);
+    }
+    std::vector<float> x(size_t(4) * k);
+    for (size_t j = 0; j < x.size(); ++j) x[j] = float(int(j % 31) - 15) * 0.001f;
+    auto* device = up(blob);
+    window_contract(type, x, k, ff, device, stride, offsets, 7.f, report);
+    std::vector<unsigned long long> plan(experts);
+    std::vector<float> weights{.25f, .5f, .75f}, shared(k, .125f);
+    for (int e = 0; e < experts; ++e) plan[e] = reinterpret_cast<unsigned long long>(device + size_t(e) * stride);
+    strata::dsv41k::exl3::MoeArgs a{};
+    a.plan_ptr = up(plan); a.plan_w = up(weights); a.k = experts; a.n_embd = k; a.n_ff = ff; a.limit = 7.f;
+    a.lay.fmt = gg::kFmtMXFP4;
+    for (int r = 0; r < 3; ++r) a.lay.trellis[r] = offsets[r];
+    float *h, *out; device_alloc(h, size_t(experts) * ff * 4); device_alloc(out, size_t(k) * 4);
+    gg::moe_gate_up(a, up(x), h, queue());
+    const auto actual_h = down_(h, size_t(experts) * ff);
+    const auto dot = [](const float* w, const Q8& q) {
+        float sum = 0;
+        for (size_t b = 0; b < q.d.size(); ++b) {
+            float block = 0;
+            for (int j = 0; j < 32; ++j) block += float(q.q[b * 32 + j]) * w[b * 32 + j];
+            sum = std::fma(q.d[b], block, sum);
+        }
+        return sum;
+    };
+    const Q8 input = quant(x.data(), k);
+    std::vector<float> decoded(size_t(k) * ff), gate(ff), expected(k, .125f);
+    double gu_error = 0;
+    const auto* traits = ggml_get_type_traits((ggml_type)type);
+    for (int e = 0; e < experts; ++e) {
+        traits->to_float(blob.data() + size_t(e) * stride, decoded.data(), k * ff);
+        for (int r = 0; r < ff; ++r) gate[r] = dot(decoded.data() + size_t(r) * k, input);
+        traits->to_float(blob.data() + size_t(e) * stride + offsets[1], decoded.data(), k * ff);
+        for (int r = 0; r < ff; ++r) {
+            const float reference = swiglu_f32(gate[r], dot(decoded.data() + size_t(r) * k, input), 7.f);
+            gu_error = std::max(gu_error, std::fabs(double(actual_h[size_t(e) * ff + r]) - reference) / (1 + std::fabs(double(reference))));
+        }
+        const Q8 hidden = quant(actual_h.data() + size_t(e) * ff, ff);
+        traits->to_float(blob.data() + size_t(e) * stride + offsets[2], decoded.data(), k * ff);
+        for (int r = 0; r < k; ++r) expected[r] += weights[e] * dot(decoded.data() + size_t(r) * ff, hidden);
+    }
+    gg::moe_down(a, h, up(shared), out, queue());
+    const auto actual = down_(out, k);
+    double down_error = 0;
+    for (int r = 0; r < k; ++r) down_error = std::max(down_error, std::fabs(double(actual[r]) - expected[r]) / (1 + std::fabs(double(expected[r]))));
+    report("MX gate ggml reference", type, gu_error, 1e-5);
+    report("MX down ggml reference", type, down_error, 1e-5);
 }
 
 // Default upstream runr declines N=64/192 although the vector-load alignment is
@@ -875,6 +934,7 @@ int main(int argc, char** argv) try {
         std::printf("%-7s %-22s worst %.2e (tol %.0e) %s\n", iq::name(type), what, worst, tol, ok ? "ok" : "FAIL");
         fails += !ok;
     };
+    mx_contract(report);
     for (int type : types) {
         if (!iq::supported(type) && !iq::known(type)) { std::printf("%-7s not a type this engine knows\n", iq::name(type)); ++fails; continue; }
         if (type == iq::kIQ2_XXS) matrix_precision_boundary(report);

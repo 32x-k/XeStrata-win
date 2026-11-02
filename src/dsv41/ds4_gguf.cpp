@@ -346,8 +346,8 @@ void q8_quant_token(const float* x, int rows, int k, TokenScratch& scratch, cons
 
 bool token_iq_args(const x3::MoeArgs& a, iq::Args& q) {
     const int tg = expert_type(a.lay, 0), tu = expert_type(a.lay, 1), td = expert_type(a.lay, 2);
-    if (a.k <= 0 || tg != tu || tg == kTypeMXFP4 || td == kTypeMXFP4 ||
-        iq::is_tq(tg) || iq::is_tq(td) || !iq::supported(tg) || !iq::supported(td)) return false;
+    if (a.k <= 0 || tg != tu || iq::is_tq(tg) || iq::is_tq(td) ||
+        (!iq::supported(tg) && tg != kTypeMXFP4) || (!iq::supported(td) && td != kTypeMXFP4)) return false;
     q.plan_ptr = a.plan_ptr;
     for (int r = 0; r < 3; ++r) q.tr[r] = a.lay.trellis[r];
     q.n_embd = a.n_embd; q.n_ff = a.n_ff; q.limit = a.limit; q.tg = tg; q.td = td;
