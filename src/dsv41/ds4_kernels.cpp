@@ -621,7 +621,7 @@ bool unpack_selected_parts(const void* ckv, const int* sel, int sel_stride, cons
         }
         if (j >= selected) return;
         const auto* row = static_cast<const uint8_t*>(ckv) + size_t(sel[size_t(t) * sel_stride + j]) * row_bytes;
-        const auto codes = load_aligned<sycl::vec<uint32_t, 4>, 16>(row + part * 16);
+        const auto codes = load_aligned<sycl::vec<uint32_t, 4>, 16>(row + size_t(part) * 16);
         const float k0 = e4m3_value(row[Dim / 2 + part * 2]), k1 = e4m3_value(row[Dim / 2 + part * 2 + 1]);
         sycl::vec<uint32_t, 16> out;
 #pragma unroll
@@ -631,7 +631,7 @@ bool unpack_selected_parts(const void* ckv, const int* sel, int sel_stride, cons
             out[i] = uint32_t(bf16_rn(e2m1_value(uint8_t(b & 15u)) * k)) |
                      uint32_t(bf16_rn(e2m1_value(uint8_t((b >> 4) & 15u)) * k)) << 16;
         }
-        __builtin_memcpy(__builtin_assume_aligned(decoded + (size_t(t) * decoded_stride + j) * Dim + part * 32, 16),
+        __builtin_memcpy(__builtin_assume_aligned(decoded + (size_t(t) * decoded_stride + j) * Dim + size_t(part) * 32, 16),
                          &out, sizeof(out));
     });
     return true;
