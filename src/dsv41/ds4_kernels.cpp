@@ -13,6 +13,9 @@
 #include "ds4_hc.hpp"
 #include "strata/core/per_device.hpp"
 #include "strata/core/readback.hpp"
+#if defined(SYCL_EXT_ONEAPI_SUB_GROUP_MASK) && SYCL_EXT_ONEAPI_SUB_GROUP_MASK >= 2
+#include <sycl/ext/oneapi/sub_group_mask.hpp>
+#endif
 #include <algorithm>
 #include <atomic>
 #include <cfloat>
@@ -662,6 +665,127 @@ bool index_score_group(const float* q, const float* w, const uint8_t* kc, int he
     return true;
 }
 
+// Upstream topk_kernel's ballot/popcount and warp-count prefix, generalized to
+// reported subgroups. The old WG scan path remains the capability fallback.
+#if defined(SYCL_EXT_ONEAPI_SUB_GROUP_MASK) && SYCL_EXT_ONEAPI_SUB_GROUP_MASK >= 2
+template <int SG>
+bool topk_ballot_group(const float* vals, long long stride, int T, const Rows& r, const int* cand, int cand_stride,
+                       int blk, int* out, int out_stride, size_t wg, const GroupCaps& caps, sycl::queue& s) {
+    if (wg % SG || !has_subgroup(caps, SG)) return false;
+    const size_t count_groups = wg / SG;
+    const size_t local_bytes = 256 * sizeof(unsigned) + 5 * sizeof(uint32_t) + 2 * count_groups * sizeof(int);
+    if (caps.local < local_bytes) return false;
+    sycl_detail::submit(s, [&](sycl::handler& h) {
+        sycl::local_accessor<unsigned, 1> hist(sycl::range<1>(256), h);
+        sycl::local_accessor<uint32_t, 1> state(sycl::range<1>(5), h); // prefix, mask, remaining, gt, eq
+        sycl::local_accessor<int, 1> offsets(sycl::range<1>(2 * count_groups), h);
+        h.parallel_for(sycl::nd_range<1>(size_t(T) * wg, wg),
+                       [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
+            const auto sg = item.get_sub_group();
+            const int lane = int(sg.get_local_id()[0]), width = int(sg.get_local_range()[0]);
+            const int wid = int(sg.get_group_id()[0]), groups = int(sg.get_group_range()[0]);
+            // Assign consecutive logical positions from subgroup IDs explicitly;
+            // do not assume a physical mapping from work-group local IDs.
+            const int tid = wid * width + lane, step = int(wg), t = int(item.get_group_linear_id());
+            int n, k;
+            rows_at(r, t, n, k);
+            if (n <= 0 || k <= 0) return;
+            const float* v = vals + static_cast<long long>(t) * stride;
+            int* dst = out + size_t(t) * out_stride;
+            const int* cd = cand ? cand + size_t(t) * cand_stride : nullptr;
+            if (k >= n) {
+                for (int i = tid; i < n; i += step) dst[i] = cd ? cd[i / blk] * blk + i % blk : i;
+                return;
+            }
+            if (tid == 0) {
+                state[0] = 0u; state[1] = 0u; state[2] = uint32_t(k); state[3] = 0u; state[4] = 0u;
+            }
+            item.barrier(sycl::access::fence_space::local_space);
+            // Preserve all four upstream radix passes and the integer threshold.
+            for (int shift = 24; shift >= 0; shift -= 8) {
+                for (int i = tid; i < 256; i += step) hist[i] = 0u;
+                item.barrier(sycl::access::fence_space::local_space);
+                const uint32_t prefix = state[0], mask = state[1];
+                for (int i = tid; i < n; i += step) {
+                    const uint32_t u = ord_key(v[i]);
+                    if ((u & mask) == prefix)
+                        sycl::atomic_ref<unsigned, sycl::memory_order::relaxed, sycl::memory_scope::work_group,
+                                         sycl::access::address_space::local_space>(hist[(u >> shift) & 255u])
+                            .fetch_add(1u);
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+                if (tid == 0) {
+                    const int rem = int(state[2]);
+                    int cum = 0;
+                    for (int digit = 255; digit >= 0; --digit) {
+                        const int count = int(hist[digit]);
+                        if (cum + count >= rem) {
+                            state[0] = prefix | (uint32_t(digit) << shift);
+                            state[1] = mask | (255u << shift);
+                            state[2] = uint32_t(rem - cum);
+                            break;
+                        }
+                        cum += count;
+                    }
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+            }
+            const uint32_t threshold = state[0], below = (uint32_t(1) << lane) - 1u;
+            const int remaining = int(state[2]), n_gt = k - remaining;
+            for (int i0 = 0; i0 < n; i0 += step) {
+                const int i = i0 + tid;
+                const uint32_t u = i < n ? ord_key(v[i]) : 0u;
+                const bool gt = i < n && u > threshold, eq = i < n && u == threshold;
+                uint32_t bg = 0, be = 0;
+                sycl::ext::oneapi::group_ballot(sg, gt).extract_bits(bg);
+                sycl::ext::oneapi::group_ballot(sg, eq).extract_bits(be);
+                if (lane == 0) {
+                    offsets[wid] = int(sycl::popcount(bg));
+                    offsets[groups + wid] = int(sycl::popcount(be));
+                }
+                item.barrier(sycl::access::fence_space::local_space);
+                if (wid == 0) {
+                    int carry_gt = int(state[3]), carry_eq = int(state[4]);
+                    // At WG1024, SG32 takes one chunk and SG16 takes four.
+                    // All members of this subgroup execute every shuffle.
+                    for (int first = 0; first < groups; first += width) {
+                        const int j = first + lane;
+                        const int g0 = j < groups ? offsets[j] : 0;
+                        const int e0 = j < groups ? offsets[groups + j] : 0;
+                        int gs = g0, es = e0;
+                        for (int delta = 1; delta < width; delta <<= 1) {
+                            const int a = sycl::shift_group_right(sg, gs, uint32_t(delta));
+                            const int b = sycl::shift_group_right(sg, es, uint32_t(delta));
+                            if (lane >= delta) { gs += a; es += b; }
+                        }
+                        if (j < groups) {
+                            offsets[j] = carry_gt + gs - g0;
+                            offsets[groups + j] = carry_eq + es - e0;
+                        }
+                        carry_gt += sycl::select_from_group(sg, gs, sycl::id<1>(size_t(width - 1)));
+                        carry_eq += sycl::select_from_group(sg, es, sycl::id<1>(size_t(width - 1)));
+                    }
+                    if (lane == 0) { state[3] = uint32_t(carry_gt); state[4] = uint32_t(carry_eq); }
+                }
+                // No conditional subgroup barrier: all work-items reach each
+                // work-group barrier, including the one before scratch reuse.
+                item.barrier(sycl::access::fence_space::local_space);
+                int slot = -1;
+                if (gt) slot = offsets[wid] + int(sycl::popcount(bg & below));
+                else if (eq) {
+                    const int equal_rank = offsets[groups + wid] + int(sycl::popcount(be & below));
+                    if (equal_rank < remaining) slot = n_gt + equal_rank;
+                }
+                if (slot >= 0) dst[slot] = cd ? cd[i / blk] * blk + i % blk : i;
+                item.barrier(sycl::access::fence_space::local_space);
+            }
+        });
+    });
+    return true;
+}
+#endif
+
+
 // Upstream topk_kernel: a work-group a row, the k-th largest key by four 8-bit radix passes over a local
 // histogram, then the picks in index order (strictly greater first, then the lowest equal positions). The ranks
 // are integer scans over the work-group, so the result does not depend on the group or sub-group size; the size
@@ -671,6 +795,10 @@ bool topk_group(const float* vals, long long stride, int T, const Rows& r, const
     const auto& caps = group_caps(s);
     const size_t wg = std::min<size_t>(1024, caps.max_group);
     if (wg < 32 || caps.local < 256 * sizeof(unsigned) + 4 * sizeof(uint32_t)) return false;
+#if defined(SYCL_EXT_ONEAPI_SUB_GROUP_MASK) && SYCL_EXT_ONEAPI_SUB_GROUP_MASK >= 2
+    if (topk_ballot_group<32>(vals, stride, T, r, cand, cand_stride, blk, out, out_stride, wg, caps, s)) return true;
+    if (topk_ballot_group<16>(vals, stride, T, r, cand, cand_stride, blk, out, out_stride, wg, caps, s)) return true;
+#endif
     sycl_detail::submit(s, [&](sycl::handler& h) {
         sycl::local_accessor<unsigned, 1> hist(sycl::range<1>(256), h);
         sycl::local_accessor<uint32_t, 1> state(sycl::range<1>(3), h);   // prefix, mask, remaining
