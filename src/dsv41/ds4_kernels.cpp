@@ -253,9 +253,12 @@ AttnTile attn_tile(const sycl::queue& q, int heads, int d, int T, int requested_
     }
     return best;
 }
+bool unpack_selected_parts(const void* ckv, const int* sel, int sel_stride, const AttnRows& a, int T, int d,
+                           uint16_t* decoded, size_t decoded_stride, sycl::queue& s);
 // Upstream unpack_sel_kernel: each query's selected packed rows decoded once into the scratch (rows decoded_stride apart).
 void unpack_selected(const void* ckv, const int* sel, int sel_stride, const AttnRows& a, int T, int d,
                      uint16_t* decoded, size_t decoded_stride, sycl::queue& s) {
+    if (unpack_selected_parts(ckv, sel, sel_stride, a, T, d, decoded, decoded_stride, s)) return;
     const size_t dim = size_t(d), row_bytes = kv_row_bytes(kKvFp4, d);
     parallel(s, size_t(T) * sel_stride * dim, [=](size_t i) {
         const size_t row = i / dim, t = row / sel_stride, j = row % sel_stride, e = i % dim;
@@ -592,6 +595,46 @@ void gemv_f32_warp(const float* W, const float* x, int n, int k, int T, float* y
         acc = subgroup_sum<SG>(it.get_sub_group(), acc);
         if (lane == 0) y[size_t(t) * ldy + row] = acc;
     });
+}
+// Upstream unpack_sel_kernel's shape for 512-value rows: sixteen work-items a selected row, each 32 values from one
+// 16-byte load of codes and their two scales, stored 16 bytes at a time - kv_value's values, the same BF16 bits.
+// Takes upstream's 256-item group where the device reports it, and 16-byte aligned rows.
+bool unpack_selected_parts(const void* ckv, const int* sel, int sel_stride, const AttnRows& a, int T, int d,
+                           uint16_t* decoded, size_t decoded_stride, sycl::queue& s) {
+    constexpr int Parts = 16, Rows = 16, WG = Parts * Rows, Dim = 512;
+    if (d != Dim || sel_stride <= 0 || group_caps(s).max_group < size_t(WG) ||
+        reinterpret_cast<uintptr_t>(ckv) % 16 || reinterpret_cast<uintptr_t>(decoded) % 16) return false;
+    const size_t row_bytes = kv_row_bytes(kKvFp4, Dim), groups = (size_t(sel_stride) + Rows - 1) / Rows;
+    sycl_detail::launch(s, sycl::nd_range<2>(sycl::range<2>(size_t(T), groups * WG), sycl::range<2>(1, WG)),
+                        [=](sycl::nd_item<2> it) {
+        const int t = int(it.get_group(0)), item = int(it.get_local_id(1));
+        const int j = int(it.get_group(1)) * Rows + item / Parts, part = item % Parts;
+        // attn_counts' selected rows, a.nsel read at constant indices: indexing the kernel's copy of the rows
+        // by t would put it in private memory.
+        int selected = 0;
+        if (a.gen) {
+            if (a.R > 0) selected = int(sycl::min(static_cast<long long>(a.kcap), (a.p0 + a.t0 + t + 1) / a.R));
+        } else {
+#pragma unroll
+            for (int i = 0; i < kWin; ++i)
+                if (i == t) selected = a.nsel[i];
+        }
+        if (j >= selected) return;
+        const auto* row = static_cast<const uint8_t*>(ckv) + size_t(sel[size_t(t) * sel_stride + j]) * row_bytes;
+        const auto codes = load_aligned<sycl::vec<uint32_t, 4>, 16>(row + part * 16);
+        const float k0 = e4m3_value(row[Dim / 2 + part * 2]), k1 = e4m3_value(row[Dim / 2 + part * 2 + 1]);
+        sycl::vec<uint32_t, 16> out;
+#pragma unroll
+        for (int i = 0; i < 16; ++i) {   // values 2i and 2i + 1: the low and the high nibble of byte i
+            const uint32_t b = codes[i >> 2] >> (8 * (i & 3));
+            const float k = i < 8 ? k0 : k1;
+            out[i] = uint32_t(bf16_rn(e2m1_value(uint8_t(b & 15u)) * k)) |
+                     uint32_t(bf16_rn(e2m1_value(uint8_t((b >> 4) & 15u)) * k)) << 16;
+        }
+        __builtin_memcpy(__builtin_assume_aligned(decoded + (size_t(t) * decoded_stride + j) * Dim + part * 32, 16),
+                         &out, sizeof(out));
+    });
+    return true;
 }
 // The subgroup width the rows kernel can take on this device, or 0.
 int sparse_rows_width(const sycl::queue& s) {
