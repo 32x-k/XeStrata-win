@@ -1529,7 +1529,7 @@ void markov_group(float* logits, const uint16_t* E, const void* H, const int* to
             const auto sg = it.get_sub_group();
             const size_t lane = sg.get_local_linear_id();
             float sum = 0.f;
-            for (size_t c = lane * 8; c < size_t(R); c += SG * 8) {
+            for (size_t c = lane * 8; c < size_t(R); c += size_t(SG) * 8) {
                 if constexpr (Q8) {
                     const auto* row = static_cast<const uint8_t*>(H) + v * (size_t(R) / 32) * 34;
                     const auto* block = row + (c / 32) * 34;
@@ -1557,7 +1557,7 @@ void markov_group(float* logits, const uint16_t* E, const void* H, const int* to
 bool markov_cooperative(float* logits, const uint16_t* E, const void* H, const int* tok, int V, int R,
                         bool q8, sycl::queue& s) {
     if (V <= 0 || R <= 0 || R % 8 || (q8 && R % 32)) return false;
-    struct Caps { size_t group, bytes; std::vector<size_t> subgroups; };
+    struct Caps { size_t group = 0, bytes = 0; std::vector<size_t> subgroups; };
     static core::PerDevice<Caps> cache;
     const auto device = s.get_device();
     const auto& caps = cache.get(device, [&] {
@@ -1567,16 +1567,22 @@ bool markov_cooperative(float* logits, const uint16_t* E, const void* H, const i
                     device.get_info<sycl::info::device::sub_group_sizes>()};
     });
     if (size_t(R) > caps.bytes / sizeof(float)) return false;
-    const auto run = [&]<int SG>() {
-        if (caps.group < SG || std::find(caps.subgroups.begin(), caps.subgroups.end(), size_t(SG)) == caps.subgroups.end())
-            return false;
-        const size_t warps = std::min(size_t(8), caps.group / SG); // upstream's eight output rows per group, capped by the device
-        sycl_detail::require_in_order(s);
-        if (q8) markov_group<SG, true>(logits, E, H, tok, V, R, warps, s);
-        else markov_group<SG, false>(logits, E, H, tok, V, R, warps, s);
-        return true;
-    };
-    return run.template operator()<32>() || run.template operator()<16>();
+    size_t width = 0;
+    for (const size_t candidate : {size_t(32), size_t(16)})
+        if (candidate <= caps.group && std::find(caps.subgroups.begin(), caps.subgroups.end(), candidate) != caps.subgroups.end()) {
+            width = candidate; break;
+        }
+    if (!width) return false;
+    const size_t warps = std::min(size_t(8), caps.group / width); // upstream's eight output rows per group, capped by the device
+    sycl_detail::require_in_order(s);
+    if (width == 32) {
+        if (q8) markov_group<32, true>(logits, E, H, tok, V, R, warps, s);
+        else markov_group<32, false>(logits, E, H, tok, V, R, warps, s);
+    } else {
+        if (q8) markov_group<16, true>(logits, E, H, tok, V, R, warps, s);
+        else markov_group<16, false>(logits, E, H, tok, V, R, warps, s);
+    }
+    return true;
 }
 }  // namespace
 void markov_add(float* logits, const uint16_t* E, const uint16_t* H, const int* tok, int V, int R, sycl::queue& s) {
