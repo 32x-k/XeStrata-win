@@ -28,13 +28,15 @@ int check(int R, int V, bool q8, bool offset) {
     std::vector<uint8_t> quantized(pad + (q8 ? vocab * row_bytes : 1));
     std::vector<float> initial(vocab + 2, 12345.f), actual(initial.size());
     std::vector<double> expected(vocab);
-    for (size_t i = 0; i < embedding.size(); ++i) embedding[i] = ds::bf16_rn(float(int(i % 37) - 18) / 32.f);
+    for (size_t i = 0; i < embedding.size(); ++i)
+        embedding[i] = ds::bf16_rn(float(int(i % 37) - 18) / float(17 + i % 7));
     for (size_t v = 0; v < vocab; ++v) {
         initial[v + 1] = float(int(v % 7) - 3) / 8.f;
-        for (size_t i = 0; i < rank; ++i) head[pad + v * rank + i] = sd::f16_bits(float(int((v + i * 7) % 41) - 20) / 32.f);
+        for (size_t i = 0; i < rank; ++i)
+            head[pad + v * rank + i] = sd::f16_bits(float(int((v + i * 7) % 41) - 20) / float(19 + (v + i) % 11));
         if (q8) for (size_t b = 0; b < rank / 32; ++b) {
             auto* block = quantized.data() + pad + v * row_bytes + b * 34;
-            const uint16_t scale = sd::f16_bits(float(1 + (v + b) % 5) / 128.f);
+            const uint16_t scale = sd::f16_bits(float(1 + (v + b) % 5) / float(97 + (v + b) % 7));
             block[0] = uint8_t(scale); block[1] = uint8_t(scale >> 8);
             for (size_t j = 0; j < 32; ++j) block[2 + j] = uint8_t(int8_t(int((v + b * 11 + j * 13) % 255) - 127));
         }
