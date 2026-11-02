@@ -649,8 +649,11 @@ bool index_score_group(const float* q, const float* w, const uint8_t* kc, int he
 #pragma unroll
                 for (int hh = 0; hh < 32; ++hh) {
                     if (hh >= heads) break;
+                    float query[8];
 #pragma unroll
-                    for (int x = 0; x < 8; ++x) acc[hh] += qs[hh * HD + c + x] * kv[x];
+                    for (int x = 0; x < 8; ++x) query[x] = qs[hh * HD + c + x];
+#pragma unroll
+                    for (int x = 0; x < 8; ++x) acc[hh] += query[x] * kv[x];
                 }
             }
             float sum = 0.f;
