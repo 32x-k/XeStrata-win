@@ -56,18 +56,17 @@ inline float bf16_value(uint16_t v) {
     return sycl::bit_cast<float>(uint32_t(v) << 16);
 }
 
-// Integer conversion also works on devices without the optional fp16 aspect.
+// Integer conversion also works on devices without the optional fp16 aspect. Zeros and subnormals come out
+// of one float subtraction, exact (both operands and the result are normal), instead of a normalizing loop.
 inline float f16_value(uint16_t v) {
-    const uint32_t sign = uint32_t(v & 0x8000u) << 16;
-    uint32_t e = (v >> 10) & 31u, m = v & 1023u;
-    if (e == 31) return sycl::bit_cast<float>(sign | 0x7f800000u | (m << 13));
-    if (e == 0) {
-        if (!m) return sycl::bit_cast<float>(sign);
-        int exp = -14;
-        while (!(m & 1024u)) { m <<= 1; --exp; }
-        return sycl::bit_cast<float>(sign | (uint32_t(exp + 127) << 23) | ((m & 1023u) << 13));
-    }
-    return sycl::bit_cast<float>(sign | ((e + 112u) << 23) | (m << 13));
+    constexpr uint32_t exponent = 0x7c00u << 13;
+    uint32_t bits = uint32_t(v & 0x7fffu) << 13;
+    const uint32_t e = bits & exponent;
+    bits += (127u - 15u) << 23;
+    float value = sycl::bit_cast<float>(bits);
+    if (e == exponent) value = sycl::bit_cast<float>(bits + ((128u - 16u) << 23));
+    else if (e == 0) value = sycl::bit_cast<float>(bits + (1u << 23)) - sycl::bit_cast<float>(113u << 23);
+    return sycl::bit_cast<float>(sycl::bit_cast<uint32_t>(value) | (uint32_t(v & 0x8000u) << 16));
 }
 
 inline uint16_t f16_bits(float v) {
