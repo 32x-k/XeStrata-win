@@ -1510,7 +1510,77 @@ void hc_mean(const float* h, int T, int hc, int dim, float* out, long long out_s
 void iota_rows(int* out, int T, int n, int stride, sycl::queue& s) {
     parallel(s, size_t(T) * n, [=](size_t z) { out[(z / n) * stride + z % n] = int(z % n); });
 }
+namespace {
+template <int SG, bool Q8>
+void markov_group(float* logits, const uint16_t* E, const void* H, const int* tok, int V, int R,
+                  size_t warps, sycl::queue& s) {
+    const size_t local = warps * SG;
+    // Upstream markov_kernel(_q8)/markov_share_kernel: stage the one embedding
+    // row once per group, then one subgroup per output, eight values per lane.
+    sycl_detail::submit(s, [&](sycl::handler& cgh) {
+        sycl::local_accessor<float, 1> er(size_t(R), cgh);
+        cgh.parallel_for(sycl::nd_range<1>(((size_t(V) + warps - 1) / warps) * local, local),
+                         [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
+            const auto* embedding = E + (tok ? size_t(*tok) * R : 0);
+            for (size_t i = it.get_local_linear_id(); i < size_t(R); i += local) er[i] = bf16_value(embedding[i]);
+            sycl::group_barrier(it.get_group());
+            const size_t v = it.get_group_linear_id() * warps + it.get_local_linear_id() / SG;
+            if (v >= size_t(V)) return;
+            const auto sg = it.get_sub_group();
+            const size_t lane = sg.get_local_linear_id();
+            float sum = 0.f;
+            for (size_t c = lane * 8; c < size_t(R); c += SG * 8) {
+                if constexpr (Q8) {
+                    const auto* row = static_cast<const uint8_t*>(H) + v * (size_t(R) / 32) * 34;
+                    const auto* block = row + (c / 32) * 34;
+                    const float d = f16_value(uint16_t(block[0] | uint16_t(block[1]) << 8));
+                    const auto* codes = reinterpret_cast<const int8_t*>(block + 2 + c % 32);
+                    float dot = 0.f;
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) dot += float(codes[i]) * er[c + size_t(i)];
+                    sum += d * dot;
+                } else {
+                    sycl::ushort8 values;
+                    __builtin_memcpy(&values, static_cast<const uint16_t*>(H) + v * R + c, sizeof(values));
+#pragma unroll
+                    for (int i = 0; i < 4; ++i)
+                        sum += f16_value(values[2 * i]) * er[c + size_t(2 * i)] +
+                               f16_value(values[2 * i + 1]) * er[c + size_t(2 * i + 1)];
+                }
+            }
+#pragma unroll
+            for (int offset = SG / 2; offset; offset >>= 1) sum += sycl::permute_group_by_xor(sg, sum, offset);
+            if (lane == 0) logits[v] += sum;
+        });
+    });
+}
+bool markov_cooperative(float* logits, const uint16_t* E, const void* H, const int* tok, int V, int R,
+                        bool q8, sycl::queue& s) {
+    if (V <= 0 || R <= 0 || R % 8 || (q8 && R % 32)) return false;
+    struct Caps { size_t group, bytes; std::vector<size_t> subgroups; };
+    static core::PerDevice<Caps> cache;
+    const auto device = s.get_device();
+    const auto& caps = cache.get(device, [&] {
+        return Caps{std::min(device.get_info<sycl::info::device::max_work_group_size>(),
+                             device.get_info<sycl::info::device::max_work_item_sizes<1>>()[0]),
+                    device.get_info<sycl::info::device::local_mem_size>(),
+                    device.get_info<sycl::info::device::sub_group_sizes>()};
+    });
+    if (size_t(R) > caps.bytes / sizeof(float)) return false;
+    const auto run = [&]<int SG>() {
+        if (caps.group < SG || std::find(caps.subgroups.begin(), caps.subgroups.end(), size_t(SG)) == caps.subgroups.end())
+            return false;
+        const size_t warps = std::min(size_t(8), caps.group / SG); // upstream's eight output rows per group, capped by the device
+        sycl_detail::require_in_order(s);
+        if (q8) markov_group<SG, true>(logits, E, H, tok, V, R, warps, s);
+        else markov_group<SG, false>(logits, E, H, tok, V, R, warps, s);
+        return true;
+    };
+    return run.template operator()<32>() || run.template operator()<16>();
+}
+}  // namespace
 void markov_add(float* logits, const uint16_t* E, const uint16_t* H, const int* tok, int V, int R, sycl::queue& s) {
+    if (markov_cooperative(logits, E, H, tok, V, R, false, s)) return;
     parallel(s, size_t(V), [=](size_t v) {
         float sum = 0.f;
         for (int i = 0; i < R; ++i) sum += bf16_value(E[size_t(*tok) * R + i]) * f16_value(H[v * R + i]);
@@ -1518,6 +1588,7 @@ void markov_add(float* logits, const uint16_t* E, const uint16_t* H, const int* 
     });
 }
 void markov_add_q8(float* logits, const uint16_t* E, const uint8_t* Hq, const int* tok, int V, int R, sycl::queue& s) {
+    if (markov_cooperative(logits, E, Hq, tok, V, R, true, s)) return;
     parallel(s, size_t(V), [=](size_t v) {
         const uint8_t* row = Hq + v * (R / 32) * 34;
         float sum = 0.f;
@@ -1530,6 +1601,7 @@ void markov_add_q8(float* logits, const uint16_t* E, const uint8_t* Hq, const in
     });
 }
 void markov_share(float* logits, const uint16_t* H, const uint16_t* erow, int vn, int R, sycl::queue& s) {
+    if (markov_cooperative(logits, erow, H, nullptr, vn, R, false, s)) return;
     parallel(s, size_t(vn), [=](size_t v) {
         float sum = 0.f;
         for (int i = 0; i < R; ++i) sum += bf16_value(erow[i]) * f16_value(H[v * R + i]);
