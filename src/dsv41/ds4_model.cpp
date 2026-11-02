@@ -755,7 +755,9 @@ struct Layer {
     size_t blob = 0;                            // bytes of one expert's blob
     int n_vram = 0;
     bool cpu_only = false;   // a role's type has no device kernel: every expert of this layer is the CPU lane's
-    uint8_t* vram_base = nullptr;
+    // the VRAM slots: allocated in pieces of piece_slots slots, each within the device's largest allocation (slot_ptr)
+    std::vector<uint8_t*> vram_pieces;
+    int piece_slots = 0;
     std::vector<int> slot;                      // expert -> VRAM slot or -1
     std::vector<int> ram;                       // expert -> RAM-tier slot or -1 (a GGUF's in-place experts; empty: none)
     std::vector<uint8_t*> host;                 // expert -> host (non-null: on the CPU lane; its halves in hh)
@@ -1557,6 +1559,10 @@ struct Model::Impl {
     static const Layer& member(const Layer& l, int m) { return m == 0 ? l : l.mates[(size_t) m - 1]; }
     // bytes of a VRAM slot of l's experts (a member's part of each, in a group)
     static size_t unit(const Layer& l) { return l.nm > 1 ? l.hblob : l.blob; }
+    // VRAM slot s of l's experts (a member's part of each, in a group)
+    static uint8_t* slot_ptr(const Layer& l, int s) {
+        return l.vram_pieces[(size_t) (s / l.piece_slots)] + (size_t) (s % l.piece_slots) * unit(l);
+    }
     // the members of a group of nm that take heads: the most the heads and the wo_a groups split among evenly (64
     // heads and 8 groups: 9 -> 8, 7 or 6 -> 4, 5 -> 4, 3 -> 2); the first members the rest, only their FFN share
     int head_members(int nm) const {
@@ -4107,7 +4113,7 @@ struct Model::Impl {
     // ones in shares between them (the device works while the reads run)
     bool flow_layer(Dev& d, Chunk& c, Layer& L0, int mi, int k, int T, const std::vector<int>& b, std::string& err) {
         rt::Queue s = d.st;
-        const uint8_t* vbase = member(L0, mi).vram_base;   // (a member's: its part of each VRAM expert, L0's slots)
+        const Layer& vx = member(L0, mi);   // (a member's: its part of each VRAM expert, L0's slots)
         if (c.spec_k != k || c.spec_il != L0.il) {
             err = "the prompt path's expert stream is out of step (layer " + std::to_string(L0.il) + ")";
             return false;
@@ -4153,10 +4159,10 @@ struct Model::Impl {
             c.n_comp = i1;
             if (!flow_pump(c, err)) return false;
             const int v_to = (int) ((int64_t) L0.n_slots * (int64_t) (c.n_comp - lb) / (int64_t) std::max<size_t>(1, n_lay));
-            if (!run_set(d, c, L0, vbase, 0, unit(L0), c.bounds, b.data(), v_done, v_to, T, err)) return false;
+            if (!run_vram(d, c, L0, vx, c.bounds, b.data(), v_done, v_to, T, err)) return false;
             v_done = v_to;
         }
-        if (!run_set(d, c, L0, vbase, 0, unit(L0), c.bounds, b.data(), v_done, L0.n_slots, T, err)) return false;
+        if (!run_vram(d, c, L0, vx, c.bounds, b.data(), v_done, L0.n_slots, T, err)) return false;
         while (c.base < c.n_comp && c.items.size() > 4096) {   // (done with: read, copied and used)
             c.items.pop_front();
             ++c.base;
@@ -4164,6 +4170,17 @@ struct Model::Impl {
         return true;
     }
 
+    // run_set over VRAM slots [i0, i1) of x (l's member), a piece of its slots at a time
+    bool run_vram(Dev& d, Chunk& c, const Layer& l, const Layer& x, const int* d_bounds, const int* b, int i0, int i1,
+                  int T, std::string& err) {
+        while (i0 < i1) {
+            const int p = i0 / x.piece_slots, end = std::min(i1, (p + 1) * x.piece_slots);
+            if (!run_set(d, c, l, x.vram_pieces[(size_t) p], p * x.piece_slots, unit(x), d_bounds, b, i0, end, T, err))
+                return false;
+            i0 = end;
+        }
+        return true;
+    }
     // the experts [i0, i1) of a sorted set (blobs at wbase + i * stride; bounds b on the host, d_bounds on the device)
     // over the chunk's rows, in pieces of at most C rows, each added into acc in pick order
     bool run_set(Dev& d, Chunk& c, const Layer& l, const uint8_t* wbase, int wb0, size_t stride, const int* d_bounds,
@@ -4405,7 +4422,7 @@ struct Model::Impl {
     }
 
     void set_vm(Layer& l, int e, int slot) {
-        uint8_t* b = l.vram_base + (size_t) slot * l.blob;
+        uint8_t* b = slot_ptr(l, slot);
         if (l.lay.fmt == gg::kFmtMXFP4) {
             for (int r = 0; r < 3; ++r) {
                 x3::Mat& m = l.vm[(size_t) e][(size_t) r];
@@ -4609,15 +4626,22 @@ struct Model::Impl {
                 Layer& x = member(l, m);
                 Dev& d = devs[(size_t) x.dev];
                 rt::set_device(d.id);
-                void* v = nullptr;
-                if (rt::alloc_device(&v, (size_t) l.n_slots * unit(x)) != rt::Result::success) {
-                    err = "rt::alloc_device of layer " + std::to_string(l.il) + "'s " + std::to_string(l.n_slots) +
-                          " experts on GPU" + std::to_string(d.id) + " failed";
-                    return false;
+                // pieces within the device's largest allocation (the HIP runtime reports 1 GiB on a 32 GB card)
+                x.piece_slots =
+                    (int) std::max<size_t>(1, std::min<size_t>(core::max_alloc_bytes() / unit(x), (size_t) l.n_slots));
+                x.vram_pieces.clear();
+                for (int s0 = 0; s0 < l.n_slots; s0 += x.piece_slots) {
+                    const size_t bytes = (size_t) std::min(x.piece_slots, l.n_slots - s0) * unit(x);
+                    void* v = nullptr;
+                    if (rt::alloc_device(&v, bytes) != rt::Result::success) {
+                        err = "rt::alloc_device of layer " + std::to_string(l.il) + "'s " + std::to_string(l.n_slots) +
+                              " experts on GPU" + std::to_string(d.id) + " failed";
+                        return false;
+                    }
+                    d.allocs.push_back(v);
+                    d.experts += bytes;
+                    x.vram_pieces.push_back((uint8_t*) v);
                 }
-                d.allocs.push_back(v);
-                d.experts += (size_t) l.n_slots * unit(x);
-                x.vram_base = (uint8_t*) v;
             }
             l.heat.assign((size_t) l.n_exp, 0.0f);
             {   // the profile as the starting heat: its counts scaled to ~512 hits a layer
@@ -4686,7 +4710,7 @@ struct Model::Impl {
                 std::vector<unsigned long long> tab((size_t) l.n_exp, 0ull);
                 for (int e = 0; e < l.n_exp; ++e)
                     if (l.slot[(size_t) e] >= 0)
-                        tab[(size_t) e] = (unsigned long long) (x.vram_base + (size_t) l.slot[(size_t) e] * unit(x));
+                        tab[(size_t) e] = (unsigned long long) slot_ptr(x, l.slot[(size_t) e]);
                 rt::set_device(devs[(size_t) x.dev].id);
                 CK(rt::copy(x.vram_tab, tab.data(), tab.size() * 8));
             }
@@ -4734,7 +4758,7 @@ struct Model::Impl {
                         const Layer& x = member(l, m);
                         rt::set_device(devs[(size_t) x.dev].id);
                         if (l.nm > 1) blob_to_half(l, stage, m, stage2);
-                        ok = rt::copy(x.vram_base + (size_t) l.slot[(size_t) e] * unit(l), l.nm > 1 ? stage2 : stage, unit(l)) == rt::Result::success;
+                        ok = rt::copy(slot_ptr(x, l.slot[(size_t) e]), l.nm > 1 ? stage2 : stage, unit(l)) == rt::Result::success;
                     }
                     if (!ok) {
                         std::lock_guard<std::mutex> lk(emu);
@@ -5142,7 +5166,7 @@ struct Model::Impl {
                                 cur_dev = d.id;
                             }
                             if (l.nm > 1) blob_to_half(l, stage, m, stage2);
-                            up = rt::copy(x.vram_base + (size_t) l.slot[(size_t) e] * unit(x), l.nm > 1 ? stage2 : stage, unit(x)) == rt::Result::success;
+                            up = rt::copy(slot_ptr(x, l.slot[(size_t) e]), l.nm > 1 ? stage2 : stage, unit(x)) == rt::Result::success;
                         }
                         if (!up) {
                             std::lock_guard<std::mutex> lk(emu);
@@ -6696,9 +6720,9 @@ struct Model::Impl {
                 const Dev& d = devs[(size_t) l.dev];
                 rt::set_device(d.id);
                 rt::Queue cs = B.st[(size_t) l.dev];
-                rt::copy_async(l.vram_base + (size_t) l.spare_vram * l.blob, B.a, l.blob, cs);
+                rt::copy_async(slot_ptr(l, l.spare_vram), B.a, l.blob, cs);
                 if (!file_experts)
-                    rt::readback_async(B.b, l.vram_base + (size_t) l.slot[(size_t) sw.out] * l.blob, l.blob, cs);
+                    rt::readback_async(B.b, slot_ptr(l, l.slot[(size_t) sw.out]), l.blob, cs);
                 rt::stream_sync(cs);
             } else {   // a group: each member's part in, each member's part out
                 for (int m = 0; m < l.nm; ++m) {
@@ -6706,10 +6730,10 @@ struct Model::Impl {
                     rt::set_device(devs[(size_t) x.dev].id);
                     rt::Queue cs = B.st[(size_t) x.dev];
                     blob_to_half(l, B.a, m, B.h);
-                    rt::copy_async(x.vram_base + (size_t) l.spare_vram * x.hblob, B.h, x.hblob, cs);
+                    rt::copy_async(slot_ptr(x, l.spare_vram), B.h, x.hblob, cs);
                     rt::stream_sync(cs);
                     if (file_experts) continue;
-                    rt::readback_async(B.h, x.vram_base + (size_t) l.slot[(size_t) sw.out] * x.hblob, x.hblob, cs);
+                    rt::readback_async(B.h, slot_ptr(x, l.slot[(size_t) sw.out]), x.hblob, cs);
                     rt::stream_sync(cs);
                     half_to_blob(l, B.h, m, B.b);
                 }
@@ -6727,12 +6751,12 @@ struct Model::Impl {
                         repack(l, reg.data(), blob.data());
                         std::vector<uint8_t> dev(l.blob);
                         if (l.nm == 1)
-                            rt::readback(dev.data(), l.vram_base + (size_t) l.spare_vram * l.blob, l.blob, B.st[(size_t) l.dev]);
+                            rt::readback(dev.data(), slot_ptr(l, l.spare_vram), l.blob, B.st[(size_t) l.dev]);
                         else
                             for (int m = 0; m < l.nm; ++m) {   // (the members' parts, put together again)
                                 std::vector<uint8_t> h(member(l, m).hblob);
                                 rt::set_device(devs[(size_t) member(l, m).dev].id);
-                                rt::readback(h.data(), member(l, m).vram_base + (size_t) l.spare_vram * member(l, m).hblob,
+                                rt::readback(h.data(), slot_ptr(member(l, m), l.spare_vram),
                                              member(l, m).hblob, B.st[(size_t) member(l, m).dev]);
                                 half_to_blob(l, h.data(), m, dev.data());
                             }
@@ -6773,7 +6797,7 @@ struct Model::Impl {
             rt::set_device(devs[(size_t) x.dev].id);
             rt::Queue cs = copy_st[(size_t) x.dev];
             if (l.nm > 1) blob_to_half(l, sw_a, m, sw_h);
-            ok = rt::copy_async(x.vram_base + (size_t) l.spare_vram * unit(l), l.nm > 1 ? sw_h : sw_a, unit(l), cs) == rt::Result::success &&
+            ok = rt::copy_async(slot_ptr(x, l.spare_vram), l.nm > 1 ? sw_h : sw_a, unit(l), cs) == rt::Result::success &&
                  rt::stream_sync(cs) == rt::Result::success;
         }
         if (sw.ram >= 0) {   // `out` from its VRAM slot (each member its part) into the spare RAM slot
@@ -6782,7 +6806,7 @@ struct Model::Impl {
                 const Layer& x = member(l, m);
                 rt::set_device(devs[(size_t) x.dev].id);
                 rt::Queue cs = copy_st[(size_t) x.dev];
-                got = rt::readback_async(l.nm > 1 ? sw_h : sw_b, x.vram_base + (size_t) l.slot[(size_t) sw.out] * unit(l), unit(l), cs) == rt::Result::success &&
+                got = rt::readback_async(l.nm > 1 ? sw_h : sw_b, slot_ptr(x, l.slot[(size_t) sw.out]), unit(l), cs) == rt::Result::success &&
                       rt::stream_sync(cs) == rt::Result::success;
                 if (got && l.nm > 1) half_to_blob(l, sw_h, m, sw_b);
             }
@@ -6796,7 +6820,7 @@ struct Model::Impl {
                 const Layer& x = member(l, 0);
                 rt::set_device(devs[(size_t) x.dev].id);
                 rt::Queue cs = copy_st[(size_t) x.dev];
-                const bool got = rt::readback_async(dst, x.vram_base + (size_t) l.slot[(size_t) sw.out] * unit(l), l.blob, cs) ==
+                const bool got = rt::readback_async(dst, slot_ptr(x, l.slot[(size_t) sw.out]), l.blob, cs) ==
                                      rt::Result::success &&
                                  rt::stream_sync(cs) == rt::Result::success;
                 store->put_done(l.il, sw.out, got);
@@ -6807,7 +6831,7 @@ struct Model::Impl {
             for (int m = 0; m < l.nm && ok; ++m) {
                 const Layer& x = member(l, m);
                 rt::set_device(devs[(size_t) x.dev].id);
-                rt::readback(l.nm > 1 ? h.data() : dev.data(), x.vram_base + (size_t) l.spare_vram * unit(l),
+                rt::readback(l.nm > 1 ? h.data() : dev.data(), slot_ptr(x, l.spare_vram),
                              unit(l), copy_st[(size_t) x.dev]);
                 if (l.nm > 1) half_to_blob(l, h.data(), m, dev.data());
             }
@@ -6996,7 +7020,7 @@ struct Model::Impl {
             for (int m = 0; m < l.nm; ++m) {
                 Layer& x = member(l, m);
                 const Dev& dm = devs[(size_t) x.dev];
-                l.tab_pin[2 * m] = (unsigned long long) (x.vram_base + (size_t) l.slot[(size_t) sw.in] * unit(x));
+                l.tab_pin[2 * m] = (unsigned long long) slot_ptr(x, l.slot[(size_t) sw.in]);
                 l.tab_pin[2 * m + 1] = 0ull;
                 rt::set_device(dm.id);   // (stream order: before the next window)
                 rt::copy_async(x.vram_tab + sw.in, &l.tab_pin[2 * m], 8, dm.st);
@@ -8132,10 +8156,10 @@ struct Model::Impl {
             ++S.kp;
             if (!copy_ahead(d, c, S, di, err)) return false;
             const int v_to = (int) ((int64_t) L0.n_slots * (bi + 1) / nb);
-            if (!run_set(d, c, l, l.vram_base, 0, unit(l), c.bounds, b.data(), v_done, v_to, T, err)) return false;
+            if (!run_vram(d, c, l, l, c.bounds, b.data(), v_done, v_to, T, err)) return false;
             v_done = v_to;
         }
-        if (!run_set(d, c, l, l.vram_base, 0, unit(l), c.bounds, b.data(), v_done, L0.n_slots, T, err)) return false;
+        if (!run_vram(d, c, l, l, c.bounds, b.data(), v_done, L0.n_slots, T, err)) return false;
         if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
         hc_post_inplace(c.acc, c.h, c.f_post, c.f_comb, D, H, T, s);
         CK(rt::copy_async(c.pre, c.f_pre, (size_t) T * 8 * 4, s));
