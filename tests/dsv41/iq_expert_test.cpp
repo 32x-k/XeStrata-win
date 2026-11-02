@@ -20,6 +20,7 @@ using namespace dsv41_test;
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -332,11 +333,11 @@ static void window_contract(int type, const std::vector<float>& x, int k, int ff
     std::vector<float> scales(size_t(T) * k / 32);
     for (int t = 0; t < T; ++t) for (int b = 0; b < k / 32; ++b) {
         float amax = 0.f;
-        for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(x[size_t(t) * k + b * 32 + j]));
+        for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(x[size_t(t) * k + size_t(b) * 32 + j]));
         const float scale = amax / 127.f;
         scales[size_t(t) * (k / 32) + b] = scale;
         for (int j = 0; j < 32; ++j)
-            codes[size_t(t) * k + b * 32 + j] = int8_t(amax > 0 ? std::nearbyint(x[size_t(t) * k + b * 32 + j] / scale) : 0);
+            codes[size_t(t) * k + size_t(b) * 32 + j] = int8_t(amax > 0 ? std::nearbyint(x[size_t(t) * k + size_t(b) * 32 + j] / scale) : 0);
     }
     strata::dsv41k::exl3::Mat matrix{};
     matrix.fmt = gg::kFmtGG; matrix.K = type; matrix.k = k; matrix.n = ff;
@@ -396,23 +397,65 @@ static void mx_contract(Report report) {
     double gu_error = 0;
     const auto* traits = ggml_get_type_traits((ggml_type)type);
     for (int e = 0; e < experts; ++e) {
-        traits->to_float(blob.data() + size_t(e) * stride, decoded.data(), k * ff);
+        traits->to_float(blob.data() + size_t(e) * stride, decoded.data(), int64_t(k) * ff);
         for (int r = 0; r < ff; ++r) gate[r] = dot(decoded.data() + size_t(r) * k, input);
-        traits->to_float(blob.data() + size_t(e) * stride + offsets[1], decoded.data(), k * ff);
+        traits->to_float(blob.data() + size_t(e) * stride + offsets[1], decoded.data(), int64_t(k) * ff);
         for (int r = 0; r < ff; ++r) {
             const float reference = swiglu_f32(gate[r], dot(decoded.data() + size_t(r) * k, input), 7.f);
             gu_error = std::max(gu_error, std::fabs(double(actual_h[size_t(e) * ff + r]) - reference) / (1 + std::fabs(double(reference))));
         }
         const Q8 hidden = quant(actual_h.data() + size_t(e) * ff, ff);
-        traits->to_float(blob.data() + size_t(e) * stride + offsets[2], decoded.data(), k * ff);
+        traits->to_float(blob.data() + size_t(e) * stride + offsets[2], decoded.data(), int64_t(k) * ff);
         for (int r = 0; r < k; ++r) expected[r] += weights[e] * dot(decoded.data() + size_t(r) * ff, hidden);
     }
+    iq::Args fallback{};
+    fallback.plan_ptr = a.plan_ptr; fallback.n_embd = k; fallback.n_ff = ff; fallback.limit = a.limit;
+    for (int r = 0; r < 3; ++r) fallback.tr[r] = offsets[r];
+    // An unaligned code buffer selects the existing portable fallback on every
+    // device, without changing its dimensions or quantized values.
+    const auto unaligned_codes = [&](const std::vector<int8_t>& codes) {
+        std::vector<int8_t> padded(codes.size() + 16, 0);
+        auto* base = up(padded);
+        const size_t offset = (reinterpret_cast<uintptr_t>(base) & 15u) == 0 ? 1 : 0;
+        std::copy(codes.begin(), codes.end(), padded.begin() + static_cast<std::ptrdiff_t>(offset));
+        strata::core::copy_async(queue(), base, padded.data(), padded.size()).wait_and_throw();
+        return base + offset;
+    };
+    fallback.tg = fallback.td = type;
+    fallback.xq = unaligned_codes(input.q); fallback.xd = up(input.d);
+    float *fallback_h, *fallback_part;
+    device_alloc(fallback_h, size_t(experts) * ff * 4); device_alloc(fallback_part, size_t(experts) * k * 4);
+    fallback.h = fallback_h; fallback.part = fallback_part;
+    if (!iq::gate_up(fallback, experts, 1, queue())) throw std::runtime_error("MX portable gate refused");
+    const auto old_h = down_(fallback_h, size_t(experts) * ff);
+    double fallback_gu = 0;
+    for (size_t j = 0; j < old_h.size(); ++j)
+        fallback_gu = std::max(fallback_gu, std::fabs(double(actual_h[j]) - old_h[j]) / (1 + std::fabs(double(old_h[j]))));
+    std::vector<int8_t> hidden_codes;
+    std::vector<float> hidden_scales;
+    for (int e = 0; e < experts; ++e) {
+        const Q8 hidden = quant(actual_h.data() + size_t(e) * ff, ff);
+        hidden_codes.insert(hidden_codes.end(), hidden.q.begin(), hidden.q.end());
+        hidden_scales.insert(hidden_scales.end(), hidden.d.begin(), hidden.d.end());
+    }
+    fallback.hq = unaligned_codes(hidden_codes); fallback.hd = up(hidden_scales);
+    if (!iq::down(fallback, experts, 1, queue())) throw std::runtime_error("MX portable down refused");
+    const auto old_part = down_(fallback_part, size_t(experts) * k);
     gg::moe_down(a, h, up(shared), out, queue());
     const auto actual = down_(out, k);
     double down_error = 0;
     for (int r = 0; r < k; ++r) down_error = std::max(down_error, std::fabs(double(actual[r]) - expected[r]) / (1 + std::fabs(double(expected[r]))));
     report("MX gate ggml reference", type, gu_error, 1e-5);
     report("MX down ggml reference", type, down_error, 1e-5);
+    double fallback_down = 0;
+    for (int r = 0; r < k; ++r) {
+        float reference = 0;
+        for (int e = 0; e < experts; ++e) reference = std::fma(weights[e], old_part[size_t(e) * k + r], reference);
+        reference += shared[r];
+        fallback_down = std::max(fallback_down, std::fabs(double(actual[r]) - reference) / (1 + std::fabs(double(reference))));
+    }
+    report("MX gate portable path", type, fallback_gu, 1e-5);
+    report("MX down portable path", type, fallback_down, 1e-5);
 }
 
 // Default upstream runr declines N=64/192 although the vector-load alignment is
