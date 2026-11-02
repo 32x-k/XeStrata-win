@@ -406,7 +406,36 @@ bool mv(const MvJob* jobs, int n, sycl::queue& s) {
     for (int i = 0; i < n; ++i) {
         const MvJob j = jobs[i];
         if (is_tq(j.type)) { if (!tq::mv(&j, 1, s)) return false; }
-        else if (!dispatch(j.type, [&](auto t) { portable::mv(j, Decoder<t.value>{}, s); })) return false;
+        else if (!dispatch(j.type, [&](auto t) {
+            const auto& caps = token_detail::caps(s);
+            const auto run = [&]<int SG>() {
+                const size_t warps = std::min(size_t(8), caps.group / SG);
+                if (!warps || j.k % 256) return false;
+                const size_t rows = size_t(j.n) * j.ncol, local = warps * SG;
+                sycl_detail::launch(s, sycl::nd_range<1>(((rows + warps - 1) / warps) * local, local),
+                    [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
+                        const size_t r = it.get_group_linear_id() * warps + it.get_local_linear_id() / SG;
+                        if (r >= rows) return;
+                        const size_t col = r / j.n, row = r % j.n;
+                        const auto sg = it.get_sub_group();
+                        float sum = 0.f;
+                        for (int b = int(sg.get_local_linear_id()); b < j.k / 32; b += SG)
+                            sum = sycl::fma(j.xd[col * (j.k / 32) + b],
+                                Decoder<t.value>{}.dot_q8_block(j.w + row * j.ld, b, j.xq + col * j.k + size_t(b) * 32), sum);
+                        for (int offset = SG / 2; offset; offset /= 2)
+                            sum += sycl::permute_group_by_xor(sg, sum, offset);
+                        if (sg.get_local_linear_id() == 0)
+                            j.y[col * j.ycs + row] = j.alpha * sum + (j.bias ? j.bias[row] : 0.f);
+                    });
+                return true;
+            };
+            if (std::find(caps.subgroups.begin(), caps.subgroups.end(), size_t(32)) != caps.subgroups.end()) {
+                if (run.template operator()<32>()) return;
+            } else if (std::find(caps.subgroups.begin(), caps.subgroups.end(), size_t(16)) != caps.subgroups.end()) {
+                if (run.template operator()<16>()) return;
+            }
+            portable::mv(j, Decoder<t.value>{}, s);
+        })) return false;
     }
     return true;
 }

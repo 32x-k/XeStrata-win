@@ -550,6 +550,23 @@ bool mv(const x3::MvJob* jobs, int n, sycl::queue& s) {
     for (int i = 0; i < n; ++i) {
         if (batched & (1u << i)) continue;
         const x3::MvJob j = jobs[i];
+        // Upstream's low-bit jobs quantize each activation row once, then share
+        // it across the output rows. Keep the scalar path for unavailable scratch.
+        if (j.m->fmt == kFmtGG && j.m->K != kTypeMXFP4 && iq_tiled_set_type(j.m->K) && j.m->k % 256 == 0) {
+            const auto& caps = token_caps(s);
+            const size_t xcs = j.xf_cs ? j.xf_cs : size_t(j.m->k);
+            if (auto* scratch = caps.subgroup ? quant_scratch(size_t(j.ncol) * j.m->k, 0, caps, s) : nullptr) {
+                if (caps.subgroup == 32)
+                    q8_quant_token<32>(j.xf, xcs, j.ncol, j.m->k, scratch->codes, scratch->scales, caps.quant_group, s);
+                else q8_quant_token<16>(j.xf, xcs, j.ncol, j.m->k, scratch->codes, scratch->scales, caps.quant_group, s);
+                iq::MvJob q{};
+                q.w = static_cast<const uint8_t*>(j.m->raw); q.ld = row_stride(*j.m); q.type = j.m->K;
+                q.k = j.m->k; q.n = j.m->n; q.ncol = j.ncol; q.xq = scratch->codes; q.xd = scratch->scales;
+                q.y = j.y; q.ycs = j.y_cs ? j.y_cs : size_t(j.m->n); q.bias = j.bias; q.alpha = j.alpha;
+                if (!iq::mv(&q, 1, s)) return fail("unsupported IQ matvec");
+                continue;
+            }
+        }
         if (q5_mv(j, s)) continue;
         const x3::Mat m = *j.m;
         const size_t ld = row_stride(m), xcs = j.xf_cs ? j.xf_cs : size_t(m.k), ycs = j.y_cs ? j.y_cs : size_t(m.n);

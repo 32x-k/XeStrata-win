@@ -325,6 +325,35 @@ static void window_contract(int type, const std::vector<float>& x, int k, int ff
     }
     report("window against tokens", type, worst, 1e-5);
     std::printf("%-7s window against tokens: %s\n", iq::name(type), same ? "bit-equal" : "within tolerance only");
+    // The host-routed prompt's public matvec, against independently quantized
+    // activation rows consumed by the established IQ entry point.
+    std::vector<int8_t> codes(size_t(T) * k);
+    std::vector<float> scales(size_t(T) * k / 32);
+    for (int t = 0; t < T; ++t) for (int b = 0; b < k / 32; ++b) {
+        float amax = 0.f;
+        for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(x[size_t(t) * k + b * 32 + j]));
+        const float scale = amax / 127.f;
+        scales[size_t(t) * (k / 32) + b] = scale;
+        for (int j = 0; j < 32; ++j)
+            codes[size_t(t) * k + b * 32 + j] = int8_t(amax > 0 ? std::nearbyint(x[size_t(t) * k + b * 32 + j] / scale) : 0);
+    }
+    strata::dsv41k::exl3::Mat matrix{};
+    matrix.fmt = gg::kFmtGG; matrix.K = type; matrix.k = k; matrix.n = ff;
+    matrix.raw = blobs + offsets[0];
+    strata::dsv41k::exl3::MvJob job{};
+    job.m = &matrix; job.xf = dx; job.y = h; job.ncol = T; job.xf_cs = k; job.y_cs = ff;
+    if (!gg::mv(&job, 1, queue())) throw std::runtime_error("prompt matvec refused");
+    const auto actual = down_(h, size_t(T) * ff);
+    iq::MvJob reference{};
+    reference.w = blobs + offsets[0]; reference.ld = gg::type_row_bytes(type, k);
+    reference.type = type; reference.k = k; reference.n = ff; reference.ncol = T;
+    reference.xq = up(codes); reference.xd = up(scales); reference.y = h; reference.ycs = ff;
+    if (!iq::mv(&reference, 1, queue())) throw std::runtime_error("prompt reference refused");
+    const auto expected = down_(h, size_t(T) * ff);
+    double mv_error = 0;
+    for (size_t j = 0; j < actual.size(); ++j)
+        mv_error = std::max(mv_error, std::fabs(double(actual[j]) - expected[j]) / (std::fabs(double(expected[j])) + 1e-6));
+    report("prompt matvec", type, mv_error, 1e-5);
 }
 
 // Default upstream runr declines N=64/192 although the vector-load alignment is
