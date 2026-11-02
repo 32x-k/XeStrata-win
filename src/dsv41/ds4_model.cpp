@@ -8049,9 +8049,13 @@ struct Model::Impl {
         // ring slots free, not only once the bounds are back (Project Maya #360; DS4_FLOW_PUMP_WAIT=0: wait as before)
         static const bool pump_wait = std::getenv("DS4_FLOW_PUMP_WAIT") == nullptr ||
                                       std::atoi(std::getenv("DS4_FLOW_PUMP_WAIT")) != 0;
+        // Only while the stream has items left to read and copy: the HIP backend on Windows (WDDM) need not report the
+        // queue empty before a blocking wait submits its work, and with nothing to pump the wait below does the same.
         if (c.flow && pump_wait)
             while (rt::stream_status(s) == rt::Result::pending) {
                 if (!flow_pump(c, err)) return false;
+                const size_t end = c.base + c.items.size();
+                if (c.n_read >= end && c.n_dma >= end) break;
                 std::this_thread::yield();
             }
         CK(rt::stream_sync(s));
