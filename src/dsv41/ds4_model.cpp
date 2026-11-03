@@ -3055,6 +3055,7 @@ struct Model::Impl {
         }
         // the experts: VRAM slots in what each device has left, the rest on the host
         if (!place_experts(err)) return false;
+        if (automatic_store_unused()) { prepare_warm(); start_warm(); }
         if (!load_experts(err)) return false;
         if (pk.gguf) make_pools();
         if (chunk > 0) {
@@ -5390,9 +5391,26 @@ struct Model::Impl {
     // allocations come out of the same RAM the store would use, and the first estimate (made at the layout, before any upload)
     // saw all of it free.  The explicit sizes (--ssd-cache, DS4_STORE_GB) stand.
     mutable uint64_t avail0_ = ~uint64_t{0};   // (free RAM when the first estimate was made, before the weights went to the GPU)
+    // An automatic store has no consumer once every trunk expert has an actual VRAM slot.
+    // The estimate used while laying out the buffers is not proof of that placement; explicit budgets stand.
+    bool automatic_store_unused() const {
+        if (o.ssd_cache_gb >= 0.0 || std::getenv("DS4_STORE_GB")) return false;
+        bool trunk = false;
+        for (const Layer& l : L) {
+            if (l.mtp) continue;
+            trunk = true;
+            if (l.slot.size() != (size_t) l.n_exp ||
+                std::any_of(l.slot.begin(), l.slot.end(), [](int slot) { return slot < 0; })) return false;
+        }
+        return trunk;
+    }
     double store_gb_now() const {
         const double gb = store_gb();
         if (gb <= 0.0 || o.ssd_cache_gb >= 0.0 || std::getenv("DS4_STORE_GB")) return gb;
+        if (automatic_store_unused()) {
+            if (o.verbose) std::fprintf(stderr, "ds4: RAM store: all trunk experts are in VRAM; no automatic store\n");
+            return 0.0;
+        }
         const uint64_t avail = ram_avail();
         if (avail == ~uint64_t{0}) return gb;
         // Shared-memory devices leave room for the prompt working set when the
