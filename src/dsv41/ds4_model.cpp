@@ -3645,17 +3645,12 @@ struct Model::Impl {
         }
         return true;
     }
-    // hc_mix over a chunk: the dots by an F32 GEMM, then the rms scale
-    bool hc_mix_chunk(Dev& d, Chunk& c, const float* h, const float* fn, int T, float* mixes, std::string& err) {
+    // Keep the reduction order for the small HC projection fixed. A BLAS
+    // backend may choose a different GEMM algorithm at each start; the small
+    // rounding difference is amplified by the following HC splits.
+    void hc_mix_chunk(Dev& d, const float* h, const float* fn, int T, float* mixes) {
         const int hcd = g.hc * g.dim, n_mix = (2 + g.hc) * g.hc;
-        const float one = 1.0f, zero = 0.0f;
-        if (rt::dense_f32(c.blas, n_mix, T, hcd, one, fn, hcd, h, hcd, zero, mixes, 32) !=
-            rt::Result::success) {
-            err = "dense FP32 GEMM (mHC mixes)";
-            return false;
-        }
-        hc_mix_scale(h, hcd, n_mix, T, g.eps, mixes, d.st);
-        return true;
+        hc_mix(h, fn, hcd, n_mix, T, g.eps, mixes, d.st);
     }
 
     // expert e of l (on the CPU lane: its NH column parts) -> member m's VRAM copy at dst, in the GPU layout (the full
@@ -7879,7 +7874,7 @@ struct Model::Impl {
         }
         prof_mark(d, 4);
         // attention
-        if (!hc_mix_chunk(d, c, c.h, l.hca_fn, T, c.mix, err)) return false;
+        hc_mix_chunk(d, c.h, l.hca_fn, T, c.mix);
         hc_split(c.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, c.a_pre, c.a_post, c.a_comb, s);
         dump_sub(d, "mix0", l.il, p0, T, c.mix, (size_t) T * 32 * 4);
         hc_pre_norm(c.h, c.pre, l.attn_norm, D, H, T, g.eps, c.x, s);
@@ -8106,7 +8101,7 @@ struct Model::Impl {
         if (dump_l != nullptr && mi == 0) dump_layer(d, c.h, 1000 + l.il, p0, T);   // (after the attention, as the window path)
         prof_mark(d, 1);
         // the MoE
-        if (!hc_mix_chunk(d, c, c.h, l.hcf_fn, T, c.mix, err)) return false;
+        hc_mix_chunk(d, c.h, l.hcf_fn, T, c.mix);
         hc_split(c.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, c.f_pre, c.f_post, c.f_comb, s);
         hc_pre_norm(c.h, c.a_pre, l.ffn_norm, D, H, T, g.eps, c.x, s);
         x3::rows_f16(c.x, D, nullptr, T, D, c.x16, s);
