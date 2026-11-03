@@ -1444,7 +1444,7 @@ struct Model::Impl {
         lane_quit.store(true, std::memory_order_release);
         if (!service.joinable()) mailbox->producer_done.store(true, std::memory_order_release);
         quit.store(true);
-        if (warm_bg.joinable()) warm_bg.join();   // (the warm-up uses the BLAS handles destroyed below)
+        if (warm_bg.joinable()) warm_bg.join();   // (warm-up storage and handles outlive this join)
         for (auto& w : workers) { w->wait(); w->stop(); }
         eg_io.stop();   // producers stopped; its threads finish writing h_eg
         if (store_bg.joinable()) store_bg.join();   // (the store's background fill: it checks quit between its pieces)
@@ -1469,6 +1469,7 @@ struct Model::Impl {
             if (rt::device_sync() != rt::Result::success)
                 std::fprintf(stderr, "ds4: queue drain during shutdown: %s\n", rt::error_string(rt::Result::error));
         }
+        warm_scratch.clear();   // all users of queues have joined before their release
         pools.clear();
         store.reset();
         if (zc_stage_buf) rt::free(zc_stage_buf);
@@ -3201,13 +3202,14 @@ struct Model::Impl {
                 workers.push_back(std::make_unique<Worker>());
                 workers.back()->start();
             }
+        prepare_warm();
         calibrate_paths();
         init_store();      // (last: the store's arena is registered with the driver - page-locked memory the other pinned allocations must come before)
+        start_warm();   // the store arena is allocated: overlap its reads without blocking the model's queue
         preload_store();
         if (o.verbose) std::fprintf(stderr, "ds4: loaded in %.1f s\n%s", (now_ms() - t0) / 1000.0, describe().c_str());
         if (chunk > 0) (void) pick_flow_min();   // (the startup line)
         reset();
-        start_warm();
         return true;
     }
 
@@ -3218,43 +3220,115 @@ struct Model::Impl {
     size_t ckv_rb() const { return kv_row_bytes(kKvFp4, g.hd); }
     size_t ik_rb() const { return kv_row_bytes(kKvFp4p, g.ix_hd); }
 
-    // The chunked prompt's first GEMM of each kind pays the BLAS library's start (its handle's heuristics, the code objects of its
-    // kernels loaded on first use): ~1 s of hipModuleLoad plus ~2.5 s of library time on the R9700 (rocprofv3), 1-2 s on GPU, once a
-    // process - 3.6 s on the first prompt that went through the flow, measured as 4.9 s for a 25-token pass against 1.0 s for the
-    // next one.  Paid here instead, at load, on a thread beside the store's read: the chunk GEMMs on tiny inputs into the chunk's own
-    // scratch buffers (the mHC mix GEMM in F32, the FP16 GEMM the projections and the indexer weights use) - no engine state is
-    // touched (heat, profile, stats, positions, KV), so the answers are what they were.  DS4_WARM=0 turns it off.
+    // Warm the same chunk products on independent storage and an independent queue. In-order BLAS
+    // interop work on the model queue otherwise delays even a window which never uses that BLAS handle.
+    struct WarmScratch {
+        int device = 0;
+        int ns[2] = {};
+        rt::Queue stream;
+        float *h = nullptr, *mix = nullptr, *y = nullptr;
+        uint16_t *x = nullptr, *w = nullptr, *host = nullptr;
+        WarmScratch() = default;
+        WarmScratch(const WarmScratch&) = delete;
+        WarmScratch& operator=(const WarmScratch&) = delete;
+        ~WarmScratch() {
+            if (!stream) return;
+            try {
+                rt::set_device(device);
+                (void) rt::stream_sync(stream);
+                for (void* p : {(void*) h, (void*) mix, (void*) y, (void*) x, (void*) w, (void*) host})
+                    if (p != nullptr) rt::free(p);
+                release_stream(stream);
+            } catch (...) {}
+        }
+    };
+    std::vector<std::unique_ptr<WarmScratch>> warm_scratch;
+    bool warm_shared = false;   // no independent resources: retain the original serialized warm-up
+    std::mutex warm_mu;
+    std::thread warm_bg;
+    void prepare_warm() {
+        if (!warm_scratch.empty() || chunk <= 0 || (std::getenv("DS4_WARM") && std::atoi(std::getenv("DS4_WARM")) == 0)) return;
+        const int T = kWin, D = g.dim, hcd = g.hc * D, n_mix = (2 + g.hc) * g.hc;
+        const int mix_stride = std::max(32, n_mix);   // the chunk mix's padded row, not a device tile
+        warm_scratch.resize(chunks.size());
+        for (size_t di = 0; di < chunks.size(); ++di) {
+            if (!chunks[di] || chunks[di]->blas == nullptr || chunks[di]->C < T) continue;
+            const Chunk& c = *chunks[di];
+            rt::set_device(devs[di].id);
+            auto b = std::make_unique<WarmScratch>();
+            b->device = devs[di].id;
+            const int shapes[2] = {g.q_lora, g.ix_hd};
+            for (int i = 0; i < 2; ++i)
+                b->ns[i] = (int) std::min<size_t>(std::max(0, std::min(D, shapes[i])), c.w16_elems / (size_t) D);
+            const int max_n = std::max(b->ns[0], b->ns[1]);
+            const size_t hb = (size_t) std::max(T, n_mix) * hcd * sizeof(float);
+            const size_t mb = (size_t) T * mix_stride * sizeof(float), yb = (size_t) T * max_n * sizeof(float);
+            const size_t xb = (size_t) T * D * sizeof(uint16_t), wb = (size_t) max_n * D * sizeof(uint16_t);
+            const size_t total = hb + mb + yb + xb + wb;
+            size_t available = 0, memory = 0;
+            const bool room = rt::mem_info(&available, &memory) == rt::Result::success && total <= available &&
+                              std::max({hb, mb, yb, xb, wb}) <= core::max_alloc_bytes();
+            if (!room || rt::stream_create(&b->stream) != rt::Result::success ||
+                rt::alloc_device(&b->h, hb) != rt::Result::success ||
+                rt::alloc_device(&b->mix, mb) != rt::Result::success ||
+                (max_n > 0 && (rt::alloc_device(&b->y, yb) != rt::Result::success ||
+                               rt::alloc_device(&b->x, xb) != rt::Result::success ||
+                               rt::alloc_device(&b->w, wb) != rt::Result::success))) {
+                warm_shared = true;
+                continue;
+            }
+            const std::pair<void*, size_t> buffers[] = {{b->h, hb}, {b->mix, mb}, {b->y, yb}, {b->x, xb}, {b->w, wb}};
+            for (const auto& buffer : buffers)
+                if (buffer.first != nullptr && rt::memset_async(buffer.first, 0, buffer.second, b->stream) != rt::Result::success)
+                    throw std::runtime_error("the prompt warm-up's buffers failed");
+            // Prepare the same ordered host/device transfer used by prefill before the store's pinned arena.
+            if (rt::alloc_host(&b->host, sizeof(uint16_t)) == rt::Result::success) {
+                *b->host = 0;
+                if (rt::copy_async(b->h, b->host, sizeof(uint16_t), b->stream) != rt::Result::success)
+                    throw std::runtime_error("the prompt warm-up's transfer failed");
+            }
+            if (rt::stream_sync(b->stream) != rt::Result::success)
+                throw std::runtime_error("the prompt warm-up's queue failed");
+            warm_scratch[di] = std::move(b);
+        }
+        if (o.verbose && warm_shared)
+            std::fprintf(stderr, "ds4: independent warm-up resources unavailable; retaining the shared warm-up\n");
+    }
     void warm_flow() {
-        const int T = 16, D = g.dim, hcd = g.hc * g.dim, n_mix = (2 + g.hc) * g.hc;
+        const int T = kWin, D = g.dim, hcd = g.hc * g.dim, n_mix = (2 + g.hc) * g.hc;
         const float one = 1.0f, zero = 0.0f;
         for (size_t di = 0; di < chunks.size(); ++di) {
-            if (!chunks[di] || chunks[di]->blas == nullptr) continue;
+            if (!chunks[di] || chunks[di]->blas == nullptr || chunks[di]->C < T) continue;
             Chunk& c = *chunks[di];
-            if (c.C < T) continue;
             rt::set_device(devs[di].id);
-            (void) rt::dense_f32(c.blas, n_mix, T, hcd, one, c.h, hcd, c.h, hcd, zero, c.mix, 32);
-            const int ns[2] = {g.q_lora, g.ix_hd};
-            for (int shape : ns) {
-                const int n = (int) std::min<size_t>(std::min(D, shape), c.w16_elems / (size_t) D);
-                if (n > 0) (void) rt::dense_f16(c.blas, n, T, D, one, c.w16, D, c.x16, D, zero, c.y, n);
+            if (warm_scratch[di]) {
+                const WarmScratch& b = *warm_scratch[di];
+                prefill::Gemm blas;
+                blas.init_external(b.stream.handle, nullptr, 0);
+                blas.f32_strided(b.h, b.h, b.mix, T, n_mix, hcd, hcd, hcd, std::max(32, n_mix), one, zero);
+                for (int n : b.ns)
+                    if (n > 0) blas.f16_strided(b.x, b.w, b.y, T, n, D, D, D, n, one, zero);
+                if (rt::stream_sync(b.stream) != rt::Result::success)
+                    throw std::runtime_error("the prompt warm-up's products failed");
+            } else {
+                // Resource fallback only: the mutex below preserves the original shared-buffer contract.
+                (void) rt::dense_f32(c.blas, n_mix, T, hcd, one, c.h, hcd, c.h, hcd, zero, c.mix, 32);
+                for (int shape : {g.q_lora, g.ix_hd}) {
+                    const int n = (int) std::min<size_t>(std::min(D, shape), c.w16_elems / (size_t) D);
+                    if (n > 0) (void) rt::dense_f16(c.blas, n, T, D, one, c.w16, D, c.x16, D, zero, c.y, n);
+                }
+                (void) rt::stream_sync(devs[di].st);
+                (void) rt::last_error();
             }
-            (void) rt::stream_sync(devs[di].st);
-            (void) rt::last_error();
         }
     }
-    // The warm-up runs once the model is loaded, on a thread of its own: HIP serialises the BLAS start with the store's page-locked
-    // arena (measured: beside the store's read it finished only when the read did, 21 s, and load still grew by its 3.5 s), so
-    // it cannot hide inside the load; after it, a person typing gives it the seconds it needs.  A chunked pass that starts first
-    // waits for it (warm_mu) - never later than that pass would have been without it - and a warm-up that finds the flow already
-    // used does nothing.  DS4_WARM=0 turns it off.
-    std::mutex warm_mu;
-    std::atomic<bool> flow_used{false};
-    std::thread warm_bg;
+    // Keep all products even if prefill starts first. Only the resource fallback shares model state;
+    // the normal background job has no lock, queue or buffer dependency on a window or chunk.
     void start_warm() {
-        if (chunk <= 0 || (std::getenv("DS4_WARM") && std::atoi(std::getenv("DS4_WARM")) == 0)) return;
+        if (warm_bg.joinable() || warm_scratch.empty()) return;
         warm_bg = std::thread([this] { try {
-            std::lock_guard<std::mutex> lk(warm_mu);
-            if (flow_used.load() || quit.load()) return;
+            std::unique_lock<std::mutex> lk(warm_mu, std::defer_lock);
+            if (warm_shared) lk.lock();
             const double tw = now_ms();
             warm_flow();
             if (o.verbose) std::fprintf(stderr, "ds4: prompt path warmed up in %.0f ms\n", now_ms() - tw);
@@ -8969,8 +9043,8 @@ struct Model::Impl {
     // the last min(logits_rows, 16) rows (logits_rows > 16: a run of one chunk, every row's into chunk_logits)
     bool forward_chunks(const int* tk, int n, int logits_rows, std::string& err, int snap_slot = -1) {
         if (n < 1) return true;
-        flow_used.store(true);
-        std::lock_guard<std::mutex> warm_lk(warm_mu);   // (the warm-up, if it is running, finishes first)
+        std::unique_lock<std::mutex> warm_lk(warm_mu, std::defer_lock);
+        if (warm_shared) warm_lk.lock();
         if (pos + n > o.max_context) {
             err = "the context is full";
             return false;
