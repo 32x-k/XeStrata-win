@@ -124,7 +124,7 @@ inline float dot_q8_sub(const Sub& d, const int8_t* x) {
     int lo = 0, hi = 0, sl = 0, sh = 0;
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
-        const int packed = int(ld4(reinterpret_cast<const uint8_t*>(x + 4 * j)));
+        const int packed = int(ld4(reinterpret_cast<const uint8_t*>(x + size_t(j) * 4)));
         if (j < 4) {
             lo = strata::kernels::xe::dp4a(d.q[j], packed, lo);
             sl = strata::kernels::xe::dp4a(0x01010101, packed, sl);
