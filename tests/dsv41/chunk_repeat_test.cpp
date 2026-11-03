@@ -12,7 +12,7 @@
 #include <vector>
 
 int main(int argc, char** argv) try {
-    if (argc != 1 && (argc != 3 || std::strcmp(argv[1], "--dump"))) return 1;
+    if (argc != 1 && (argc != 3 || std::strcmp(argv[1], "--dump") != 0)) return 1;
     const char* pack = std::getenv("STRATA_DSV41_TEST_PACK");
     if (!pack || !*pack) {
         std::puts("SKIP: set STRATA_DSV41_TEST_PACK to a synthetic model pack");
@@ -29,7 +29,7 @@ int main(int argc, char** argv) try {
     options.ssd_cache_gb = 0;
     options.dspark_auto = false;
     if (const char* threads = std::getenv("STRATA_DSV41_TEST_THREADS"))
-        options.cpu_threads = std::max(1, std::atoi(threads));
+        options.cpu_threads = std::max(1, int(std::strtol(threads, nullptr, 10)));
     strata::ds4::Model model;
     std::string error;
     if (!model.load(options, error)) {
@@ -58,7 +58,7 @@ int main(int argc, char** argv) try {
                 return 1;
             }
             if (repeat == 0) expected.insert(expected.end(), logits.begin(), logits.end());
-            else if (std::memcmp(expected.data() + offset * size_t(model.vocab()), logits.data(), count * sizeof(float))) {
+            else if (std::memcmp(expected.data() + offset * size_t(model.vocab()), logits.data(), count * sizeof(float)) != 0) {
                 std::fprintf(stderr, "chunk repeat: logits differ at chunk %zu\n", offset / 16);
                 return 1;
             }

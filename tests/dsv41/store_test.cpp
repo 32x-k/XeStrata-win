@@ -88,11 +88,11 @@ static int selftest() {
         batch.reads.push_back(r);
         reader.submit(batch);
         reader.wait(batch);
-        if (batch.ok != std::vector<uint8_t>({1, 1, 1}) || std::memcmp(packed, bytes.data() + 19, sizeof packed) ||
-            std::memcmp(split, bytes.data() + 16, sizeof split) ||
-            std::memcmp(split_scale, bytes.data() + 109, sizeof split_scale)) ++bad;
+        if (batch.ok != std::vector<uint8_t>({1, 1, 1}) || std::memcmp(packed, bytes.data() + 19, sizeof packed) != 0 ||
+            std::memcmp(split, bytes.data() + 16, sizeof split) != 0 ||
+            std::memcmp(split_scale, bytes.data() + 109, sizeof split_scale) != 0) ++bad;
         for (size_t k = 0; k < 2; ++k)
-            if (scales[k] != bytes[37 + k * 33] || std::memcmp(codes + k * 32, bytes.data() + 38 + k * 33, 32)) ++bad;
+            if (scales[k] != bytes[37 + k * 33] || std::memcmp(codes + k * 32, bytes.data() + 38 + k * 33, 32) != 0) ++bad;
         reader.stop();
     }
     {

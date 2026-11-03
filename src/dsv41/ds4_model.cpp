@@ -3240,7 +3240,7 @@ struct Model::Impl {
                 for (void* p : {(void*) h, (void*) mix, (void*) y, (void*) x, (void*) w, (void*) host})
                     if (p != nullptr) rt::free(p);
                 release_stream(stream);
-            } catch (...) {}
+            } catch (...) { std::fputs("ds4: warm scratch cleanup failed\n", stderr); }
         }
     };
     std::vector<std::unique_ptr<WarmScratch>> warm_scratch;
@@ -3248,7 +3248,8 @@ struct Model::Impl {
     std::mutex warm_mu;
     std::thread warm_bg;
     void prepare_warm() {
-        if (!warm_scratch.empty() || chunk <= 0 || (std::getenv("DS4_WARM") && std::atoi(std::getenv("DS4_WARM")) == 0)) return;
+        if (!warm_scratch.empty()) return;
+        if (chunk <= 0 || (std::getenv("DS4_WARM") && std::atoi(std::getenv("DS4_WARM")) == 0)) return;
         const int T = kWin, D = g.dim, hcd = g.hc * D, n_mix = (2 + g.hc) * g.hc;
         const int mix_stride = std::max(32, n_mix);   // the chunk mix's padded row, not a device tile
         warm_scratch.resize(chunks.size());
