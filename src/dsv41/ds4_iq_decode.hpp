@@ -118,6 +118,23 @@ struct Sub {
     float d, m0, m1;
     int s0, s1;
 };
+// Four signed bytes per word, with exact integer sums. Keep the two halves and the
+// following FP32 operations in the same order as the byte loop.
+inline float dot_q8_sub(const Sub& d, const int8_t* x) {
+    int lo = 0, hi = 0, sl = 0, sh = 0;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int packed = int(ld4(reinterpret_cast<const uint8_t*>(x + 4 * j)));
+        if (j < 4) {
+            lo = strata::kernels::xe::dp4a(d.q[j], packed, lo);
+            sl = strata::kernels::xe::dp4a(0x01010101, packed, sl);
+        } else {
+            hi = strata::kernels::xe::dp4a(d.q[j], packed, hi);
+            sh = strata::kernels::xe::dp4a(0x01010101, packed, sh);
+        }
+    }
+    return d.d * float(d.s0 * lo + d.s1 * hi) - (d.m0 * float(sl) + d.m1 * float(sh));
+}
 // (b: the block's address, ib: the sub-block in it (0 for the 32-value types); the token kernels keep ib fixed a lane)
 template <int T>
 inline void decode_b(const uint8_t* __restrict__ b, int ib, const uint32_t* tab, Sub& s) {
@@ -341,15 +358,7 @@ template <int T> struct Decoder {
     float dot_q8_block(const uint8_t* row, int b, const int8_t* x) const {
         Sub d{};
         decode<T>(row, b, table<T>(), d);
-        int lo = 0, hi = 0, sl = 0, sh = 0;
-        for (int j = 0; j < 32; ++j) {
-            const uint32_t byte = ((uint32_t) d.q[j / 4] >> (8 * (j % 4))) & 255u;
-            const int code = (int) (byte ^ 128u) - 128;
-            const int v = (int) ((uint8_t) x[j] ^ 128u) - 128;
-            if (j < 16) { lo += code * v; sl += v; }
-            else { hi += code * v; sh += v; }
-        }
-        return d.d * (float) (d.s0 * lo + d.s1 * hi) - (d.m0 * (float) sl + d.m1 * (float) sh);
+        return dot_q8_sub(d, x);
     }
     float dot_q8(const uint8_t* row, const int8_t* x, const float* xd, int k) const {
         float sum = 0.0f;

@@ -166,24 +166,11 @@ bool light_set_tiled(const SetArgs& a, size_t rb, sycl::queue& s) {
                 const Sub g = weights[col];
                 Sub u{};
                 if constexpr (GU) u = weights[bn + col];
-                int lo = 0, hi = 0, ulo = 0, uhi = 0, sl = 0, sh = 0;
-                for (int j = 0; j < 32; ++j) {
-                    const int v = int(uint8_t(codes[row * 32 + size_t(j)]) ^ 128u) - 128;
-                    const uint32_t byte = (uint32_t(g.q[j / 4]) >> (8 * (j % 4))) & 255u;
-                    const int code = int(byte ^ 128u) - 128;
-                    if (j < 16) { lo += code * v; sl += v; }
-                    else { hi += code * v; sh += v; }
-                    if constexpr (GU) {
-                        const uint32_t ub = (uint32_t(u.q[j / 4]) >> (8 * (j % 4))) & 255u;
-                        const int uc = int(ub ^ 128u) - 128;
-                        if (j < 16) ulo += uc * v;
-                        else uhi += uc * v;
-                    }
-                }
-                const float dot = g.d * float(g.s0 * lo + g.s1 * hi) - (g.m0 * float(sl) + g.m1 * float(sh));
+                const auto* quantized = codes.template get_multi_ptr<sycl::access::decorated::no>().get() + row * 32;
+                const float dot = dot_q8_sub(g, quantized);
                 sum = sycl::fma(scales[row], dot, sum);
                 if constexpr (GU) {
-                    const float udot = u.d * float(u.s0 * ulo + u.s1 * uhi) - (u.m0 * float(sl) + u.m1 * float(sh));
+                    const float udot = dot_q8_sub(u, quantized);
                     usum = sycl::fma(scales[row], udot, usum);
                 }
                 it.barrier(sycl::access::fence_space::local_space);
