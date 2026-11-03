@@ -2866,7 +2866,6 @@ struct Model::Impl {
             const uint64_t avail = ram_avail();
             uint64_t mb = avail == ~uint64_t{0} ? 0 : (avail >> 20) / 64;
             if (const char* e = std::getenv("DS4_ENGRAM_CACHE_MB")) mb = std::strtoull(e, nullptr, 10);
-            eg_cache.init((size_t) ((mb << 20) / row), row);
             std::vector<std::string> paths;
             for (const std::string& fn : pk.files) paths.push_back(pk.model_dir + "/" + fn);
             // Windows: the Engram tables' files that hold nothing else are unmapped and read unbuffered - an SSD's
@@ -2892,7 +2891,7 @@ struct Model::Impl {
                     }
             }
 #endif
-            eg_io.start(paths, nth, eg_direct);
+            std::vector<EgSpan> eg_tables;
             for (int li = 0; li < pk.eg_layers; ++li) {
                 eg_win.emplace_back(new EgBatch());
                 const std::string id = std::to_string(g.eg_layers[(size_t) li]);
@@ -2930,7 +2929,20 @@ struct Model::Impl {
                     return false;
                 }
                 eg_fmt.push_back((uint8_t) fmt);
+                eg_tables.push_back({tw->file, tw->off, tw->bytes});
+                if (fmt == 3) {
+                    const Tensor* ts = pk.get("layers." + id + ".engram.embed.scale");
+                    eg_tables.push_back({ts->file, ts->off, ts->bytes});
+                }
             }
+            // A small table can fit the existing cache outright: read its bytes sequentially before the store's
+            // arena competes for RAM, rather than filling that same budget with individual random rows later.
+            const size_t cache_bytes = (size_t) (mb << 20);
+            const size_t held = eg_io.preload(paths, std::move(eg_tables), cache_bytes);
+            eg_cache.init((cache_bytes - held) / row, row);
+            eg_io.start(paths, nth, eg_direct);
+            if (o.verbose && held != 0)
+                std::fprintf(stderr, "ds4: Engram tables kept in %zu bytes of the row cache budget\n", held);
             if (o.verbose)
                 std::fprintf(stderr, "ds4: Engram rows read on %d threads, issued with the tokens, collected before "
                                      "their layer; row cache %llu MB (%zu rows)\n",

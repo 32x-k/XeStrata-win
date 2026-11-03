@@ -17,6 +17,8 @@
 #include "ds4_os.hpp"
 
 #include <algorithm>
+#include <new>
+#include <stdexcept>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -116,6 +118,11 @@ struct EgRead {
     uint64_t key = 0;
 };
 
+struct EgSpan {
+    int file = -1;
+    uint64_t off = 0, n = 0;
+};
+
 /// A batch of rows (one Engram layer of a window): reads, the other places a row read once goes, and its state.
 struct EgBatch {
     std::vector<EgRead> reads;
@@ -140,6 +147,45 @@ struct EgBatch {
 class EgReader {
 public:
     ~EgReader() { stop(); }
+    /// Before start: retain whole tables only when their union fits the caller's cache budget. Larger tables,
+    /// allocation failures and incomplete reads keep the demand reader; no partially filled table is published.
+    size_t preload(const std::vector<std::string>& paths, std::vector<EgSpan> spans, size_t budget) {
+        if (!th_.empty()) return 0;
+        held_.clear();
+        if (budget == 0) return 0;
+        try {
+            std::sort(spans.begin(), spans.end(), [](const EgSpan& a, const EgSpan& b) {
+                return std::make_pair(a.file, a.off) < std::make_pair(b.file, b.off);
+            });
+            std::vector<EgSpan> merged;
+            for (const EgSpan& s : spans) {
+                if (s.file < 0 || (size_t) s.file >= paths.size() || s.n > UINT64_MAX - s.off) return 0;
+                if (s.n == 0) continue;
+                if (!merged.empty() && merged.back().file == s.file && s.off <= merged.back().off + merged.back().n) {
+                    EgSpan& last = merged.back();
+                    last.n = std::max(last.off + last.n, s.off + s.n) - last.off;
+                } else merged.push_back(s);
+            }
+            size_t total = 0;
+            for (const EgSpan& s : merged) {
+                if (s.n > budget - total) return 0;
+                total += (size_t) s.n;
+            }
+            std::vector<Held> ready;
+            for (const EgSpan& s : merged) {
+                Held h{s, std::vector<uint8_t>((size_t) s.n)};
+                const os::fd_t f = os::open_ro(paths[(size_t) s.file]);
+                if (f == os::kBadFd) return 0;
+                const bool ok = os::pread_full(f, h.data.data(), h.data.size(), s.off);
+                os::close_fd(f);
+                if (!ok) return 0;
+                ready.push_back(std::move(h));
+            }
+            held_ = std::move(ready);
+            return total;
+        } catch (const std::bad_alloc&) { return 0; }
+          catch (const std::length_error&) { return 0; }
+    }
     /// direct[i]: file i read unbuffered (Windows, a file nothing maps: os::open_unbuffered), else buffered
     void start(const std::vector<std::string>& paths, int threads, std::vector<char> direct = {}) {
         paths_ = paths;
@@ -187,6 +233,17 @@ public:
     }
 
 private:
+    struct Held {
+        EgSpan span;
+        std::vector<uint8_t> data;
+    };
+    std::vector<Held> held_;   // immutable from start until the reader threads have joined
+    const uint8_t* retained(int file, uint64_t off, size_t n) const {
+        for (const Held& h : held_)
+            if (file == h.span.file && off >= h.span.off && off - h.span.off <= h.span.n &&
+                n <= h.span.n - (off - h.span.off)) return h.data.data() + (size_t) (off - h.span.off);
+        return nullptr;
+    }
     void loop() {
         std::vector<os::fd_t> fds(paths_.size(), os::kBadFd);   // this thread's own handles, opened on first use
         std::vector<os::fd_t> ufds(paths_.size(), os::kBadFd);  // (and its unbuffered ones)
@@ -216,6 +273,20 @@ private:
     }
     bool read(std::vector<os::fd_t>& fds, std::vector<os::fd_t>& ufds, uint8_t* al, const EgRead& r,
               std::vector<uint8_t>& buf) {
+        const uint8_t* held = retained(r.file, r.off, r.n);
+        const uint8_t* scale = r.n2 == 0 ? nullptr : retained(r.file2, r.off2, r.n2);
+        if (held != nullptr && (r.n2 == 0 || scale != nullptr)) {
+            if (r.mx8) {
+                for (uint32_t k = 0; k < r.n / 33; ++k) {
+                    r.scales[k] = held[(size_t) k * 33];
+                    std::memcpy(r.dst + (size_t) k * 32, held + (size_t) k * 33 + 1, 32);
+                }
+            } else {
+                std::memcpy(r.dst, held, r.n);
+                if (r.n2 != 0) std::memcpy(r.scales, scale, r.n2);
+            }
+            return true;
+        }
         if ((r.mx8 || r.n2 == 0) && r.file >= 0 && (size_t) r.file < direct_.size() && direct_[(size_t) r.file] &&
             os::direct_span(r.off, r.n) <= 2 * os::kDirectAlign) {
             os::fd_t& u = ufds[(size_t) r.file];

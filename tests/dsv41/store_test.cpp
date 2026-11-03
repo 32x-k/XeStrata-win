@@ -60,6 +60,47 @@ static int selftest() {
         cache.init(0, mb);
         if (cache.size() != 0 || cache.find(1) != nullptr || cache.put(1) != nullptr) ++bad;
     }
+    // Retained and demand reads must preserve packed rows, interleaved MXFP8 scales, and separate scales. The
+    // requested union fits exactly; a smaller budget and a truncated table must both leave the demand path usable.
+    for (int mode = 0; mode < 3; ++mode) {
+        EgReader reader;
+        const fs::path table = dir / "engram.bin";
+        {
+            std::ofstream f(table, std::ios::binary);
+            f.write((const char*) bytes.data(), (std::streamsize) bytes.size());
+            if (!f) return 1;
+        }
+        const std::vector<std::string> paths = {table.string()};
+        const size_t kept = reader.preload(paths, mode == 2 ? std::vector<EgSpan>{{0, bytes.size() - 2, 5}} :
+            std::vector<EgSpan>{{0, 13, 90}, {0, 23, 90}}, mode == 0 ? 100 : mode == 1 ? 99 : 100);
+        if (kept != (mode == 0 ? 100u : 0u)) ++bad;
+        if (mode == 0 && !fs::remove(table)) ++bad;   // retained bytes must not silently fall back to a file read
+        reader.start(paths, 2);
+        EgBatch batch;
+        uint8_t packed[41] = {}, codes[64] = {}, scales[2] = {}, split[31] = {}, split_scale[3] = {};
+        EgRead r;
+        r.file = 0; r.off = 19; r.n = sizeof packed; r.dst = packed;
+        batch.reads.push_back(r);
+        r.off = 37; r.n = 66; r.dst = codes; r.scales = scales; r.mx8 = true;
+        batch.reads.push_back(r);
+        r.off = 16; r.n = sizeof split; r.dst = split; r.scales = split_scale; r.mx8 = false;
+        r.file2 = 0; r.off2 = 109; r.n2 = sizeof split_scale;
+        batch.reads.push_back(r);
+        reader.submit(batch);
+        reader.wait(batch);
+        if (batch.ok != std::vector<uint8_t>({1, 1, 1}) || std::memcmp(packed, bytes.data() + 19, sizeof packed) ||
+            std::memcmp(split, bytes.data() + 16, sizeof split) ||
+            std::memcmp(split_scale, bytes.data() + 109, sizeof split_scale)) ++bad;
+        for (size_t k = 0; k < 2; ++k)
+            if (scales[k] != bytes[37 + k * 33] || std::memcmp(codes + k * 32, bytes.data() + 38 + k * 33, 32)) ++bad;
+        reader.stop();
+    }
+    {
+        EgReader reader;
+        const std::vector<std::string> paths = {path.string()};
+        if (reader.preload(paths, {{0, UINT64_MAX - 1, 4}}, 4) != 0 ||
+            reader.preload(paths, {{-1, 0, 1}}, 1) != 0 || reader.preload(paths, {{0, 0, 1}}, 0) != 0) ++bad;
+    }
     ExpertStore::LayerGeo geo;
     geo.n_exp = ne;
     for (int role = 0; role < 3; ++role) {
