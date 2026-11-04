@@ -857,6 +857,10 @@ struct Worker {
         std::unique_lock<std::mutex> lk(mu);
         cv.wait(lk, [&] { return !busy; });
     }
+    void wait_until(std::chrono::steady_clock::time_point deadline) {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait_until(lk, deadline, [&] { return !busy; });
+    }
     bool idle() {
         std::lock_guard<std::mutex> lk(mu);
         return !busy;
@@ -9218,7 +9222,22 @@ struct Model::Impl {
                     progress(run.p0[reported - 1] + run.T[reported - 1] - run.p0[0]);
             }
             if (all) break;
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            // Job completion already notifies the worker's CV. Do not make a
+            // completed device wait for a host timer tick before returning.
+            if (!progress && !cancel) {
+                for (auto& w : workers) w->wait();
+            } else {
+                // Keep the existing progress/cancel callback cadence; this is
+                // a responsiveness deadline, not an estimate of GPU work.
+                // Completion wakes the predicate wait before that deadline.
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+                for (auto& w : workers) {
+                    if (!w->idle()) {
+                        w->wait_until(deadline);
+                        break;
+                    }
+                }
+            }
         }
         if (!mailbox->ready(err)) return false;
         for (const std::string& e : errs)   // (a device's failure first: a Stop's early end is not one)
