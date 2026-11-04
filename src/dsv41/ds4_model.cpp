@@ -5392,10 +5392,7 @@ struct Model::Impl {
     // allocations come out of the same RAM the store would use, and the first estimate (made at the layout, before any upload)
     // saw all of it free.  The explicit sizes (--ssd-cache, DS4_STORE_GB) stand.
     mutable uint64_t avail0_ = ~uint64_t{0};   // (free RAM when the first estimate was made, before the weights went to the GPU)
-    // An automatic store has no consumer once every trunk expert has an actual VRAM slot.
-    // The estimate used while laying out the buffers is not proof of that placement; explicit budgets stand.
-    bool automatic_store_unused() const {
-        if (o.ssd_cache_gb >= 0.0 || std::getenv("DS4_STORE_GB")) return false;
+    bool trunk_experts_resident() const {
         bool trunk = false;
         for (const Layer& l : L) {
             if (l.mtp) continue;
@@ -5404,6 +5401,12 @@ struct Model::Impl {
                 std::any_of(l.slot.begin(), l.slot.end(), [](int slot) { return slot < 0; })) return false;
         }
         return trunk;
+    }
+    // An automatic store has no consumer once every trunk expert has an actual VRAM slot.
+    // The estimate used while laying out the buffers is not proof of that placement; explicit budgets stand.
+    bool automatic_store_unused() const {
+        if (o.ssd_cache_gb >= 0.0 || std::getenv("DS4_STORE_GB")) return false;
+        return trunk_experts_resident();
     }
     double store_gb_now() const {
         const double gb = store_gb();
@@ -8848,10 +8851,42 @@ struct Model::Impl {
     // (first prompt of a run, windows against the flow, ms): 28 tokens 594 / 4966 (4 cards), 1094 / 5588 (1 card); 100: 1164 / 5375,
     // 3279 / 7299; 300: 2831 / 5874, 9018 / 9803; 600: 5304 / 6808, 16969 / 11327; 1500: 13325 / 8012, 41547 / 18187 - the flow pays a
     // fixed ~5 s the first time (its buffers and GEMM libraries), then wins from about 400 tokens up.
-    // The length from which the flow is taken: one number for every box (ds4_pick_rule.hpp says why 96), DS4_PICK_MIN=N overrides.
+    // A deterministic rule from actual expert placement and reported device/model capacities.
     int pick_flow_min() {
         if (pick_min_ > 0) return pick_min_;
-        pick_min_ = prompt_flow_min(std::getenv("DS4_PICK_MIN"), kWin);
+        const char* explicit_min = std::getenv("DS4_PICK_MIN");
+        PromptPathFacts f;
+        f.window_capacity = kWin;
+        f.attention_window = g.win;
+        f.expert_width = std::min(g.dim, g.ff);
+        f.single_device = devs.size() == 1;
+        f.resident = trunk_experts_resident();
+        f.matrix = matrix_capable();
+        f.one_bit = !L.empty();
+        for (const Layer& l : L) {
+            if (l.mtp) continue;
+            if (l.lay.fmt != gg::kFmtMXFP4) { f.one_bit = false; break; }
+            for (int role = 0; role < 3; ++role) {
+                const int type = gg::expert_type(l.lay, role);
+                if (type != gg::iq::kIQ1_S && type != gg::iq::kIQ1_M) f.one_bit = false;
+            }
+        }
+        if (f.single_device && !(explicit_min != nullptr && *explicit_min != 0)) {
+            try {
+                strata::core::OnDevice on(devs.front().id);
+                const auto device = strata::core::Runtime::get().compute().get_device();
+                f.max_group = std::min(device.get_info<sycl::info::device::max_work_group_size>(),
+                                      device.get_info<sycl::info::device::max_work_item_sizes<1>>()[0]);
+                const size_t cover = f.max_group / size_t(kWin);
+                for (const size_t subgroup : device.get_info<sycl::info::device::sub_group_sizes>())
+                    if (subgroup <= cover) f.subgroup = std::max(f.subgroup, subgroup);
+            } catch (...) { f.max_group = 0; f.subgroup = 0; }   // no report: the capacity default
+        }
+        pick_min_ = prompt_flow_min(explicit_min, f);
+        if (o.verbose)
+            std::fprintf(stderr, "ds4: prompt rule: window %d, model window %d, expert width %d, max WG %zu, SG %zu, devices %zu, resident %d, matrix %d, IQ1 %d\n",
+                         f.window_capacity, f.attention_window, f.expert_width, f.max_group, f.subgroup, devs.size(),
+                         int(f.resident), int(f.matrix), int(f.one_bit));
         std::fprintf(stderr, "ds4: prompt path: the chunked pass from %d tokens, windows of 16 below\n", pick_min_);
         return pick_min_;
     }
