@@ -106,31 +106,44 @@ bool launch(const SetArgs& a, sycl::queue& s) {
     if (std::find(c.subgroups.begin(), c.subgroups.end(), SG) == c.subgroups.end()) return false;
     constexpr size_t roles = GU ? 2 : 1;
     constexpr size_t table_words = Ty<T>::TAB > 0 ? Ty<T>::TAB : 1;
-    const size_t fixed = table_words * sizeof(uint32_t) + MM * QK * sizeof(uint16_t) + MM * sizeof(int);
-    const size_t per_subgroup = roles * MN * (QK * sizeof(uint16_t) + MM * sizeof(float));
-    if (c.local <= fixed) return false;
-    const size_t subgroups = std::min({c.group / SG, (c.local - fixed) / per_subgroup,
+    // Balance subgroup rows and columns from the reported group limit. Each
+    // subgroup keeps the same matrix shape and ascending-K accumulation, while
+    // a work-group's expanded weights serve all of its row subgroups.
+    size_t row_groups = 1;
+    const size_t needed = (size_t(a.max_rows) + MM - 1) / MM;
+    while (row_groups * 2 <= needed && (row_groups * 2) * (row_groups * 2) <= c.group / SG)
+        row_groups *= 2;
+    size_t column_groups = 0, rows = 0;
+    for (;;) {
+        rows = row_groups * MM;
+        const size_t fixed = table_words * sizeof(uint32_t) + rows * (QK * sizeof(uint16_t) + sizeof(int));
+        const size_t per_column = roles * MN * (QK * sizeof(uint16_t) + rows * sizeof(float));
+        if (c.local > fixed)
+            column_groups = std::min({c.group / (SG * row_groups), (c.local - fixed) / per_column,
                                       (size_t(n) + MN - 1) / MN});
-    if (!subgroups) return false;
+        if (column_groups) break;
+        if (row_groups == 1) return false;
+        row_groups /= 2;
+    }
     sycl_detail::require_in_order(s);
-    const size_t bn = subgroups * MN, threads = subgroups * SG;
-    const size_t nc = (size_t(n) + bn - 1) / bn, nr = (size_t(a.max_rows) + MM - 1) / MM;
+    const size_t bn = column_groups * MN, threads = row_groups * column_groups * SG;
+    const size_t nc = (size_t(n) + bn - 1) / bn, nr = (size_t(a.max_rows) + rows - 1) / rows;
     const size_t rb = row_bytes_t<T>(k), groups = size_t(a.n_exp) * nc * nr;
     const int skip = std::max(a.skip_le, kLightRows);
     sycl_detail::submit(s, [&](sycl::handler& h) {
         sycl::local_accessor<uint32_t, 1> table_data(sycl::range<1>(table_words), h);
-        sycl::local_accessor<int, 1> source(sycl::range<1>(MM), h);
-        sycl::local_accessor<sycl::half, 1> xs(sycl::range<1>(MM * QK), h), ws(sycl::range<1>(roles * bn * QK), h);
-        sycl::local_accessor<float, 1> result(sycl::range<1>(roles * MM * bn), h);
+        sycl::local_accessor<int, 1> source(sycl::range<1>(rows), h);
+        sycl::local_accessor<sycl::half, 1> xs(sycl::range<1>(rows * QK), h), ws(sycl::range<1>(roles * bn * QK), h);
+        sycl::local_accessor<float, 1> result(sycl::range<1>(roles * rows * bn), h);
         h.parallel_for(sycl::nd_range<1>(sycl::range<1>(groups * threads), sycl::range<1>(threads)),
                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
             const size_t id = it.get_local_linear_id(), group = it.get_group_linear_id();
-            const size_t e = group / (nc * nr), r0 = ((group / nc) % nr) * MM, c0 = (group % nc) * bn;
+            const size_t e = group / (nc * nr), r0 = ((group / nc) % nr) * rows, c0 = (group % nc) * bn;
             const int first = a.bounds[e] - a.row0, count = a.bounds[e + 1] - a.bounds[e];
             if (count <= skip || (a.skip_ge > 0 && count >= a.skip_ge) || r0 >= size_t(count)) return;
             if constexpr (Ty<T>::TAB > 0)
                 for (size_t j = id; j < size_t(Ty<T>::TAB); j += threads) table_data[j] = table<T>()[j];
-            if (id < MM) {
+            if (id < rows) {
                 const size_t r = r0 + id, row = size_t(first) + r;
                 source[id] = r < size_t(count) && r < size_t(a.max_rows) ?
                              (GU && a.idx ? a.idx[row] : int(row)) : -1;
@@ -141,7 +154,8 @@ bool launch(const SetArgs& a, sycl::queue& s) {
             const auto wp = ws.template get_multi_ptr<sycl::access::decorated::no>();
             const auto op = result.template get_multi_ptr<sycl::access::decorated::no>();
             const auto sg = it.get_sub_group();
-            const size_t column = sg.get_group_linear_id() * MN;
+            const size_t row_block = (sg.get_group_linear_id() / column_groups) * MM;
+            const size_t column = (sg.get_group_linear_id() % column_groups) * MN;
 #if STRATA_AMD_WMMA
             xe::wmma::C accum[roles];
             for (size_t role = 0; role < roles; ++role) xe::wmma::fill(sg, accum[role], 0.0f);
@@ -160,13 +174,12 @@ bool launch(const SetArgs& a, sycl::queue& s) {
                     Sub sub{};
                     if (c0 + col < size_t(n))
                         decode<T>(blob + (GU ? (role ? a.tr[1] : a.tr[0]) : a.tr[2]) + (c0 + col) * rb, kb, grids, sub);
-                    // Constant sub-word indices keep Sub in registers; the
-                    // per-output rounding and ascending-K matrix MADs stay the same.
+                    // Fixed QK indices retain the adopted register expansion.
 #pragma unroll
                     for (size_t q = 0; q < QK; ++q)
                         ws[(role * bn + col) * QK + q] = sycl::bit_cast<sycl::half>(matrix_weight<T>(sub, int(q)));
                 }
-                for (size_t j = id; j < MM * QK; j += threads) {
+                for (size_t j = id; j < rows * QK; j += threads) {
                     const int src = source[j / QK];
                     uint16_t value = 0;
                     if (src >= 0) {
@@ -180,7 +193,7 @@ bool launch(const SetArgs& a, sycl::queue& s) {
                 for (size_t kk = 0; kk < QK; kk += MK) {
 #if STRATA_AMD_WMMA
                     xe::wmma::A<sycl::half> av;
-                    xe::wmma::load(sg, av, xp + std::ptrdiff_t(kk), QK);
+                    xe::wmma::load(sg, av, xp + std::ptrdiff_t(row_block * QK + kk), QK);
                     for (size_t role = 0; role < roles; ++role) {
                         xe::wmma::Bc<sycl::half> bv;
                         xe::wmma::load(sg, bv, wp + std::ptrdiff_t((role * bn + column) * QK + kk), QK);
@@ -191,7 +204,7 @@ bool launch(const SetArgs& a, sycl::queue& s) {
                     for (size_t j = 0; j < MM * MN / SG; ++j) {
                         const size_t out = j * SG + lane, r = out / MN, col = column + out % MN;
                         for (size_t q = kk; q < kk + MK; ++q) {
-                            const float x = sycl_detail::f16_value(sycl::bit_cast<uint16_t>(xs[r * QK + q]));
+                            const float x = sycl_detail::f16_value(sycl::bit_cast<uint16_t>(xs[(row_block + r) * QK + q]));
                             for (size_t role = 0; role < roles; ++role)
                                 accum[role][j] = sycl::fma(x, sycl_detail::f16_value(sycl::bit_cast<uint16_t>(
                                     ws[(role * bn + col) * QK + q])), accum[role][j]);
@@ -199,7 +212,7 @@ bool launch(const SetArgs& a, sycl::queue& s) {
                     }
 #else
                     mx::joint_matrix<sycl::sub_group, sycl::half, mx::use::a, MM, MK, mx::layout::row_major> av;
-                    mx::joint_matrix_load(sg, av, xp + std::ptrdiff_t(kk), QK);
+                    mx::joint_matrix_load(sg, av, xp + std::ptrdiff_t(row_block * QK + kk), QK);
                     for (size_t role = 0; role < roles; ++role) {
                         mx::joint_matrix<sycl::sub_group, sycl::half, mx::use::b, MK, MN, mx::layout::col_major> bv;
                         mx::joint_matrix_load(sg, bv, wp + std::ptrdiff_t((role * bn + column) * QK + kk), QK);
@@ -211,23 +224,23 @@ bool launch(const SetArgs& a, sycl::queue& s) {
             }
             for (size_t role = 0; role < roles; ++role) {
 #if STRATA_AMD_WMMA
-                xe::wmma::store(sg, accum[role], op + std::ptrdiff_t(role * MM * bn + column), bn);
+                xe::wmma::store(sg, accum[role], op + std::ptrdiff_t(role * rows * bn + row_block * bn + column), bn);
 #elif STRATA_IQ_MATRIX_SCALAR
                 const size_t lane = sg.get_local_linear_id();
                 for (size_t j = 0; j < MM * MN / SG; ++j) {
                     const size_t out = j * SG + lane;
-                    result[role * MM * bn + (out / MN) * bn + column + out % MN] = accum[role][j];
+                    result[role * rows * bn + (row_block + out / MN) * bn + column + out % MN] = accum[role][j];
                 }
 #else
-                mx::joint_matrix_store(sg, accum[role], op + std::ptrdiff_t(role * MM * bn + column), bn, mx::layout::row_major);
+                mx::joint_matrix_store(sg, accum[role], op + std::ptrdiff_t(role * rows * bn + row_block * bn + column), bn, mx::layout::row_major);
 #endif
             }
             it.barrier(sycl::access::fence_space::local_space);
-            for (size_t j = id; j < MM * bn; j += threads) {
+            for (size_t j = id; j < rows * bn; j += threads) {
                 const size_t row = j / bn, col = j % bn;
                 if (r0 + row >= size_t(count) || r0 + row >= size_t(a.max_rows) || c0 + col >= size_t(n)) continue;
                 const size_t out = (size_t(first) + r0 + row) * a.ldo + c0 + col;
-                if constexpr (GU) a.h[out] = sycl_detail::f16_bits(portable::swiglu(result[j], result[MM * bn + j], a.limit));
+                if constexpr (GU) a.h[out] = sycl_detail::f16_bits(portable::swiglu(result[j], result[rows * bn + j], a.limit));
                 else a.y[out] = result[j];
             }
         });
