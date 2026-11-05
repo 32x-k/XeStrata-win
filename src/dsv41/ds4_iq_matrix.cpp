@@ -48,17 +48,37 @@ const Caps& caps(const sycl::queue& s) {
     });
 }
 
+// Matrix dispatch already requires fp16. Native RTE is used only where the
+// result is a finite normal half; the bit-defined path keeps subnormals and
+// special values independent of the device's half denormal modes.
+uint16_t matrix_half_bits(float value) {
+    const uint32_t bits = sycl::bit_cast<uint32_t>(value), magnitude = bits & 0x7fffffffu;
+    if (magnitude == 0) return uint16_t(bits >> 16);
+    if (magnitude >= 0x38800000u && magnitude <= 0x477fe000u) [[likely]] {
+        const auto rounded = sycl::vec<float, 1>(value).convert<sycl::half, sycl::rounding_mode::rte>();
+        return sycl::bit_cast<uint16_t>(sycl::half(rounded[0]));
+    }
+    return sycl_detail::f16_bits(value);
+}
+float matrix_half_value(uint16_t bits) {
+    const uint16_t magnitude = bits & 0x7fffu, exponent = bits & 0x7c00u;
+    if (magnitude == 0) return sycl::bit_cast<float>(uint32_t(bits & 0x8000u) << 16);
+    if (exponent != 0 && exponent != 0x7c00u) [[likely]]
+        return float(sycl::bit_cast<sycl::half>(bits));
+    return sycl_detail::f16_value(bits);
+}
+
 template <int T>
 uint16_t matrix_weight(const Sub& sub, int j) {
     const uint32_t byte = (uint32_t(sub.q[j / 4]) >> (8 * (j % 4))) & 255u;
     const int code = int(byte ^ 128u) - 128;
     // MXFP4 rounds the decoded product once. Rounding its power-of-two scale
     // first would lose small representable products or turn zero into NaN.
-    if constexpr (T == kMXFP4) return sycl_detail::f16_bits(sub.d * float(code));
+    if constexpr (T == kMXFP4) return matrix_half_bits(sub.d * float(code));
     // Upstream hipk first rounds the sub-block scale, then its product with the
     // integer code. IQ1's +/-1/8 offset is already in its signed integer codes.
-    const float scale = sycl_detail::f16_value(sycl_detail::f16_bits(sub.d * float(j < 16 ? sub.s0 : sub.s1)));
-    return sycl_detail::f16_bits(scale * float(code));
+    const float scale = matrix_half_value(matrix_half_bits(sub.d * float(j < 16 ? sub.s0 : sub.s1)));
+    return matrix_half_bits(scale * float(code));
 }
 
 template <int T, bool GU>
@@ -139,7 +159,10 @@ bool launch(const SetArgs& a, sycl::queue& s) {
                     const size_t role = j / bn, col = j % bn;
                     Sub sub{};
                     if (c0 + col < size_t(n))
-                        decode<T>(blob + a.tr[GU ? role : 2] + (c0 + col) * rb, kb, grids, sub);
+                        decode<T>(blob + (GU ? (role ? a.tr[1] : a.tr[0]) : a.tr[2]) + (c0 + col) * rb, kb, grids, sub);
+                    // Constant sub-word indices keep Sub in registers; the
+                    // per-output rounding and ascending-K matrix MADs stay the same.
+#pragma unroll
                     for (size_t q = 0; q < QK; ++q)
                         ws[(role * bn + col) * QK + q] = sycl::bit_cast<sycl::half>(matrix_weight<T>(sub, int(q)));
                 }
