@@ -17,6 +17,9 @@
 #include <algorithm>
 #include <cstdlib>
 #include <vector>
+#include <limits>
+#include <memory>
+#include "strata/core/runtime.hpp"
 
 namespace strata::ds4::gguf::iq {
 using namespace sycl_decode;
@@ -97,8 +100,87 @@ SetTile light_tile(const SetArgs& a, const sycl::queue& s) {
     return tile;
 }
 
+// One quantized row per sorted light entry. The same in-order queue owns
+// production and consumption; independent host threads never share its scratch.
+struct LightQ8 { int8_t* codes = nullptr; float* scales = nullptr; size_t rows = 0; };
+struct LightScratch {
+    sycl::queue queue;
+    int8_t* codes = nullptr;
+    float* scales = nullptr;
+    size_t capacity = 0;
+    explicit LightScratch(const sycl::queue& q) : queue(q) {}
+    ~LightScratch() {
+        if (!codes && !scales) return;
+        try { queue.wait_and_throw(); sycl::free(codes, queue); sycl::free(scales, queue); }
+        catch (...) { std::terminate(); }
+    }
+    bool reserve(size_t count, size_t max_alloc, size_t memory) {
+        if (count <= capacity) return true;
+        const size_t scale_bytes = count / 32 * sizeof(float);
+        if (count > max_alloc || scale_bytes > max_alloc || count > memory || scale_bytes > memory - count) return false;
+        int8_t* next_codes = nullptr;
+        float* next_scales = nullptr;
+        const auto release = [&] { if (next_codes) sycl::free(next_codes, queue); if (next_scales) sycl::free(next_scales, queue); };
+        try {
+            next_codes = sycl::malloc_device<int8_t>(count, queue);
+            next_scales = sycl::malloc_device<float>(count / 32, queue);
+            if (!next_codes || !next_scales) { release(); return false; }
+            // Only growth may retire work. Reuse on the steady path neither waits nor allocates.
+            if (codes || scales) queue.wait_and_throw();
+        } catch (const std::bad_alloc&) { release(); return false; }
+          catch (const sycl::exception& e) {
+            release();
+            if (e.code() == sycl::make_error_code(sycl::errc::memory_allocation)) return false;
+            throw;
+        }
+        if (codes) sycl::free(codes, queue);
+        if (scales) sycl::free(scales, queue);
+        codes = next_codes; scales = next_scales; capacity = count;
+        return true;
+    }
+};
+template <bool GU>
+LightQ8 light_quantized(const SetArgs& a, sycl::queue& s) {
+    if (a.n_exp <= 0 || a.max_rows <= 0 || !s.has_property<sycl::property::queue::in_order>()) return {};
+    const int k = GU ? a.n_embd : a.n_ff;
+    if (k <= 0 || k % 32) return {};
+    const size_t rows = size_t(std::min(a.max_rows, kLightRows)), experts = size_t(a.n_exp);
+    if (experts > std::numeric_limits<size_t>::max() / rows || experts * rows > std::numeric_limits<size_t>::max() / size_t(k)) return {};
+    const size_t count = experts * rows * size_t(k);
+    const auto device = s.get_device();
+    size_t max_alloc = size_t(device.get_info<sycl::info::device::max_mem_alloc_size>());
+    size_t memory = size_t(device.get_info<sycl::info::device::global_mem_size>());
+    if (const auto limit = core::max_alloc_limit_bytes()) max_alloc = size_t(std::min<uint64_t>(max_alloc, limit));
+    if (const auto limit = core::vram_limit_bytes()) memory = size_t(std::min<uint64_t>(memory, limit));
+    // Retain only the last queue: model reloads must not accumulate live queues
+    // and device allocations. Switching queues retires the preceding readers.
+    thread_local std::unique_ptr<LightScratch> scratch;
+    if (!scratch || scratch->queue != s) scratch = std::make_unique<LightScratch>(s);
+    if (!scratch->reserve(count, max_alloc, memory)) return {};
+    const LightQ8 q{scratch->codes, scratch->scales, rows};
+    const size_t blocks = size_t(k) / 32;
+    sycl_detail::parallel(s, experts * rows * blocks, [=](size_t id) {
+        const size_t entry = id / blocks, e = entry / rows, row = entry % rows, b = id % blocks;
+        const int n = a.bounds[e + 1] - a.bounds[e];
+        if (n <= 0 || n > kLightRows || row >= size_t(n)) return;
+        const int local = a.bounds[e] - a.row0 + int(row);
+        const int src = GU && a.idx ? a.idx[local] : local;
+        float values[32], amax = 0.0f;
+        for (int j = 0; j < 32; ++j) {
+            const size_t at = size_t(src) * a.ldx + b * 32 + size_t(j);
+            values[j] = src < 0 ? 0.f : GU ? a.xf[at] : sycl_detail::f16_value(a.xh[at]);
+            amax = sycl::fmax(amax, sycl::fabs(values[j]));
+        }
+        const float scale = amax / 127.0f;
+        q.scales[id] = scale;
+        for (int j = 0; j < 32; ++j)
+            q.codes[id * 32 + size_t(j)] = int8_t(amax > 0.0f ? sycl::rint(values[j] / scale) : 0.0f);
+    });
+    return q;
+}
+
 template <int T, bool GU>
-bool light_set_tiled(const SetArgs& a, size_t rb, sycl::queue& s) {
+bool light_set_tiled(const SetArgs& a, size_t rb, sycl::queue& s, LightQ8 q = {}) {
     if (a.n_exp <= 0 || a.max_rows <= 0) return false;
     const int n = GU ? a.n_ff : a.n_embd, k = GU ? a.n_embd : a.n_ff;
     if (n <= 0 || k <= 0) return false;
@@ -145,7 +227,13 @@ bool light_set_tiled(const SetArgs& a, size_t rb, sycl::queue& s) {
                     weights[id] = g;
                     if constexpr (GU) weights[bn + id] = u;
                 }
-                if (id < rm) {
+                if (id < rm && q.codes) {
+                    const int src = sources[id];
+                    const size_t at = (e * q.rows + r0 + id) * size_t(k / 32) + size_t(kb);
+                    scales[id] = src >= 0 ? q.scales[at] : 0.f;
+                    for (int j = 0; j < 32; ++j)
+                        codes[id * 32 + size_t(j)] = src >= 0 ? q.codes[at * 32 + size_t(j)] : 0;
+                } else if (id < rm) {
                     const int src = sources[id];
                     float values[32], amax = 0.0f;
                     for (int j = 0; j < 32; ++j) {
@@ -294,7 +382,7 @@ void launch_set(const SetArgs& args, sycl::queue& s) {
 }
 
 template <bool GU, typename Decoder>
-void light_set(const SetArgs& a, size_t rb, Decoder decode, sycl::queue& s) {
+void light_set(const SetArgs& a, size_t rb, Decoder decode, sycl::queue& s, LightQ8 q = {}) {
     if (a.n_exp <= 0 || a.max_rows <= 0) return;
     const int n = GU ? a.n_ff : a.n_embd, k = GU ? a.n_embd : a.n_ff;
     const int rows = std::min(a.max_rows, kLightRows);
@@ -311,6 +399,13 @@ void light_set(const SetArgs& a, size_t rb, Decoder decode, sycl::queue& s) {
         const uint8_t* up = blob + a.tr[1] + (size_t) col * rb;
         float sum = 0.0f, usum = 0.0f;
         for (int b = 0; b < k / 32; ++b) {
+            if (q.codes) {
+                const size_t at = (size_t(e) * q.rows + size_t(row)) * size_t(k / 32) + size_t(b);
+                const int8_t* codes = q.codes + at * 32;
+                sum = sycl::fma(q.scales[at], decode.dot_q8_block(w, b, codes), sum);
+                if constexpr (GU) usum = sycl::fma(q.scales[at], decode.dot_q8_block(up, b, codes), usum);
+                continue;
+            }
             const size_t base = (size_t) input * a.ldx + (size_t) b * 32;
             float values[32], amax = 0.0f;
             for (int j = 0; j < 32; ++j) {
@@ -333,14 +428,15 @@ bool launch_light(const SetArgs& a, sycl::queue& s) {
     const int type = GU ? a.tg : a.td;
     if (is_tq(type) || type == kQ5_K || type == kQ6_K || !light_on() ||
         a.n_embd % 256 != 0 || a.n_ff % 256 != 0 || (GU && !a.xf)) return false;
+    const LightQ8 q = light_quantized<GU>(a, s);
     return dispatch(type, [&](auto t) {
         // Gate/up shares its quantized activation tile across both projections.
         // Down retains the output-owned reduction.
         if constexpr (GU && (t.value == kIQ1_S || t.value == kIQ1_M || t.value == kIQ2_XXS ||
                              t.value == kIQ2_XS || t.value == kIQ2_S || t.value == kIQ3_XXS || t.value == kMXFP4)) {
-            if (light_set_tiled<t.value, GU>(a, row_bytes_t<t.value>(GU ? a.n_embd : a.n_ff), s)) return;
+            if (light_set_tiled<t.value, GU>(a, row_bytes_t<t.value>(GU ? a.n_embd : a.n_ff), s, q)) return;
         }
-        light_set<GU>(a, row_bytes_t<t.value>(GU ? a.n_embd : a.n_ff), Decoder<t.value>{}, s);
+        light_set<GU>(a, row_bytes_t<t.value>(GU ? a.n_embd : a.n_ff), Decoder<t.value>{}, s, q);
     });
 }
 }  // namespace
