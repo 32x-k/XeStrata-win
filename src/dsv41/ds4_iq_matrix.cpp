@@ -19,6 +19,9 @@
 #include <algorithm>
 #include <cstddef>
 #include <vector>
+#include <memory>
+#include <limits>
+#include "strata/core/runtime.hpp"
 
 #if (defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__) && !STRATA_AMD_WMMA) || \
     (STRATA_NV_ARCH > 0 && STRATA_NV_ARCH < 700)
@@ -82,7 +85,7 @@ uint16_t matrix_weight(const Sub& sub, int j) {
 }
 
 template <int T, bool GU>
-bool launch(const SetArgs& a, sycl::queue& s) {
+bool launch_base(const SetArgs& a, sycl::queue& s) {
     static_assert(Ty<T>::MIN == 0);
     const int n = GU ? a.n_ff : a.n_embd, k = GU ? a.n_embd : a.n_ff;
     if (a.n_exp <= 0 || a.max_rows <= kLightRows || n <= 0 || k <= 0 ||
@@ -246,6 +249,157 @@ bool launch(const SetArgs& a, sycl::queue& s) {
         });
     });
     return true;
+}
+
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// Lane-owned groups of eight IQ1 values. The existing matrix's two FP16
+// rounding boundaries are retained, without materializing a 32-value Sub.
+template <int T>
+sycl::vec<uint16_t, 8> register_eight(const uint8_t* row, int kb, int group, const uint32_t* tab) {
+    const uint8_t* b = row + size_t(kb >> 3) * Ty<T>::B;
+    const int ib = kb & 7;
+    uint32_t index; bool negative; int sc; float d;
+    if constexpr (T == kIQ1_S) {
+        const uint32_t high = uint32_t(b[34 + 2 * ib]) | uint32_t(b[35 + 2 * ib]) << 8;
+        index = b[2 + 4 * ib + group] | (((high >> (3 * group)) & 7u) << 8);
+        negative = (high & 0x8000u) != 0;
+        sc = 2 * int((high >> 12) & 7u) + 1; d = h2f(b) * 0.125f;
+    } else {
+        const uint32_t high = b[32 + 2 * ib + group / 2];
+        index = b[4 * ib + group] | (((high >> (4 * (group & 1))) & 7u) << 8);
+        negative = (high & (8u << (4 * (group & 1)))) != 0;
+        const uint32_t scales = uint32_t(b[48 + 2 * (ib >> 1)]) | uint32_t(b[49 + 2 * (ib >> 1)]) << 8;
+        sc = 2 * int((scales >> (6 * (ib & 1) + 3 * (group / 2))) & 7u) + 1;
+        d = sycl_detail::f16_value(iq1m_d(b)) * 0.125f;
+    }
+    const uint32_t grid = tab[index];
+    const float scale = matrix_half_value(matrix_half_bits(d * float(sc)));
+    sycl::vec<uint16_t, 8> result;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int code = 8 * int((grid >> ((j & 3) * 8 + (j >> 2) * 4)) & 15u) - 7 - (negative ? 2 : 0);
+        result[j] = matrix_half_bits(scale * float(code));
+    }
+    return result;
+}
+
+template <int T, bool GU, int RT>
+bool register_launch(const SetArgs& a, sycl::queue& s) {
+    if constexpr (T != kIQ1_S && T != kIQ1_M) return false;
+    else {
+        const int n = GU ? a.n_ff : a.n_embd, k = GU ? a.n_embd : a.n_ff;
+        if (a.n_exp <= 0 || a.max_rows <= kLightRows || n <= 0 || k <= 0 || k % 256 || n % 128 || a.ldx % 8 || a.ldo % 2 ||
+            (a.skip_ge > 0 && a.skip_ge <= kLightRows + 1)) return false;
+        if constexpr (GU) { if (!a.xf && !a.xf16) return false; } else if (!a.xh) return false;
+        const void* input = GU ? static_cast<const void*>(a.xf) : static_cast<const void*>(a.xh);
+        if ((reinterpret_cast<uintptr_t>(input) & 15u) || (GU && a.xf16 && (reinterpret_cast<uintptr_t>(a.xf16) & 15u))) return false;
+        if (!s.get_device().has(sycl::aspect::fp16) || !xe::mma_shape_is(s, int(MM), int(MN), int(MK), int(SG)) || !xe::amd_wmma(s.get_device())) return false;
+        const auto& c = caps(s);
+        if (std::find(c.subgroups.begin(), c.subgroups.end(), SG) == c.subgroups.end()) return false;
+        [[maybe_unused]] constexpr size_t rows = RT * MM, roles = GU ? 2 : 1, table_words = Ty<T>::TAB;
+        if (c.local < table_words * sizeof(uint32_t) + rows * (QK * sizeof(uint16_t) + sizeof(int))) return false;
+        size_t columns = 1;
+        while ((columns * 2) * (columns * 2) <= c.group / SG) columns *= 2;
+        columns = std::min(columns, (size_t(n) + MN - 1) / MN);
+        if (!columns || c.group < columns * SG) return false;
+        const size_t bn = columns * MN, threads = columns * SG;
+        const size_t nc = (size_t(n) + bn - 1) / bn, nr = (size_t(a.max_rows) + rows - 1) / rows;
+        const size_t groups = size_t(a.n_exp) * nc * nr, rb = row_bytes_t<T>(k);
+        const int skip = std::max(a.skip_le, kLightRows);
+        sycl_detail::require_in_order(s);
+        sycl_detail::submit(s, [&](sycl::handler& h) {
+            sycl::local_accessor<uint32_t, 1> table_data(sycl::range<1>(table_words), h);
+            sycl::local_accessor<int, 1> sources(sycl::range<1>(rows), h);
+            sycl::local_accessor<sycl::half, 1> xs(sycl::range<1>(rows * QK), h);
+            h.parallel_for(sycl::nd_range<1>(groups * threads, threads), [a, nc, nr, bn, skip, threads, table_data, sources, xs, rb, k, n](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+                [[maybe_unused]] constexpr size_t roles = GU ? 2 : 1, rows = RT * MM, table_words = Ty<T>::TAB;
+                // The host and device closures have the same explicit layout.
+                (void)it; (void)a; (void)nc; (void)nr; (void)bn; (void)skip; (void)threads;
+                (void)table_data; (void)sources; (void)xs; (void)rb; (void)k; (void)n;
+#if STRATA_AMD_WMMA
+                const size_t id = it.get_local_linear_id(), g = it.get_group_linear_id();
+                const size_t e = g / (nc * nr), r0 = ((g / nc) % nr) * rows, c0 = (g % nc) * bn;
+                const int count = a.bounds[e + 1] - a.bounds[e], first = a.bounds[e] - a.row0;
+                if (count <= skip || (a.skip_ge > 0 && count >= a.skip_ge) || r0 >= size_t(count)) return;
+                for (size_t j = id; j < table_words; j += threads) table_data[j] = table<T>()[j];
+                if (id < rows) sources[id] = r0 + id < size_t(count) ? (GU && a.idx ? a.idx[size_t(first) + r0 + id] : first + int(r0 + id)) : -1;
+                it.barrier(sycl::access::fence_space::local_space);
+                const auto sg = it.get_sub_group();
+                const size_t column = sg.get_group_linear_id() * MN + xe::wmma::lane16(sg);
+                const uint8_t* blob = a.wbase + e * a.stride;
+                const auto* grids = table_data.template get_multi_ptr<sycl::access::decorated::no>().get();
+                const auto xp = xs.template get_multi_ptr<sycl::access::decorated::no>();
+                xe::wmma::C accum[RT][roles];
+#pragma unroll
+                for (int r = 0; r < RT; ++r)
+#pragma unroll
+                    for (size_t role = 0; role < roles; ++role) xe::wmma::fill(sg, accum[r][role], 0.f);
+                for (int kb = 0; kb < k / int(QK); ++kb) {
+                    for (size_t j = id; j < rows * QK; j += threads) {
+                        const int src = sources[j / QK]; const size_t at = size_t(src) * a.ldx + size_t(kb) * QK + j % QK;
+                        xs[j] = sycl::bit_cast<sycl::half>(src < 0 ? uint16_t(0) : GU ? (a.xf16 ? a.xf16[at] : sycl_detail::f16_bits(a.xf[at])) : a.xh[at]);
+                    }
+                    it.barrier(sycl::access::fence_space::local_space);
+#pragma unroll
+                    for (int kk = 0; kk < int(QK); kk += int(MK)) {
+                        xe::wmma::Bc<sycl::half> bv[roles];
+#pragma unroll
+                        for (size_t role = 0; role < roles; ++role) {
+                            const uint8_t* w = blob + (GU ? (role ? a.tr[1] : a.tr[0]) : a.tr[2]) + (c0 + column) * rb;
+#pragma unroll
+                            for (int part = 0; part < xe::wmma::KN / 8; ++part) {
+                                sycl::vec<uint16_t, 8> bits(uint16_t(0));
+                                if (c0 + column < size_t(n)) bits = register_eight<T>(w, kb, (kk + xe::wmma::half_of(sg) * xe::wmma::KOFF) / 8 + part, grids);
+#pragma unroll
+                                for (int j = 0; j < 8; ++j) bv[role].v[part * 8 + j] = c0 + column < size_t(n) ? sycl::bit_cast<_Float16>(bits[j]) : _Float16(0);
+                            }
+                        }
+#pragma unroll
+                        for (int r = 0; r < RT; ++r) {
+                            xe::wmma::A<sycl::half> av;
+                            xe::wmma::load(sg, av, xp + std::ptrdiff_t(size_t(r) * MM * QK + kk), QK);
+#pragma unroll
+                            for (size_t role = 0; role < roles; ++role) xe::wmma::mad(sg, accum[r][role], av, bv[role], accum[r][role]);
+                        }
+                    }
+                    it.barrier(sycl::access::fence_space::local_space);
+                }
+#pragma unroll
+                for (int r = 0; r < RT; ++r)
+#pragma unroll
+                    for (int j = 0; j < 8; ++j) {
+                        const size_t row = r0 + size_t(r) * MM + xe::wmma::row_of(xe::wmma::half_of(sg), j);
+                        if (row >= size_t(count) || row >= size_t(a.max_rows) || c0 + column >= size_t(n)) continue;
+                        const size_t out = (size_t(first) + row) * a.ldo + c0 + column;
+                        if constexpr (GU) a.h[out] = sycl_detail::f16_bits(portable::swiglu(accum[r][0].v[j], accum[r][1].v[j], a.limit));
+                        else a.y[out] = accum[r][0].v[j];
+                    }
+#endif
+            });
+        });
+        return true;
+    }
+}
+
+template <int T, bool GU>
+bool launch(const SetArgs& a, sycl::queue& s) {
+    const size_t needed = (size_t(std::max(0, a.max_rows)) + MM - 1) / MM;
+    const auto& c = caps(s); size_t r = 1;
+    // Keep the existing light/FP16 precision boundary: the device must report
+    // the matrix shape above, and model dimensions must meet its alignment.
+    // Nonzero synthetic 64/128-token and 197-group 4096-token fixtures measured
+    // this path with ascending K16 and unchanged rounding (2026-11-06).
+    // Choose the largest compiled R1/R2/R4 fitting ceil(max_rows/MM) and the
+    // reported WG/SG limit; cap the family to bound register accumulators.
+    // Local storage follows rows and the quantization table. Unsupported
+    // layouts or insufficient device resources use the existing matrix path.
+    // Compile a bounded family, selecting from device limits and actual rows.
+    while (r < 4 && r * 2 <= needed && (r * 2) * (r * 2) <= c.group / SG) r *= 2;
+    if (r == 4 && register_launch<T, GU, 4>(a, s)) return true;
+    if (r == 2 && register_launch<T, GU, 2>(a, s)) return true;
+    if (r == 1 && register_launch<T, GU, 1>(a, s)) return true;
+    return launch_base<T, GU>(a, s);
 }
 
 template <bool GU>
