@@ -724,7 +724,7 @@ static void bench(int type) {
 
 // --dump F / --cmp F: every device output of a run as raw bits, to a file / against one (a kernel change that keeps the sums
 // exact and the float order must leave all of them identical)
-static FILE* g_dump = nullptr; static FILE* g_cmp = nullptr; static long g_cmp_bad = 0, g_cmp_n = 0;
+static FILE* g_dump = nullptr; static FILE* g_cmp = nullptr; static long g_cmp_bad = 0, g_cmp_n = 0, g_cmp_rms_n = 0;
 static void bits(const char* what, int type, const void* p, size_t bytes) {
     if (!g_dump && !g_cmp) return;
     if (g_dump) { std::fwrite(p, 1, bytes, g_dump); return; }
@@ -738,6 +738,69 @@ static void bits(const char* what, int type, const void* p, size_t bytes) {
     }
 }
 // the real shapes (n_embd 5120, n_ff 2304): the plan path (6 groups of one entry) and the grouped path (windows of 3 and 2)
+// Compare the changed light outputs to the same independent FP64 reference.
+// Other outputs retain the existing exact comparison. The golden file stores
+// the previous kernel's values; its binary layout remains unchanged.
+static double dot_q8_double(const float* w, const Q8& x, int k) {
+    double sum = 0;
+    for (int i = 0; i < k; ++i) sum += double(w[i]) * (double(x.d[size_t(i) / 32]) * double(x.q[i]));
+    return sum;
+}
+template <typename T>
+static void bits_rms(const char* what, int type, const std::vector<T>& actual,
+                     const std::vector<double>& reference, const std::vector<size_t>& positions, int cols) {
+    if (!g_cmp) { bits(what, type, actual.data(), actual.size() * sizeof(T)); return; }
+    std::vector<T> previous(actual.size());
+    if (std::fread(previous.data(), sizeof(T), previous.size(), g_cmp) != previous.size()) {
+        std::printf("cmp: golden file too short at %s %s\n", iq::name(type), what); ++g_cmp_bad; return;
+    }
+    ++g_cmp_n; ++g_cmp_rms_n;
+    if (reference.size() != positions.size() || reference.size() % size_t(cols)) throw std::runtime_error("RMS reference shape");
+    const auto value = [](T v) { if constexpr (sizeof(T) == 2) return double(h2f(uint16_t(v))); else return double(v); };
+    std::vector<bool> changed(actual.size(), false);
+    std::vector<double> absolute[2], relative[2];
+    bool finite = true;
+    for (size_t row = 0; row < reference.size(); row += size_t(cols)) {
+        double sum = 0;
+        for (int col = 0; col < cols; ++col) sum += reference[row + size_t(col)] * reference[row + size_t(col)];
+        const double rms = std::sqrt(sum / cols);
+        for (int col = 0; col < cols; ++col) {
+            const size_t at = row + size_t(col), pos = positions[at];
+            if (pos >= actual.size()) throw std::runtime_error("RMS output position");
+            changed[pos] = true;
+            for (int arm = 0; arm < 2; ++arm) {
+                const double v = arm ? value(actual[pos]) : value(previous[pos]);
+                const double error = std::fabs(v - reference[at]);
+                finite &= std::isfinite(v) && std::isfinite(error) && std::isfinite(rms);
+                absolute[arm].push_back(error);
+                if (rms > 0) relative[arm].push_back(error / rms);
+            }
+        }
+    }
+    bool exact = true;
+    for (size_t i = 0; i < actual.size(); ++i)
+        if (!changed[i]) exact &= std::memcmp(reinterpret_cast<const unsigned char*>(&actual[i]),
+                                             reinterpret_cast<const unsigned char*>(&previous[i]), sizeof(T)) == 0;
+    const auto median = [](std::vector<double>& values) {
+        if (values.empty()) return 0.;
+        const auto mid = static_cast<std::vector<double>::difference_type>(values.size() / 2);
+        std::nth_element(values.begin(), values.begin() + mid, values.end());
+        return values.size() % 2 ? values[mid] : (values[mid] + *std::max_element(values.begin(), values.begin() + mid)) * .5;
+    };
+    double stats[2][4]{};
+    for (int arm = 0; arm < 2; ++arm) {
+        stats[arm][0] = absolute[arm].empty() ? 0 : *std::max_element(absolute[arm].begin(), absolute[arm].end());
+        stats[arm][2] = relative[arm].empty() ? 0 : *std::max_element(relative[arm].begin(), relative[arm].end());
+        stats[arm][1] = median(absolute[arm]); stats[arm][3] = median(relative[arm]);
+    }
+    bool ok = finite && exact;
+    for (int metric = 0; metric < 4; ++metric) ok &= stats[1][metric] <= 1.1 * stats[0][metric];
+    std::printf("cmp %s %s FP64 abs max/median %.9g/%.9g -> %.9g/%.9g, row-RMS relative max/median %.9g/%.9g -> %.9g/%.9g: %s\n",
+                iq::name(type), what, stats[0][0], stats[0][1], stats[1][0], stats[1][1],
+                stats[0][2], stats[0][3], stats[1][2], stats[1][3], ok ? "ok" : "FAIL");
+    if (!ok) ++g_cmp_bad;
+}
+
 static void real_shape_bits(int type) {
     std::mt19937_64 rng(1000 + type);   // (its own stream: the main loop's random experts are the same with or without this)
     const int E = 5120, FF = 2304, NG = 2, NEnt = 12;
@@ -966,7 +1029,7 @@ int main(int argc, char** argv) try {
         select_device(devs[di]);
         if (devs.size() > 1) {
             if (g_dump) { std::fclose(g_dump); g_dump = nullptr; }
-            if (di == 0) g_dump = std::fopen("iq_devices.bin", "wb"); else { g_cmp = std::fopen("iq_devices.bin", "rb"); g_cmp_n = g_cmp_bad = 0; }
+            if (di == 0) g_dump = std::fopen("iq_devices.bin", "wb"); else { g_cmp = std::fopen("iq_devices.bin", "rb"); g_cmp_n = g_cmp_bad = g_cmp_rms_n = 0; }
         }
         std::printf("---- device %d\n", devs[di]);
     }
@@ -982,7 +1045,10 @@ int main(int argc, char** argv) try {
         if (!iq::supported(type) && !iq::known(type)) { std::printf("%-7s not a type this engine knows\n", iq::name(type)); ++fails; continue; }
         if (type == iq::kIQ2_XXS) matrix_precision_boundary(report);
         const bool dev = iq::supported(type);   // (IQ1_S / IQ1_M / IQ4_NL: a known layout, no device kernel - CPU lane only)
-        const int E = 512, FF = 256, NEXP = 3, T = 4;
+        // IQ1 exercises a complete K32 subgroup in the changed light path.
+        // Other types retain their existing fixture and exact comparisons.
+        const bool lane_light = type == 19 || type == 29;
+        const int E = lane_light ? 32 * 32 : 512, FF = lane_light ? E : 256, NEXP = 3, T = 4;
         const float lim = 7.0f;
         const size_t rb_g = iq::row_bytes(type, E), rb_d = iq::row_bytes(type, FF);
         auto al = [](size_t n) { return (n + 255) / 256 * 256; };
@@ -1070,7 +1136,19 @@ int main(int argc, char** argv) try {
             if (!iq::set_gate_up(q, queue())) { std::printf("set_gate_up refused\n"); return 1; }
             queue().wait_and_throw();
             const auto h16 = down_(dh16, (size_t) NR * FF);
-            bits("set h16", type, h16.data(), h16.size() * 2);
+            if ((type == 19 || type == 29) && g_cmp) {
+                std::vector<double> reference; std::vector<size_t> positions;
+                for (int e = 0; e < NEXP; ++e) if (bounds[e + 1] - bounds[e] <= 16)
+                    for (int lr = bounds[e]; lr < bounds[e + 1]; ++lr) {
+                        const Q8 input = quant(x.data() + size_t(idx[lr]) * E, E);
+                        for (int col = 0; col < FF; ++col) {
+                            reference.push_back(swiglu(dot_q8_double(G[e].w.data() + size_t(col) * E, input, E),
+                                                       dot_q8_double(U[e].w.data() + size_t(col) * E, input, E), lim));
+                            positions.push_back(size_t(lr) * FF + col);
+                        }
+                    }
+                bits_rms("set h16", type, h16, reference, positions, FF);
+            } else bits("set h16", type, h16.data(), h16.size() * 2);
             double w2 = 0;
             for (int e = 0; e < 3; ++e)
                 for (int lr = bounds[e]; lr < bounds[e + 1]; ++lr)
@@ -1082,18 +1160,36 @@ int main(int argc, char** argv) try {
             // (the prompt sets quantise the activations, so this worst case is data dependent: IQ1_S measured 7.1e-3 .. 1.08e-2 over
             // different random-data orders, the same on the older build, with every other check far inside; IQ1_S gets 1.5e-2)
             report("set gate_up (f16)", type, w2, type == 19 ? 1.5e-2 : 1e-2);
-            q.xh = dh16; q.ldx = FF;
+            // Keep down inputs independent of gate/up rounding, so both
+            // kernels' golden comparisons use the same quantized operands.
+            std::vector<uint16_t> down_input = h16;
+            if (lane_light) for (size_t i = 0; i < down_input.size(); ++i)
+                down_input[i] = strata::ds4::sycl_detail::f16_bits(x[i % x.size()]);
+            q.xh = lane_light ? up(down_input) : dh16; q.ldx = FF;
             float* dy; device_alloc(dy, (size_t) NR * E * 4); q.y = dy; q.ldo = E;
             if (!iq::set_down(q, queue())) { std::printf("set_down refused\n"); return 1; }
             queue().wait_and_throw();
             const auto y = down_(dy, (size_t) NR * E);
-            bits("set y", type, y.data(), y.size() * 4);
+            if ((type == 19 || type == 29) && g_cmp) {
+                std::vector<double> reference; std::vector<size_t> positions;
+                for (int e = 0; e < NEXP; ++e) if (bounds[e + 1] - bounds[e] <= 16)
+                    for (int lr = bounds[e]; lr < bounds[e + 1]; ++lr) {
+                        std::vector<float> hidden(FF);
+                        for (int col = 0; col < FF; ++col) hidden[col] = h2f(down_input[size_t(lr) * FF + col]);
+                        const Q8 input = quant(hidden.data(), FF);
+                        for (int col = 0; col < E; ++col) {
+                            reference.push_back(dot_q8_double(D[e].w.data() + size_t(col) * FF, input, FF));
+                            positions.push_back(size_t(lr) * E + col);
+                        }
+                    }
+                bits_rms("set y", type, y, reference, positions, E);
+            } else bits("set y", type, y.data(), y.size() * 4);
             real_shape_bits(type);
             w2 = 0;
             for (int e = 0; e < 3; ++e)
                 for (int lr = bounds[e]; lr < bounds[e + 1]; ++lr) {
                     std::vector<float> hf(FF);
-                    for (int c = 0; c < FF; ++c) hf[c] = h2f(h16[(size_t) lr * FF + c]);
+                    for (int c = 0; c < FF; ++c) hf[c] = h2f(down_input[(size_t) lr * FF + c]);
                     for (int r = 0; r < E; ++r) {
                         double sa; const double ref = dotd(&D[e].w[(size_t) r * FF], hf.data(), FF, &sa);
                         w2 = std::max(w2, std::fabs(y[(size_t) lr * E + r] - ref) / (sa + 1e-30));
@@ -1191,7 +1287,7 @@ int main(int argc, char** argv) try {
     }
     if (g_cmp && devs.size() > 1) { std::fclose(g_cmp); g_cmp = nullptr; std::printf("device %d vs device %d: %ld buffers, %ld differ\n", devs[di], devs[0], g_cmp_n, g_cmp_bad); fails += g_cmp_bad != 0; }
     }
-    if (g_cmp) { std::printf("bit-compare vs golden: %ld buffers, %ld differ -> %s\n", g_cmp_n, g_cmp_bad, g_cmp_bad ? "DIFFERENT" : "IDENTICAL"); fails += g_cmp_bad != 0; }
+    if (g_cmp) { std::printf("golden comparison: %ld buffers (%ld FP64/RMS), %ld failed -> %s\n", g_cmp_n, g_cmp_rms_n, g_cmp_bad, g_cmp_bad ? "FAIL" : "PASS"); fails += g_cmp_bad != 0; }
     if (g_dump) std::fclose(g_dump);
     std::printf("%s\n", fails ? "FAILED" : "ALL OK");
     return fails;

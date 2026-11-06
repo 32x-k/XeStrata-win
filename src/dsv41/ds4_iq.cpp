@@ -423,6 +423,95 @@ void light_set(const SetArgs& a, size_t rb, Decoder decode, sycl::queue& s, Ligh
     });
 }
 
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// K32 is the existing Q8 quantization block, not a hardware tile. A subgroup
+// owns one output column and reuses each decoded block for all light rows.
+template <int T, bool GU, int SG, int R>
+bool light_lane_run(const SetArgs& a, size_t rb, sycl::queue& s, LightQ8 q) {
+    const auto& c = set_caps(s);
+    const int n = GU ? a.n_ff : a.n_embd, k = GU ? a.n_embd : a.n_ff;
+    if (!q.codes || !q.scales || n <= 0 || k <= 0 || q.rows > size_t(R) ||
+        c.max_group / SG < size_t(R) ||
+        c.local_bytes < size_t(Ty<T>::TAB > 0 ? Ty<T>::TAB : 1) * sizeof(uint32_t)) return false;
+    size_t columns = 1;
+    while ((columns * 2) * (columns * 2) <= c.max_group / SG) columns *= 2;
+    columns = std::min({columns, c.max_group / (size_t(SG) * size_t(R)), size_t(n)});
+    if (!columns) return false;
+    const size_t nc = (size_t(n) + columns - 1) / columns, threads = columns * SG;
+    sycl_detail::require_in_order(s);
+    sycl_detail::submit(s, [&](sycl::handler& h) {
+        sycl::local_accessor<uint32_t, 1> tab(sycl::range<1>(Ty<T>::TAB > 0 ? Ty<T>::TAB : 1), h);
+        h.parallel_for(sycl::nd_range<1>(size_t(a.n_exp) * nc * threads, threads),
+                       [a, q, rb, k, n, columns, nc, tab](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            const size_t id = it.get_local_linear_id(), group = it.get_group_linear_id(), e = group / nc;
+            const int count = a.bounds[e + 1] - a.bounds[e], first = a.bounds[e] - a.row0;
+            if (count <= 0 || count > kLightRows) return;
+            if constexpr (Ty<T>::TAB > 0)
+                for (size_t j = id; j < size_t(Ty<T>::TAB); j += it.get_local_range(0)) tab[j] = table<T>()[j];
+            it.barrier(sycl::access::fence_space::local_space);
+            const auto sg = it.get_sub_group();
+            const size_t col = (group % nc) * columns + sg.get_group_linear_id();
+            if (col >= size_t(n)) return;
+            const auto* grids = tab.template get_multi_ptr<sycl::access::decorated::no>().get();
+            const uint8_t* blob = a.wbase + e * a.stride;
+            float sums[R]{}, ups[GU ? R : 1]{};
+            for (int kb = int(sg.get_local_linear_id()); kb < k / 32; kb += SG) {
+                Sub g{}, u{};
+                decode<T>(blob + a.tr[GU ? 0 : 2] + col * rb, kb, grids, g);
+                if constexpr (GU) decode<T>(blob + a.tr[1] + col * rb, kb, grids, u);
+#pragma unroll
+                for (int row = 0; row < R; ++row) {
+                    if (row >= count || size_t(row) >= q.rows) continue;
+                    const size_t at = (e * q.rows + size_t(row)) * size_t(k / 32) + size_t(kb);
+                    const int8_t* codes = q.codes + at * 32;
+                    sums[row] = sycl::fma(q.scales[at], dot_q8_sub(g, codes), sums[row]);
+                    if constexpr (GU) ups[row] = sycl::fma(q.scales[at], dot_q8_sub(u, codes), ups[row]);
+                }
+            }
+#pragma unroll
+            for (int row = 0; row < R; ++row) {
+                if (row >= count || size_t(row) >= q.rows) continue;
+                const float sum = sycl::reduce_over_group(sg, sums[row], sycl::plus<float>());
+                float up = 0.f;
+                if constexpr (GU) up = sycl::reduce_over_group(sg, ups[row], sycl::plus<float>());
+                if (sg.get_local_linear_id() != 0) continue;
+                const size_t out = (size_t(first) + size_t(row)) * a.ldo + col;
+                if constexpr (GU) a.h[out] = sycl_detail::f16_bits(portable::swiglu(sum, up, a.limit));
+                else a.y[out] = sum;
+            }
+        });
+    });
+    return true;
+}
+
+template <int T, bool GU, int SG>
+bool light_lane_rows(const SetArgs& a, size_t rb, sycl::queue& s, LightQ8 q) {
+    if (q.rows <= 1) return light_lane_run<T, GU, SG, 1>(a, rb, s, q);
+    if (q.rows <= 2) return light_lane_run<T, GU, SG, 2>(a, rb, s, q);
+    if (q.rows <= 4) return light_lane_run<T, GU, SG, 4>(a, rb, s, q);
+    if (q.rows <= 8) return light_lane_run<T, GU, SG, 8>(a, rb, s, q);
+    if (q.rows <= 16) return light_lane_run<T, GU, SG, 16>(a, rb, s, q);
+    return false;
+}
+
+template <int T, bool GU>
+bool light_lane(const SetArgs& a, size_t rb, sycl::queue& s, LightQ8 q) {
+    if constexpr (T != kIQ1_S && T != kIQ1_M) return false;
+    else {
+        if (!q.codes || a.n_exp <= 0 || a.max_rows <= 0) return false;
+        const auto& c = set_caps(s); const int k = GU ? a.n_embd : a.n_ff;
+        size_t width = 0;
+        // This compiled family requires 32 lanes; use it only if reported by
+        // the device. Other subgroup widths keep the existing portable path.
+        for (size_t sg : c.sub_groups)
+            if (sg == 32 && sg <= c.max_group && sg <= size_t(k / 32))
+                width = std::max(width, sg);
+        if (width == 32) return light_lane_rows<T, GU, 32>(a, rb, s, q);
+        return false;
+    }
+}
+
 template <bool GU>
 bool launch_light(const SetArgs& a, sycl::queue& s) {
     const int type = GU ? a.tg : a.td;
@@ -430,6 +519,7 @@ bool launch_light(const SetArgs& a, sycl::queue& s) {
         a.n_embd % 256 != 0 || a.n_ff % 256 != 0 || (GU && !a.xf)) return false;
     const LightQ8 q = light_quantized<GU>(a, s);
     return dispatch(type, [&](auto t) {
+        if (light_lane<t.value, GU>(a, row_bytes_t<t.value>(GU ? a.n_embd : a.n_ff), s, q)) return;
         // Gate/up shares its quantized activation tile across both projections.
         // Down retains the output-owned reduction.
         if constexpr (GU && (t.value == kIQ1_S || t.value == kIQ1_M || t.value == kIQ2_XXS ||
