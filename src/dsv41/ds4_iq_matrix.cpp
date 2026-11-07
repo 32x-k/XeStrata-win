@@ -382,8 +382,136 @@ bool register_launch(const SetArgs& a, sycl::queue& s) {
     }
 }
 
+// Share an expanded weight tile across row subgroups while each lane keeps
+// only one output fragment per role. The bounded four/eight-subgroup family
+// is selected from actual rows and the device's WG/SG/local-memory limits.
+template <int T, bool GU, int RG>
+bool shared_weight_launch(const SetArgs& a, sycl::queue& s) {
+    if constexpr (T != kIQ1_S && T != kIQ1_M) return false;
+    else {
+        const int n = GU ? a.n_ff : a.n_embd, k = GU ? a.n_embd : a.n_ff;
+        constexpr int cutoff = int(2 * MM);
+        if (a.n_exp <= 0 || a.max_rows <= cutoff ||
+            (a.skip_ge > 0 && a.skip_ge <= cutoff + 1) || n <= 0 || k <= 0 ||
+            k % 256 || n % 128 || a.ldx % 8 || a.ldo % 2) return false;
+        if constexpr (GU) { if (!a.xf && !a.xf16) return false; }
+        else if (!a.xh) return false;
+        const void* input = GU ? static_cast<const void*>(a.xf) : static_cast<const void*>(a.xh);
+        if ((reinterpret_cast<uintptr_t>(input) & 15u) ||
+            (GU && a.xf16 && (reinterpret_cast<uintptr_t>(a.xf16) & 15u))) return false;
+        if (!s.get_device().has(sycl::aspect::fp16) ||
+            !xe::mma_shape_is(s, int(MM), int(MN), int(MK), int(SG)) ||
+            !xe::amd_wmma(s.get_device())) return false;
+        const auto& c = caps(s);
+        if (std::find(c.subgroups.begin(), c.subgroups.end(), SG) == c.subgroups.end()) return false;
+        if ((size_t(a.max_rows) + MM - 1) / MM < size_t(RG)) return false;
+        [[maybe_unused]] constexpr size_t rows = RG * MM, roles = GU ? 2 : 1;
+        [[maybe_unused]] constexpr size_t table_words = Ty<T>::TAB, pitch = QK + MK / 2;
+        size_t columns = 1;
+        while ((columns * 2) * (columns * 2) <= c.group / SG) columns *= 2;
+        columns = std::min(columns, (size_t(n) + MN - 1) / MN);
+        const size_t bn = columns * MN, threads = RG * columns * SG;
+        const size_t local = table_words * sizeof(uint32_t) + rows * sizeof(int) +
+                             (rows + roles * bn) * pitch * sizeof(uint16_t);
+        if (!columns || threads > c.group || local > c.local) return false;
+        const size_t nc = (size_t(n) + bn - 1) / bn, nr = (size_t(a.max_rows) + rows - 1) / rows;
+        const size_t groups = size_t(a.n_exp) * nc * nr, rb = row_bytes_t<T>(k);
+        const int skip = std::max(a.skip_le, cutoff);
+        sycl_detail::require_in_order(s);
+        // Small experts retain p2 with its actual row upper bound. This also
+        // avoids dispatching empty high row tiles for those experts.
+        if (a.skip_le < cutoff) {
+            SetArgs small = a;
+            small.max_rows = cutoff;
+            small.skip_ge = cutoff + 1;
+            if (!register_launch<T, GU, 2>(small, s)) return false;
+        }
+        sycl_detail::submit(s, [&](sycl::handler& h) {
+            sycl::local_accessor<uint32_t, 1> table_data(sycl::range<1>(table_words), h);
+            sycl::local_accessor<int, 1> sources(sycl::range<1>(rows), h);
+            sycl::local_accessor<sycl::half, 1> xs(sycl::range<1>(rows * pitch), h);
+            sycl::local_accessor<sycl::half, 1> ws(sycl::range<1>(roles * bn * pitch), h);
+            h.parallel_for(sycl::nd_range<1>(groups * threads, threads),
+                [a, nc, nr, bn, skip, threads, table_data, sources, xs, ws, rb, k, n, columns]
+                (sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+                [[maybe_unused]] constexpr size_t rows = RG * MM, roles = GU ? 2 : 1;
+                [[maybe_unused]] constexpr size_t table_words = Ty<T>::TAB, pitch = QK + MK / 2;
+                (void)it; (void)a; (void)nc; (void)nr; (void)bn; (void)skip; (void)threads;
+                (void)table_data; (void)sources; (void)xs; (void)ws; (void)rb; (void)k; (void)n; (void)columns;
+#if STRATA_AMD_WMMA
+                const size_t id = it.get_local_linear_id(), group = it.get_group_linear_id();
+                const size_t e = group / (nc * nr), r0 = ((group / nc) % nr) * rows, c0 = (group % nc) * bn;
+                const int first = a.bounds[e] - a.row0, count = a.bounds[e + 1] - a.bounds[e];
+                if (count <= skip || (a.skip_ge > 0 && count >= a.skip_ge) || r0 >= size_t(count)) return;
+                for (size_t j = id; j < table_words; j += threads) table_data[j] = table<T>()[j];
+                if (id < rows) sources[id] = r0 + id < size_t(count) ?
+                    (GU && a.idx ? a.idx[size_t(first) + r0 + id] : first + int(r0 + id)) : -1;
+                it.barrier(sycl::access::fence_space::local_space);
+                const auto sg = it.get_sub_group();
+                const size_t row_block = (sg.get_group_linear_id() / columns) * MM;
+                const size_t column = (sg.get_group_linear_id() % columns) * MN;
+                const size_t lane_column = column + xe::wmma::lane16(sg);
+                const uint8_t* blob = a.wbase + e * a.stride;
+                const auto* grids = table_data.template get_multi_ptr<sycl::access::decorated::no>().get();
+                const auto xp = xs.template get_multi_ptr<sycl::access::decorated::no>();
+                const auto wp = ws.template get_multi_ptr<sycl::access::decorated::no>();
+                xe::wmma::C accum[roles];
+#pragma unroll
+                for (size_t role = 0; role < roles; ++role) xe::wmma::fill(sg, accum[role], 0.f);
+                for (int kb = 0; kb < k / int(QK); ++kb) {
+                    for (size_t j = id; j < roles * bn * (QK / 8); j += threads) {
+                        const size_t role = j / (bn * (QK / 8)), col = (j / (QK / 8)) % bn, piece = j % (QK / 8);
+                        sycl::vec<uint16_t, 8> bits(uint16_t(0));
+                        if (c0 + col < size_t(n)) {
+                            const uint8_t* w = blob + (GU ? (role ? a.tr[1] : a.tr[0]) : a.tr[2]) + (c0 + col) * rb;
+                            bits = register_eight<T>(w, kb, int(piece), grids);
+                        }
+#pragma unroll
+                        for (int q = 0; q < 8; ++q)
+                            ws[(role * bn + col) * pitch + piece * 8 + size_t(q)] = sycl::bit_cast<sycl::half>(bits[q]);
+                    }
+                    for (size_t j = id; j < rows * QK; j += threads) {
+                        const int src = sources[j / QK];
+                        uint16_t value = 0;
+                        if (src >= 0) {
+                            const size_t at = size_t(src) * a.ldx + size_t(kb) * QK + j % QK;
+                            value = GU ? (a.xf16 ? a.xf16[at] : sycl_detail::f16_bits(a.xf[at])) : a.xh[at];
+                        }
+                        xs[(j / QK) * pitch + j % QK] = sycl::bit_cast<sycl::half>(value);
+                    }
+                    it.barrier(sycl::access::fence_space::local_space);
+#pragma unroll
+                    for (size_t kk = 0; kk < QK; kk += MK) {
+                        xe::wmma::A<sycl::half> av;
+                        xe::wmma::load(sg, av, xp + std::ptrdiff_t(row_block * pitch + kk), pitch);
+#pragma unroll
+                        for (size_t role = 0; role < roles; ++role) {
+                            xe::wmma::Bc<sycl::half> bv;
+                            xe::wmma::load(sg, bv, wp + std::ptrdiff_t((role * bn + column) * pitch + kk), pitch);
+                            xe::wmma::mad(sg, accum[role], av, bv, accum[role]);
+                        }
+                    }
+                    it.barrier(sycl::access::fence_space::local_space);
+                }
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const size_t row = r0 + row_block + xe::wmma::row_of(xe::wmma::half_of(sg), j);
+                    if (row >= size_t(count) || row >= size_t(a.max_rows) || c0 + lane_column >= size_t(n)) continue;
+                    const size_t out = (size_t(first) + row) * a.ldo + c0 + lane_column;
+                    if constexpr (GU) a.h[out] = sycl_detail::f16_bits(portable::swiglu(accum[0].v[j], accum[1].v[j], a.limit));
+                    else a.y[out] = accum[0].v[j];
+                }
+#endif
+            });
+        });
+        return true;
+    }
+}
+
+
 template <int T, bool GU>
 bool launch(const SetArgs& a, sycl::queue& s) {
+    if (shared_weight_launch<T, GU, 8>(a, s) || shared_weight_launch<T, GU, 4>(a, s)) return true;
     const size_t needed = (size_t(std::max(0, a.max_rows)) + MM - 1) / MM;
     const auto& c = caps(s); size_t r = 1;
     // Keep the existing light/FP16 precision boundary: the device must report
