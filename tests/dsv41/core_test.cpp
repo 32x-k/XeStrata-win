@@ -268,6 +268,74 @@ void attention_scratch(sycl::queue& queue) {
     }
     std::puts("attention FP4 scratch/capacity/empty selection/guards: PASS");
 }
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
+void attention_generated(sycl::queue& queue) {
+    constexpr int tokens = 64, heads = 17, d = 512, stride = 17, padding = 7;
+    constexpr float guard = 12345.f, scale = .03125f;
+    const size_t row_bytes = size_t(d) / 2 + size_t(d) / 16;
+    std::vector<uint8_t> packed(64 * row_bytes);
+    std::vector<float> decoded(size_t(64) * d), query(size_t(tokens) * heads * d), sinks(heads);
+    std::vector<uint16_t> window(size_t(tokens + 8) * d);
+    std::vector<int> selection(size_t(tokens) * stride);
+    std::vector<float> output(query.size() + 2 * size_t(padding), guard);
+    constexpr float magnitudes[] = {0.f, .5f, 1.f, 1.5f, 2.f, 3.f, 4.f, 6.f};
+    for (int row = 0; row < 64; ++row) {
+        for (int e = 0; e < d; ++e) {
+            const int code = (e + 3 * row) % 16, exponent = (row + e / 16) % 3 - 1;
+            packed[size_t(row) * row_bytes + e / 2] |= uint8_t(code << (4 * (e & 1)));
+            decoded[size_t(row) * d + e] = std::ldexp((code & 8 ? -1.f : 1.f) * magnitudes[code & 7], exponent);
+        }
+        for (int b = 0; b < d / 16; ++b)
+            packed[size_t(row) * row_bytes + d / 2 + b] = uint8_t(((row + b) % 3 + 6) << 3);
+    }
+    for (size_t i = 0; i < query.size(); ++i) query[i] = float(int(i % 17) - 8) / 256.f;
+    for (size_t i = 0; i < window.size(); ++i)
+        window[i] = uint16_t(sycl::bit_cast<uint32_t>(float(int(i % 13) - 6) / 16.f) >> 16);
+    for (int head = 0; head < heads; ++head) sinks[head] = float(head % 3 - 1) / 2.f;
+    for (int t = 0; t < tokens; ++t) for (int j = 0; j < stride; ++j) selection[size_t(t) * stride + j] = j;
+    Memory memory(queue);
+    auto* dq = memory.upload(query); auto* dsink = memory.upload(sinks);
+    auto* dw = memory.upload(window); auto* dp = memory.upload(packed);
+    auto* di = memory.upload(selection); auto* dy = memory.upload(output);
+    for (int compression : {0, 2}) {
+        ds::AttnRows rows{};
+        rows.gen = 1; rows.p0 = 64; rows.win = 8; rows.R = compression; rows.kcap = stride;
+        std::vector<double> expected(output.size(), guard);
+        for (int t = 0; t < tokens; ++t) for (int head = 0; head < heads; ++head) {
+            const int count = 8 + (compression ? stride : 0);
+            auto value = [&](int row, int e) -> double {
+                return row < 8 ? sd::bf16_value(window[size_t(t + 1 + row) * d + e]) :
+                    decoded[size_t(selection[size_t(t) * stride + row - 8]) * d + e];
+            };
+            std::vector<double> weights(size_t(count), 0.);
+            double denominator = std::exp(double(sinks[head]));
+            for (int row = 0; row < count; ++row) {
+                double dot = 0.;
+                for (int e = 0; e < d; ++e) dot += double(query[(size_t(t) * heads + head) * d + e]) * value(row, e);
+                weights[size_t(row)] = std::exp(dot * scale);
+                denominator += weights[size_t(row)];
+            }
+            for (int e = 0; e < d; ++e) {
+                double numerator = 0.;
+                for (int row = 0; row < count; ++row) numerator += weights[size_t(row)] * value(row, e);
+                expected[size_t(padding) + (size_t(t) * heads + head) * d + e] = numerator / denominator;
+            }
+        }
+        queue.fill(dy, guard, output.size());
+        ds::sparse_attn(dq, dw, dp, di, stride, rows, dsink, heads, d, tokens, scale,
+                        dy + padding, queue, ds::kKvFp4);
+        strata::core::readback(queue, output.data(), dy, output.size() * sizeof(float));
+        for (size_t i = 0; i < output.size(); ++i) {
+            if ((i < padding || i >= query.size() + padding) && output[i] != guard)
+                throw std::runtime_error("generated attention output guard");
+            close(output[i], expected[i], "generated attention double reference");
+        }
+    }
+    std::puts("attention generated R0/R2/ragged heads/FP64/guards: PASS");
+}
+
+
 void engram(sycl::queue& q) {
     // Independent double reference; include partial groups, a single element,
     // the model dimension, zero norms, signed gates, and residual output guards.
@@ -320,6 +388,7 @@ int main() try {
     route(q);
     attention(q);
     attention_scratch(q);
+    attention_generated(q);
     engram(q);
     return 0;
 } catch (const std::exception& e) {

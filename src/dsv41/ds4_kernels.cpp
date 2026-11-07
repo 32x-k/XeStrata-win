@@ -5,6 +5,9 @@
 // Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
 // Ported into Strata (third_party/main/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 #include "ds4_kernels.cuh"
+#if __has_include(<sycl/ext/oneapi/group_local_memory.hpp>)
+#include <sycl/ext/oneapi/group_local_memory.hpp>
+#endif
 #include "ds4_numerics.cuh"
 #include "ds4_q6k.cuh"
 #include "ds4_mailbox.hpp"
@@ -269,7 +272,7 @@ void unpack_selected(const void* ckv, const int* sel, int sel_stride, const Attn
         decoded[(t * decoded_stride + j) * dim + e] = bf16_rn(kv_value(source, kKvFp4, d, int(e)));
     });
 }
-bool sparse_attn_tiled(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
+bool sparse_attn_tiled_original(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
                        const AttnRows& a, const float* sink, int heads, int d, int T, float scale,
                        float* out, sycl::queue& s, int ckv_fmt, int heads_per_block, const AttnScratch* scratch) {
     const auto tile = attn_tile(s, heads, d, T, heads_per_block);
@@ -367,6 +370,195 @@ bool sparse_attn_tiled(const float* q, const uint16_t* win, const void* ckv, con
     });
     return true;
 }
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
+#if __has_include(<sycl/ext/oneapi/group_local_memory.hpp>)
+// One sub-group owns a head. Only decoded KV rows are shared between heads;
+// each lane retains its query and output components across the row tiles.
+template <int G, int R, int SG>
+bool sparse_attn_register(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
+                          const AttnRows& a, const float* sink, int heads, int T, float scale, float* out,
+                          sycl::queue& s, int ckv_fmt, int heads_per_block, const AttnScratch* scratch,
+                          size_t original_head_tiles) {
+    constexpr int D = 512, V = D / SG, S = (R + SG - 1) / SG;
+    constexpr size_t local = size_t(G) * SG;
+    const size_t head_tiles = (size_t(heads) + G - 1) / G, row_bytes = kv_row_bytes(ckv_fmt, D);
+    uint16_t* decoded = nullptr;
+    size_t decoded_stride = 0;
+    if (ckv_fmt == kKvFp4 && sel_stride > 0 && scratch && scratch->rows &&
+        T <= scratch->max_t && sel_stride <= scratch->cap &&
+        (heads_per_block == -1 || (heads_per_block == 0 && original_head_tiles > 1))) {
+        decoded = scratch->rows;
+        decoded_stride = size_t(scratch->cap);
+        unpack_selected(ckv, sel, sel_stride, a, T, D, decoded, decoded_stride, s);
+    }
+    const long long p0 = a.p0;
+    const int t0 = a.t0, window = a.win, compression = a.R, cap = a.kcap;
+    sycl_detail::submit(s, [&](sycl::handler& h) {
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(size_t(T) * head_tiles * local), sycl::range<1>(local)),
+                       [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
+            const auto group = item.get_group();
+            const auto sg = item.get_sub_group();
+            const size_t lane = item.get_local_linear_id(), sl = sg.get_local_linear_id();
+            const size_t block = item.get_group_linear_id(), t = block / head_tiles;
+            const size_t head = (block % head_tiles) * G + sg.get_group_linear_id();
+            const long long ta = t0 + static_cast<long long>(t), pa = p0 + ta;
+            const long long first = sycl::max(static_cast<long long>(window) - p0, ta + 1);
+            const int nwin = int(window + ta - first + 1);
+            const int nsel = compression > 0 ? int(sycl::min(static_cast<long long>(cap), (pa + 1) / compression)) : 0;
+            const int total = nwin + nsel;
+            const size_t base = (t * heads + head) * D;
+            if (total <= 0) {
+                if (head < size_t(heads)) {
+#pragma unroll
+                    for (int k = 0; k < V; ++k) out[base + sl + size_t(k) * SG] = 0.f;
+                }
+                return;
+            }
+            auto values = sycl::ext::oneapi::group_local_memory_for_overwrite<float[R * D]>(group);
+            float query[V], accum[V] = {};
+#pragma unroll
+            for (int k = 0; k < V; ++k) query[k] = head < size_t(heads) ? q[base + sl + size_t(k) * SG] : 0.f;
+            float maximum = head < size_t(heads) ? sink[head] : 0.f, denominator = 1.f;
+            for (int start = 0; start < total; start += R) {
+                const int nr = sycl::min(R, total - start);
+                for (size_t i = lane; i < size_t(nr) * D; i += local) {
+                    const int j = start + int(i / D), e = int(i % D);
+                    const int fmt = j < nwin || decoded ? kKvBf16 : ckv_fmt;
+                    const void* row = j < nwin ? static_cast<const void*>(win + size_t(first + j) * D) :
+                        decoded ? static_cast<const void*>(decoded + (t * decoded_stride + size_t(j - nwin)) * D) :
+                        static_cast<const void*>(static_cast<const uint8_t*>(ckv) +
+                            size_t(sel[t * sel_stride + j - nwin]) * row_bytes);
+                    (*values)[i] = kv_value(row, fmt, D, e);
+                }
+                sycl::group_barrier(group);
+                float scores[S] = {};
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    if (r < nr) {
+                        float dot = 0.f;
+#pragma unroll
+                        for (int k = 0; k < V; ++k) dot += query[k] * (*values)[size_t(r) * D + sl + size_t(k) * SG];
+                        dot = sycl::reduce_over_group(sg, dot, sycl::plus<float>());
+                        if (sl == size_t(r % SG)) scores[r / SG] = dot * scale;
+                    }
+                }
+                float top = -std::numeric_limits<float>::infinity();
+#pragma unroll
+                for (int k = 0; k < S; ++k) if (sl + size_t(k) * SG < size_t(nr)) top = sycl::fmax(top, scores[k]);
+                top = sycl::reduce_over_group(sg, top, sycl::maximum<float>());
+                const float next = sycl::fmax(maximum, top), keep = sycl::exp(maximum - next);
+                float sum = 0.f, weights[S] = {};
+#pragma unroll
+                for (int k = 0; k < S; ++k) {
+                    if (sl + size_t(k) * SG < size_t(nr)) {
+                        weights[k] = sycl::exp(scores[k] - next);
+                        sum += weights[k];
+                    }
+                }
+                sum = sycl::reduce_over_group(sg, sum, sycl::plus<float>());
+                maximum = next;
+                denominator = denominator * keep + sum;
+#pragma unroll
+                for (int k = 0; k < V; ++k) accum[k] *= keep;
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    if (r < nr) {
+                        const float weight = sycl::select_from_group(sg, weights[r / SG], sycl::id<1>(r % SG));
+#pragma unroll
+                        for (int k = 0; k < V; ++k) accum[k] = sycl::fma(weight, (*values)[size_t(r) * D + sl + size_t(k) * SG], accum[k]);
+                    }
+                }
+                sycl::group_barrier(group);
+            }
+            if (head < size_t(heads)) {
+#pragma unroll
+                for (int k = 0; k < V; ++k) out[base + sl + size_t(k) * SG] = accum[k] / denominator;
+            }
+        });
+    });
+    return true;
+}
+size_t attention_register_budget(const sycl::queue& s) {
+    static core::PerDevice<size_t> cache;
+    return cache.get(s.get_device(), [&] {
+#if defined(SYCL_EXT_CODEPLAY_MAX_REGISTERS_PER_WORK_GROUP_QUERY)
+        try { return size_t(s.get_device().get_info<sycl::ext::codeplay::experimental::info::device::max_registers_per_work_group>()); }
+        catch (const sycl::exception&) { return size_t(0); }
+#else
+        return size_t(0);
+#endif
+    });
+}
+template <int SG, int R>
+bool dispatch_attention_register(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
+                                 const AttnRows& a, const float* sink, int heads, int T, float scale, float* out,
+                                 sycl::queue& s, int ckv_fmt, int heads_per_block, const AttnScratch* scratch,
+                                 const AttnTile& original) {
+    const auto device = s.get_device();
+    const size_t max_group = std::min(device.get_info<sycl::info::device::max_work_group_size>(),
+                                      device.get_info<sycl::info::device::max_work_item_sizes<1>>()[0]);
+    const size_t local_bytes = device.get_info<sycl::info::device::local_mem_size>();
+    const size_t registers = attention_register_budget(s);
+    if (!registers) return false;
+    const size_t units = std::max(size_t(1), size_t(device.get_info<sycl::info::device::max_compute_units>()));
+    const size_t head_limit = std::min(size_t(heads), heads_per_block > 0 ? size_t(heads_per_block) :
+                                      std::max(size_t(1), size_t(T) * heads / units));
+    size_t selected = 0;
+    // The component dimension bounds the group. Candidate head bundles are
+    // compile-time powers of two, not a threshold measured on a single GPU.
+    for (size_t g : {size_t(1), size_t(2), size_t(4), size_t(8), size_t(16)}) {
+        const size_t local = g * SG;
+        const size_t per_item = 2 * (512 / SG) + 2 * ((R + SG - 1) / SG) + 32;
+        if (g <= head_limit && local <= std::min(max_group, size_t(512)) &&
+            (size_t(R) * 512 + 2 * local) * sizeof(float) <= local_bytes && per_item * local <= registers)
+            selected = g;
+    }
+    const size_t original_head_tiles = (size_t(heads) + original.heads - 1) / original.heads;
+#define ATTENTION_REGISTER(G) case G: return sparse_attn_register<G, R, SG>(q, win, ckv, sel, sel_stride, a, sink, heads, T, scale, out, s, ckv_fmt, heads_per_block, scratch, original_head_tiles)
+    switch (selected) {
+        ATTENTION_REGISTER(16); ATTENTION_REGISTER(8); ATTENTION_REGISTER(4); ATTENTION_REGISTER(2); ATTENTION_REGISTER(1);
+    default: return false;
+    }
+#undef ATTENTION_REGISTER
+}
+bool try_attention_register(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
+                            const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out,
+                            sycl::queue& s, int ckv_fmt, int heads_per_block, const AttnScratch* scratch) {
+    if (!a.gen || d != 512 || heads <= 0 || T <= 0) return false;
+    const auto original = attn_tile(s, heads, d, T, heads_per_block);
+    if (!original.local) return false;
+    const auto widths = s.get_device().get_info<sycl::info::device::sub_group_sizes>();
+    // A single reported width preserves the old reduction width. With several
+    // widths the old kernel's chosen width is not guaranteed; retain its path.
+    if (widths.size() != 1) return false;
+    // Only cover existing row tile values. In particular 13 is the result of
+    // the existing local-memory formula, not a newly measured row threshold.
+#define ATTENTION_ROWS(SG, R) case R: return dispatch_attention_register<SG, R>(q, win, ckv, sel, sel_stride, a, sink, heads, T, scale, out, s, ckv_fmt, heads_per_block, scratch, original)
+    if (widths[0] == 32) {
+        switch (original.rows) { ATTENTION_ROWS(32, 8); ATTENTION_ROWS(32, 13); ATTENTION_ROWS(32, 16); default: return false; }
+    }
+    if (widths[0] == 16) {
+        switch (original.rows) { ATTENTION_ROWS(16, 8); ATTENTION_ROWS(16, 13); ATTENTION_ROWS(16, 16); default: return false; }
+    }
+#undef ATTENTION_ROWS
+    return false;
+}
+#else
+bool try_attention_register(const float*, const uint16_t*, const void*, const int*, int,
+                            const AttnRows&, const float*, int, int, int, float, float*,
+                            sycl::queue&, int, int, const AttnScratch*) { return false; }
+#endif
+
+bool sparse_attn_tiled(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
+                       const AttnRows& a, const float* sink, int heads, int d, int T, float scale,
+                       float* out, sycl::queue& s, int ckv_fmt, int heads_per_block, const AttnScratch* scratch) {
+    if (try_attention_register(q, win, ckv, sel, sel_stride, a, sink, heads, d, T, scale,
+                               out, s, ckv_fmt, heads_per_block, scratch)) return true;
+    return sparse_attn_tiled_original(q, win, ckv, sel, sel_stride, a, sink, heads, d, T, scale,
+                                      out, s, ckv_fmt, heads_per_block, scratch);
+}
+
 uint32_t ord_key(float v) {
     const uint32_t u = sycl::bit_cast<uint32_t>(v);
     return u ^ ((u & 0x80000000u) ? 0xffffffffu : 0x80000000u);
