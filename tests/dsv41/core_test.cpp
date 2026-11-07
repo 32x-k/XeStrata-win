@@ -268,6 +268,46 @@ void attention_scratch(sycl::queue& queue) {
     }
     std::puts("attention FP4 scratch/capacity/empty selection/guards: PASS");
 }
+void engram(sycl::queue& q) {
+    // Independent double reference; include partial groups, a single element,
+    // the model dimension, zero norms, signed gates, and residual output guards.
+    constexpr int tokens = 3, streams = 4, padding = 7;
+    constexpr float guard = 12345.f, eps = 1e-20f;
+    for (int dim : {1, 17, 257, 5120}) for (bool zero : {false, true}) {
+        const size_t count = size_t(tokens) * streams * size_t(dim);
+        std::vector<float> input(count + 2 * size_t(padding), guard), kv(size_t(tokens) * (streams + 1) * size_t(dim)), w(size_t(streams) * size_t(dim));
+        for (size_t i = 0; i < count; ++i) input[padding + i] = zero ? 0.f : float(int(i % 31) - 15) / 32.f;
+        for (size_t i = 0; i < kv.size(); ++i) kv[i] = zero ? 0.f : float(int((i * 13) % 37) - 18) / 64.f;
+        for (size_t i = 0; i < w.size(); ++i) w[i] = float(int((i * 7) % 29) - 14) / 32.f;
+        std::vector<double> reference(input.begin(), input.end());
+        for (int t = 0; t < tokens; ++t) for (int stream = 0; stream < streams; ++stream) {
+            const size_t off = size_t(padding) + (size_t(t) * streams + size_t(stream)) * size_t(dim);
+            const size_t key = (size_t(t) * (streams + 1) + size_t(stream)) * size_t(dim);
+            const size_t value = (size_t(t) * (streams + 1) + streams) * size_t(dim);
+            double sh = 0., sk = 0., sd = 0.;
+            for (int j = 0; j < dim; ++j) {
+                const double h = input[off + size_t(j)], k = kv[key + size_t(j)];
+                sh += h * h; sk += k * k; sd += h * double(w[size_t(stream) * size_t(dim) + size_t(j)]) * k;
+            }
+            const double dot = sd / std::sqrt(sh / dim + double(eps)) / std::sqrt(sk / dim + double(eps)) / std::sqrt(double(dim));
+            const double sq = std::copysign(std::sqrt(std::max(std::abs(dot), double(1e-6f))), dot);
+            const double gate = 1. / (1. + std::exp(-sq));
+            for (int j = 0; j < dim; ++j) reference[off + size_t(j)] += gate * double(kv[value + size_t(j)]);
+        }
+        Memory memory(q); auto* h = memory.upload(input); auto* keys = memory.upload(kv); auto* weights = memory.upload(w);
+        ds::engram_gate(h + padding, keys, weights, streams, dim, tokens, eps, q);
+        strata::core::readback(q, input.data(), h, input.size() * sizeof(float));
+        for (size_t i = 0; i < input.size(); ++i) {
+            if ((i < padding || i >= size_t(padding) + count) && input[i] != guard)
+                throw std::runtime_error("Engram residual output guard");
+            if (zero && i >= padding && i < size_t(padding) + count && input[i] != 0.f)
+                throw std::runtime_error("Engram zero norm output");
+            close(input[i], reference[i], "Engram double reference");
+        }
+    }
+    std::puts("Engram ragged/zero norms/residual/FP64: PASS");
+}
+
 }  // namespace
 
 int main() try {
@@ -280,6 +320,7 @@ int main() try {
     route(q);
     attention(q);
     attention_scratch(q);
+    engram(q);
     return 0;
 } catch (const std::exception& e) {
     std::fprintf(stderr, "ds4 core parity: %s\n", e.what());

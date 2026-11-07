@@ -1360,8 +1360,16 @@ void engram_dequant_tok(const uint8_t* src, size_t per, int cols, int T, int hd,
                               int(z % hd), fmt);
     });
 }
-void engram_gate(float* h, const float* kv, const float* w, int hc, int dim, int T, float eps, sycl::queue& s) {
-    parallel(s, size_t(T) * hc, [=](size_t z) {
+// S54 checked the FP32 group reduction at the reported width; only the
+// partition/reduction order changes. Keep the old path for unsupported shapes.
+void engram_gate(float* h,const float* kv,const float* w,int hc,int dim,int T,float eps,sycl::queue& s) {
+    if(hc<=0||dim<=0||T<=0)return;
+    static core::PerDevice<size_t> cache;const auto d=s.get_device();
+    const size_t reported=cache.get(d,[&]{size_t width=1;const size_t limit=std::min(d.get_info<sycl::info::device::max_work_group_size>(),d.get_info<sycl::info::device::max_work_item_sizes<1>>()[0]);for(size_t sg:d.get_info<sycl::info::device::sub_group_sizes>())if(sg<=limit)width=std::max(width,sg);return width;});
+    // Shapes smaller than a reported subgroup, and devices without a usable
+    // subgroup, retain the established one-work-item reduction.
+    if(reported<=1 || size_t(dim)<reported) {
+        sycl_detail::parallel(s, size_t(T) * hc, [=](size_t z) {
         const size_t t = z / hc, k = z % hc;
         float* row = h + z * dim;
         const float* key = kv + (t * (hc + 1) + k) * dim;
@@ -1373,6 +1381,20 @@ void engram_gate(float* h, const float* kv, const float* w, int hc, int dim, int
         const float gate = 1.f / (1.f + sycl::exp(-sq));
         for (int e = 0; e < dim; ++e) row[e] += gate * value[e];
     });
+        return;
+    }
+    const size_t local=std::min(reported,size_t(dim));
+    sycl_detail::require_in_order(s);
+    sycl_detail::submit(s,[&](sycl::handler& handler){handler.parallel_for(sycl::nd_range<1>(size_t(T)*size_t(hc)*local,local),[=](sycl::nd_item<1> it){
+        const size_t z=it.get_group_linear_id(),t=z/size_t(hc),k=z%size_t(hc),lane=it.get_local_linear_id();
+        float* row=h+z*size_t(dim);const float* key=kv+(t*size_t(hc+1)+k)*size_t(dim);const float* value=kv+(t*size_t(hc+1)+size_t(hc))*size_t(dim);
+        float sh=0.f,sk=0.f,sd=0.f;
+        for(size_t e=lane;e<size_t(dim);e+=local){sh+=row[e]*row[e];sk+=key[e]*key[e];sd+=row[e]*w[k*size_t(dim)+e]*key[e];}
+        sh=sycl::reduce_over_group(it.get_group(),sh,sycl::plus<float>());sk=sycl::reduce_over_group(it.get_group(),sk,sycl::plus<float>());sd=sycl::reduce_over_group(it.get_group(),sd,sycl::plus<float>());
+        const float dot=sd*sycl::rsqrt(sh/float(dim)+eps)*sycl::rsqrt(sk/float(dim)+eps)*sycl::rsqrt(float(dim));
+        const float sq=sycl::copysign(sycl::sqrt(sycl::fmax(sycl::fabs(dot),1e-6f)),dot);const float gate=1.f/(1.f+sycl::exp(-sq));
+        for(size_t e=lane;e<size_t(dim);e+=local)row[e]+=gate*value[e];
+    });});
 }
 void gather_rows(const float* x, const Gather& g, int n, int cols, float* out, sycl::queue& s) {
     parallel(s, size_t(n) * cols, [=](size_t z) { out[z] = x[size_t(g.src[z / cols]) * cols + z % cols]; });
