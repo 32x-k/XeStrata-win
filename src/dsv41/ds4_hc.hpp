@@ -169,12 +169,37 @@ inline sycl::float4 load4(const float* pointer) {
 
 // Upstream hc_mix_kernel / hc_mix_split_kernel, one 256-item work-group per
 // (mix, token). These are algorithm launch shapes, gated by reported limits.
+// Two independent sums keep the same lane and subgroup order while sharing
+// the publication barriers. Each half has its own local-memory slots.
+template <int SG, int WG>
+inline sycl::float2 block_sum_pair(sycl::nd_item<1> item, float first, float second,
+                                    sycl::local_accessor<float, 1> red) {
+    constexpr size_t stride = WG / SG + 1;
+    const size_t tid = item.get_local_linear_id(), lane = tid % SG, warp = tid / SG;
+    first = warp_sum<SG>(item.get_sub_group(), first);
+    second = warp_sum<SG>(item.get_sub_group(), second);
+    if (lane == 0) { red[warp] = first; red[stride + warp] = second; }
+    item.barrier(sycl::access::fence_space::local_space);
+    if (warp == 0) {
+        float a = lane < WG / SG ? red[lane] : 0.f;
+        float b = lane < WG / SG ? red[stride + lane] : 0.f;
+        for (size_t i = lane + SG; i < WG / SG; i += SG) { a += red[i]; b += red[stride + i]; }
+        a = warp_sum<SG>(item.get_sub_group(), a);
+        b = warp_sum<SG>(item.get_sub_group(), b);
+        if (lane == 0) { red[WG / SG] = a; red[stride + WG / SG] = b; }
+    }
+    item.barrier(sycl::access::fence_space::local_space);
+    const sycl::float2 result(red[WG / SG], red[stride + WG / SG]);
+    item.barrier(sycl::access::fence_space::local_space);
+    return result;
+}
+
 template <int SG, bool Fused>
 void mix_kernel(const float* h, const float* fn, int hcdim, int n_mix, int tokens, float eps,
                 float* mixes, unsigned* counters, const Split& split, sycl::queue& q) {
     constexpr int WG = 256;
     sycl_detail::submit(q, [&](sycl::handler& handler) {
-        sycl::local_accessor<float, 1> red(sycl::range<1>(WG / SG + 1), handler);
+        sycl::local_accessor<float, 1> red(sycl::range<1>(2 * (WG / SG + 1)), handler);
         sycl::local_accessor<float, 1> smx(sycl::range<1>(Fused ? 32 : 1), handler);
         sycl::local_accessor<unsigned, 1> last(sycl::range<1>(1), handler);
         auto body = [=](sycl::nd_item<1> item) {
@@ -188,8 +213,8 @@ void mix_kernel(const float* h, const float* fn, int hcdim, int n_mix, int token
                 acc += hv.x() * wv.x() + hv.y() * wv.y() + hv.z() * wv.z() + hv.w() * wv.w();
                 ss += hv.x() * hv.x() + hv.y() * hv.y() + hv.z() * hv.z() + hv.w() * hv.w();
             }
-            acc = block_sum<SG, WG>(item, acc, red);
-            ss = block_sum<SG, WG>(item, ss, red);
+            const auto sums = block_sum_pair<SG, WG>(item, acc, ss, red);
+            acc = sums.x(); ss = sums.y();
             if (tid == 0) {
                 mixes[token * 32 + mix] = acc * sycl::rsqrt(ss / float(hcdim) + eps);
                 if constexpr (Fused) {
@@ -233,7 +258,7 @@ inline bool mix(const float* h, const float* fn, int hcdim, int n_mix, int token
     const bool fused = split != nullptr;
     const auto& c = caps(q);
     // Non-fused instantiations still declare the one-element dummy accessors.
-    const int sg = subgroup(c, 256, fused, fused ? 0 : sizeof(float) + sizeof(unsigned));
+    const int sg = subgroup(c, 256, fused, (256 / 16 + 1) * sizeof(float) + (fused ? 0 : sizeof(float) + sizeof(unsigned)));
     if (!sg || (fused && (!counters || !c.device_acq_rel))) return false;
     const Split args = fused ? *split : Split{};
     if (sg == 32) {

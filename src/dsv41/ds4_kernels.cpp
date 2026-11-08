@@ -172,9 +172,11 @@ bool route_groups(sycl::queue& s, int T, int n, F f) {
     if (bytes >= caps.local_bytes) return false;
     // Cache both scores and reserve a score/ID pair per item for the reductions.
     // A small device can use fewer items, or the serial path if the row will not fit.
-    const size_t local = std::min({size_t(n), caps.max_group,
+    const size_t limit = std::min({size_t(n), caps.max_group,
                                    (caps.local_bytes - bytes) / (sizeof(float) + sizeof(int))});
-    if (!local) return false;
+    if (!limit) return false;
+    size_t local = 1;
+    while (local <= limit / 2) local *= 2;
     sycl_detail::submit(s, [&](sycl::handler& h) {
         sycl::local_accessor<float, 1> scores(size_t(n), h), biased(size_t(n), h);
         h.parallel_for(sycl::nd_range<1>(sycl::range<1>(size_t(T) * local), sycl::range<1>(local)),
@@ -202,6 +204,42 @@ void route_group(sycl::nd_item<1> item, sycl::local_accessor<float, 1> scores,
         }
         const float top = sycl::reduce_over_group(group, best, sycl::maximum<float>());
         ix = sycl::reduce_over_group(group, best == top ? ix : std::numeric_limits<int>::max(), sycl::minimum<int>());
+        if (lane == 0) {
+            const bool valid = ix < n;
+            ids[r] = valid ? ix : -1;
+            if (weights) { weights[r] = valid ? scores[ix] : 0.f; sum += weights[r]; }
+            if (valid) biased[ix] = -std::numeric_limits<float>::infinity();
+        }
+        sycl::group_barrier(group);
+    }
+    if (lane == 0 && weights)
+        for (int r = 0; r < k; ++r) weights[r] = weights[r] / (sum + 1e-20f) * scale;
+}
+void route_group_packed(sycl::nd_item<1> item, sycl::local_accessor<float, 1> scores,
+                 sycl::local_accessor<float, 1> biased, const float* logits, const float* bias,
+                 int n, int k, float scale, int* ids, float* weights) {
+    const size_t lane = item.get_local_linear_id(), local = item.get_local_range(0);
+    const auto group = item.get_group();
+    for (size_t i = lane; i < size_t(n); i += local) {
+        scores[i] = route_score(logits[i]);
+        biased[i] = scores[i] + bias[i];
+    }
+    sycl::group_barrier(group);
+    float sum = 0.f;
+    for (int r = 0; r < k; ++r) {
+        float best = -FLT_MAX;
+        int ix = std::numeric_limits<int>::max();
+        for (size_t i = lane; i < size_t(n); i += local) {
+            const float v = biased[i];
+            if (v > best || (v == best && int(i) < ix)) { best = v; ix = int(i); }
+        }
+        // One ordered key selects the largest score, then the smallest ID.
+        // Normalize signed zero: the original float comparisons tie on it.
+        const uint32_t bits = sycl::bit_cast<uint32_t>(best == 0.f ? 0.f : best);
+        const uint32_t ordered = bits & 0x80000000u ? ~bits : bits ^ 0x80000000u;
+        const uint64_t key = (uint64_t(ordered) << 32) | (0xffffffffu - uint32_t(ix));
+        const uint64_t winner = sycl::reduce_over_group(group, key, sycl::maximum<uint64_t>());
+        ix = int(0xffffffffu - uint32_t(winner));
         if (lane == 0) {
             const bool valid = ix < n;
             ids[r] = valid ? ix : -1;
@@ -1312,7 +1350,7 @@ void route(const float* logits, const float* bias, int n, int k, int T, float sc
     const bool launched = route_groups(s, T, n, [=](sycl::nd_item<1> item, auto scores, auto biased) {
         const size_t t = item.get_group_linear_id();
         const float* b = bias_vl && ((bits.w[t >> 5] >> (t & 31)) & 1u) ? bias_vl : bias;
-        route_group(item, scores, biased, logits + t * 1024, b, n, k, scale, idx + t * kPicks, w + t * kPicks);
+        route_group_packed(item, scores, biased, logits + t * 1024, b, n, k, scale, idx + t * kPicks, w + t * kPicks);
     });
     if (!launched) parallel(s, size_t(T), [=](size_t t) {
         const float* b = bias_vl && ((bits.w[t >> 5] >> (t & 31)) & 1u) ? bias_vl : bias;
@@ -1686,17 +1724,55 @@ void wait_seq(const unsigned* seq_ptr, unsigned seq, sycl::queue& s) {
     s.submit([=](sycl::handler& h) { h.host_task([=] { wait_mailbox(seq_ptr, seq, false, control.get()); }); });
 }
 void moe_sort(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds, int* row_tok, int* pos, sycl::queue& s) {
-    parallel(s, size_t(n_vs), [=](size_t slot) {
-        int count = 0;
-        for (int t = 0; t < T; ++t) for (int i = 0; i < k; ++i) count += vs[idx[size_t(t) * kPicks + i]] == int(slot);
-        bounds[slot + 1] = count;
+    sycl_detail::require_in_order(s);
+    if (n_vs <= 0) { sycl_detail::single(s, [=] { bounds[0] = 0; }); return; }
+    const auto& caps = group_caps(s);
+    const size_t total = size_t(T) * size_t(k);
+    const size_t limit = std::min(caps.max_group, std::max(size_t(1), total));
+    size_t wg = 1;
+    while (wg <= limit / 2) wg *= 2;
+    // Each group owns one slot. Integer scans preserve ascending token/pick order.
+    sycl_detail::submit(s, [&](sycl::handler& h) {
+        h.parallel_for(sycl::nd_range<1>(size_t(n_vs) * wg, wg), [=](sycl::nd_item<1> item) {
+            const size_t slot = item.get_group_linear_id(), lane = item.get_local_linear_id();
+            int count = 0;
+            for (size_t q = lane; q < total; q += wg)
+                count += vs[idx[(q / k) * kPicks + q % k]] == int(slot);
+            const int sum = sycl::reduce_over_group(item.get_group(), count, sycl::plus<int>());
+            if (lane == 0) bounds[slot + 1] = sum;
+        });
     });
-    sycl_detail::single(s, [=] { bounds[0] = 0; for (int i = 0; i < n_vs; ++i) bounds[i + 1] += bounds[i]; });
-    parallel(s, size_t(n_vs), [=](size_t slot) {
-        int r = bounds[slot];
-        for (int t = 0; t < T; ++t) for (int i = 0; i < k; ++i) if (vs[idx[size_t(t) * kPicks + i]] == int(slot)) {
-            row_tok[r] = t; pos[size_t(t) * kPicks + i] = r++;
-        }
+    size_t scan_wg = 1;
+    while (scan_wg < size_t(n_vs) + 1 && scan_wg <= caps.max_group / 2) scan_wg *= 2;
+    if (scan_wg >= size_t(n_vs) + 1) {
+        sycl_detail::submit(s, [&](sycl::handler& h) {
+            h.parallel_for(sycl::nd_range<1>(scan_wg, scan_wg), [=](sycl::nd_item<1> item) {
+                const size_t lane = item.get_local_linear_id();
+                const int count = lane && lane <= size_t(n_vs) ? bounds[lane] : 0;
+                sycl::group_barrier(item.get_group());
+                const int prefix = sycl::inclusive_scan_over_group(item.get_group(), count, sycl::plus<int>());
+                if (lane <= size_t(n_vs)) bounds[lane] = prefix;
+            });
+        });
+    } else {
+        sycl_detail::single(s, [=] { bounds[0] = 0; for (int i = 0; i < n_vs; ++i) bounds[i + 1] += bounds[i]; });
+    }
+    sycl_detail::submit(s, [&](sycl::handler& h) {
+        h.parallel_for(sycl::nd_range<1>(size_t(n_vs) * wg, wg), [=](sycl::nd_item<1> item) {
+            const size_t slot = item.get_group_linear_id(), lane = item.get_local_linear_id();
+            int base = bounds[slot];
+            for (size_t start = 0; start < total; start += wg) {
+                const size_t q = start + lane;
+                const int hit = q < total && vs[idx[(q / k) * kPicks + q % k]] == int(slot) ? 1 : 0;
+                const int offset = sycl::exclusive_scan_over_group(item.get_group(), hit, 0, sycl::plus<int>());
+                const int count = sycl::reduce_over_group(item.get_group(), hit, sycl::plus<int>());
+                if (hit) {
+                    const int row = base + offset;
+                    row_tok[row] = int(q / k); pos[(q / k) * kPicks + q % k] = row;
+                }
+                base += count;
+            }
+        });
     });
 }
 void moe_combine(float* acc, const float* y, const int* pos, const float* w, int T, int k, int r0, int r1, int dim, sycl::queue& s) {
