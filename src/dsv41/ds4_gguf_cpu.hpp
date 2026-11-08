@@ -89,7 +89,7 @@ void mx_rows(const uint8_t* w, size_t rb, int k, int r0, int r1, const void* con
 /// The same with tier t (the scalar one when the CPU does not run t, or k % 256 != 0); pf: bytes prefetched ahead.
 void mx_rows_tier(int t, const uint8_t* w, size_t rb, int k, int r0, int r1, const void* const* act, int n,
                   float* const* y, int pf = 0);
-int mx_tier();                   // the tier mx_rows takes, selected from CPU feature bits and explicit overrides
+int mx_tier();                   // the fastest measured supported tier, or an explicit override; once per process
 const char* mx_tier_report();    // how the tier was picked
 bool mx_tier_ok(int t);          // this CPU runs tier t
 const char* mx_tier_name(int t);

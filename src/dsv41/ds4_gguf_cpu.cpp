@@ -268,6 +268,7 @@ const Cpu& cpu() {
 // from RAM they all reach the memory's speed) in interleaved rounds, the best round of each counting.  The choice never
 // changes an answer (the tiers give the same bits), only the speed.  DS4_MX_TIER=<name> picks one by hand.
 std::string g_tier_report;
+int measure_tier(const std::vector<int>& cand);
 int pick_tier() {
     if (const char* f = std::getenv("DS4_MX_TIER"))
         for (int t = 0; t < kMxTiers; ++t)
@@ -277,12 +278,53 @@ int pick_tier() {
             }
     const bool avx2_only = std::getenv("STRATA_FORCE_AVX2") != nullptr &&
                            std::strtol(std::getenv("STRATA_FORCE_AVX2"), nullptr, 10) != 0;
-    for (int t = avx2_only ? kMxAvxVnni : kMxAvx512Vnni; t >= kMxScalar; --t)
-        if (mx_tier_ok(t)) {
-            g_tier_report = "CPU feature bits";
-            return t;
+    std::vector<int> cand;
+    for (int t = kMxAvx2; t <= (avx2_only ? kMxAvxVnni : kMxAvx512Vnni); ++t)
+        if (mx_tier_ok(t)) cand.push_back(t);
+    if (cand.empty()) return kMxScalar;
+    if (cand.size() == 1) return cand[0];
+    return measure_tier(cand);
+}
+int measure_tier(const std::vector<int>& cand) {
+    constexpr int K = 5120, R = 64, NT = 4;
+    const size_t rb = (size_t) K / kBlock * kBytes;
+    std::vector<uint8_t> w(rb * R), act(mx_act_bytes(K) * NT);
+    uint32_t s = 0x9E3779B9u;
+    for (size_t i = 0; i < w.size(); ++i) {
+        s = s * 1664525u + 1013904223u;
+        w[i] = (uint8_t) (s >> 24);
+    }
+    for (size_t b = 0; b < w.size() / kBytes; ++b) w[b * kBytes] = (uint8_t) (118 + b % 6);
+    std::vector<float> x(K);
+    for (int i = 0; i < NT; ++i) {
+        for (int j = 0; j < K; ++j) {
+            s = s * 1664525u + 1013904223u;
+            x[(size_t) j] = (float) ((int) (s >> 16) - 32768) / 32768.0f;
         }
-    return kMxScalar;
+        quant_scalar(x.data(), 0, K / kBlock, act.data() + (size_t) i * mx_act_bytes(K), K);
+    }
+    const void* ap[NT];
+    for (int i = 0; i < NT; ++i) ap[i] = act.data() + (size_t) i * mx_act_bytes(K);
+    float y[NT][R];
+    float* yp[NT] = {y[0], y[1], y[2], y[3]};
+    std::vector<double> best(cand.size(), 1e30);
+    for (int round = 0; round < 6; ++round)
+        for (size_t c = 0; c < cand.size(); ++c) {
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int rep = 0; rep < 8; ++rep)
+                for (int n : {1, 2, 4}) mx_rows_tier(cand[c], w.data(), rb, K, 0, R, ap, n, yp, 0);
+            const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+            if (round > 0) best[c] = std::min(best[c], us);   // (round 0: the clock and the caches warm)
+        }
+    size_t bi = 0;
+    for (size_t c = 1; c < cand.size(); ++c)
+        if (best[c] < best[bi]) bi = c;
+    char buf[64];
+    for (size_t c = 0; c < cand.size(); ++c) {
+        std::snprintf(buf, sizeof buf, "%s%s %.0f us", c ? ", " : "", mx_tier_name(cand[c]), best[c]);
+        g_tier_report += buf;
+    }
+    return cand[bi];
 }
 int prefetch_bytes() {
     const char* f = std::getenv("DS4_MX_PF");

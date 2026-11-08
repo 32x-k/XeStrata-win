@@ -24,7 +24,7 @@ endif()
 
 if(STRATA_BUILD_TESTS)
     enable_testing()
-    foreach(_ds4_host_test slot experts_rule pick_rule store pool)
+    foreach(_ds4_host_test slot experts_rule pick_rule store pool mx_tier)
         add_executable(ds4_${_ds4_host_test}_test tests/dsv41/${_ds4_host_test}_test.cpp)
         target_link_libraries(ds4_${_ds4_host_test}_test PRIVATE strata_dsv41_host)
         if(_ds4_host_test STREQUAL "store")
@@ -49,4 +49,18 @@ if(STRATA_BUILD_TESTS)
             $<TARGET_FILE:ds4_gg_bench> --check-only --type 18 --nt 3)
         set_tests_properties(ds4_gg_check_avx2 PROPERTIES LABELS "dsv41;host" TIMEOUT 60)
     endif()
+endif()
+
+if(STRATA_BUILD_TESTS)
+  foreach(ds4_mx_tier scalar avx2 avxvnni avx512 avx512vnni)
+    add_test(NAME ds4_mx_tier_override_${ds4_mx_tier}
+      COMMAND ${CMAKE_COMMAND} -E env DS4_MX_TIER=${ds4_mx_tier}
+        $<TARGET_FILE:ds4_mx_tier_test> --selection-only --expect ${ds4_mx_tier})
+    set_tests_properties(ds4_mx_tier_override_${ds4_mx_tier} PROPERTIES LABELS "dsv41;host" TIMEOUT 60)
+  endforeach()
+  add_test(NAME ds4_mx_tier_avx2 COMMAND ${CMAKE_COMMAND} -E env STRATA_FORCE_AVX2=1 DS4_MX_TIER=
+    $<TARGET_FILE:ds4_mx_tier_test> --selection-only)
+  add_test(NAME ds4_mx_tier_invalid COMMAND ${CMAKE_COMMAND} -E env DS4_MX_TIER=invalid
+    $<TARGET_FILE:ds4_mx_tier_test> --selection-only)
+  set_tests_properties(ds4_mx_tier_avx2 ds4_mx_tier_invalid PROPERTIES LABELS "dsv41;host" TIMEOUT 60)
 endif()
