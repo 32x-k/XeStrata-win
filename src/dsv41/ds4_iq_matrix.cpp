@@ -31,6 +31,7 @@
 #endif
 
 namespace strata::ds4::gguf::iq::matrix_detail {
+template <int T, bool GU, int STAGE> class LargeKernel;
 namespace {
 using namespace sycl_decode;
 namespace xe = strata::kernels::xe;
@@ -510,7 +511,7 @@ bool shared_weight_launch(const SetArgs& a, sycl::queue& s) {
 
 
 template <int T, bool GU>
-bool launch(const SetArgs& a, sycl::queue& s) {
+bool established_launch(const SetArgs& a, sycl::queue& s) {
     if (shared_weight_launch<T, GU, 8>(a, s) || shared_weight_launch<T, GU, 4>(a, s)) return true;
     const size_t needed = (size_t(std::max(0, a.max_rows)) + MM - 1) / MM;
     const auto& c = caps(s); size_t r = 1;
@@ -529,6 +530,8 @@ bool launch(const SetArgs& a, sycl::queue& s) {
     if (r == 1 && register_launch<T, GU, 1>(a, s)) return true;
     return launch_base<T, GU>(a, s);
 }
+
+#include "ds4_iq_matrix_large.inc"
 
 template <bool GU>
 bool dispatch_matrix(const SetArgs& a, sycl::queue& s) {
