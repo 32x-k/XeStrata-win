@@ -43,6 +43,19 @@ inline int prefill_chunk_default(bool own_default, double gpu_share, bool gguf_c
     return (int) std::max<uint64_t>(1, std::min<uint64_t>((uint64_t) std::max(1, big), budget_bytes / bytes_per_token));
 }
 
+// Total temporary storage and a single allocation are independent limits.
+// The one-eighth policy leaves the rest for weights and experts; it is not a
+// throughput threshold. Actual allocation failure retries the old default.
+inline int prefill_chunk_capacity(uint64_t free_bytes, uint64_t reserve_bytes, uint64_t largest,
+                                   size_t row_bytes, size_t allocation_row_bytes, size_t padding_bytes,
+                                   int context_rows, int fallback) {
+    if (free_bytes <= reserve_bytes || !largest || !row_bytes || !allocation_row_bytes ||
+        largest <= padding_bytes || context_rows <= 0) return fallback;
+    const uint64_t total_rows = (free_bytes - reserve_bytes) / 8 / row_bytes;
+    const uint64_t single_rows = (largest - padding_bytes) / allocation_row_bytes;
+    return (int) std::max<uint64_t>(1, std::min({uint64_t(context_rows), total_rows, single_rows}));
+}
+
 inline bool copy_all_fits(double lane_bytes, uint64_t ram_avail, double ram_margin, double commit_room) {
     if (!(lane_bytes > 0.0) || ram_avail == ~uint64_t{0}) return false;
     return lane_bytes + ram_margin <= (double) ram_avail && lane_bytes <= commit_room;

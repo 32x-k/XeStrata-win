@@ -620,6 +620,8 @@ struct Chunk {
     // host-mapped: a chunk's hand-off to the next group (h | pre | topk | cand), two in flight (slot = chunk % 2), each
     // with its flag, and the next group's members' acknowledgements [slot][member] (32 apart)
     uint8_t* hand[2] = {nullptr, nullptr};
+    size_t host_rows[2] = {0, 0};   // each used slot's actual row capacity, independent of device chunk capacity
+    bool hand_needed = false;   // only a group with a following group publishes a hand-off
     unsigned* hand_flag[2] = {nullptr, nullptr};
     unsigned* hand_ack = nullptr;
     unsigned arb_seq = 0;        // the group's chunk all-reduces
@@ -945,6 +947,7 @@ struct Model::Impl {
     unsigned win_seq = 0;             // the windows the threads ran (the hand-offs' seq)
     // the chunked prompt path (threads mode): chunk tokens a pass, runs shorter than chunk_min in windows
     int chunk = 0, chunk_min = kWin + 1;
+    int chunk_host_fallback = 0;
     static constexpr bool kChunkedPromptDefault = true;   // the layer-major prompt is the default (gate: KL 0.1685 vs 0.1686, 8K prompt 6x, decode within 2% - ds4 notes-dsv41-r97)
     static constexpr int kFlowChunkMin = 2;   // chunk_min with every device's layers on the flow (see load)
     // Sorted expert-row indices are int; each token contributes at most kPicks rows.
@@ -2333,13 +2336,30 @@ struct Model::Impl {
         const bool gguf_copy = pk.gguf && (o.mmap_experts == 0 || (store_gb() <= 0.0 && auto_copy_all));
         const bool matrix_engines = matrix_capable();
         const int rule_chunk = prefill_chunk_default(own_default, gpu_expert_share(), gguf_copy, file_experts, matrix_engines, scratch_budget() / 2, (int) std::clamp<int64_t>(o.max_context, 1, kMaxChunk), multi_tp, defaults_026(), chunk_row_bytes());
-        chunk = prompt_par ? (o.prefill_chunk >= 0 ? o.prefill_chunk : rule_chunk) : 0;
+        // Bound the sum of scratch arrays separately from each USM allocation.
+        // Capped slabs A/AI/ES never exceed C, so these are conservative per-row
+        // maxima of alloc_chunks; model padding is reserved at the same limit.
+        const size_t allocation_row = std::max({size_t(g.hc) * g.dim * sizeof(float),
+            size_t(g.heads) * g.hd * sizeof(float), (size_t(g.hc) + 1) * g.dim * sizeof(float),
+            (size_t(o.max_context) + 64) * sizeof(float), size_t(g.ff) * sizeof(float),
+            size_t(std::max(0, pk.eg_ngram - 1)) * std::max(0, pk.eg_heads) * std::max(0, pk.eg_hd) * sizeof(float)});
+        const size_t padding = std::max(size_t(g.win) * g.hd * sizeof(float),
+                                       size_t(kH16Pad) * g.ff * sizeof(uint16_t));
+        size_t chunk_free = 0, chunk_total = 0;
+        const int capacity_chunk = rt::mem_info(&chunk_free, &chunk_total) == rt::Result::success ?
+            prefill_chunk_capacity(chunk_free, (uint64_t) std::max<int64_t>(0, o.reserve_mib) << 20,
+                strata::core::max_alloc_bytes(), chunk_row_bytes(), allocation_row, padding,
+                (int) std::clamp<int64_t>(o.max_context, 1, kMaxChunk), rule_chunk) : rule_chunk;
+        // Ascending K and rounding are unchanged. Explicit requests still win.
+        chunk = prompt_par ? (o.prefill_chunk >= 0 ? o.prefill_chunk : capacity_chunk) : 0;
         const char* dc = std::getenv("DS4_CHUNK");   // a short prompt in several chunks, down to one row
         if (dc != nullptr) chunk = prompt_par ? std::atoi(dc) : 0;
         if (const char* v = std::getenv("DS4_CHUNK_MIN")) chunk_min = std::max(1, std::atoi(v));
+        bool capacity_fallback = o.prefill_chunk < 0 && dc == nullptr && chunk > rule_chunk;
+        chunk_host_fallback = capacity_fallback ? rule_chunk : 0;
         if (chunk > 0) {
             chunk = (int) std::min<int64_t>(o.max_context, std::min(kMaxChunk, std::max(1, chunk)));
-            eg_cap = (size_t) std::max(kWin, chunk);
+
             tap_cap = std::max(kWin, 128);
         } else   // (only as asked for: --prefill-chunk 0, or --tp 1 with --threads off)
             std::fprintf(stderr,
@@ -2853,7 +2873,7 @@ struct Model::Impl {
         const int cols = pk.eg_layers > 0 ? (pk.eg_ngram - 1) * pk.eg_heads : 0;
         if (!halloc(h_x, (size_t) kWin * g.dim, err) || !halloc(h_w, (size_t) kWin * kPicks, err) ||
             !halloc(h_part, (size_t) kWin * g.dim, err) || !halloc(h_idx, (size_t) kWin * kPicks, err) || !halloc(h_idx_a, (size_t) 2 * kPicks, err) ||
-            !halloc(h_emb, (size_t) std::max(kWin, chunk) * g.dim, err) ||
+            !halloc(h_emb, (size_t) kWin * g.dim, err) ||
             !halloc(h_eg, (size_t) std::max(1, pk.eg_layers) * eg_cap * cols * (pk.eg_hd + pk.eg_hd / 32) + 64, err))
             return false;
         if (pk.eg_layers > 0) {
@@ -2992,6 +3012,13 @@ struct Model::Impl {
                     host_allocs.pop_back();
                 }
                 chunks.clear();
+                if (capacity_fallback) {
+                    capacity_fallback = false;
+                    chunk = rule_chunk;
+                    slab_force_base_ = false;
+                    std::fprintf(stderr, "ds4: chunk capacity did not fit; retrying resource fallback %d\n", chunk);
+                    continue;
+                }
                 if (slab_auto_grew_) {   // try the budget's base slab before shrinking the chunk
                     slab_auto_grew_ = false;
                     slab_force_base_ = true;
@@ -3002,7 +3029,7 @@ struct Model::Impl {
                 const int was = chunk;
                 chunk = chunk > 1 ? chunk / 2 : 0;
                 if (chunk > 0) {
-                    eg_cap = (size_t) std::max(kWin, chunk);
+
                     std::fprintf(stderr, "ds4: the prompt path's buffers for chunks of %d rows did not fit (%s): trying %d\n",
                                  was, aerr.c_str(), chunk);
                 } else {
@@ -3347,6 +3374,74 @@ struct Model::Impl {
         return (size_t) chunk * ((size_t) g.hc * g.dim * 4 + 8 * 4 + topk_stride() * 4 + cand_stride() * 4);
     }
 
+    // No data contents survive a run; flags and acknowledgements do. Growth
+    // drains every reader, including a failed run's outstanding device work.
+    template <class T>
+    bool replace_host(T*& p, size_t count, bool mapped, std::string& err) {
+        T* fresh = nullptr;
+        if (!(mapped ? hmap(fresh, count, err) : halloc(fresh, count, err))) return false;
+        if (p != nullptr) {
+            const auto it = std::find(host_allocs.begin(), host_allocs.end(), (void*) p);
+            if (it != host_allocs.end()) host_allocs.erase(it);
+            rt::free(p);
+        }
+        p = fresh;
+        return true;
+    }
+    bool chunk_hosts_failed(std::string& err) {
+        // A failed growth can leave some larger allocations installed. Drop
+        // them before retrying the old capacity, so they cannot consume its room.
+        for (const Dev& d : devs) {
+            rt::set_device(d.id);
+            CK(rt::stream_sync(d.st));
+        }
+        auto release = [this](auto*& p) {
+            if (p == nullptr) return;
+            const auto it = std::find(host_allocs.begin(), host_allocs.end(), (void*) p);
+            if (it != host_allocs.end()) host_allocs.erase(it);
+            rt::free(p);
+            p = nullptr;
+        };
+        for (auto& c : chunks) {
+            for (int sl = 0; sl < 2; ++sl) {
+                release(c->hand[sl]);
+                release(c->emb_host[sl]);
+                release(c->eg_host[sl]);
+                c->host_rows[sl] = 0;
+            }
+        }
+        return false;
+    }
+    bool chunk_hosts(int rows, int chunk_count, std::string& err) {
+        const int slots = std::min(2, chunk_count);
+        const bool growing = std::any_of(chunks.begin(), chunks.end(), [rows, slots](const auto& c) {
+            for (int sl = 0; sl < slots; ++sl)
+                if (c->host_rows[sl] > 0 && c->host_rows[sl] < (size_t) rows) return true;
+            return false;
+        });
+        if (growing)
+            for (const Dev& d : devs) {
+                rt::set_device(d.id);
+                CK(rt::stream_sync(d.st));
+            }
+        const size_t per = pk.eg_layers > 0 ?
+            (size_t) (pk.eg_ngram - 1) * pk.eg_heads * (pk.eg_hd + pk.eg_hd / 32) : 0;
+        for (size_t di = 0; di < chunks.size(); ++di) {
+            Chunk& c = *chunks[di];
+            rt::set_device(devs[di].id);
+            for (int sl = 0; sl < slots; ++sl) {
+                if ((size_t) rows <= c.host_rows[sl]) continue;
+                if (c.hand_needed && !replace_host(c.hand[sl], (size_t) rows *
+                    ((size_t) g.hc * g.dim * sizeof(float) + 8 * sizeof(float) + size_t(topk_stride()) * sizeof(int) +
+                     size_t(cand_stride()) * sizeof(int)), true, err)) return chunk_hosts_failed(err);
+                if (c.emb != nullptr && !replace_host(c.emb_host[sl], (size_t) rows * g.dim, false, err)) return chunk_hosts_failed(err);
+                if (c.eg_rows != nullptr && !replace_host(c.eg_host[sl], (size_t) rows * pk.eg_layers * per, false, err)) return chunk_hosts_failed(err);
+                c.host_rows[sl] = (size_t) rows;
+            }
+        }
+        return true;
+    }
+
     // the staging ring's size (MB) for the experts a chunk streams from the CPU lane: 400 where a good part of them are
     // streamed; 16 where the cards hold most of the experts (they are within 30% of fitting) (a 4-card box) - the ring's VRAM is then worth more
     // as expert slots, and the decode after a prompt keeps the windowed path's speed (R9700 x4: 29.6 -> 31.7 tok/s)
@@ -3473,6 +3568,8 @@ struct Model::Impl {
                         const Layer& ml = member(l, m);
                         has_eg = has_eg || l.eg >= 0;
                         has_first = has_first || l.il == 0;
+                        c.hand_needed = c.hand_needed || (d.mi == 0 && l.il + 1 < g.nl &&
+                            L[(size_t) l.il + 1].grp != l.grp);
                         stride = std::max(stride, align256(unit(member(l, m))));
                         bounds_count = std::max(bounds_count, (size_t) l.n_exp + 1);
                         for (const x3::Mat* mat : {&ml.wq_a, &ml.wq_b, &ml.wkv, &ml.wo_b, &ml.s1, &ml.s2, &ml.s3,
@@ -3532,13 +3629,12 @@ struct Model::Impl {
                 return false;
             }
             for (int sl = 0; sl < 2; ++sl) {
-                if (d.mi == 0 && (!hmap(c.hand[sl], chunk_hand_bytes(), err) || !hmap(c.hand_flag[sl], 32, err))) return false;
-                if (has_first && !halloc(c.emb_host[sl], C * D, err)) return false;
-                if (has_eg && !halloc(c.eg_host[sl], C * pk.eg_layers * (size_t) cols * (ehd + ehd / 32), err)) return false;
+                // Data staging is acquired for the actual run, not for C rows.
+                if (c.hand_needed && !hmap(c.hand_flag[sl], 32, err)) return false;
                 CK(rt::event_create(&c.emb_ev[sl]));
                 CK(rt::event_create(&c.eg_ev[sl]));
             }
-            if (d.mi == 0 && !hmap(c.hand_ack, (size_t) 2 * 8 * 32, err)) return false;
+            if (c.hand_needed && !hmap(c.hand_ack, (size_t) 2 * 8 * 32, err)) return false;
         }
         return true;
     }
@@ -7887,7 +7983,7 @@ struct Model::Impl {
             const int cols = (pk.eg_ngram - 1) * pk.eg_heads, ehd = pk.eg_hd;
             const size_t per = (size_t) cols * (ehd + ehd / 32);
             const int slot = wp.eg_slot >= 0 ? wp.eg_slot : wp.k % 2;   // (read ahead by the run: two in flight)
-            uint8_t* host = c.eg_host[slot] + (size_t) l.eg * c.C * per;
+            uint8_t* host = c.eg_host[slot] + (size_t) l.eg * c.host_rows[slot] * per;
             CK(rt::copy_async(c.eg_rows, host, (size_t) T * per, s));
             CK(rt::event_record(c.eg_ev[slot], s));
             for (int s0 = 0; s0 < T; s0 += c.eg_slab) {
@@ -8376,7 +8472,7 @@ struct Model::Impl {
         auto read_eg = [this, &c, &run, &egu, eg_per](size_t u) {
             if (u >= 2) rt::event_sync(c.eg_ev[u % 2]);
             const int li = egu[u].first, k = egu[u].second;
-            engram_rows(run.p0[(size_t) k], run.T[(size_t) k], li, c.eg_host[u % 2] + (size_t) li * c.C * eg_per);
+            engram_rows(run.p0[(size_t) k], run.T[(size_t) k], li, c.eg_host[u % 2] + (size_t) li * c.host_rows[u % 2] * eg_per);
         };
         size_t eg_u = 0;
         std::future<void> eg_next;
@@ -8542,7 +8638,7 @@ struct Model::Impl {
         auto read_eg = [this, &c, &run, &egs, eg_per](int k) {
             if (k >= 2) rt::event_sync(c.eg_ev[k % 2]);
             for (int li : egs)
-                engram_rows(run.p0[(size_t) k], run.T[(size_t) k], li, c.eg_host[k % 2] + (size_t) li * c.C * eg_per);
+                engram_rows(run.p0[(size_t) k], run.T[(size_t) k], li, c.eg_host[k % 2] + (size_t) li * c.host_rows[k % 2] * eg_per);
         };
         std::future<void> eg_next;
         if (!egs.empty()) eg_next = std::async(std::launch::async, read_eg, 0);
@@ -9124,7 +9220,18 @@ struct Model::Impl {
                          : yoco_mode() == 2 ? g.win : (g.nl - yl) * (g.win - 1) + g.win;
         // Only the model's receptive window determines which prefix can be omitted.
         const int a = yl > 0 ? std::max(0, n - keep) : 0;
-        const int nc = (n + chunk - 1) / chunk, per = (n + nc - 1) / nc;
+        int nc = (n + chunk - 1) / chunk, per = (n + nc - 1) / nc;
+        if (!chunk_hosts(per, nc, err)) {
+            if (chunk_host_fallback <= 0 || chunk <= chunk_host_fallback) return false;
+            // Device storage may remain larger; the run uses the old capacity.
+            chunk = chunk_host_fallback;
+            chunk_host_fallback = 0;
+            nc = (n + chunk - 1) / chunk;
+            per = (n + nc - 1) / nc;
+            err.clear();
+            if (!chunk_hosts(per, nc, err)) return false;
+            if (o.verbose) std::fprintf(stderr, "ds4: host staging did not fit; using resource fallback %d\n", chunk);
+        }
         if (ds4_dbg("DS4_DBG_CHUNK")) std::fprintf(stderr, "forward_chunks n %d nc %d per %d\n", n, nc, per);
         Run run;
         for (int x = 0; x < n; x += per) {

@@ -27,6 +27,17 @@ int main() {
     CHECK(prefill_chunk_default(false, 0, false, true, false, 64 * mib, 1024, false, false, mib) == 64);
     CHECK(prefill_chunk_default(true, 1, true, false, true, 64 * mib, 17, false, false, mib) == 17);
     CHECK(prefill_chunk_default(false, 0, false, true, false, 64, 1024, false, false, mib) == 1);
+    // Aggregate budget can exceed the allocation limit when arrays fit singly.
+    CHECK(prefill_chunk_capacity(32ULL * 1024 * mib, 1024 * mib, 1024 * mib,
+                                 784000, 131072, 262144, 4096, 684) == 4096);
+    CHECK(prefill_chunk_capacity(32ULL * 1024 * mib, 1024 * mib, 128 * mib,
+                                 784000, 131072, 262144, 4096, 684) == 1022);
+    CHECK(prefill_chunk_capacity(0, 0, mib, 1, 1, 0, 4096, 17) == 17);
+    CHECK(prefill_chunk_capacity(mib, mib, mib, 1, 1, 0, 4096, 17) == 17);
+    CHECK(prefill_chunk_capacity(mib, 0, 0, 1, 1, 0, 4096, 17) == 17);
+    CHECK(prefill_chunk_capacity(mib, 0, mib, 0, 1, 0, 4096, 17) == 17);
+    CHECK(prefill_chunk_capacity(mib, 0, mib, 1, 1, mib, 4096, 17) == 17);
+    CHECK(prefill_chunk_capacity(64, 0, 64, 8, 8, 0, 4096, 17) == 1);
     CHECK(copy_all_fits(100, 120, 20, 100));
     CHECK(!copy_all_fits(100, 119, 20, 100));
     CHECK(!copy_all_fits(100, 120, 20, 99));

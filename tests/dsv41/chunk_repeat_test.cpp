@@ -21,13 +21,15 @@ int main(int argc, char** argv) try {
     strata::ds4::Options options;
     options.pack = pack;
     options.max_context = 128;
-    options.prefill_chunk = 16;
+    options.prefill_chunk = 32;
     if (const char* share = std::getenv("STRATA_DSV41_TEST_VRAM_EXPERTS")) {
         options.vram_experts_auto = false;
         options.vram_experts = std::strtod(share, nullptr);
     }
     options.ssd_cache_gb = 0;
     options.dspark_auto = false;
+    options.profile_readonly = true;
+    if (const char* profile = std::getenv("STRATA_DSV41_TEST_PROFILE")) options.profile = profile;
     if (const char* threads = std::getenv("STRATA_DSV41_TEST_THREADS"))
         options.cpu_threads = std::max(1, int(std::strtol(threads, nullptr, 10)));
     strata::ds4::Model model;
@@ -44,24 +46,32 @@ int main(int argc, char** argv) try {
     for (size_t i = 0; i < tokens.size(); ++i)
         tokens[i] = int((i * 1001) % size_t(model.vocab()));
     std::vector<float> expected, logits;
-    for (int repeat = 0; repeat < 2; ++repeat) {
+    for (int repeat = 0; repeat < 6; ++repeat) {
+        // Repeat each layout after reset, including one-slot reuse after the
+        // two-slot layout has expanded both capacities.
+        const auto sizes = repeat / 2 == 1 ? std::vector<int>{64} : std::vector<int>{17, 30, 17};
+        if (repeat % 2 == 0) expected.clear();
         model.reset();
-        for (size_t offset = 0; offset < tokens.size(); offset += 16) {
-            if (!model.feed(tokens.data() + offset, 16, 16, error) || !model.logits(logits)) {
+        size_t offset = 0;
+        // Grow one slot from 17 to 30 rows, then reuse it after reset. A
+        // 64-row feed also needs the second slot with this 32-row chunk.
+        for (const int rows : sizes) {
+            if (!model.feed(tokens.data() + offset, rows, rows, error) || !model.logits(logits)) {
                 std::fprintf(stderr, "chunk repeat feed at %zu: %s\n", offset, error.c_str());
                 return 1;
             }
-            const size_t count = size_t(16) * size_t(model.vocab());
+            const size_t count = size_t(rows) * size_t(model.vocab());
             if (logits.size() != count ||
                 !std::all_of(logits.begin(), logits.end(), [](float x) { return std::isfinite(x); })) {
                 std::fputs("chunk repeat: invalid logits\n", stderr);
                 return 1;
             }
-            if (repeat == 0) expected.insert(expected.end(), logits.begin(), logits.end());
+            if (repeat % 2 == 0) expected.insert(expected.end(), logits.begin(), logits.end());
             else if (std::memcmp(expected.data() + offset * size_t(model.vocab()), logits.data(), count * sizeof(float)) != 0) {
-                std::fprintf(stderr, "chunk repeat: logits differ at chunk %zu\n", offset / 16);
+                std::fprintf(stderr, "chunk repeat: logits differ at row %zu\n", offset);
                 return 1;
             }
+            offset += size_t(rows);
         }
         if (model.pos() != int64_t(tokens.size())) return 1;
     }
