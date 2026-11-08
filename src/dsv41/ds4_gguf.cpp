@@ -103,7 +103,7 @@ iq::SetArgs light_args(const x3::SetArgs& a) {
     iq::SetArgs q{};
     q.wbase = a.wbase; q.stride = a.stride;
     for (int r = 0; r < 3; ++r) q.tr[r] = a.lay.trellis[r];
-    q.bounds = a.bounds; q.row0 = a.row0; q.max_rows = a.max_rows; q.n_exp = a.n_exp;
+    q.bounds = a.bounds; q.host_bounds = a.host_bounds; q.row0 = a.row0; q.max_rows = a.max_rows; q.n_exp = a.n_exp;
     q.n_embd = a.n_embd; q.n_ff = a.n_ff; q.limit = a.limit; q.skip_ge = a.skip_ge;
     q.tg = expert_type(a.lay, 0); q.td = expert_type(a.lay, 2);
     return q;

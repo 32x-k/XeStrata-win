@@ -1136,6 +1136,14 @@ int main(int argc, char** argv) try {
             if (!iq::set_gate_up(q, queue())) { std::printf("set_gate_up refused\n"); return 1; }
             queue().wait_and_throw();
             const auto h16 = down_(dh16, (size_t) NR * FF);
+            // Compact routing must preserve every output bit, including an
+            // empty expert between two populated experts and the light split.
+            q.host_bounds = bounds.data();
+            if (!iq::set_gate_up(q, queue())) throw std::runtime_error("compact gate/up refused");
+            const auto compact_h = down_(dh16, h16.size());
+            if (std::memcmp(h16.data(), compact_h.data(), h16.size() * sizeof(uint16_t)) != 0)
+                throw std::runtime_error("compact gate/up differs from rectangular grid");
+            q.host_bounds = nullptr;
             if ((type == 19 || type == 29) && g_cmp) {
                 std::vector<double> reference; std::vector<size_t> positions;
                 for (int e = 0; e < NEXP; ++e) if (bounds[e + 1] - bounds[e] <= 16)
@@ -1170,6 +1178,12 @@ int main(int argc, char** argv) try {
             if (!iq::set_down(q, queue())) { std::printf("set_down refused\n"); return 1; }
             queue().wait_and_throw();
             const auto y = down_(dy, (size_t) NR * E);
+            q.host_bounds = bounds.data();
+            if (!iq::set_down(q, queue())) throw std::runtime_error("compact down refused");
+            const auto compact_y = down_(dy, y.size());
+            if (std::memcmp(y.data(), compact_y.data(), y.size() * sizeof(float)) != 0)
+                throw std::runtime_error("compact down differs from rectangular grid");
+            q.host_bounds = nullptr;
             if ((type == 19 || type == 29) && g_cmp) {
                 std::vector<double> reference; std::vector<size_t> positions;
                 for (int e = 0; e < NEXP; ++e) if (bounds[e + 1] - bounds[e] <= 16)

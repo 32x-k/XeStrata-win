@@ -52,6 +52,8 @@ const Caps& caps(const sycl::queue& s) {
     });
 }
 
+#include "ds4_iq_matrix_grid.inc"
+
 // Matrix dispatch already requires fp16. Native RTE is used only where the
 // result is a finite normal half; the bit-defined path keeps subnormals and
 // special values independent of the device's half denormal modes.
@@ -132,8 +134,11 @@ bool launch_base(const SetArgs& a, sycl::queue& s) {
     sycl_detail::require_in_order(s);
     const size_t bn = column_groups * MN, threads = row_groups * column_groups * SG;
     const size_t nc = (size_t(n) + bn - 1) / bn, nr = (size_t(a.max_rows) + rows - 1) / rows;
-    const size_t rb = row_bytes_t<T>(k), groups = size_t(a.n_exp) * nc * nr;
+    const size_t rb = row_bytes_t<T>(k);
     const int skip = std::max(a.skip_le, kLightRows);
+    const MatrixGrid grid = matrix_grid(a, s, rows, nc, skip);
+    const size_t groups = grid.groups;
+    if (!groups) return true;
     sycl_detail::submit(s, [&](sycl::handler& h) {
         sycl::local_accessor<uint32_t, 1> table_data(sycl::range<1>(table_words), h);
         sycl::local_accessor<int, 1> source(sycl::range<1>(rows), h);
@@ -142,7 +147,9 @@ bool launch_base(const SetArgs& a, sycl::queue& s) {
         h.parallel_for(sycl::nd_range<1>(sycl::range<1>(groups * threads), sycl::range<1>(threads)),
                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
             const size_t id = it.get_local_linear_id(), group = it.get_group_linear_id();
-            const size_t e = group / (nc * nr), r0 = ((group / nc) % nr) * rows, c0 = (group % nc) * bn;
+            const size_t e = grid.jobs ? size_t(grid.jobs[group / nc][0]) : group / (nc * nr);
+            const size_t r0 = grid.jobs ? size_t(grid.jobs[group / nc][1]) : ((group / nc) % nr) * rows;
+            const size_t c0 = (group % nc) * bn;
             const int first = a.bounds[e] - a.row0, count = a.bounds[e + 1] - a.bounds[e];
             if (count <= skip || (a.skip_ge > 0 && count >= a.skip_ge) || r0 >= size_t(count)) return;
             if constexpr (Ty<T>::TAB > 0)
@@ -306,21 +313,26 @@ bool register_launch(const SetArgs& a, sycl::queue& s) {
         if (!columns || c.group < columns * SG) return false;
         const size_t bn = columns * MN, threads = columns * SG;
         const size_t nc = (size_t(n) + bn - 1) / bn, nr = (size_t(a.max_rows) + rows - 1) / rows;
-        const size_t groups = size_t(a.n_exp) * nc * nr, rb = row_bytes_t<T>(k);
+        const size_t rb = row_bytes_t<T>(k);
         const int skip = std::max(a.skip_le, kLightRows);
         sycl_detail::require_in_order(s);
+        const MatrixGrid grid = matrix_grid(a, s, rows, nc, skip);
+        const size_t groups = grid.groups;
+        if (!groups) return true;
         sycl_detail::submit(s, [&](sycl::handler& h) {
             sycl::local_accessor<uint32_t, 1> table_data(sycl::range<1>(table_words), h);
             sycl::local_accessor<int, 1> sources(sycl::range<1>(rows), h);
             sycl::local_accessor<sycl::half, 1> xs(sycl::range<1>(rows * QK), h);
-            h.parallel_for(sycl::nd_range<1>(groups * threads, threads), [a, nc, nr, bn, skip, threads, table_data, sources, xs, rb, k, n](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            h.parallel_for(sycl::nd_range<1>(groups * threads, threads), [a, nc, nr, bn, skip, threads, grid, table_data, sources, xs, rb, k, n](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
                 [[maybe_unused]] constexpr size_t roles = GU ? 2 : 1, rows = RT * MM, table_words = Ty<T>::TAB;
                 // The host and device closures have the same explicit layout.
                 (void)it; (void)a; (void)nc; (void)nr; (void)bn; (void)skip; (void)threads;
-                (void)table_data; (void)sources; (void)xs; (void)rb; (void)k; (void)n;
+                (void)table_data; (void)sources; (void)xs; (void)rb; (void)k; (void)n; (void)grid;
 #if STRATA_AMD_WMMA
                 const size_t id = it.get_local_linear_id(), g = it.get_group_linear_id();
-                const size_t e = g / (nc * nr), r0 = ((g / nc) % nr) * rows, c0 = (g % nc) * bn;
+                const size_t e = grid.jobs ? size_t(grid.jobs[g / nc][0]) : g / (nc * nr);
+                const size_t r0 = grid.jobs ? size_t(grid.jobs[g / nc][1]) : ((g / nc) % nr) * rows;
+                const size_t c0 = (g % nc) * bn;
                 const int count = a.bounds[e + 1] - a.bounds[e], first = a.bounds[e] - a.row0;
                 if (count <= skip || (a.skip_ge > 0 && count >= a.skip_ge) || r0 >= size_t(count)) return;
                 for (size_t j = id; j < table_words; j += threads) table_data[j] = table<T>()[j];
@@ -416,7 +428,7 @@ bool shared_weight_launch(const SetArgs& a, sycl::queue& s) {
                              (rows + roles * bn) * pitch * sizeof(uint16_t);
         if (!columns || threads > c.group || local > c.local) return false;
         const size_t nc = (size_t(n) + bn - 1) / bn, nr = (size_t(a.max_rows) + rows - 1) / rows;
-        const size_t groups = size_t(a.n_exp) * nc * nr, rb = row_bytes_t<T>(k);
+        const size_t rb = row_bytes_t<T>(k);
         const int skip = std::max(a.skip_le, cutoff);
         sycl_detail::require_in_order(s);
         // Small experts retain p2 with its actual row upper bound. This also
@@ -427,21 +439,26 @@ bool shared_weight_launch(const SetArgs& a, sycl::queue& s) {
             small.skip_ge = cutoff + 1;
             if (!register_launch<T, GU, 2>(small, s)) return false;
         }
+        const MatrixGrid grid = matrix_grid(a, s, rows, nc, skip);
+        const size_t groups = grid.groups;
+        if (!groups) return true;
         sycl_detail::submit(s, [&](sycl::handler& h) {
             sycl::local_accessor<uint32_t, 1> table_data(sycl::range<1>(table_words), h);
             sycl::local_accessor<int, 1> sources(sycl::range<1>(rows), h);
             sycl::local_accessor<sycl::half, 1> xs(sycl::range<1>(rows * pitch), h);
             sycl::local_accessor<sycl::half, 1> ws(sycl::range<1>(roles * bn * pitch), h);
             h.parallel_for(sycl::nd_range<1>(groups * threads, threads),
-                [a, nc, nr, bn, skip, threads, table_data, sources, xs, ws, rb, k, n, columns]
+                [a, nc, nr, bn, skip, threads, table_data, sources, xs, ws, rb, k, n, columns, grid]
                 (sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
                 [[maybe_unused]] constexpr size_t rows = RG * MM, roles = GU ? 2 : 1;
                 [[maybe_unused]] constexpr size_t table_words = Ty<T>::TAB, pitch = QK + MK / 2;
                 (void)it; (void)a; (void)nc; (void)nr; (void)bn; (void)skip; (void)threads;
-                (void)table_data; (void)sources; (void)xs; (void)ws; (void)rb; (void)k; (void)n; (void)columns;
+                (void)table_data; (void)sources; (void)xs; (void)ws; (void)rb; (void)k; (void)n; (void)columns; (void)grid;
 #if STRATA_AMD_WMMA
                 const size_t id = it.get_local_linear_id(), group = it.get_group_linear_id();
-                const size_t e = group / (nc * nr), r0 = ((group / nc) % nr) * rows, c0 = (group % nc) * bn;
+                const size_t e = grid.jobs ? size_t(grid.jobs[group / nc][0]) : group / (nc * nr);
+                const size_t r0 = grid.jobs ? size_t(grid.jobs[group / nc][1]) : ((group / nc) % nr) * rows;
+                const size_t c0 = (group % nc) * bn;
                 const int first = a.bounds[e] - a.row0, count = a.bounds[e + 1] - a.bounds[e];
                 if (count <= skip || (a.skip_ge > 0 && count >= a.skip_ge) || r0 >= size_t(count)) return;
                 for (size_t j = id; j < table_words; j += threads) table_data[j] = table<T>()[j];

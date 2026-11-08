@@ -152,6 +152,7 @@ struct SetArgs {
     ExpertLayout lay;
     int n_exp = 0;
     const int* bounds = nullptr;
+    const int* host_bounds = nullptr; // Optional matching host routing bounds, for compact matrix grids.
     int row0 = 0;
     int max_rows = 0;   // the most rows one expert of the set has
     int n_embd = 4096, n_ff = 2048;

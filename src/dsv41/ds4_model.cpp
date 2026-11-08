@@ -4382,6 +4382,7 @@ struct Model::Impl {
                 sa.lay = l.nm > 1 ? l.hlay : l.lay;
                 sa.n_exp = j - i0;
                 sa.bounds = d_bounds + i0;
+                sa.host_bounds = b + i0;
                 sa.row0 = a;
                 sa.max_rows = max_rows;
                 sa.n_embd = D;

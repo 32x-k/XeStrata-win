@@ -57,6 +57,7 @@ struct SetArgs {
     size_t stride = 0;
     size_t tr[3] = {0, 0, 0};
     const int* bounds = nullptr;
+    const int* host_bounds = nullptr; // Optional matching host routing bounds; consumed during dispatch only.
     int row0 = 0, max_rows = 0, n_exp = 0;
     int n_embd = 0, n_ff = 0;
     float limit = 0.0f;

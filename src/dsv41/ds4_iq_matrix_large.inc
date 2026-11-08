@@ -90,28 +90,33 @@ bool large_launch(const SetArgs& a, sycl::queue& s) {
             } catch (const sycl::exception&) { return false; }
         })) return false;
         const size_t nc = size_t(n) / bn, nr = (size_t(a.max_rows) + rows - 1) / rows;
-        const size_t groups = size_t(a.n_exp) * nc * nr, rb = row_bytes_t<T>(k);
+        const size_t rb = row_bytes_t<T>(k);
         const int skip = std::max(a.skip_le, cutoff);
         sycl_detail::require_in_order(s);
         if (a.skip_le < cutoff) {
             SetArgs small = a; small.max_rows = cutoff; small.skip_ge = cutoff + 1;
             if (!established_launch<T, GU>(small, s)) return false;
         }
+        const MatrixGrid grid = matrix_grid(a, s, rows, nc, skip);
+        const size_t groups = grid.groups;
+        if (!groups) return true;
         sycl_detail::submit(s, [&](sycl::handler& h) {
             sycl::local_accessor<uint32_t, 1> table_data(sycl::range<1>(Ty<T>::TAB), h);
             sycl::local_accessor<int, 1> sources(sycl::range<1>(rows), h);
             sycl::local_accessor<sycl::half, 1> xs(sycl::range<1>(buffers * rows * pitch), h);
             h.parallel_for<LargeKernel<T, GU, STAGE>>(sycl::nd_range<1>(groups * threads, threads),
-                [a, nc, nr, skip, rb, k, n, table_data, sources, xs]
+                [a, nc, nr, skip, rb, k, n, table_data, sources, xs, grid]
                 (sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG), sycl::reqd_work_group_size(threads)]] {
                 (void)it; (void)a; (void)nc; (void)nr; (void)skip; (void)rb; (void)k; (void)n;
-                (void)table_data; (void)sources; (void)xs;
+                (void)table_data; (void)sources; (void)xs; (void)grid;
 #if STRATA_AMD_WMMA
                 constexpr size_t RT = 8, CT = 8, rows = RT * MM, bn = CT * MN, threads = CT * SG;
                 constexpr size_t roles = GU ? 2 : 1, pk = STAGE ? 4 * MK : QK;
                 constexpr size_t pitch = pk + MK / 2, parts = xe::wmma::KN / 8;
                 const size_t id = it.get_local_linear_id(), g = it.get_group_linear_id();
-                const size_t e = g / (nc * nr), r0 = ((g / nc) % nr) * rows, c0 = (g % nc) * bn;
+                const size_t e = grid.jobs ? size_t(grid.jobs[g / nc][0]) : g / (nc * nr);
+                const size_t r0 = grid.jobs ? size_t(grid.jobs[g / nc][1]) : ((g / nc) % nr) * rows;
+                const size_t c0 = (g % nc) * bn;
                 const int count = a.bounds[e + 1] - a.bounds[e], first = a.bounds[e] - a.row0;
                 if (count <= skip || (a.skip_ge > 0 && count >= a.skip_ge) || r0 >= size_t(count)) return;
                 for (size_t j = id; j < size_t(Ty<T>::TAB); j += threads) table_data[j] = table<T>()[j];
