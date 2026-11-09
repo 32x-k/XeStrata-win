@@ -118,6 +118,8 @@ bool large_launch(const SetArgs& a, sycl::queue& s) {
                 const size_t r0 = grid.jobs ? size_t(grid.jobs[g / nc][1]) : ((g / nc) % nr) * rows;
                 const size_t c0 = (g % nc) * bn;
                 const int count = a.bounds[e + 1] - a.bounds[e], first = a.bounds[e] - a.row0;
+                // Round up to retain zero padding of the last live WMMA block.
+                const size_t active_rows = sycl::min(rows, ((size_t(count) - r0 + MM - 1) / MM) * MM);
                 if (count <= skip || (a.skip_ge > 0 && count >= a.skip_ge) || r0 >= size_t(count)) return;
                 for (size_t j = id; j < size_t(Ty<T>::TAB); j += threads) table_data[j] = table<T>()[j];
                 if (id < rows) sources[id] = r0 + id < size_t(count) ?
@@ -156,7 +158,7 @@ bool large_launch(const SetArgs& a, sycl::queue& s) {
                     return sycl::bit_cast<sycl::half>(value);
                 };
                 if constexpr (STAGE == 2) {
-                    for (size_t j = id; j < rows * pk; j += threads) xs[(j / pk) * pitch + j % pk] = read_x(j, 0);
+                    for (size_t j = id; j < active_rows * pk; j += threads) xs[(j / pk) * pitch + j % pk] = read_x(j, 0);
                     it.barrier(sycl::access::fence_space::local_space);
                 }
                 for (size_t base = 0; base < size_t(k); base += pk) {
@@ -181,10 +183,10 @@ bool large_launch(const SetArgs& a, sycl::queue& s) {
                         // MADs read only this iteration's face; the end barrier
                         // makes the next face visible before its first read.
                         if (base + pk < size_t(k))
-                            for (size_t j = id; j < rows * pk; j += threads)
+                            for (size_t j = id; j < active_rows * pk; j += threads)
                                 xs[(1 - slot) * rows * pitch + (j / pk) * pitch + j % pk] = read_x(j, base + pk);
                     } else {
-                        for (size_t j = id; j < rows * pk; j += threads) xs[(j / pk) * pitch + j % pk] = read_x(j, base);
+                        for (size_t j = id; j < active_rows * pk; j += threads) xs[(j / pk) * pitch + j % pk] = read_x(j, base);
                         it.barrier(sycl::access::fence_space::local_space);
                     }
 #pragma unroll

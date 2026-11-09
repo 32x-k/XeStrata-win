@@ -517,6 +517,141 @@ bool sparse_attn_register(const float* q, const uint16_t* win, const void* ckv, 
     });
     return true;
 }
+// Two heads share each local KV load while retaining each head's order.
+// Select bounded groups from reported resources; a compiled-kernel check
+// keeps the existing one-head path when this family needs private storage.
+template <int H, int G, int R, int SG> class SparseHeadsKernel;
+template <int H, int G, int R, int SG>
+bool sparse_attn_heads(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
+                          const AttnRows& a, const float* sink, int heads, int T, float scale, float* out,
+                          sycl::queue& s, int ckv_fmt, int heads_per_block, const AttnScratch* scratch,
+                          size_t original_head_tiles) {
+    (void)original_head_tiles;
+    constexpr int D = 512, V = D / SG, S = (R + SG - 1) / SG;
+    constexpr size_t local = size_t(G) * SG;
+    constexpr size_t heads_per_group = size_t(H) * G;
+    const size_t head_tiles = (size_t(heads) + heads_per_group - 1) / heads_per_group;
+    const size_t row_bytes = kv_row_bytes(ckv_fmt, D);
+    const auto device = s.get_device();
+    static core::PerDevice<bool> compiled_caps;
+    if (!compiled_caps.get(device, [&] {
+        try {
+            const auto id = sycl::get_kernel_id<SparseHeadsKernel<H, G, R, SG>>();
+            const auto bundle = sycl::get_kernel_bundle<sycl::bundle_state::executable>(s.get_context(), {device}, {id});
+            const auto kernel = bundle.get_kernel(id);
+            return kernel.template get_info<sycl::info::kernel_device_specific::work_group_size>(device) >= local &&
+                   kernel.template get_info<sycl::info::kernel_device_specific::private_mem_size>(device) == 0;
+        } catch (const sycl::exception&) { return false; }
+    })) return false;
+
+    uint16_t* decoded = nullptr;
+    size_t decoded_stride = 0;
+    if (ckv_fmt == kKvFp4 && sel_stride > 0 && scratch && scratch->rows &&
+        T <= scratch->max_t && sel_stride <= scratch->cap &&
+        (heads_per_block == -1 || (heads_per_block == 0 && head_tiles > 1))) {
+        decoded = scratch->rows;
+        decoded_stride = size_t(scratch->cap);
+        unpack_selected(ckv, sel, sel_stride, a, T, D, decoded, decoded_stride, s);
+    }
+    const long long p0 = a.p0;
+    const int t0 = a.t0, window = a.win, compression = a.R, cap = a.kcap;
+    sycl_detail::submit(s, [&](sycl::handler& h) {
+        h.parallel_for<SparseHeadsKernel<H, G, R, SG>>(sycl::nd_range<1>(sycl::range<1>(size_t(T) * head_tiles * local), sycl::range<1>(local)),
+                       [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
+            const auto group = item.get_group();
+            const auto sg = item.get_sub_group();
+            const size_t lane = item.get_local_linear_id(), sl = sg.get_local_linear_id();
+            const size_t block = item.get_group_linear_id(), t = block / head_tiles;
+            const size_t head = ((block % head_tiles) * G + sg.get_group_linear_id()) * H;
+            const long long ta = t0 + static_cast<long long>(t), pa = p0 + ta;
+            const long long first = sycl::max(static_cast<long long>(window) - p0, ta + 1);
+            const int nwin = int(window + ta - first + 1);
+            const int nsel = compression > 0 ? int(sycl::min(static_cast<long long>(cap), (pa + 1) / compression)) : 0;
+            const int total = nwin + nsel;
+            const size_t base = (t * heads + head) * D;
+            if (total <= 0) {
+                if (head < size_t(heads)) {
+#pragma unroll
+                    for (int hh = 0; hh < H; ++hh) if(head + hh < size_t(heads))
+                    for (int k = 0; k < V; ++k) out[base + size_t(hh)*D + sl + size_t(k) * SG] = 0.f;
+                }
+                return;
+            }
+            auto values = sycl::ext::oneapi::group_local_memory_for_overwrite<float[R * D]>(group);
+            float query[H][V], accum[H][V] = {}, maximum[H], denominator[H];
+#pragma unroll
+            for (int hh=0; hh<H; ++hh) {
+#pragma unroll
+                for(int k=0;k<V;++k) query[hh][k]=head+hh<size_t(heads)?q[base+size_t(hh)*D+sl+size_t(k)*SG]:0.f;
+                maximum[hh]=head+hh<size_t(heads)?sink[head+hh]:0.f; denominator[hh]=1.f;
+            }
+            for (int start = 0; start < total; start += R) {
+                const int nr = sycl::min(R, total - start);
+                for (size_t i = lane; i < size_t(nr) * D; i += local) {
+                    const int j = start + int(i / D), e = int(i % D);
+                    const int fmt = j < nwin || decoded ? kKvBf16 : ckv_fmt;
+                    const void* row = j < nwin ? static_cast<const void*>(win + size_t(first + j) * D) :
+                        decoded ? static_cast<const void*>(decoded + (t * decoded_stride + size_t(j - nwin)) * D) :
+                        static_cast<const void*>(static_cast<const uint8_t*>(ckv) +
+                            size_t(sel[t * sel_stride + j - nwin]) * row_bytes);
+                    (*values)[i] = kv_value(row, fmt, D, e);
+                }
+                sycl::group_barrier(group);
+                float scores[H][S] = {};
+#pragma unroll
+                for(int r=0;r<R;++r) if(r<nr) {
+                    float dot[H] = {};
+#pragma unroll
+                    for(int k=0;k<V;++k) {
+                        const float value=(*values)[size_t(r)*D+sl+size_t(k)*SG];
+#pragma unroll
+                        for(int hh=0;hh<H;++hh) dot[hh]+=query[hh][k]*value;
+                    }
+#pragma unroll
+                    for(int hh=0;hh<H;++hh) {
+                        dot[hh]=sycl::reduce_over_group(sg,dot[hh],sycl::plus<float>());
+                        if(sl==size_t(r%SG)) scores[hh][r/SG]=dot[hh]*scale;
+                    }
+                }
+                float weights[H][S] = {};
+#pragma unroll
+                for(int hh=0;hh<H;++hh) {
+                    float top=-std::numeric_limits<float>::infinity();
+#pragma unroll
+                    for(int k=0;k<S;++k) if(sl+size_t(k)*SG<size_t(nr)) top=sycl::fmax(top,scores[hh][k]);
+                    top=sycl::reduce_over_group(sg,top,sycl::maximum<float>());
+                    const float next=sycl::fmax(maximum[hh],top),keep=sycl::exp(maximum[hh]-next);
+                    float sum=0.f;
+#pragma unroll
+                    for(int k=0;k<S;++k) if(sl+size_t(k)*SG<size_t(nr)) {weights[hh][k]=sycl::exp(scores[hh][k]-next);sum+=weights[hh][k];}
+                    sum=sycl::reduce_over_group(sg,sum,sycl::plus<float>());
+                    maximum[hh]=next; denominator[hh]=denominator[hh]*keep+sum;
+#pragma unroll
+                    for(int k=0;k<V;++k) accum[hh][k]*=keep;
+                }
+#pragma unroll
+                for(int r=0;r<R;++r) if(r<nr) {
+                    float weight[H];
+#pragma unroll
+                    for(int hh=0;hh<H;++hh) weight[hh]=sycl::select_from_group(sg,weights[hh][r/SG],sycl::id<1>(r%SG));
+#pragma unroll
+                    for(int k=0;k<V;++k) {
+                        const float value=(*values)[size_t(r)*D+sl+size_t(k)*SG];
+#pragma unroll
+                        for(int hh=0;hh<H;++hh) accum[hh][k]=sycl::fma(weight[hh],value,accum[hh][k]);
+                    }
+                }
+                sycl::group_barrier(group);
+            }
+            if (head < size_t(heads)) {
+#pragma unroll
+                for(int hh=0;hh<H;++hh) if(head+hh<size_t(heads))
+                for (int k = 0; k < V; ++k) out[base+size_t(hh)*D+sl+size_t(k)*SG]=accum[hh][k]/denominator[hh];
+            }
+        });
+    });
+    return true;
+}
 size_t attention_register_budget(const sycl::queue& s) {
     static core::PerDevice<size_t> cache;
     return cache.get(s.get_device(), [&] {
@@ -553,6 +688,31 @@ bool dispatch_attention_register(const float* q, const uint16_t* win, const void
             selected = g;
     }
     const size_t original_head_tiles = (size_t(heads) + original.heads - 1) / original.heads;
+    // H2 preserves the current R/SG and all FP32 reductions. The tested
+    // 64/128-token and long-row shapes (2026-11-09) use the same bounded
+    // family; other resource combinations retain the existing fallback.
+    constexpr size_t heads_per_sg = 2;
+    size_t grouped = 0;
+    // Cover the local-memory envelope of the reported compute units before
+    // reducing the grid. Small grids retain the original head grouping.
+    const size_t local_envelope = std::max(size_t(1), local_bytes / (size_t(R) * 512 * sizeof(float)));
+    for (size_t g : {size_t(1), size_t(2), size_t(4), size_t(8), size_t(16)}) {
+        const size_t local = g * SG;
+        const size_t per_item = heads_per_sg * (2 * (512 / SG) + 2 * ((R + SG - 1) / SG) + 2) + 32;
+        const size_t groups = size_t(T) * ((size_t(heads) + heads_per_sg * g - 1) / (heads_per_sg * g));
+        if (heads_per_sg * g <= head_limit && local <= std::min(max_group, size_t(512)) &&
+            (size_t(R) * 512 + 2 * local) * sizeof(float) <= local_bytes && per_item * local <= registers &&
+            groups / units >= local_envelope)
+            grouped = g;
+    }
+#define ATTENTION_HEADS(G) case G: if (sparse_attn_heads<2, G, R, SG>(q, win, ckv, sel, sel_stride, a, sink, heads, T, scale, out, s, ckv_fmt, heads_per_block, scratch, original_head_tiles)) return true; break
+    if (heads_per_sg * grouped > selected) {
+        switch (grouped) {
+            ATTENTION_HEADS(16); ATTENTION_HEADS(8); ATTENTION_HEADS(4); ATTENTION_HEADS(2); ATTENTION_HEADS(1);
+        default: break;
+        }
+    }
+#undef ATTENTION_HEADS
 #define ATTENTION_REGISTER(G) case G: return sparse_attn_register<G, R, SG>(q, win, ckv, sel, sel_stride, a, sink, heads, T, scale, out, s, ckv_fmt, heads_per_block, scratch, original_head_tiles)
     switch (selected) {
         ATTENTION_REGISTER(16); ATTENTION_REGISTER(8); ATTENTION_REGISTER(4); ATTENTION_REGISTER(2); ATTENTION_REGISTER(1);
