@@ -518,6 +518,45 @@ bool sparse_attn_register(const float* q, const uint16_t* win, const void* ckv, 
     });
     return true;
 }
+// Reproduce the existing lane31 inclusive-prefix tree. Each 16-lane row
+// computes its own prefix; lane31 then adds lane15 and is broadcast. The other
+// cross-row intermediate values are not consumed. Keep x on the left of each
+// add, including NaNs and signed zero: DPP/add fusion may commute the operands.
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
+float attention_ordered_add(float x, float contribution) {
+    float result;
+    asm volatile("v_add_f32 %0, %1, %2" : "=v"(result) : "v"(x), "v"(contribution));
+    return result;
+}
+#endif
+template<int Offset> float attention_prefix_step(float x) {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
+    int source = __builtin_amdgcn_update_dpp(0, sycl::bit_cast<int>(x), 0x110 + Offset, 0xf, 0xf, true);
+    return attention_ordered_add(x, sycl::bit_cast<float>(source));
+#else
+    return x;
+#endif
+}
+template<int Subgroup> float attention_dot_sum(sycl::sub_group sg, float x) {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
+    if constexpr (Subgroup == 32) {
+        x = attention_prefix_step<1>(x);
+        x = attention_prefix_step<2>(x);
+        x = attention_prefix_step<4>(x);
+        x = attention_prefix_step<8>(x);
+#if defined(__GFX11__) || defined(__GFX12__)
+        uint32_t across = __builtin_amdgcn_permlanex16(0, sycl::bit_cast<int>(x), 0x76543210, 0xfedcba98, false, false);
+        x = attention_ordered_add(x, (sg.get_local_linear_id() >= 16 ? sycl::bit_cast<float>(across) : 0.f));
+#else
+        float across = sycl::select_from_group(sg, x, sycl::id<1>((sg.get_local_linear_id() + 16) % 32));
+        x = attention_ordered_add(x, (sg.get_local_linear_id() >= 16 ? across : 0.f));
+#endif
+        return sycl::select_from_group(sg, x, sycl::id<1>(31));
+    }
+#endif
+    return sycl::reduce_over_group(sg, x, sycl::plus<float>());
+}
+
 // Two heads share each local KV load while retaining each head's order.
 // Select bounded groups from reported resources; a compiled-kernel check
 // keeps the existing one-head path when this family needs private storage.
@@ -610,7 +649,7 @@ bool sparse_attn_heads(const float* q, const uint16_t* win, const void* ckv, con
                     }
 #pragma unroll
                     for(int hh=0;hh<H;++hh) {
-                        dot[hh]=sycl::reduce_over_group(sg,dot[hh],sycl::plus<float>());
+                        dot[hh]=attention_dot_sum<SG>(sg,dot[hh]);
                         if(sl==size_t(r%SG)) scores[hh][r/SG]=dot[hh]*scale;
                     }
                 }
