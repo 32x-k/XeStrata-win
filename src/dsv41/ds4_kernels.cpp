@@ -14,6 +14,7 @@
 #include "ds4_finish.hpp"
 #include "ds4_compress.hpp"
 #include "ds4_hc.hpp"
+#include "kernels/xe/kernel_properties.hpp"
 #include "strata/core/per_device.hpp"
 #include "strata/core/readback.hpp"
 #if defined(SYCL_EXT_ONEAPI_SUB_GROUP_MASK) && SYCL_EXT_ONEAPI_SUB_GROUP_MASK >= 2
@@ -557,7 +558,7 @@ bool sparse_attn_heads(const float* q, const uint16_t* win, const void* ckv, con
     const int t0 = a.t0, window = a.win, compression = a.R, cap = a.kcap;
     sycl_detail::submit(s, [&](sycl::handler& h) {
         h.parallel_for<SparseHeadsKernel<H, G, R, SG>>(sycl::nd_range<1>(sycl::range<1>(size_t(T) * head_tiles * local), sycl::range<1>(local)),
-                       [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
+                       strata::kernels::xe::kernel_properties::wrap<local, STRATA_SUB_GROUP(SG)>([=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
             const auto group = item.get_group();
             const auto sg = item.get_sub_group();
             const size_t lane = item.get_local_linear_id(), sl = sg.get_local_linear_id();
@@ -648,7 +649,7 @@ bool sparse_attn_heads(const float* q, const uint16_t* win, const void* ckv, con
                 for(int hh=0;hh<H;++hh) if(head+hh<size_t(heads))
                 for (int k = 0; k < V; ++k) out[base+size_t(hh)*D+sl+size_t(k)*SG]=accum[hh][k]/denominator[hh];
             }
-        });
+        }));
     });
     return true;
 }
