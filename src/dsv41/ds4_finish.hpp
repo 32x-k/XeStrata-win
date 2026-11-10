@@ -146,6 +146,7 @@ inline uint8_t e4m3_code(float value, int k = 0) {
     if (!a) return uint8_t(sign);
     const int exponent = int(a >> 23) - 127 - k;
     if (exponent >= -6) return uint8_t(sign | (uint32_t(exponent + 7) << 3) | ((a >> 20) & 7u));
+    if (exponent <= -18) return uint8_t(sign);
     return uint8_t(sign | (((a & 0x7fffffu) | 0x800000u) >> (14 - exponent)));
 }
 inline float quant_scale(float a, int quant) {

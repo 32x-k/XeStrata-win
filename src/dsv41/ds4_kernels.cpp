@@ -72,6 +72,7 @@ uint8_t e4m3_code(float v, int k = 0) {
     if (!a) return uint8_t(sg);
     const int e = int(a >> 23) - 127 - k;
     if (e >= -6) return uint8_t(sg | (uint32_t(e + 7) << 3) | ((a >> 20) & 7u));
+    if (e <= -18) return uint8_t(sg);
     return uint8_t(sg | (((a & 0x7fffffu) | 0x800000u) >> (14 - e)));
 }
 float e2m1_value(uint8_t q) {
