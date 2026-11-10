@@ -540,7 +540,7 @@ template<int Offset> float attention_prefix_step(float x) {
 }
 template<int Subgroup> float attention_dot_sum(sycl::sub_group sg, float x) {
 #if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
-    if constexpr (Subgroup == 32) {
+    if constexpr (Subgroup == 32) { // Caller: all 32 lanes active, with a work-group-uniform row predicate.
         x = attention_prefix_step<1>(x);
         x = attention_prefix_step<2>(x);
         x = attention_prefix_step<4>(x);
