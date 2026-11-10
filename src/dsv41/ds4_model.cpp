@@ -929,9 +929,9 @@ struct Model::Impl {
     std::vector<std::unique_ptr<Worker>> workers;   // threads mode: one per device
     bool par = false;                 // threads mode (the windows: decode)
     mutable int matrix_available = -1;       // matrix_capable(): -1 not asked yet
-    // Every GPU the engine uses is a gfx1200 / gfx1201 (RDNA4: R9700, RX 9000) in a HIP build.  The DeepSeek engine's share-based defaults (the small
-    // chunk for multi-card tp runs, the whole-chunk slab, the small staging ring, the pinned copy at share >= 0.5) and the drafter's cumulative cut are
-    // the 4 x R9700 measurements, so only RDNA4 takes them until another AMD part is tested (Strix Halo next).
+    // Every GPU used by the engine must report F16 matrix engines. The share-based defaults (the small
+    // chunk for multi-card runs, whole-chunk slab, staging ring, pinned copy and cumulative cut)
+    // were measured on 4 x R9700; matrix_capable() applies them by capability, not by model name.
     bool matrix_capable() const {
         if (matrix_available < 0) {
             bool available = !devs.empty();
@@ -2403,13 +2403,13 @@ struct Model::Impl {
                         rt::DeviceProperties ip{};
                         if (rt::device_properties(&ip, dv.id) == rt::Result::success && ip.integrated) integrated = true;
                     }
-                    // two or more RDNA4 cards holding at least half of the experts (the 4 x R9700 class): Faster by default too
-                    const bool multi_rdna4 = matrix_capable() && devs.size() >= 2 && gpu_expert_share() >= 0.5;
-                    const int n = experts_test_override(experts_per_word(o.experts, vram_all, l.k_exp, integrated, multi_rdna4, defaults_026()), l.k_exp);
+                    // Two or more devices with F16 matrix engines use faster defaults when they hold at least half the experts.
+                    const bool multi_f16_devices = matrix_capable() && devs.size() >= 2 && gpu_expert_share() >= 0.5;
+                    const int n = experts_test_override(experts_per_word(o.experts, vram_all, l.k_exp, integrated, multi_f16_devices, defaults_026()), l.k_exp);
                     experts_used = n;
                     if (n < l.k_exp)
                         std::fprintf(stderr, "ds4: experts per word: %d (%s; full quality: --experts %d)\n", n,
-                                     o.experts >= 1 ? "as asked" : multi_rdna4 ? "faster mode: the cards hold most of the experts" : "faster mode", l.k_exp);
+                                     o.experts >= 1 ? "as asked" : multi_f16_devices ? "faster mode: the cards hold most of the experts" : "faster mode", l.k_exp);
                     else if (o.experts >= 1)
                         std::fprintf(stderr, "ds4: experts per word: %d (full quality)\n", n);
                 }
