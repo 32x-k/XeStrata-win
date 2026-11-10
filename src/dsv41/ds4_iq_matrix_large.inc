@@ -51,11 +51,12 @@ size_t large_register_budget(const sycl::device& device) {
     });
 }
 
-template <int T, bool GU, int STAGE, bool Prefetch = false>
+template <int T, bool GU, int STAGE, bool Prefetch = false, bool Packed = false>
 bool large_launch(const SetArgs& a, sycl::queue& s) {
     if constexpr (T != kIQ1_S && T != kIQ1_M) return false;
     else {
-        using Kernel = std::conditional_t<Prefetch, PrefetchLargeKernel<T, GU, STAGE>, LargeKernel<T, GU, STAGE>>;
+        using Kernel = std::conditional_t<Packed, NativeHalfLargeKernel<T, GU, STAGE, Prefetch>,
+            std::conditional_t<Prefetch, PrefetchLargeKernel<T, GU, STAGE>, LargeKernel<T, GU, STAGE>>>;
         constexpr size_t RT = kLargeRowGroups, CT = 8, rows = RT * MM, bn = CT * MN, threads = CT * SG;
         constexpr size_t roles = GU ? 2 : 1, pk = STAGE ? 4 * MK : QK;
         constexpr size_t pitch = pk + MK / 2, buffers = STAGE == 2 ? 2 : 1;
@@ -235,7 +236,13 @@ bool large_launch(const SetArgs& a, sycl::queue& s) {
 #pragma unroll
                             for (size_t part = 0; part < parts; ++part) {
                                 sycl::vec<uint16_t, 8> bits;
-                                if constexpr (STAGE > 0) bits = large_expand(packets[step][role][part], grids);
+                                if constexpr (Packed && STAGE > 0) {
+                                    const uint32_t packet=packets[step][role][part];
+                                    const float d=sycl_detail::f16_value(uint16_t(packet>>16))*.125f;
+                                    bits=packed_expand(matrix_half_bits(d*float(2*int((packet>>12)&7u)+1)),grids[packet&2047u],(packet&2048u)!=0);
+                                } else if constexpr (STAGE > 0) bits = large_expand(packets[step][role][part], grids);
+                                else if constexpr (Packed) bits = packed_register_eight<T>(w[role], int((base + step * MK) / QK),
+                                    int((step * MK % QK + xe::wmma::half_of(sg) * xe::wmma::KOFF) / 8 + part), grids);
                                 else bits = register_eight<T>(w[role], int((base + step * MK) / QK),
                                     int((step * MK % QK + xe::wmma::half_of(sg) * xe::wmma::KOFF) / 8 + part), grids);
 #pragma unroll
@@ -283,6 +290,18 @@ bool large_launch(const SetArgs& a, sycl::queue& s) {
     }
 }
 
+template <int T, bool GU, int STAGE, bool Prefetch = false>
+bool qualified_large_launch(const SetArgs& a, sycl::queue& s) {
+    if constexpr (GU && (T == kIQ1_S || T == kIQ1_M)) {
+        if (a.max_rows > int(2 * MM) && xe::amd_wmma(s.get_device()) && half_decode_qualified(s) &&
+            large_launch<T, GU, STAGE, Prefetch, true>(a, s)) {
+            native_half_used<Prefetch>(s.get_device());
+            return true;
+        }
+    }
+    return large_launch<T, GU, STAGE, Prefetch>(a, s);
+}
+
 template <int T, bool GU>
 bool launch(const SetArgs& a, sycl::queue& s) {
     if constexpr (GU && (T == kIQ1_S || T == kIQ1_M)) {
@@ -293,12 +312,12 @@ bool launch(const SetArgs& a, sycl::queue& s) {
         constexpr int threshold = int((kLargeRowGroups + 1) * MM);
         if (a.xf16 && a.max_rows >= threshold && !(a.skip_ge > 0 && a.skip_ge <= threshold)) {
             SetArgs high = a; high.skip_le = std::max(a.skip_le, threshold - 1);
-            if (large_launch<T, GU, 0, true>(high, s)) {
+            if (qualified_large_launch<T, GU, 0, true>(high, s)) {
                 if (a.skip_le >= threshold - 1) return true;
                 SetArgs low = a;
                 low.skip_ge = a.skip_ge > 0 ? std::min(a.skip_ge, threshold) : threshold;
                 low.max_rows = std::min(a.max_rows, threshold - 1);
-                if (large_launch<T, GU, 0>(low, s)) return true;
+                if (qualified_large_launch<T, GU, 0>(low, s)) return true;
                 return established_launch<T, GU>(low, s);
             }
         }
@@ -311,16 +330,16 @@ bool launch(const SetArgs& a, sycl::queue& s) {
         constexpr int threshold = int(3 * MM);
         if (a.xh && a.max_rows >= threshold && !(a.skip_ge > 0 && a.skip_ge <= threshold)) {
             SetArgs high = a; high.skip_le = std::max(a.skip_le, threshold - 1);
-            if (large_launch<T, GU, 0, true>(high, s)) {
+            if (qualified_large_launch<T, GU, 0, true>(high, s)) {
                 if (a.skip_le >= threshold - 1) return true;
                 SetArgs low = a;
                 low.skip_ge = a.skip_ge > 0 ? std::min(a.skip_ge, threshold) : threshold;
                 low.max_rows = std::min(a.max_rows, threshold - 1);
-                if (large_launch<T, GU, 0>(low, s)) return true;
+                if (qualified_large_launch<T, GU, 0>(low, s)) return true;
                 return established_launch<T, GU>(low, s);
             }
         }
     }
-    if (large_launch<T, GU, 0>(a, s)) return true;
+    if (qualified_large_launch<T, GU, 0>(a, s)) return true;
     return established_launch<T, GU>(a, s);
 }

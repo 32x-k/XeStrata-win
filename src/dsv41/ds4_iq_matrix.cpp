@@ -20,6 +20,11 @@
 #include <algorithm>
 #include <cstddef>
 #include <vector>
+#include <cstdio>
+#include <mutex>
+#if defined(SYCL_EXT_ONEAPI_GRAPH)
+#include <sycl/ext/oneapi/experimental/graph.hpp>
+#endif
 #include <type_traits>
 #include <memory>
 #include <limits>
@@ -35,6 +40,7 @@
 namespace strata::ds4::gguf::iq::matrix_detail {
 template <int T, bool GU, int STAGE> class LargeKernel;
 template <int T, bool GU, int STAGE> class PrefetchLargeKernel;
+template <int T, bool GU, int STAGE, bool Prefetch> class NativeHalfLargeKernel;
 template <bool Enabled, size_t N, int Width, class F>
 auto large_bound(F function) {
     if constexpr (Enabled) return strata::kernels::xe::kernel_properties::wrap<N, Width>(function);
@@ -271,6 +277,8 @@ bool launch_base(const SetArgs& a, sycl::queue& s) {
 
 // Lane-owned groups of eight IQ1 values. The existing matrix's two FP16
 // rounding boundaries are retained, without materializing a 32-value Sub.
+#include "ds4_iq_matrix_half.inc"
+
 template <int T>
 sycl::vec<uint16_t, 8> register_eight(const uint8_t* row, int kb, int group, const uint32_t* tab) {
     const uint8_t* b = row + size_t(kb >> 3) * Ty<T>::B;
@@ -298,6 +306,29 @@ sycl::vec<uint16_t, 8> register_eight(const uint8_t* row, int kb, int group, con
         result[j] = matrix_half_bits(scale * float(code));
     }
     return result;
+}
+
+template <int T>
+sycl::vec<uint16_t, 8> packed_register_eight(const uint8_t* row, int kb, int group, const uint32_t* tab) {
+    const uint8_t* b = row + size_t(kb >> 3) * Ty<T>::B;
+    const int ib = kb & 7;
+    uint32_t index; bool negative; int sc; float d;
+    if constexpr (T == kIQ1_S) {
+        const uint32_t high = uint32_t(b[34 + 2 * ib]) | uint32_t(b[35 + 2 * ib]) << 8;
+        index = b[2 + 4 * ib + group] | (((high >> (3 * group)) & 7u) << 8);
+        negative = (high & 0x8000u) != 0;
+        sc = 2 * int((high >> 12) & 7u) + 1; d = h2f(b) * 0.125f;
+    } else {
+        const uint32_t high = b[32 + 2 * ib + group / 2];
+        index = b[4 * ib + group] | (((high >> (4 * (group & 1))) & 7u) << 8);
+        negative = (high & (8u << (4 * (group & 1)))) != 0;
+        const uint32_t scales = uint32_t(b[48 + 2 * (ib >> 1)]) | uint32_t(b[49 + 2 * (ib >> 1)]) << 8;
+        sc = 2 * int((scales >> (6 * (ib & 1) + 3 * (group / 2))) & 7u) + 1;
+        d = sycl_detail::f16_value(iq1m_d(b)) * 0.125f;
+    }
+    const uint32_t grid = tab[index];
+    const uint16_t scale_bits = matrix_half_bits(d * float(sc));
+    return packed_expand(scale_bits, grid, negative);
 }
 
 template <int T, bool GU, int RT>
