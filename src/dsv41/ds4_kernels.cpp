@@ -412,9 +412,16 @@ bool sparse_attn_tiled_original(const float* q, const uint16_t* win, const void*
 }
 
 
+sycl::vec<uint16_t,8> sparse_bf16_pack(const uint16_t* p) {
+    sycl::vec<uint16_t,8> v;
+    __builtin_memcpy(&v,__builtin_assume_aligned(p,16),sizeof(v));
+    return v;
+}
+
 #if __has_include(<sycl/ext/oneapi/group_local_memory.hpp>)
 // One sub-group owns a head. Only decoded KV rows are shared between heads;
 // each lane retains its query and output components across the row tiles.
+
 template <int G, int R, int SG>
 bool sparse_attn_register(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
                           const AttnRows& a, const float* sink, int heads, int T, float scale, float* out,
@@ -462,14 +469,24 @@ bool sparse_attn_register(const float* q, const uint16_t* win, const void* ckv, 
             float maximum = head < size_t(heads) ? sink[head] : 0.f, denominator = 1.f;
             for (int start = 0; start < total; start += R) {
                 const int nr = sycl::min(R, total - start);
-                for (size_t i = lane; i < size_t(nr) * D; i += local) {
+                // Change only the cooperative copy: dot/value lane assignment and arithmetic stay intact.
+                constexpr size_t pack=sizeof(sycl::vec<uint16_t,8>)/sizeof(uint16_t);
+                for (size_t block = lane; block < size_t(nr) * D / pack; block += local) {
+                    const size_t i=block*pack;
                     const int j = start + int(i / D), e = int(i % D);
                     const int fmt = j < nwin || decoded ? kKvBf16 : ckv_fmt;
                     const void* row = j < nwin ? static_cast<const void*>(win + size_t(first + j) * D) :
                         decoded ? static_cast<const void*>(decoded + (t * decoded_stride + size_t(j - nwin)) * D) :
                         static_cast<const void*>(static_cast<const uint8_t*>(ckv) +
                             size_t(sel[t * sel_stride + j - nwin]) * row_bytes);
-                    (*values)[i] = kv_value(row, fmt, D, e);
+                    if(fmt==kKvBf16 && reinterpret_cast<uintptr_t>(row)%sizeof(sycl::vec<uint16_t,8>)==0) {
+                        const auto v=sparse_bf16_pack(static_cast<const uint16_t*>(row)+e);
+#pragma unroll
+                        for(size_t k=0;k<pack;++k)(*values)[i+k]=bf16_value(v[int(k)]);
+                    } else {
+#pragma unroll
+                        for(size_t k=0;k<pack;++k)(*values)[i+k]=kv_value(row,fmt,D,e+int(k));
+                    }
                 }
                 sycl::group_barrier(group);
                 float scores[S] = {};
@@ -628,14 +645,24 @@ bool sparse_attn_heads(const float* q, const uint16_t* win, const void* ckv, con
             }
             for (int start = 0; start < total; start += R) {
                 const int nr = sycl::min(R, total - start);
-                for (size_t i = lane; i < size_t(nr) * D; i += local) {
+                // Change only the cooperative copy: dot/value lane assignment and arithmetic stay intact.
+                constexpr size_t pack=sizeof(sycl::vec<uint16_t,8>)/sizeof(uint16_t);
+                for (size_t block = lane; block < size_t(nr) * D / pack; block += local) {
+                    const size_t i=block*pack;
                     const int j = start + int(i / D), e = int(i % D);
                     const int fmt = j < nwin || decoded ? kKvBf16 : ckv_fmt;
                     const void* row = j < nwin ? static_cast<const void*>(win + size_t(first + j) * D) :
                         decoded ? static_cast<const void*>(decoded + (t * decoded_stride + size_t(j - nwin)) * D) :
                         static_cast<const void*>(static_cast<const uint8_t*>(ckv) +
                             size_t(sel[t * sel_stride + j - nwin]) * row_bytes);
-                    (*values)[i] = kv_value(row, fmt, D, e);
+                    if(fmt==kKvBf16 && reinterpret_cast<uintptr_t>(row)%sizeof(sycl::vec<uint16_t,8>)==0) {
+                        const auto v=sparse_bf16_pack(static_cast<const uint16_t*>(row)+e);
+#pragma unroll
+                        for(size_t k=0;k<pack;++k)(*values)[i+k]=bf16_value(v[int(k)]);
+                    } else {
+#pragma unroll
+                        for(size_t k=0;k<pack;++k)(*values)[i+k]=kv_value(row,fmt,D,e+int(k));
+                    }
                 }
                 sycl::group_barrier(group);
                 float scores[H][S] = {};
@@ -896,8 +923,17 @@ void sparse_rows(const float* q, const uint16_t* win, const uint16_t* rows_base,
                 for (int jj = wp; jj < nt; jj += nw) {
                     const uint16_t* rr = row(jj) + lane * Per;
                     float dot = 0.f;
+                    if(reinterpret_cast<uintptr_t>(rr)%sizeof(sycl::vec<uint16_t,8>)==0) {
 #pragma unroll
-                    for (int x = 0; x < Per; ++x) dot += qs[lane * Per + x] * bf16_value(rr[x]);
+                        for(int block=0;block<Per/8;++block) {
+                            const auto v=sparse_bf16_pack(rr+ptrdiff_t(block)*8);
+#pragma unroll
+                            for(int k=0;k<8;++k)dot+=qs[lane*Per+block*8+k]*bf16_value(v[k]);
+                        }
+                    } else {
+#pragma unroll
+                        for (int x = 0; x < Per; ++x) dot += qs[lane * Per + x] * bf16_value(rr[x]);
+                    }
                     dot = subgroup_sum<SG>(sg, dot);
                     if (lane == 0) sc[jj] = dot * scale;
                 }
