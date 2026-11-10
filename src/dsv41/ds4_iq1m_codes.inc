@@ -2,7 +2,7 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-// Generated from ggml-common.h iq1s_grid_gpu (third_party/ggml): entry (neg << 11 | grid index) -> the 8 int8 codes of an
+// Generated from ggml-common.h iq1s_grid_gpu (third_party/main/ggml): entry (neg << 11 | grid index) -> the 8 int8 codes of an
 // IQ1_M / IQ1_S group (iq1_codes of its low and its high nibbles), the delta sign folded in.  Checked against the device
 // computation by ds4_iq_test (bit-compare) and against ggml by its parity checks.
 {0xf9f9f9f9,0xf9f9f9f9},{0xf9f9f909,0xf9f9f9f9},{0xf9f90101,0xf9f9f9f9},{0xf9f909f9,0xf9f9f9f9},{0xf9f90909,0xf9f9f9f9},{0xf901f901,0xf9f9f9f9},{0xf9010101,0xf9f9f9f9},{0xf909f9f9,0xf9f9f9f9},

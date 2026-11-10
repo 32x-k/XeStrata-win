@@ -5,9 +5,9 @@
 // SPDX-FileCopyrightText: 2023-2026 The ggml authors
 
 // Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
-// Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
+// Ported into Strata (third_party/main/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 // src/ds4/ds4_iq.cu - a GGUF's low-bit routed experts on the device (see ds4_iq.cuh).  The block layouts and grids are
-// ggml's (ggml-common.h, MIT, third_party/ggml/LICENSE); the sign and grid tricks are llama.cpp's vecdotq.cuh.
+// ggml's (ggml-common.h, MIT, third_party/main/ggml/LICENSE); the sign and grid tricks are llama.cpp's vecdotq.cuh.
 #include "ds4_quant_sycl.hpp"
 #include "ds4_numerics.cuh"
 #include "ds4_iq_decode.hpp"

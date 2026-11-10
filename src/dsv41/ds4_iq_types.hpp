@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 
 // Copyright (c) 2026 Peasant Smith and the Project Maya contributors (MIT; https://github.com/mw00/project-maya, v1.1.17).
-// Ported into Strata (third_party/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
+// Ported into Strata (third_party/main/project-maya/NOTICE.md, LICENSE); changes are in the git history of this file.
 #pragma once
 #include <cstddef>
 #include <cstdint>
