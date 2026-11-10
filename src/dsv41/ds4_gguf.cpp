@@ -221,25 +221,28 @@ TokenScratch* token_scratch(const x3::MoeArgs& a, const TokenCaps& caps, sycl::q
 // Q5_K matrices (the dense attention outputs and shared expert) take upstream's
 // low-bit GEMV on the same int8 activations as Q8_0.
 bool mv_q5(const x3::Mat& m) { return m.fmt == kFmtGG && m.K == iq::kQ5_K && m.k % 256 == 0; }
+bool mv_iq(const x3::Mat& m) { return m.fmt == kFmtGG && m.K != kTypeMXFP4 && iq_tiled_set_type(m.K) && m.k % 256 == 0; }
 unsigned mv_batch(const x3::MvJob* jobs, int n, sycl::queue& s) {
     bool any = false;
     for (int i = 0; i < n; ++i)
-        any = any || ((jobs[i].m->fmt == kFmtBF16 || jobs[i].m->fmt == kFmtQ8_0 || mv_q5(*jobs[i].m)) &&
+        any = any || ((jobs[i].m->fmt == kFmtBF16 || jobs[i].m->fmt == kFmtQ8_0 || mv_q5(*jobs[i].m) || (mv_iq(*jobs[i].m) && jobs[i].ncol > 1)) &&
                       jobs[i].ncol <= x3::kMaxMvCols);
     if (!any) return 0;
     const auto& caps = token_caps(s);
     if (!caps.subgroup) return 0;
-    mv_detail::Jobs batch[3];
+    mv_detail::Jobs batch[4];
     mv_detail::QuantItems items;
-    int counts[3] = {}, max_n[3] = {}, max_cols[3] = {};
+    int counts[4] = {}, max_n[4] = {}, max_cols[4] = {};
     bool aligned[3] = {true, true, true};
     size_t offsets[x3::kMaxMvJobs] = {}, code_count = 0;
+    int iq_types[x3::kMaxMvJobs] = {};
     unsigned accepted = 0;
     for (int i = 0; i < n; ++i) {
         const auto& job = jobs[i];
         const auto& m = *job.m;
-        if ((m.fmt != kFmtBF16 && m.fmt != kFmtQ8_0 && !mv_q5(m)) || job.ncol > x3::kMaxMvCols) continue;
-        const int kind = m.fmt == kFmtQ8_0 ? 1 : m.fmt == kFmtGG ? 2 : 0;
+        if ((m.fmt != kFmtBF16 && m.fmt != kFmtQ8_0 && !mv_q5(m) && !(mv_iq(m) && job.ncol > 1)) || job.ncol > x3::kMaxMvCols) continue;
+        const int kind = m.fmt == kFmtQ8_0 ? 1 : m.fmt == kFmtGG ? (mv_iq(m) ? 3 : 2) : 0;
+        if (kind == 3) iq_types[counts[kind]] = m.K;
         auto& b = batch[kind].j[counts[kind]++];
         b.w = m.raw; b.ld = row_stride(m); b.x = job.xf; b.xcs = job.xf_cs ? job.xf_cs : size_t(m.k);
         b.y = job.y; b.ycs = job.y_cs ? job.y_cs : size_t(m.n); b.bias = job.bias; b.alpha = job.alpha;
@@ -287,7 +290,7 @@ unsigned mv_batch(const x3::MvJob* jobs, int n, sycl::queue& s) {
             items.d[j] = scratch->scales + offsets[j] / 32;
             max_k = std::max(max_k, items.k[j]); max_rows = std::max(max_rows, items.rows[j]);
         }
-        for (int kind = 1; kind < 3; ++kind)
+        for (int kind = 1; kind < 4; ++kind)
             for (int j = 0; j < counts[kind]; ++j) {
                 auto& b = batch[kind].j[j];
                 const size_t ldx = b.ncol == 1 ? size_t(b.k) : b.xcs;
@@ -306,6 +309,16 @@ unsigned mv_batch(const x3::MvJob* jobs, int n, sycl::queue& s) {
     }
     if (caps.subgroup == 32) mv_detail::launch_iq<iq::kQ5_K, 32>(batch[2], counts[2], max_n[2], max_cols[2], warps[2], s);
     else mv_detail::launch_iq<iq::kQ5_K, 16>(batch[2], counts[2], max_n[2], max_cols[2], warps[2], s);
+    if (counts[3]) {
+        iq::MvJob jobs_iq[x3::kMaxMvJobs] = {};
+        for (int i = 0; i < counts[3]; ++i) {
+            const auto& b = batch[3].j[i]; auto& j = jobs_iq[i];
+            j.w = static_cast<const uint8_t*>(b.w); j.ld = b.ld; j.type = iq_types[i];
+            j.k = b.k; j.n = b.n; j.ncol = b.ncol; j.xq = b.xq; j.xd = b.xd;
+            j.y = b.y; j.ycs = b.ycs; j.bias = b.bias; j.alpha = b.alpha;
+        }
+        iq::mv(jobs_iq, counts[3], s);
+    }
     return accepted;
 }
 

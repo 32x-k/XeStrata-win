@@ -574,9 +574,99 @@ bool light_down(const SetArgs& a, sycl::queue& s) { return launch_light<false>(a
 bool hipk_force(int) { return false; }
 long long hipk_launches() { return -1; }
 
+namespace {
+struct MvJobs { MvJob j[8]; };
+template<int T, int NC, int SG>
+void mv_columns(const MvJobs& jobs, int count, int max_rows, int max_cols, size_t warps, sycl::queue& s) {
+    const size_t tiles=(size_t(max_rows)+warps-1)/warps, columns=(size_t(max_cols)+NC-1)/NC;
+    const size_t local=warps*SG;
+    sycl_detail::launch(s,sycl::nd_range<1>(tiles*columns*count*local,local),
+        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
+            const size_t group=it.get_group_linear_id(), tile=group%tiles;
+            const size_t index=group/(tiles*columns);
+            // Constant member indices keep the captured descriptor array out of private storage.
+            MvJob j=jobs.j[0];
+#pragma unroll
+            for(int i=1;i<8;++i)if(index==size_t(i))j=jobs.j[i];
+            const size_t first=(group/tiles%columns)*NC, row=tile*warps+it.get_local_linear_id()/SG;
+            if(row>=size_t(j.n) || first>=size_t(j.ncol))return;
+            const auto sg=it.get_sub_group();const int lane=int(sg.get_local_linear_id());
+            float sum[NC]={};
+            // Each column keeps the original lane's ascending block sequence and xor tree.
+            for(int b=lane;b<j.k/32;b+=SG) {
+                Sub sub{};decode<T>(j.w+row*j.ld,b,table<T>(),sub);
+#pragma unroll
+                for(int c=0;c<NC;++c)if(first+c<size_t(j.ncol)) {
+                    const size_t col=first+c;
+                    sum[c]=sycl::fma(j.xd[col*(j.k/32)+b],dot_q8_sub(sub,j.xq+col*j.k+size_t(b)*32),sum[c]);
+                }
+            }
+#pragma unroll
+            for(int c=0;c<NC;++c)if(first+c<size_t(j.ncol)) {
+                for(int offset=SG/2;offset;offset/=2)sum[c]+=sycl::permute_group_by_xor(sg,sum[c],offset);
+                if(lane==0)j.y[(first+c)*j.ycs+row]=j.alpha*sum[c]+(j.bias?j.bias[row]:0.f);
+            }
+        });
+}
+template<int T, int SG>
+bool mv_columns(const MvJobs& jobs,int count,int rows,int cols,sycl::queue& s) {
+    const auto& caps=token_detail::caps(s);const size_t warps=std::min(size_t(8),caps.group/SG);
+    if(!warps)return false;
+    static core::PerDevice<size_t> budgets;
+    const auto device=s.get_device();const size_t budget=budgets.get(device,[&]()->size_t {
+#if defined(SYCL_EXT_CODEPLAY_MAX_REGISTERS_PER_WORK_GROUP_QUERY)
+        try{return device.get_info<sycl::ext::codeplay::experimental::info::device::max_registers_per_work_group>();}
+        catch(const sycl::exception&){return 0;}
+#else
+        return 0;
+#endif
+    });
+    // Reserve the decoded block and job/address state, divide the reported register
+    // budget between those and accumulators. Without a report use one column.
+    const size_t fixed=(sizeof(Sub)+sizeof(MvJob)+sizeof(float)-1)/sizeof(float);
+    const size_t per_item=budget/(warps*SG), available=per_item>fixed?per_item-fixed:1;
+    const size_t columns=std::min(size_t(SG/2),available);
+    if(cols<=1 || columns<2)mv_columns<T,1,SG>(jobs,count,rows,cols,warps,s);
+    else if(columns<4)mv_columns<T,2,SG>(jobs,count,rows,cols,warps,s);
+    else if(columns<8)mv_columns<T,4,SG>(jobs,count,rows,cols,warps,s);
+    else if(columns<16)mv_columns<T,8,SG>(jobs,count,rows,cols,warps,s);
+    else mv_columns<T,16,SG>(jobs,count,rows,cols,warps,s);
+    return true;
+}
+unsigned mv_grouped(const MvJob* jobs,int n,sycl::queue& s) {
+    if(n>8)return 0;
+    bool multiple=false;
+    for(int i=0;i<n;++i)multiple=multiple || jobs[i].ncol>1;
+    if(!multiple)return 0; // Single-token decode retains its existing kernel.
+    unsigned accepted=0;
+    for(int type:{kIQ1_S,kIQ1_M,kIQ2_XXS,kIQ2_XS,kIQ2_S,kIQ3_XXS}) {
+        MvJobs group{};int count=0,rows=0,cols=0;unsigned mask=0;
+        for(int i=0;i<n;++i)if(jobs[i].type==type && jobs[i].k%256==0 && jobs[i].ncol>1) {
+            group.j[count++]=jobs[i];rows=std::max(rows,jobs[i].n);cols=std::max(cols,jobs[i].ncol);mask|=1u<<i;
+        }
+        if(!count)continue;
+        bool launched=false;
+        dispatch(type,[&](auto t) {
+            if constexpr(t.value==kIQ1_S || t.value==kIQ1_M || t.value==kIQ2_XXS ||
+                         t.value==kIQ2_XS || t.value==kIQ2_S || t.value==kIQ3_XXS) {
+                const auto& caps=token_detail::caps(s);
+                if(std::find(caps.subgroups.begin(),caps.subgroups.end(),size_t(32))!=caps.subgroups.end())
+                    launched=mv_columns<t.value,32>(group,count,rows,cols,s);
+                else if(std::find(caps.subgroups.begin(),caps.subgroups.end(),size_t(16))!=caps.subgroups.end())
+                    launched=mv_columns<t.value,16>(group,count,rows,cols,s);
+            }
+        });
+        if(launched)accepted|=mask;
+    }
+    return accepted;
+}
+} // namespace
+
 bool mv(const MvJob* jobs, int n, sycl::queue& s) {
     for (int i = 0; i < n; ++i) if (!supported(jobs[i].type)) return false;
+    const unsigned grouped = mv_grouped(jobs, n, s);
     for (int i = 0; i < n; ++i) {
+        if (i < 8 && (grouped & (1u << i))) continue;
         const MvJob j = jobs[i];
         if (is_tq(j.type)) { if (!tq::mv(&j, 1, s)) return false; }
         else if (!dispatch(j.type, [&](auto t) {
