@@ -87,9 +87,26 @@ bool prepare_copy(sycl::queue& q, void* dst, const void* src, const std::vector<
 void compute_copy(sycl::handler& h, void* dst, const void* src, size_t bytes) {
     auto* d = static_cast<unsigned char*>(dst);
     const auto* s = static_cast<const unsigned char*>(src);
-    // Byte access supports arbitrary alignment and object representations. The runtime chooses the work-group
-    // from the device's limits; no measured launch shape or size threshold is shared between devices.
-    h.parallel_for(sycl::range<1>(bytes), [=](sycl::id<1> at) { d[at[0]] = s[at[0]]; });
+    // Match the object-representation vector's alignment at both ends. Only complete vectors are loaded;
+    // unequal alignments, the leading bytes and the tail retain byte access. The device chooses the WG size.
+    constexpr size_t width = sizeof(sycl::vec<unsigned char, 16>);
+    const auto da = reinterpret_cast<uintptr_t>(d), sa = reinterpret_cast<uintptr_t>(s);
+    const size_t prefix = (da % width == sa % width) ? std::min(bytes, (width - sa % width) % width) : bytes;
+    const size_t blocks = (bytes - prefix) / width, tail = bytes - prefix - blocks * width;
+    h.parallel_for(sycl::range<1>(blocks + prefix + tail), [=](sycl::id<1> at) {
+        const size_t i = at[0];
+        if (i < blocks) {
+            sycl::vec<unsigned char, 16> value;
+            value.load(i, sycl::address_space_cast<sycl::access::address_space::global_space,
+                       sycl::access::decorated::no>(s + prefix));
+            value.store(i, sycl::address_space_cast<sycl::access::address_space::global_space,
+                        sycl::access::decorated::no>(d + prefix));
+        } else {
+            const size_t j = i - blocks;
+            const size_t offset = j < prefix ? j : blocks * width + j;
+            d[offset] = s[offset];
+        }
+    });
 }
 
 // Readback batches contain copies only: after one fallback fence they can all use DMA, without adding a host

@@ -8225,7 +8225,7 @@ struct Model::Impl {
         prof_mark(d, 1);
         // the MoE
         hc_mix_chunk(d, c.h, l.hcf_fn, T, c.mix);
-        hc_split(c.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, c.f_pre, c.f_post, c.f_comb, s);
+        hc_split(c.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, c.pre, c.f_post, c.f_comb, s);
         hc_pre_norm(c.h, c.a_pre, l.ffn_norm, D, H, T, g.eps, c.x, s);
         x3::rows_f16(c.x, D, nullptr, T, D, c.x16, s);
         gemv_f32(l.gate_w, c.x, l.n_exp, D, T, c.glog, 1024, s);   // (F32 x: the token path's bits)
@@ -8342,7 +8342,6 @@ struct Model::Impl {
             if (!flow_layer(d, c, L0, mi, wp.k, T, b, err)) return false;
             if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
             hc_post_inplace(c.acc, c.h, c.f_post, c.f_comb, D, H, T, s);
-            CK(rt::copy_async(c.pre, c.f_pre, (size_t) T * 8 * 4, s));
             prof_mark(d, 3);
             return true;
         }
@@ -8370,7 +8369,6 @@ struct Model::Impl {
         if (!run_vram(d, c, l, l, c.bounds, b.data(), v_done, L0.n_slots, T, err)) return false;
         if (nm > 1) allreduce(c.acc, T * D, ab, mi, ++c.arb_seq, d.xcnt, s);
         hc_post_inplace(c.acc, c.h, c.f_post, c.f_comb, D, H, T, s);
-        CK(rt::copy_async(c.pre, c.f_pre, (size_t) T * 8 * 4, s));
         prof_mark(d, 3);
         return true;
     }
@@ -9901,11 +9899,11 @@ struct Model::Impl {
             const size_t per = (size_t) cols * (ehd + ehd / 32);
             eg_finish(*eg_win[(size_t) l.eg]);   // (asked for when the window began)
             uint8_t* src = h_eg + (size_t) l.eg * eg_cap * per;
-            for (int t = 0; t < T; ++t)   // [token][rows | scales] -> [all rows][all scales]
-                CK(rt::copy_async(d.eg_rows + (size_t) t * cols * ehd, src + (size_t) t * per, (size_t) cols * ehd, s));
+            // [token][rows | scales] -> [all rows][all scales], two strided copies for the whole window.
+            const size_t row_bytes = (size_t) cols * ehd, scale_bytes = (size_t) cols * (ehd / 32);
+            CK(rt::copy2d_async(d.eg_rows, row_bytes, src, per, row_bytes, (size_t) T, s));
             uint8_t* sc = d.eg_rows + (size_t) T * cols * ehd;
-            for (int t = 0; t < T; ++t)
-                CK(rt::copy_async(sc + (size_t) t * cols * (ehd / 32), src + (size_t) t * per + (size_t) cols * ehd, (size_t) cols * (ehd / 32), s));
+            CK(rt::copy2d_async(sc, scale_bytes, src + row_bytes, per, scale_bytes, (size_t) T, s));
             engram_dequant(d.eg_rows, sc, T * cols, ehd, d.eg_x, s, (int) eg_fmt[(size_t) l.eg]);
             dump_sub(d, "eg_rows", l.il, p0, T, d.eg_rows, (size_t) T * cols * ehd);
             dump_sub(d, "eg_x", l.il, p0, T, d.eg_x, (size_t) T * cols * ehd * 4);
@@ -10157,9 +10155,9 @@ struct Model::Impl {
         prof_mark(d, 1);
         // the MoE
         hc_mix_split(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, d.hccnt, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps,
-                     d.f_pre, d.f_post, d.f_comb, s);
+                     d.pre, d.f_post, d.f_comb, s);
         hc_pre_norm(d.h, d.a_pre, l.ffn_norm, D, H, T, g.eps, d.x, s);
-        dump_sub(d, "f_pre", l.il, p0, T, d.f_pre, (size_t) T * 8 * 4);
+        dump_sub(d, "f_pre", l.il, p0, T, d.pre, (size_t) T * 8 * 4);
         dump_sub(d, "f_post", l.il, p0, T, d.f_post, (size_t) T * 8 * 4);
         dump_sub(d, "f_comb", l.il, p0, T, d.f_comb, (size_t) T * 64 * 4);
         dump_sub(d, "ffn_x", l.il, p0, T, d.x, (size_t) T * D * 4);
@@ -10271,7 +10269,6 @@ struct Model::Impl {
             if (nm > 1) allreduce(d.moe_out, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
             hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
             std::swap(d.h, d.h2);
-            CK(rt::copy_async(d.pre, d.f_pre, (size_t) T * 8 * 4, s));
             prof_mark(d, 5);
             return true;
         }
@@ -10416,7 +10413,6 @@ struct Model::Impl {
         std::swap(d.h, d.h2);
         dump_sub(d, "h_out", l.il, p0, T, d.h, (size_t) T * H * D * 4);
         if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, l.il, p0, T);   // (post-layer residual, as the chunk path writes it)
-        CK(rt::copy_async(d.pre, d.f_pre, (size_t) T * 8 * 4, s));
         if (phases && T == 1) {
             const double ph4 = now_ms();
             ph[0] += ph2 - ph0; ph[1] += ph3 - ph2; ph[2] += ph4 - ph3; if (ph_prev > 0 && ph0 - ph_prev < 5.0) ph[3] += ph0 - ph_prev; ph_prev = ph4; ++ph_n;

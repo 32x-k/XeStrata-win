@@ -63,8 +63,12 @@ void safe_read(sycl::queue& q, void* dst, const void* src, size_t bytes) {
 }
 
 void byte_ranges(sycl::queue& q, bool host_usm) {
-    for (size_t bytes : {size_t{37}, (size_t{1} << 20) + 3}) {
-        constexpr size_t source_offset = 1, destination_offset = 3;
+    // Cover vector boundaries and every source/destination alignment, including equal unaligned prefixes.
+    for (size_t variant = 0; variant < 258; ++variant) {
+        const size_t bytes = variant == 257 ? (size_t{1} << 20) + 3 : variant == 256 ? 37 :
+                             15 + (variant % 4) * 16;
+        const size_t source_offset = variant < 256 ? variant / 16 : 1;
+        const size_t destination_offset = variant < 256 ? variant % 16 : 3;
         const size_t size = bytes + 19;
         std::vector<uint8_t> source(size), actual(size, 0xa5), expected = actual;
         for (size_t i = 0; i < size; ++i) source[i] = static_cast<uint8_t>((i * 29 + 7) & 255);
