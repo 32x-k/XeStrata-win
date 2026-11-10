@@ -267,8 +267,8 @@ bool launch_base(const SetArgs& a, sycl::queue& s) {
     return true;
 }
 
-// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+
+
 // Lane-owned groups of eight IQ1 values. The existing matrix's two FP16
 // rounding boundaries are retained, without materializing a 32-value Sub.
 template <int T>

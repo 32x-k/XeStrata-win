@@ -410,8 +410,8 @@ bool sparse_attn_tiled_original(const float* q, const uint16_t* win, const void*
     });
     return true;
 }
-// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+
+
 #if __has_include(<sycl/ext/oneapi/group_local_memory.hpp>)
 // One sub-group owns a head. Only decoded KV rows are shared between heads;
 // each lane retains its query and output components across the row tiles.

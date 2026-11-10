@@ -423,8 +423,8 @@ void light_set(const SetArgs& a, size_t rb, Decoder decode, sycl::queue& s, Ligh
     });
 }
 
-// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-// SPDX-License-Identifier: LGPL-3.0-or-later
+
+
 // K32 is the existing Q8 quantization block, not a hardware tile. A subgroup
 // owns one output column and reuses each decoded block for all light rows.
 template <int T, bool GU, int SG, int R>
