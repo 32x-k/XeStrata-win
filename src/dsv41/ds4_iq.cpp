@@ -443,7 +443,7 @@ bool light_lane_run(const SetArgs& a, size_t rb, sycl::queue& s, LightQ8 q) {
     sycl_detail::submit(s, [&](sycl::handler& h) {
         sycl::local_accessor<uint32_t, 1> tab(sycl::range<1>(Ty<T>::TAB > 0 ? Ty<T>::TAB : 1), h);
         h.parallel_for(sycl::nd_range<1>(size_t(a.n_exp) * nc * threads, threads),
-                       [a, q, rb, k, n, columns, nc, tab](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+                       [a, q, rb, k, n, columns, nc, tab](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
             const size_t id = it.get_local_linear_id(), group = it.get_group_linear_id(), e = group / nc;
             const int count = a.bounds[e + 1] - a.bounds[e], first = a.bounds[e] - a.row0;
             if (count <= 0 || count > kLightRows) return;

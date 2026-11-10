@@ -361,6 +361,16 @@ int main(int argc, char** argv) try {
                         worst = std::max(worst, std::fabs(h2f(h16[(size_t) lr * FF + r]) - ref) / sc);
                     }
             report("set gate_up (f16 out)", type, worst, 1e-3);
+            // A missing index means the inputs already follow sorted rows.
+            std::vector<float> sorted_x(size_t(NR) * size_t(E));
+            for (int row = 0; row < NR; ++row)
+                std::copy_n(x.data() + size_t(idx[row]) * size_t(E), E, sorted_x.data() + size_t(row) * size_t(E));
+            const auto* original_x = q.xf; const auto* original_idx = q.idx;
+            auto* sorted_device = up(sorted_x); q.xf = sorted_device; q.idx = nullptr;
+            iq::set_gate_up(q, queue()); queue().wait_and_throw();
+            const auto sorted_h = down_(dh16, size_t(NR) * size_t(FF));
+            report("set gate_up null idx", type, std::memcmp(h16.data(), sorted_h.data(), h16.size() * sizeof(uint16_t)) != 0, 0);
+            q.xf = original_x; q.idx = original_idx; sycl::free(sorted_device, queue());
             // down over those f16 h rows
             q.xh = dh16; q.ldx = FF;
             float* dy; device_alloc(dy, (size_t) NR * E * 4); q.y = dy; q.ldo = E;

@@ -65,7 +65,7 @@ void set(const SetArgs& a, size_t rb, Decoder decode, sycl::queue& s) {
         const int lo = a.bounds[e] - a.row0, hi = a.bounds[e + 1] - a.row0, count = hi - lo;
         if (row >= count || count <= a.skip_le || (a.skip_ge > 0 && count >= a.skip_ge)) return;
         const size_t local = (size_t) lo + (size_t) row;
-        const int input = GU ? a.idx[local] : (int) local;
+        const int input = GU && a.idx ? a.idx[local] : (int) local;
         const uint8_t* blob = a.wbase + (size_t) e * a.stride;
         const uint8_t* w = blob + a.tr[GU ? 0 : 2] + (size_t) col * rb;
         const uint8_t* up = blob + a.tr[1] + (size_t) col * rb;
