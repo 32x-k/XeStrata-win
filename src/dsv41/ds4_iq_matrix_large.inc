@@ -75,11 +75,12 @@ bool large_launch(const SetArgs& a, sycl::queue& s) {
         if (c.group < threads || c.local < local || !device.has(sycl::aspect::fp16) ||
             !xe::mma_shape_is(s, int(MM), int(MN), int(MK), int(SG)) || !xe::amd_wmma(device) ||
             std::find(c.subgroups.begin(), c.subgroups.end(), SG) == c.subgroups.end()) return false;
-        // Accumulators, two compact metadata sets, staged X and a conservative
+        // Accumulators, two compact metadata sets, staged X, prefetched X and a conservative
         // expansion/address allowance; absence of the query keeps M1/p2.
         constexpr size_t per_lane = RT * roles * (MM * MN / SG) +
             (STAGE ? 2 * (pk / MK) * roles * 2 : 0) +
-            (STAGE == 2 ? rows * pk / threads : 0) + 48;
+            (STAGE == 2 ? rows * pk / threads : 0) +
+            (Prefetch && GU && STAGE == 0 ? ((rows * pk / 8 + threads - 1) / threads) * 4 : 0) + 48;
         const size_t budget = large_register_budget(device);
         if (budget < threads * per_lane) return false;
         static core::PerDevice<bool> compiled_caps;
