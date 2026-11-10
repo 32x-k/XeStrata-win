@@ -719,8 +719,8 @@ bool dispatch_attention_register(const float* q, const uint16_t* win, const void
     const size_t head_limit = std::min(size_t(heads), heads_per_block > 0 ? size_t(heads_per_block) :
                                       std::max(size_t(1), size_t(T) * heads / units));
     size_t selected = 0;
-    // The component dimension bounds the group. Candidate head bundles are
-    // compile-time powers of two, not a threshold measured on a single GPU.
+    // The 512-component rows bound each group; per_item depends on R and SG.
+    // The extra 32-register allowance for both families has no recorded measurement.
     for (size_t g : {size_t(1), size_t(2), size_t(4), size_t(8), size_t(16)}) {
         const size_t local = g * SG;
         const size_t per_item = 2 * (512 / SG) + 2 * ((R + SG - 1) / SG) + 32;
@@ -729,9 +729,9 @@ bool dispatch_attention_register(const float* q, const uint16_t* win, const void
             selected = g;
     }
     const size_t original_head_tiles = (size_t(heads) + original.heads - 1) / original.heads;
-    // H2 preserves the current R/SG and all FP32 reductions. The tested
-    // 64/128-token and long-row shapes (2026-11-09) use the same bounded
-    // family; other resource combinations retain the existing fallback.
+    // H2 keeps R/SG and FP32 order. Timed on R9700 (2026-11-09) for 64/128
+    // tokens and long rows; its choice depends on 512-component rows, R/SG
+    // and reported registers/local memory, with the existing fallback.
     constexpr size_t heads_per_sg = 2;
     size_t grouped = 0;
     // Cover the local-memory envelope of the reported compute units before

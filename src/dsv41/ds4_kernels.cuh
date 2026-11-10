@@ -161,7 +161,7 @@ struct AttnScratch {
     uint16_t* rows = nullptr;   // [max_t * cap][512] BF16
     int max_t = 0, cap = 0;     // queries, rows a query (at least the sel_stride)
 };
-constexpr int kAttnScratchT = 7;   // (the staged kernel wins from 8 queries: V100, Sun)
+constexpr int kAttnScratchT = 7;   // Upstream V100/Sun comment: exact setup unknown; depends on query count and staging.
 struct AttnRows {
     int win0[kWin], nwin[kWin], nsel[kWin];
     // gen: query t is a chunk's row t0 + t at position p0 + t0 + t (the window buffer: the ring's win rows before p0,
