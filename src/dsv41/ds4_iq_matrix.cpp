@@ -11,6 +11,7 @@
 #include "ds4_iq_decode.hpp"
 #include "ds4_quant_sycl.hpp"
 #include "kernels/xe/mma_gemm.hpp"
+#include "kernels/xe/kernel_properties.hpp"
 #include "kernels/xe/amd_wmma.hpp"
 #include "kernels/xe/device_target.hpp"
 #include "strata/core/per_device.hpp"
@@ -19,6 +20,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <vector>
+#include <type_traits>
 #include <memory>
 #include <limits>
 #include "strata/core/runtime.hpp"
@@ -32,6 +34,12 @@
 
 namespace strata::ds4::gguf::iq::matrix_detail {
 template <int T, bool GU, int STAGE> class LargeKernel;
+template <int T, bool GU, int STAGE> class PrefetchLargeKernel;
+template <bool Enabled, size_t N, int Width, class F>
+auto large_bound(F function) {
+    if constexpr (Enabled) return strata::kernels::xe::kernel_properties::wrap<N, Width>(function);
+    else return function;
+}
 namespace {
 using namespace sycl_decode;
 namespace xe = strata::kernels::xe;

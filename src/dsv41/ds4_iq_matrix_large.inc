@@ -3,6 +3,8 @@
 // An independent register-output GEMM using XeStrata's IQ1 decoder and WMMA.
 // STAGE 0: larger tile; 1: K64 metadata lookahead; 2: double-buffered X.
 // Keep the original ascending K16 accumulation and both half roundings.
+constexpr size_t kLargeRowGroups = 8;
+
 template <int T>
 uint32_t large_packet(const uint8_t* row, int kb, int group) {
     const uint8_t* b = row + size_t(kb >> 3) * Ty<T>::B;
@@ -49,11 +51,12 @@ size_t large_register_budget(const sycl::device& device) {
     });
 }
 
-template <int T, bool GU, int STAGE>
+template <int T, bool GU, int STAGE, bool Prefetch = false>
 bool large_launch(const SetArgs& a, sycl::queue& s) {
     if constexpr (T != kIQ1_S && T != kIQ1_M) return false;
     else {
-        constexpr size_t RT = 8, CT = 8, rows = RT * MM, bn = CT * MN, threads = CT * SG;
+        using Kernel = std::conditional_t<Prefetch, PrefetchLargeKernel<T, GU, STAGE>, LargeKernel<T, GU, STAGE>>;
+        constexpr size_t RT = kLargeRowGroups, CT = 8, rows = RT * MM, bn = CT * MN, threads = CT * SG;
         constexpr size_t roles = GU ? 2 : 1, pk = STAGE ? 4 * MK : QK;
         constexpr size_t pitch = pk + MK / 2, buffers = STAGE == 2 ? 2 : 1;
         constexpr size_t local = Ty<T>::TAB * sizeof(uint32_t) + rows * sizeof(int) + buffers * rows * pitch * sizeof(uint16_t);
@@ -82,7 +85,7 @@ bool large_launch(const SetArgs& a, sycl::queue& s) {
         static core::PerDevice<bool> compiled_caps;
         if (!compiled_caps.get(device, [&] {
             try {
-                const auto id = sycl::get_kernel_id<LargeKernel<T, GU, STAGE>>();
+                const auto id = sycl::get_kernel_id<Kernel>();
                 const auto bundle = sycl::get_kernel_bundle<sycl::bundle_state::executable>(s.get_context(), {device}, {id});
                 const auto kernel = bundle.get_kernel(id);
                 return kernel.template get_info<sycl::info::kernel_device_specific::work_group_size>(device) >= threads &&
@@ -104,13 +107,13 @@ bool large_launch(const SetArgs& a, sycl::queue& s) {
             sycl::local_accessor<uint32_t, 1> table_data(sycl::range<1>(Ty<T>::TAB), h);
             sycl::local_accessor<int, 1> sources(sycl::range<1>(rows), h);
             sycl::local_accessor<sycl::half, 1> xs(sycl::range<1>(buffers * rows * pitch), h);
-            h.parallel_for<LargeKernel<T, GU, STAGE>>(sycl::nd_range<1>(groups * threads, threads),
-                [a, nc, nr, skip, rb, k, n, table_data, sources, xs, grid]
+            h.parallel_for<Kernel>(sycl::nd_range<1>(groups * threads, threads),
+                large_bound<Prefetch && GU, threads, SG>([a, nc, nr, skip, rb, k, n, table_data, sources, xs, grid]
                 (sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG), sycl::reqd_work_group_size(threads)]] {
                 (void)it; (void)a; (void)nc; (void)nr; (void)skip; (void)rb; (void)k; (void)n;
                 (void)table_data; (void)sources; (void)xs; (void)grid;
 #if STRATA_AMD_WMMA
-                constexpr size_t RT = 8, CT = 8, rows = RT * MM, bn = CT * MN, threads = CT * SG;
+                constexpr size_t RT = kLargeRowGroups, CT = 8, rows = RT * MM, bn = CT * MN, threads = CT * SG;
                 constexpr size_t roles = GU ? 2 : 1, pk = STAGE ? 4 * MK : QK;
                 constexpr size_t pitch = pk + MK / 2, parts = xe::wmma::KN / 8;
                 const size_t id = it.get_local_linear_id(), g = it.get_group_linear_id();
@@ -157,11 +160,37 @@ bool large_launch(const SetArgs& a, sycl::queue& s) {
                     }
                     return sycl::bit_cast<sycl::half>(value);
                 };
+                static_assert(pk%8==0 && pitch%8==0);
+                using XPack=sycl::vec<sycl::half,8>;
+                auto read_pack=[&](size_t j,size_t base) {
+                    sycl::vec<uint16_t,8> bits(0);const int src=sources[j/(pk/8)];
+                    if(src>=0) {
+                        const size_t at=size_t(src)*a.ldx+base+(j%(pk/8))*8;
+                        const uint16_t* aligned=static_cast<const uint16_t*>(__builtin_assume_aligned(a.xf16+at,16));
+                        bits.load(0,sycl::address_space_cast<sycl::access::address_space::global_space,sycl::access::decorated::no>(aligned));
+                    }
+                    return bits.template as<XPack>();
+                };
+                auto store_pack=[&](size_t j,const XPack& value) {
+                    const size_t dst=(j/(pk/8))*pitch+(j%(pk/8))*8;
+                    value.store(0,xp+std::ptrdiff_t(dst));
+                };
+                constexpr size_t packs=(rows*pk/8+threads-1)/threads;
+                if constexpr(Prefetch && GU && STAGE==0) if(a.xf16) {
+#pragma unroll
+                    for(size_t p=0;p<packs;++p){size_t j=id+p*threads;if(j<active_rows*pk/8)store_pack(j,read_pack(j,0));}
+                    it.barrier(sycl::access::fence_space::local_space);
+                }
                 if constexpr (STAGE == 2) {
                     for (size_t j = id; j < active_rows * pk; j += threads) xs[(j / pk) * pitch + j % pk] = read_x(j, 0);
                     it.barrier(sycl::access::fence_space::local_space);
                 }
                 for (size_t base = 0; base < size_t(k); base += pk) {
+                    XPack future[packs];
+                    if constexpr(Prefetch && GU && STAGE==0) if(a.xf16 && base+pk<size_t(k)) {
+#pragma unroll
+                        for(size_t p=0;p<packs;++p){size_t j=id+p*threads;if(j<active_rows*pk/8)future[p]=read_pack(j,base+pk);}
+                    }
                     uint32_t next[pk / MK][roles][parts] = {};
                     if constexpr (STAGE > 0) {
                         if (base + pk < size_t(k)) {
@@ -186,8 +215,16 @@ bool large_launch(const SetArgs& a, sycl::queue& s) {
                             for (size_t j = id; j < active_rows * pk; j += threads)
                                 xs[(1 - slot) * rows * pitch + (j / pk) * pitch + j % pk] = read_x(j, base + pk);
                     } else {
-                        for (size_t j = id; j < active_rows * pk; j += threads) xs[(j / pk) * pitch + j % pk] = read_x(j, base);
-                        it.barrier(sycl::access::fence_space::local_space);
+                        if constexpr(Prefetch && GU && STAGE==0) {
+                            if(a.xf16) {
+                            } else {
+                                for(size_t j=id;j<active_rows*pk;j+=threads)xs[(j/pk)*pitch+j%pk]=read_x(j,base);
+                                it.barrier(sycl::access::fence_space::local_space);
+                            }
+                        } else {
+                            for(size_t j=id;j<active_rows*pk;j+=threads)xs[(j/pk)*pitch+j%pk]=read_x(j,base);
+                            it.barrier(sycl::access::fence_space::local_space);
+                        }
                     }
 #pragma unroll
                     for (size_t step = 0; step < pk / MK; ++step) {
@@ -222,6 +259,11 @@ bool large_launch(const SetArgs& a, sycl::queue& s) {
                                 for (size_t part = 0; part < parts; ++part) packets[step][role][part] = next[step][role][part];
                     }
                     it.barrier(sycl::access::fence_space::local_space);
+                    if constexpr(Prefetch && GU && STAGE==0) if(a.xf16 && base+pk<size_t(k)) {
+#pragma unroll
+                        for(size_t p=0;p<packs;++p){size_t j=id+p*threads;if(j<active_rows*pk/8)store_pack(j,future[p]);}
+                        it.barrier(sycl::access::fence_space::local_space);
+                    }
                 }
 #pragma unroll
                 for (size_t r = 0; r < RT; ++r)
@@ -234,7 +276,7 @@ bool large_launch(const SetArgs& a, sycl::queue& s) {
                         else a.y[out] = accum[r][0].v[j];
                     }
 #endif
-            });
+            }));
         });
         return true;
     }
@@ -242,6 +284,24 @@ bool large_launch(const SetArgs& a, sycl::queue& s) {
 
 template <int T, bool GU>
 bool launch(const SetArgs& a, sycl::queue& s) {
+    if constexpr (GU && (T == kIQ1_S || T == kIQ1_M)) {
+        // One row tile plus one WMMA row block was the conservative crossover
+        // measured on R9700 (2026-11-10), IQ1_S/M, K5120/N2304 and K32 staging.
+        // It depends on this compiled tile, K and the expert row population;
+        // unsupported device resources/layouts retain the existing kernels.
+        constexpr int threshold = int((kLargeRowGroups + 1) * MM);
+        if (a.xf16 && a.max_rows >= threshold && !(a.skip_ge > 0 && a.skip_ge <= threshold)) {
+            SetArgs high = a; high.skip_le = std::max(a.skip_le, threshold - 1);
+            if (large_launch<T, GU, 0, true>(high, s)) {
+                if (a.skip_le >= threshold - 1) return true;
+                SetArgs low = a;
+                low.skip_ge = a.skip_ge > 0 ? std::min(a.skip_ge, threshold) : threshold;
+                low.max_rows = std::min(a.max_rows, threshold - 1);
+                if (large_launch<T, GU, 0>(low, s)) return true;
+                return established_launch<T, GU>(low, s);
+            }
+        }
+    }
     if (large_launch<T, GU, 0>(a, s)) return true;
     return established_launch<T, GU>(a, s);
 }
