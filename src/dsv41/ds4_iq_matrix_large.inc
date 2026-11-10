@@ -80,7 +80,7 @@ bool large_launch(const SetArgs& a, sycl::queue& s) {
         constexpr size_t per_lane = RT * roles * (MM * MN / SG) +
             (STAGE ? 2 * (pk / MK) * roles * 2 : 0) +
             (STAGE == 2 ? rows * pk / threads : 0) +
-            (Prefetch && GU && STAGE == 0 ? ((rows * pk / 8 + threads - 1) / threads) * 4 : 0) + 48;
+            (Prefetch && STAGE == 0 ? ((rows * pk / 8 + threads - 1) / threads) * 4 : 0) + 48;
         const size_t budget = large_register_budget(device);
         if (budget < threads * per_lane) return false;
         static core::PerDevice<bool> compiled_caps;
@@ -109,7 +109,7 @@ bool large_launch(const SetArgs& a, sycl::queue& s) {
             sycl::local_accessor<int, 1> sources(sycl::range<1>(rows), h);
             sycl::local_accessor<sycl::half, 1> xs(sycl::range<1>(buffers * rows * pitch), h);
             h.parallel_for<Kernel>(sycl::nd_range<1>(groups * threads, threads),
-                large_bound<Prefetch && GU, threads, SG>([a, nc, nr, skip, rb, k, n, table_data, sources, xs, grid]
+                large_bound<Prefetch, threads, SG>([a, nc, nr, skip, rb, k, n, table_data, sources, xs, grid]
                 (sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG), sycl::reqd_work_group_size(threads)]] {
                 (void)it; (void)a; (void)nc; (void)nr; (void)skip; (void)rb; (void)k; (void)n;
                 (void)table_data; (void)sources; (void)xs; (void)grid;
@@ -167,7 +167,7 @@ bool large_launch(const SetArgs& a, sycl::queue& s) {
                     sycl::vec<uint16_t,8> bits(0);const int src=sources[j/(pk/8)];
                     if(src>=0) {
                         const size_t at=size_t(src)*a.ldx+base+(j%(pk/8))*8;
-                        const uint16_t* aligned=static_cast<const uint16_t*>(__builtin_assume_aligned(a.xf16+at,16));
+                        const uint16_t* aligned=static_cast<const uint16_t*>(__builtin_assume_aligned((GU ? a.xf16 : a.xh)+at,16));
                         bits.load(0,sycl::address_space_cast<sycl::access::address_space::global_space,sycl::access::decorated::no>(aligned));
                     }
                     return bits.template as<XPack>();
@@ -177,7 +177,7 @@ bool large_launch(const SetArgs& a, sycl::queue& s) {
                     value.store(0,xp+std::ptrdiff_t(dst));
                 };
                 constexpr size_t packs=(rows*pk/8+threads-1)/threads;
-                if constexpr(Prefetch && GU && STAGE==0) if(a.xf16) {
+                if constexpr(Prefetch && STAGE==0) if(!GU || a.xf16) {
 #pragma unroll
                     for(size_t p=0;p<packs;++p){size_t j=id+p*threads;if(j<active_rows*pk/8)store_pack(j,read_pack(j,0));}
                     it.barrier(sycl::access::fence_space::local_space);
@@ -188,7 +188,7 @@ bool large_launch(const SetArgs& a, sycl::queue& s) {
                 }
                 for (size_t base = 0; base < size_t(k); base += pk) {
                     XPack future[packs];
-                    if constexpr(Prefetch && GU && STAGE==0) if(a.xf16 && base+pk<size_t(k)) {
+                    if constexpr(Prefetch && STAGE==0) if((!GU || a.xf16) && base+pk<size_t(k)) {
 #pragma unroll
                         for(size_t p=0;p<packs;++p){size_t j=id+p*threads;if(j<active_rows*pk/8)future[p]=read_pack(j,base+pk);}
                     }
@@ -216,8 +216,8 @@ bool large_launch(const SetArgs& a, sycl::queue& s) {
                             for (size_t j = id; j < active_rows * pk; j += threads)
                                 xs[(1 - slot) * rows * pitch + (j / pk) * pitch + j % pk] = read_x(j, base + pk);
                     } else {
-                        if constexpr(Prefetch && GU && STAGE==0) {
-                            if(a.xf16) {
+                        if constexpr(Prefetch && STAGE==0) {
+                            if(!GU || a.xf16) {
                             } else {
                                 for(size_t j=id;j<active_rows*pk;j+=threads)xs[(j/pk)*pitch+j%pk]=read_x(j,base);
                                 it.barrier(sycl::access::fence_space::local_space);
@@ -260,7 +260,7 @@ bool large_launch(const SetArgs& a, sycl::queue& s) {
                                 for (size_t part = 0; part < parts; ++part) packets[step][role][part] = next[step][role][part];
                     }
                     it.barrier(sycl::access::fence_space::local_space);
-                    if constexpr(Prefetch && GU && STAGE==0) if(a.xf16 && base+pk<size_t(k)) {
+                    if constexpr(Prefetch && STAGE==0) if((!GU || a.xf16) && base+pk<size_t(k)) {
 #pragma unroll
                         for(size_t p=0;p<packs;++p){size_t j=id+p*threads;if(j<active_rows*pk/8)store_pack(j,future[p]);}
                         it.barrier(sycl::access::fence_space::local_space);
@@ -292,6 +292,24 @@ bool launch(const SetArgs& a, sycl::queue& s) {
         // unsupported device resources/layouts retain the existing kernels.
         constexpr int threshold = int((kLargeRowGroups + 1) * MM);
         if (a.xf16 && a.max_rows >= threshold && !(a.skip_ge > 0 && a.skip_ge <= threshold)) {
+            SetArgs high = a; high.skip_le = std::max(a.skip_le, threshold - 1);
+            if (large_launch<T, GU, 0, true>(high, s)) {
+                if (a.skip_le >= threshold - 1) return true;
+                SetArgs low = a;
+                low.skip_ge = a.skip_ge > 0 ? std::min(a.skip_ge, threshold) : threshold;
+                low.max_rows = std::min(a.max_rows, threshold - 1);
+                if (large_launch<T, GU, 0>(low, s)) return true;
+                return established_launch<T, GU>(low, s);
+            }
+        }
+    }
+    if constexpr (!GU && (T == kIQ1_S || T == kIQ1_M)) {
+        // R9700 (2026-11-10), IQ1_S/M, K2304/N5120: the row sweep selected
+        // three WMMA row blocks for down, independently of the GU boundary.
+        // It depends on K, this compiled tile and the expert row population;
+        // unsupported resources or layouts retain the existing path.
+        constexpr int threshold = int(3 * MM);
+        if (a.xh && a.max_rows >= threshold && !(a.skip_ge > 0 && a.skip_ge <= threshold)) {
             SetArgs high = a; high.skip_le = std::max(a.skip_le, threshold - 1);
             if (large_launch<T, GU, 0, true>(high, s)) {
                 if (a.skip_le >= threshold - 1) return true;
