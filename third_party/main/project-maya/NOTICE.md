@@ -13,3 +13,7 @@ Changes made while porting into Strata are listed in the git history of the `src
 Later changes taken from Project Maya releases v1.1.18 to v1.1.26 (the same approach re-written onto Strata's engine,
 for example the long-prompt layer skip, the thinking budget, conversation slots) are covered by the same copyright
 and permission notice, in `LICENSE` beside this file.
+
+The batches-path selection of streamed experts follows Project Maya #691 (needmorevram),
+Strata commit 54eff4875, and the file-backed default in Project Maya commit 8563f6bba (mw00).
+XeStrata rewrites that approach for its SYCL queues without changing virtual slots, batches or summation order.

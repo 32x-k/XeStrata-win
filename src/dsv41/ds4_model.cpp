@@ -23,6 +23,7 @@
 #include "ds4_pick_rule.hpp"
 #include "ds4_experts_rule.hpp"
 #include "ds4_engram_io.hpp"
+#include "ds4_stream_selection.hpp"
 
 #include "ds4_gguf.cuh"
 #include "ds4_iq.cuh"
@@ -3870,6 +3871,29 @@ struct Model::Impl {
         std::vector<Batch> b;
         size_t cp = 0, kp = 0;        // the next batch to copy, to compute
         std::atomic<size_t> done{0};  // cp, for read_ahead's thread
+        StreamSelection selection;
+        std::vector<int> rows;
+        struct Counts {
+            uint64_t layers = 0, picked = 0, experts = 0, unused_cpu = 0, cpu = 0;
+            uint64_t sent = 0, skipped = 0, sent_bytes = 0, skipped_bytes = 0;
+            double copy_ms = 0;
+        };
+        std::map<int, Counts> counts;
+        int device = 0;
+        bool statistics = false, complete = false;
+        ~Streamer() {
+            for (const auto& entry : counts) {
+                const Counts& v = entry.second;
+                std::fprintf(stderr, "ds4 unpicked: device=%d rows=%d layers=%llu picked=%llu experts=%llu "
+                             "unused_cpu=%llu cpu=%llu sent=%llu skipped=%llu sent_bytes=%llu skipped_bytes=%llu "
+                             "copy_ms=%.6f complete=%d\n", device, entry.first,
+                             (unsigned long long) v.layers, (unsigned long long) v.picked,
+                             (unsigned long long) v.experts, (unsigned long long) v.unused_cpu,
+                             (unsigned long long) v.cpu, (unsigned long long) v.sent,
+                             (unsigned long long) v.skipped, (unsigned long long) v.sent_bytes,
+                             (unsigned long long) v.skipped_bytes, v.copy_ms, int(complete));
+            }
+        }
     };
     // in place (file_experts): the batches' file regions read ahead of their copies - POSIX_FADV_WILLNEED, the kernel
     // reading them in the background in large requests, where the copies alone fault the pages in a few at a time -
@@ -3894,6 +3918,10 @@ struct Model::Impl {
             const Batch& bt = S.b[q];
             const Layer& l0 = L[(size_t) bt.il];
             double nb = 0;
+            if (S.selection.selective(bt.k)) {
+                ++q;   // Routing will decide the reads; no speculative pages or zero-byte queue entries.
+                continue;
+            }
             if (l0.dev == di)
                 for (int i = 0; i < bt.n; ++i) {
                     const int e = l0.host_list[(size_t) (bt.j0 + i)];
@@ -3915,8 +3943,14 @@ struct Model::Impl {
         const int P = c.parts;
         while (S.cp < S.b.size() && S.cp < S.kp + P) {
             const Batch& bt = S.b[S.cp];
+            if (!S.selection.ready(bt.il, bt.k)) break;
+            const bool selective = S.selection.selective(bt.k);
+            const double began = S.statistics ? now_ms() : 0;
             const int half = (int) (S.cp % P);
             const Layer& l0 = L[(size_t) bt.il];
+            const auto picked = [&](int i) {
+                return !selective || S.selection.selected(size_t(l0.n_slots) + size_t(bt.j0) + size_t(i));
+            };
             int mi = 0;
             for (int m = 0; m < l0.nm; ++m)
                 if (member(l0, m).dev == di) mi = m;
@@ -3930,6 +3964,7 @@ struct Model::Impl {
                 std::atomic<bool> bad{false};
                 const double t_st = now_ms();
                 c.readers->run(bt.n, [&](int i) {
+                    if (!picked(i)) return;
                     const int e = l0.host_list[(size_t) (bt.j0 + i)];
                     if (l0.lay.fmt == gg::kFmtMXFP4 ? !read_mx(l0, e, sb + (size_t) i * c.stage_stride)
                                                     : !pk.read_at(l0.region_file[(size_t) e], l0.region_off[(size_t) e],
@@ -3945,6 +3980,13 @@ struct Model::Impl {
             }
             const double t_dma = now_ms();
             for (int i = 0; i < bt.n; ++i) {
+                if (S.statistics) {
+                    auto& count = S.counts[S.rows[(size_t) bt.k]];
+                    const uint64_t bytes = (uint64_t) unit(member(l0, mi));
+                    if (picked(i)) { ++count.sent; count.sent_bytes += bytes; }
+                    else { ++count.skipped; count.skipped_bytes += bytes; }
+                }
+                if (!picked(i)) continue;
                 uint8_t* dst = c.ring + ((size_t) half * (c.ring_n / P) + i) * c.ring_stride;
                 if (!stream_expert(l0, mi, l0.host_list[(size_t) (bt.j0 + i)], dst, c.cs, err,
                                    sb != nullptr ? sb + (size_t) i * c.stage_stride : nullptr))
@@ -3955,6 +3997,7 @@ struct Model::Impl {
             CK(rt::event_record(c.filled[half], c.cs));
             ++S.cp;
             S.done.store(S.cp, std::memory_order_relaxed);
+            if (S.statistics) S.counts[S.rows[(size_t) bt.k]].copy_ms += now_ms() - began;
         }
         return true;
     }
@@ -8331,16 +8374,28 @@ struct Model::Impl {
         }
         if (mi == 0) {   // the profile (the CPU lane's experts: by the plan's order)
             uint32_t* pr = prof.data() + (size_t) l.il * g.n_exp;
+            int picked_count = 0;
             for (int e = 0; e < l.n_exp; ++e) {
                 const int v = L0.vs_pin[e];
                 const int cnt = b[(size_t) v + 1] - b[(size_t) v];
                 pr[e] += (uint32_t) cnt;
                 if (cnt > 0) {   // (the expert cache learns from a chunked prompt as from windows: heat, and the CPU lane's hits)
+                    ++picked_count;
                     l.heat[(size_t) e] += (float) cnt;
                     if (l.slot[(size_t) e] < 0) l.cpu_hits.push_back(e);
                 }
             }
             st.experts += (int64_t) T * l.k_exp;
+            if (S.statistics && !c.flow && !l.mtp) {
+                auto& count = S.counts[T];
+                ++count.layers;
+                count.picked += (uint64_t) picked_count;
+                count.experts += (uint64_t) l.n_exp;
+                for (size_t v = (size_t) L0.n_slots; v + 1 < b.size(); ++v) {
+                    ++count.cpu;
+                    count.unused_cpu += b[v + 1] == b[v];
+                }
+            }
         }
         if (c.flow) {
             if (!flow_layer(d, c, L0, mi, wp.k, T, b, err)) return false;
@@ -8354,6 +8409,10 @@ struct Model::Impl {
         const int di = l.dev, P = c.parts;
         int nb = 0;
         for (size_t q = S.kp; q < S.b.size() && S.b[q].il == L0.il && S.b[q].k == wp.k; ++q) ++nb;
+        if (nb > 0 && S.selection.selective(wp.k)) {
+            S.selection.routed(L0.il, wp.k, b);
+            if (!copy_ahead(d, c, S, di, err)) return false;
+        }
         int v_done = 0;
         for (int bi = 0; bi < nb; ++bi) {
             const Batch& bt = S.b[S.kp];
@@ -8614,6 +8673,18 @@ struct Model::Impl {
             err = "no slots to stream experts into on GPU" + std::to_string(d.id);
             return false;
         }
+        if (!S.b.empty()) {
+            S.rows = run.T;
+            const int limit = stream_selection_limit(std::getenv("DS4_SKIP_UNPICKED"),
+                                                      std::getenv("DS4_SKIP_UNPICKED_ROWS"), file_experts);
+            if (limit > 0) {
+                S.selection.chunks.resize((size_t) nk);
+                for (int k = 0; k < nk; ++k) S.selection.chunks[(size_t) k] = run.T[(size_t) k] <= limit;
+            }
+            const char* stat = std::getenv("DS4_UNPICKED_STAT");
+            S.statistics = stat != nullptr && std::strtol(stat, nullptr, 10) != 0;
+            S.device = d.id;
+        }
         std::atomic<bool> ra_stop{false};
         std::thread ra;
         if (file_experts && !S.b.empty()) ra = std::thread([this, &S, di, &ra_stop] {
@@ -8759,6 +8830,7 @@ struct Model::Impl {
                 }
             }
         }
+        S.complete = true;
         return true;
     }
 
