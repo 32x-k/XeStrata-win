@@ -238,15 +238,10 @@ uint64_t ram_avail() {
     return avail;
 }
 
-// the device memory the experts' placement may count on: rt::mem_info's free, but on an integrated NVIDIA GPU on Linux
-// (a DGX Spark's GB10, one memory with the CPU) what the kernel can still give back, MemAvailable less
-// DS4_UMA_HEADROOM_GIB (6): rt::mem_info counts only MemFree there, and the model's files just read fill the page cache
-// (measured on a GB10: 55 GB "free" with 115 GB available).  Not on HIP: a Strix Halo's GPU memory is its carve-out plus
-// the GTT pool, which hipMemGetInfo already counts and MemAvailable may exceed
+// rt::mem_info already applies the RAM headroom limit only to integrated GPUs, selected from the device report.
+// Keep that result here: applying the RAM limit again would also cap a discrete GPU's separate memory.
 size_t uma_free(int, size_t fr) {
-    uint64_t available = fr;
-    strata::core::apply_uma_limit(available);
-    return (size_t) available;
+    return fr;
 }
 
 float bf16_to_f32(uint16_t b) {
