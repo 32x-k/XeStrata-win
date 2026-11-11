@@ -106,6 +106,7 @@ iq::SetArgs light_args(const x3::SetArgs& a) {
     q.bounds = a.bounds; q.host_bounds = a.host_bounds; q.row0 = a.row0; q.max_rows = a.max_rows; q.n_exp = a.n_exp;
     q.n_embd = a.n_embd; q.n_ff = a.n_ff; q.limit = a.limit; q.skip_ge = a.skip_ge;
     q.tg = expert_type(a.lay, 0); q.td = expert_type(a.lay, 2);
+    q.native_f16_output = a.native_f16_output;
     return q;
 }
 bool iq_tiled_set_type(int type) {

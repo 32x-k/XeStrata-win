@@ -11,6 +11,9 @@ add_library(strata_dsv41_kernels STATIC
     src/dsv41/ds4_gguf.cpp
     src/dsv41/ds4_iq.cpp
     src/dsv41/ds4_iq_matrix.cpp
+    src/dsv41/ds4_iq_matrix_native_f16.cpp
+    src/dsv41/ds4_iq_native_f16.cpp
+    src/dsv41/ds4_native_f16.cpp
     src/dsv41/ds4_tq.cpp
     src/dsv41/vendor/exl3.cpp
     src/dsv41/vendor/sampler.cpp

@@ -17,6 +17,7 @@
 //   h = post * moe + comb^T h;  pre = f_pre
 // and after the last layer logits = head(rmsnorm(sum_s pre[s] h[s])).
 #include "ds4_runtime.hpp"
+#include "ds4_native_f16.hpp"
 #include "ds4_model.hpp"
 #include "strata/kernels/xmx_gemm.hpp"
 #include "ds4_pick_rule.hpp"
@@ -517,6 +518,7 @@ std::vector<float> rope_freqs(int dim, int original, double base, double factor,
 // ------------------------------------------------------------------ devices, layers
 struct Dev {
     int id = 0;
+    bool native_f16_output = false;
     rt::Queue st = nullptr;
     rt::Event ev = nullptr, ev2 = nullptr;   // (ev2: the lookahead's guesses are on the host)
     int* ridx_a = nullptr;                      // (Metal) the next layers' guessed picks (2 x kPicks)
@@ -2236,6 +2238,7 @@ struct Model::Impl {
             sycl::queue& queue = d.st;
             mailbox_queues.push_back(&queue);
             bind_mailbox(queue, mailbox);
+            d.native_f16_output = native_f16::qualify(queue);
             CK(rt::event_create(&d.ev));
             CK(rt::event_create(&d.ev2));
             if (!x3::prepare(d.st) || (pk.gguf && !gg::prepare(d.st))) {
@@ -4377,6 +4380,7 @@ struct Model::Impl {
             for (int i = i0; i < j; ++i) max_rows = std::max(max_rows, b[i + 1] - b[i]);
             if (nrows > 0) {
                 x3::SetArgs sa;
+                sa.native_f16_output = d.native_f16_output;
                 sa.wbase = wbase + (size_t) (i0 - wb0) * stride;   // (wbase: set member wb0's blob)
                 sa.stride = stride;
                 sa.lay = l.nm > 1 ? l.hlay : l.lay;
@@ -7990,7 +7994,7 @@ struct Model::Impl {
             for (int s0 = 0; s0 < T; s0 += c.eg_slab) {
                 const int ns = std::min(c.eg_slab, T - s0);
                 engram_dequant_tok(c.eg_rows + (size_t) s0 * per, per, cols, ns, ehd, c.eg_x, s, (int) eg_fmt[(size_t) l.eg]);
-                x3::rows_f16(c.eg_x, cols * ehd, nullptr, ns, cols * ehd, c.eg_x16, s);
+                native_f16::rows(c.eg_x, cols * ehd, nullptr, ns, cols * ehd, c.eg_x16, s, d.native_f16_output);
                 if (!gemm(d, c, l.eg_wkv, c.eg_x16, cols * ehd, ns, c.eg_kv, (H + 1) * D, 0.0f, err)) return false;
                 engram_gate(c.h + (size_t) s0 * H * D, c.eg_kv, l.eg_w, H, D, ns, g.eps, s);
             }
@@ -8006,7 +8010,7 @@ struct Model::Impl {
         dump_sub(d, "a_post", l.il, p0, T, c.a_post, (size_t) T * 8 * 4);
         dump_sub(d, "a_comb", l.il, p0, T, c.a_comb, (size_t) T * 64 * 4);
         dump_sub(d, "attn_x", l.il, p0, T, c.x, (size_t) T * D * 4);
-        x3::rows_f16(c.x, D, nullptr, T, D, c.x16, s);
+        native_f16::rows(c.x, D, nullptr, T, D, c.x16, s, d.native_f16_output);
         prof_mark(d, 5);
         if (!kv_only && (!gemm(d, c, l.wq_a, c.x16, D, T, c.qr, g.q_lora, 0.0f, err) ||
                          !gemm(d, c, l.wkv, c.x16, D, T, c.kvr, HD, 0.0f, err)))
@@ -8022,7 +8026,7 @@ struct Model::Impl {
             fq.w = l.q_norm;
             fq.eps = g.eps;
             finish(c.qr, T, g.q_lora, g.q_lora, fq, s);
-            x3::rows_f16(c.qr, g.q_lora, nullptr, T, g.q_lora, c.qr16, s);
+            native_f16::rows(c.qr, g.q_lora, nullptr, T, g.q_lora, c.qr16, s, d.native_f16_output);
             // the window rows: the ring's (positions p0 - win ..) then the chunk's
             ring_to_ext(l.win, c.ext, p0, g.win, HD, s);
             Finish fk;
@@ -8075,7 +8079,7 @@ struct Model::Impl {
             if (l.ix_src) {
                 Src& ks = srcs[(size_t) l.ik_src];
                 if (l.owns_k && ng > 0) {
-                    x3::rows_f16(latent, HD, nullptr, ng, HD, c.lat16, s);
+                    native_f16::rows(latent, HD, nullptr, ng, HD, c.lat16, s, d.native_f16_output);
                     if (!gemm(d, c, l.i_wk, c.lat16, HD, ng, c.ikr, g.ix_hd, 0.0f, err)) return false;
                     Finish fi;
                     fi.w = l.ik_norm;
@@ -8208,13 +8212,13 @@ struct Model::Impl {
             fo.quant = 1;
             finish(c.o, na * NHL, HD, HD, fo, s);
             if (a0 == 0 && na == T) dump_sub(d, "o_fin", l.il, p0, T, c.o, (size_t) T * HQ * 4);
-            x3::rows_f16(c.o, HQ, nullptr, na, HQ, c.o16, s);
+            native_f16::rows(c.o, HQ, nullptr, na, HQ, c.o16, s, d.native_f16_output);
             const int per = HQ / OG;
             for (int gi = 0; gi < OG; ++gi)
                 if (!gemm(d, c, l.wo_a[gi], c.o16 + (size_t) gi * per, HQ, na, c.oa + (size_t) gi * g.o_lora,
                           OG * g.o_lora, 0.0f, err))
                     return false;
-            x3::rows_f16(c.oa, OG * g.o_lora, nullptr, na, OG * g.o_lora, c.oa16, s);
+            native_f16::rows(c.oa, OG * g.o_lora, nullptr, na, OG * g.o_lora, c.oa16, s, d.native_f16_output);
             if (!gemm(d, c, l.wo_b, c.oa16, OG * g.o_lora, na, c.acc + (size_t) a0 * D, D, 0.0f, err)) return false;
             if (a0 == 0 && na == T) dump_sub(d, "ao", l.il, p0, T, c.acc, (size_t) T * D * 4);
         }
@@ -8227,7 +8231,7 @@ struct Model::Impl {
         hc_mix_chunk(d, c.h, l.hcf_fn, T, c.mix);
         hc_split(c.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, c.pre, c.f_post, c.f_comb, s);
         hc_pre_norm(c.h, c.a_pre, l.ffn_norm, D, H, T, g.eps, c.x, s);
-        x3::rows_f16(c.x, D, nullptr, T, D, c.x16, s);
+        native_f16::rows(c.x, D, nullptr, T, D, c.x16, s, d.native_f16_output);
         gemv_f32(l.gate_w, c.x, l.n_exp, D, T, c.glog, 1024, s);   // (F32 x: the token path's bits)
         for (int r0 = 0; r0 < T; r0 += kVlRows) {   // (route()'s image bits cover kVlRows rows a call)
             const int nr = std::min(kVlRows, T - r0);
@@ -8245,7 +8249,7 @@ struct Model::Impl {
         if (!gemm(d, c, l.s1, c.x16, D, T, c.sg, FF, 0.0f, err) || !gemm(d, c, l.s3, c.x16, D, T, c.su, FF, 0.0f, err))
             return false;
         swiglu(c.sg, c.su, T * FF, g.lim, c.sg, s);
-        x3::rows_f16(c.sg, FF, nullptr, T, FF, c.sh16, s);
+        native_f16::rows(c.sg, FF, nullptr, T, FF, c.sh16, s, d.native_f16_output);
         if (!gemm(d, c, l.s2, c.sh16, FF, T, c.acc, D, 0.0f, err)) return false;
         prof_mark(d, 2);
         // the expert stream's copies keep going while the device runs this layer's attention, routing and shared expert:

@@ -280,7 +280,7 @@ bool large_launch(const SetArgs& a, sycl::queue& s) {
                         const size_t row = r0 + r * MM + xe::wmma::row_of(xe::wmma::half_of(sg), j);
                         if (row >= size_t(count) || row >= size_t(a.max_rows)) continue;
                         const size_t out = (size_t(first) + row) * a.ldo + c0 + column;
-                        if constexpr (GU) a.h[out] = sycl_detail::f16_bits(portable::swiglu(accum[r][0].v[j], accum[r][1].v[j], a.limit));
+                        if constexpr (GU) a.h[out] = output_f16_bits(portable::swiglu(accum[r][0].v[j], accum[r][1].v[j], a.limit));
                         else a.y[out] = accum[r][0].v[j];
                     }
 #endif

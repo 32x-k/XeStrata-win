@@ -12,6 +12,7 @@
 #include "ds4_numerics.cuh"
 #include "ds4_iq_decode.hpp"
 #include "ds4_iq_matrix.hpp"
+#include "ds4_native_f16.hpp"
 #include "ds4_iq_token.hpp"
 #include "strata/core/per_device.hpp"
 #include <algorithm>
@@ -21,9 +22,14 @@
 #include <memory>
 #include "strata/core/runtime.hpp"
 
+#if defined(STRATA_DSV41_NATIVE_F16_OUTPUT)
+namespace strata::ds4::gguf::iq::native_f16_light_detail {
+#else
 namespace strata::ds4::gguf::iq {
+#endif
 using namespace sycl_decode;
 
+#if !defined(STRATA_DSV41_NATIVE_F16_OUTPUT)
 const token_detail::Caps& token_detail::caps(const sycl::queue& q) {
     static core::PerDevice<Caps> cache;
     const auto device = q.get_device();
@@ -35,7 +41,17 @@ const token_detail::Caps& token_detail::caps(const sycl::queue& q) {
     });
 }
 
+#endif
+
 namespace {
+inline uint16_t output_f16_bits(float value) {
+#if defined(STRATA_DSV41_NATIVE_F16_OUTPUT)
+    return native_f16::bits(value);
+#else
+    return sycl_detail::f16_bits(value);
+#endif
+}
+
 bool light_on() {
     static const bool on = [] {
         // Test-only parity switch: bypass the per-32 Q8 light-set contract so
@@ -265,7 +281,7 @@ bool light_set_tiled(const SetArgs& a, size_t rb, sycl::queue& s, LightQ8 q = {}
             }
             if (r0 + row >= size_t(count) || r0 + row >= rows || c0 + col >= size_t(n)) return;
             const size_t out = (size_t(first) + r0 + row) * a.ldo + c0 + col;
-            if constexpr (GU) a.h[out] = sycl_detail::f16_bits(portable::swiglu(sum, usum, a.limit));
+            if constexpr (GU) a.h[out] = output_f16_bits(portable::swiglu(sum, usum, a.limit));
             else a.y[out] = sum;
         });
     });
@@ -350,7 +366,7 @@ bool busy_set(const SetArgs& a, size_t rb, sycl::queue& s) {
             }
             if (r0 + row >= size_t(count) || r0 + row >= size_t(a.max_rows) || c0 + col >= size_t(n)) return;
             const size_t out = (size_t(lo) + r0 + row) * a.ldo + c0 + col;
-            if constexpr (GU) a.h[out] = sycl_detail::f16_bits(portable::swiglu(sum, usum, a.limit));
+            if constexpr (GU) a.h[out] = output_f16_bits(portable::swiglu(sum, usum, a.limit));
             else a.y[out] = sum;
         });
     });
@@ -418,7 +434,7 @@ void light_set(const SetArgs& a, size_t rb, Decoder decode, sycl::queue& s, Ligh
             sum = sycl::fma(scale, decode.dot_q8_block(w, b, codes), sum);
             if constexpr (GU) usum = sycl::fma(scale, decode.dot_q8_block(up, b, codes), usum);
         }
-        if constexpr (GU) a.h[local * a.ldo + col] = sycl_detail::f16_bits(portable::swiglu(sum, usum, a.limit));
+        if constexpr (GU) a.h[local * a.ldo + col] = output_f16_bits(portable::swiglu(sum, usum, a.limit));
         else a.y[local * a.ldo + col] = sum;
     });
 }
@@ -477,7 +493,7 @@ bool light_lane_run(const SetArgs& a, size_t rb, sycl::queue& s, LightQ8 q) {
                 if constexpr (GU) up = sycl::reduce_over_group(sg, ups[row], sycl::plus<float>());
                 if (sg.get_local_linear_id() != 0) continue;
                 const size_t out = (size_t(first) + size_t(row)) * a.ldo + col;
-                if constexpr (GU) a.h[out] = sycl_detail::f16_bits(portable::swiglu(sum, up, a.limit));
+                if constexpr (GU) a.h[out] = output_f16_bits(portable::swiglu(sum, up, a.limit));
                 else a.y[out] = sum;
             }
         });
@@ -531,6 +547,7 @@ bool launch_light(const SetArgs& a, sycl::queue& s) {
 }
 }  // namespace
 
+#if !defined(STRATA_DSV41_NATIVE_F16_OUTPUT)
 bool gate_up(const Args& a, int groups, int ne_max, sycl::queue& s) {
     if (is_tq(a.tg)) return tq::gate_up(a, groups, ne_max, s);
     return dispatch(a.tg, [&](auto t) {
@@ -551,15 +568,21 @@ bool down(const Args& a, int groups, int ne_max, sycl::queue& s) {
         portable::token<false>(a, groups, ne_max, row_bytes_t<t.value>(a.n_ff), Decoder<t.value>{}, s);
     });
 }
+#endif
+
 bool set_gate_up(const SetArgs& a, sycl::queue& s) {
+#if !defined(STRATA_DSV41_NATIVE_F16_OUTPUT)
+    if (a.native_f16_output && a.tg == kIQ1_S) return native_f16_light_detail::set_gate_up(a, s);
+#endif
     if (is_tq(a.tg)) return tq::set_gate_up(a, s);
     SetArgs rest = a;
-    if (light_gate_up(a, s)) {
+    if (launch_light<true>(a, s)) {
         if (a.max_rows <= kLightRows) return true;
         rest.skip_le = std::max(a.skip_le, kLightRows);
     }
     return dispatch(a.tg, [&](auto t) { launch_set<t.value, true>(rest, s); });
 }
+#if !defined(STRATA_DSV41_NATIVE_F16_OUTPUT)
 bool set_down(const SetArgs& a, sycl::queue& s) {
     if (is_tq(a.td)) return tq::set_down(a, s);
     SetArgs rest = a;
@@ -569,7 +592,15 @@ bool set_down(const SetArgs& a, sycl::queue& s) {
     }
     return dispatch(a.td, [&](auto t) { launch_set<t.value, false>(rest, s); });
 }
-bool light_gate_up(const SetArgs& a, sycl::queue& s) { return launch_light<true>(a, s); }
+#endif
+
+bool light_gate_up(const SetArgs& a, sycl::queue& s) {
+#if !defined(STRATA_DSV41_NATIVE_F16_OUTPUT)
+    if (a.native_f16_output && a.tg == kIQ1_S) return native_f16_light_detail::light_gate_up(a, s);
+#endif
+    return launch_light<true>(a, s);
+}
+#if !defined(STRATA_DSV41_NATIVE_F16_OUTPUT)
 bool light_down(const SetArgs& a, sycl::queue& s) { return launch_light<false>(a, s); }
 bool hipk_force(int) { return false; }
 long long hipk_launches() { return -1; }
@@ -729,4 +760,6 @@ void swiglu_f16(const float* gu, int ld, int n, int ff, float limit, uint16_t* h
         h[row * ldh + col] = sycl_detail::f16_bits(portable::swiglu(gu[row * ld + col], gu[row * ld + ff + col], limit));
     });
 }
-}  // namespace strata::ds4::gguf::iq
+
+#endif
+}  // namespace

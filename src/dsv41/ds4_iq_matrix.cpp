@@ -8,6 +8,7 @@
 // Keep matrix kernels in their own device image: portable light/FMA kernels must
 // remain loadable on devices without the matrix or fp16 aspects.
 #include "ds4_iq_matrix.hpp"
+#include "ds4_native_f16.hpp"
 #include "ds4_iq_decode.hpp"
 #include "ds4_quant_sycl.hpp"
 #include "kernels/xe/mma_gemm.hpp"
@@ -15,7 +16,11 @@
 #include "kernels/xe/amd_wmma.hpp"
 #include "kernels/xe/device_target.hpp"
 #include "strata/core/per_device.hpp"
+#if defined(STRATA_DSV41_NATIVE_F16_OUTPUT)
+#define STRATA_DEVICE_ARCH_TAG_TU dsv41_iq_matrix_native_f16
+#else
 #define STRATA_DEVICE_ARCH_TAG_TU dsv41_iq_matrix
+#endif
 #include "strata/kernels/device_arch_tag.hpp"
 #include <algorithm>
 #include <cstddef>
@@ -37,7 +42,11 @@
 #define STRATA_IQ_MATRIX_SCALAR 0
 #endif
 
+#if defined(STRATA_DSV41_NATIVE_F16_OUTPUT)
+namespace strata::ds4::gguf::iq::native_f16_matrix_detail {
+#else
 namespace strata::ds4::gguf::iq::matrix_detail {
+#endif
 template <int T, bool GU, int STAGE> class LargeKernel;
 template <int T, bool GU, int STAGE> class PrefetchLargeKernel;
 template <int T, bool GU, int STAGE, bool Prefetch> class NativeHalfLargeKernel;
@@ -48,6 +57,14 @@ auto large_bound(F function) {
 }
 namespace {
 using namespace sycl_decode;
+inline uint16_t output_f16_bits(float value) {
+#if defined(STRATA_DSV41_NATIVE_F16_OUTPUT)
+    return native_f16::bits(value);
+#else
+    return sycl_detail::f16_bits(value);
+#endif
+}
+
 namespace xe = strata::kernels::xe;
 namespace mx = sycl::ext::oneapi::experimental::matrix;
 
@@ -265,7 +282,7 @@ bool launch_base(const SetArgs& a, sycl::queue& s) {
                 const size_t row = j / bn, col = j % bn;
                 if (r0 + row >= size_t(count) || r0 + row >= size_t(a.max_rows) || c0 + col >= size_t(n)) continue;
                 const size_t out = (size_t(first) + r0 + row) * a.ldo + c0 + col;
-                if constexpr (GU) a.h[out] = sycl_detail::f16_bits(portable::swiglu(result[j], result[rows * bn + j], a.limit));
+                if constexpr (GU) a.h[out] = output_f16_bits(portable::swiglu(result[j], result[rows * bn + j], a.limit));
                 else a.y[out] = result[j];
             }
         });
@@ -424,7 +441,7 @@ bool register_launch(const SetArgs& a, sycl::queue& s) {
                         const size_t row = r0 + size_t(r) * MM + xe::wmma::row_of(xe::wmma::half_of(sg), j);
                         if (row >= size_t(count) || row >= size_t(a.max_rows) || c0 + column >= size_t(n)) continue;
                         const size_t out = (size_t(first) + row) * a.ldo + c0 + column;
-                        if constexpr (GU) a.h[out] = sycl_detail::f16_bits(portable::swiglu(accum[r][0].v[j], accum[r][1].v[j], a.limit));
+                        if constexpr (GU) a.h[out] = output_f16_bits(portable::swiglu(accum[r][0].v[j], accum[r][1].v[j], a.limit));
                         else a.y[out] = accum[r][0].v[j];
                     }
 #endif
@@ -555,7 +572,7 @@ bool shared_weight_launch(const SetArgs& a, sycl::queue& s) {
                     const size_t row = r0 + row_block + xe::wmma::row_of(xe::wmma::half_of(sg), j);
                     if (row >= size_t(count) || row >= size_t(a.max_rows) || c0 + lane_column >= size_t(n)) continue;
                     const size_t out = (size_t(first) + row) * a.ldo + c0 + lane_column;
-                    if constexpr (GU) a.h[out] = sycl_detail::f16_bits(portable::swiglu(accum[0].v[j], accum[1].v[j], a.limit));
+                    if constexpr (GU) a.h[out] = output_f16_bits(portable::swiglu(accum[0].v[j], accum[1].v[j], a.limit));
                     else a.y[out] = accum[0].v[j];
                 }
 #endif
@@ -600,8 +617,13 @@ bool dispatch_matrix(const SetArgs& a, sycl::queue& s) {
     return launched;
 }
 }  // namespace
-bool gate_up(const SetArgs& a, sycl::queue& s) { return dispatch_matrix<true>(a, s); }
+bool gate_up(const SetArgs& a, sycl::queue& s) {
+#if !defined(STRATA_DSV41_NATIVE_F16_OUTPUT)
+    if (a.native_f16_output && a.tg == kIQ1_S) return native_f16_matrix_detail::gate_up(a, s);
+#endif
+    return dispatch_matrix<true>(a, s);
+}
 bool down(const SetArgs& a, sycl::queue& s) { return dispatch_matrix<false>(a, s); }
-}  // namespace strata::ds4::gguf::iq::matrix_detail
+}  // namespace
 
 #undef STRATA_IQ_MATRIX_SCALAR

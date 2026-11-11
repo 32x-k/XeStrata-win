@@ -162,6 +162,7 @@ struct SetArgs {
     // every column block of an expert (18-36 reads of 1.8-3.7 MB on a prompt) - MarLin's "small operand cheap".
     const uint16_t* x16 = nullptr;
     int skip_ge = 0;    // (ds4's low-bit GGUF experts) > 0: experts of at least this many rows are the caller's (FP16 GEMMs)
+    bool native_f16_output = false; // Passed from the model's device qualification.
 };
 /// h[local row] = FP16 clamped swiglu of gate and up over x[row_idx[local row]] (F32 rows, ldx floats apart).
 void set_gate_up(const SetArgs& a, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh, sycl::queue& s);

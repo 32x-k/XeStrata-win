@@ -73,7 +73,12 @@ struct SetArgs {
     int tg = 0, td = 0;
     int skip_le = 0;   // (the tiles) the experts of at most this many rows are left out: the light kernels took them
     int skip_ge = 0;   // (the tiles) > 0: the experts of at least this many rows are left out - the caller's GEMMs
+    bool native_f16_output = false; // Qualified during model loading, before recording or timing.
 };
+namespace native_f16_light_detail {
+bool set_gate_up(const SetArgs& a, sycl::queue& s);
+bool light_gate_up(const SetArgs& a, sycl::queue& s);
+}
 bool set_gate_up(const SetArgs& a, sycl::queue& s);
 bool set_down(const SetArgs& a, sycl::queue& s);
 /// Compatibility test hooks for upstream's HIP matrix-engine prompt tiles. The SYCL shared-memory tiles do not

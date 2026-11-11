@@ -9,3 +9,7 @@ namespace strata::ds4::gguf::iq::matrix_detail {
 bool gate_up(const SetArgs& a, sycl::queue& s);
 bool down(const SetArgs& a, sycl::queue& s);
 }  // namespace strata::ds4::gguf::iq::matrix_detail
+
+namespace strata::ds4::gguf::iq::native_f16_matrix_detail {
+bool gate_up(const SetArgs& a, sycl::queue& s);
+}
