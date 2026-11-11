@@ -10,6 +10,7 @@
 #include "../ds4_kernels.cuh"
 #include "../ds4_numerics.cuh"
 #include "../ds4_quant_sycl.hpp"
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <memory>
@@ -314,6 +315,24 @@ void rows_rot_out(float* y, int ldy, int rows, int cols, const uint16_t* svh, sy
     });
 }
 void rows_f16(const float* x, int ldx, const int* idx, int rows, int cols, uint16_t* out, sycl::queue& s) {
+    if (rows > 0 && cols > 0 && (reinterpret_cast<uintptr_t>(out) & 15u) == 0 && ldx % 8 == 0 && cols % 8 == 0) {
+        try {
+            sd::require_in_order(s);
+            const auto device = s.get_device();
+            const size_t width = std::min(device.get_info<sycl::info::device::max_work_group_size>(),
+                                          device.get_info<sycl::info::device::max_work_item_sizes<1>>()[0]);
+            const size_t group = std::min(width, size_t(cols / 8));
+            s.parallel_for(sycl::nd_range<1>(size_t(rows) * group, group), [=](sycl::nd_item<1> it) {
+                const size_t row = it.get_group(0), source_row = idx ? size_t(idx[row]) : row;
+                for (size_t c = it.get_local_id(0) * 8; c < size_t(cols); c += it.get_local_range(0) * 8) {
+                    sycl::vec<uint16_t, 8> values;
+                    for (int j = 0; j < 8; ++j) values[j] = sd::f16_bits(x[source_row * ldx + c + j]);
+                    __builtin_memcpy(out + row * cols + c, &values, sizeof(values));
+                }
+            });
+            return;
+        } catch (...) { errors.fetch_add(1, std::memory_order_relaxed); throw; }
+    }
     launch(s, (size_t) rows * cols, [=](size_t i) {
         const size_t r = i / cols;
         out[i] = sd::f16_bits(x[(idx ? (size_t) idx[r] : r) * ldx + i % cols]);
