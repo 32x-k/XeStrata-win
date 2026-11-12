@@ -1,16 +1,21 @@
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later
 #include "ds4_kernels.cuh"
+#include "ds4_mailbox.hpp"
 #include "ds4_runtime.hpp"
 #include "ds4_sycl.hpp"
 #include "strata/core/readback.hpp"
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <memory>
 #include <numeric>
 #include <stdexcept>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -376,6 +381,65 @@ void engram(sycl::queue& q) {
     std::puts("Engram ragged/zero norms/residual/FP64: PASS");
 }
 
+// The wait a decode layer queues ahead of its down kernels: the stream stays behind the flag the host
+// writes and then reads the reply written before it. A stopped mailbox releases the wait only after the CPU
+// writer has finished, on the device as on the host.
+void reply_wait(sycl::queue& q) {
+    using namespace std::chrono_literals;
+    struct Words {
+        sycl::queue& q;
+        unsigned* flag = sycl::malloc_host<unsigned>(1, q);
+        float* reply = sycl::malloc_host<float>(1, q);
+        float* seen = sycl::malloc_host<float>(1, q);
+        explicit Words(sycl::queue& queue) : q(queue) {}
+        ~Words() {
+            try {
+                q.wait_and_throw();
+                for (void* p : {static_cast<void*>(flag), static_cast<void*>(reply), static_cast<void*>(seen)})
+                    if (p) sycl::free(p, q);
+            } catch (...) {
+                std::fputs("core parity: cannot safely release the reply words\n", stderr);
+                std::_Exit(1);
+            }
+        }
+    } w(q);
+    if (!w.flag || !w.reply || !w.seen) throw std::bad_alloc();
+    unsigned* const flag = w.flag;
+    float* const reply = w.reply;
+    float* const seen = w.seen;
+    auto queue_reader = [&](unsigned sequence) {
+        *flag = 0u;
+        *seen = -1.f;
+        ds::wait_seq(flag, sequence, q);
+        sd::single(q, [=] { *seen = *reply; });
+    };
+    for (bool bound : {false, true}) {
+        const auto control = std::make_shared<ds::MailboxControl>();
+        if (bound) ds::bind_mailbox(q, control);
+        *reply = 0.f;
+        queue_reader(7u);
+        std::this_thread::sleep_for(50ms);
+        if (q.ext_oneapi_empty()) throw std::runtime_error("reply wait ended before the reply");
+        *reply = 93.f;
+        std::atomic_ref<unsigned>(*flag).store(7u, std::memory_order_release);
+        q.wait_and_throw();
+        if (*seen != 93.f) throw std::runtime_error("reply wait did not expose the reply");
+        if (!bound) continue;
+        control->producer_done.store(false);
+        queue_reader(9u);
+        control->stop("CPU response failed");
+        std::this_thread::sleep_for(50ms);
+        if (q.ext_oneapi_empty())
+            throw std::runtime_error("cancellation released a reply wait while the CPU producer could still write");
+        *reply = 51.f;
+        control->producer_finished();
+        q.wait_and_throw();
+        if (*seen != 51.f) throw std::runtime_error("producer completion did not publish its final write");
+        ds::unbind_mailbox(&q);
+    }
+    std::puts("reply wait publish/cancel: PASS");
+}
+
 }  // namespace
 
 int main() try {
@@ -390,6 +454,7 @@ int main() try {
     attention_scratch(q);
     attention_generated(q);
     engram(q);
+    reply_wait(q);
     return 0;
 } catch (const std::exception& e) {
     std::fprintf(stderr, "ds4 core parity: %s\n", e.what());

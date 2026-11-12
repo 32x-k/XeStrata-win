@@ -24,7 +24,10 @@
 #include <atomic>
 #include <cfloat>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
+#include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include <unordered_map>
@@ -36,19 +39,26 @@ using sycl_detail::parallel;
 using sycl_detail::bf16_value;
 using sycl_detail::f16_value;
 
+struct MailboxBinding {
+    std::weak_ptr<MailboxControl> control;
+    std::optional<sycl::context> context;   // the release word's
+    unsigned* release = nullptr;            // host USM: nonzero releases a wait queued on the device
+};
 struct MailboxRegistry {
     std::mutex mutex;
-    std::unordered_map<const sycl::queue*, std::weak_ptr<MailboxControl>> queues;
+    std::unordered_map<const sycl::queue*, MailboxBinding> queues;
 };
 MailboxRegistry& mailbox_registry() {
     static MailboxRegistry registry;
     return registry;
 }
-std::shared_ptr<MailboxControl> mailbox_for(const sycl::queue& queue) {
+std::shared_ptr<MailboxControl> mailbox_for(const sycl::queue& queue, unsigned** release = nullptr) {
     auto& registry = mailbox_registry();
     std::lock_guard<std::mutex> lock(registry.mutex);
     const auto found = registry.queues.find(&queue);
-    return found == registry.queues.end() ? nullptr : found->second.lock();
+    if (found == registry.queues.end()) return nullptr;
+    if (release) *release = found->second.release;
+    return found->second.control.lock();
 }
 
 float pow2_ceil(float x) {
@@ -868,6 +878,16 @@ bool system_publish(const sycl::queue& q) {
                std::find(fences.begin(), fences.end(), sycl::memory_scope::system) != fences.end();
     });
 }
+// Whether a kernel can wait for a reply the host writes: the same two reports, read in the other direction
+// (the reply's flag is an atomic on the host allocation, and a system-scope fence orders the reply's data
+// behind it for the kernels that follow).  DS4_HOST_WAIT=1 keeps the host task (for comparisons).
+bool device_wait(const sycl::queue& q) {
+    static const bool host_only = [] {
+        const char* e = std::getenv("DS4_HOST_WAIT");
+        return e != nullptr && e[0] == '1';
+    }();
+    return !host_only && system_publish(q);
+}
 bool has_subgroup(const GroupCaps& caps, size_t width) {
     return std::find(caps.subgroups.begin(), caps.subgroups.end(), width) != caps.subgroups.end();
 }
@@ -1381,15 +1401,40 @@ bool topk_group(const float* vals, long long stride, int T, const Rows& r, const
 }
 
 void bind_mailbox(sycl::queue& queue, const std::shared_ptr<MailboxControl>& control) {
+    MailboxBinding binding{control, std::nullopt, nullptr};
+    if (control && device_wait(queue)) {
+        binding.context = queue.get_context();
+        binding.release = sycl::malloc_host<unsigned>(1, *binding.context);
+        if (!binding.release) throw std::runtime_error("ds4: no host memory for a mailbox release word");
+        *binding.release = 0u;
+        {
+            std::lock_guard<std::mutex> lock(control->mutex);
+            control->device_release.push_back(binding.release);
+        }
+        control->release_device_waits();   // (a control stopped before this queue was bound)
+    }
     auto& registry = mailbox_registry();
     std::lock_guard<std::mutex> lock(registry.mutex);
-    registry.queues[&queue] = control;
+    registry.queues[&queue] = std::move(binding);
 }
+// The queue has drained before this (its waits read the release word).
 void unbind_mailbox(const sycl::queue* queue) noexcept {
     try {
-        auto& registry = mailbox_registry();
-        std::lock_guard<std::mutex> lock(registry.mutex);
-        registry.queues.erase(queue);
+        MailboxBinding binding;
+        {
+            auto& registry = mailbox_registry();
+            std::lock_guard<std::mutex> lock(registry.mutex);
+            const auto found = registry.queues.find(queue);
+            if (found == registry.queues.end()) return;
+            binding = std::move(found->second);
+            registry.queues.erase(found);
+        }
+        if (!binding.release) return;
+        if (const auto control = binding.control.lock()) {
+            std::lock_guard<std::mutex> lock(control->mutex);
+            std::erase(control->device_release, binding.release);
+        }
+        sycl::free(binding.release, *binding.context);
     } catch (...) { std::fputs("ds4: mailbox registry cleanup failed\n", stderr); }
 }
 
@@ -1955,9 +2000,27 @@ void zc_stage(unsigned long long* plan, const int* idx, const unsigned long long
 }
 void wait_seq(const unsigned* seq_ptr, unsigned seq, sycl::queue& s) {
     sycl_detail::require_in_order(s);
-    // The mailbox is host-accessible USM. Waiting on the host avoids requiring
-    // system-scope atomics or forward progress between GPU work groups.
-    const auto control = mailbox_for(s);
+    unsigned* release = nullptr;
+    const auto control = mailbox_for(s, &release);
+    if (device_wait(s) && (release || !control)) {
+        // Upstream waits on the device. One work item polls the reply's flag in the host allocation, so the
+        // stream's next kernels stay behind the reply without a host task. A host task's completion takes the
+        // SYCL scheduler's graph lock; on Windows a submission from another thread (an expert cache move's
+        // barrier) holds that lock off in 10 ms slices while this stream's drain waits for the task, and a
+        // decode token then took seconds. A model's queue also polls its release word (MailboxControl), so a
+        // failed CPU service still ends the wait.
+        using Flag = sycl::atomic_ref<unsigned, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                      sycl::access::address_space::generic_space>;
+        unsigned* const flag = const_cast<unsigned*>(seq_ptr);
+        sycl_detail::single(s, [=] {
+            if (release) while (Flag(*flag).load() != seq && Flag(*release).load() == 0u) {}
+            else while (Flag(*flag).load() != seq) {}
+            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+        });
+        return;
+    }
+    // Elsewhere the wait stays on the host: it needs neither atomics on host allocations nor a system-scope
+    // fence from the device.
     s.submit([=](sycl::handler& h) { h.host_task([=] { wait_mailbox(seq_ptr, seq, false, control.get()); }); });
 }
 void moe_sort(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds, int* row_tok, int* pos, sycl::queue& s) {

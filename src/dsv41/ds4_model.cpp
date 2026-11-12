@@ -1448,7 +1448,7 @@ struct Model::Impl {
     ~Impl() {
         mailbox->stop();
         lane_quit.store(true, std::memory_order_release);
-        if (!service.joinable()) mailbox->producer_done.store(true, std::memory_order_release);
+        if (!service.joinable()) mailbox->producer_finished();
         quit.store(true);
         if (warm_bg.joinable()) warm_bg.join();   // (warm-up storage and handles outlive this join)
         for (auto& w : workers) { w->wait(); w->stop(); }
@@ -3206,10 +3206,10 @@ struct Model::Impl {
                         serve_lane();
                     } catch (const std::exception& e) { mailbox->stop(e.what()); }
                     catch (...) { mailbox->stop("ds4 CPU service failed"); }
-                    mailbox->producer_done.store(true, std::memory_order_release);
+                    mailbox->producer_finished();
                 });
             } catch (...) {
-                mailbox->producer_done.store(true, std::memory_order_release);
+                mailbox->producer_finished();
                 throw;
             }
             if (ahead_mode > 0) pf_th = std::thread([this] { prefetch_loop(); });

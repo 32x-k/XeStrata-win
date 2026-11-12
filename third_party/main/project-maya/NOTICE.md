@@ -23,3 +23,7 @@ Project Maya's vision tower and Strata's port. It uses XeStrata's shared dense p
 The transient workspace follows the lifetime described in Project Maya commit 6fba6be981:
 weights remain on the host and GPU buffers are returned after each image. Buffer sizes and weight stripes
 are derived from the image, model and device reports rather than the CUDA implementation's fixed budgets.
+
+The device-side wait for a CPU lane reply follows the sequence wait of Strata's and Project Maya's DeepSeek kernels.
+XeStrata selects it from the device's reported atomics and fences, keeps the host task elsewhere,
+and adds a host-visible release word for cancellation.
