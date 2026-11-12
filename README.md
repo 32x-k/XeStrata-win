@@ -12,7 +12,8 @@ English | [日本語](README.ja.md)
 > This section was added on the `feature/dsv41-sycl` branch. Everything below the rule is the upstream XeStrata README, unchanged.
 
 This branch ports upstream Strata's DeepSeek-V4.1-Flash engine (`strata-dsv41`, upstream commit `870aedd9`) to SYCL.
-**It is unverified test code**. It has not been run with the real model. All that has been checked is GPU tests that use no model and synthetic tests comparing its outputs with upstream's HIP build (Radeon AI PRO R9700, Windows, free mode).
+On a Radeon AI PRO R9700 (Windows, free mode) it loads the UD-IQ1_S GGUF of DeepSeek-V4.1-Flash and answers questions about text and about a picture. Asked the same question, it generated the same tokens as upstream's HIP build. Speculative decoding with the draft model (DSpark) works as well.
+Its speed is still being tuned. It has run on one R9700 only.
 
 ---
 

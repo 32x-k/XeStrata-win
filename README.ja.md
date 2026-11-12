@@ -12,7 +12,8 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 > この節は `feature/dsv41-sycl` ブランチで足したものです。区切り線から下は本家 XeStrata の README のままです。
 
 このブランチは上流 Strata の DeepSeek-V4.1-Flash 用のエンジン（`strata-dsv41`、上流のコミット `870aedd9`）を SYCL に移したものです。
-**未検証のテストコードです**。実物のモデルでは動かしていません。確かめたのは、モデルを使わない GPU のテストと、上流の HIP 版と出力を比べる合成の試験だけです（Radeon AI PRO R9700、Windows、free モード）。
+Radeon AI PRO R9700（Windows、free モード）で、DeepSeek-V4.1-Flash の UD-IQ1_S の GGUF を読み込み、文章の問いと画像についての問いに答えます。上流の HIP 版と同じ問いで比べると、生成したトークンは一致しました。下書きのモデル（DSpark）を使う推測デコードも動きます。
+速さはまだ調整の途中です。動かしたのは R9700 の 1 枚だけです。
 
 ---
 
