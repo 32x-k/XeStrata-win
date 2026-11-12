@@ -94,7 +94,7 @@ void usage() {
                  "strata-dsv41 --pack <pack> [--gpus N] [--context N] [--reserve-mib N]\n"
                  "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--profile-readonly] [--ssd-cache GB] [--ssd-policy lru|lfu|lfulru] [--no-expert-cache] [--verbose]\n"
                  "           [--tp 1] [--threads off] [--prefill-chunk N] [--dspark on|off|none|auto] [--dspark-block N] [--dspark-conf F] [--experts N|auto]\n"
-                 "           [--vision off] [--mmap-experts on|off|auto]\n"
+                 "           [--vision on|off] [--mmap-experts on|off|auto]\n"
                  "           (--ids I,J,... [--n N] [--dump-logits FILE] | --serve\n"
                  "           | --pack-info)\n");
 }
@@ -1380,10 +1380,6 @@ int main(int argc, char** argv) try {
         std::fprintf(stderr, "this SYCL prototype supports one GPU only (--tp 1 --threads off)\n");
         return 2;
     }
-    if (o.vision || !images.empty() || !enc_rgb.empty()) {
-        std::fprintf(stderr, "this build does not support images (--vision off)\n");
-        return 2;
-    }
     if (pack_info_mode) {   // the pack's description only: no device, no weights, no lock
         if (o.pack.empty()) {
             usage();
@@ -1398,6 +1394,7 @@ int main(int argc, char** argv) try {
     if (o.profile.empty()) o.profile = o.pack + "/expert-profile.bin";   // "none": no profile
     if (o.profile == "none") o.profile.clear();
     o.vision_only = !enc_rgb.empty();
+    if (o.vision_only || !images.empty()) o.vision = true;
     strata::core::restrict_hip_to_selector();
     strata::core::no_hip_resource_cache();
     strata::ds4::Model m;

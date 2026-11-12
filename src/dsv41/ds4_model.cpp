@@ -19,6 +19,7 @@
 #include "ds4_runtime.hpp"
 #include "ds4_native_f16.hpp"
 #include "ds4_model.hpp"
+#include "ds4_vision.hpp"
 #include "strata/kernels/xmx_gemm.hpp"
 #include "ds4_pick_rule.hpp"
 #include "ds4_experts_rule.hpp"
@@ -2188,14 +2189,11 @@ struct Model::Impl {
     // ---- loading
     bool load(const Options& opt, std::string& err) {
         o = opt;
+        if (o.vision_only) o.profile_readonly = true;   // the expert profile is not part of a tower-only load
         const uint64_t available_ram = ram_avail();
         ram_margin_bytes = available_ram == ~uint64_t{0} ? 0 : available_ram / 10;
         if (o.tp != 1 || o.threads || o.gpus.size() > 1) {
             err = "this SYCL prototype supports one GPU only (--tp 1 --threads off)";
-            return false;
-        }
-        if (o.vision || o.vision_only) {
-            err = "this build does not support images (--vision off)";
             return false;
         }
         const double t0 = now_ms();
@@ -2249,6 +2247,14 @@ struct Model::Impl {
             for (const auto& d : devs) free_bytes = std::min<uint64_t>(free_bytes, d.free0);
             o.reserve_mib = (int64_t) std::max<uint64_t>(1, (free_bytes / 32) >> 20);
         }
+        if ((o.vision || o.vision_only) && !load_vision(err)) {
+            if (o.vision_only) return false;
+            std::fprintf(stderr, "ds4: WARNING: vision is off: %s\n", err.c_str());
+            vision.release();
+            img_tok = -1;
+            err.clear();
+        }
+        if (o.vision_only) return true;   // the tower and image markers, without the LLM's weights
         // the groups' width: o.tp, less while the experts' blocks do not split in it (a member takes n_ff / tp of each
         // expert: the down's inputs in whole blocks - a GGUF's 256-value types split n_ff 2304 in 1, 3 or 9 parts)
         int tp = o.tp;
@@ -6323,12 +6329,106 @@ struct Model::Impl {
     size_t bm_stride() const { return (size_t) (o.max_context + 64) / std::max(1, g.cand_blk) + 64; }
     static constexpr int kSlots = kWin * kPicks;   // the CPU lane's (token, expert) rows a window can need
 
+    VisionTower vision;
+    VisionGeo vision_geo;
+    std::array<std::vector<uint16_t>, 3> image_markers;
     int img_tok = -1;
     std::vector<Image> imgs;
-    bool encode_image(const uint8_t*, int, int, std::vector<uint16_t>& span, std::string& err) {
+    bool vision_tensor(const Tensor& tensor, size_t count, void* destination) const {
+        if (count > SIZE_MAX / 2) return false;
+        if (tensor.dtype == "BF16")
+            return tensor.bytes == count * 2 && pk.read_at(tensor.file, tensor.off, tensor.bytes, destination);
+        if (tensor.dtype != "F16" && tensor.dtype != "F32") return false;
+        const size_t width = tensor.dtype == "F32" ? 4 : 2;
+        if (count > SIZE_MAX / width || tensor.bytes != count * width) return false;
+        std::vector<uint8_t> raw(tensor.bytes);
+        if (!pk.read_at(tensor.file, tensor.off, tensor.bytes, raw.data())) return false;
+        auto* output = static_cast<uint16_t*>(destination);
+        for (size_t i = 0; i < count; ++i) {
+            float value;
+            if (width == 4) std::memcpy(&value, raw.data() + i * 4, 4);
+            else {
+                uint16_t bits;
+                std::memcpy(&bits, raw.data() + i * 2, 2);
+                value = f16_to_f32(bits);
+            }
+            uint32_t bits;
+            std::memcpy(&bits, &value, 4);
+            output[i] = (bits & 0x7fffffffu) > 0x7f800000u ? uint16_t((bits >> 16) | 0x40u)
+                         : uint16_t((bits + 0x7fffu + ((bits >> 16) & 1u)) >> 16);
+        }
+        return true;
+    }
+    bool load_vision(std::string& err) {
+        auto& v = vision_geo;
+        v.layers = int(pk.num("vision.num_hidden_layers", 0));
+        const int token = int(pk.num("image_token_id", -1));
+        if (v.layers <= 0 || token < 0 || token >= g.vocab) {
+            err = "pack has no vision geometry or image token";
+            return false;
+        }
+        v.dim = int(pk.num("vision.hidden_size", 1024)); v.heads = int(pk.num("vision.num_attention_heads", 16));
+        v.inter = int(pk.num("vision.intermediate_size", 2816)); v.patch = int(pk.num("vision.patch_size", 14));
+        v.merge = int(pk.num("vision.downsample_ratio", 3)); v.theta = float(pk.num("vision.rope_theta", 10000));
+        v.eps = float(pk.num("vision.rms_norm_eps", 1e-6)); v.max_tokens = int(pk.num("vision.max_image_tokens", 1024));
+        v.out = g.dim;
+        const char* marks[] = {"image_start", "image_newline", "image_end"};
+        for (size_t i = 0; i < image_markers.size(); ++i) {
+            const Tensor* t = pk.get(marks[i]);
+            image_markers[i].resize(size_t(g.dim));
+            if (!t || !vision_tensor(*t, size_t(g.dim), image_markers[i].data())) {
+                err = std::string("vision: invalid marker ") + marks[i];
+                return false;
+            }
+        }
+        auto reader = [this](const std::string& name, std::vector<int64_t>& shape, void* destination) {
+            const Tensor* t = pk.get(name);
+            const std::string suffix = "mlp.w1.weight";
+            if (!t && name.size() >= suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                const std::string prefix = name.substr(0, name.size() - suffix.size());
+                const Tensor* gate = pk.get(prefix + "mlp.gate.weight");
+                const Tensor* up = pk.get(prefix + "mlp.up.weight");
+                if (!gate || !up || gate->shape.size() != 2 || gate->shape != up->shape ||
+                    gate->shape[0] <= 0 || gate->shape[1] <= 0 || gate->shape[0] > INT64_MAX / 2) return false;
+                shape = {gate->shape[0] * 2, gate->shape[1]};
+                if (uint64_t(gate->shape[0]) > SIZE_MAX / uint64_t(gate->shape[1])) return false;
+                const size_t half = size_t(gate->shape[0]) * size_t(gate->shape[1]);
+                return !destination || (vision_tensor(*gate, half, destination) &&
+                                        vision_tensor(*up, half, static_cast<uint16_t*>(destination) + half));
+            }
+            if (!t) return false;
+            shape = t->shape;
+            size_t count = 1;
+            for (int64_t dim : shape) {
+                if (dim <= 0 || count > SIZE_MAX / uint64_t(dim)) return false;
+                count *= size_t(dim);
+            }
+            return !destination || vision_tensor(*t, count, destination);
+        };
+        if (!vision.load(v, devs.front().id, reader, err)) return false;
+        img_tok = token;
+        if (o.verbose) std::fprintf(stderr, "ds4: vision: %d blocks, %.1f MB host weights, transient SYCL workspace\n",
+                                   v.layers, double(vision.host_bytes()) / 1e6);
+        return true;
+    }
+    bool encode_image(const uint8_t* rgb, int width, int height, std::vector<uint16_t>& span, std::string& err) {
         span.clear();
-        err = "this build does not support images";
-        return false;
+        if (img_tok < 0) { err = "vision tower is not loaded"; return false; }
+        std::vector<uint16_t> patches;
+        int nh = 0, nw = 0;
+        if (!vision.encode(rgb, width, height, patches, nh, nw, err)) return false;
+        if (o.verbose) std::fprintf(stderr, "ds4: vision workspace estimate %.1f MiB, released after encode\n",
+                                   double(vision.workspace_bytes()) / (1 << 20));
+        const size_t dim = size_t(g.dim);
+        span.reserve((size_t(nh) * (size_t(nw) + 1) + 2) * dim);
+        auto append = [&](const uint16_t* row) { span.insert(span.end(), row, row + dim); };
+        append(image_markers[0].data());
+        for (int row = 0; row < nh; ++row) {
+            for (int col = 0; col < nw; ++col) append(patches.data() + (size_t(row) * nw + col) * dim);
+            append(image_markers[1].data());
+        }
+        append(image_markers[2].data());
+        return true;
     }
     // the row of a picture's span at position p (null: p is in none)
     const uint16_t* image_row(int64_t p) const {
@@ -8301,7 +8401,10 @@ struct Model::Impl {
             while (rt::stream_status(s) == rt::Result::pending) {
                 if (!flow_pump(c, err)) return false;
                 const size_t end = c.base + c.items.size();
-                if (c.n_read >= end && c.n_dma >= end) break;
+                // A full speculative ring needs this layer's consumer to advance n_comp.
+                // That consumer runs after the bounds wait; leave further pumping to it.
+                if ((c.n_read >= end && c.n_dma >= end) ||
+                    c.n_dma >= c.n_comp + size_t(c.ring_n)) break;
                 std::this_thread::yield();
             }
         CK(rt::stream_sync(s));
@@ -10562,7 +10665,14 @@ struct Model::Impl {
                           pk.eg_layers * (pk.eg_ngram - 1) * pk.eg_heads);
             v.push_back(b);
         }
-        v.push_back("INFO vision=off");
+        if (img_tok >= 0) {
+            std::snprintf(b, sizeof b, "INFO vision=ds4 vision_patch=%d vision_merge=%d vision_min_pixels=%lld "
+                                      "vision_max_tokens=%d vision_max_wh_ratio=%lld image_token=%d vision_gpu=%d "
+                                      "vision_mib=0 vision_lazy=1",
+                          vision_geo.patch, vision_geo.merge, (long long) pk.num("vision.min_pixels", 0),
+                          vision_geo.max_tokens, (long long) pk.num("vision.max_wh_ratio", 0), img_tok, vision.device());
+            v.push_back(b);
+        } else v.push_back("INFO vision=off");
         return v;
     }
 };

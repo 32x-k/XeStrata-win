@@ -67,8 +67,8 @@ struct Options {
     // CPU lane's experts streamed to the GPUs a chunk at a time instead of computed on the host; 0: windows of 16;
     // -1: derive the chunk from available memory, largest allocation and model shapes
     int prefill_chunk = -1;
-    bool vision = false;             // unsupported in this prototype; load rejects true
-    bool vision_only = false;        // unsupported in this prototype; load rejects true
+    bool vision = false;             // load image weights only when images are requested
+    bool vision_only = false;        // load the tower and span markers without the LLM body
     bool verbose = false;
 };
 
@@ -189,7 +189,7 @@ public:
     /// blocks - a slot naming anything else is not this model's state (a file's .meta says so; slot_load refuses).
     std::string slot_identity() const;
 
-    /// Images are unsupported in this prototype; image_token() returns -1 and encode_image() reports an error.
+    /// The image token, or -1 when the tower is absent or off. Image rows are BF16 bits.
     int image_token() const;
     /// An image's pixels (RGB rows, width x height, both multiples of the patch size: the server's resize) -> the
     /// rows of its span, BF16 [n_h * (n_w + 1) + 2][dim]: image_start, n_h rows of (n_w aligner rows, image_newline),

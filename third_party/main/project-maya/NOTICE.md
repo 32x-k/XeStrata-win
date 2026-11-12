@@ -17,3 +17,9 @@ and permission notice, in `LICENSE` beside this file.
 The batches-path selection of streamed experts follows Project Maya #691 (needmorevram),
 Strata commit 54eff4875, and the file-backed default in Project Maya commit 8563f6bba (mw00).
 XeStrata rewrites that approach for its SYCL queues without changing virtual slots, batches or summation order.
+
+The SYCL DeepSeek vision tower follows the geometry, BF16 rounding stages and image span contract of
+Project Maya's vision tower and Strata's port. It uses XeStrata's shared dense products and its own SYCL kernels.
+The transient workspace follows the lifetime described in Project Maya commit 6fba6be981:
+weights remain on the host and GPU buffers are returned after each image. Buffer sizes and weight stripes
+are derived from the image, model and device reports rather than the CUDA implementation's fixed budgets.

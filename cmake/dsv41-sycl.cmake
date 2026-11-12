@@ -7,6 +7,7 @@ if(NOT STRATA_ENABLE_XE)
 endif()
 
 add_library(strata_dsv41_kernels STATIC
+    src/dsv41/ds4_vision.cpp
     src/dsv41/ds4_kernels.cpp
     src/dsv41/ds4_gguf.cpp
     src/dsv41/ds4_iq.cpp
@@ -41,6 +42,12 @@ if(STRATA_NATIVE_EXPERTS)
 endif()
 
 if(STRATA_BUILD_TESTS)
+  add_executable(ds4_vision_test tests/dsv41/vision_test.cpp)
+  target_link_libraries(ds4_vision_test PRIVATE strata_dsv41_kernels)
+  add_test(NAME ds4_vision_test COMMAND ds4_vision_test)
+  set_tests_properties(ds4_vision_test PROPERTIES LABELS "dsv41;gpu" TIMEOUT 120 SKIP_RETURN_CODE 77)
+  add_test(NAME ds4_vision_host_test COMMAND ds4_vision_test --host-only)
+  set_tests_properties(ds4_vision_host_test PROPERTIES LABELS "dsv41;host" TIMEOUT 30)
   add_executable(ds4_chunk_repeat_test tests/dsv41/chunk_repeat_test.cpp src/dsv41/ds4_model.cpp)
   target_compile_features(ds4_chunk_repeat_test PRIVATE cxx_std_20)
   target_link_libraries(ds4_chunk_repeat_test PRIVATE strata_dsv41_kernels)
