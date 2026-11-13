@@ -5097,7 +5097,19 @@ struct Model::Impl {
         for (int t = 0; t < 12 && nw > 0; ++t)
             wt.emplace_back([&] {
                 std::vector<uint8_t> buf(maxb);
-                for (size_t i; (i = wi.fetch_add(1)) < nw;) read_mx(L[(size_t) warm[i].layer], warm[i].e, buf.data());
+                for (size_t i; (i = wi.fetch_add(1)) < nw;) {
+                    const Layer& lw = L[(size_t) warm[i].layer];
+#if defined(_WIN32)
+                    // (Windows: read through the mapping the CPU lane reads, so the pages are in this process's working
+                    // set - read into a buffer they are only in RAM, and the lane faulted each one in on decode: 1024
+                    // tokens of the 1-bit set on an R9700 and 117 GB of RAM, 100,000+ faults a second, 23.5 -> 29.5 tok/s)
+                    if (lw.ram.empty() || lw.ram[(size_t) warm[i].e] < 0) {
+                        for (int r = 0; r < 3; ++r) os::map_in(mx_mat(lw, warm[i].e, r), mx_part_bytes(lw, r));
+                        continue;
+                    }
+#endif
+                    read_mx(lw, warm[i].e, buf.data());
+                }
             });
         for (auto& t : wt) t.join();
         if (o.verbose && nw > 0)
@@ -5838,7 +5850,9 @@ struct Model::Impl {
                 c.resize(c.size() - (size_t) lane_free);
             int nw = (int) c.size();
             if (o.cpu_threads > 0) nw = std::max(X == 0 ? 0 : 1, std::min(nw, o.cpu_threads / NH - (X == 0 ? 1 : 0)));
-            pools.push_back(std::make_unique<Pool>(nw, c, 0));   // sleep on the condition variable between jobs
+            // the workers spin through a token's layers (20 ms, upstream's bound) before they sleep on the condition variable:
+            // as upstream's pool does (a sleeping pool is woken twice a layer the CPU lane serves)
+            pools.push_back(std::make_unique<Pool>(nw, c, 20000));
         }
         (void) gg::mx_tier();   // (measured here, not on the first token)
         if (o.verbose) {
@@ -6753,12 +6767,12 @@ struct Model::Impl {
         const float lim = g.lim;
         {   // (os::prefetch_cold, as above: the resident ones are left alone - on Windows the hint walks every page of a
             // range, ~0.13 ms an IQ2_XXS expert, on the lane's critical path before the first entry computes.
-            // off by default (the mmap path, owner PC: not faster in every pair); DS4_IQ_PF_COLD=1 turns it on)
+            // DS4_IQ_PF_COLD=0: every range, as before - on an R9700 with the experts in place, 512 tokens 18.3 -> 20.4 tok/s)
             std::vector<std::pair<const void*, size_t>> want;
             for (const Ent& en : ents)
                 if (!store && (l.ram.empty() || l.ram[(size_t) en.e] < 0))
                     for (int r = 0; r < 3; ++r) want.push_back({mx_mat(l, en.e, r), mx_part_bytes(l, r)});
-            static const bool pf_all = std::getenv("DS4_IQ_PF_COLD") == nullptr || std::atoi(std::getenv("DS4_IQ_PF_COLD")) == 0;
+            static const bool pf_all = std::getenv("DS4_IQ_PF_COLD") != nullptr && std::atoi(std::getenv("DS4_IQ_PF_COLD")) == 0;
             if (pf_all) os::prefetch(want);
             else os::prefetch_cold(want);
         }

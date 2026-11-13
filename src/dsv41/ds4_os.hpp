@@ -606,6 +606,16 @@ inline std::vector<std::vector<int>> node_cores(bool smt = false) {   // (smt: e
     for (auto& v : nodes) std::sort(v.begin(), v.end());
     return nodes;
 }
+/// [p, p + n) of a file's mapping read a byte a page, so its pages are in the process's working set: Windows faults a
+/// mapped page in the first time it is read, even when its file's pages are in RAM (the standby list), and the CPU
+/// lane's threads faulting them in while a token waits queue on the process's working set.
+inline void map_in(const void* p, size_t n) {
+    const size_t pg = page_size();
+    const volatile uint8_t* b = (const volatile uint8_t*) p;
+    uint8_t acc = 0;
+    for (size_t o = 0; o < n; o += pg) acc ^= b[o];
+    (void) acc;
+}
 /// The RAM this process can still get (~0: not known).
 inline uint64_t ram_avail() {
     MEMORYSTATUSEX s{};
