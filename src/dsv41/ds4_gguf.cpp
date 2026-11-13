@@ -223,6 +223,11 @@ TokenScratch* token_scratch(const x3::MoeArgs& a, const TokenCaps& caps, sycl::q
 // low-bit GEMV on the same int8 activations as Q8_0.
 bool mv_q5(const x3::Mat& m) { return m.fmt == kFmtGG && m.K == iq::kQ5_K && m.k % 256 == 0; }
 bool mv_iq(const x3::Mat& m) { return m.fmt == kFmtGG && m.K != kTypeMXFP4 && iq_tiled_set_type(m.K) && m.k % 256 == 0; }
+// The other ggml block types ds4_iq decodes (Q6_K, Q4_K, IQ4_NL and the like: the dense attention and shared expert of
+// unsloth's UD quants) take the same int8 GEMV, as upstream's mv sends every such matrix to iq::mv; Q5_K keeps q5_mv.
+bool mv_low(const x3::Mat& m) {
+    return m.fmt == kFmtGG && m.K != kTypeMXFP4 && m.K != iq::kQ5_K && iq::supported(m.K) && m.k % 256 == 0;
+}
 unsigned mv_batch(const x3::MvJob* jobs, int n, sycl::queue& s) {
     bool any = false;
     for (int i = 0; i < n; ++i)
@@ -566,7 +571,7 @@ bool mv(const x3::MvJob* jobs, int n, sycl::queue& s) {
         const x3::MvJob j = jobs[i];
         // Upstream's low-bit jobs quantize each activation row once, then share
         // it across the output rows. Keep the scalar path for unavailable scratch.
-        if (j.m->fmt == kFmtGG && j.m->K != kTypeMXFP4 && iq_tiled_set_type(j.m->K) && j.m->k % 256 == 0) {
+        if (mv_low(*j.m)) {
             const auto& caps = token_caps(s);
             const size_t xcs = j.xf_cs ? j.xf_cs : size_t(j.m->k);
             if (auto* scratch = caps.subgroup ? quant_scratch(size_t(j.ncol) * j.m->k, 0, caps, s) : nullptr) {
