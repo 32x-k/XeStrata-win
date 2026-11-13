@@ -5,6 +5,7 @@
 #include "strata/spec/draft_policy.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 
 namespace strata::spec {
 namespace {
@@ -32,7 +33,42 @@ constexpr double kProbeHeld = 0.5;
 }  // namespace
 
 DraftPolicy::DraftPolicy(int max_t, double margin)
-    : max_t_(std::clamp(max_t, 1, kMaxT)), margin_(margin) {}
+    : max_t_(std::clamp(max_t, 1, kMaxT)), margin_(margin) {
+    const char* v = std::getenv("STRATA_SPEC_COST");
+    robust_ = v != nullptr && std::strtol(v, nullptr, 10) != 0;
+}
+
+void DraftPolicy::set_context(int64_t pos) {
+    if (!robust_) return;
+    const int b = pos < 6144 ? 0 : pos < 24576 ? 1 : 2;
+    if (b == bk_) return;
+    bk_ = b;
+    bool any = false;
+    for (int t = 1; t <= kMaxT && !any; ++t) any = cost_n_[b][t] > 0;
+    if (any) return;
+    for (int d = 1; d < kCtxBuckets; ++d)   // a table not measured yet starts from the nearest one that is
+        for (int o : {b - d, b + d}) {
+            if (o < 0 || o >= kCtxBuckets) continue;
+            bool has = false;
+            for (int t = 1; t <= kMaxT && !has; ++t) has = cost_n_[o][t] > 0;
+            if (!has) continue;
+            for (int t = 1; t <= kMaxT; ++t) {
+                cost_[b][t] = cost_[o][t];
+                cost_n_[b][t] = std::min(cost_n_[o][t], 1.0);   // a guess the bucket's own rounds soon replace
+                last_[b][t] = last_[o][t];
+            }
+            return;
+        }
+}
+
+void DraftPolicy::add_cost(int t, double round_ms) {
+    double w = 1.0;
+    if (robust_ && cost_n_[bk_][t] >= kProbes && round_ms > 3.0 * cost_[bk_][t]) w = 0.1;   // a graph capture, a stall
+    const double alpha = robust_ ? std::max(kCostAlpha * w, w / (cost_n_[bk_][t] + w)) : kCostAlpha;
+    cost_[bk_][t] = cost_n_[bk_][t] > 0 ? (1.0 - alpha) * cost_[bk_][t] + alpha * round_ms : round_ms;
+    cost_n_[bk_][t] += w;
+    last_[bk_][t] = rounds_;
+}
 
 int DraftPolicy::bucket(int match) {
     return match < 6 ? 0 : match < 12 ? 1 : match < 24 ? 2 : 3;
@@ -45,24 +81,24 @@ double DraftPolicy::lookup_rate(int match) const {
 
 double DraftPolicy::cost_ms(int t) const {
     t = std::clamp(t, 1, kMaxT);
-    if (cost_n_[t] > 0) return cost_[t];
+    if (cost_n_[bk_][t] > 0) return cost_[bk_][t];
     // scale from the nearest measured size below: a round's fixed part flattens the measured curve at its small end,
     // and scaled from there the wider sizes came out too dear to be tried (Gyro-M on the RX 9060 XT: 46 ms at one
     // token, 57 at four, the six guessed at 98 against its 74)
     for (int u = t - 1; u >= 1 && !scale_all_; --u)
-        if (cost_n_[u] > 0) return cost_[u] * kShape[t] / kShape[u];
+        if (cost_n_[bk_][u] > 0) return cost_[bk_][u] * kShape[t] / kShape[u];
     // none below: scale from the measured sizes, weighting each by how often it was seen
     double num = 0.0, den = 0.0;
     for (int u = 1; u <= kMaxT; ++u)
-        if (cost_n_[u] > 0) {
-            const double w = std::min(cost_n_[u], 20.0);
-            num += w * cost_[u] * kShape[t] / kShape[u];
+        if (cost_n_[bk_][u] > 0) {
+            const double w = std::min(cost_n_[bk_][u], 20.0);
+            num += w * cost_[bk_][u] * kShape[t] / kShape[u];
             den += w;
         }
     return den > 0 ? num / den : kShape[t];
 }
 
-bool DraftPolicy::stale(int t) const { return cost_n_[t] > 0 && rounds_ - last_[t] > kStaleRounds; }
+bool DraftPolicy::stale(int t) const { return cost_n_[bk_][t] > 0 && rounds_ - last_[bk_][t] > kStaleRounds; }
 
 double DraftPolicy::mtp_tokens(int t) const {
     if (mtp_n_[t] > 0) return mtp_tok_[t];
@@ -93,7 +129,7 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
     }
     // a guessed cost can keep the policy from ever measuring a size: the first few times a confident lookup would
     // need a size not measured yet, it is tried (verification keeps the output; only the one round's speed is at stake)
-    if (t_full > p.t && (cost_n_[t_full] < kProbes || stale(t_full)) && q >= 0.85) {
+    if (t_full > p.t && (cost_n_[bk_][t_full] < kProbes || stale(t_full)) && q >= 0.85) {
         p.lookup = true;
         p.t = t_full;
     }
@@ -102,11 +138,7 @@ DraftPolicy::Pick DraftPolicy::choose(int t_mtp, int lookup_k, int match) const 
 
 void DraftPolicy::observe(bool lookup, int t, int accepted, int match, double round_ms) {
     t = std::clamp(t, 1, kMaxT);
-    if (round_ms > 0) {
-        cost_[t] = cost_n_[t] > 0 ? (1.0 - kCostAlpha) * cost_[t] + kCostAlpha * round_ms : round_ms;
-        cost_n_[t] += 1.0;
-        last_[t] = rounds_;
-    }
+    if (round_ms > 0) add_cost(t, round_ms);
     rounds_ += 1.0;
     if (lookup) {
         const int b = bucket(match);
@@ -134,10 +166,15 @@ double DraftPolicy::draft_q_mean() const { return (dq_ok_ + kPriorN * kDraftPrio
 bool DraftPolicy::mtp_step_pays(int t, double held, double q, double expected) const {
     if (t + 1 > max_t_) return false;
     const double gain = held * q;
-    if (cost_n_[t + 1] < kProbes || stale(t + 1)) return gain >= kProbeHeld;
+    if (cost_n_[bk_][t + 1] < kProbes || stale(t + 1)) return gain >= kProbeHeld;
     const double dc = cost_ms(t + 1) - cost_ms(t);
     if (dc <= 0.0) return gain > 0.0;   // measured no dearer: the tokens come free
-    return gain / dc > expected / cost_ms(t);
+    if (gain / dc > expected / cost_ms(t)) return true;
+    // STRATA_SPEC_COST: the cost is not convex (with experts in RAM a window of 3 can cost about one of 2), so a draft
+    // that does not pay alone is kept when it and one more as likely to hold would
+    if (!robust_ || t + 2 > max_t_ || cost_n_[bk_][t + 2] < kProbes || stale(t + 2)) return false;
+    const double dc2 = cost_ms(t + 2) - cost_ms(t);
+    return dc2 > 0.0 && (gain + gain * q) / dc2 > expected / cost_ms(t);
 }
 
 int DraftPolicy::mtp_window(const float* probs, int max_t) const {
@@ -206,17 +243,13 @@ int DraftPolicy::chain(int t_mtp, double p_mtp, int k_avail, int match) const {
         return best_k;
     }
     // as choose(): a size whose cost is only guessed is tried a few times when the continuation looks likely
-    if ((cost_n_[t_full] < kProbes || stale(t_full)) && p_mtp * c >= 0.6) return kmax;
+    if ((cost_n_[bk_][t_full] < kProbes || stale(t_full)) && p_mtp * c >= 0.6) return kmax;
     return 0;
 }
 
 void DraftPolicy::observe_chain(int t_mtp, int k, int accepted, int match, double round_ms) {
     const int t = std::clamp(t_mtp + k, 1, kMaxT);
-    if (round_ms > 0) {
-        cost_[t] = cost_n_[t] > 0 ? (1.0 - kCostAlpha) * cost_[t] + kCostAlpha * round_ms : round_ms;
-        cost_n_[t] += 1.0;
-        last_[t] = rounds_;
-    }
+    if (round_ms > 0) add_cost(t, round_ms);
     rounds_ += 1.0;
     // the MTP part is an ordinary MTP window as far as its own drafts go
     const int mtp_acc = std::min(accepted, t_mtp - 1);

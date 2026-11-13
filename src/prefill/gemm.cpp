@@ -219,6 +219,45 @@ std::string rocblas_lacks(const sycl::device& dev) {
 // chunk sizes (qkv 10240 x 2560 at 7.6 TFLOPS up to T 7040, 4.3 from T 7041); its SGEMM runs at 8.4-9.8 from T 512,
 // and for the engine's shapes upstream measured the same bits as the FP16 call.  That is the cuBLAS build's property,
 // so opt-in.  The copies are kept per queue and grown to the largest product (a few hundred MiB for the big ones).
+// f16's half_sums: the product with FP16 sums (oneMath's half GEMM; cuBLAS's HGEMM on NVIDIA GPUs, where GeForce cards
+// run it at twice the FP32 sums' rate) into a half buffer kept per queue and grown to the largest, then widened into Y.
+bool half_sums(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+               void* stream) {
+    sycl::queue& q = core::Runtime::get().stream(stream);
+    const Backend b = backend(q.get_device());
+    if (!b.blas) return false;
+    struct Buf { sycl::half* p = nullptr; size_t n = 0; };
+    static std::mutex mu;
+    static std::unordered_map<const sycl::queue*, Buf> bufs;
+    const size_t need = (size_t) T * (size_t) N;
+    sycl::half* yh = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mu);
+        Buf& c = bufs[&q];
+        if (c.n < need) {
+            q.wait();
+            if (c.p != nullptr) sycl::free(c.p, q);
+            c.p = sycl::malloc_device<sycl::half>(need, q);
+            c.n = c.p != nullptr ? need : 0;
+        }
+        yh = c.p;
+    }
+    if (yh == nullptr) return false;
+    try {
+        namespace om = oneapi::math;
+        om::blas::column_major::gemm(q, om::transpose::trans, om::transpose::nontrans, N, T, K, sycl::half(1.0f),
+                                     reinterpret_cast<const sycl::half*>(W), K, reinterpret_cast<const sycl::half*>(X),
+                                     K, sycl::half(0.0f), yh, N);
+    } catch (const oneapi::math::exception& e) {
+        std::fprintf(stderr, "strata: oneMath (FP16 sums): %s; the FP32 sums instead\n", e.what());
+        return false;
+    }
+    q.parallel_for(sycl::range<2>((size_t) T, (size_t) N), [=](sycl::id<2> i) {
+        Y[(int64_t) i[0] * ldy + (int64_t) i[1]] = (float) yh[(int64_t) i[0] * N + (int64_t) i[1]];
+    });
+    return true;
+}
+
 bool dense_f32(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                void* stream) {
     static const bool on = env_on("STRATA_DENSE_F32");
@@ -335,7 +374,17 @@ const char* Gemm::path() {
     return text.c_str();
 }
 
+bool gemm_dequant_side() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_DEQUANT_SIDE"); return v && v[0] == '1'; }();
+    return on;
+}
+
 Gemm::~Gemm() {
+    for (strata::gpu::Event* e : side_ready_)
+        if (e) strata::gpu::event_destroy(e);
+    for (strata::gpu::Event* e : side_free_)
+        if (e) strata::gpu::event_destroy(e);
+    if (side_stream_) strata::gpu::stream_destroy(side_stream_);
     if (!external_ && scratch_) strata::gpu::free(scratch_);
     if (tc_w_) strata::gpu::free(tc_w_);
     if (tc_x_) strata::gpu::free(tc_x_);
@@ -351,6 +400,32 @@ void Gemm::init_external(void* stream, uint16_t* scratch, int64_t scratch_elems)
 void Gemm::rebind(uint16_t* scratch, int64_t scratch_elems) {
     scratch_ = scratch;
     scratch_elems_ = scratch_elems;
+}
+
+bool Gemm::set_dequant_side(uint16_t* scratch2, std::string& err) {
+    side_scratch_ = scratch2;
+    side_cur_ = 0;
+    if (scratch2 == nullptr) return true;
+    if (side_stream_ == nullptr) {   // once: the stream and the four events outlive every rebind
+        side_stream_ = strata::gpu::stream_create();
+        if (side_stream_ == nullptr) {
+            err = std::string("prefill gemm: dequant side stream: ") + strata::gpu::last_error();
+            side_scratch_ = nullptr;
+            return false;
+        }
+        for (int i = 0; i < 2; ++i) {
+            // kept even on a failure: the destructor frees what was made
+            if (!strata::gpu::event_create(&side_ready_[i]) || !strata::gpu::event_create(&side_free_[i])) {
+                err = "prefill gemm: dequant side events";
+                side_scratch_ = nullptr;
+                return false;
+            }
+        }
+    }
+    // both scratches are free once what the compute stream holds now is done (a rebind follows a stream sync, so
+    // this is belt and braces)
+    for (strata::gpu::Event* e : side_free_) strata::gpu::event_record(e, stream_);
+    return true;
 }
 
 bool Gemm::init(void* stream, int64_t scratch_elems, std::string& err) {
@@ -413,17 +488,23 @@ void Gemm::bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64
         strata::kernels::gemm_rows(XmxType::bf16, X, W, Y, T, N, K, ldy, stream_, accumulate);
 }
 
-void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy) {
+void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+               bool half, bool accumulate) {
     if (T <= 0 || N <= 0) return;
     if (ldy <= 0) ldy = N;
 #if STRATA_ONEMATH
-    if (dense_f32(X, W, Y, T, N, K, ldy, stream_)) return;
-    if (blas<sycl::half>(X, W, Y, T, N, K, ldy, false, stream_)) return;
+    // the FP32 copies and the half-sum path leave Y unread (or write it whole): an accumulating product keeps the
+    // half GEMM's FP32 sums, as the engine's own kernels do
+    if (!accumulate && dense_f32(X, W, Y, T, N, K, ldy, stream_)) return;
+    if (half && !accumulate && half_sums(X, W, Y, T, N, K, ldy, stream_)) return;
+    if (blas<sycl::half>(X, W, Y, T, N, K, ldy, accumulate, stream_)) return;
+#else
+    (void) half;
 #endif
     if (strata::kernels::xmx_gemm_ok(X, W, Y, N, K, ldy))
-        strata::kernels::xmx_gemm(XmxType::f16, X, W, Y, T, N, K, ldy, stream_);
+        strata::kernels::xmx_gemm(XmxType::f16, X, W, Y, T, N, K, ldy, stream_, accumulate);
     else
-        strata::kernels::gemm_rows(XmxType::f16, X, W, Y, T, N, K, ldy, stream_);
+        strata::kernels::gemm_rows(XmxType::f16, X, W, Y, T, N, K, ldy, stream_, accumulate);
 }
 
 bool Gemm::i8_usable(void* stream) {
@@ -505,7 +586,7 @@ bool Gemm::f16_groups(const uint16_t* X, const uint16_t* W, int64_t w_stride, fl
 }
 
 void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
-                  int64_t ldy) {
+                  int64_t ldy, bool half_sums) {
     if (N * K > scratch_elems_) {
         // Too large for the scratch at once: in row slices (of 16 rows, so every slice's Y stays 64-byte aligned).
         const int64_t rows = scratch_elems_ / K / 16 * 16;
@@ -514,12 +595,30 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
         for (int64_t r0 = 0; r0 < N; r0 += rows) {
             const int64_t n = std::min(rows, N - r0);
             strata::kernels::dequant_f16(ggml_type, W_blocks, r0, n, K, scratch_, stream_);
-            f16(X, scratch_, Y + r0, T, n, K, ldy);
+            f16(X, scratch_, Y + r0, T, n, K, ldy, half_sums);
         }
+        // the side stream's next dequant into scratch_ waits for these slices' reads and writes of it
+        if (side_scratch_) strata::gpu::event_record(side_free_[0], stream_);
+        return;
+    }
+    if (side_scratch_) {
+        // STRATA_DEQUANT_SIDE (upstream dc390c386): the dequant on the side stream, into the scratch the compute
+        // stream read last but one.  free[cur] -> dequant -> ready[cur] -> product -> free[cur] orders the dequant
+        // after the product that last read this scratch and the product after the dequant that filled it, so every
+        // read and write of a scratch is where the serial form had it - the same kernels, the same bits - and the
+        // dequant runs while the kernels queued ahead of this product do.
+        uint16_t* const s = side_cur_ == 0 ? scratch_ : side_scratch_;
+        strata::gpu::stream_wait_event(side_stream_, side_free_[side_cur_]);
+        strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, s, side_stream_);
+        strata::gpu::event_record(side_ready_[side_cur_], side_stream_);
+        strata::gpu::stream_wait_event(stream_, side_ready_[side_cur_]);
+        f16(X, s, Y, T, N, K, ldy, half_sums);
+        strata::gpu::event_record(side_free_[side_cur_], stream_);
+        side_cur_ ^= 1;
         return;
     }
     strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
-    f16(X, scratch_, Y, T, N, K, ldy);
+    f16(X, scratch_, Y, T, N, K, ldy, half_sums);
 }
 
 }  // namespace strata::prefill

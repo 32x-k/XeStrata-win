@@ -93,7 +93,7 @@ NVIDIA のコードの PTX は、既定ではツールキットの版です（CU
 PTX 7.8 で作ったものは RTX 4070 で CTest 52 件が通りました。
 ドライバーには、intel/llvm の CUDA のアダプタが使う関数（SYCL のグラフの `cuGraphAddKernelNode_v2`）のため、CUDA 12.0 以上（525 以降）が要ります。
 どちらの変数も既定は `auto` で、指定すればそれを使います（別の機械向けに作るとき）。
-oneMath は configure のときに CMake が GitHub の XeStrata のフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)、タグ `xestrata-10`）から取ってきます（アーカイブの SHA-256 を確かめます）。XeStrata の変更（cuBLAS の BF16 の積、rocBLAS の後端の hipBLASLt、rocBLAS と cuBLAS の後端の int8 の積、cuBLAS と rocBLAS の後端を 1 つのビルドで作れるようにするターゲットの指定の分離、rocBLAS の後端からの HIP と SYCL の非推奨の API の除去、Windows のクロスビルドの GNU 形の clang++ への対応と、そこでの cuBLAS と rocBLAS の後端と Windows の import library）が入り、本家の `develop` をマージした oneMath です。
+oneMath は configure のときに CMake が GitHub の XeStrata のフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)、タグ `xestrata-12`）から取ってきます（アーカイブの SHA-256 を確かめます）。XeStrata の変更（cuBLAS の BF16 の積、rocBLAS の後端の hipBLASLt、rocBLAS と cuBLAS の後端の int8 の積、cuBLAS と rocBLAS の後端を 1 つのビルドで作れるようにするターゲットの指定の分離、rocBLAS の後端からの HIP と SYCL の非推奨の API の除去、Windows のクロスビルドの GNU 形の clang++ への対応と、そこでの cuBLAS と rocBLAS の後端と Windows の import library、Windows での oneMKL の SYCL のリンクの `-fsycl-allow-device-image-dependencies` の除去）が入り、本家の `develop` をマージした oneMath です。
 ネットワークのない機械では、同じアーカイブを `STRATA_ONEMATH_SOURCE`（手元のファイルか URL）で渡します。
 変更の一覧は [third_party/main/README.md](../third_party/main/README.md) にあります。
 oneMath が GPU の後端を持たないときは、自前のカーネルを使います。
@@ -137,6 +137,8 @@ sm_60 には dp4a の命令がないので、その積だけを 1 バイトず�
 Tensor Core を使うカーネルは、sm_70 より前のコードでは空の本体になり、そのような GPU では起動されません。
 sm_60 だけのコードを作って RTX 4070 で動かすと（ドライバーが PTX をコンパイル）、CTest 59 件が通り、
 `STRATA_NO_XMX=1` で行列エンジンを外して IQ2_XS で答えさせると、sm_89 のコードと 8 問すべて同じ答えになりました（エキスパートのキャッシュの大きさを固定、decode の速さは 3〜5% 遅い）。
+compute capability 6.0 の GPU（GP100: P100）では、`STRATA_DOWN_WS=1` で、ルーティングされたエキスパートの IQ4_NL と Q2_0 の down の重みの行を、作業グループのローカルメモリに写してから積を取ります（upstream の 6a6d58ad0、opt-in。出力はビット単位で同じで、ほかの GPU では何もしません）。
+Maxwell 以前（compute capability 6.0 未満）では動きません。NVIDIA の GPU の SYCL のランタイムは 5.3 未満の GPU に FP16 を報告せず、エンジンは FP16 を報告しない GPU を使いません（`xestrata --setup` もそう知らせます）。
 
 Volta（sm_70）では、upstream が V100 で測った出力のカーネル 2 つを `STRATA_SM70_TABLE=1` で使います（upstream の c85b7c87 と同じく、確認が済むまで opt-in）。
 ひとつはルーティングされたエキスパートの「モード 8」で、gate/up の積と SwiGLU・q8_1 への量子化を 1 回で行い、格子の表と活性を作業グループのローカルメモリに置きます（`src/kernels/xe/iq_kernels.cpp`、upstream の f6330507: V100 で 227 → 159 µs）。

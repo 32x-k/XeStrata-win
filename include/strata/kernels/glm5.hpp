@@ -118,8 +118,17 @@ void glm5_latent_store(const float* kv, const int32_t* steps, int64_t n_tokens, 
 /// out[t][h] = sum_j p_j latent[c_j], over the steps[t][kStepWidth] cells ids[t][0 ..) (qsa_block_topk's output, cap
 /// apart) and, with `tail_kpool` (the pool size; 0 for none), the token's unfinished pool's cells up to it.  A token
 /// with no cell gets zeros.  q, out [T][H][L] (q already through wk_b); latent [cells][L] FP16.  L = 512.
+/// `compact` > 0: `latent` is glm5_latent_gather's [T][compact][L] rows instead, token t's cell j at row t compact + j.
 void glm5_mla_attn(const float* q, const uint16_t* latent, const int32_t* ids, int64_t cap, const int32_t* steps,
-                   int n_heads, float scale, int64_t n_tokens, float* out, void* stream, int tail_kpool = 0);
+                   int n_heads, float scale, int64_t n_tokens, float* out, void* stream, int tail_kpool = 0,
+                   int64_t compact = 0);
+
+/// The cells glm5_mla_attn reads for each token (its selection, then its unfinished pool's cells up to it) copied
+/// from `latent` [cells][L] into out [T][stride][L], in that order: one read of each over PCIe when the latent lives
+/// in host memory (--kv-ram), where the attention would read each cell twice for each head.  stride >= cap +
+/// tail_kpool - 1.  L = 512.
+void glm5_latent_gather(const uint16_t* latent, const int32_t* ids, int64_t cap, const int32_t* steps,
+                        int64_t n_tokens, int tail_kpool, int64_t stride, uint16_t* out, void* stream);
 
 /// GLM's clamped SwiGLU (ggml_swiglu_clamp): out = silu(min(gate, limit)) clamp(up, -limit, limit), n values.
 /// `out` may be `gate` or `up`.

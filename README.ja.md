@@ -30,7 +30,7 @@ GPU の計算を CUDA から SYCL と Level Zero に書き直し、同じコー�
 
 - **チャットとコーディングエージェント**: ブラウザのチャット、端末の会話、OpenAI 互換と Anthropic 互換の API で使えます。
 - **画像**: 画像を読ませることも、画像を作ることもできます（任意。[画像の生成](docs/IMAGE.ja.md)）。
-- **ほかのモデル**: Qwen3.8-Flash-Next の調整版や圧縮の違う版のほか、Ornith-1.5、llm-jp-4.1、Qwen3.6-35B-A3B、GLM-5.3-Flash も動かせます（BETA）。
+- **ほかのモデル**: Qwen3.8-Flash-Next の調整版や圧縮の違う版のほか、Ornith-1.5、llm-jp-4.1、Qwen3.6-35B-A3B、Qwen3.5-9B、GLM-5.3-Flash も動かせます（BETA）。
 - **GPU は 1 枚が基本**です。同じ PC の 2 枚以上の GPU に層を分けて載せることもでき、メーカーの違う GPU も組み合わせられます（NVIDIA を含むときは contrib-llvm のビルド）。
   2 枚のときは、2 枚目を層の分担にするか、1 枚目のキャッシュの助けにするかを、速い方に自動で選びます（[MULTIGPU](docs/MULTIGPU.ja.md)）。
 - **自由ソフトウェアだけでも動きます**（free のビルド、Debian main に入れられる程度に自由な構成。[ソースから作ります](docs/BUILD.ja.md#deb-と-rpm-のパッケージ)）。
@@ -42,7 +42,7 @@ GPU の計算を CUDA から SYCL と Level Zero に書き直し、同じコー�
 | --- | --- |
 | GPU | Intel Arc（A シリーズ、B シリーズ）、AMD Radeon（RDNA2 以降、[AMD の GPU](#amd-の-gpu)）か、NVIDIA の GPU（Pascal 以降。Tensor Core のない Pascal は遅い経路で動きます）。VRAM は 12 GB 以上を勧めます（それより少なくても動きますが、遅くなります）。 |
 | CPU | x86-64 で AVX2 があるもの。AVX-512（F、BW、VL、VNNI、VBMI）があれば、CPU の計算に AVX-512 を使います。 |
-| RAM | ふつうは 32〜62 GB（[モデルの選び方](#モデルの選び方)）。いちばん小さな Gyro-S は RAM と VRAM の合計で 28 GB、大きな版は 100 GB 以上です。 |
+| RAM | ふつうは 32〜62 GB（[モデルの選び方](#モデルの選び方)）。いちばん小さな Gyro-Coder は 26 GB（VRAM が補えば RAM と VRAM の合計で 28 GB）、大きな版は 100 GB 以上です。 |
 | ディスク | モデルに 60〜110 GB ほど（大きな版は 190 GB まで）、ほかに MTP 層に約 5 GB。SSD（NVMe）を強く勧めます。 |
 | OS | Linux（パッケージは Ubuntu 26.04 と Fedora 44 向け。ほかのディストリビューションでは [Podman](#podman) か[ソースから](docs/BUILD.ja.md#ソースから入れる)）、Windows 10 と 11（x64、[Windows](#windows)）。WSL 2 は動くかもしれません（プルリクエスト歓迎）。 |
 | BIOS | 単体の GPU では Above 4G Decoding と Re-Size BAR を有効にし、CSM を無効にします。 |
@@ -83,7 +83,7 @@ AMD の GPU では、prefill の密な行列積をディストリビューショ
 ## モデルの選び方
 
 **迷ったら、`xestrata --setup` の質問で Enter を押してください。** 元の Qwen3.8-Flash-Next の **Q2_0** を選び、RAM が 60 GB 以上なら **IQ3_XXS** を選びます（Ryzen AI Max で RAM が 80 GB 以上なら UD-IQ4_XS）。
-RAM がそれより少ない PC では、Coder（32 GB）、Gyro（RAM と VRAM の合計で 28 GB から）、BETA のモデルが選べます。
+RAM がそれより少ない PC では、Coder（32 GB）、Gyro（36 GB、RAM と VRAM の合計なら 38 GB から）、Gyro-Coder（26 GB、合計なら 28 GB から）、BETA のモデルが選べます。
 あとから別のモデルを足すときも `xestrata --setup` を実行します。
 
 | モデル | パラメーター | RAM の目安 | 向いていること |
@@ -92,9 +92,10 @@ RAM がそれより少ない PC では、Coder（32 GB）、Gyro（RAM と VRAM 
 | **Ornith-1.5**（BETA） | 350 億（1 トークンで 30 億） | 21〜80 GB | RAM の少ない PC 向け |
 | **llm-jp-4.1**（BETA） | 320 億（1 トークンで 30 億） | 30〜73 GB | 日本語と英語の思考するモデル |
 | **Qwen3.6-35B-A3B**（BETA） | 350 億（1 トークンで 30 億） | 31〜46 GB | 思考するモデル。RAM の少ない PC 向け |
+| **Qwen3.5-9B**（BETA） | 90 億（密） | 8 GB（VRAM は 8〜20 GB） | 画像も読む思考するモデル。重みを GPU に全部載せる。拒否を外した版もあります |
 | **GLM-5.3-Flash**（BETA） | 3,200 億（1 トークンで 180 億） | RAM と VRAM で 101〜165 GB | 思考する大きなモデル。RAM の多い PC 向け |
 
-BETA の 4 つは、画像（読ませることも作ることも）にまだ対応していません。大きさの表とオプションは [DETAILS](docs/DETAILS.ja.md#qwen38-flash-next-以外のモデルornith-15llm-jp-41qwen36-35b-a3bglm-53-flash) にあります。
+BETA のモデルは、画像の生成にまだ対応していません。画像を読ませられるのは Qwen3.5-9B だけです。大きさの表とオプションは [DETAILS](docs/DETAILS.ja.md#qwen38-flash-next-以外のモデルornith-15llm-jp-41qwen36-35b-a3bqwen35-9bglm-53-flash) にあります。
 
 ### Qwen3.8-Flash-Next の版と大きさ
 
@@ -107,8 +108,11 @@ BETA の 4 つは、画像（読ませることも作ることも）にまだ対
 | 元のモデル、Swift 1.5 | **IQ3_XXS** | 76 GB | 60 GB | 遅め。とても良い |
 | 元のモデル、Swift 1.5 | **IQ3_S** | 84 GB | 62 GB | 遅い。元のモデルと同等 |
 | Coder | **IQ1_M** | 58 GB | 32 GB | 速い。コードでは良く、ほかは弱い |
-| Gyro | **Gyro-S** | 58 GB | RAM と VRAM で 28 GB | 遅い。2〜3 ビットの大きさより低い |
-| Gyro | **Gyro-M** | 92 GB | RAM と VRAM で 35 GB | 遅い。IQ3_XXS くらい |
+| Gyro | **Gyro-S** | 58 GB | 36 GB（RAM と VRAM で 38 GB） | 遅い。2〜3 ビットの大きさより低い |
+| Gyro | **Gyro-M** | 92 GB | 43 GB（RAM と VRAM で 45 GB） | 遅い。IQ3_XXS くらい |
+| Gyro | **Gyro-L** | 108 GB | 59 GB（RAM と VRAM で 61 GB） | Gyro-M より遅い。Gyro の中でいちばん良い |
+| Gyro-Coder | **Gyro-Coder-L** | 84 GB | 35 GB（RAM と VRAM で 37 GB） | Gyro-M より遅い。コードでは良く、ほかは弱い |
+| Gyro-Coder | **Gyro-Coder** | 76 GB | 26 GB（RAM と VRAM で 28 GB） | Gyro-M くらいの速さ。Gyro-Coder-L より低い |
 | Unsloth | **UD-IQ4_XS** | 94 GB | 48 GB | RAM が約 80 GB より少ないと遅い。IQ3_S より良い |
 | Unsloth（実験的） | **UD-Q4_K_XL** | 111 GB | 48 GB | RAM 64 GB の PC では遅い。さらに良い |
 | Unsloth（実験的） | **UD-Q5_K_XL**、**UD-Q6_K_XL**、**Q8_0** | 158〜188 GB | 108〜136 GB | RAM の多い PC 向け。Q8_0 が元のモデルにいちばん近い |
@@ -116,7 +120,8 @@ BETA の 4 つは、画像（読ませることも作ることも）にまだ対
 - **元のモデル**: Qwen の [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) を、ISTA-DASLab が[圧縮](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF)したものです。
 - **[Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)**: UkisAI による調整版です。答える前の思考が短く、答えが早く出ます。品質はほぼ同じです。
 - **[Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)**: ISTA-DASLab によるコード向けの版です。エキスパートが半分なので、コード以外や、英語以外の言語では弱くなります。
-- **[Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)**: agentionai による、メモリの少ない PC 向けの量子化です。要るメモリは RAM と VRAM の合計です。
+- **[Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)**: agentionai による、メモリの少ない PC 向けの量子化です。RAM が足りなければ、VRAM が補います（括弧の中の、RAM と VRAM の合計）。
+- **[Gyro-Coder](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF)**: agentionai によるコード向けの版です。エキスパートを半分にし、Gyro の形式で量子化しています。コード以外では弱くなります。RAM が足りなければ、Gyro と同じく VRAM が補います。
 - **[Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)**: 元のモデルの 4〜8 ビットの版です。RAM に入りきらないエキスパートは、答えている間に SSD から読みます。
   UD-Q4_K_XL より大きなものは実験的で、XeStrata では動かしていません。
 - **[huihui-ai の abliterated 版](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF)**: Swift 1.5（IQ2_XS、IQ3_XXS）と Unsloth（UD-IQ4_XS、UD-Q4_K_XL、Q8_0）から拒否の方向を取り除いた版です。
@@ -130,8 +135,8 @@ OrcaRouter の Flash-Next Uncensored IQ3_XXS は setup のメニューにはな�
 
 ### 画像の生成（任意）
 
-`xestrata --setup --images qwen-image-turbo` で、文章のモデルとは別に画像を作るモデル（Qwen-Image-2.1 か Mage-Flow）を入れられます。
-画像のモデルには、文章のモデルとは別に 16〜20 GB の RAM が要ります。
+`xestrata --setup --images qwen-image-turbo` で、文章のモデルとは別に画像を作るモデル（Qwen-Image-2.1、Mage-Flow、MageTrail、Tencent の HunyuanImage 3.0、OpenMOSS の MOSS-Image）を入れられます。
+画像のモデルには、文章のモデルとは別に 16〜20 GB の RAM が要ります（HunyuanImage 3.0 は約 50 GB）。
 選び方、使い方、API は [docs/IMAGE.ja.md](docs/IMAGE.ja.md) にあります。
 
 ## インストール
@@ -235,9 +240,9 @@ sudo dnf remove xestrata-contrib-cuda13.4    # Fedora（同じ）
   Visual C++ の再頒布可能パッケージがなければ、`xestrata.exe` が知らせて止まります。
 - **GPU**: Intel、NVIDIA（Pascal 以降、cuda12.4 のパッケージと同じコード）、AMD（RDNA2 以降、[上の表](#amd-の-gpu)の Fedora 44 と Windows の列の gfx）です。AMD は Adrenalin 26.5.1 以降のドライバーが要ります（`amdhip64_7.dll`）。
 - **計算ライブラリ**: Intel の oneMKL、NVIDIA の cuBLAS と cuDNN、AMD の rocBLAS と hipBLASLt は 7z に入っていません。
-  入っていなければ、setup が 7z の Python で入れるコマンド（`pip install`）を示します。なくても XeStrata 自身のカーネルで動きます。
-- **置き場所**: 7z のフォルダーには書き込みません。設定は `%APPDATA%\xestrata`、ログなどは `%LOCALAPPDATA%\xestrata`、モデルはデータのフォルダー（既定は `%LOCALAPPDATA%\xestrata\data`）に置きます。
-- **更新**: 新しい 7z を別のフォルダーに展開して、そちらの `xestrata.exe` を起動します。設定とモデルはそのまま使います。
+  入っていなければ、setup が入れるかを聞き、答えが y なら 7z の Python に `pip install` で入れます。`--check` のときと 7z のフォルダーに書き込めないときは、入れるコマンドを示すだけです。なくても XeStrata 自身のカーネルで動きます。
+- **置き場所**: 7z のフォルダーに書き込むのは、上の計算ライブラリ（7z の `python\`）だけです。設定は `%APPDATA%\xestrata`、ログなどは `%LOCALAPPDATA%\xestrata`、モデルはデータのフォルダー（既定は `%LOCALAPPDATA%\xestrata\data`）に置きます。
+- **更新**: 新しい 7z を別のフォルダーに展開して、そちらの `xestrata.exe` を起動します。設定とモデルはそのまま使います。計算ライブラリは新しい 7z の Python にはないので、setup がまた入れるかを聞きます。
 
 ## 使い方
 
@@ -355,15 +360,17 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
      [Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)。
    - UkisAI による [Swift 1.5](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)。
    - [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) による UD-IQ4_XS、UD-Q4_K_XL、UD-Q5_K_XL、UD-Q6_K_XL、Q8_0。
-   - agentionai による [Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)。
+   - agentionai による [Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF) と [Gyro-Coder](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF)。
    - huihui-ai による [abliterated 版](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF)。
    - Ornith AI の [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)（GSQ-RCO は pfeifferj）、LLM-jp の [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)、
      Qwen の [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)、Z.ai の [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)（どちらも GGUF は Unsloth）。
-   - 画像の生成: Qwen の Qwen-Image-2.1、Microsoft の Mage-Flow、文の読み手の Qwen3-VL（[IMAGE](docs/IMAGE.ja.md#ライセンス)）。
+   - Qwen の [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)（GGUF は Unsloth）と、HauhauCS による拒否を外した版の [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive)。
+   - 画像の生成: Qwen の Qwen-Image-2.1、Microsoft の Mage-Flow、RicemanT の MageTrail と Black Forest Labs の Flux2 VAE、Tencent の HunyuanImage 3.0、OpenMOSS の MOSS-Image、文の読み手の Qwen3-VL と Qwen3.5-9B（[IMAGE](docs/IMAGE.ja.md#ライセンス)）。
 
   モデルのファイルには、それぞれのライセンスが適用されます。
 - **使っている部品**:
    - [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)（MIT）の一部。Gyro の形式は agentionai の llama.cpp のフォーク（MIT）から。
+   - Peasant Smith と Project Maya の貢献者による [Project Maya](https://github.com/mw00/project-maya)（MIT）: server のループ対策（`serve/loop_guard.py`）。
    - [oneMath](https://github.com/uxlfoundation/oneMath)（Apache-2.0）: 密な行列積（contrib-llvm、free では AMD の GPU）。
      CMake が XeStrata の変更の入ったフォーク（[MistVVK/oneMath](https://github.com/MistVVK/oneMath)、同じライセンス）から取得します。
    - [intel/llvm](https://github.com/intel/llvm) の DPC++（Apache-2.0 WITH LLVM-exception）: free と contrib-llvm のコンパイラ。
@@ -375,18 +382,21 @@ RAM が足りていません。ほかのプログラムを閉じるか、小さ�
      [cuDNN Frontend](https://github.com/NVIDIA/cudnn-frontend)（Apache-2.0、一部 MIT、NVIDIA の GPU）。参照画像の読み込みに [stb_image](https://github.com/nothings/stb)（MIT か Unlicense）。
    - [quantscope](https://github.com/1872183316/quantscope)（MIT か Apache-2.0）: `setup.py --inspect` が GGUF の中身を確かめるのに使います。
    - 画面のフォント [Outfit](https://github.com/Outfitio/Outfit-Fonts)（SIL Open Font License 1.1）。
+   - チャットの数式を描く [KaTeX](https://katex.org/)（MIT）。
 - **参考にした考え方**:
    - Inco AI と Splash の貢献者による [Splash](https://github.com/incoai/splash)。
    - Neroued による [ninfer](https://github.com/Neroued/ninfer)。
    - syv.ai と HyperQwen の貢献者による [HyperQwen](https://github.com/syv-ai/HyperQwen)。
-   - mw00 と Project Maya の貢献者による [Project Maya](https://github.com/mw00/project-maya)（VRAM にないエキスパートを CPU と PCIe に分ける数の決め方）。
+   - Peasant Smith と Project Maya の貢献者による [Project Maya](https://github.com/mw00/project-maya)（VRAM にないエキスパートを CPU と PCIe に分ける数の決め方、SSD から読むエキスパートを順位で飛ばすやり方）。
    - maxfridbe による [nextsycl](https://github.com/maxfridbe/nextsycl)（Qwen3.5 系のモデルの decode でカーネルをまとめるやり方）。
 - 部品の一覧は [third_party/main/README.md](third_party/main/README.md)、詳しくは [docs/DETAILS.ja.md](docs/DETAILS.ja.md#クレジットとライセンス) にあります。
 
 ## ライセンス
 
-XeStrata（著作権は MistVVK と XeStrata の貢献者）は自由ソフトウェアで、全体を
-[GNU Lesser General Public License の第 3 版以降](COPYING.LESSER)（`COPYING.LESSER` と `COPYING`）で配布します。
+XeStrata は自由ソフトウェアです。MistVVK と XeStrata の貢献者が XeStrata のために書いたコードは
+[GNU Lesser General Public License の第 3 版以降](COPYING.LESSER)（`COPYING.LESSER` と `COPYING`）で、
+それらを組み合わせた XeStrata 全体も同じライセンスで配布します。ただし、Strata と ggml / llama.cpp から来たコード（MIT）と
+下に挙げる部品は、元のライセンスのままです。
 
 - **メーカーの計算ライブラリと OS のランタイムとのリンク**: GPU や CPU のメーカーが自社の製品向けに出している計算ライブラリとその実行時ライブラリ
   （oneMKL や Intel oneAPI のコンパイラの実行時ライブラリ、cuBLAS や CUDA のランタイムとドライバなど）、
@@ -403,6 +413,7 @@ XeStrata（著作権は MistVVK と XeStrata の貢献者）は自由ソフト�
    - 変えていない写し: ggml の `ggml-common.h` と、agentionai の llama.cpp の `ggml-common-tq.h`（`third_party/main/ggml/`、MIT）、
      `quantscope.py`（`third_party/main/quantscope/`、MIT か Apache-2.0）、`stb_image.h`（`third_party/main/stb/`、MIT か Unlicense）。
    - 画面のフォント Outfit（`third_party/main/outfit/`）: SIL Open Font License 1.1。
+   - チャットの数式を描く KaTeX（`third_party/main/katex/`）: MIT。
    - `third_party/nonfree/`: 自由ソフトウェアでないもの。元のモデルのチャットテンプレートと、実験的な速度向上用の射影のベクトルで、
      どちらも Qwen Community License 1.0 です。
 - **`third_party/nonfree/` がなくても**、XeStrata はビルドでき、動きます。パッケージには入れていません。

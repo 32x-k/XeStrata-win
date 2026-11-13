@@ -53,6 +53,8 @@ type MainWindow() as this =
     let version = muted ""
     let updateBar = Border(IsVisible = false, Background = accentTint, CornerRadius = CornerRadius 6.0, Padding = Thickness 10.0)
     let mutable running: Setup.Run option = None
+    // setup's warnings while it checked this PC: why a GPU is missing ("the engine could not list the GPUs: ...", #41)
+    let mutable checkWarnings: string list = []
 
     let show (content: Control) =
         host.Content <- ScrollViewer(Content = content, HorizontalScrollBarVisibility = Primitives.ScrollBarVisibility.Disabled)
@@ -97,11 +99,11 @@ type MainWindow() as this =
         |> ignore
 
     // ---------------------------------------------------------------------------------------------- a run of setup
-    /// setup.py with `args`, its steps, progress, questions and log on a page of its own: `answer` answers a question
-    /// the window has already asked (else the page asks it), `onReady` gets the server's address once it says so,
-    /// `onDone` the exit code (after a failure: when the page is left).
-    let runPage (title: string) (args: string list) (answer: string -> string option) (onReady: string -> unit)
-                (onDone: int -> unit) =
+    /// setup.py (or `script`, Setup.Run's) with `args`, its steps, progress, questions and log on a page of its own:
+    /// `answer` answers a question the window has already asked (else the page asks it), `onReady` gets the server's
+    /// address once it says so, `onDone` the exit code (after a failure: when the page is left).
+    let runScriptPage (script: string) (title: string) (args: string list) (answer: string -> string option)
+                      (onReady: string -> unit) (onDone: int -> unit) =
         let stepText = subheading "Starting ..."
         let status = text ""
         let bar = ProgressBar(IsIndeterminate = true, Minimum = 0.0, Maximum = 1.0, Height = 6.0)
@@ -181,9 +183,86 @@ type MainWindow() as this =
                 actions [ cancel ]
             ]
         )
-        let r = Setup.Run(args, onMessage, (fun code -> ui (fun () -> if not failed then onDone code)))
+        let r = Setup.Run(script, args, onMessage, (fun code -> ui (fun () -> if not failed then onDone code)))
         run <- Some r
         r
+
+    let runPage = runScriptPage Places.setupPy
+
+    /// The image models to choose from (describe's), `current` checked (--images names: the default first) -> the
+    /// control and its --images value (None: none checked).  A choice of the default where several are, of the size
+    /// where a model has several (Auto: by the RAM), and of the text encoder with the refusal direction removed
+    /// (-uncensored) where the models have one.
+    let imagePicker (models: ImageModel[]) (current: string[]) =
+        let plain (id: string) =
+            let id = id.Split(':')[0]
+            if id.EndsWith "-uncensored" then id.Substring(0, id.Length - 11) else id
+        let had = current |> Array.map plain
+        let boxes =
+            [| for m in models ->
+                   CheckBox(
+                       IsChecked = Nullable(Array.contains m.Id had),
+                       Content =
+                           stack 2.0 [
+                               row 6.0 [
+                                   yield subheading m.Title
+                                   if not m.Edits then yield badge mutedBrush "no edits"
+                               ]
+                               muted (sprintf "%s; download %s, needs ~%s of RAM besides the text model" m.About (gb m.DownloadGb) (gb m.RamGb))
+                           ]
+                   ) |]
+        // each model's size where it has several: Auto (the largest that fits the RAM) or one of them
+        let sizes =
+            [| for m in models ->
+                   let c = ComboBox(ItemsSource = Array.append [| "Auto" |] m.Quants, SelectedIndex = 0, MinWidth = 110.0)
+                   let was = current |> Array.tryFind (fun id -> plain id = m.Id && id.Contains ":")
+                   was |> Option.iter (fun id -> c.SelectedItem <- id.Split(':')[1])
+                   c.IsVisible <- m.Quants.Length > 0
+                   c |]
+        let uncensored =
+            CheckBox(
+                Content = text "Text encoder with its refusal direction removed (-uncensored)",
+                IsChecked = Nullable(current |> Array.exists (fun c -> c.EndsWith "-uncensored"))
+            )
+        let defaultBox = ComboBox(MinWidth = 260.0)
+        let defaultField = field "Default image model (the others: chosen on the web page or by the API's \"model\")" defaultBox
+        let checkedModels () = [ for i, b in Array.indexed boxes do if b.IsChecked = Nullable true then models[i] ]
+        let refresh () =
+            let ms = checkedModels ()
+            let was = match defaultBox.SelectedItem with :? string as t -> t | _ -> ""
+            let first = if had.Length > 0 then (models |> Array.tryFind (fun m -> m.Id = had[0])) else None
+            defaultBox.ItemsSource <- [ for m in ms -> m.Title ]
+            defaultBox.SelectedItem <-
+                (match ms |> List.tryFind (fun m -> m.Title = was), first with
+                 | Some m, _ -> m.Title
+                 | None, Some f when List.contains f ms -> f.Title
+                 | _ -> (match ms with m :: _ -> m.Title | [] -> null))
+            defaultField.IsVisible <- ms.Length > 1
+            uncensored.IsVisible <- ms |> List.exists (fun m -> m.Uncensored)
+        for b in boxes do
+            b.IsCheckedChanged.Add(fun _ -> refresh ())
+        refresh ()
+        let value () =
+            match checkedModels () with
+            | [] -> None
+            | ms ->
+                let def = match defaultBox.SelectedItem with :? string as t -> t | _ -> ms.Head.Title
+                let ordered = (ms |> List.filter (fun m -> m.Title = def)) @ (ms |> List.filter (fun m -> m.Title <> def))
+                let name (m: ImageModel) =
+                    let id = if uncensored.IsChecked = Nullable true && m.Uncensored then m.Id + "-uncensored" else m.Id
+                    let size = sizes[Array.findIndex (fun (x: ImageModel) -> x.Id = m.Id) models]
+                    match size.SelectedItem with
+                    | :? string as q when q <> "Auto" -> id + ":" + q
+                    | _ -> id
+                Some(ordered |> List.map name |> String.concat ",")
+        let control =
+            stack 8.0 [
+                for i, b in Array.indexed boxes do
+                    yield row 12.0 [ b :> Control; sizes[i] :> Control ] :> Control
+                yield defaultField :> Control
+                yield uncensored :> Control
+            ]
+        control, value
 
     // ---------------------------------------------------------------------------------------------- the pages
     let rec home () =
@@ -191,6 +270,7 @@ type MainWindow() as this =
         task {
             let! messages, code = Setup.collect [ "--describe" ]
             let found = messages |> List.tryPick (function Described d -> Some d | _ -> None)
+            checkWarnings <- messages |> List.choose (function Warn s -> Some s | _ -> None)
             ui (fun () ->
                 match found with
                 | Some d -> homePage d
@@ -219,6 +299,8 @@ type MainWindow() as this =
                 for g in d.Gpus do
                     if not (isNull g.Problem) then
                         yield coloured warnBrush (sprintf "%s: %s" g.Name g.Problem)
+                for w in checkWarnings do
+                    yield coloured warnBrush ("⚠ " + w)
                 yield text (sprintf "RAM: %s" (gb d.RamGb))
                 yield
                     text (
@@ -235,13 +317,20 @@ type MainWindow() as this =
                               muted (
                                   (if m.Context.HasValue then contextLabel m.Context.Value + " of context, " else "")
                                   + sprintf "http://127.0.0.1:%d/" m.Port
+                                  + (if m.Images.Length > 0 then ", images: " + String.Join(", ", m.Images) else "")
                               )
                           ]
-                      let start = accentButton "Start" (fun () -> startModel i m)
-                      Grid.SetColumn(start, 1)
-                      start.VerticalAlignment <- VerticalAlignment.Center
+                      let imagesOk = d.Families |> Array.exists (fun f -> f.Id = m.Family && f.Images)
+                      let buttons =
+                          row 8.0 [
+                              if imagesOk && d.Images.Length > 0 then
+                                  yield button "Images ..." (fun () -> imagesPage d m)
+                              yield accentButton "Start" (fun () -> startModel i m)
+                          ]
+                      Grid.SetColumn(buttons, 1)
+                      buttons.VerticalAlignment <- VerticalAlignment.Center
                       g.Children.Add info
-                      g.Children.Add start
+                      g.Children.Add buttons
                       g
                   )
                   :> Control ]
@@ -294,6 +383,8 @@ type MainWindow() as this =
         let ggufDir = TextBox(PlaceholderText = "(optional) a folder with the model files already downloaded", MinWidth = 420.0)
         let license = muted ""
         let install = accentButton "Install" ignore
+        let images, imagesValue = imagePicker d.Images [||]
+        let imagesField = field "Image generation (optional): models to make images with, besides the text model" images
         let selectedModel () =
             match sizes.SelectedItem with
             | :? Model as m -> Some m
@@ -303,6 +394,7 @@ type MainWindow() as this =
             | :? Family as f ->
                 sizes.ItemsSource <- f.Models
                 sizes.SelectedItem <- (f.Models |> Array.tryFind (fun m -> m.Recommended) |> Option.defaultValue f.Models[0])
+                imagesField.IsVisible <- f.Images && d.Images.Length > 0
                 license.Text <- (if String.IsNullOrEmpty f.License then "" else "Its license: " + f.License)
             | _ -> ()
         let sizeChanged () =
@@ -323,6 +415,9 @@ type MainWindow() as this =
                       "--data-dir"; dataDir.Text ]
                     @ (if gpus.Length > 0 then [ "--gpu"; string gpus[max 0 gpuBox.SelectedIndex].Index ] else [])
                     @ (if String.IsNullOrWhiteSpace ggufDir.Text then [] else [ "--gguf-dir"; ggufDir.Text ])
+                    @ (match imagesValue () with
+                       | Some v when f.Images -> [ "--images"; v ]
+                       | _ -> [])
                 installPage (f.Title + " " + m.Id) args
             | _ -> ())
         families.SelectedIndex <- 0
@@ -336,12 +431,31 @@ type MainWindow() as this =
                 if gpus.Length > 1 then field "GPU" gpuBox
                 field "Data folder: where the model files go (tens of GB)" (row 8.0 [ dataDir; button "Browse ..." (fun () -> pickFolder "Data folder" dataDir) ])
                 field "Model files you already have" (row 8.0 [ ggufDir; button "Browse ..." (fun () -> pickFolder "Model files" ggufDir) ])
+                imagesField
                 actions [ button "Back" (fun () -> homePage d); install ]
             ]
         )
 
     and installPage (what: string) (args: string list) =
         runPage ("Installing " + what) args (fun _ -> None) ignore (fun _ -> home ()) |> ignore
+
+    /// An installed model's image generation: its image models chosen again (none: taken out), the files downloaded
+    /// and its config rewritten by tools/image/install.py; the server takes it at its next start.
+    and imagesPage (d: Describe) (m: Installed) =
+        let picker, value = imagePicker d.Images m.Images
+        let apply () =
+            let v = value () |> Option.defaultValue "no"
+            runScriptPage Places.imageInstallPy ("Image generation for " + m.ModelName)
+                [ "--config"; m.Config; "--model"; v; "--yes" ] (fun _ -> None) ignore (fun _ -> home ())
+            |> ignore
+        show (
+            stack 14.0 [
+                heading ("Image generation for " + m.ModelName)
+                muted "Check the image models to make images with (none: image generation off). Their files are downloaded, and the model takes them at its next start."
+                picker
+                actions [ button "Back" (fun () -> homePage d); accentButton "Apply" apply ]
+            ]
+        )
 
     and startModel (index: int) (m: Installed) =
         let stopButton = button "Stop" ignore

@@ -62,6 +62,8 @@ class ContextOverflow(unittest.TestCase):
         for path, key in APIS:
             for stream in (False, True):
                 for prompt, budget, fit, detail in cases:
+                    if budget is None and path == "/v1/messages":
+                        continue                    # Anthropic's max_tokens is required: no request without it
                     with self.subTest(path=path, stream=stream, prompt=prompt, budget=budget, fit=fit):
                         self.svc.fit_max_tokens = fit
                         with mock.patch.object(self.engine, "generate") as generate:
@@ -85,8 +87,10 @@ class ContextOverflow(unittest.TestCase):
                         if path == "/v1/responses":
                             self.assertEqual(error["code"], "context_length_exceeded")
                             self.assertEqual(error["param"], "input")
-                        else:
+                        elif path == "/v1/messages":
                             self.assertEqual(set(error), {"type", "message"})
+                        else:                    # OpenAI's error: param and code are null when there is none
+                            self.assertEqual(error, {**error, "param": None, "code": None})
 
     def test_default_service_shortens_an_overshooting_budget_in_every_dialect(self):
         # the Service default (fit_max_tokens on): a prompt that fits is answered, streaming or not; the prompt that

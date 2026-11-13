@@ -791,23 +791,44 @@ template<> struct Split<11> : WholeDot<vec_dot_q3_K_q8_1> {};   // Q3_K
 
 // ---------------------------------------------------------------- the formats
 // bsz = bytes per block, qk = values per block, ipb = dot calls per block (qi / vdr), step = the iqs stride between calls.
-// ---------------------------------------------------------------- APR trellis types (ggml 144 TQ2_T, 145 TQK6, 146 TQK7)
+// ---------------------------------------------------------------- APR trellis types (ggml 144 TQ2_T, 145 TQK6,
+// 146 TQK7, 147 / 148 / 149 TQP5 / TQP6 / TQP7)
 // Upstream's (src/kernels/cuda/iq_kernels.cu, transcribed from the agention llama.cpp fork's ggml-cuda/tq.cuh; format
 // in ggml-common-tq.h).  A 128-value block is 8 lanes of 4 trellis steps (16 values); lane l reads q8_1 block l / 2,
 // ints 4 (l & 1) .. 4 (l & 1) + 3.  The lane's 16 codebook values come from the int8 codebook tq_lut_i8 (one global
 // scale, relative RMS error 0.85% of the codebook's), two 2-byte entries a step = one int of packed int8, so a lane is
 // 4 dp4a; the prompt path's FP16 dequantizer (dq_tq) reads the fp16 codebook, as ggml's to_float does, so the decode
 // and the prompt agree within tolerance, not bitwise (upstream's Numerics).
+// TQP (pair trellis, agentionai/llama.cpp 9aa51ce): 64 steps of K bits a block, each step two values (the state's
+// first codebook point only), so a lane is 8 steps and the same 4 dp4a.
 template<int TY> struct TqInfo;
-template<> struct TqInfo<144> { using block_t = block_tq2_t; };   // byte-aligned, no K
-template<> struct TqInfo<145> { using block_t = block_tqk6; static constexpr int K = 6; };
-template<> struct TqInfo<146> { using block_t = block_tqk7; static constexpr int K = 7; };
+template<> struct TqInfo<144> { using block_t = block_tq2_t; static constexpr int NS = 32; };   // byte-aligned, no K
+template<> struct TqInfo<145> { using block_t = block_tqk6; static constexpr int K = 6, NS = 32; };
+template<> struct TqInfo<146> { using block_t = block_tqk7; static constexpr int K = 7, NS = 32; };
+template<> struct TqInfo<147> { using block_t = block_tqp5; static constexpr int K = 5, NS = 64; };
+template<> struct TqInfo<148> { using block_t = block_tqp6; static constexpr int K = 6, NS = 64; };
+template<> struct TqInfo<149> { using block_t = block_tqp7; static constexpr int K = 7, NS = 64; };
+constexpr bool is_tq(int t) { return t >= 144 && t <= 149; }
 inline float tq_h2f(uint32_t bits) { return (float) sycl::bit_cast<sycl::half>((uint16_t) bits); }
-// the states of steps 4l .. 4l + 3 of one block (qs is 2-byte aligned: every trellis block has an even size)
+// The u16 words the four states of tq_states4 span at most: the window's offset into its first word (0..15, set by
+// t0 and K) plus 3 K + 16 bits.  K = 5 and 6 need three words wherever t0 falls; IGC proved it for K = 5 only and
+// read a fourth for K = 6, and TQP6's grouped products ran 35% slower than TQP5's and TQP7's (B70, 2026-10-25).
 template<int TY>
-inline void tq_states4(const uint8_t* qs, int l, uint32_t s[4]) {
+constexpr int tq_window_words() {
+    int bits = 0;
+    for (int t0 = 0; t0 + 4 <= TqInfo<TY>::NS; t0 += 4) {
+        const int b = (((TqInfo<TY>::NS - 4 - t0) * TqInfo<TY>::K) & 15) + 3 * TqInfo<TY>::K + 16;
+        bits = b > bits ? b : bits;
+    }
+    return (bits + 15) / 16;
+}
+// the states of steps t0 .. t0 + 3 of one block, t0 a multiple of 4 (qs is 2-byte aligned: every trellis block has an
+// even size)
+template<int TY>
+inline void tq_states4(const uint8_t* qs, int t0, uint32_t s[4]) {
     const uint16_t* qs16 = (const uint16_t*) qs;
     if constexpr (TY == 144) {   // s_t = qs[(t + 31) % 32] << 8 | qs[t]
+        const int l = t0 / 4;
         const uint32_t w01 = qs16[2 * l + 0], w23 = qs16[2 * l + 1];
         const uint32_t prev = qs[(4 * l + 31) & 31];
         const uint32_t b0 = w01 & 0xFF, b1 = w01 >> 8, b2 = w23 & 0xFF, b3 = w23 >> 8;
@@ -816,15 +837,17 @@ inline void tq_states4(const uint8_t* qs, int l, uint32_t s[4]) {
         s[2] = (b1 << 8) | b2;
         s[3] = (b2 << 8) | b3;
     } else {
-        // step t's state: the 16 stream bits from bit (31 - t) K, circular over 2K u16 words; steps 4l .. 4l + 3 all
-        // lie in the four words from (28 - 4l) K >> 4
-        constexpr int K = TqInfo<TY>::K, nwords = 2 * K;
-        const int off3 = (28 - 4 * l) * K, wb = off3 >> 4, r = off3 & 15;
+        // step t's state: the 16 stream bits from bit (NS - 1 - t) K, circular over NS K / 16 u16 words; steps
+        // t0 .. t0 + 3 all lie in the tq_window_words words from (NS - 4 - t0) K >> 4
+        constexpr int K = TqInfo<TY>::K, nwords = TqInfo<TY>::NS * K / 16;
+        const int off3 = (TqInfo<TY>::NS - 4 - t0) * K, wb = off3 >> 4, r = off3 & 15;
         const int wi1 = wb + 1 >= nwords ? wb + 1 - nwords : wb + 1;
         const int wi2 = wb + 2 >= nwords ? wb + 2 - nwords : wb + 2;
-        const int wi3 = wb + 3 >= nwords ? wb + 3 - nwords : wb + 3;
-        const uint64_t v = (uint64_t) qs16[wb] | ((uint64_t) qs16[wi1] << 16) | ((uint64_t) qs16[wi2] << 32) |
-                           ((uint64_t) qs16[wi3] << 48);
+        uint64_t v = (uint64_t) qs16[wb] | ((uint64_t) qs16[wi1] << 16) | ((uint64_t) qs16[wi2] << 32);
+        if constexpr (tq_window_words<TY>() > 3) {
+            const int wi3 = wb + 3 >= nwords ? wb + 3 - nwords : wb + 3;
+            v |= (uint64_t) qs16[wi3] << 48;
+        }
         for (int i = 0; i < 4; ++i) s[i] = (uint32_t) (v >> (r + (3 - i) * K)) & 0xFFFFu;
     }
 }
@@ -832,12 +855,23 @@ template<int TY> struct SplitTq {
     struct W { int q[4]; float d; };
     static W load(const void* vbq, int kbx, int iqs) {
         const auto* b = (const typename TqInfo<TY>::block_t*) vbq + kbx;
-        uint32_t s[4];
-        tq_states4<TY>(b->qs, iqs / 4, s);
         W r{};
-        for (int i = 0; i < 4; ++i) {
-            const uint32_t x = (s[i] & TQ_STATE_MASK) * 0x9e3779b1u;
-            r.q[i] = (int) ((uint32_t) tq_lut_i8[x >> 21] | ((uint32_t) tq_lut_i8[(x >> 10) & 2047u] << 16));
+        if constexpr (TqInfo<TY>::NS == 64) {   // lane l = steps 8l .. 8l + 7, int i = steps 8l + 2i, 8l + 2i + 1
+            uint32_t s[8];
+            tq_states4<TY>(b->qs, 2 * iqs, s);
+            tq_states4<TY>(b->qs, 2 * iqs + 4, s + 4);
+            for (int i = 0, j = 0; i < 4; ++i, j += 2) {
+                const uint32_t x0 = (s[j] & TQ_STATE_MASK) * 0x9e3779b1u;
+                const uint32_t x1 = (s[j + 1] & TQ_STATE_MASK) * 0x9e3779b1u;
+                r.q[i] = (int) ((uint32_t) tq_lut_i8[x0 >> 21] | ((uint32_t) tq_lut_i8[x1 >> 21] << 16));
+            }
+        } else {
+            uint32_t s[4];
+            tq_states4<TY>(b->qs, iqs, s);
+            for (int i = 0; i < 4; ++i) {
+                const uint32_t x = (s[i] & TQ_STATE_MASK) * 0x9e3779b1u;
+                r.q[i] = (int) ((uint32_t) tq_lut_i8[x >> 21] | ((uint32_t) tq_lut_i8[(x >> 10) & 2047u] << 16));
+            }
         }
         r.d = tq_h2f(b->d);
         return r;
@@ -854,6 +888,9 @@ template<int TY> struct SplitTq {
 template<> struct Split<144> : SplitTq<144> {};
 template<> struct Split<145> : SplitTq<145> {};
 template<> struct Split<146> : SplitTq<146> {};
+template<> struct Split<147> : SplitTq<147> {};
+template<> struct Split<148> : SplitTq<148> {};
+template<> struct Split<149> : SplitTq<149> {};
 
 template<int TY, int BSZ, int QK, int IPB, int STEP> struct FmtOf {
     static constexpr int bsz = BSZ, qk = QK, ipb = IPB, step = STEP;
@@ -885,6 +922,9 @@ template<> struct Fmt<14> : FmtOf<14, (int) sizeof(block_q6_K), 256, QI6_K / VDR
 template<> struct Fmt<144> : FmtOf<144, (int) sizeof(block_tq2_t), 128, 8, 4> {};
 template<> struct Fmt<145> : FmtOf<145, (int) sizeof(block_tqk6), 128, 8, 4> {};
 template<> struct Fmt<146> : FmtOf<146, (int) sizeof(block_tqk7), 128, 8, 4> {};
+template<> struct Fmt<147> : FmtOf<147, (int) sizeof(block_tqp5), 128, 8, 4> {};
+template<> struct Fmt<148> : FmtOf<148, (int) sizeof(block_tqp6), 128, 8, 4> {};
+template<> struct Fmt<149> : FmtOf<149, (int) sizeof(block_tqp7), 128, 8, 4> {};
 template<> struct Fmt<10> : FmtOf<10, (int) sizeof(block_q2_K), 256, QI2_K / 2, 2> {};   // two words a call
 template<> struct Fmt<11> : FmtOf<11, (int) sizeof(block_q3_K), 256, QI3_K / VDR_Q3_K, VDR_Q3_K> {};
 
@@ -1246,15 +1286,21 @@ sycl::event launch_native_gu_fused(sycl::queue& q, size_t cap_groups, const unsi
     });
 }
 
-template<int TD, int LPR>
+// WS (STRATA_DOWN_WS, upstream 6a6d58ad0: down_ws_on): the work-group's kM8Rows weight rows are first copied into
+// local memory, 16 bytes a load where the rows' start allows, and the row dots read that copy.  The copy keeps the
+// rows' start address modulo 16, so every load inside a row sees the alignment it has in device memory, and the sums
+// are the same code on the same bytes: the output is bitwise the kernel's without WS.
+template<int TD, int LPR, bool WS = false>
 sycl::event launch_native_down_lds(sycl::queue& q, size_t cap_groups, const unsigned long long* grp_ptr,
                                    const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
                                    const block_q8_1* hq, NativeExpertLayout L, float* out) {
     constexpr int RPW = kWarp / LPR, WG = 8 * kWarp;
     static_assert(kM8Rows % (8 * RPW) == 0, "whole passes");
     const int hb = (int) (L.n_ff / 32);
+    const size_t wvecs = WS ? ((size_t) kM8Rows * L.d_row + 15) / 16 + 1 : 1;   // + 1: room to keep the alignment
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<int, 1> sh(sycl::range<1>((size_t) kEntriesPass * hb * 9), h);
+        sycl::local_accessor<sycl::vec<uint32_t, 4>, 1> sw(sycl::range<1>(wvecs), h);
         h.parallel_for(sycl::nd_range<2>({cap_groups, (size_t) ((L.n_embd + kM8Rows - 1) / kM8Rows) * WG}, {1, WG}),
                        [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kWarp)]] {
             const int g = (int) it.get_group(0);
@@ -1266,6 +1312,21 @@ sycl::event launch_native_down_lds(sycl::queue& q, size_t cap_groups, const unsi
             const auto* shb = reinterpret_cast<const block_q8_1*>(sh.template get_multi_ptr<sycl::access::decorated::no>().get());
             const uint8_t* blob = (const uint8_t*) grp_ptr[g];
             const int e0 = grp_start[g], e1 = grp_start[g + 1];
+            const int rb = (int) it.get_group(1) * kM8Rows;   // the work-group's first row
+            [[maybe_unused]] const uint8_t* lw = nullptr;     // its rows in local memory (WS)
+            if constexpr (WS) {
+                const uint8_t* wbase = blob + L.down_off + (size_t) rb * L.d_row;
+                const size_t nbytes = (size_t) sycl::min(kM8Rows, (int) L.n_embd - rb) * L.d_row;
+                const size_t off = (size_t) ((uintptr_t) wbase & 15);
+                uint8_t* lb = reinterpret_cast<uint8_t*>(sw.template get_multi_ptr<sycl::access::decorated::no>().get());
+                if (off == 0 && nbytes % 16 == 0) {
+                    const auto* src = reinterpret_cast<const sycl::vec<uint32_t, 4>*>(wbase);
+                    for (size_t i = (size_t) tid; i < nbytes / 16; i += WG) sw[i] = src[i];
+                } else {
+                    for (size_t i = (size_t) tid; i < nbytes; i += WG) lb[off + i] = wbase[i];
+                }
+                lw = lb + off;   // made visible by the barrier before the entries' activations are read
+            }
             for (int c0 = e0; c0 < e1; c0 += kEntriesPass) {
                 const int cn = sycl::min(kEntriesPass, e1 - c0);
                 sycl::group_barrier(it.get_group());
@@ -1281,8 +1342,10 @@ sycl::event launch_native_down_lds(sycl::queue& q, size_t cap_groups, const unsi
                     const bool valid = r < L.n_embd;
                     const int nb = valid ? (int) (L.n_ff / Fmt<TD>::qk) : 0;
                     float s[kEntriesPass];
-                    seg_dot_multi<TD, LPR, kEntriesPass, void, false>(sg, blob + L.down_off + (size_t) (valid ? r : 0) * L.d_row,
-                                                         xs, cn, nb, (int) (L.n_ff / Fmt<TD>::qk), seg_lane, s);
+                    const uint8_t* wr = WS ? lw + (size_t) (valid ? r - rb : 0) * L.d_row
+                                           : blob + L.down_off + (size_t) (valid ? r : 0) * L.d_row;
+                    seg_dot_multi<TD, LPR, kEntriesPass, void, false>(sg, wr, xs, cn, nb, (int) (L.n_ff / Fmt<TD>::qk),
+                                                                      seg_lane, s);
                     if (valid && seg_lane == 0)
                         for (int j = 0; j < cn; ++j) out[(size_t) ent_dst[c0 + j] * L.n_embd + r] = s[j];
                 }
@@ -1308,6 +1371,25 @@ size_t local_mem_bytes(sycl::queue& q) {
     static core::PerDevice<size_t> per_device;
     const sycl::device d = q.get_device();
     return per_device.get(d, [&d] { return (size_t) d.get_info<sycl::info::device::local_mem_size>(); });
+}
+
+// STRATA_DOWN_WS=1 (upstream 6a6d58ad0, opt-in): the mode-8 down rows of IQ4_NL and Q2_0 staged in local memory
+// (launch_native_down_lds' WS) on a device that reports compute capability 6.0 (Pascal GP100: no dp4a, its row dots
+// wait on 2-byte loads from device memory).  Upstream measured it on one GP100 die only (a one-token window's down
+// 72.6 / 53.5 us -> 42.3 / 38.6 us for IQ4_NL / Q2_0); there is no such GPU here.  Elsewhere the switch does nothing.
+bool down_ws_on(sycl::queue& q) {
+    static const bool env = [] {
+        const char* v = std::getenv("STRATA_DOWN_WS");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (!env) return false;
+    static core::PerDevice<bool> gp100;
+    const sycl::device d = q.get_device();
+    return gp100.get(d, [&d] {
+        namespace syclex = sycl::ext::oneapi::experimental;
+        return d.get_backend() == sycl::backend::ext_oneapi_cuda &&
+               d.get_info<syclex::info::device::architecture>() == syclex::architecture::nvidia_gpu_sm_60;
+    });
 }
 
 // ---------------------------------------------------------------- q8_1 (quantize.cu)
@@ -1696,16 +1778,28 @@ inline void dq_bf16(const void* vx, int64_t ibs, const Out& o, int tid) {
 }
 
 // the trellis types: one 256-value call is two 128-value blocks; work-item tid decodes block tid / 16, lane
-// (tid / 2) % 8, steps 2 (tid % 2) .. 2 (tid % 2) + 1 (8 values), through the fp16 codebook (ggml's to_float)
+// (tid / 2) % 8, steps 2 (tid % 2) .. 2 (tid % 2) + 1 (8 values; TQP: steps 8l + 4 (tid % 2) .. + 3), through the fp16
+// codebook (ggml's to_float)
 template<int TY, typename Out>
 inline void dq_tq(const void* vx, int64_t ibs, const Out& o, int tid) {
     const int blk = tid >> 4, l = (tid >> 1) & 7, half = tid & 1;
     const auto* b = (const typename TqInfo<TY>::block_t*) vx + 2 * ibs + blk;
     const float d = tq_h2f(b->d);
-    uint32_t s[4];
-    tq_states4<TY>(b->qs, l, s);
     const uint32_t* lut = (const uint32_t*) tq_lut_f16;
     float v[8];
+    if constexpr (TqInfo<TY>::NS == 64) {
+        uint32_t s[4];
+        tq_states4<TY>(b->qs, 8 * l + 4 * half, s);
+        for (int i = 0; i < 4; ++i) {
+            const uint32_t pa = lut[((s[i] & TQ_STATE_MASK) * 0x9e3779b1u) >> 21];
+            v[2 * i + 0] = d * tq_h2f(pa & 0xFFFFu);
+            v[2 * i + 1] = d * tq_h2f(pa >> 16);
+        }
+        o.template put<8>(blk * 128 + 16 * l + 8 * half, v);
+        return;
+    }
+    uint32_t s[4];
+    tq_states4<TY>(b->qs, 4 * l, s);
     for (int i = 0; i < 2; ++i) {
         const uint32_t x = (s[2 * half + i] & TQ_STATE_MASK) * 0x9e3779b1u;
         const uint32_t pa = lut[x >> 21], pb = lut[(x >> 10) & 2047u];
@@ -1744,6 +1838,9 @@ inline void dq_dispatch(int ty, const void* vx, int64_t ibs, const Out& o, int t
         case 144: dq_tq<144>(vx, ibs, o, tid); break;
         case 145: dq_tq<145>(vx, ibs, o, tid); break;
         case 146: dq_tq<146>(vx, ibs, o, tid); break;
+        case 147: dq_tq<147>(vx, ibs, o, tid); break;
+        case 148: dq_tq<148>(vx, ibs, o, tid); break;
+        case 149: dq_tq<149>(vx, ibs, o, tid); break;
         default: break;
     }
 }
@@ -1804,7 +1901,7 @@ inline void dq_one(const void* vx, int64_t ibs, const Out& o, int tid) {
     else if constexpr (TYPE == 29) dq_iq1_m(vx, ibs, o, tid);
     else if constexpr (TYPE == 19) dq_iq1_s(vx, ibs, o, tid);
     else if constexpr (TYPE == 42) dq_q2_0(vx, ibs, o, tid);
-    else if constexpr (TYPE == 144 || TYPE == 145 || TYPE == 146) dq_tq<TYPE>(vx, ibs, o, tid);
+    else if constexpr (is_tq(TYPE)) dq_tq<TYPE>(vx, ibs, o, tid);
     else static_assert(TYPE == 16, "iq_gemm: type");
 }
 
@@ -1946,7 +2043,7 @@ sycl::event launch_iq_gemm(sycl::queue& q, const sycl::half* X, const IqGemmPtrs
 // dequant and xmx_gemm_grouped instead
 bool in_iq_gemm(int t) {
     return t == 16 || t == 17 || t == 18 || t == 19 || t == 20 || t == 21 || t == 22 || t == 23 || t == 29 || t == 42 ||
-           t == 144 || t == 145 || t == 146;
+           is_tq(t);
 }
 bool is_iq(int t) {
     return in_iq_gemm(t) || t == 10 || t == 11 || t == 12 || t == 13 || t == 14 || t == 6 || t == 7 || t == 8 || t == 2 ||
@@ -1988,6 +2085,9 @@ size_t iq_row_bytes(int t, int64_t n) noexcept {
         case 144: return (size_t) (n / 128) * sizeof(block_tq2_t);
         case 145: return (size_t) (n / 128) * sizeof(block_tqk6);
         case 146: return (size_t) (n / 128) * sizeof(block_tqk7);
+        case 147: return (size_t) (n / 128) * sizeof(block_tqp5);
+        case 148: return (size_t) (n / 128) * sizeof(block_tqp6);
+        case 149: return (size_t) (n / 128) * sizeof(block_tqp7);
         default: return 0;
     }
 }
@@ -2132,6 +2232,9 @@ void iq_mmvq(int t, const void* w, const void* x_q8_1, float* y, int n_in, int n
         case 144: e = launch_mmvq<144>(q, W, rb, X, y, n_in, n_out, ncols); break;
         case 145: e = launch_mmvq<145>(q, W, rb, X, y, n_in, n_out, ncols); break;
         case 146: e = launch_mmvq<146>(q, W, rb, X, y, n_in, n_out, ncols); break;
+        case 147: e = launch_mmvq<147>(q, W, rb, X, y, n_in, n_out, ncols); break;
+        case 148: e = launch_mmvq<148>(q, W, rb, X, y, n_in, n_out, ncols); break;
+        case 149: e = launch_mmvq<149>(q, W, rb, X, y, n_in, n_out, ncols); break;
         default: throw core::DeviceError("iq_mmvq: type " + std::to_string(t) + " is not supported");
     }
     sync_if_needed(stream, e, "iq_mmvq");
@@ -2229,6 +2332,9 @@ void iq_gemm_grouped_f16(int t, const uint16_t* X, const void* const* W, int64_t
         case 144: e = launch_iq_gemm<144>(q, x, w, interleave, Y, ldy, bounds, G, max_rows, N, K); break;
         case 145: e = launch_iq_gemm<145>(q, x, w, interleave, Y, ldy, bounds, G, max_rows, N, K); break;
         case 146: e = launch_iq_gemm<146>(q, x, w, interleave, Y, ldy, bounds, G, max_rows, N, K); break;
+        case 147: e = launch_iq_gemm<147>(q, x, w, interleave, Y, ldy, bounds, G, max_rows, N, K); break;
+        case 148: e = launch_iq_gemm<148>(q, x, w, interleave, Y, ldy, bounds, G, max_rows, N, K); break;
+        case 149: e = launch_iq_gemm<149>(q, x, w, interleave, Y, ldy, bounds, G, max_rows, N, K); break;
         default: e = launch_iq_gemm<42>(q, x, w, interleave, Y, ldy, bounds, G, max_rows, N, K); break;
     }
     sync_if_needed(stream, e, "iq_gemm_grouped_f16");
@@ -2248,9 +2354,9 @@ bool native_expert_supported(int gu_type, int d_type, int64_t n_embd, int64_t n_
     const bool d = d_type == 20 || d_type == 23 || d_type == 42 || d_type == 6 || d_type == 7 || d_type == 8 ||
                    d_type == 2 || d_type == 3 || d_type == 14 || d_type == 10 || d_type == 11 || d_type == 12 ||
                    d_type == 13 || d_type == 16 || d_type == 17 || d_type == 18 || d_type == 21 || d_type == 22 ||
-                   d_type == 144 || d_type == 145 || d_type == 146;
+                   is_tq(d_type);
     const auto qk = [](int t) {
-        return t == 20 || t == 6 || t == 7 || t == 8 || t == 2 || t == 3 ? 32 : t == 42 ? 64 : t >= 144 && t <= 146 ? 128 : 256;
+        return t == 20 || t == 6 || t == 7 || t == 8 || t == 2 || t == 3 ? 32 : t == 42 ? 64 : is_tq(t) ? 128 : 256;
     };
     return gu && d && n_embd > 0 && n_ff > 0 && n_embd % qk(gu_type) == 0 && n_ff % qk(d_type) == 0 &&
            n_embd % 256 == 0;   // the dequantizers write whole 256-value pieces of a gate/up row
@@ -2311,8 +2417,9 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const bool fused_gu = m8 && (L.up_type < 0 || L.up_type == L.gu_type) && (L.gu_type == 16 || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 ||
                                  L.gu_type == 23) &&
                           grid_bytes + xbytes + (size_t) kEntriesPass * kM8Rows * sizeof(float) <= local_mem_bytes(q);
-    const bool lds_down = m8 && (L.d_type == 20 || L.d_type == 42) &&
-                          (size_t) kEntriesPass * (size_t) (L.n_ff / 32) * sizeof(block_q8_1) <= local_mem_bytes(q);
+    const size_t hbytes = (size_t) kEntriesPass * (size_t) (L.n_ff / 32) * sizeof(block_q8_1);
+    const bool lds_down = m8 && (L.d_type == 20 || L.d_type == 42) && hbytes <= local_mem_bytes(q);
+    const bool ws_down = lds_down && down_ws_on(q) && hbytes + (size_t) kM8Rows * L.d_row + 32 <= local_mem_bytes(q);
     if (fused_gu) {
         const size_t cgs = (size_t) cap_groups;
         switch (L.gu_type) {
@@ -2347,6 +2454,9 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
             case 144: launch_native_gu<144, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
             case 145: launch_native_gu<145, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
             case 146: launch_native_gu<146, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
+            case 147: launch_native_gu<147, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
+            case 148: launch_native_gu<148, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
+            case 149: launch_native_gu<149, GU_LPR>(q, cg, grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up, part); break;
             default: throw core::DeviceError("native_expert_grouped: gate/up type " + std::to_string(ty));
         }
     };
@@ -2394,7 +2504,10 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     sycl::event e;
     if (lds_down) {
         const size_t cgs = (size_t) cap_groups;
-        if (L.d_type == 20) e = launch_native_down_lds<20, down_lpr<20>()>(q, cgs, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        if (ws_down) {
+            if (L.d_type == 20) e = launch_native_down_lds<20, down_lpr<20>(), true>(q, cgs, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+            else e = launch_native_down_lds<42, down_lpr<42>(), true>(q, cgs, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+        } else if (L.d_type == 20) e = launch_native_down_lds<20, down_lpr<20>()>(q, cgs, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
         else e = launch_native_down_lds<42, down_lpr<42>()>(q, cgs, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
     } else
     switch (L.d_type) {
@@ -2421,6 +2534,9 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
         case 144: e = launch_native_down<144, down_lpr<144>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 145: e = launch_native_down<145, down_lpr<145>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         case 146: e = launch_native_down<146, down_lpr<146>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 147: e = launch_native_down<147, down_lpr<147>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 148: e = launch_native_down<148, down_lpr<148>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        case 149: e = launch_native_down<149, down_lpr<149>()>(q, cg, grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
         default: throw core::DeviceError("native_expert_grouped: down type " + std::to_string(L.d_type));
     }
     sync_if_needed(stream, e, "native_expert_grouped");

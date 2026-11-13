@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-// SPDX-License-Identifier: MIT
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/ngram/ple_reader.cpp - see include/strata/ngram/ple_reader.hpp.
 #include "strata/ngram/ple_reader.hpp"
 #include "strata/platform/aux_cpus.hpp"
@@ -431,6 +432,13 @@ PleReader::Ticket PleReader::issue(const uint32_t* rows, size_t n, uint8_t* out_
     const bool rearm = m.keep_us > 0 && (m.last_issue_us <= 0 || now - m.last_issue_us > m.keep_window_us);
     m.last_issue_us = now;
     TicketState& ts = m.tickets[id];
+    // After a failed read the reader stays failed (`collect` reports `error` until the next `open`) and its worker has
+    // parked (worker_loop). A ticket queued now would never be read and `collect` would wait for it for ever, so it
+    // is not queued: it has no jobs, and `collect` returns the error at once (upstream ebe3383a3, #3602).
+    if (!m.error.empty()) {
+        ts.pending = 0;
+        return Ticket{id};
+    }
     std::unordered_map<uint64_t, size_t> by_page;     // aligned offset -> index in `jobs`
     std::vector<Job> jobs;
     for (size_t i = 0; i < n; ++i) {
@@ -497,7 +505,7 @@ bool PleReader::collect(Ticket t, std::string& err) {
         });
         it = m.tickets.find(t.id);
         if (it == m.tickets.end()) { err = "PleReader: unknown ticket"; return false; }
-        if (!m.error.empty()) { err = m.error; return false; }
+        if (!m.error.empty()) { err = m.error; m.tickets.erase(it); return false; }
         m.stats.wait_us += now_us() - start;
         m.tickets.erase(it);
         return true;
@@ -510,7 +518,7 @@ bool PleReader::collect(Ticket t, std::string& err) {
         it = m.tickets.find(t.id);
         if (it == m.tickets.end()) { err = "PleReader: unknown ticket"; return false; }
     }
-    if (!m.error.empty()) { err = m.error; return false; }
+    if (!m.error.empty()) { err = m.error; m.tickets.erase(it); return false; }
     m.stats.wait_us += now_us() - start;
     m.tickets.erase(it);
     return true;

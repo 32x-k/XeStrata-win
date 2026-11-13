@@ -57,13 +57,15 @@ case "$distro" in
       patchelf curl ca-certificates unzip libblosc2-dev libvulkan-dev glslc spirv-headers dpkg-dev file gpg ccache lld opencl-headers \
       xz-utils
     python_deps="python3 (>= 3.10), python3-numpy, python3-jinja2, python3-regex, python3-yaml, python3-tqdm, \
-python3-requests, python3-pil, python3-psutil"
+python3-requests, python3-pil, python3-psutil, python3-jsonschema"
     # Ubuntu's libze-intel-gpu1 does not depend on the graphics compiler it opens (libigc2, libigdfcl2): without them
     # the driver aborts at the first kernel
     level_zero="libze1, libze-intel-gpu1, libigc2, libigdfcl2"
     # oneDNN's SDPA (the image engine's attention on Intel GPUs) runs on OpenCL: Intel's driver and the ICD loader
     opencl="intel-opencl-icd, ocl-icd-libopencl1"
     vulkan_icd="mesa-vulkan-drivers"
+    jxl="libjxl-tools"   # cjxl: the images' JPEG XL (serve/images.py)
+    pdf="poppler-utils"  # a PDF a request sends: pdftotext and pdftoppm (serve/server.py read_file)
     if [ "$license" = contrib ]; then
       case "$cuda_ver" in
         12.4) apt-get install -y -q --no-install-recommends nvidia-cuda-toolkit
@@ -89,10 +91,12 @@ python3-requests, python3-pil, python3-psutil"
     dnf install -y -q git cmake ninja-build gcc-c++ hwloc-devel libzstd-devel libzstd-static python3 patchelf curl unzip \
       blosc2-devel vulkan-loader-devel glslc spirv-headers-devel rpm-build file findutils ccache lld opencl-headers
     python_deps="python3 >= 3.10, python3-numpy, python3-jinja2, python3-regex, python3-pyyaml, python3-tqdm, \
-python3-requests, python3-pillow, python3-psutil"
+python3-requests, python3-pillow, python3-psutil, python3-jsonschema"
     level_zero="oneapi-level-zero, intel-level-zero"
     opencl="intel-opencl, OpenCL-ICD-Loader"   # as on Ubuntu
     vulkan_icd="mesa-vulkan-drivers"
+    jxl="libjxl-utils"
+    pdf="poppler-utils"     # as on Ubuntu
     if [ "$license" = contrib ]; then
       dnf install -y -q dnf5-plugins   # config-manager
       dnf config-manager addrepo \
@@ -178,9 +182,11 @@ cmake --build /build/engine --target $targets -j "$jobs"
 # What the package depends on (Python's modules, and the libraries the engine links), recommends and suggests.  A GPU
 # maker's driver and libraries are never required: the free package recommends Intel's Level Zero driver and AMD's
 # ROCm libraries (both free software, for the GPUs it runs), and the cuda ones, for a PC with GPUs of one maker or
-# more, only suggest every maker's, so that apt and dnf do not install the others'.
+# more, only suggest every maker's, so that apt and dnf do not install the others'.  Every package recommends libjxl's
+# tools (the images' JPEG XL) and poppler's (a PDF a request sends).  jsonschema is a Python module it depends on: a
+# strict request is refused without it (serve/structured.py).
 depends=$python_deps
-recommends=""
+recommends="$jxl, $pdf"
 suggests=""
 # the packages of the libraries the HIP adapter and oneMath's rocBLAS backend open: ROCm's HIP runtime, rocBLAS and
 # hipBLASLt
@@ -193,7 +199,7 @@ pkg_of() {
 }
 rocm="$(pkg_of libamdhip64.so), $(pkg_of librocblas.so), $(pkg_of libhipblaslt.so)"
 if [ "$license" = free ]; then
-  recommends="$level_zero, $opencl, $rocm, $vulkan_icd"
+  recommends="$recommends, $level_zero, $opencl, $rocm, $vulkan_icd"
 else
   # and oneMKL's
   mkl=$(readlink -f /opt/intel/oneapi/mkl/latest/lib/libmkl_sycl_blas.so)

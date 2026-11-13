@@ -31,8 +31,8 @@ const char* gemm_path(XmxType t);
 /// block loads and stores).  The others go to gemm_rows.
 bool xmx_gemm_ok(const void* X, const void* W, const float* Y, int64_t N, int64_t K, int64_t ldy) noexcept;
 
-/// `accumulate`: Y += X . W^T (Y read before the product is added, in FP32); BF16 only on the XMX engines (without
-/// them the sum goes through gemm_rows).
+/// `accumulate`: Y += X . W^T (Y read before the product is added, in FP32); on the XMX engines, and without
+/// them through gemm_rows.  (An image engine's LoRA delta adds into a product's output this way.)
 void xmx_gemm(XmxType t, const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
               void* stream, bool accumulate = false);
 

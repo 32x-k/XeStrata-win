@@ -12,6 +12,7 @@
 // pinned RAM and copied in at each step (an edit with many or large reference images).
 #pragma once
 
+#include "strata/image/image_lora.hpp"
 #include "strata/image/pipeline.hpp"
 #include "strata/image/qi_stream.hpp"
 #include "strata/image/qi_kernels.hpp"
@@ -19,6 +20,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -70,12 +72,16 @@ public:
 
     /// The flow sampler: x (device FP32 [64][H][W], the starting noise) through `sigmas` by Euler's steps.
     /// `step` (if set) is called after each step with (steps done, steps); it returns false to stop (the sampler then
-    /// throws QiStopped).  `after` (if set) is given x and the step's new sigma first, on the sampler's stream (an
-    /// edit's mask: qi_inpaint_blend).  `cfg` above 1 (with a second context set): classifier-free guidance, the
+    /// throws QiStopped).  `after` (if set) is given x and the step's new sigma first, on the sampler's stream (a mask:
+    /// img_start.hpp's blend).  `cfg` above 1 (with a second context set): classifier-free guidance, the
     /// velocity neg + cfg * (cond - neg) of the two contexts' (diffusers' true_cfg_scale).
+    /// `peek` (if set) is called after each step with the steps done and a function that writes the step's x0, the
+    /// sampler's prediction of the finished latent (x - sigma * v), into a buffer of x's size: a partial image's
+    /// latent, on the sampler's stream; the sampling itself is not changed.
     void sample(float* x, int64_t H, int64_t W, const std::vector<float>& sigmas,
                 const std::function<bool(int, int)>& step = {},
-                const std::function<void(float*, float)>& after = {}, float cfg = 1.0f);
+                const std::function<void(float*, float)>& after = {}, float cfg = 1.0f,
+                const std::function<void(int, const std::function<void(float*)>&)>& peek = {});
 
     int64_t channels() const { return in_ch_; }
     int64_t hidden() const { return C_; }
@@ -92,6 +98,8 @@ public:
     uint64_t activations_held() const { return cap_T_ > 0 ? activation_bytes(cap_T_, mlp_rows_) : 0; }
     /// Frees the blocks' VRAM (they come back from the file on use).
     void drop_blocks() { blocks_stream_.drop(); }
+    /// Frees the streamed blocks' copies in RAM (LayerStream's homes).
+    void drop_block_homes() { blocks_stream_.drop_homes(); }
     /// Frees the activations (grown again on use).
     void drop_activations();
     /// The GPU memory the activations of a T-token sequence take, the MLP computed `mlp_rows` rows at a time (0: all).
@@ -108,6 +116,28 @@ public:
     /// The rows the MLP takes at a time (0: all of them): its 2 x 12288-wide product is the largest activation.
     void set_mlp_rows(int64_t rows);
 
+    /// An adapter as a file names it: a weight of the DiT, and the rows of the weight a file's entry of that name
+    /// changes (a fused weight's halves by their own names: img_mlp.gate_layer is gate_up's rows [0, inter)).
+    struct LoraTarget {
+        std::string name;
+        int64_t row0 = 0, rows = 0, cols = 0;
+    };
+    /// The weights adapters may change: what a file's keys are matched against (the probe's map, the server's list).
+    std::vector<LoraTarget> lora_targets() const;
+
+    /// The adapters the next steps apply, each with its strength, bound to the weights' products: a key the DiT does
+    /// not take (or a shape that is not its weight's, or a form the engine does not apply) is false with err, and
+    /// nothing bound.  The context starts again (set_context before the next forward): the prefix's K and V were the
+    /// other adapters'.  The same set again (its files and strengths) changes nothing.
+    bool set_loras(const std::vector<LoraUse>& loras, std::string& err);
+    /// The set bound, as its files' paths and strengths (empty: none).
+    const std::string& lora_key() const { return lora_key_; }
+    /// The bound entries' A and B on the GPU.
+    uint64_t lora_bytes() const;
+    /// The adapter files bound (a set whose strengths are all 0 binds none).
+    int lora_count() const { return (int) lora_files_.size(); }
+    void drop_loras();
+
 private:
     struct W {
         int type = 0;
@@ -116,6 +146,7 @@ private:
         uint64_t row_bytes = 0;
         bool packed = false;    // Q8_0 rewritten for q8_mma_gemm (q8_mma_repack)
         bool w8 = false;        // rewritten as int8 rows and a scale a row (qi_rows_i8) for prefill::Gemm::i8
+        LoraLayer* lora = nullptr;   // the adapters' deltas for its products (null: none: the product is unchanged)
     };
     struct Block {
         W q, k, v, o, gu, down;   // d: the offset within the block's region (LayerStream)
@@ -143,6 +174,12 @@ private:
     void forward_pair(const float* x, float t, int64_t H, int64_t W, float* out, float* out2);
     void ensure(int64_t T, int64_t HW);
     void swap_context();   // the first context's state <-> other_'s
+    /// The weights adapters may take, from the blocks and the weights outside them (open).
+    void build_lora_targets();
+    /// The products' scratch: T rows of the largest bound rank, FP32 and FP16 (grown on use).
+    void lora_scratch(int64_t T);
+    /// The context's prefix let go: its text rows, and both contexts' K and V caches (an adapter change).
+    void drop_prefix();
 
     std::unique_ptr<GgufFile> g_;
     void* s_ = nullptr;
@@ -156,6 +193,41 @@ private:
     const float* tnorm_ = nullptr;
     std::vector<Block> blocks_;
     LayerStream blocks_stream_;
+    // the adapters: the weights a file's keys land on, the layers the weights hold, and the products' scratch
+    struct LoraSlot {
+        std::string name;
+        W* w = nullptr;
+        int64_t row0 = 0, rows = 0;
+    };
+    /// A DoRA's row norms: the norms of a slot's weight, one a row of it, from the file's tensor (a fused weight's
+    /// gate_layer and proj are its gate_up's rows), cached a tensor (open drops the cache).
+    bool dora_norms(const LoraSlot& slot, std::vector<float>& out, std::string& err);
+    /// One of the file's tensors' row norms, FP32, cached (`key`: the GGUF's own name).
+    bool tensor_norms(const std::string& key, const std::vector<float>*& out, std::string& err);
+    std::vector<LoraSlot> lora_slots_;
+    std::vector<std::unique_ptr<LoraLayer>> lora_layers_;
+    std::vector<std::shared_ptr<const LoraFile>> lora_files_;
+    std::string lora_key_;
+    int64_t lora_cols_ = 0;   // the deltas' scratch's columns (the largest lora_scratch_cols of the bound entries)
+    float* lora_f32_ = nullptr;
+    uint16_t* lora16_ = nullptr;
+    int64_t lora_tmp_t_ = 0;   // the scratch's rows
+    // a GLoRA's own path: its input's columns, the weight's rows it is added over, and the buffers a band of its
+    // products takes (the rows' table, a W8A8 weight's int8 input and its scales, a Q8_0 weight's packed one)
+    int64_t lora_glora_cols_ = 0, lora_glora_rows_ = 0;
+    float* lora_glora_y_ = nullptr;
+    int8_t* lora_glora_x8_ = nullptr;
+    float* lora_glora_sx_ = nullptr;
+    void* lora_glora_xq_ = nullptr;
+    size_t lora_glora_xq_bytes_ = 0;
+    void lora_glora_scratch();   // allocates them, once a set with a GLoRA is bound
+    void free_glora_scratch();
+    /// A GLoRA's own path: the weight's rows [r0, r0 + n) product of v (nt tokens, the first of them t0), added to
+    /// the product's output y at the rows' place in it (the weight's own path, as product takes it).
+    void glora_weight(const uint16_t* v, const W& w, int64_t r0, int64_t n, int64_t nt, int64_t t0, float* y,
+                      int64_t ldy, int64_t row0);
+    std::map<std::string, std::vector<float>> norm_cache_;   // DoRA's row norms, a file's tensor (open clears them)
+    bool prefix_cache_ = false;   // the blocks' pk and pv hold the context's prefix (set_context; set_loras drops it)
     // activations, grown on demand
     int64_t cap_T_ = 0, mlp_cap_ = 0, mlp_rows_ = 0;
     int64_t dirty_T_ = 0;   // the most rows q16_, k16_ and v16_ were written to (the padding past a shorter T is zeroed)
@@ -176,12 +248,14 @@ private:
     std::vector<float> pre_pos_;      // the prefix rows' positions [n_text][3]
     int64_t target_pos_ = 0;          // the image's first position
     int32_t* key_lim_ = nullptr;      // the prefix rows' key limits, with references (null: each its own prefix)
+    std::vector<std::pair<int64_t, int64_t>> ref_spans_;   // the references' rows [a, b): they see keys 0 .. b - 1
     // the other context (guidance's negative prompt): the same state, swapped in while it runs (swap_context)
     struct Context {
         float* text = nullptr;
         int64_t n_text = 0, target_pos = 0;
         std::vector<float> pre_pos;
         int32_t* key_lim = nullptr;
+        std::vector<std::pair<int64_t, int64_t>> ref_spans;
         std::vector<uint16_t*> pk, pv;
         float *cos = nullptr, *sin = nullptr;   // its rotary tables (forward_pair), for this size and prefix
         int64_t rope_H = -1, rope_W = -1, rope_text = -1, rope_cap = 0;

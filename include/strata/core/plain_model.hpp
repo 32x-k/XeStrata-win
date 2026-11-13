@@ -11,6 +11,9 @@
 // and whose head is rms_norm, then the output projection.  Qwen3.8 (four residual streams, the QSA indexer, PLE) keeps
 // its own engine.
 //
+// qwen35 (Qwen3.5-9B) is qwen35moe's block with a dense SwiGLU in place of the MoE (`dense_`): every weight in VRAM, a
+// window one graph with nothing for the host to answer, the prompt's buffers of their own; no tiers, no CPU pool.
+//
 // glm5-next (GLM-5.3-Flash, plain_glm5.cpp) runs here too, with its own block: four mHC streams read before and written
 // after every mixer and FFN, KDA (per-channel decay) and DSA (a k-pool indexer, the MLA attention over its selection)
 // mixers, leading dense FFN layers, a sigmoid router and the clamped SwiGLU; the expert tiers and the windows as above.
@@ -29,12 +32,15 @@
 #pragma once
 
 #include "strata/artifact/model_spec.hpp"
+#include "strata/core/draft_head.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/moe_window.hpp"
 #include "strata/kernels/cpu/pool.hpp"
+#include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/spec/draft_policy.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -52,12 +58,36 @@ namespace strata::core {
 struct PlainOptions {
     std::string gguf;               ///< any shard of the model
     int64_t max_cells = 4096;       ///< the context the K/V cache holds
+    /// --kv int8: the attention layers' K and V as int8 codes with an FP16 scale per 64 values (kv_q8.hpp), half the
+    /// FP16 cache's bytes; the answers differ slightly.  Not GLM-5.3-Flash's DSA caches.
+    bool kv_int8 = false;
+    /// --kv-ram on|off (GLM-5.3-Flash): the DSA layers' MLA latent cells in host memory instead of VRAM, which goes to
+    /// the expert tier: a window copies the cells each token selected into VRAM once (glm5_latent_gather), a prompt
+    /// chunk the layer's cells up to it (Project Maya #86's idea, written anew: there the cells live in VRAM slots).
+    /// On by default: with 128K cells the B70's tier went 2,150 -> 2,322 slots and decode 3.84 -> 3.94 tok/s at 56 GB
+    /// of RAM; the RTX 4070 started at all (it had 161 MiB left for the tier), and at 64K went 86 -> 172 slots, its
+    /// prompt 3.3 -> 7.1 tok/s and decode 2.32 -> 2.30 (UD-IQ3_XXS, 1K + 256, 2026-10-26).  The other models: off.
+    bool kv_ram = true;
+    /// --vision (qwen35, qwen35moe): pictures among the prompt's tokens (plain_generate's GENI): their rows in place
+    /// of the token embeddings (set_embeddings) and every cell's M-RoPE position from a table (set_positions)
+    bool vision = false;
+    /// An image model's text encoder (encode: MOSS-Image reads Qwen3.5-9B's states): no head, no decode attention
+    /// timed; the prompt runs in chunks only.  A dense model (qwen35) on one GPU.
+    bool encoder = false;
+    /// An encoder's block matrices left in the mapped file (block_spans): a BlockSource puts each block's on the device
+    /// as the prompt walks the blocks (strata-image's LayerStream, within its budget)
+    bool stream_blocks = false;
+    /// --vram-elastic (#533; --serve, one GPU with virtual memory): the expert slots in physical segments of
+    /// vram_segment_mib that `vram` gives back to the driver and maps again between requests
+    bool vram_elastic = false;
+    int64_t vram_segment_mib = 512;
     int max_t = 8;                  ///< the largest window
     int pool_workers = 0;           ///< CPU pool workers (0: every physical core but the first)
     int64_t reserve_mib = -1;       ///< VRAM left free after the expert slots (-1: from the device's memory)
     int64_t vram_free_mib = -1;     ///< the free VRAM the tier is sized from at most (-1: what the device reports)
     int64_t expert_slots = -1;      ///< the VRAM tier's slots at most, over all the layers (-1: what fits)
     int adapt_every = 4;            ///< windows between adaptive rounds (0: off)
+    bool adapt_every_given = false; ///< --adapt-every was given: its period stays (no auto_adapt_period)
     int adapt_swaps = 96;           ///< the most experts one round moves into the VRAM tier
     /// ... and at most this many MiB of experts for each token the windows read since the last round: the copies share
     /// the RAM's bandwidth with the missed experts.  48: on the RX 9060 XT with a Ryzen 7 5700X (DDR4, 2026-10-12),
@@ -66,6 +96,7 @@ struct PlainOptions {
     /// a token.  On the B70 with an i7-14700 (DDR5) the bound changed nothing (llm-jp 8 GB 41.5 / 41.6).  0: none.
     int adapt_mib_per_token = 48;
     float adapt_decay = 0.7f;       ///< the routing counts are multiplied by this after each round
+    float adapt_min_gain = 1.5f;    ///< an expert moves in only when its count is this much over the one it evicts
     /// The experts read from the GGUF in place (the page cache, the drive) instead of loaded into pinned RAM: the
     /// low-RAM mode, taken by itself when the RAM available is less than the experts.  It has no PCIe share.
     bool mmap_experts = false;
@@ -90,11 +121,21 @@ struct PlainOptions {
     /// The most tokens a prompt chunk takes through the batched products (`prompt`; a shorter prompt, one chunk of its
     /// length); 0: the prompt runs in windows.
     int64_t prompt_chunk = 4096;
+    bool prompt_chunk_given = false;   ///< --prompt-chunk was given: no chunk is chosen (auto_prompt_chunk)
     /// Speculative decoding with the model's MTP layer: windows of up to this many tokens, the last accepted one and
     /// spec - 1 drafts (0 or 1: off; a model without the layer: off).  Greedy requests only.  3 by default: two
     /// drafts were the fastest of one to three on the RX 9060 XT (16 and 8 GB), the B70 and the RTX 4070 (Ornith Q6_K
     /// and Q4_K_M, 2026-10-12).
     int spec = 3;
+    /// --spec-window: how many of the drafts a window checks.  "all": every draft made (the fixed window of spec
+    /// tokens); "auto": the drafts kept while the tokens each is expected to add, at its calibrated acceptance, raise
+    /// the window's expected tokens per ms at the measured window costs (strata::spec::DraftPolicy, as Qwen3.8-Flash-
+    /// Next's engine); "min-p": the drafts while each is at least spec_min_p likely under the MTP layer.  "all" by
+    /// default: auto decoded as fast at spec 3, no faster (Ornith-1.5 Q6_K, 256 tokens: B70 95.5 / 97.7 against 96.5 /
+    /// 95.8 tok/s, RTX 4070 80.0 / 84.2 against 79.4 / 84.7; GLM-5.3-Flash at 56 GB of RAM on the B70 4.17 against
+    /// 4.13, 2026-10-26).
+    std::string spec_window = "all";
+    double spec_min_p = 0.0;
     /// A layer split across the engine's GPUs (--layer-split): GPU 0 runs the blocks before split_at[0], GPU 1 those
     /// from there to split_at[1], and so on, the last GPU the rest, the head and the MTP layer; `split_auto`: the points
     /// chosen at load from each GPU's free memory.  Empty and false: one GPU, the current one.
@@ -122,6 +163,12 @@ public:
     int64_t max_cells() const { return opt_.max_cells; }
     /// The prompt's chunk (0: the prompt runs in windows; GLM-5.3-Flash's for now, whatever the options asked).
     int64_t prompt_chunk() const { return opt_.prompt_chunk; }
+    /// --vision: the M-RoPE positions (t, h, w) of cells 0 .. n - 1, `pos3` 3 n of them on the host
+    /// (kernels/mrope.hpp's table, every stage's; the cells after n keep theirs).  Between requests.
+    bool set_positions(const int32_t* pos3, int64_t n, std::string& err);
+    /// --vision: (*rows)[p], n_embd floats, in place of the embedding of the token at position p where it is not null
+    /// (a picture's rows; null `rows`: none).  The vector outlives the prompt it is set for.
+    void set_embeddings(const std::vector<const float*>* rows);
 
     /// Zeroes the recurrent states and the K/V cache: the next window starts a sequence at position 0.
     bool reset(std::string& err);
@@ -140,7 +187,10 @@ public:
     size_t state_bytes(int64_t tokens) const;
     /// Tokens [0, T) at positions pos .. pos + T - 1 (T <= max_t): out[t] is the greedy token after token t, and with
     /// `logits` the T rows of n_vocab logits.  Positions must follow the previous window's.
-    bool forward(const int32_t* tokens, int T, int64_t pos, int32_t* out, float* logits, std::string& err);
+    /// `defer`: the window's rows are not yet known to be kept (a verify window): spec_step counts the ones it keeps
+    /// (after_rows), else every row counts.
+    bool forward(const int32_t* tokens, int T, int64_t pos, int32_t* out, float* logits, std::string& err,
+                 bool defer = false);
     /// The prompt: tokens [0, n) at positions pos .. pos + n - 1 in chunks of `prompt_chunk` tokens, every projection a
     /// matrix product and the routed experts grouped by expert, all on the GPU (src/prefill/plain_prompt.cpp, in the
     /// prompt path's library).  `out`: the greedy token after the last; `logits`: its row (or null).  The state is left
@@ -153,6 +203,32 @@ public:
     /// Runs each dense product the prompt takes once, so the products' library has loaded its kernels before the
     /// first prompt (plain_prompt.cpp); nothing when the prompt runs in windows.
     bool prompt_warm(std::string& err);
+    /// The states of the prompt tokens [0, n) from position 0: `hidden` takes n rows of n_embd floats, every token's
+    /// last block output through the final norm (host), as the prompt computes them before its logits.  A dense model
+    /// on one GPU: an encoder (PlainOptions::encoder), or the chat's engine, whose conversation the caller saves and
+    /// restores around it.  The state is reset first and left as the prompt leaves it.  False with the reason, also
+    /// when the device cannot lend the prompt's buffers.
+    bool encode(const int32_t* tokens, int64_t n, float* hidden, std::string& err);
+
+    /// A streamed encoder's (PlainOptions::stream_blocks) block matrices on the device, block by block: begin(l) gives
+    /// block l's region for work about to be queued on stream(), end(l) says that work is queued.
+    struct BlockSource {
+        virtual ~BlockSource() = default;
+        virtual const uint8_t* begin(int l) = 0;
+        virtual void end(int l) = 0;
+    };
+    struct HostSpan {
+        const void* host = nullptr;   ///< in the mapped file
+        uint64_t bytes = 0;
+    };
+    /// Block l's matrices in the mapped file, in the order set_block_source's offsets take them.
+    std::vector<HostSpan> block_spans(int64_t l) const;
+    /// Where the blocks' matrices are while the prompt runs: block l's region from `src`, its spans at offsets[l].
+    void set_block_source(BlockSource* src, std::vector<std::vector<uint64_t>> offsets);
+    /// Queues on stream() what a block's region needs each time its matrices are copied there (the engine's row
+    /// layouts of Q6_K and Q8_0, as upload makes them).
+    void prepare_block(int64_t l, uint8_t* region);
+    strata::gpu::Stream stream() const { return cs_; }
     /// Whether every MoE layer's experts take the int8 products on this GPU (iq_mmq; STRATA_PLAIN_MMQ=0: no).
     bool prompt_int8() const;
 
@@ -183,6 +259,21 @@ public:
     int64_t hits() const;
     int64_t misses() const;
     int64_t swaps() const;
+    /// The tiers below VRAM, for the report: the routed entries the GPUs read over PCIe (not in hits or misses), the
+    /// experts taken from the RAM copy and from the model's files, and the bytes read from the files.
+    int64_t offloaded() const;
+    int64_t ram_reads() const;
+    int64_t file_reads() const;
+    uint64_t file_read_bytes() const;
+    /// #533, `VRAM <reserve_mib>` between requests (--vram-elastic): shrinks the VRAM tier until that much VRAM is
+    /// free, or grows it back towards its full size when more is free (reserve_mib < 0: the reserve it started with).
+    /// `answer` gets the protocol line (VRAM reserve_mib=... expert_slots=...); false with `err` when not elastic.
+    bool vram(int64_t reserve_mib, std::string& answer, std::string& err);
+    bool vram_elastic() const { return cache_.segmented(); }
+    /// STRATA_RAM_ADAPT's moves into the RAM copy so far
+    int64_t ram_adapts() const { return complement_ != nullptr ? complement_->ram_adapts() : 0; }
+    /// ...of them, copied out of a stage buffer
+    int64_t ram_staged() const { return complement_ != nullptr ? complement_->ram_staged() : 0; }
     /// The layer split's first blocks after GPU 0's (empty: one GPU).
     std::vector<int64_t> split_points() const;
     /// Writes what this run learned as a profile (rank_learned_profile: the experts in VRAM now, then by the routing
@@ -216,7 +307,8 @@ private:
     void pinned_split();
     /// One stage's part of a window: its blocks over the T rows (from `hand_in`, the previous stage's rows, after the
     /// first), the last stage's picks into h_out_
-    bool stage_forward(const int32_t* tokens, int T, int64_t pos, const float* hand_in, std::string& err);
+    bool stage_forward(const int32_t* tokens, int T, int64_t pos, const float* hand_in, std::string& err,
+                       bool defer = false);
     /// The recurrent states back to the state after row n (spec_step), every stage's
     bool rollback(int n, std::string& err);
     /// The file's MTP layer is run: by the last stage (has_mtp_); the rest keep the recurrent states' copies for it
@@ -229,6 +321,7 @@ private:
     /// pinned: a layer split's prompt rows in and out, up to prompt_chunk of them (each stage reads them in chunks of
     /// its own, as long as its tier lends the buffers for)
     float* hand_host_ = nullptr;
+    float* enc_out_ = nullptr;   ///< encode's rows (host): prompt_chunks writes every row there, normed, no logits
     bool in_ram_ = false;              ///< the experts in pinned RAM (an arena), else read in place
     bool level_zero_ = false;
     uint64_t total_b_ = 0;             ///< the GPU's memory
@@ -250,8 +343,20 @@ private:
         const float *q_norm = nullptr, *k_norm = nullptr;
         const float* router = nullptr;                        // F32 [n_embd, n_expert]
         const float* sh_gate_inp = nullptr;                   // F32 [n_embd]
-        W sh_gate, sh_up, sh_down;
+        W sh_gate, sh_up, sh_down;                            // the shared expert, or qwen35's dense FFN
     };
+    /// stream_blocks: each block's matrices in the mapped file (W::data set as the block is bound), and their source
+    struct Streamed {
+        W* w = nullptr;
+        HostSpan span;
+        uint64_t offset = 0;     ///< in the block's region
+    };
+    std::vector<std::vector<Streamed>> streamed_;
+    std::vector<Streamed>* stream_into_ = nullptr;   ///< load_block's block, while it loads
+    BlockSource* block_src_ = nullptr;
+    /// Block l's matrices at their source's region (streamed blocks; nothing else), and that work queued.
+    void bind_block(int64_t l);
+    void unbind_block(int64_t l);
 
     /// A projection's GGUF tensor into VRAM: its first dimension the input, every other the outputs (a 3-D tensor, the
     /// MLA's per-head wk_b and wv_b, is its heads' matrices one after another).  `f32`: an F32 matrix is taken as it is
@@ -263,13 +368,21 @@ private:
     /// in BF16).
     bool upload_f32(const GgufModel& m, const std::string& name, uint64_t elements, const float*& out, std::string& err);
     bool open_experts(std::string& err);
+    /// qwen35's in place of open_experts: no tiers, the prompt's buffers beside the weights
+    bool open_dense(std::string& err);
     bool record(int T, bool mtp, std::string& err);
+    bool run_window(int T, bool mtp, std::string& err);
     /// The window's inputs (embeddings, steps, positions) for `tokens` at pos .. pos + T - 1 into the mapped staging;
     /// `emb` false: no embeddings (a later stage's window, which reads the rows handed on).
     bool stage(const int32_t* tokens, int T, int64_t pos, std::string& err, bool emb = true);
     bool record_window(int T, strata::gpu::Stream cs, std::string& err);
     /// The head over T normed rows `x` into logits_.
     void head_logits(const float* x, int T, strata::gpu::Stream cs);
+    /// The MTP layer's head for its last row (hn_ into logits_): the drafts' token subset or the whole head, at 2 bits
+    /// where that measured faster on this device (int2_); `pos` is that row's position (device).
+    void draft_logits(const int32_t* pos, strata::gpu::Stream cs);
+    /// int2_ from the model file's head rows, kept where it measures faster (a failure keeps the head as it is).
+    void setup_int2();
     /// One block over the window's T rows of x_ (MoE layer `ml` of the tiers, ring `ring` + 1): a segmented window's
     /// graphs go into `segs`.
     bool record_block(const Block& b, int64_t ml, int T, uint32_t& ring, std::vector<strata::gpu::Graph*>& segs,
@@ -291,6 +404,10 @@ private:
     /// The adaptive tier's copies in flight: their experts become resident once the copies are done (`wait`: wait
     /// for them; else only if they are).
     bool settle_swaps(bool wait, std::string& err);
+    /// STRATA_RAM_ADAPT=<n> (opt-in, one GPU, the experts outside the VRAM tier in RAM): after a window, experts the
+    /// conversation keeps routing to take the RAM places of unused ones, n of them read from the file (generate.cpp's
+    /// rule, ram_adapt_round).
+    void ram_adapt();
     bool fill_slot(int64_t layer, int32_t expert, std::string& err);
     /// The prompt path's buffers for chunks of `T` tokens, carved by prompt_carve: the pinned host block allocated at
     /// load for the longest chunk, the device block borrowed from the tier for each prompt (plain_prompt.cpp uses them).
@@ -350,15 +467,31 @@ private:
         int32_t* g_ids = nullptr;
         float *g_ffg = nullptr, *g_ffu = nullptr;
     };
+    /// Device buffers in pieces of at most max_alloc_bytes() (a chunk's buffers may take more than a device allots at
+    /// once: the RX 9060 XT's HIP adapter allots 1 GiB): each piece's bytes and, once allocated, where it lies.
+    struct PromptPieces {
+        std::vector<uint64_t> bytes;
+        std::vector<uint8_t*> at;
+    };
+    /// The lowest slot of `n` a prompt chunk may borrow from (prefill::lend_pct of them, 128 left).
+    int64_t lend_lowest(int64_t n) const;
+    /// --prompt-chunk not given: the chunk from the tier, as Qwen3.8-Flash-Next's --prefill auto.
+    void auto_prompt_chunk(uint64_t beside);
     /// Lays the buffers for chunks of `T` tokens out from `dev` / `host` (null: only counts), returning the device and
-    /// host bytes.
+    /// host bytes.  With `pieces` the device's go into pieces instead: sized (pieces->bytes, each within
+    /// max_alloc_bytes()) while pieces->at is empty, else laid out within those pieces in turn (a chunk of at most the
+    /// T they were sized for fits: every buffer grows with T).
     void prompt_carve(int64_t T, PromptBufs& b, uint8_t* dev, uint8_t* host, uint64_t& dev_bytes,
-                      uint64_t& host_bytes) const;
+                      uint64_t& host_bytes, PromptPieces* pieces = nullptr) const;
+    /// The pieces for chunks of `T` tokens (prompt_dev_, not yet in allocs_) when they take at most `room` bytes;
+    /// false, nothing held, when they do not or an allocation fails.
+    bool alloc_prompt_dev(int64_t T, uint64_t room);
     PromptBufs pb_;
     void* prompt_host_ = nullptr;
     /// The prompt's device buffers of their own, for chunks of up to prompt_dev_T_ tokens, when every expert has a
-    /// slot and the VRAM beside the tier holds them (else null: prompt_borrow lends the tier's last slots).
-    void* prompt_dev_ = nullptr;
+    /// slot and the VRAM beside the tier holds them (else none: prompt_borrow lends the tier's last slots), and a dense
+    /// model's always (open_dense; none there: the prompt runs in windows).
+    PromptPieces prompt_dev_;
     int64_t prompt_dev_T_ = 0;
     /// The prompt's device buffers, carved from the tier's last slots for one prompt (prompt_borrow) and given back
     /// after it (prompt_return), with the experts that were in them put back: the tier keeps that memory between
@@ -374,6 +507,22 @@ private:
     bool prompt_one(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits, std::string& err);
     bool prompt_split(const int32_t* tokens, int64_t n, int64_t pos, int32_t* out, float* logits, std::string& err);
     bool prompt_warm_products(std::string& err);
+    /// W's dense products can go in int8: the int8 products are this GPU's (prefill::mmq::chosen, not turned off by
+    /// STRATA_PLAIN_DENSE_MMQ=0) and take W's type and shape.
+    bool dense_int8_ok(const W& w) const;
+    /// A dense product y = x W^T of T float rows (ldx a row) in int8 (iq_mmq, as one expert of T rows), into y (ldy a
+    /// row, 0: W's n_out); false where dense_int8_ok is not (the caller takes Gemm::native).
+    bool prompt_dense_int8(const W& w, const float* x, int64_t ldx, float* y, int64_t T, int64_t ldy);
+    /// A dense model's: the rows from which a dense product is faster through Gemm::native (dequantized to FP16, the
+    /// products' library) than in int8, from the two timed on the dense FFN's gate at 16 rows and a whole chunk's
+    /// (dense_native_rows_); after prompt_warm_products, in its buffers.
+    void prompt_dense_calibrate();
+    /// Dense products of at least this many rows go through Gemm::native, fewer in int8 (INT64_MAX: always in int8,
+    /// as the MoE models' dense products)
+    int64_t dense_native_rows_ = INT64_MAX;
+    /// A dense model's: Gemm::native's products from the normed rows with their sums in FP16 (measured faster at a
+    /// chunk's rows by prompt_dense_calibrate: cuBLAS's HGEMM on GeForce cards; not oneMKL's on the B70)
+    bool dense_half_sums_ = false;
     /// The chunk's routed experts of MoE layer `ml`: pb_.hn its T normed rows (and pb_.x16 their FP16 copy for the FP16
     /// path), pb_.ids their routes; writes pb_.parts in routing order, the routes into `routes` (null: not kept).
     /// `mark(stage)` is the profile's (1 the grouping, 2 the experts).
@@ -460,8 +609,19 @@ private:
     int64_t nkv_ = 0;                ///< the attention blocks' K/V heads (the same in every one)
     bool has_gate_ = false;          ///< the attention's output gate: [q | gate] per head (qwen35moe)
     bool has_shared_ = false;        ///< the gated shared expert (qwen35moe)
+    bool dense_ = false;             ///< a dense FFN in every block and no experts (qwen35)
+    /// a dense model's one-row windows with a graph (0) or straight onto the stream (1), or being timed (-1): the
+    /// first decode windows in turns, then the faster (STRATA_PLAIN_EAGER=0 / 1 fixes it).  Other models: 0
+    int eager_ = 0;
+    int eager_trial_ = 0;            ///< one-row windows timed so far
+    double eager_ms_[2] = {};        ///< their milliseconds, with a graph and without
     int emb_type_ = -1;
     const uint8_t* emb_ = nullptr;   ///< token_embd in the GGUF mapping (rows dequantized on the host)
+    const std::vector<const float*>* emb_rows_ = nullptr;   ///< set_embeddings'
+    /// The embedding of token `tok` at position `pos` into `dst` (n_embd floats): a picture's row there, else the
+    /// token's; false for a token outside the vocabulary or a row the host cannot dequantize
+    bool embed(int32_t tok, int64_t pos, float* dst) const;
+    int32_t* mrope_ = nullptr;       ///< --vision: the cells' (t, h, w), device [max_cells][3]
     size_t emb_row_ = 0;
     W head_;
     const float* out_norm_ = nullptr;
@@ -488,6 +648,7 @@ private:
     MoeWindow win_;
     std::vector<int32_t> res_;                    ///< [moe layer][expert] slot or -1
     std::vector<std::vector<int32_t>> free_;      ///< per moe layer, its free slots
+    std::vector<int64_t> slot_layer_;             ///< per slot, the moe layer it holds experts of
     std::vector<double> heat_;                    ///< [moe layer][expert] routed entries since the load
     std::FILE* route_dump_ = nullptr;             ///< --dump-routing's file, or null
     /// `n` tokens' `k` routed experts of MoE layer `layer` into --dump-routing's file
@@ -506,8 +667,27 @@ private:
     /// Before a window: the PCIe share of the window, while it is being chosen.  After it: its time.
     void pcie_probe_before();
     void pcie_probe_after(double ms, int T);
-    int64_t tokens_since_adapt_ = 0;
-    int64_t adapt_phase_ = 0;   ///< a layer split's stage: its rounds this many windows after the root's   ///< tokens the windows read since the last adaptive round
+    int64_t tokens_since_adapt_ = 0;   ///< tokens the windows read since the last adaptive round
+    int64_t adapt_phase_ = 0;   ///< a layer split's stage: its rounds this many tokens after the root's
+    /// The root's: the tokens between rounds (4 x --adapt-every, or core/expert_tier's auto_adapt_period after
+    /// kAdaptDecideAt tokens of output when --adapt-every is not given, from the CPU pool's share of the windows' time).
+    int64_t adapt_period_ = 0;
+    bool adapt_auto_ = false;
+    int64_t adapt_rows_ = 0;
+    double pool_ms_ = 0, win_ms_ = 0;   ///< this stage's windows: the CPU pool's host time and the whole
+    /// The root's period and the stages' phases from it: the rounds in turn, a share of the period apart.
+    void set_adapt_period(int64_t period);
+    /// The adaptive tier after a window, as Qwen3.8-Flash-Next's (generate.cpp): its first `rows` rows (from `pos0`)
+    /// counted, and a round when the text passes a multiple of the period (adapt_period_).
+    bool after_rows(int rows, int64_t pos0, std::string& err);
+    /// At a window's start: the last round's swaps taken once they are adapt_lag() windows old (waiting for their
+    /// copies then), as Qwen3.8-Flash-Next's verify windows.
+    bool settle_window(std::string& err);
+    int pending_age_ = 0;
+    /// After a prompt: the counts from its routing (seed_usage) and the free slots filled (prompt_return's caller).
+    bool prompt_settle(std::string& err);
+    std::vector<int64_t> trunk_layers_;            ///< moe_local_ less the MTP layer
+    std::vector<int64_t> prompt_routed_, prompt_seen_;   ///< the prompts' routings so far, for seed_usage
     uint8_t* fill_tmp_ = nullptr;                 ///< pinned staging for a slot fill
 
     // per-sequence device state
@@ -521,16 +701,30 @@ private:
     int32_t cur_ = -1;
     int64_t cur_pos_ = 0;
     std::vector<int32_t> drafts_;
+    std::vector<float> dprob_;   ///< drafts_[j]'s probability under the MTP layer, for the window rule
+    strata::spec::DraftPolicy policy_{strata::spec::DraftPolicy::kMaxT};
+    /// Whether the window rule keeps another draft after the n drafts made (opt_.spec_window).
+    bool draft_more(int n) const;
     float* mtp_h_ = nullptr;
     // the drafts' head over opt_.draft_vocab's subset (null: the whole head); a draft's pick is its index there
     void* dhead_ = nullptr;
+    std::unique_ptr<DraftSubset> subset_;   ///< the token subset dhead_, dvocab_ and n_dvocab_ come from
+    std::unique_ptr<DraftHeadInt2> int2_;   ///< the drafts' head at 2 bits (null: as it is)
+    /// --kv-ram: a window's gathered latent rows [max_t][g_gather_stride_][L] and a prompt chunk's layer of cells
+    uint16_t *g_lat_gather_ = nullptr, *g_lat_stage_ = nullptr;
+    int64_t g_gather_stride_ = 0;
     int64_t n_dvocab_ = 0;
     std::vector<int32_t> dvocab_;
     bool mtp_h_set_ = false;   ///< prompt() left the trunk's last row in mtp_h_ (else forward's last row in hn_)
     int last_T_ = 0;           ///< the last forward window's size
     int64_t spec_windows_ = 0, spec_drafted_ = 0, spec_accepted_ = 0;
     double spec_ms_check_ = 0, spec_ms_draft_ = 0;
-    std::vector<uint16_t*> k_pool_, v_pool_;      ///< per attention block
+    std::vector<uint16_t*> k_pool_, v_pool_;      ///< per attention block (FP16; null with kv_int8)
+    std::vector<std::pair<int32_t, int32_t>> vram_evicted_;   ///< `vram`'s shrinks: (residency index, slot)
+    std::vector<int8_t*> k_q_, v_q_;              ///< ...kv_int8's codes
+    std::vector<uint16_t*> k_scale_, v_scale_;    ///< ...and their scales
+    /// The attention block a's pools, for the kernels
+    strata::kernels::QsaAttnPools kv_pools(size_t a) const;
     int32_t* page_table_ = nullptr;
     int64_t n_pages_ = 0;
 
@@ -549,6 +743,7 @@ private:
     int32_t *h_step_ = nullptr, *m_step_ = nullptr;              ///< mapped: T x kStepCount
     int32_t *h_pos_ = nullptr, *m_pos_ = nullptr;                ///< mapped: T x n_head, then T x n_head_kv
     int32_t *h_out_ = nullptr, *m_out_ = nullptr;                ///< mapped: T picked tokens
+    float *h_prob_ = nullptr, *m_prob_ = nullptr;                ///< mapped: the last draft's probability
     strata::kernels::SamplerParams sampler_ = [] {
         strata::kernels::SamplerParams p;
         p.greedy = true;

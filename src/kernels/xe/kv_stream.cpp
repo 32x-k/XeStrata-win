@@ -18,6 +18,9 @@
 #include <string>
 
 namespace strata::kernels {
+
+template <int RT> class KvResolveKernel;   // asked for its work-group (work_group_upto_1024)
+
 namespace {
 
 constexpr int WARP = 32;
@@ -131,7 +134,8 @@ void resolve_launch(sycl::queue& queue, const KvStreamMap mm, const int32_t* ids
     queue.submit([&](sycl::handler& hd) {
         sycl::local_accessor<int, 1> sh(sycl::range<1>(3), hd);          // s_nmiss, s_lookups, s_cut
         sycl::local_accessor<int, 1> warp_sums(sycl::range<1>(32), hd);
-        hd.parallel_for(sycl::nd_range<1>(RT, RT), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
+        hd.parallel_for<KvResolveKernel<RT>>(sycl::nd_range<1>(RT, RT),
+                                            [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const auto grp = it.get_group();
             const int tid = (int) it.get_local_id(0);
             local_atomic<int> s_nmiss(sh[0]), s_lookups(sh[1]);
@@ -220,7 +224,7 @@ void kv_stream_resolve(const KvStreamMap& m, const QsaAttnPools& slots, const Kv
     // see the same slot and may both take it for two misses (upstream f3925cf).  The engine never streams with fewer
     // than qsa_kv_resident_min() / page_size = 5,120 slots, so this is a guard, not a limit.
     auto& queue = queue_for(stream);
-    const int rt = xe::work_group_upto_1024(queue);
+    const int rt = xe::work_group_upto_1024<KvResolveKernel>(queue);
     if (m.n_slots < rt)
         throw core::DeviceError("kv_stream: " + std::to_string(m.n_slots) + " slots is fewer than the resolve block (" +
                                 std::to_string(rt) + "): the clock sweep would take a slot twice");

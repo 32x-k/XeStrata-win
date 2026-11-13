@@ -10,7 +10,7 @@ open System.Diagnostics
 open System.Text
 open System.Threading.Tasks
 
-let private startInfo (args: string seq) =
+let private startInfo (script: string) (args: string seq) =
     let si = ProcessStartInfo(Places.python, WorkingDirectory = Places.app, UseShellExecute = false)
     // The bundled Python sees its own packages only: not a Python installed on the PC (PYTHONHOME, PYTHONPATH) nor the
     // user's site-packages.  It has no ._pth file, which would also leave the script's folder off sys.path (setup.py
@@ -18,21 +18,22 @@ let private startInfo (args: string seq) =
     si.Environment.Remove "PYTHONHOME" |> ignore
     si.Environment.Remove "PYTHONPATH" |> ignore
     si.Environment["PYTHONNOUSERSITE"] <- "1"
-    si.ArgumentList.Add Places.setupPy
+    si.ArgumentList.Add script
     for a in args do
         si.ArgumentList.Add a
     si
 
 /// setup.py on this console, interactive as on Linux; its exit code.
 let runOnConsole (args: string seq) =
-    use p = Process.Start(startInfo args)
+    use p = Process.Start(startInfo Places.setupPy args)
     p.WaitForExit()
     p.ExitCode
 
-/// setup.py --json with `args`: each line to `onMessage` (on a thread of its own), the exit code to `onExit` once
-/// both streams have ended.
-type Run(args: string seq, onMessage: Protocol.Message -> unit, onExit: int -> unit) =
-    let si = startInfo (Seq.append [ "--json" ] args)
+/// setup.py --json with `args` (or `script`, another of the app's scripts that speaks setup.py's --json:
+/// tools/image/install.py): each line to `onMessage` (on a thread of its own), the exit code to `onExit` once both
+/// streams have ended.
+type Run(script: string, args: string seq, onMessage: Protocol.Message -> unit, onExit: int -> unit) =
+    let si = startInfo script (Seq.append [ "--json" ] args)
     do
         si.RedirectStandardInput <- true
         si.RedirectStandardOutput <- true
@@ -79,6 +80,9 @@ type Run(args: string seq, onMessage: Protocol.Message -> unit, onExit: int -> u
             ()
 
     member _.HasExited = proc.HasExited
+
+    new(args: string seq, onMessage: Protocol.Message -> unit, onExit: int -> unit) =
+        Run(Places.setupPy, args, onMessage, onExit)
 
 /// The messages of a short run that asks nothing (--describe, --check-update), and its exit code.
 let collect (args: string seq) : Task<Protocol.Message list * int> =

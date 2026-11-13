@@ -4,13 +4,15 @@
 //
 //     strata --native MODEL.gguf --tokens 1,2,3 [options: plain_usage, --help]
 //
-// The prompt runs in chunks of up to N tokens through the batched products (--prompt-chunk, default 4096; 0: in
-// windows of up to T tokens), then one token a window (--spec: the pending token and the MTP layer's drafts, the
-// accepted ones emitted together).  stdout gets one line,
+// The prompt runs in chunks of up to N tokens through the batched products (--prompt-chunk, default from the VRAM
+// tier; 0: in windows of up to T tokens), then one token a window (--spec: the pending token and the MTP layer's
+// drafts, the accepted ones emitted together).  stdout gets one line,
 // `tokens: a,b,c`, the generated ids; --dump-logits writes the logits each generated token was chosen from, n_vocab
 // floats a row.  The report goes to stderr.
 #include "strata/program/plain_generate.hpp"
 #include "strata/program/option_scope.hpp"
+#include "strata/program/done_line.hpp"
+#include "strata/program/shared_options.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/conversation_memory.hpp"
@@ -18,8 +20,10 @@
 #include "strata/core/plain_model.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/sampler.hpp"
+#include "strata/platform/memory.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/prefill.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -99,6 +103,21 @@ std::vector<int32_t> eos_tokens(const std::string& path) {
     return ids;
 }
 
+// The id of the token spelled `text` in the GGUF's vocabulary, -1 when it has none
+int32_t token_id(const std::string& path, const char* text) {
+    try {
+        return (int32_t) GgufModel::open(path).meta().string_index("tokenizer.ggml.tokens", text);
+    } catch (const std::exception&) {
+        return -1;   // an unreadable file has no such token; loading it reports why
+    }
+}
+
+// FNV-1a over `n` bytes, from `h`
+uint64_t fnv1a(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {
+    for (size_t i = 0; i < n; ++i) h = (h ^ static_cast<const uint8_t*>(p)[i]) * 1099511628211ull;
+    return h;
+}
+
 // The processor's own graphics through Level Zero: with the Unified Runtime's second Level Zero adapter the UHD 770's
 // driver aborted at the first window graph's launch (its command stream full, linear_stream.h), and a thread of the
 // products' library crashed in it; with the first adapter llm-jp-4.1 Q4_K_M ran and agreed with llama.cpp over 32
@@ -134,22 +153,24 @@ void linkless_gpu_adapter() {
 
 }  // namespace
 
-// `--serve` for these models: generate.cpp's --serve protocol (server.py's StrataEngine) for text requests.  READY
-// <context> stop; then `GEN <max_new> [temperature=F top_p=F top_k=N min_p=F seed=N] <ids>` -> RESUME <reused>,
-// one `T <id>` a token, DONE (generate.cpp's fields; the RAM, file and offload ones zero); STOP ends a request,
-// QUIT the engine; SAVE / RESTORE <path> a session file.  The commands of Qwen3.8-Flash-Next's engine this one has no
-// part for (VRAM, GENI, BGEN) answer ERR.  The conversation's tokens stay read between requests: a request that starts
-// with them reads only what follows (a model with a recurrent state only when it extends them all; else it starts
-// over, or from the conversation cache).
+// `--serve` for these models: generate.cpp's --serve protocol (server.py's StrataEngine).  READY <context> stop; then
+// `GEN <max_new> [temperature=F top_p=F top_k=N min_p=F seed=N] <ids>` -> RESUME <reused>, one `T <id>` a token, DONE
+// (generate.cpp's fields); with --vision `GENI <max_new> [keys] <embeddings file> <ids>` the same with pictures (their
+// rows in place of the <|image_pad|> tokens, generate.cpp's format and positions); STOP ends a request, QUIT the
+// engine; SAVE / RESTORE <path> a session file.  The commands of Qwen3.8-Flash-Next's engine this one has no part for
+// (BGEN) answer ERR; VRAM needs --vram-elastic.  The conversation's tokens stay read between requests: a request that
+// starts with them reads only what follows (a model with a recurrent state only when it extends them all; else it
+// starts over, or from the conversation cache).
 namespace {
 
-// The conversation cache (--conversation-cache-mib, off by default as Qwen3.8-Flash-Next's): conversations set aside
+// The conversation cache (--conversation-cache-mib, sized from the free RAM by default as Qwen3.8-Flash-Next's, #3493):
+// conversations set aside
 // in RAM, each its tokens and the state they left (PlainModel::save_state), so a client that comes back to one reads
 // only what it added.  A request takes the live state or a parked one, whichever holds the longer start of it (with a
 // recurrent state, all of the conversation's tokens); the live one is parked before another takes its place, the
 // least recently used one dropped past the slots or the budget, or when the RAM left would fall under the floor.
 struct ConversationCache {
-    int64_t budget = 0;           // bytes; 0: off
+    int64_t budget = -1;          // bytes; 0: off, -1: not given (plain_main sizes it, core's auto_conversation_cache_mib)
     int slots = 4;
     int64_t min_free = 2560ll << 20;
     struct Entry {
@@ -285,8 +306,17 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         in_shared->lines.pop_front();
         return true;
     };
-    const int64_t ctx = model.max_cells(), V = model.vocab();
-    std::vector<int32_t> live;   // the tokens the state holds, positions 0 .. live.size() - 1
+    const int64_t ctx = model.max_cells(), V = model.vocab(), N = model.spec().n_embd;
+    // the tokens the state holds, positions 0 .. live.size() - 1; a picture's cells as keys of their own (below)
+    std::vector<int32_t> live;
+    int64_t live_prompt = 0;     // how many of them the last request sent (its prompt)
+    // --vision: the pictures' rows (img_rows, row_ptr by position), the cells' M-RoPE positions (pos3, the identity
+    // while no request has pictures)
+    const int32_t image_pad = opt.vision ? token_id(opt.gguf, "<|image_pad|>") : -1;
+    std::vector<float> img_rows;
+    std::vector<const float*> row_ptr;
+    std::vector<int32_t> pos3;
+    bool pos3_identity = true;
     // a session file's identity: the model file (its name and size) and the context, which fix the state's shape
     std::string model_id;
     {
@@ -296,7 +326,9 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
     }
     std::vector<int32_t> out((size_t) opt.max_t);
     std::string err;
-    std::printf("INFO context=%lld expert_slots=%lld\n", (long long) ctx, (long long) model.slots());
+    std::printf("INFO context=%lld expert_slots=%lld vram_elastic=%d\n", (long long) ctx, (long long) model.slots(),
+                model.vram_elastic() ? 1 : 0);
+    strata::platform::settle_before_ready();
     std::printf("READY %lld stop\n", (long long) ctx);
     std::fflush(stdout);
     std::string line;
@@ -313,6 +345,19 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         }
         if (line.empty()) continue;
         stop_req.store(false);   // a STOP between requests ends nothing
+        // VRAM [reserve_mib] (#533, --vram-elastic): the tier shrinks or grows between requests (server.py's vram)
+        if (line == "VRAM" || line.rfind("VRAM ", 0) == 0) {
+            char* end = nullptr;
+            const bool bare = line.size() <= 5;
+            const long long reserve = bare ? -1 : std::strtoll(line.c_str() + 5, &end, 10);
+            std::string answer;
+            if (!bare && (end == line.c_str() + 5 || reserve < 0)) std::printf("ERR expected: VRAM [reserve_mib]\n");
+            else if (!model.vram(reserve, answer, err)) std::printf("ERR %s\n", err.c_str());
+            else std::printf("%s\n", answer.c_str());
+            err.clear();
+            std::fflush(stdout);
+            continue;
+        }
         // SAVE / RESTORE <path>: the live conversation to a file and back (server.py's session_file)
         if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
             const bool save = line[0] == 'S';
@@ -337,20 +382,88 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                 if (!session_read(path, model_id, ids, snap, bytes, err)) { refuse("invalid", err); continue; }
                 if (!model.restore_state(snap, err)) { refuse("invalid", err); continue; }
                 live = std::move(ids);
+                live_prompt = 0;
                 std::printf("RESTORED %zu %zu %.1f\n", live.size(), bytes, ms());
             }
             std::fflush(stdout);
             continue;
         }
-        if (line.rfind("GEN ", 0) != 0) {
+        // ENCODE <ids file> <states file> (serve/images.py: MOSS-Image's text encoder, when this engine reads the GGUF
+        // it names): every prompt token's state after the final norm, from position 0, into the file - int32 'STE1',
+        // the rows and their width, then the rows (MossText::read_states).  The live conversation is set aside first
+        // and put back after, so the next request takes it up as it would have.  ENCODED <rows> <ms>, or ERR.
+        if (line.rfind("ENCODE ", 0) == 0) {
+            const size_t gap = line.find(' ', 7);
+            const std::string ids_path = line.substr(7, gap == std::string::npos ? 0 : gap - 7);
+            const std::string out_path = gap == std::string::npos ? std::string() : line.substr(gap + 1);
+            auto refuse = [&](const std::string& why) {
+                std::printf("ERR %s\n", why.c_str());
+                std::fflush(stdout);
+            };
+            std::vector<int32_t> ids;
+            {
+                std::ifstream f(ids_path);
+                const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+                if (ids_path.empty() || out_path.empty() || !f || !parse_ids(text, ids)) {
+                    refuse("expected: ENCODE <ids file> <states file>, the ids comma- or space-separated");
+                    continue;
+                }
+            }
+            const int64_t n = (int64_t) ids.size();
+            if (n > ctx || std::any_of(ids.begin(), ids.end(), [&](int32_t t) { return t >= V; })) {
+                refuse("the prompt is longer than the context or has a token outside the vocabulary");
+                continue;
+            }
+            const auto t0 = Clock::now();
+            strata::core::PlainModel::Snapshot snap;
+            const bool kept = !live.empty();
+            if (kept && !model.save_state((int64_t) live.size(), snap, err)) {
+                refuse("the conversation could not be set aside: " + err);
+                continue;
+            }
+            std::vector<int32_t> flat;
+            if (!pos3_identity) {   // a picture's M-RoPE positions in the table: the prompt's own, then them again
+                flat.resize((size_t) ctx * 3);
+                for (int64_t c = 0; c < ctx; ++c) flat[(size_t) c * 3] = flat[(size_t) c * 3 + 1] = flat[(size_t) c * 3 + 2] = (int32_t) c;
+            }
+            std::vector<float> rows((size_t) (n * N));
+            bool ok = (flat.empty() || model.set_positions(flat.data(), ctx, err)) &&
+                      model.encode(ids.data(), n, rows.data(), err);
+            std::string why = ok ? std::string() : err;
+            if (!flat.empty() && !model.set_positions(pos3.data(), ctx, err) && why.empty()) why = err;
+            // the conversation back (the state as it was), or a clean one for the next request to start from
+            if (kept ? !model.restore_state(snap, err) : !model.reset(err)) {
+                live.clear();
+                if (why.empty()) why = "the conversation could not be put back: " + err;
+            }
+            if (why.empty()) {
+                std::FILE* f = std::fopen(out_path.c_str(), "wb");
+                const int32_t hdr[3] = {0x31455453, (int32_t) n, (int32_t) N};
+                const bool wrote = f != nullptr && std::fwrite(hdr, sizeof(int32_t), 3, f) == 3 &&
+                                   std::fwrite(rows.data(), sizeof(float), rows.size(), f) == rows.size();
+                if (f == nullptr || std::fclose(f) != 0 || !wrote) why = "cannot write " + out_path;
+            }
+            err.clear();
+            if (!why.empty()) {
+                refuse(why);
+                continue;
+            }
+            std::printf("ENCODED %lld %.1f\n", (long long) n,
+                        std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+            std::fflush(stdout);
+            continue;
+        }
+        const bool geni = line.rfind("GENI ", 0) == 0;
+        if (!geni && line.rfind("GEN ", 0) != 0) {
             const std::string head = line.substr(0, line.find(' '));
-            std::printf("ERR %s is not available for %s (this engine takes GEN, STOP and QUIT)\n", head.c_str(),
+            std::printf("ERR %s is not available for %s (this engine takes GEN, GENI, ENCODE, STOP and QUIT)\n", head.c_str(),
                         arch.c_str());
             std::fflush(stdout);
             continue;
         }
         char* endp = nullptr;
-        const long long max_new = std::strtoll(line.c_str() + 4, &endp, 10);
+        const long long max_new = std::strtoll(line.c_str() + (geni ? 5 : 4), &endp, 10);
+        std::vector<uint64_t> img_keys;   // #2228: the server's key of each picture, in prompt order
         strata::kernels::SamplerParams sp;   // greedy unless the request sets a temperature
         sp.greedy = true;
         sp.temperature = 0.0f;
@@ -369,11 +482,31 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             else if (key == "top_k") sp.top_k = (int) std::strtol(val.c_str(), nullptr, 10);
             else if (key == "min_p") sp.min_p = std::strtof(val.c_str(), nullptr);
             else if (key == "seed") sp.seed = std::strtoull(val.c_str(), nullptr, 10);
+            else if (key == "img_keys")
+                for (const char* q = val.c_str(); *q != '\0';) {
+                    char* qe = nullptr;
+                    img_keys.push_back((uint64_t) std::strtoull(q, &qe, 16));
+                    if (qe == q || (*qe != ',' && *qe != '\0')) { img_keys.clear(); break; }
+                    q = *qe == ',' ? qe + 1 : qe;
+                }
         }
         sp.greedy = sp.temperature <= 0.0f;
+        std::string emb_path;   // GENI: the embeddings file, the first word after the keys
+        if (geni && endp != nullptr) {
+            while (*endp == ' ') ++endp;
+            if (char* gap = std::strchr(endp, ' '); gap != nullptr) {
+                emb_path.assign(endp, (size_t) (gap - endp));
+                endp = gap;
+            }
+        }
         std::vector<int32_t> ids;
-        if (max_new < 1 || endp == nullptr || !parse_ids(endp, ids) || ids.empty()) {
+        if (max_new < 1 || endp == nullptr || (geni && emb_path.empty()) || !parse_ids(endp, ids) || ids.empty()) {
             std::printf("ERR bad request: max_new or the ids\n");
+            std::fflush(stdout);
+            continue;
+        }
+        if (geni && (!opt.vision || image_pad < 0)) {
+            std::printf("ERR %s\n", opt.vision ? "the model has no <|image_pad|> token" : "this engine was started without --vision");
             std::fflush(stdout);
             continue;
         }
@@ -389,11 +522,82 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             std::fflush(stdout);
             continue;
         }
+        // the conversation's keys: its ids, a picture's first cell a negative key from its grid and the server's key
+        // (else its rows) and its other cells -1, so that a conversation is taken up again only as far as its pictures
+        // are the same ones; and with pictures, their rows and every cell's position
+        std::vector<int32_t> keys = ids;
+        if (geni || !pos3_identity) {
+            std::string ve;
+            pos3.resize((size_t) ctx * 3);
+            row_ptr.assign(geni ? (size_t) n : 0, nullptr);
+            auto put = [&](int64_t c, int64_t t, int64_t h, int64_t w) {
+                pos3[(size_t) c * 3] = (int32_t) t;
+                pos3[(size_t) c * 3 + 1] = (int32_t) h;
+                pos3[(size_t) c * 3 + 2] = (int32_t) w;
+            };
+            struct Img { int64_t n, nx, ny; size_t off; };
+            std::vector<Img> imgs;
+            img_rows.clear();
+            if (geni) {   // strata-vision's records: int32 'SVE1', n, nx, ny, n_embd, then n x n_embd floats
+                std::FILE* f = std::fopen(emb_path.c_str(), "rb");
+                if (f == nullptr) ve = "cannot open " + emb_path;
+                while (f != nullptr && ve.empty()) {
+                    int32_t hdr[5];
+                    const size_t got = std::fread(hdr, sizeof(int32_t), 5, f);
+                    if (got == 0) break;
+                    if (got != 5 || hdr[0] != 0x31455653 || hdr[1] < 1 || hdr[2] < 1 || hdr[3] < 1 ||
+                        (int64_t) hdr[2] * hdr[3] != hdr[1] || hdr[4] != (int32_t) N) {
+                        ve = "bad embeddings file (expected strata-vision records of width " + std::to_string((long long) N) + ")";
+                        break;
+                    }
+                    const size_t off = img_rows.size(), cnt = (size_t) hdr[1] * (size_t) hdr[4];
+                    img_rows.resize(off + cnt);
+                    if (std::fread(img_rows.data() + off, sizeof(float), cnt, f) != cnt) { ve = "short embeddings file"; break; }
+                    imgs.push_back({hdr[1], hdr[2], hdr[3], off});
+                }
+                if (f != nullptr) std::fclose(f);
+            }
+            // mtmd's positions: a picture's cells t = p, h = p + y, w = p + x; the text after it at p + max(nx, ny)
+            int64_t p = 0, i = 0;
+            size_t k = 0;
+            while (ve.empty() && i < n) {
+                if (!geni || ids[(size_t) i] != image_pad) { put(i++, p, p, p); ++p; continue; }
+                if (k >= imgs.size()) { ve = "the prompt has more pictures than the embeddings file"; break; }
+                const Img& im = imgs[k++];
+                const int64_t grid[3] = {im.n, im.nx, im.ny};
+                uint64_t h = fnv1a(grid, sizeof grid);
+                h = img_keys.size() == imgs.size()
+                        ? fnv1a(&img_keys[k - 1], sizeof(uint64_t), h)
+                        : fnv1a(img_rows.data() + im.off, (size_t) im.n * (size_t) N * sizeof(float), h);
+                for (int64_t j = 0; j < im.n && ve.empty(); ++j)
+                    if (i + j >= n || ids[(size_t) (i + j)] != image_pad)
+                        ve = "picture " + std::to_string(k) + " has " + std::to_string((long long) im.n) +
+                             " rows but fewer <|image_pad|> tokens";
+                for (int64_t j = 0; j < im.n && ve.empty(); ++j) {
+                    put(i + j, p, p + j / im.nx, p + j % im.nx);
+                    row_ptr[(size_t) (i + j)] = img_rows.data() + im.off + (size_t) j * (size_t) N;
+                    keys[(size_t) (i + j)] = j == 0 ? -1 - (int32_t) (h & 0x3fffffff) : -1;
+                }
+                i += im.n;
+                p += std::max(im.nx, im.ny);
+            }
+            if (ve.empty() && k != imgs.size()) ve = "the embeddings file has more pictures than the prompt";
+            for (int64_t c = n; ve.empty() && c < ctx; ++c, ++p) put(c, p, p, p);   // the answer's cells
+            if (ve.empty() && !model.set_positions(pos3.data(), ctx, err)) ve = err;
+            if (!ve.empty()) {
+                // the table may be half written: the next request writes it again
+                pos3_identity = false;
+                std::printf("ERR %s\n", ve.c_str());
+                std::fflush(stdout);
+                continue;
+            }
+            pos3_identity = !geni;
+        }
         // what of the conversation to keep: the common prefix, at least the last prompt token read again (its
         // logits pick the first token); with a recurrent state, all of it or nothing
         auto takes = [&](const std::vector<int32_t>& have) -> int64_t {   // how much of the request a state serves
             size_t common = 0;
-            while (common < have.size() && common < (size_t) n && have[common] == ids[common]) ++common;
+            while (common < have.size() && common < (size_t) n && have[common] == keys[common]) ++common;
             int64_t r = std::min<int64_t>((int64_t) common, n - 1);
             if (model.recurrent() && r != (int64_t) have.size()) r = 0;
             return r;
@@ -437,7 +641,12 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                 cache.parked.erase(best);
                 resume = best_r;
             } else if (resume < (int64_t) live.size()) {
-                park_live(cache.parked.end());   // the request starts another conversation: keep this one
+                // the request starts another conversation: keep this one.  Not on the next turn of the same one (it
+                // sends the last prompt whole and then the history the client keeps, the reply's thinking dropped):
+                // the copy would hold only that reply, which no request sends again (generate.cpp, next_turn)
+                size_t common = 0;
+                while (common < live.size() && common < (size_t) n && live[common] == ids[common]) ++common;
+                if (live_prompt <= 0 || (int64_t) common < live_prompt) park_live(cache.parked.end());
             }
         }
         if (resume == 0 && !live.empty() && !model.reset(err)) {
@@ -446,15 +655,19 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
             return 1;
         }
         live.resize((size_t) resume);
+        live_prompt = n;
         std::printf("RESUME %lld\n", (long long) resume);
         std::fflush(stdout);
         model.set_sampler(sp);
         const Clock::time_point t0 = Clock::now();
         const int64_t hits0 = model.hits(), look0 = model.hits() + model.misses();
         const int64_t acc0 = model.spec_accepted(), off0 = model.spec_drafted();
+        const int64_t ram0 = model.ram_reads(), files0 = model.file_reads(), offload0 = model.offloaded();
+        const uint64_t file_bytes0 = model.file_read_bytes();
         bool ok = true;
         int32_t next = -1;
         bool windows = opt.prompt_chunk <= 0;
+        if (geni) model.set_embeddings(&row_ptr);   // the pictures' rows for the prompt's cells
         if (!windows) {
             ok = model.prompt(ids.data() + resume, n - resume, resume, out.data(), nullptr, err);
             next = out[0];
@@ -468,13 +681,14 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
                 next = out[(size_t) w - 1];
             }
         }
+        model.set_embeddings(nullptr);
         if (!ok) {   // the state is the device's, half written: the next request starts over
             live.clear();
             std::printf("ERR %s\n", err.c_str());
             std::fflush(stdout);
             continue;
         }
-        live.assign(ids.begin(), ids.end());
+        live.assign(keys.begin(), keys.end());
         const Clock::time_point t1 = Clock::now();
         const char* finish = "length";
         long long produced = 0;
@@ -518,10 +732,13 @@ static int plain_serve(strata::core::PlainModel& model, const strata::core::Plai
         const Clock::time_point t2 = Clock::now();
         const double prompt_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
         const double decode_ms = std::chrono::duration<double, std::milli>(t2 - t1).count();
-        std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld 0 0 0.0 %lld 0\n", produced, (long long) n,
-                    prompt_ms, decode_ms, finish, (long long) (model.spec_accepted() - acc0),
-                    (long long) (model.spec_drafted() - off0), (long long) resume, (long long) (model.hits() - hits0),
-                    (long long) (model.hits() + model.misses() - look0), (long long) (n - resume));
+        strata::program::print_done({(int64_t) produced, (int64_t) n, prompt_ms, decode_ms, finish,
+                                     (int64_t) (model.spec_accepted() - acc0), (int64_t) (model.spec_drafted() - off0),
+                                     (int64_t) resume, (int64_t) (model.hits() - hits0),
+                                     (int64_t) (model.hits() + model.misses() - look0),
+                                     (int64_t) (model.ram_reads() - ram0), (int64_t) (model.file_reads() - files0),
+                                     (double) (model.file_read_bytes() - file_bytes0) / 1e6, (int64_t) (n - resume),
+                                     (int64_t) (model.offloaded() - offload0), ""});
         std::fflush(stdout);
     }
     if (!profile_save.empty() && !model.save_profile(profile_save, err)) {
@@ -558,16 +775,28 @@ static void plain_usage(const std::string& arch) {
                  "  --adapt-mib-per-token N   and at most N MiB of them for each token read since the last round\n"
                  "                       (default 48; 0: no such bound)\n"
                  "  --adapt-decay F      the routing counts are multiplied by F after each round (default 0.7)\n"
+                 "  --adapt-min-gain F   an expert moves in only when its decayed count is F over the one it\n"
+                 "                       evicts (default 1.5)\n"
                  "  --expert-cache N|auto   the VRAM tier's most expert slots, over all the layers (default auto)\n"
                  "  --vram-free-mib N    size the VRAM tier from at most N MiB free\n"
                  "  --vram-reserve-mib N leave N MiB of VRAM free beside the tier (default a 32nd of the memory)\n"
+                 "  --vram-elastic       --serve, one GPU (#533): the tier in segments (--vram-segment-mib, default 512)\n"
+                 "                       that the VRAM command gives back and maps again between requests\n"
                  "  --mmap-experts       read the experts from the GGUF through mmap instead of pinned RAM\n"
                  "  --no-pcie-split      the CPU computes every expert the VRAM tier misses\n"
-                 "  --prompt-chunk N     the prompt's most tokens a chunk through the batched products (default\n"
-                 "                       4096; 0: the prompt in windows)\n"
+                 "  --kv fp16|int8       the attention layers' K/V cache: FP16 (the default) or int8 codes with a scale\n"
+                 "                       per 64 values (half the VRAM; the answers differ slightly; not GLM-5.3-Flash)\n"
+                 "  --prefill-cpu-share S  the CPU pool's share of the prompt's experts the VRAM tier misses (0-1;\n"
+                 "                       auto = from the times measured at load, the default; 0: all on the GPU)\n"
+                 "  --prompt-chunk N     the prompt's most tokens a chunk through the batched products (default:\n"
+                 "                       4096, or up to 32768 where the VRAM tier lends it; 0: the prompt in windows)\n"
                  "  --max-t N            the decode window's most tokens (default 8)\n"
                  "  --spec N             speculative decoding with the model's MTP layer: windows of up to N tokens,\n"
                  "                       the last one and N - 1 drafts (default 3; 0: off; greedy only)\n"
+                 "  --kv-ram on|off      GLM-5.3-Flash: the DSA layers' latent cells in RAM, their VRAM to the experts (on)\n"
+                 "  --spec-window all|auto|min-p  how many drafts a window checks: all (default); auto while each is\n"
+                 "                       expected to raise the tokens per ms at the measured window costs; or while\n"
+                 "                       each is at least --spec-min-p P likely under the MTP layer\n"
                  "  --draft-vocab PATH   the drafts over this token subset (int32 ids, data/draft_vocab*.bin)\n"
                  "  --rope-scaling none|linear|yarn, --rope-scale F, --yarn-orig-ctx N   context extension\n"
                  "  --rope-freq-base F, --rope-freq-scale F   the rotation's base and frequency scale\n"
@@ -575,7 +804,8 @@ static void plain_usage(const std::string& arch) {
                  "  --dump-routing PATH  the routed experts of every token and MoE layer (tools/make_profile.py)\n"
                  "  --spec-follow PATH   benchmarks: emit this continuation (token ids) instead of the picks and\n"
                  "                       accept the drafts that match it, so settings compare on the same text\n"
-                 "  --serve              stay resident and take requests on stdin (server.py's protocol, text requests)\n"
+                 "  --serve              stay resident and take requests on stdin (server.py's protocol)\n"
+                 "  --vision             --serve takes pictures too (GENI; qwen35 and qwen35moe, the rows from strata-vision)\n"
                  "  --gpu PCI            the GPU (its PCI address)\n"
                  "  --layer-split K[,K2..]|auto  the blocks across the GPUs: the first runs the blocks before K, the\n"
                  "                       next those from K on, ..; auto: in proportion to each GPU's free memory\n"
@@ -604,12 +834,50 @@ int plain_main(int argc, char** argv) {
     std::vector<int32_t> follow;   // --spec-follow: the continuation emitted instead of the picks (benchmarks)
     ConversationCache cache;       // --serve: --conversation-cache-mib and its slots
     double save_min = 10.0;   // --expert-profile-save-every (serve)
+    // the options Qwen3.8-Flash-Next's engine takes with the same meaning, parsed by the same code
+    const std::string who = "strata (" + arch + ")";
+    strata::program::SharedOptionFields shared;
+    shared.who = who.c_str();
+    shared.adapt_every = &opt.adapt_every;
+    shared.adapt_every_given = &opt.adapt_every_given;
+    shared.adapt_swaps = &opt.adapt_swaps;
+    shared.adapt_min_gain = &opt.adapt_min_gain;
+    shared.adapt_decay = &opt.adapt_decay;
+    shared.expert_profile = &opt.profile;
+    shared.expert_profile_save = &profile_save;
+    shared.expert_profile_save_min = &save_min;
+    shared.max_context = &opt.max_cells;
+    shared.max_new = &n_new;
+    shared.temperature = &sp.temperature;
+    shared.top_k = &sp.top_k;
+    shared.top_p = &sp.top_p;
+    shared.seed = &sp.seed;
+    shared.greedy = &sp.greedy;
+    shared.spec = &opt.spec;
+    shared.spec_window = &opt.spec_window;
+    shared.spec_window_all = true;
+    shared.spec_min_p = &opt.spec_min_p;
+    shared.mmap_experts = &opt.mmap_experts;
+    shared.vram_free_mib = &opt.vram_free_mib;
+    shared.vram_elastic = &opt.vram_elastic;
+    shared.vram_segment_mib = &opt.vram_segment_mib;
+    shared.pool_workers = &opt.pool_workers;
+    shared.prefill_cpu_share = true;
+    shared.rope_scaling = &opt.rope_scaling;
+    shared.rope_scale = &opt.rope_scale;
+    shared.rope_freq_base = &opt.rope_freq_base;
+    shared.rope_freq_scale = &opt.rope_freq_scale;
+    shared.yarn_orig_ctx = &opt.yarn_orig_ctx;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&](const char* what) -> const char* {
             if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", what); std::exit(2); }
             return argv[++i];
         };
+        if (const int r = strata::program::parse_shared_option(a, next, shared); r != 0) {
+            if (r < 0) return 2;
+            continue;
+        }
         if (a == "--native") (void) next("--native");
         else if (a == "--tokens") {
             if (!parse_ids(next("--tokens"), prompt)) { std::fprintf(stderr, "--tokens: a list of token ids\n"); return 2; }
@@ -620,26 +888,19 @@ int plain_main(int argc, char** argv) {
             if (!parse_ids(text, prompt)) { std::fprintf(stderr, "--tokens-file: a list of token ids\n"); return 2; }
         }
         else if (a == "--help" || a == "-h") { plain_usage(arch); return 0; }
-        else if (a == "--max-new") n_new = std::strtoll(next("--max-new"), nullptr, 10);
         else if (a == "--serve") serve = true;
+        else if (a == "--vision") opt.vision = true;
         else if (a == "--greedy") sp.greedy = true;
-        else if (a == "--seed") { sp.seed = std::strtoull(next("--seed"), nullptr, 10); sp.greedy = false; }
-        else if (a == "--top-k") sp.top_k = (int) std::strtol(next("--top-k"), nullptr, 10);
-        else if (a == "--top-p") sp.top_p = std::strtof(next("--top-p"), nullptr);
-        else if (a == "--temperature") sp.temperature = std::strtof(next("--temperature"), nullptr);
         else if (a == "--stop-eos") stop_eos = true;
         else if (a == "--eos-ids") {
             if (!parse_ids(next("--eos-ids"), eos)) { std::fprintf(stderr, "--eos-ids: a list of token ids\n"); return 2; }
             stop_eos = true;
         }
-        else if (a == "--max-context") opt.max_cells = std::strtoll(next("--max-context"), nullptr, 10);
         else if (a == "--max-t") opt.max_t = (int) std::strtol(next("--max-t"), nullptr, 10);
-        else if (a == "--spec") opt.spec = (int) std::strtol(next("--spec"), nullptr, 10);
-        else if (a == "--pool-workers") opt.pool_workers = (int) std::strtol(next("--pool-workers"), nullptr, 10);
         else if (a == "--dump-logits") dump_path = next("--dump-logits");
         else if (a == "--dump-routing") opt.dump_routing = next("--dump-routing");
         else if (a == "--conversation-cache-mib")
-            cache.budget = std::max<int64_t>(0, std::strtoll(next("--conversation-cache-mib"), nullptr, 10)) << 20;
+            cache.budget = std::max<int64_t>(0, std::strtoll(next("--conversation-cache-mib"), nullptr, 10)) * (1ll << 20);
         else if (a == "--conversation-cache-slots")
             cache.slots = std::max(1, (int) std::strtol(next("--conversation-cache-slots"), nullptr, 10));
         else if (a == "--conversation-cache-min-free-mib")
@@ -650,19 +911,15 @@ int plain_main(int argc, char** argv) {
             const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
             if (!parse_ids(text, follow)) { std::fprintf(stderr, "--spec-follow: a list of token ids\n"); return 2; }
         }
-        else if (a == "--adapt-every") opt.adapt_every = (int) std::strtol(next("--adapt-every"), nullptr, 10);
-        else if (a == "--adapt-swaps") opt.adapt_swaps = (int) std::strtol(next("--adapt-swaps"), nullptr, 10);
         else if (a == "--adapt-mib-per-token")
             opt.adapt_mib_per_token = (int) std::strtol(next("--adapt-mib-per-token"), nullptr, 10);
         else if (a == "--gpu") (void) next("--gpu");
-        else if (a == "--mmap-experts") opt.mmap_experts = true;
         else if (a == "--no-pcie-split") opt.pcie_split = false;
-        else if (a == "--expert-profile") opt.profile = next("--expert-profile");
         else if (a == "--draft-vocab") opt.draft_vocab = next("--draft-vocab");
-        else if (a == "--prompt-chunk") opt.prompt_chunk = std::strtoll(next("--prompt-chunk"), nullptr, 10);
-        else if (a == "--rope-scaling") opt.rope_scaling = next("--rope-scaling");
-        else if (a == "--rope-scale") opt.rope_scale = std::strtod(next("--rope-scale"), nullptr);
-        else if (a == "--yarn-orig-ctx") opt.yarn_orig_ctx = std::strtod(next("--yarn-orig-ctx"), nullptr);
+        else if (a == "--prompt-chunk") {
+            opt.prompt_chunk = std::strtoll(next("--prompt-chunk"), nullptr, 10);
+            opt.prompt_chunk_given = true;
+        }
         else if (a == "--layer-split") {
             const std::string v = next("--layer-split");
             opt.split_auto = v == "auto";
@@ -707,17 +964,27 @@ int plain_main(int argc, char** argv) {
         else if (a == "--split-order") (void) next("--split-order");   // the stages take the GPUs as given
         else if (a == "--vram-reserve-mib")
             opt.reserve_mib = std::max<int64_t>(0, std::strtoll(next("--vram-reserve-mib"), nullptr, 10));
-        else if (a == "--vram-free-mib")
-            opt.vram_free_mib = std::max<int64_t>(0, std::strtoll(next("--vram-free-mib"), nullptr, 10));
         else if (a == "--expert-cache") {
             const std::string v = next("--expert-cache");
             opt.expert_slots = v == "auto" ? -1 : std::max<int64_t>(0, std::strtoll(v.c_str(), nullptr, 10));
         }
-        else if (a == "--adapt-decay") opt.adapt_decay = std::strtof(next("--adapt-decay"), nullptr);
-        else if (a == "--rope-freq-base") opt.rope_freq_base = std::strtod(next("--rope-freq-base"), nullptr);
-        else if (a == "--rope-freq-scale") opt.rope_freq_scale = std::strtod(next("--rope-freq-scale"), nullptr);
-        else if (a == "--expert-profile-save") profile_save = next("--expert-profile-save");
-        else if (a == "--expert-profile-save-every") save_min = std::strtod(next("--expert-profile-save-every"), nullptr);
+        else if (a == "--kv-ram") {
+            const std::string v = next("--kv-ram");
+            if (v != "on" && v != "off") {
+                std::fprintf(stderr, "strata (%s): --kv-ram takes on or off\n", arch.c_str());
+                return 2;
+            }
+            opt.kv_ram = v == "on";
+        }
+        else if (a == "--kv") {   // fp16 or int8; Qwen3.8-Flash-Next's q4 and k8v4 have no kernels here
+            const std::string v = next("--kv");
+            if (v != "fp16" && v != "int8") {
+                std::fprintf(stderr, "strata (%s): --kv takes fp16 or int8 for this model, not \"%s\"\n", arch.c_str(),
+                             v.c_str());
+                return 2;
+            }
+            opt.kv_int8 = v == "int8";
+        }
         else {
             switch (option_scope(a)) {
                 case OptionScope::qwen38_only:
@@ -746,11 +1013,19 @@ int plain_main(int argc, char** argv) {
 
     if (sp.greedy) sp.temperature = 0.0f;
     if (stop_eos && eos.empty()) eos = eos_tokens(gguf);
+    if (opt.vision && arch != "qwen35" && arch != "qwen35moe") {   // the M-RoPE table: the Qwen3.5 rotation's
+        std::fprintf(stderr, "strata (%s): --vision is off: pictures are read for qwen35 and qwen35moe\n", arch.c_str());
+        opt.vision = false;
+    }
     auto at_eos = [&](int32_t t) { return stop_eos && std::find(eos.begin(), eos.end(), t) != eos.end(); };
 
     strata::core::PlainModel model;
     model.set_sampler(sp);
     std::string err;
+    if (opt.vram_elastic && !serve) {   // the VRAM command comes between requests
+        std::fprintf(stderr, "strata (%s): --vram-elastic is off: it works between requests of --serve\n", arch.c_str());
+        opt.vram_elastic = false;
+    }
     const Clock::time_point t0 = Clock::now();
     if (opt.prompt_chunk > 0) strata::prefill::Gemm::prepare();   // the products' library loads beside the model
     if (!model.load(opt, err) || !model.prompt_warm(err)) {
@@ -758,11 +1033,25 @@ int plain_main(int argc, char** argv) {
         return 1;
     }
     opt.prompt_chunk = model.prompt_chunk();   // the model may take the prompt in windows (short of pinned memory)
-    if (opt.prompt_chunk > 0) {
+    if (opt.prompt_chunk > 0 && model.spec().n_expert == 0) {   // a dense model (qwen35)
+        std::fprintf(stderr, "strata (%s): prompt matrix products on %s, the int8 ones on %s\n", arch.c_str(),
+                     strata::prefill::Gemm::path(),
+                     strata::prefill::mmq::chosen() ? strata::prefill::mmq::path() : "none (FP16 for all)");
+    } else if (opt.prompt_chunk > 0) {
         const char* experts = model.prompt_int8() ? strata::prefill::mmq::path() : nullptr;
         std::fprintf(stderr, "strata (%s): prompt matrix products on %s; the experts' in %s%s%s\n", arch.c_str(),
                      strata::prefill::Gemm::path(), experts ? "int8 (" : "FP16", experts ? experts : "",
                      experts ? ")" : "");
+    }
+    if (cache.budget < 0) {   // from the RAM free now that the model is loaded, as generate.cpp's (#3493)
+        const int64_t mib = serve && cache.slots > 0
+            ? strata::core::auto_conversation_cache_mib(strata::core::available_host_bytes(), cache.min_free >> 20)
+            : 0;
+        cache.budget = mib << 20;
+        if (mib > 0)
+            std::fprintf(stderr, "strata (%s): conversation cache sized from the free RAM: %lld MiB for up to %d parked "
+                                 "conversations (--conversation-cache-mib N sets it, 0 turns it off)\n", arch.c_str(),
+                         (long long) mib, cache.slots);
     }
     if (serve)
         return plain_serve(model, opt, arch, eos.empty() ? eos_tokens(gguf) : eos, profile_save, save_min, cache);
@@ -862,6 +1151,13 @@ int plain_main(int argc, char** argv) {
                  (double) (produced.size() - 1) / (tg > 0 ? tg : 1), (long long) model.resident(),
                  (long long) model.slots(), routed > 0 ? 100.0 * (double) model.hits() / (double) routed : 0.0,
                  (long long) model.swaps());
+    std::fprintf(stderr, "strata (%s): below the VRAM tier: %lld routed entries read over PCIe; experts taken from "
+                         "RAM %lld, from the files %lld (%.1f MB)\n", arch.c_str(), (long long) model.offloaded(),
+                 (long long) model.ram_reads(), (long long) model.file_reads(), (double) model.file_read_bytes() / 1e6);
+    if (model.ram_adapts() > 0)
+        std::fprintf(stderr, "strata (%s): %lld experts moved into the RAM copy in the places of unused ones, %lld of "
+                             "them out of a stage buffer (STRATA_RAM_ADAPT)\n", arch.c_str(),
+                     (long long) model.ram_adapts(), (long long) model.ram_staged());
     if (model.spec_windows() > 0)
         std::fprintf(stderr, "strata (%s): %lld windows checked %lld drafts, accepted %lld (%.1f%%), %.2f tokens a window; "
                              "a window %.2f ms, its drafts %.2f ms\n",

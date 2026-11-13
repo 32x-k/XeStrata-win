@@ -17,6 +17,6 @@ bool onednn(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint
 bool cudnn(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t q0, int64_t q1,
            int64_t T, int64_t heads, int64_t hd, uint16_t* out16);
 bool aotriton(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t q0, int64_t q1,
-              int64_t T, int64_t heads, int64_t hd, uint16_t* out16);
+              int64_t T, int64_t heads, int64_t hd, uint16_t* out16, bool causal);
 
 }  // namespace strata::image::sdpa

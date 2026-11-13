@@ -10,6 +10,20 @@
 # builds code for the most GPUs, then the newest architectures, then has cuBLAS, then is the newest; the NVIDIA code
 # and oneMath's cuBLAS backend both use it.
 
+# `flags` (a list) for try_compile's COMPILE_DEFINITIONS: a flag with a space is quoted, since they reach the probe's
+# compile line as written and a path such as C:/Program Files/... split there (its LINK_OPTIONS are quoted by CMake).
+function(strata_try_compile_defs flags out)
+  set(defs "")
+  foreach(flag IN LISTS flags)
+    if(flag MATCHES " ")
+      list(APPEND defs "\"${flag}\"")
+    else()
+      list(APPEND defs "${flag}")
+    endif()
+  endforeach()
+  set(${out} "${defs}" PARENT_SCOPE)
+endfunction()
+
 # Whether `flags` (a list) build and link a SYCL kernel; remembered in the cache as `name`.
 function(strata_sycl_compiles flags name out)
   if(NOT DEFINED ${name})
@@ -18,9 +32,10 @@ function(strata_sycl_compiles flags name out)
       file(WRITE "${src}" "#include <sycl/sycl.hpp>\nint main() { sycl::queue q; q.single_task([] {}); }\n")
     endif()
     message(CHECK_START "Building a SYCL kernel with ${flags}")
+    strata_try_compile_defs("${flags}" defs)
     # a result variable of its own: try_compile caches it, and an older one would answer this check
     try_compile(${name}_result "${CMAKE_BINARY_DIR}/strata_sycl_probe" SOURCES "${src}"
-                COMPILE_DEFINITIONS -fsycl ${flags} LINK_OPTIONS -fsycl ${flags})
+                COMPILE_DEFINITIONS -fsycl ${defs} LINK_OPTIONS -fsycl ${flags})
     set(ok "${${name}_result}")
     if(ok)
       message(CHECK_PASS "yes")
