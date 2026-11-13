@@ -138,6 +138,52 @@ void swiglu(const float* gu, float* h, int64_t rows, int64_t n_ff, bool interlea
     });
 }
 
+void swiglu_quantize(const float* gu, void* xq, int t, int64_t rows, int64_t n_ff, bool interleaved, void* stream) {
+    if (rows <= 0) return;
+    // swiglu()'s value for each element, then kernels::iq_mmq_quantize's block of 32 (ids null, ld n_ff), written as
+    // that kernel writes it: the same bytes without H's round trip through memory
+    const float lim = kernels::expert_swiglu_limit();
+    const bool sums = kernels::iq_mmq_type_sums(t), dup = kernels::iq_mmq_type_dup(t);
+    using u32x4 = uint32_t __attribute__((ext_vector_type(4)));
+    const int64_t oc = dup ? 2 * n_ff : n_ff, rep = dup ? 2 : 1;
+    auto* x8 = static_cast<int8_t*>(xq);
+    auto* xs = reinterpret_cast<float*>(x8 + rows * oc);
+    const int64_t nb = n_ff / 32, onb = oc / 32;
+    float* xu = xs + rows * onb;
+    Q(stream).parallel_for(sycl::range<1>((size_t) (rows * nb)), [=](sycl::id<1> i) {
+        const int64_t r = (int64_t) i[0] / nb, b = (int64_t) i[0] % nb;
+        const float* row = gu + r * 2 * n_ff;
+        float v[32], amax = 0.0f;
+        for (int j = 0; j < 32; ++j) {
+            const int64_t k = b * 32 + j;
+            float g = interleaved ? row[2 * k] : row[k], u = interleaved ? row[2 * k + 1] : row[n_ff + k];
+            kernels::swiglu_clamp(g, u, lim);
+            v[j] = g / (1.0f + sycl::exp(-g)) * u;
+            amax = sycl::fmax(amax, sycl::fabs(v[j]));
+        }
+        const float d = amax / 127.0f, id = amax > 0.0f ? 1.0f / d : 0.0f;
+        uint32_t p[8];
+        int sum = 0;
+        for (int j = 0; j < 8; ++j) {
+            uint32_t w = 0;
+            for (int k = 0; k < 4; ++k) {
+                const int q = (int) sycl::round(v[4 * j + k] * id);
+                sum += q;
+                w |= (uint32_t) (uint8_t) (int8_t) q << (8 * k);
+            }
+            p[j] = w;
+        }
+        for (int64_t c = 0; c < rep; ++c) {
+            const int64_t ob = b * rep + c;
+            u32x4* o = reinterpret_cast<u32x4*>(x8 + r * oc + ob * 32);
+            o[0] = u32x4{p[0], p[1], p[2], p[3]};
+            o[1] = u32x4{p[4], p[5], p[6], p[7]};
+            xs[r * onb + ob] = d;
+            if (sums) xu[r * onb + ob] = d * (float) sum;
+        }
+    });
+}
+
 void iota(int32_t* dst, int64_t n, void* stream) {
     if (n > 0) Q(stream).parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> i) { dst[i] = (int32_t) i[0]; });
 }

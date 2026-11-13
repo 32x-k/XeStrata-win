@@ -10,30 +10,34 @@ namespace strata::kernels {
 void native_router_set_enabled(bool enabled);
 bool native_router_enabled();
 
-// Pinned CUDA topk-moe contract for ONE token, 512 experts, top 10, softmax,
+// Whether the native router takes this shape: 512 or 256 experts (a pruned model's), top 10.
+bool native_router_takes(int n_expert, int k);
+// Pinned CUDA topk-moe contract for ONE token, `n_expert` experts (native_router_takes), top 10, softmax,
 // no selection bias, lower normalization clamp 2^-14, and scale 1.
-// Reads 512 finite F32 logits; writes 10 I32 IDs and 10 F32 weights. Equal
+// Reads n_expert finite F32 logits; writes 10 I32 IDs and 10 F32 weights. Equal
 // computed probabilities select the lower expert index. All spans must be
 // four-byte aligned and outputs disjoint from each other and the input.
 // Requires a nonnull ordered CUDA stream. No allocation or synchronization.
-void native_router_top10(const float* logits, int32_t* ids, float* weights, void* stream);
-/// n_tok rows at once (logits [n,512], ids/weights [n,10]); each row exactly as the single call.
-void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream);
+void native_router_top10(const float* logits, int32_t* ids, float* weights, void* stream, int n_expert = 512);
+/// n_tok rows at once (logits [n,n_expert], ids/weights [n,10]); each row exactly as the single call.
+void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream,
+                               int n_expert = 512);
 /// The multi call and the doorbell (elementwise.hpp's doorbell_publish) in one launch: the rows routed as above, the
 /// ids and weights written to the device buffers and to the mapped `ids_out`/`weights_out`, `x` (n_x floats) copied
 /// to `x_out`, then `*d_seq` incremented for the host.  n_tok sub-groups of one work-group: n_tok x 32 work-items at
 /// most the device's work-group.
 void native_router_top10_publish(const float* logits, int32_t* ids, float* weights, int n_tok, const float* x,
                                  int64_t n_x, float* x_out, int32_t* ids_out, float* weights_out, uint32_t* d_seq,
-                                 void* stream);
+                                 void* stream, int n_expert = 512);
 /// STRATA_ROUTE_RESIDENT (upstream 5df35dcb): swap non-resident tail-rank experts for resident ones within `margin`
 /// logits (see router.cpp).  `stats` is nullptr or 4 device uint64 counters: tail entries seen, swaps, non-resident
 /// before, non-resident after.
-/// STRATA_ROUTE_PRIOR=lambda (upstream 2de9ae06, opt-in, changes the output): top-10 per token over `logits` (n_tok x 512)
+/// STRATA_ROUTE_PRIOR=lambda (upstream 2de9ae06, opt-in, changes the output): top-10 per token over `logits` (n_tok x n_expert)
 /// where a resident expert (`res_layer[e] >= 0`) gets `lambda` added to its logit for the SELECTION; the weights are the
 /// router's own probabilities (softmax over the 512 unbiased logits) renormalised over the 10 picked.
 void route_prior_top10(const float* logits, const int32_t* res_layer, float lambda, int32_t* ids, float* weights,
-                       int n_tok, void* stream);
+                       int n_tok, void* stream, int n_expert = 512);
 void native_route_resident(const float* logits, int32_t* ids, float* weights, const int32_t* res_layer, int n_tok,
-                           float margin, int rank_lo, int rank_hi, unsigned long long* stats, void* stream);
+                           float margin, int rank_lo, int rank_hi, unsigned long long* stats, void* stream,
+                           int n_expert = 512);
 }

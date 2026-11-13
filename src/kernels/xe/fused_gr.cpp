@@ -17,6 +17,7 @@
 #define STRATA_DEVICE_ARCH_TAG_TU xe_fused_gr
 #include "strata/kernels/device_arch_tag.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <string>
@@ -836,10 +837,15 @@ void fused_gr_time_q8(const FusedGrArgs& w, int n_tok, int reps, void* stream, d
         q.wait();
         return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / reps;
     };
-    bf16_us = run(0);
-    q8_us = run(1);
-    q8f_us = run(2);
-    bf16_us = (bf16_us + run(0)) / 2;   // the BF16 read timed on either side of the others
+    // the three forms in turn, three times, the fastest of each: one pass right after the load read every form at up to
+    // twice its time on the B70 (BF16 44 against 26 us, Q8_0 50 against 21) and took the BF16 read, keeping 1.17 GiB
+    // of BF16 weights off the expert cache
+    bf16_us = q8_us = q8f_us = 1e30;
+    for (int r = 0; r < 3; ++r) {
+        bf16_us = std::min(bf16_us, run(0));
+        q8_us = std::min(q8_us, run(1));
+        q8f_us = std::min(q8f_us, run(2));
+    }
     sycl::free(buf, q);
 }
 

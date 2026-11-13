@@ -3,6 +3,9 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // serve/web/app.js - the Strata web app: Chat, Monitor, About. No framework, no network beyond this server.
 // The Monitor tab rebuilds PR #22's dashboard idea (code-martin) on the server's own /metrics.
+/* global tr, StrataI18n, StrataMath, StrataPreview, node, panel, msgActions, saveChat, stillWriting, initChats, setChatList,
+          clearUndo, syncActions, closePanel, renderSidebar, renderParent, renderUndoBar, setSidebar, sidebarOpen */
+// serve/web/i18n.js, math.js, preview.js and chats-ui.js, loaded before this file
 "use strict";
 
 const $ = (id) => document.getElementById(id);
@@ -17,7 +20,8 @@ const gb = (b, d = 1) => (b == null ? "–" : fmt(b / 1073741824, d));   // memo
 
 const store = {
   get(k, d) { try { const v = localStorage.getItem("xestrata." + k); return v === null ? d : JSON.parse(v); } catch (e) { return d; } },
-  set(k, v) { try { localStorage.setItem("xestrata." + k, JSON.stringify(v)); } catch (e) { /* private mode: in memory only */ } },
+  set(k, v) { try { localStorage.setItem("xestrata." + k, JSON.stringify(v)); return true; } catch (e) { return false; } },
+  del(k) { try { localStorage.removeItem("xestrata." + k); } catch (e) { /* ignore */ } },
 };
 
 // ------------------------------------------------------------------ toasts
@@ -53,7 +57,7 @@ async function copyText(text, btn) {
     use.setAttribute("href", `${SPRITE}#i-check`);
     setTimeout(() => use.setAttribute("href", `${SPRITE}#i-copy`), 1500);
   }
-  toast("success", "Copied to clipboard", "", 1800);
+  toast("success", tr("toast.copied", "Copied to clipboard"), "", 1800);
 }
 
 // ------------------------------------------------------------------ theme and tabs
@@ -63,6 +67,7 @@ function setTheme(t, save) {
   if (save) try { localStorage.setItem("xestrata.theme", t); } catch (e) { /* ignore */ }
   $("theme-icon").setAttribute("href", `${SPRITE}#i-${t === "dark" ? "sun" : "moon"}`);
   $("dark-toggle").setAttribute("aria-checked", String(t === "dark"));
+  refreshPreviews();                                  // the preview frames carry the page's colours
 }
 const flipTheme = () => setTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark", true);
 $("theme-btn").onclick = flipTheme;
@@ -84,7 +89,7 @@ function showTab(name) {
     $("img-prompt").focus();
     if (health.image_note && !noteShown) {   // once a page load: setup lowered the image model's size for the RAM
       noteShown = true;
-      toast("info", "Image model size lowered", health.image_note, 12000);
+      toast("info", tr("img.noteToast", "Image model size lowered"), health.image_note, 12000);
     }
   }
   if (location.hash.slice(1) !== tab) history.replaceState(null, "", tab === "chat" ? location.pathname : `#${tab}`);
@@ -97,26 +102,41 @@ for (const b of document.querySelectorAll(".st-tab")) b.onclick = () => showTab(
 window.addEventListener("hashchange", () => showTab(location.hash.slice(1)));
 
 // ------------------------------------------------------------------ server access
+let apiKey = store.get("apikey", "");
 function headers(json = false) {
   const h = {};
-  const key = store.get("apikey", "");
-  if (key) h.Authorization = "Bearer " + key;
+  if (apiKey) h.Authorization = "Bearer " + apiKey;
   if (json) h["Content-Type"] = "application/json";
   return h;
 }
-$("api-key").value = store.get("apikey", "");
-$("api-key").onchange = () => { store.set("apikey", $("api-key").value.trim()); toast("success", "API key saved", "Kept in this browser only."); };
+$("api-key").value = apiKey;
+function saveApiKey(notify = false) {
+  apiKey = $("api-key").value.trim();                // usable even when browser storage is blocked or full
+  const saved = store.set("apikey", apiKey);
+  if (notify) {
+    if (saved) toast("success", "API key saved", "Kept in this browser only.");
+    else toast("warn", "API key used for this page only", "Browser storage is unavailable. Enter it again after reloading.");
+  }
+}
+$("api-key").oninput = () => saveApiKey();
+$("api-key").onchange = () => saveApiKey(true);
 
 let health = {model: "strata", images: false, max_context: 0};
+// the texts that depend on what this server offers: the empty chat's line and the attach button's hint
+function renderEmptyChat() {
+  $("attach-btn").title = health.images ? tr("composer.attachPictures", "Attach a text file or a picture (or drop it here)")
+                                        : tr("composer.attach", "Attach a text file (or drop it here)");
+  $("chat-empty-sub").textContent = tr("chat.emptyModel", "{model} runs on this PC. Nothing leaves it.", {model: health.model});
+}
 async function loadHealth() {
   try {
     health = await (await fetch("health")).json();
-    $("attach-btn").title = health.images ? "Attach a text file or a picture (or drop it here)"
-                                          : "Attach a text file (or drop it here)";
-    $("chat-empty-sub").textContent = `${health.model} runs on this PC. Nothing leaves it.`;
+    renderEmptyChat();
     $("tab-btn-images").hidden = !health.image_generation;
     $("img-note").hidden = !health.image_note;
     $("img-note").textContent = health.image_note || "";
+    imgModels();
+    thinkingButtons();
     if (location.hash === "#images" && health.image_generation) showTab("images");
   } catch (e) {
     setTimeout(loadHealth, 2000);
@@ -142,17 +162,17 @@ async function loadSwitcher() {
   }));
   sel.disabled = !!sw.starting || !!switching;
   $("model-switch").hidden = false;
-  if (sw.starting && !switching) setPill("reading", `Loading ${sw.choices[sw.starting] || sw.starting}…`);
+  if (sw.starting && !switching) setPill("reading", tr("switch.loading", "Loading {name}…", {name: sw.choices[sw.starting] || sw.starting}));
 }
 $("model-select").onchange = async () => {
   const mode = $("model-select").value, name = $("model-select").selectedOptions[0].textContent;
-  if (!confirm(`Load ${name}? The current model is unloaded first; it takes about 2 minutes and stops any answer in progress.`)) {
+  if (!confirm(tr("switch.confirm", "Load {name}? The current model is unloaded first; it takes about 2 minutes and stops any answer in progress.", {name}))) {
     loadSwitcher();
     return;
   }
   switching = {mode, from: health.model, t0: Date.now()};
   $("model-select").disabled = true;
-  setPill("reading", `Switching to ${name}… (about 2 minutes)`, true);
+  setPill("reading", tr("switch.switching", "Switching to {name}… (about 2 minutes)", {name}), true);
   try {
     await fetch("switcher", {method: "POST", headers: headers(true), body: JSON.stringify({mode})});
   } catch (e) { /* this server may already be going down */ }
@@ -162,11 +182,11 @@ $("model-select").onchange = async () => {
       if (h.model && h.model !== switching.from) { location.reload(); return; }
     } catch (e) { /* down while the models swap */ }
     if (Date.now() - switching.t0 > 6 * 60 * 1000) {
-      setPill("error", `${name} did not come up in 6 minutes`, true);
+      setPill("error", tr("switch.failed", "{name} did not come up in 6 minutes", {name}), true);
       switching = null;
       return;
     }
-    setPill("reading", `Switching to ${name}… ${Math.round((Date.now() - switching.t0) / 1000)} s`, true);
+    setPill("reading", tr("switch.switchingFor", "Switching to {name}… {s} s", {name, s: Math.round((Date.now() - switching.t0) / 1000)}), true);
     setTimeout(wait, 3000);
   };
   setTimeout(wait, 5000);
@@ -228,7 +248,7 @@ function spark(id, values, max, gaps = false) {
 }
 // an image job's step for the header and the state card: "step 3/8", or its stage before and after the sampling
 function imageStep(img) {
-  return img.stage === "sampling" ? `step ${img.step}/${img.steps}` : img.label;
+  return img.stage === "sampling" ? tr("img.step", "step {i}/{n}", {i: img.step, n: img.steps}) : img.label;
 }
 function setMetric(key, value, unit, sub) {
   $(`mv-${key}`).innerHTML = value == null ? "–" : `${esc(value)}${unit ? `<small>${esc(unit)}</small>` : ""}`;
@@ -237,22 +257,38 @@ function setMetric(key, value, unit, sub) {
 
 let lastMetrics = null, metricsFailures = 0, keyWarned = false, mcpTick = 0;
 let failureSeen = null;   // issue #10: the engine failure already shown as a toast (its time)
+let metricsEpoch = 0;
+// After Load or Unload returns, a poll that started earlier can still say the opposite. Hold the POST's state until a later
+// poll agrees, or until the first poll that started after the POST arrives. (PR #3550 by sakuumomo)
+let metricsHold = null;
 let reqShowAll = false;   // the Monitor's request table: the last 12, or every one the server keeps (issue #35)
+function metricsAgree(live, state) {
+  const s = (live && live.state) || "";
+  if (state === "unloaded") return s === "unloaded";
+  return s !== "" && s !== "unloaded";
+}
 async function poll() {
+  const epoch = ++metricsEpoch;
   try {
     const r = await fetch(reqShowAll ? "metrics?requests=all" : "metrics", {headers: headers()});
     if (r.status === 401) {
-      setPill("error", "API key needed");
-      if (!keyWarned) { keyWarned = true; toast("warn", "API key needed", "This server needs a key: add it under About > Settings.", 6000); }
+      setPill("error", tr("pill.keyNeeded", "API key needed"));
+      if (!keyWarned) { keyWarned = true; toast("warn", tr("pill.keyNeeded", "API key needed"), tr("toast.keyAbout", "This server needs a key: add it under About > Settings."), 6000); }
     } else if (r.ok) {
-      lastMetrics = await r.json();
+      const m = await r.json();
+      if (metricsHold && epoch <= metricsHold.after && !metricsAgree(m.live, metricsHold.state)) {
+        setTimeout(poll, 1000);
+        return;
+      }
+      if (metricsHold && (metricsAgree(m.live, metricsHold.state) || epoch > metricsHold.after)) metricsHold = null;
+      lastMetrics = m;
       metricsFailures = 0;
       render(lastMetrics);
     } else {
       throw new Error(`HTTP ${r.status}`);
     }
   } catch (e) {
-    if (++metricsFailures === 3) setPill("error", "Server not reachable");
+    if (++metricsFailures === 3) setPill("error", tr("pill.unreachable", "Server not reachable"));
   }
   if (tab === "monitor" && ++mcpTick % 10 === 0) loadMcp();       // server states change rarely: every 10 s
   setTimeout(poll, 1000);
@@ -262,34 +298,179 @@ function setPill(state, text, force = false) {
   if (switching && !force) return;   // while the models swap, the menu owns the pill
   $("pill").dataset.state = state === "error" ? "queued" : state;
   $("pill-text").textContent = text;
+  // a poll re-sets the sentence every second; refit only when its text changed
+  if (text !== lastPillText) { lastPillText = text; fitHeader(); }
 }
+let lastPillText = null;
+// The pill's sentence is the first thing the header row can spare when it runs out of room.
+function fitHeader() {
+  const header = document.querySelector(".st-header");
+  if (!header) return;
+  header.classList.remove("st-header--clip");
+  if (header.scrollWidth > header.clientWidth) header.classList.add("st-header--clip");
+}
+window.addEventListener("resize", fitHeader);
+
+// ------------------------------------------------------------------ Load / Unload (POST /load, /unload: the header button)
+// Metrics stay "unloaded" until the engine is READY, so a turn or an image job on this page has to paint Loading itself.
+// modelOp covers the button's own POST, which returns before the next poll can agree.
+let modelOp = null;
+let imageBusy = false;
+function pageBusy() { return busy != null || imageBusy; }
+// live.image (the image engine's job, on the metrics) is the job a refresh can see. imageBusy is this page's POST before
+// that job is published. A chat phase already on the metrics wins, because Stop still stops that reply.
+function imageLive(live) {
+  if (live && live.image) return true;
+  const state = live && live.state;
+  if (state === "reading" || state === "generating") return false;
+  return imageBusy;
+}
+function paintLive() { if (lastMetrics) render(lastMetrics); }
+function turnBlocksUnload(live) {
+  const state = (live && live.state) || "";
+  return pageBusy() || imageLive(live) || state === "reading" || state === "generating" || (live && live.queued > 0);
+}
+function setModelButton(text, title, disabled) {
+  const btn = $("unload-btn");
+  btn.textContent = text; btn.title = title; btn.disabled = disabled;
+  fitHeader();
+}
+function modelButton(live) {
+  if (modelOp === "load") return setModelButton(tr("model.loading", "Loading…"), tr("model.loadingTitle", "The model is loading"), true);
+  if (modelOp === "unload") return setModelButton(tr("model.unloading", "Unloading…"), tr("model.unloadingTitle", "The model is unloading"), true);
+  const state = (live && live.state) || "";
+  const metricsBusy = state === "reading" || state === "generating" || (live && live.queued > 0);
+  const imageNow = imageLive(live);
+  const unload = tr("model.unload", "Unload");
+  if (state === "unloaded") {
+    // an image job runs on its own engine beside the unloaded text model: Load waits until it has finished
+    if (imageNow) return setModelButton(tr("model.load", "Load"), tr("model.imageBusy", "An image is generating. It finishes on its own."), true);
+    if (pageBusy()) return setModelButton(tr("model.loading", "Loading…"), tr("model.replyLoading", "A reply is already loading the model"), true);
+    return setModelButton(tr("model.load", "Load"), tr("model.loadTitle", "Load the model now. A message also loads it."), false);
+  }
+  if (imageNow) return setModelButton(unload, tr("model.imageBusy", "An image is generating. It finishes on its own."), true);
+  if (!state) return setModelButton("…", tr("model.waiting", "Waiting for the server"), true);
+  if (metricsBusy || pageBusy()) return setModelButton(unload, tr("model.stopFirst", "Stop the reply, then unload"), true);
+  return setModelButton(unload, tr("model.unloadTitle", "Unload the model and free the GPU"), false);
+}
+$("unload-btn").onclick = async () => {
+  if (modelOp) return;
+  const live = (lastMetrics && lastMetrics.live) || {};
+  const loading = live.state === "unloaded";
+  const busyCopy = (sample, stillLoading) => stillLoading
+    ? (imageLive(sample) ? tr("model.imageBusy", "An image is generating. It finishes on its own.") : tr("model.replyLoadingDot", "A reply is already loading the model."))
+    : (imageLive(sample) ? tr("model.imageBusy", "An image is generating. It finishes on its own.") : tr("model.stopFirstDot", "Stop the reply, then unload."));
+  if (loading ? pageBusy() || imageLive(live) : turnBlocksUnload(live)) {
+    toast("warn", tr("model.busy", "Model is busy"), busyCopy(live, loading));
+    return;
+  }
+  if (!loading && !confirm(tr("model.confirmUnload", "Unload the model and free the GPU? Load, or the next message, brings it back."))) return;
+  // confirm() blocks the poll. Yield so a sample that arrived during the dialog is applied. A confirmed Unload stays an unload.
+  if (!loading) {
+    modelOp = "unload";
+    modelButton(live);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  const now = (lastMetrics && lastMetrics.live) || {};
+  const loadingNow = loading;
+  if (loadingNow ? pageBusy() || imageLive(now) : turnBlocksUnload(now)) {
+    modelOp = null;
+    if (lastMetrics) render(lastMetrics); else modelButton(now);
+    toast("warn", tr("model.busy", "Model is busy"), busyCopy(now, loadingNow));
+    return;
+  }
+  modelOp = loadingNow ? "load" : "unload";
+  modelButton(now);
+  if (loadingNow) toast("info", tr("model.loadingToast", "Loading the model"), tr("model.fewMinutes", "This can take a few minutes."));
+  const remember = (state) => {
+    if (!lastMetrics) lastMetrics = {};
+    lastMetrics.live = Object.assign({}, lastMetrics.live, {state, queued: 0});
+    metricsHold = {state, after: metricsEpoch};
+  };
+  try {
+    const r = await fetch(loadingNow ? "load" : "unload", {method: "POST", headers: headers(true), body: "{}"});
+    let body = {};
+    try { body = await r.json(); } catch (e) { /* the connection dropped */ }
+    const status = body.status || "";
+    const msg = (body.error && body.error.message) ||
+                (r.status === 401 ? tr("toast.keyAbout2", "API key needed: add it under About > Settings.") : tr("toast.httpAnswer", "The server answered HTTP {code}.", {code: r.status}));
+    const failTitle = loadingNow ? tr("model.loadFailed", "Load failed") : tr("model.unloadFailed", "Unload failed");
+    if (loadingNow) {
+      if (r.ok && status === "loaded") {
+        remember("idle");
+        toast("success", tr("model.loaded", "Model loaded"), tr("model.gpuInUse", "The GPU is in use."));
+      } else {
+        toast("error", failTitle, msg);
+      }
+    } else if (status === "unloaded" || status === "not loaded") {
+      remember("unloaded");
+      toast(status === "unloaded" ? "success" : "info",
+            status === "unloaded" ? tr("model.unloaded", "Model unloaded") : tr("model.alreadyUnloaded", "Already unloaded"),
+            tr("model.gpuFree", "The GPU is free. Load, or the next message, brings it back."));
+    } else if (r.status === 409 || status === "busy") {
+      let sample = (lastMetrics && lastMetrics.live) || {};
+      try {
+        const mr = await fetch("metrics", {headers: headers()});
+        if (mr.ok) {
+          const m = await mr.json();
+          if (m && m.live) { sample = m.live; lastMetrics = m; }
+        }
+      } catch (e) { /* the 409 body has no phase */ }
+      toast("warn", tr("model.busy", "Model is busy"), imageLive(sample)
+        ? tr("model.imageBusy", "An image is generating. It finishes on its own.") : tr("model.stopFirstDot", "Stop the reply, then unload."));
+    } else if (status === "unsupported") {
+      toast("error", tr("model.unsupported", "Unload is not available"), "");
+    } else {
+      toast("error", failTitle, msg);
+    }
+  } catch (e) {
+    toast("error", loadingNow ? tr("model.loadFailed", "Load failed") : tr("model.unloadFailed", "Unload failed"), tr("model.noAnswer", "The server did not answer."));
+  } finally {
+    modelOp = null;
+    if (lastMetrics) render(lastMetrics); else modelButton({});
+  }
+};
 
 function render(m) {
   const live = m.live || {}, hw = m.hardware || {}, st = m.hardware_static || {}, eng = m.engine || {}, h = m.history || {};
   const last = (m.requests || []).find((r) => r.kind !== "image");   // the chat's last request (image jobs aside)
-  // the header pill
-  if (live.image) {
-    setPill("generating", `Image · ${imageStep(live.image)}`);
+  // the header pill. modelOp and a local load win over "N queued": with parallel requests, queued stays up through
+  // ensure_loaded(), and metrics stay "unloaded" until the engine is READY. An image job runs beside an unloaded text
+  // model (it has its own engine), so only a chat turn here counts as a load.
+  const localLoad = live.state === "unloaded" && busy != null;
+  if (modelOp === "load") {
+    setPill("idle", tr("model.loading", "Loading…"));
+  } else if (modelOp === "unload") {
+    setPill("idle", tr("model.unloading", "Unloading…"));
+  } else if (live.image) {
+    setPill("generating", tr("img.pill", "Image · {step}", {step: imageStep(live.image)}));
+  } else if (localLoad) {
+    setPill("idle", tr("model.loading", "Loading…"));
+  } else if (imageLive(live)) {
+    setPill("reading", tr("pill.image", "Generating image…"));
   } else if (live.state === "reading") {
     const pct = live.prompt_total ? Math.round((100 * live.prompt_read) / live.prompt_total) : null;
-    setPill("reading", pct != null ? `Reading prompt · ${pct}%` : "Reading prompt");
+    setPill("reading", pct != null ? tr("pill.readingPct", "Reading prompt · {pct}%", {pct}) : tr("pill.reading", "Reading prompt"));
   } else if (live.state === "generating") {
-    setPill("generating", `Generating · ${fmt(live.tok_s, 1)} tok/s`);
+    setPill("generating", tr("pill.generating", "Generating · {rate} tok/s", {rate: fmt(live.tok_s, 1)}));
+  } else if (live.state === "unloaded") {
+    setPill("idle", tr("pill.unloaded", "Unloaded"));
   } else {
-    setPill("idle", "Idle");
+    setPill("idle", tr("pill.idle", "Idle"));
   }
-  if (live.queued > 0) setPill("queued", `${live.queued} queued`);
+  modelButton(live);
+  if (!modelOp && !localLoad && live.queued > 0) setPill("queued", tr("pill.queued", "{n} queued", {n: live.queued}));
   // issue #10: an engine that stopped in a request says why once (the server starts it again for the next one)
   const fail = m.engine_failure;
   if (fail && fail.at !== failureSeen) {
-    if (failureSeen !== null || Date.now() / 1000 - fail.at < 600) toast("error", "The engine stopped", fail.message, 15000);
+    if (failureSeen !== null || Date.now() / 1000 - fail.at < 600) toast("error", tr("engine.stopped", "The engine stopped"), fail.message, 15000);
     failureSeen = fail.at;
   }
   // Intel's compiler 2.27 to 2.30: the engine works around a bug of it (INFO igc_workaround); said once a version
   if (eng.igc_workaround && eng.igc_workaround !== "none" && store.get("igc-told", "") !== eng.igc_workaround) {
     store.set("igc-told", eng.igc_workaround);
-    toast("warn", "Intel's compiler slows the decode", `IGC ${eng.igc_workaround} has a bug XeStrata works around; the decode of short prompts is up to 10% slower. For full speed, use Fedora 44 (its IGC is 2.32 or later), or install with Podman (Fedora 44 inside).`, 12000,
-          {label: "Show", run: () => showTab("about")});
+    toast("warn", tr("igc.toast", "Intel's compiler slows the decode"), tr("igc.toastText", "IGC {version} has a bug XeStrata works around; the decode of short prompts is up to 10% slower. For full speed, use Fedora 44 (its IGC is 2.32 or later), or install with Podman (Fedora 44 inside).", {version: eng.igc_workaround}), 12000,
+          {label: tr("show", "Show"), run: () => showTab("about")});
   }
   if (tab === "monitor") renderMonitor(live, hw, st, eng, h, last, m.requests || [], m.totals, m.requests_kept, fail);
   if (tab === "monitor") renderConvCache(m.conversation_cache);
@@ -340,18 +521,37 @@ function renderTotals(t) {
 }
 function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail) {
   // model state
-  const on = live.queued > 0 ? "queued" : live.image ? "generating" : live.state;
-  for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", b.dataset.s === on || (!live.image && b.dataset.s === live.state));
+  // A local turn keeps metrics on "unloaded" for the whole engine start.
+  const imageNow = imageLive(live);
+  const starting = modelOp === "load" || (busy != null && live.state === "unloaded");
+  const on = !modelOp && live.queued > 0 ? "queued" : live.image ? "generating" : live.state;
+  for (const b of document.querySelectorAll("#state-badges .st-badge")) {
+    const lit = (b.dataset.s === on || (!live.image && b.dataset.s === live.state)) && !(starting && b.dataset.s === "unloaded");
+    b.classList.toggle("on", lit);
+  }
   const prog = $("state-progress");
   let label = "Waiting for a request", detail = "", pct = 0;
   if (live.image) {
     const img = live.image;
-    label = img.label + (img.images > 1 ? ` · image ${img.image} of ${img.images}` : "");
+    label = img.label + (img.images > 1 ? ` · ${tr("img.nOf", "image {i} of {n}", {i: img.image, n: img.images})}` : "");
     delete prog.dataset.tone;
     pct = 100 * (img.progress || 0);
-    detail = [`step ${img.step}/${img.steps}`, img.step_s != null ? `${fmt(img.step_s, 2)} s/step` : null,
-              `${fmt(img.elapsed_s, 0)} s`, img.size, img.refs ? `${img.refs} reference${img.refs > 1 ? "s" : ""}` : null]
+    detail = [tr("img.step", "step {i}/{n}", {i: img.step, n: img.steps}), img.step_s != null ? `${fmt(img.step_s, 2)} s/step` : null,
+              `${fmt(img.elapsed_s, 0)} s`, img.size,
+              img.refs ? tr("img.refs", {one: "{n} reference", other: "{n} references"}, {n: img.refs}) : null]
       .filter(Boolean).join(" · ");
+  } else if (modelOp === "load" || (busy != null && live.state === "unloaded")) {
+    label = "Loading";
+    delete prog.dataset.tone;
+    detail = "The model is loading.";
+  } else if (imageNow) {
+    label = tr("img.generating", "Generating image");
+    delete prog.dataset.tone;
+    detail = tr("model.imageBusy", "An image is generating. It finishes on its own.");
+  } else if (modelOp === "unload") {
+    label = "Unloading";
+    delete prog.dataset.tone;
+    detail = "Freeing the GPU.";
   } else if (live.state === "reading") {
     label = "Reading prompt";
     prog.dataset.tone = "info";
@@ -366,12 +566,16 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
     delete prog.dataset.tone;
     pct = live.max_tokens ? Math.min(100, (100 * live.generated) / live.max_tokens) : 0;
     detail = `${fmt(live.generated)} tokens · ${fmt(live.tok_s, 1)} tok/s`;
+  } else if (live.state === "unloaded") {
+    label = "Unloaded";
+    delete prog.dataset.tone;
+    detail = "Load brings it back. A message does too.";
   } else if (last) {
     delete prog.dataset.tone;
     detail = `last: ${fmt(last.output_tokens)} tokens${last.decode_tok_s ? ` at ${fmt(last.decode_tok_s, 1)} tok/s` : ""}`;
   }
   if (fail && live.state === "idle") {   // issue #10: the last engine that stopped, until a request runs again
-    label = `Engine stopped at ${new Date(fail.at * 1000).toLocaleTimeString()}`;
+    label = tr("engine.stoppedAt", "Engine stopped at {time}", {time: new Date(fail.at * 1000).toLocaleTimeString()});
     detail = fail.message;
     for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", b.dataset.s === "error");
   }
@@ -382,7 +586,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
   // the eight cards
   if (live.image) {   // an image job: its seconds a step, not a decode rate
     setMetric("speed", live.image.step_s == null ? null : fmt(live.image.step_s, 2), "s/step",
-              `Image · ${imageStep(live.image)}`);
+              tr("img.pill", "Image · {step}", {step: imageStep(live.image)}));
   } else {
     const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
     setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s",
@@ -390,7 +594,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
   }
   const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
                 : last && last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null;
-  if (live.image) setMetric("prefill", null, "t/s", "Image job");
+  if (live.image) setMetric("prefill", null, "t/s", tr("img.job", "Image job"));
   else setMetric("prefill", prefill == null ? null : fmt(prefill), "t/s",
                  live.state === "reading" ? "Prefill now" : live.state === "generating" ? "Prefill this request" : last ? "Prefill last request" : "Prefill");
   spark("sp-speed", h.tok_s, undefined, true);
@@ -408,7 +612,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
   // an idle GPU on the xe driver may report its last temperature, not its present one (Battlemage's hwmon): dimmed
   const stale = Boolean(hw.gpu_temp_may_be_stale) && hw.gpu_temp != null;
   setMetric("temp", hw.gpu_temp == null ? null : fmt(hw.gpu_temp), "°C",
-            stale ? "GPU idle (the reading may be old)"
+            stale ? tr("mon.tempStale", "GPU idle (the reading may be old)")
             : multi ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`))
             : hw.gpu_mem_temp == null ? "" : `VRAM ${fmt(hw.gpu_mem_temp)} °C`);
   $("mv-temp").classList.toggle("is-stale", stale);
@@ -418,7 +622,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
   const gen = hw.gpu_pcie_gen_max || hw.gpu_pcie_gen;
   setMetric("pcie", gen ? `Gen${gen}` : null, hw.gpu_pcie_width ? `x${hw.gpu_pcie_width}` : "",
             hw.gpu_pcie_rx_mb == null ? "" : `to GPU ${fmt(hw.gpu_pcie_rx_mb, hw.gpu_pcie_rx_mb < 10 ? 1 : 0)} MB/s` +
-            (hw.gpu_pcie_own_gen && gen && hw.gpu_pcie_own_gen < gen ? ` · now Gen${hw.gpu_pcie_own_gen}` : ""));
+            (hw.gpu_pcie_own_gen && gen && hw.gpu_pcie_own_gen < gen ? ` · ${tr("mon.nowGen", "now Gen{n}", {n: hw.gpu_pcie_own_gen})}` : ""));
   spark("sp-pcie", h.gpu_pcie_rx_mb);
   setMetric("cpu", hw.cpu == null ? null : fmt(hw.cpu), "%", st.threads ? `${st.cores ? `${st.cores} cores · ` : ""}${st.threads} threads` : "");
   spark("sp-cpu", h.cpu, 100);
@@ -457,25 +661,31 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, fail)
     body.innerHTML = `<tr><td colspan="9" class="muted">No requests yet</td></tr>`;
   } else {
     const badge = {stop: ["", "Done"], length: ["", "Max tokens"], cancel: ["st-badge--queued", "Stopped"],
-                   disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"]};
+                   disconnect: ["st-badge--queued", "Closed"], error: ["st-badge--error", "Error"],
+                   timeout: ["st-badge--queued", "Timeout"]};
     body.innerHTML = requests.slice(0, reqShowAll ? requests.length : 12).map((r) => {
       const [cls, text] = badge[r.finish] || ["", r.finish || "–"];
       const t = new Date(r.time * 1000).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit", second: "2-digit"});
       if (r.kind === "image") {   // an image job: its size, references and stages in place of the token columns
-        const what = [`${r.edit ? "Edit" : "Image"} ${r.size}`, r.n > 1 ? `${r.n} images` : null,
-                      r.refs ? `${r.refs} reference${r.refs > 1 ? "s" : ""}` : null].filter(Boolean).join(" · ");
+        const what = [r.edit ? tr("img.rowEdit", "Edit {size}", {size: r.size}) : tr("img.rowImage", "Image {size}", {size: r.size}),
+                      r.n > 1 ? tr("img.rowCount", {one: "{n} image", other: "{n} images"}, {n: r.n}) : null,
+                      r.refs ? tr("img.refs", {one: "{n} reference", other: "{n} references"}, {n: r.refs}) : null].filter(Boolean).join(" · ");
         const stages = r.error ? r.error
-          : [r.text_encode_ms != null ? `text ${fmt(r.text_encode_ms / 1000, 1)} s` : null,
-             r.sampling_s != null ? `sampling ${fmt(r.sampling_s, 1)} s` : null,
-             r.vae_decode_s != null ? `VAE ${fmt(r.vae_decode_s, 1)} s` : null].filter(Boolean).join(" · ");
-        return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span> <span class="st-badge st-badge--reading">Image</span></td>
+          : [r.text_encode_ms != null ? tr("img.stageText", "text {s} s", {s: fmt(r.text_encode_ms / 1000, 1)}) : null,
+             r.sampling_s != null ? tr("img.stageSampling", "sampling {s} s", {s: fmt(r.sampling_s, 1)}) : null,
+             r.vae_decode_s != null ? tr("img.stageVae", "VAE {s} s", {s: fmt(r.vae_decode_s, 1)}) : null].filter(Boolean).join(" · ");
+        return `<tr><td>${esc(t)}</td><td><span class="st-badge ${cls}">${esc(text)}</span> <span class="st-badge st-badge--reading">${esc(tr("img.badge", "Image"))}</span></td>
           <td colspan="6" class="req-image${r.error ? " req-image--error" : ""}">${esc(what)}${stages ? ` <span class="muted">· ${esc(stages)}</span>` : ""}</td>
           <td class="num">${fmt(r.seconds != null ? r.seconds : r.duration_s, 1)} s</td></tr>`;
       }
       const proj = r.projection == null ? "" : ` <span class="st-badge${r.projection ? " st-badge--reading" : ""}" title="experimental speed projection ${r.projection ? "on" : "off"}">${r.projection ? "ESP" : "stock"}</span>`;
       // #588: the VRAM share; the PCIe share (--pcie-frac) beside it when there is one
       const hit = r.hit_rate == null ? "–" : `${(r.hit_rate * 100).toFixed(1)}%` +
-        (r.pcie_share ? ` <span class="muted" title="routed experts the GPU read over PCIe (--pcie-frac) or another GPU computed">+${(r.pcie_share * 100).toFixed(1)}% PCIe</span>` : "");
+        (r.pcie_share ? ` <span class="muted" title="routed experts the GPU read over PCIe (--pcie-frac) or another GPU computed">+${(r.pcie_share * 100).toFixed(1)}% PCIe</span>` : "") +
+        // the experts below VRAM: taken from the RAM copy and read from the model files (the SSD), as the engine counts them
+        ([r.ram_blobs ? `RAM ${fmt(r.ram_blobs)}` : null,
+          r.file_blobs ? `SSD ${fmt(r.file_blobs)}${r.file_mb ? ` (${fmt(r.file_mb / 1000, 1)} GB)` : ""}` : null]
+          .filter(Boolean).map((t) => ` <span class="muted" title="${esc(tr("mon.belowVram", "experts taken from the RAM copy and read from the model files"))}">${t}</span>`).join(""));
       // Reused tokens are not prefetched again. Match the Monitor's existing Prefill metric.
       const fresh = r.prompt_tokens == null ? null : Math.max(0, r.prompt_tokens - (r.reused || 0));
       const prefillRate = fresh > 0 && r.prompt_ms > 0 ? fresh / (r.prompt_ms / 1000) : null;
@@ -516,10 +726,10 @@ function renderAbout(eng, hw, st) {
     ["Speculation", eng.spec ? `MTP drafts up to ${Math.max(0, (eng.mtp_max || eng.spec) - 1)} tokens${eng.lookup ? ", prompt lookup on" : ""}` : null],
     ["Images", eng.images ? "on" : "off"],
     ["Experimental speed projection", projectionText(eng.cvec)],
-    ["Intel compiler", eng.igc_workaround && eng.igc_workaround !== "none" ? `IGC ${eng.igc_workaround} has a bug (2.27 to 2.30 miscompile some reads for Xe2 and later GPUs); XeStrata works around it, the decode of short prompts up to 10% slower. For full speed, use Fedora 44 (its IGC is 2.32 or later), or install with Podman (Fedora 44 inside).` : null],
+    [tr("igc.label", "Intel compiler"), eng.igc_workaround && eng.igc_workaround !== "none" ? tr("igc.about", "IGC {version} has a bug (2.27 to 2.30 miscompile some reads for Xe2 and later GPUs); XeStrata works around it, the decode of short prompts up to 10% slower. For full speed, use Fedora 44 (its IGC is 2.32 or later), or install with Podman (Fedora 44 inside).", {version: eng.igc_workaround}) : null],
   ]);
   facts($("facts-hw"), [
-    ["GPU", st.gpu_name ? `${st.gpu_name}${hw.gpu_mem_total ? `, ${gb(hw.gpu_mem_total, 0)} GB` : ""}` : "not readable (xe driver)"],
+    ["GPU", st.gpu_name ? `${st.gpu_name}${hw.gpu_mem_total ? `, ${gb(hw.gpu_mem_total, 0)} GB` : ""}` : tr("about.gpuUnreadable", "not readable (xe driver)")],
     ["CPU", st.cpu_name ? `${st.cpu_name}${st.threads ? `, ${st.threads} threads` : ""}` : null],
     ["RAM", hw.ram_total ? `${gb(hw.ram_total, 0)} GB` : null],
   ]);
@@ -548,30 +758,31 @@ async function loadUpdate(force = false) {
   renderUpdate(u);
   if (u.newer && store.get("update-told", "") !== u.tag) {   // once for each release
     store.set("update-told", u.tag);
-    toast("info", `XeStrata ${u.tag} is out`, "About > Updates says how to update.", 8000,
-          {label: "Show", run: () => showTab("about")});
+    toast("info", tr("update.out", "XeStrata {tag} is out", {tag: u.tag}), tr("update.outText", "About > Updates says how to update."), 8000,
+          {label: tr("show", "Show"), run: () => showTab("about")});
   }
   return true;
 }
 function renderUpdate(u) {
   const when = u.checked_at ? new Date(u.checked_at * 1000).toLocaleString([], {dateStyle: "medium", timeStyle: "short"}) : null;
   facts($("facts-update"), [
-    ["This version", `xe${u.current}`],
-    ["Latest release", u.tag ? `${u.tag}${u.newer ? " (newer)" : " (up to date)"}` : null],
-    ["Checked", when ? `${when}${u.automatic ? "" : " (automatic checks off)"}` : (u.automatic ? "not yet" : "automatic checks off")],
+    [tr("update.version", "This version"), `xe${u.current}`],
+    [tr("update.latest", "Latest release"), u.tag ? `${u.tag} ${u.newer ? tr("update.newer", "(newer)") : tr("update.isLatest", "(up to date)")}` : null],
+    [tr("update.checked", "Checked"), when ? `${when}${u.automatic ? "" : ` ${tr("update.autoOffNote", "(automatic checks off)")}`}`
+                                           : (u.automatic ? tr("update.notYet", "not yet") : tr("update.autoOff", "automatic checks off"))],
   ]);
   $("update-dot").hidden = !u.newer;
   $("update-how").hidden = !u.newer;
   if (u.newer) {
-    $("update-how").innerHTML = `<a href="${esc(u.url)}" target="_blank" rel="noopener noreferrer">Release notes of ${esc(u.tag)}</a>. ` +
-                                `To update: ${esc(u.how)}.`;
+    $("update-how").innerHTML = `<a href="${esc(u.url)}" target="_blank" rel="noopener noreferrer">${esc(tr("update.notes", "Release notes of {tag}", {tag: u.tag}))}</a>. ` +
+                                esc(tr("update.how", "To update: {how}.", {how: u.how}));
   }
   $("update-msg").textContent = u.error || "";
 }
 $("update-check").onclick = async () => {
   $("update-check").disabled = true;
-  $("update-msg").textContent = "Checking…";
-  if (!await loadUpdate(true)) $("update-msg").textContent = "The server did not answer.";
+  $("update-msg").textContent = tr("update.checking", "Checking…");
+  if (!await loadUpdate(true)) $("update-msg").textContent = tr("model.noAnswer", "The server did not answer.");
   $("update-check").disabled = false;
 };
 
@@ -676,10 +887,36 @@ function inline(s) {
     .replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
   return s.replace(/\u0000(\d+)\u0000/g, (_, i) => `<code class="inline">${esc(codes[+i])}</code>`);
 }
-function codeBlock(lang, code) {
-  return `<div class="st-code"><div class="st-code__head"><span>${esc(lang || "code")}</span>` +
-    `<button class="st-btn st-btn--icon" data-code-copy aria-label="Copy code">${icon("copy")}</button></div>` +
-    `<pre><code>${esc(code)}</code></pre></div>`;
+// An ```svg or ```html block that is complete gets a Preview button (serve/web/preview.js): the block's own code in a sandboxed
+// frame, built when it is first opened and again when the theme changes. The state lives on the box (data-preview), so it
+// resets if the answer is rebuilt. A page (html) can also be run WITH scripts, after a warning, one block at a time.
+function pageTheme() {
+  const root = document.documentElement;
+  return {dark: root.dataset.theme === "dark", ink: getComputedStyle(root).getPropertyValue("--st-ink").trim()};
+}
+function fillPreview(fr, scripts, blank) {
+  const box = fr.closest(".st-code");
+  const doc = blank ? null : StrataPreview.previewDoc(fr.dataset.lang, box.querySelector("pre").textContent, scripts, pageTheme(), window);
+  const nf = StrataPreview.makeFrame(doc, {scripts, title: fr.title, lang: fr.dataset.lang});
+  fr.replaceWith(nf);
+  box.classList.toggle("st-code--run", !!(doc && scripts));
+  const rb = box.querySelector("[data-preview-scripts]");
+  if (rb) {
+    rb.setAttribute("aria-pressed", String(!!(doc && scripts)));
+    rb.setAttribute("aria-label", doc && scripts ? tr("preview.stopScripts", "Stop scripts") : tr("preview.runScripts", "Run scripts"));
+  }
+}
+function refreshPreviews() { for (const fr of document.querySelectorAll("iframe[data-opened]")) fillPreview(fr, fr.dataset.scripts === "1"); }
+function codeBlock(lang, code, complete) {
+  const ok = complete && StrataPreview.canPreview(lang || "", code);
+  const kind = ok ? StrataPreview.kindOf(lang) : null;
+  const label = kind === "svg" ? tr("preview.showSvg", "Preview the picture") : tr("preview.showPage", "Preview the page");
+  const head = `<div class="st-code__head"><span>${esc(lang || tr("code.label", "code"))}</span><span class="st-code__btns">` +
+    (kind === "page" ? `<button class="st-btn st-btn--icon" data-preview-scripts aria-label="${esc(tr("preview.runScripts", "Run scripts"))}" aria-pressed="false" title="${esc(tr("preview.runScripts", "Run scripts"))}">${icon("warning")}</button>` : "") +
+    (ok ? `<button class="st-btn st-btn--icon" data-preview-toggle data-preview-label="${esc(label)}" aria-label="${esc(label)}" title="${esc(label)}" aria-pressed="false">${icon("image")}</button>` : "") +
+    `<button class="st-btn st-btn--icon" data-code-copy aria-label="${esc(tr("code.copy", "Copy code"))}">${icon("copy")}</button></span></div>`;
+  const prev = ok ? `<div class="st-code__preview"><iframe sandbox="" title="${esc(kind === "svg" ? tr("preview.titleSvg", "Picture preview") : tr("preview.titlePage", "Page preview"))}" data-lang="${esc(lang)}"></iframe></div>` : "";
+  return `<div class="st-code">${head}<pre><code>${esc(code)}</code></pre>${prev}</div>`;
 }
 function blocks(text) {
   const out = [], lines = text.split("\n");
@@ -725,8 +962,8 @@ function markdown(text) {
     html += blocks(rest.slice(0, m.index));
     rest = rest.slice(m.index + m[0].length);
     const end = rest.match(/(^|\n)```[ \t]*(\n|$)/);
-    if (!end) { html += codeBlock(m[2].trim(), rest); break; }         // still streaming
-    html += codeBlock(m[2].trim(), rest.slice(0, end.index));
+    if (!end) { html += codeBlock(m[2].trim(), rest, false); break; }  // still streaming: no preview of a half-written block
+    html += codeBlock(m[2].trim(), rest.slice(0, end.index), true);
     rest = rest.slice(end.index + end[0].length);
   }
   return html;
@@ -737,22 +974,21 @@ function markdown(text) {
 // fields: the server picks the card's set for the request's thinking state (thinking 1.0 / 0.95 / 20, not thinking
 // 0.7 / 0.8 / 20 with a presence penalty). Before 0.1.45 the page sent 0.6 itself; a stored 0.6 with the other two
 // values untouched counts as "not set" too.
-const DEFAULTS = {thinking: "high", temperature: 1.0, top_p: 0.95, top_k: 20, max: "", seed: "", show: true, esp: true, mcp: true};
+const DEFAULTS = {thinking: "", temperature: 1.0, top_p: 0.95, top_k: 20, min_p: "", max: "", seed: "", show: true, esp: true,
+                  mcp: true, math: false, chatList: false, chatEdit: false, whileBusy: "wait"};
 const OLD_DEFAULT_TEMPERATURE = 0.6;
 function samplingUntouched(s) {
   const t = +s.temperature;
   return (t === DEFAULTS.temperature || t === OLD_DEFAULT_TEMPERATURE) && +s.top_p === DEFAULTS.top_p && +s.top_k === DEFAULTS.top_k;
 }
 let settings = {...DEFAULTS, ...store.get("sampling", {})};
+// before the model's own levels (thinking_v 2) "high" was every model's default and saved as it: the default again
+if (settings.thinking_v !== 2 && settings.thinking === "high") settings.thinking = "";
 if (samplingUntouched(settings)) settings.temperature = DEFAULTS.temperature;
-let messages = store.get("chat", []);
+let messages = store.get("chat", []);   // the open chat's messages (chats-ui.js: with the saved-chats list on, also that chat's own)
 let attachments = [];                 // {name, url}
-let busy = null;                      // {controller, msg}
-
-function saveChat() {
-  store.set("chat", messages.map((m) => ({...m, images: (m.images || []).map((i) => ({name: i.name})),
-                                           files: (m.files || []).map((f) => ({name: f.name}))})));
-}
+let busy = null;                      // {controller, msg, cut, cutAfterTool}
+let pending = null;                   // a message parked while an answer is written: {text, images, files, mode}
 function timeStr(t) { return new Date(t).toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"}); }
 
 function msgEl(m, i) {
@@ -776,8 +1012,8 @@ function msgEl(m, i) {
       const wrap = document.createElement("div");
       wrap.className = "msg-images";
       for (const im of m.images) {
-        if (im.url) { const img = document.createElement("img"); img.src = im.url; img.alt = im.name || "image"; wrap.appendChild(img); }
-        else { const c = document.createElement("span"); c.className = "chip"; c.innerHTML = icon("image", "st-icon st-icon--sm"); c.append(im.name || "image"); wrap.appendChild(c); }
+        if (im.url) { const img = document.createElement("img"); img.src = im.url; img.alt = im.name || tr("chat.image", "image"); wrap.appendChild(img); }
+        else { const c = document.createElement("span"); c.className = "chip"; c.innerHTML = icon("image", "st-icon st-icon--sm"); c.append(im.name || tr("chat.image", "image")); wrap.appendChild(c); }
       }
       el.appendChild(wrap);
     }
@@ -787,31 +1023,35 @@ function msgEl(m, i) {
     el.appendChild(b);
     const meta = document.createElement("div");
     meta.className = "st-msg__meta";
-    meta.textContent = `You · ${timeStr(m.time)}`;
+    meta.textContent = `${tr("chat.you", "You")} · ${timeStr(m.time)}`;
     el.appendChild(meta);
   } else {
     el.innerHTML = `<details class="st-collapse think" hidden><summary>${icon("thinking", "st-icon st-icon--sm")}<span class="think-title"></span>` +
       `${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body thinking"></div></details>` +
       `<div class="st-bubble"></div><div class="st-msg__meta"><span class="meta-text"></span>` +
-      `<button class="st-btn st-btn--icon" data-msg-copy aria-label="Copy the answer" title="Copy">${icon("copy")}</button></div>`;
+      `<button class="st-btn st-btn--icon" data-msg-copy aria-label="${esc(tr("chat.copyAnswer", "Copy the answer"))}" title="${esc(tr("chat.copy", "Copy"))}">${icon("copy")}</button></div>`;
     updateAssistant(el, m, false);
   }
+  const actions = msgActions(m, i);                 // edit / regenerate / rewind (chats-ui.js), when switched on
+  if (actions) el.appendChild(actions);
   return el;
 }
 // One MCP tool call in the answer: a compact block (name, state, a one-line preview) that opens to the arguments and
 // the result as the model read it.  Its body is built only while open: a result can be 20,000 characters.
-const TOOL_STATE = {writing: ["st-badge--reading", "Writing"], running: ["st-badge--generating", "Running"], done: ["", "Done"],
-                    error: ["st-badge--error", "Error"], skipped: ["st-badge--queued", "Not run"]};
+const TOOL_STATE = {writing: ["st-badge--reading", () => tr("tool.writing", "Writing")], running: ["st-badge--generating", () => tr("tool.running", "Running")],
+                    done: ["", () => tr("tool.done", "Done")], error: ["st-badge--error", () => tr("tool.error", "Error")],
+                    skipped: ["st-badge--queued", () => tr("tool.skipped", "Not run")]};
 function toolHtml(t, k) {
-  const [cls, label] = TOOL_STATE[t.state] || ["", t.state];
+  const [cls, labelOf] = TOOL_STATE[t.state] || ["", () => t.state];
+  const label = labelOf();
   const args = t.arguments == null ? "" : JSON.stringify(t.arguments, null, 2);
   const preview = t.result != null ? t.result : args.replace(/\s+/g, " ");
   let body = "";
   if (t.open) {
-    body = `<div class="tool-call__label">Arguments</div><pre class="tool-call__pre">${esc(args || "(being written)")}</pre>`;
+    body = `<div class="tool-call__label">${esc(tr("tool.arguments", "Arguments"))}</div><pre class="tool-call__pre">${esc(args || tr("tool.beingWritten", "(being written)"))}</pre>`;
     if (t.result != null) {
-      body += `<div class="tool-call__label">${t.ok ? "Result" : "Error"}${t.chars ? ` · ${fmt(t.chars)} characters` : ""}` +
-              `${t.truncated ? ", cut for the model" : ""}</div><pre class="tool-call__pre">${esc(t.result)}</pre>`;
+      body += `<div class="tool-call__label">${esc(t.ok ? tr("tool.result", "Result") : tr("tool.error", "Error"))}${t.chars ? ` · ${esc(tr("tool.chars", "{n} characters", {n: fmt(t.chars)}))}` : ""}` +
+              `${t.truncated ? esc(tr("tool.cut", ", cut for the model")) : ""}</div><pre class="tool-call__pre">${esc(t.result)}</pre>`;
     }
   }
   return `<details class="st-collapse tool-call" data-tool="${k}" data-state="${esc(t.state)}"${t.open ? " open" : ""}>` +
@@ -820,21 +1060,65 @@ function toolHtml(t, k) {
     `<span class="tool-call__preview muted">${esc(preview.slice(0, 200))}</span>` +
     `<span class="st-badge ${cls}">${esc(label)}</span>${t.ms != null && t.state !== "skipped" ? `<span class="muted small">${fmt(t.ms / 1000, 1)} s</span>` : ""}` +
     `${icon("chevron", "st-icon st-icon--sm st-chev")}</summary><div class="st-collapse__body">${body}</div></details>` +
-    // the images an image tool made, under its block (the server keeps them: /v1/images/files/)
-    (t.images && t.images.length ? `<div class="msg-images tool-images">${t.images.map((u) =>
-      `<a href="${esc(u.replace(/^\//, ""))}" target="_blank" rel="noopener"><img src="${esc(u.replace(/^\//, ""))}" alt="${esc(t.tool || "image")}"></a>`).join("")}</div>` : "");
+    // the images an image tool made, under its block (the server keeps them: /v1/images/files/). Their addresses are
+    // strings; an MCP server's picture ({url: "tool-media/..."}, mcp.image_results) is drawn by toolImages below
+    imageToolHtml(t, k);
+}
+// a generate_image call with a layout (MOSS-Image's boxes) also gets a button that opens it in the Images tab
+function imageToolHtml(t, k) {
+  const urls = (t.images || []).filter((u) => typeof u === "string");
+  const a = t.arguments, layout = t.tool === "generate_image" && a && (typeof a === "string" ? a.includes('"layout"') : a.layout);
+  const open = layout && t.state === "done" ? `<button type="button" class="st-btn" data-tool-layout="${k}">${esc(tr("img.layoutToImages", "Open the layout in Images"))}</button>` : "";
+  return urls.length || open ? `<div class="msg-images tool-images">${urls.map((u) =>
+    `<a href="${esc(u.replace(/^\//, ""))}" target="_blank" rel="noopener"><img src="${esc(u.replace(/^\//, ""))}" alt="${esc(t.tool || "image")}"></a>`).join("")}${open}</div>` : "";
+}
+// Raster tool results are same-origin cached files; credentials stay in request headers.
+const mediaBlobs = new Map();
+let mediaEpoch = 0;
+function clearToolMedia() {
+  mediaEpoch++;
+  for (const pending of mediaBlobs.values()) pending.then((url) => URL.revokeObjectURL(url), () => {});
+  mediaBlobs.clear();
+}
+window.addEventListener("pagehide", clearToolMedia);
+window.addEventListener("pageshow", (event) => { if (event.persisted) hydrateToolImages(document); });
+function safeToolMedia(url) { return typeof url === "string" && /^tool-media\/[0-9a-f]{64}\.(png|jpg|webp)$/.test(url); }
+function toolImages(t) {
+  return (t.images || []).filter((im) => safeToolMedia(im.url)).map((im) =>
+    `<figure class="tool-image"><img data-tool-image="${esc(im.url)}" alt="Tool image" loading="lazy">` +
+    `<figcaption><a class="st-btn" data-tool-download="${esc(im.url)}" download="${esc(im.name || "generated-image.png")}">Download image</a></figcaption></figure>`).join("");
+}
+function hydrateToolImages(root) {
+  root.querySelectorAll("[data-tool-image]").forEach((img) => {
+    const url = img.dataset.toolImage, epoch = mediaEpoch;
+    if (!safeToolMedia(url)) return;
+    if (!mediaBlobs.has(url)) mediaBlobs.set(url, fetch(url, {headers: headers()}).then((r) => {
+      if (!r.ok) throw new Error("Image unavailable");
+      return r.blob();
+    }).then((b) => URL.createObjectURL(b)).catch((e) => {if (epoch === mediaEpoch) mediaBlobs.delete(url); throw e;}));
+    mediaBlobs.get(url).then((blob) => {
+      if (epoch !== mediaEpoch || !img.isConnected) return;
+      img.src = blob;
+      const a = img.closest("figure").querySelector("[data-tool-download]");
+      a.href = blob;
+    }).catch(() => { img.alt = "Image unavailable; try refreshing"; });
+  });
 }
 // the answer's text with the tool blocks where the model called them
+// math (opt-in, serve/web/math.js): formulas become placeholders before the Markdown runs and are drawn after it
+function answerMarkdown(text) {
+  return settings.math ? StrataMath.markdown(text, markdown) : markdown(text);
+}
 function answerHtml(m) {
-  if (!m.tools || !m.tools.length) return markdown(m.text || "");
+  if (!m.tools || !m.tools.length) return answerMarkdown(m.text || "");
   let html = "", pos = 0;
   m.tools.forEach((t, k) => {
     const at = Math.min(Math.max(t.at || 0, pos), m.text.length);
-    if (at > pos) html += markdown(m.text.slice(pos, at));
+    if (at > pos) html += answerMarkdown(m.text.slice(pos, at));
     pos = at;
-    html += toolHtml(t, k);
+    html += toolHtml(t, k) + toolImages(t);
   });
-  return html + markdown(m.text.slice(pos));
+  return html + answerMarkdown(m.text.slice(pos));
 }
 // a tool event from the stream (the `strata_mcp` field of a chunk)
 function onTool(m, x) {
@@ -845,7 +1129,7 @@ function onTool(m, x) {
   if (x.event === "call") {
     Object.assign(t, {name: x.name, server: x.server, tool: x.tool, arguments: x.arguments, round: x.round, state: "running"});
   } else if (x.event === "result") {
-    Object.assign(t, {result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms, images: x.images,
+    Object.assign(t, {result: x.text, ok: x.ok, chars: x.chars, truncated: x.truncated, ms: x.ms, images: x.images || [], vision: x.vision === true,
                       state: x.skipped ? "skipped" : x.ok ? "done" : "error"});
   }
 }
@@ -854,8 +1138,8 @@ function updateAssistant(el, m, streaming) {
   if (m.reasoning) {
     det.hidden = false;
     const thinkingNow = streaming && !m.text;
-    el.querySelector(".think-title").textContent = thinkingNow ? "Thinking…" :
-      m.thinkSecs != null ? `Thought for ${fmt(m.thinkSecs, 1)} s` : "Thoughts";
+    el.querySelector(".think-title").textContent = thinkingNow ? tr("think.now", "Thinking…") :
+      m.thinkSecs != null ? tr("think.for", "Thought for {s} s", {s: fmt(m.thinkSecs, 1)}) : tr("think.done", "Thoughts");
     const body = el.querySelector(".thinking");
     if (det.open || thinkingNow) body.textContent = m.reasoning;
     else body.dataset.pending = "1";
@@ -871,9 +1155,11 @@ function updateAssistant(el, m, streaming) {
     bubble.innerHTML = m.reasoning ? `<span class="muted cursor">Writing</span>` : `<span class="cursor"></span>`;
   } else {
     bubble.innerHTML = answerHtml(m);
+    if (settings.math) StrataMath.hydrate(bubble);
+    hydrateToolImages(bubble);
     if (streaming) bubble.classList.add("cursor"); else bubble.classList.remove("cursor");
   }
-  el.querySelector(".meta-text").textContent = m.meta || (streaming ? "" : m.stopped ? "Stopped" : "");
+  el.querySelector(".meta-text").textContent = m.meta || (streaming ? "" : m.stopped ? tr("chat.stopped", "Stopped") : "");
   el.querySelector("[data-msg-copy]").hidden = streaming || !m.text;
 }
 function renderChat() {
@@ -881,16 +1167,74 @@ function renderChat() {
   chat.querySelectorAll(".st-msg").forEach((e) => e.remove());
   $("chat-empty").hidden = messages.length > 0;
   messages.forEach((m, i) => chat.appendChild(msgEl(m, i)));
+  renderSidebar();
+  renderParent();
+  renderUndoBar();
   scrollDown(true);
 }
-function nearBottom() { const s = $("chat-scroll"); return s.scrollHeight - s.scrollTop - s.clientHeight < 120; }
-function scrollDown(force) { const s = $("chat-scroll"); if (force || nearBottom()) s.scrollTop = s.scrollHeight; }
+// Follow the answer while the reader has not left (#4014). Asking "am I within 120 px of the bottom?" on every frame pulled
+// the view back after every wheel notch (a notch is about 100 px), so scrolling up during a long answer only worked by
+// dragging the scrollbar. Now the reader's own input lets go (wheel up, a finger or a key moving up, the scrollbar), and a
+// scroll back to the bottom follows again.
+let stickToBottom = true, lastReaderInput = 0;
+const FOLLOW_SLACK = 24, FAR_AWAY = 400, INPUT_WINDOW_MS = 400;
+function followAfterScroll(distance, wasFollowing, msSinceInput) {
+  if (distance <= FOLLOW_SLACK) return true;
+  if (msSinceInput <= INPUT_WINDOW_MS || distance > FAR_AWAY) return false;
+  return wasFollowing;
+}
+function scrollDown(force) {
+  const s = $("chat-scroll");
+  if (force) stickToBottom = true;
+  if (stickToBottom) s.scrollTop = s.scrollHeight;
+}
+(function watchReader() {
+  const s = $("chat-scroll");
+  const touch = () => { lastReaderInput = Date.now(); };
+  s.addEventListener("wheel", (e) => { touch(); if (e.deltaY < 0 && s.scrollTop > 0) stickToBottom = false; }, {passive: true});
+  s.addEventListener("touchmove", touch, {passive: true});
+  s.addEventListener("pointerdown", touch, {passive: true});
+  s.addEventListener("keydown", (e) => {
+    touch();
+    if (["PageUp", "ArrowUp", "Home"].includes(e.key) && e.target === s && s.scrollTop > 0) stickToBottom = false;
+  });
+  s.addEventListener("scroll", () => {
+    stickToBottom = followAfterScroll(s.scrollHeight - s.scrollTop - s.clientHeight, stickToBottom, Date.now() - lastReaderInput);
+  }, {passive: true});
+})();
 
 $("chat").addEventListener("click", (e) => {
   const cc = e.target.closest("[data-code-copy]");
   if (cc) { copyText(cc.closest(".st-code").querySelector("pre").textContent, cc); return; }
+  // an svg/html block: flip between its code and its sandboxed preview. Closing the preview also turns scripts off.
+  const pv = e.target.closest("[data-preview-toggle]");
+  if (pv) {
+    const box = pv.closest(".st-code");
+    const on = box.dataset.preview === "true";
+    if (on) delete box.dataset.preview; else box.dataset.preview = "true";
+    pv.setAttribute("aria-pressed", String(!on));
+    pv.setAttribute("aria-label", on ? pv.dataset.previewLabel : tr("preview.showCode", "Show the code"));
+    const fr = box.querySelector("iframe");
+    if (on) fillPreview(fr, false, true);
+    else if (!fr.dataset.opened) fillPreview(fr, false);
+    return;
+  }
+  const rs = e.target.closest("[data-preview-scripts]");
+  if (rs) {
+    const fr = rs.closest(".st-code").querySelector("iframe");
+    const run = fr.dataset.scripts !== "1";
+    if (run && !confirm(tr("preview.confirm", "Run this code with scripts?\n\nIt runs in your browser, cut off from this chat and from the network, but it can still freeze the tab, and it is code the model wrote.\n\nOnly this block, and only until you close the preview."))) return;
+    fillPreview(fr, run);
+    return;
+  }
   const mc = e.target.closest("[data-msg-copy]");
   if (mc) { const i = +mc.closest(".st-msg").dataset.i; copyText(messages[i].text, mc); return; }
+  const tl = e.target.closest("[data-tool-layout]");
+  if (tl) {
+    const m = messages[+tl.closest(".st-msg").dataset.i], t = m && m.tools && m.tools[+tl.dataset.toolLayout];
+    if (t) imgLayoutFromTool(t);
+    return;
+  }
   // a tool block: its open state lives in the message (the answer is rebuilt while it streams), so the click sets it
   const sum = e.target.closest(".tool-call > summary");
   if (sum) {
@@ -943,7 +1287,12 @@ function assistantMessages(m) {
     const at = Math.min(Math.max(pos, calls[0].at || 0), m.text.length);
     out.push({role: "assistant", content: m.text.slice(pos, at).trim(),
               tool_calls: calls.map((t) => ({id: t.id, type: "function", function: {name: t.name, arguments: JSON.stringify(t.arguments || {})}}))});
-    for (const t of calls) out.push({role: "tool", tool_call_id: t.id, content: t.result});
+    for (const t of calls) {
+      const pictures = t.vision ? (t.images || []).filter((im) => safeToolMedia(im.url)) : [];
+      const content = pictures.length ? [{type: "text", text: t.result}, ...pictures.map((im) =>
+        ({type: "image_url", image_url: {url: "strata-tool-media:" + im.url.split("/").pop()}}))] : t.result;
+      out.push({role: "tool", tool_call_id: t.id, content});
+    }
     pos = at;
   }
   const rest = m.text.slice(pos).trim();
@@ -951,41 +1300,141 @@ function assistantMessages(m) {
   return out;
 }
 
+function busyHint() {
+  const mode = settings.whileBusy;
+  return mode === "queue" ? tr("composer.hintQueue", "Enter sends when the answer is done")
+       : mode === "interject" ? tr("composer.hintInterject", "Enter stops the answer here and sends now") : "";
+}
+// While an answer is written, Send is off ("wait", as always) or parks the message ("queue", "interject": Chat settings)
+const parksWhileBusy = () => settings.whileBusy === "queue" || settings.whileBusy === "interject";
 function setBusy(on) {
   $("stop-btn").hidden = !on;
-  $("send-btn").disabled = on;
-  $("composer-hint").textContent = on ? "" : "Shift+Enter: new line";
+  $("send-btn").disabled = (on && !parksWhileBusy()) || !!panel;
+  $("input").disabled = !!panel;
+  $("composer-hint").textContent = panel ? tr("composer.finishOpen", "Save or cancel what is open above to continue")
+                                         : on ? busyHint() : tr("composer.newline", "Shift+Enter: new line");
+  if (settings.chatEdit) syncActions();                 // the buttons follow the state: none under the answer being written
+  $("s-list").disabled = $("s-edit").disabled = !!busy || !!panel;      // they change the messages on the screen
+  renderUndoBar();
+  renderPending();
 }
 
-async function send() {
-  const text = $("input").value.trim();
-  if ((!text && !attachments.length) || busy) return;
-  messages.push({role: "user", text, images: attachments.filter((a) => a.kind !== "file"),
-                 files: attachments.filter((a) => a.kind === "file"), time: Date.now()});
-  attachments = [];
-  renderAttachments();
-  $("input").value = "";
-  autosize();
+// A message sent while an answer is being written (#4004). "queue": it waits and goes when the answer is done. "interject": the
+// answer stops where it is (what is written stays, marked interrupted) and the message goes at once; if a tool is running, the
+// tool finishes first. Only one message waits. Off by default: with "wait" the page does nothing, as before.
+function park(p, own) {
+  if (!parksWhileBusy()) return;
+  if (pending) { toast("warn", tr("pending.one", "A message is already waiting"), tr("pending.oneText", "Take it back or wait until it is sent.")); return; }
+  pending = {...p, mode: settings.whileBusy};
+  if (own) { attachments = []; renderAttachments(); $("input").value = ""; autosize(); }
+  if (pending.mode === "interject") requestCut();
+  setBusy(!!busy);
+}
+function requestCut() {
+  if (!busy || busy.cut) return;
+  if ((busy.msg.tools || []).some((t) => t.state === "running")) { busy.cutAfterTool = true; return; }   // let the tool finish
+  busy.cut = true;
+  busy.controller.abort();
+}
+function renderPending() {
+  let el = $("pending");
+  if (!pending) { if (el) el.remove(); return; }
+  if (!el) {
+    el = node("div", "pending");
+    el.id = "pending";
+    el.setAttribute("role", "status");
+    el.innerHTML = "<span class=\"pending__text\"></span><span class=\"pending__actions\"><button type=\"button\" class=\"st-btn st-btn--secondary\" data-pending-now></button>" +
+      "<button type=\"button\" class=\"st-btn st-btn--secondary\" data-pending-back></button></span>";
+    el.querySelector("[data-pending-now]").onclick = pendingNow;
+    el.querySelector("[data-pending-back]").onclick = releasePending;
+    $("composer").before(el);
+  }
+  const quote = (pending.text || (pending.files[0] || pending.images[0] || {}).name || "").replace(/\s+/g, " ").slice(0, 70);
+  const text = !busy ? tr("pending.ready", "Not sent yet: “{text}”", {text: quote})
+    : pending.mode === "queue" ? tr("pending.queued", "Sends when this answer is done: “{text}”", {text: quote})
+    : busy.cutAfterTool ? tr("pending.afterTool", "Waiting for the tool to finish, then sending: “{text}”", {text: quote})
+    : tr("pending.cutting", "Stopping the answer, then sending: “{text}”", {text: quote});
+  el.querySelector(".pending__text").textContent = text;
+  const now = el.querySelector("[data-pending-now]");
+  now.textContent = busy ? tr("pending.sendNow", "Send now") : tr("pending.send", "Send");
+  now.hidden = !!busy && pending.mode === "interject";            // already on its way
+  el.querySelector("[data-pending-back]").textContent = tr("pending.takeBack", "Take back");
+}
+function pendingNow() {
+  if (!pending) return;
+  if (busy) { pending.mode = "interject"; requestCut(); setBusy(true); return; }
+  const p = pending;
+  pending = null;
+  setBusy(false);
+  send(p);
+}
+// the waiting message goes back into the message box (a chat switch or a new chat must not lose it)
+function releasePending() {
+  if (!pending) return;
+  const p = pending;
+  pending = null;
+  if (!$("input").value.trim()) $("input").value = p.text;
+  else $("input").value = `${p.text}\n\n${$("input").value}`;
+  attachments = [...p.images, ...p.files, ...attachments];
+  renderAttachments(); autosize();
+  setBusy(!!busy);
+}
+// after an answer: an interrupted one sends an interjection, a finished one sends a queued message
+function settlePending(cut, finished) {
+  if (!pending) return;
+  if ((pending.mode === "interject" && cut) || (pending.mode === "queue" && finished)) {
+    const p = pending;
+    pending = null;
+    setBusy(false);
+    send(p);
+  }
+}
+
+// the message box (or a parked message, `payload`) becomes a user turn and a reply is asked for
+async function send(payload) {
+  const own = !payload;
+  const p = payload || {text: $("input").value.trim(), images: attachments.filter((a) => a.kind !== "file"),
+                        files: attachments.filter((a) => a.kind === "file")};
+  if (!p.text && !p.images.length && !p.files.length) return;
+  if (panel) return;                                  // something is open above (an edit): finish it first
+  if (busy) { park(p, own); return; }
+  clearUndo();
+  messages.push({role: "user", text: p.text, images: p.images, files: p.files, time: Date.now()});
+  if (own) {
+    attachments = [];
+    renderAttachments();
+    $("input").value = "";
+    autosize();
+  }
+  return generateReply();
+}
+// an answer for the messages as they are: the last one is a user turn
+async function generateReply() {
   const m = {role: "assistant", text: "", reasoning: "", time: Date.now()};
   messages.push(m);
   renderChat();
   const el = $("chat").lastElementChild;
   const controller = new AbortController();
-  busy = {controller, msg: m};
+  busy = {controller, msg: m, cut: false, cutAfterTool: false};
   setBusy(true);
+  paintLive();
 
-  const body = {model: health.model, messages: apiMessages(), stream: true,
-                reasoning_effort: settings.thinking};
+  const body = {model: health.model, messages: apiMessages(), stream: true};
+  const effort = thinkingEffort(settings);
+  if (effort) body.reasoning_effort = effort;
   if (!(settings.temperature > 0)) {
     body.temperature = 0;
   } else if (!samplingUntouched(settings)) {
     Object.assign(body, {temperature: +settings.temperature, top_p: +settings.top_p, top_k: +settings.top_k});
   }
+  if (settings.temperature > 0 && settings.min_p !== "" && settings.min_p != null) body.min_p = +settings.min_p;
   if (settings.seed) body.seed = +settings.seed;
   if (settings.max) body.max_tokens = +settings.max;
   if (projectionLoaded()) body.experimental_speed_projection = !!settings.esp;
   if (settings.mcp !== false && mcpInfo.tools > 0) body.strata_mcp = true;   // this server may run MCP tools for it
-  if (health.image_generation) body.strata_images = true;   // and make images when the conversation asks for one
+  // and make images when the conversation asks for one: by the model the words choose (auto), by one, or none
+  const ci = $("chat-images").value;
+  if (health.image_generation && ci !== "off") body.strata_images = ci === "auto" || !ci ? true : {model: ci};
 
   let firstAt = null, thinkStart = null, usage = null, frame = 0;
   const paint = () => { frame = 0; updateAssistant(el, m, true); scrollDown(); };
@@ -995,7 +1444,7 @@ async function send() {
     if (!r.ok) {
       let msg = `HTTP ${r.status}`;
       try { msg = (await r.json()).error.message || msg; } catch (e) { /* not json */ }
-      if (r.status === 401) msg = "This server needs an API key: add it under About > Settings.";
+      if (r.status === 401) msg = tr("toast.keyNeeded", "This server needs an API key: add it under About > Settings.");
       throw new Error(msg);
     }
     const reader = r.body.getReader(), dec = new TextDecoder();
@@ -1013,9 +1462,13 @@ async function send() {
         if (data === "[DONE]") continue;
         let j;
         try { j = JSON.parse(data); } catch (e) { continue; }
-        if (j.error) throw new Error(j.error.message || "the engine reported an error");
+        if (j.error) throw new Error(j.error.message || tr("toast.engineError", "the engine reported an error"));
         if (j.usage) usage = j.usage;
-        if (j.strata_mcp) onTool(m, j.strata_mcp);
+        if (j.strata_mcp) {
+          onTool(m, j.strata_mcp);
+          // an interjection waited for a running tool: it has its result now, so the answer can stop
+          if (busy.cutAfterTool && !busy.cut && !(m.tools || []).some((t) => t.state === "running")) { busy.cut = true; controller.abort(); }
+        }
         const d = (j.choices && j.choices[0] && j.choices[0].delta) || {};
         const lastTool = m.tools && m.tools.length ? m.tools[m.tools.length - 1] : null;   // a new round after a tool
         if (d.reasoning_content) {
@@ -1035,27 +1488,32 @@ async function send() {
     }
   } catch (e) {
     if (e.name === "AbortError") m.stopped = true;
-    else { m.error = e.message || String(e); toast("error", "The request failed", m.error, 6000); }
+    else { m.error = e.message || String(e); toast("error", tr("toast.requestFailed", "The request failed"), m.error, 6000); }
   }
+  const cut = busy.cut;                                      // an interjection ended it: kept as written, marked interrupted
+  if (cut) m.interrupted = true;
   if (thinkStart && m.thinkSecs == null) m.thinkSecs = (performance.now() - thinkStart) / 1000;
   const n = usage ? usage.completion_tokens : null;
+  const ended = cut ? tr("chat.interruptedLower", "interrupted") : tr("chat.stoppedLower", "stopped");
   if (n && firstAt) {
     const secs = (performance.now() - firstAt) / 1000;
-    m.meta = `${fmt(n)} tokens${secs > 0.25 ? ` · ${fmt(n / secs, 1)} tok/s` : ""}${m.stopped ? " · stopped" : ""}` +
-             (projectionLoaded() ? (settings.esp ? " · projection on" : " · projection off") : "");
+    m.meta = tr("chat.tokens", "{n} tokens", {n: fmt(n)}) + (secs > 0.25 ? ` · ${fmt(n / secs, 1)} tok/s` : "") + (m.stopped ? ` · ${ended}` : "") +
+             (projectionLoaded() ? (settings.esp ? ` · ${tr("chat.projectionOn", "projection on")}` : ` · ${tr("chat.projectionOff", "projection off")}`) : "");
   } else if (m.stopped) {
-    m.meta = "Stopped";
+    m.meta = cut ? tr("chat.interrupted", "Interrupted") : tr("chat.stopped", "Stopped");
   }
   for (const t of m.tools || []) if (t.state === "writing" || t.state === "running") { t.state = "skipped"; t.ms = null; }
   const ran = (m.tools || []).filter((t) => t.state === "done" || t.state === "error").length;
-  if (ran) m.meta = `${m.meta ? `${m.meta} · ` : ""}${ran} tool call${ran > 1 ? "s" : ""}`;
-  if (m.limit) m.meta = `${m.meta || ""} · stopped at the limit of ${m.limit} tool rounds (mcp.max_rounds)`;
+  if (ran) m.meta = `${m.meta ? `${m.meta} · ` : ""}${tr("chat.toolCalls", {one: "{n} tool call", other: "{n} tool calls"}, {n: ran})}`;
+  if (m.limit) m.meta = `${m.meta || ""} · ${tr("chat.toolLimit", "tool limit reached ({n} rounds, mcp.max_rounds)", {n: m.limit})}`;
   busy = null;
   setBusy(false);
+  paintLive();
   if (frame) cancelAnimationFrame(frame);
   updateAssistant(el, m, false);
   saveChat();
   scrollDown();
+  settlePending(cut, !m.stopped && !m.error);
 }
 
 $("composer").onsubmit = (e) => { e.preventDefault(); send(); };
@@ -1066,17 +1524,25 @@ $("input").addEventListener("keydown", (e) => {
 function autosize() { const t = $("input"); t.style.height = "auto"; t.style.height = `${Math.min(t.scrollHeight, innerHeight * 0.4)}px`; }
 $("input").addEventListener("input", autosize);
 
+// one chat, as before: New chat clears it, with an Undo (with the saved-chats list on, its own New chat button does this job)
 $("new-btn").onclick = () => {
-  if (busy) { toast("warn", "Still writing", "Stop the answer first."); return; }
+  if (busy) { stillWriting(); return; }
+  if (panel) { closePanel(); }
+  clearUndo();
+  releasePending();
   if (!messages.length) return;
   const backup = messages;
+  clearToolMedia();
   messages = [];
   saveChat();
   renderChat();
-  toast("info", "New chat", "The last one was cleared.", 6000, {label: "Undo", run: () => { messages = backup; saveChat(); renderChat(); }});
+  toast("info", tr("chat.newToast", "New chat"), tr("chat.clearedToast", "The last one was cleared."), 6000, {label: tr("undo", "Undo"), run: () => {
+    if (busy || messages.length) return;                         // a new question since: the cleared chat is not put back over it
+    messages = backup; saveChat(); renderChat();
+  }});
 };
 $("export-btn").onclick = () => {
-  if (!messages.length) { toast("info", "Nothing to save yet"); return; }
+  if (!messages.length) { toast("info", tr("export.nothing", "Nothing to save yet")); return; }
   const tools = (m) => (m.tools || []).filter((t) => t.result != null).map((t) =>
     `<details><summary>Tool ${t.server ? `${t.server} / ` : ""}${t.tool || t.name}${t.ok ? "" : " (error)"}</summary>\n\n` +
     `\`\`\`json\n${JSON.stringify(t.arguments || {}, null, 2)}\n\`\`\`\n\n\`\`\`\n${t.result}\n\`\`\`\n\n</details>\n\n`).join("");
@@ -1099,19 +1565,20 @@ function isTextFile(f) {
 function addFiles(files) {
   for (const f of files) {
     if (f.type.startsWith("image/")) {
-      if (!health.images) { toast("warn", "Pictures are off", "This model was set up for text only."); continue; }
-      if (f.size > 20e6) { toast("warn", "Picture too large", `${f.name} is over 20 MB.`); continue; }
+      if (!health.images) { toast("warn", tr("file.picturesOff", "Pictures are off"), tr("file.picturesOffText", "This model was set up for text only.")); continue; }
+      if (f.size > 20e6) { toast("warn", tr("file.pictureBig", "Picture too large"), tr("file.pictureBigText", "{name} is over 20 MB.", {name: f.name})); continue; }
       const r = new FileReader();
-      r.onload = () => { attachments.push({kind: "image", name: f.name || "pasted image", url: r.result}); renderAttachments(); };
+      r.onload = () => { attachments.push({kind: "image", name: f.name || tr("file.pasted", "pasted image"), url: r.result}); renderAttachments(); };
       r.readAsDataURL(f);
       continue;
     }
-    if (!isTextFile(f)) { toast("warn", "Not a text file", `${f.name}: attach text files (code, notes, logs, data)${health.images ? " or pictures" : ""}.`); continue; }
-    if (f.size > MAX_TEXT_FILE) { toast("warn", "File too large", `${f.name} is over 512 KB.`); continue; }
+    if (!isTextFile(f)) { toast("warn", tr("file.notText", "Not a text file"), health.images ? tr("file.notTextPictures", "{name}: attach text files (code, notes, logs, data) or pictures.", {name: f.name})
+                                                              : tr("file.notTextOnly", "{name}: attach text files (code, notes, logs, data).", {name: f.name})); continue; }
+    if (f.size > MAX_TEXT_FILE) { toast("warn", tr("file.big", "File too large"), tr("file.bigText", "{name} is over 512 KB.", {name: f.name})); continue; }
     const r = new FileReader();
     r.onload = () => {
       const text = String(r.result);
-      if (text.includes("\u0000")) { toast("warn", "Not a text file", `${f.name} looks like a binary file.`); return; }
+      if (text.includes("\u0000")) { toast("warn", tr("file.notText", "Not a text file"), tr("file.binaryText", "{name} looks like a binary file.", {name: f.name})); return; }
       attachments.push({kind: "file", name: f.name, text});
       renderAttachments();
     };
@@ -1138,7 +1605,7 @@ function renderAttachments() {
     c.innerHTML = icon(a.kind === "file" ? "attach" : "image", "st-icon st-icon--sm");
     c.append(a.name);
     const x = document.createElement("button");
-    x.type = "button"; x.className = "st-btn st-btn--icon"; x.setAttribute("aria-label", "Remove");
+    x.type = "button"; x.className = "st-btn st-btn--icon"; x.setAttribute("aria-label", tr("file.remove", "Remove"));
     x.innerHTML = icon("trash");
     x.onclick = () => { attachments.splice(i, 1); renderAttachments(); };
     c.appendChild(x);
@@ -1170,22 +1637,29 @@ $("input").addEventListener("paste", (e) => {
   if (files.length) { e.preventDefault(); addFiles(files); }
 });
 
-// ------------------------------------------------------------------ the sampling drawer
+// ------------------------------------------------------------------ the chat settings drawer
 function openDrawer(open) {
   $("drawer").dataset.open = String(open);
   $("drawer").setAttribute("aria-hidden", String(!open));
   $("scrim").hidden = !open;
   if (open) { loadDrawer(); loadShared(); loadMcp(); }
 }
+const checked = (id) => $(id).getAttribute("aria-checked") === "true";
+const segValue = (id) => { const b = [...$(id).children].find((x) => x.getAttribute("aria-checked") === "true"); return b ? b.dataset.v : null; };
 function loadDrawer(s = settings) {
-  for (const b of $("s-thinking").children) b.setAttribute("aria-checked", String(b.dataset.v === s.thinking));
+  const level = thinkingChosen(s);
+  for (const b of $("s-thinking").children) b.setAttribute("aria-checked", String(b.dataset.v === level));
   $("s-temp").value = s.temperature; $("s-topp").value = s.top_p; $("s-topk").value = s.top_k;
-  $("s-max").value = s.max; $("s-seed").value = s.seed;
+  $("s-max").value = s.max; $("s-seed").value = s.seed; $("s-minp").value = s.min_p ?? "";
+  $("s-math").setAttribute("aria-checked", String(!!s.math));
   $("s-show").setAttribute("aria-checked", String(!!s.show));
   $("s-esp").setAttribute("aria-checked", String(s.esp !== false));
   $("esp-row").hidden = !projectionLoaded();
   $("s-mcp").setAttribute("aria-checked", String(s.mcp !== false));
   $("s-share").setAttribute("aria-checked", String(sharedOn));
+  $("s-list").setAttribute("aria-checked", String(!!s.chatList));
+  $("s-edit").setAttribute("aria-checked", String(!!s.chatEdit));
+  for (const b of $("s-busy").children) b.setAttribute("aria-checked", String(b.dataset.v === (s.whileBusy || "wait")));
   outputs();
 }
 // "Use for other apps too": the server keeps these settings as every client's defaults (GET/POST /settings)
@@ -1198,9 +1672,12 @@ async function loadShared() {
   $("s-share").setAttribute("aria-checked", String(sharedOn));
 }
 function sharedDefaults(s) {
-  const d = {reasoning_effort: s.thinking};
+  const d = {};
+  const effort = thinkingEffort(s);
+  if (effort) d.reasoning_effort = effort;
   if (!(+s.temperature > 0)) d.temperature = 0;
   else if (!samplingUntouched(s)) Object.assign(d, {temperature: +s.temperature, top_p: +s.top_p, top_k: +s.top_k});
+  if (+s.temperature > 0 && s.min_p !== "" && s.min_p != null) d.min_p = +s.min_p;
   if (s.seed) d.seed = +s.seed;
   if (s.max) d.max_tokens = +s.max;
   if (projectionLoaded()) d.experimental_speed_projection = s.esp !== false;
@@ -1221,58 +1698,149 @@ function projectionLoaded() {
   const c = lastMetrics && lastMetrics.engine ? lastMetrics.engine.cvec : 0;
   return !!c && c !== "0";
 }
+// the thinking levels: the model's own (/health's "thinking": GLM-5.3-Flash's low, high and max, a model that only
+// turns its thinking on and off its on), an older server's the four of before.  The model's default is sent as no
+// reasoning_effort at all, so the model's own default applies (llm-jp-4.1's medium, GLM-5.3-Flash's max)
+function thinkingInfo() {
+  return health.thinking || {levels: ["none", "low", "medium", "high"], default: "high"};
+}
+function thinkingChosen(s) {
+  const t = thinkingInfo();
+  return t.levels.includes(s.thinking) ? s.thinking : t.default;
+}
+function thinkingEffort(s) {
+  const v = thinkingChosen(s);
+  return v && v !== thinkingInfo().default && v !== "on" ? v : undefined;
+}
+function thinkingButtons() {
+  const t = thinkingInfo();
+  const names = {none: tr("drawer.off", "Off"), low: tr("drawer.low", "Low"), medium: tr("drawer.medium", "Medium"),
+                 high: tr("drawer.high", "High"), max: tr("drawer.max", "Max"), on: tr("drawer.on", "On")};
+  $("s-thinking").replaceChildren(...t.levels.map((v) => {
+    const b = document.createElement("button");
+    Object.assign(b, {type: "button", textContent: names[v] || v});
+    b.setAttribute("role", "radio");
+    b.dataset.v = v;
+    b.onclick = () => { for (const x of $("s-thinking").children) x.setAttribute("aria-checked", String(x === b)); outputs(); };
+    return b;
+  }));
+  $("s-thinking").closest(".st-field").hidden = !t.levels.length;
+  loadDrawer();
+}
 function outputs() {
   const t = +$("s-temp").value;
-  $("o-temp").textContent = t === 0 ? "0 · greedy" : t.toFixed(2);
+  $("o-temp").textContent = t === 0 ? tr("drawer.greedy", "0 · greedy") : t.toFixed(2);
   $("o-topp").textContent = (+$("s-topp").value).toFixed(2);
   $("o-topk").textContent = $("s-topk").value;
-  const sel = [...$("s-thinking").children].find((b) => b.getAttribute("aria-checked") === "true");
-  $("o-thinking").textContent = sel ? {none: "answers right away", low: "short", medium: "medium", high: "thorough (default)"}[sel.dataset.v] : "";
-  for (const id of ["s-topp", "s-topk"]) $(id).disabled = t === 0;
+  const sel = segValue("s-thinking");
+  const what = {none: tr("drawer.thinkNone", "answers right away"), low: tr("drawer.thinkLow", "short"),
+                medium: tr("drawer.thinkMedium", "medium"), high: tr("drawer.thinkHigh", "thorough"),
+                max: tr("drawer.thinkMax", "the most thorough"), on: tr("drawer.thinkOn", "thinks first")};
+  $("o-thinking").textContent = sel ? what[sel] + (sel === thinkingInfo().default ? ` ${tr("drawer.thinkDefault", "(default)")}` : "") : "";
+  const busyMode = segValue("s-busy");
+  $("o-busy").textContent = {wait: tr("drawer.busyWaitNote", "Send is off until the answer is done, as before."),
+    queue: tr("drawer.busyQueueNote", "Your message waits and goes as soon as the answer is done."),
+    interject: tr("drawer.busyInterjectNote", "The answer stops where it is (what is written stays) and your message goes at once. A tool that is running finishes first.")}[busyMode] || "";
+  for (const id of ["s-topp", "s-topk", "s-minp"]) $(id).disabled = t === 0;
 }
-for (const b of $("s-thinking").children) b.onclick = () => { for (const x of $("s-thinking").children) x.setAttribute("aria-checked", String(x === b)); outputs(); };
+for (const b of $("s-busy").children) b.onclick = () => { for (const x of $("s-busy").children) x.setAttribute("aria-checked", String(x === b)); outputs(); };
 for (const id of ["s-temp", "s-topp", "s-topk"]) $(id).oninput = outputs;
-$("s-show").onclick = () => $("s-show").setAttribute("aria-checked", String($("s-show").getAttribute("aria-checked") !== "true"));
-$("s-esp").onclick = () => $("s-esp").setAttribute("aria-checked", String($("s-esp").getAttribute("aria-checked") !== "true"));
-$("s-mcp").onclick = () => $("s-mcp").setAttribute("aria-checked", String($("s-mcp").getAttribute("aria-checked") !== "true"));
-$("s-share").onclick = () => $("s-share").setAttribute("aria-checked", String($("s-share").getAttribute("aria-checked") !== "true"));
+for (const id of ["s-math", "s-show", "s-esp", "s-mcp", "s-share", "s-list", "s-edit"]) {
+  $(id).onclick = () => $(id).setAttribute("aria-checked", String($(id).getAttribute("aria-checked") !== "true"));
+}
 $("s-reset").onclick = () => loadDrawer(DEFAULTS);
 $("s-apply").onclick = async () => {
-  const sel = [...$("s-thinking").children].find((b) => b.getAttribute("aria-checked") === "true");
-  settings = {thinking: sel ? sel.dataset.v : "high", temperature: +$("s-temp").value, top_p: +$("s-topp").value,
-              top_k: +$("s-topk").value, max: $("s-max").value.trim(), seed: $("s-seed").value.trim(),
-              show: $("s-show").getAttribute("aria-checked") === "true",
-              esp: $("s-esp").getAttribute("aria-checked") === "true",
-              mcp: $("s-mcp").getAttribute("aria-checked") === "true"};
+  const prev = settings;
+  // the list and the edit controls change the messages on the screen: not while an answer is written or something is open
+  const locked = !!busy || !!panel;
+  const sel = segValue("s-thinking");
+  settings = {thinking: sel && sel !== thinkingInfo().default ? sel : "", thinking_v: 2, temperature: +$("s-temp").value, top_p: +$("s-topp").value,
+              top_k: +$("s-topk").value, min_p: $("s-minp").value.trim(), max: $("s-max").value.trim(),
+              seed: $("s-seed").value.trim(),
+              math: checked("s-math"), show: checked("s-show"), esp: checked("s-esp"), mcp: checked("s-mcp"),
+              chatList: locked ? !!prev.chatList : checked("s-list"), chatEdit: locked ? !!prev.chatEdit : checked("s-edit"),
+              whileBusy: segValue("s-busy") || "wait"};
   store.set("sampling", settings);
-  const share = $("s-share").getAttribute("aria-checked") === "true";
+  StrataMath.reset();                                  // math on or off: every answer is drawn again
+  if (settings.chatList !== !!prev.chatList) await setChatList(settings.chatList, true);
+  if (settings.chatEdit !== !!prev.chatEdit) { clearUndo(); syncActions(); }
+  if (settings.whileBusy === "wait" && pending) releasePending();    // "wait" parks nothing: a waiting message goes back to the box
+  setBusy(!!busy);
+  for (const el of $("chat").querySelectorAll(".st-msg--assistant")) {
+    const m = messages[+el.dataset.i];
+    updateAssistant(el, m, !!busy && busy.msg === m);  // the element send() holds stays the same while an answer streams
+  }
+  const share = checked("s-share");
   openDrawer(false);
   if (share || sharedOn) {
     try {
       await saveShared(share, settings);
-      toast("success", "Sampling saved", share ? "Other apps (omp, API clients) use these settings from their next request."
-                                               : "Other apps use their own settings again.");
+      toast("success", tr("drawer.saved", "Chat settings saved"), share ? tr("drawer.savedShared", "Other apps (omp, API clients) use these settings from their next request.")
+                                                                         : tr("drawer.savedOwn", "Other apps use their own settings again."));
     } catch (e) {
-      toast("error", "Saved here, but not for other apps", e.message, 6000);
+      toast("error", tr("drawer.savedHere", "Saved here, but not for other apps"), e.message, 6000);
     }
     return;
   }
-  toast("success", "Sampling saved", settings.temperature === 0 ? "Greedy: the same question gives the same answer." : "");
+  toast("success", tr("drawer.saved", "Chat settings saved"), settings.temperature === 0 ? tr("drawer.savedGreedy", "Greedy: the same question gives the same answer.") : "");
 };
 $("sampling-btn").onclick = () => openDrawer(true);
 $("drawer-close").onclick = () => openDrawer(false);
 $("scrim").onclick = () => openDrawer(false);
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && $("drawer").dataset.open === "true") openDrawer(false); });
 
+// ------------------------------------------------------------------ language (serve/web/i18n.js)
+// The user's own choice, kept in this browser; without one ("Automatic"), the browser's language where the page has it,
+// else English. /?lang=de shows one for this visit only.
+const urlLang = new URLSearchParams(location.search).get("lang");
+function browserLanguage() {
+  return StrataI18n.choose(urlLang, store.get("lang", ""), navigator.languages || [navigator.language]);
+}
+// the choices: Automatic first (in the language of the moment), then each language in its own name
+function languageChoices() {
+  $("lang").innerHTML = `<option value="auto">${esc(tr("settings.languageAuto", "Automatic (browser language)"))}</option>` +
+    StrataI18n.LANGUAGES.map(([code, name]) => `<option value="${esc(code)}">${esc(name)}</option>`).join("");
+  const saved = store.get("lang", "");
+  $("lang").value = urlLang && urlLang === StrataI18n.lang ? StrataI18n.lang
+                  : StrataI18n.LANGUAGES.some((l) => l[0] === saved) ? saved : "auto";
+}
+function showLanguage() {
+  languageChoices();
+  renderEmptyChat();
+  setSidebar(sidebarOpen, false);
+  thinkingButtons();   // the level buttons are built in the code, in the language of the moment
+  imgModels();         // so are the Images tab's texts and the chat's image choice
+  loadUpdate();        // and About's Updates card
+  renderChat();
+  setBusy(!!busy);
+  if (lastMetrics) render(lastMetrics);
+}
+$("lang").onchange = async () => {
+  const v = $("lang").value;
+  if (v === "auto") store.del("lang"); else store.set("lang", v);   // Automatic forgets the choice
+  await StrataI18n.setLanguage(v === "auto" ? StrataI18n.choose(null, null, navigator.languages || [navigator.language]) : v);
+  showLanguage();
+};
+
 // ------------------------------------------------------------------ start
-setBusy(false);
-renderChat();
-const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
-if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
-loadHealth().then(loadSwitcher).then(loadMcp).then(() => loadUpdate()).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
-showTab(location.hash.slice(1) || "chat");
-poll();
-setInterval(() => { if (!switching) loadSwitcher(); }, 15000);   // a switch started elsewhere shows here too
+async function start() {
+  await StrataI18n.setLanguage(browserLanguage());
+  languageChoices();
+  renderEmptyChat();
+  initChats();
+  if (settings.chatList) await setChatList(true, false);       // the saved-chats list is read before the first draw
+  setBusy(false);
+  renderChat();
+  const startQuestion = new URLSearchParams(location.search).get("q");   // /?q=... starts a chat (a shortcut)
+  if (startQuestion) history.replaceState(null, "", location.pathname + location.hash);
+  thinkingButtons();   // the four of before until /health says the model's own
+  loadHealth().then(loadSwitcher).then(loadMcp).then(() => loadUpdate()).then(() => { if (startQuestion) { $("input").value = startQuestion; send(); } });
+  showTab(location.hash.slice(1) || "chat");
+  poll();
+  setInterval(() => { if (!switching) loadSwitcher(); }, 15000);   // a switch started elsewhere shows here too
+  requestAnimationFrame(fitHeader);
+}
+start();
 
 // ------------------------------------------------------------------ images (POST /v1/images/generations)
 function readAsDataURL(f) {
@@ -1284,44 +1852,656 @@ function readAsDataURL(f) {
   });
 }
 $("img-size").onchange = () => { $("img-custom").hidden = $("img-size").value !== "custom"; };
+// the image model's defaults (/health's image_defaults, what the API gives a request that leaves a field out): the
+// fields' placeholders, the steps hidden where they are fixed (Turbo), the transparent background where it has one,
+// the negative prompt hidden where the guidance is one token the model reads (HunyuanImage 3.0: guidance_token), and
+// the sizes snapped to the model's own (buckets) for the estimate
+// the image models (/health's image_models, the default first): a choice where there are several, its defaults and
+// whether it edits; one without edits takes one image to start from (img2img) instead of reference images
+function imgModel() {
+  const ms = health.image_models || [];
+  return ms.find(m => m.id === $("img-model").value) || ms[0] || {defaults: health.image_defaults || {}, edits: true};
+}
+// the chat's image choice: auto (the words choose the model; the default otherwise), off, or one model; kept here
+function chatImages() {
+  const ms = health.image_models || [], sel = $("chat-images");
+  const was = sel.value || store.get("chat_images", "auto");
+  const opts = [new Option(ms.length > 1 ? tr("chatImages.auto", "Images: auto") : tr("chatImages.on", "Images: on"), "auto"),
+                new Option(tr("chatImages.off", "Images: off"), "off")];
+  if (ms.length > 1) opts.push(...ms.map(m => new Option(tr("chatImages.model", "Images: {model}", {model: m.id}), m.id)));
+  sel.replaceChildren(...opts);
+  sel.value = [...sel.options].some(o => o.value === was) ? was : "auto";
+  sel.hidden = !health.image_generation;
+}
+$("chat-images").onchange = () => store.set("chat_images", $("chat-images").value);
+function imgModels() {
+  chatImages();
+  const ms = health.image_models || [], sel = $("img-model"), was = sel.value;
+  sel.replaceChildren(...ms.map(m => new Option(m.id, m.id)));
+  if (ms.some(m => m.id === was)) sel.value = was;
+  $("img-model-f").hidden = ms.length < 2;
+  imgDefaults();
+}
+$("img-model").onchange = () => {
+  if (!imgModel().edits && ($("img-ref").files || []).length > 1) $("img-ref").value = "";
+  imgDefaults();
+  imgMaskSetup();
+};
+function imgDefaults() {
+  const d = imgModel().defaults || {}, edits = imgModel().edits;
+  // an image: an edit's references, or (a model without edits) the one image img2img starts from; its strength
+  // (how much of the schedule runs from it) beside it, the model's default as the placeholder
+  $("img-ref-l").textContent = edits ? tr("img.edit", "Edit an image (optional)") : tr("img.img2img", "Start from an image (optional, img2img)");
+  $("img-ref").multiple = !!edits;
+  const refs = ($("img-ref").files || []).length > 0;
+  $("img-strength-f").hidden = !refs;
+  $("img-steps-f").hidden = !!d.steps_fixed;
+  $("img-steps").min = d.steps_min || 1;
+  $("img-steps").max = d.steps_max || 100;
+  $("img-steps").placeholder = String((refs && edits ? d.edit_steps : d.steps) || "");
+  const token = !!d.guidance_token;   // one token, not a second pass with a negative prompt
+  $("img-neg-f").hidden = token;
+  $("img-cfg-l").textContent = token ? tr("img.guidance", "Guidance") : tr("img.guidanceCfg", "Guidance (CFG)");
+  $("img-cfg").placeholder = d.guidance > 1 || token ? String(d.guidance) : tr("img.off", "off");
+  $("img-bg-f").hidden = !d.transparency;
+  imgCount();
+  imgFormat();
+  imgNegHint();
+  imgMossSetup();
+  imgLoras();
+}
+// the adapters this image model applies (/health's image_models[].defaults.loras, serve/loras.py's listing): the ones
+// it takes, chosen here, with a strength each (the API's -2 to 2, starting from the listing's recommended one) and,
+// where the file names them, its trigger words, which a button puts into the prompt.  The choice is kept in this
+// browser for each model (xestrata.img_loras.<model>) and comes back with it.  A model whose listing is empty takes no
+// adapter (HunyuanImage 3.0, whose config names none: the DiT is not one of TARGETS): the block is hidden and none is sent.
+const IMG_LORA_COUNT = 4, IMG_LORA_SCALE = 2;   // serve/loras.py's MAX_LORA, and its SCALE_MIN..SCALE_MAX
+let imgLoraSel = [];   // [{name, scale}]: the adapters the next request applies, in the order they were chosen
+function imgLoras() {
+  const list = (imgModel().defaults || {}).loras || [];
+  $("img-lora").hidden = !list.length;
+  const by = new Map(list.map(e => [e.name, e]));
+  const kept = list.length ? store.get(`img_loras.${imgModel().id || "default"}`, []) : [];
+  const names = new Set();
+  imgLoraSel = (Array.isArray(kept) ? kept : []).filter(u => {
+    if (!u || typeof u.name !== "string" || !by.has(u.name) || names.has(u.name)) return false;
+    names.add(u.name);
+    return true;
+  }).slice(0, IMG_LORA_COUNT)
+    .map(u => ({name: u.name, scale: imgLoraStrength(u.scale, by.get(u.name).scale)}));
+  imgLoraDraw(list);
+}
+// a strength the API takes: the field's number within -2..2 at two decimals, `fallback` (the listing's recommended
+// one) when the field is empty or not a number, else the API's default 1
+function imgLoraStrength(value, fallback) {
+  const v = value == null || value === "" || typeof value === "boolean" ? NaN : Number(value);
+  const want = Number.isFinite(v) ? v : Number(fallback);
+  const use = Number.isFinite(want) ? want : 1;
+  return Math.max(-IMG_LORA_SCALE, Math.min(IMG_LORA_SCALE, Math.round(use * 100) / 100));
+}
+// the picker (the adapters not chosen yet) and a chip for each chosen one: its name, its strength, its trigger words
+// when it has them, and the button that takes it off
+function imgLoraDraw(list) {
+  const add = $("img-lora-add"), chosen = new Set(imgLoraSel.map(u => u.name));
+  const open = list.filter(e => !chosen.has(e.name));
+  add.replaceChildren(new Option(tr("img.loraAdd", "Add a LoRA…"), ""), ...open.map(e => new Option(e.name, e.name)));
+  add.value = "";
+  add.disabled = !open.length || imgLoraSel.length >= IMG_LORA_COUNT;
+  $("img-lora-chips").replaceChildren(...imgLoraSel.map(u => {
+    const e = list.find(x => x.name === u.name) || {name: u.name};
+    const chip = document.createElement("div"), name = document.createElement("span");
+    chip.className = "img-lora-chip";
+    chip.dataset.name = u.name;
+    name.className = "img-lora-chip__name";
+    name.textContent = u.name;
+    name.title = imgLoraAbout(e);
+    const scale = document.createElement("input");
+    scale.className = "st-input";
+    scale.type = "number";
+    scale.min = String(-IMG_LORA_SCALE);
+    scale.max = String(IMG_LORA_SCALE);
+    scale.step = "0.05";
+    scale.value = String(u.scale);
+    scale.setAttribute("aria-label", tr("img.strength", "Strength"));
+    scale.onchange = () => { u.scale = imgLoraStrength(scale.value, e.scale); scale.value = String(u.scale); imgLoraSave(); };
+    chip.append(name, scale);
+    if (e.trigger) {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = "st-btn st-btn--secondary";
+      b.textContent = tr("img.loraTrigger", "Trigger");
+      b.title = tr("img.loraTriggerTitle", "Put its trigger words into the prompt");
+      b.onclick = () => imgLoraTrigger(e.trigger);
+      chip.append(b);
+    }
+    const rm = document.createElement("button");
+    rm.type = "button";
+    rm.className = "st-btn st-btn--icon";
+    rm.textContent = "×";
+    rm.title = tr("img.loraRemove", "Remove this LoRA");
+    rm.setAttribute("aria-label", rm.title);
+    rm.onclick = () => { imgLoraSel = imgLoraSel.filter(x => x !== u); imgLoraSave(); imgLoraDraw(list); };
+    chip.append(rm);
+    return chip;
+  }));
+  const most = imgLoraSel.length >= IMG_LORA_COUNT ? tr("img.loraMost", "Up to {n} LoRAs at once (the API's limit)", {n: IMG_LORA_COUNT}) : "";
+  $("img-lora-hint").textContent = most;
+  $("img-lora-hint").hidden = !most;
+}
+// a chip's tooltip: the rank and the file's size, and the kinds of weight it changes
+function imgLoraAbout(e) {
+  const parts = [tr("img.loraAbout", "rank {rank}, {size} MiB", {rank: e.rank || "–", size: e.size_mib == null ? "–" : e.size_mib})];
+  if ((e.targets || []).length) parts.push(e.targets.join(", "));
+  return parts.join(" · ");
+}
+// an adapter's trigger words into the prompt, once: after what is written there, comma-separated (the file's own
+// words, not a <lora:...> tag: the page names its adapters in the request's field)
+function imgLoraTrigger(words) {
+  const p = $("img-prompt"), was = p.value.trim();
+  if (!was) p.value = words;
+  else if (!was.includes(words)) p.value = `${was.replace(/[\s,]+$/, "")}, ${words}`;
+  p.focus();
+}
+function imgLoraSave() {
+  store.set(`img_loras.${imgModel().id || "default"}`, imgLoraSel.map(u => ({name: u.name, scale: u.scale})));
+}
+// the adapters this request asks for, as the API's field (serve/loras.py's "lora": [{"name", "scale"}]); none for a
+// model whose block is hidden, or when none is chosen (the model's own weights)
+function imgLorasBody() {
+  return $("img-lora").hidden ? [] : imgLoraSel.slice(0, IMG_LORA_COUNT).map(u => ({name: u.name, scale: imgLoraStrength(u.scale)}));
+}
+$("img-lora-add").onchange = () => {
+  const list = (imgModel().defaults || {}).loras || [], e = list.find(x => x.name === $("img-lora-add").value);
+  if (e && imgLoraSel.length < IMG_LORA_COUNT && !imgLoraSel.some(u => u.name === e.name)) {
+    imgLoraSel.push({name: e.name, scale: imgLoraStrength(null, e.scale)});
+    imgLoraSave();
+  }
+  imgLoraDraw(list);
+};
+// the count: up to max_n, and as many as take budget_s at the speed the server measured (its rates; before it has
+// made an image, 4), with the time the images chosen take (the server refuses more, ImageGen.check_n)
+function imgEstimate(n) {
+  const d = imgModel().defaults || {}, rates = d.rates || {};
+  const refs = ($("img-ref").files || []).length > 0, edit = refs && imgModel().edits;
+  const pts = rates[edit ? "edit" : "generate"] || rates.generate || rates.edit;
+  if (!pts || !pts.length) return null;
+  let [w, h] = $("img-size").value === "custom" ? [+$("img-w").value, +$("img-h").value]
+    : ($("img-size").value === "auto" ? "1024x1024" : $("img-size").value).split("x").map(Number);
+  w = Math.ceil((w || 1024) / 16) * 16;
+  h = Math.ceil((h || 1024) / 16) * 16;
+  if (d.buckets && d.buckets.length) {   // the model's own sizes: the one whose shape is nearest (the server's choice)
+    const r = h / w;
+    [w, h] = d.buckets.reduce((a, b) => Math.abs(b[1] / b[0] - r) < Math.abs(a[1] / a[0] - r) ? b : a);
+  }
+  let steps = d.steps_fixed ? d.steps : (+$("img-steps").value || (edit ? d.edit_steps : d.steps) || 1);
+  if (refs) {   // a strength runs part of the schedule (the server's strength_run)
+    const s = $("img-strength").value !== "" ? Number($("img-strength").value) : imgStrength(d, steps);
+    if (s > 0 && s < 1) steps -= Math.floor(Math.max(steps - steps * s, 0));
+  }
+  const g = $("img-cfg").value !== "" ? Number($("img-cfg").value) : (d.guidance || 1);
+  if (g > 1 && !d.guidance_token && (d.negative_prompt != null || $("img-neg").value.trim())) steps *= 2;
+  // as the server's ImageGen.estimate_s: the size measured nearest, a step's time scaled (size_exp above it)
+  const mp = w * h / 1e6;
+  const [near, stepS, restS] = pts.reduce((a, p) => Math.abs(Math.log(mp / p[0])) < Math.abs(Math.log(mp / a[0])) ? p : a);
+  const scale = mp / near;
+  return n * (steps * stepS * scale ** (scale > 1 ? (d.size_exp || 1.5) : 1) + restS * scale);
+}
+// the strength a request without one gets: an edit's 1; an img2img's d.strength at most, lowered with few steps so
+// that it skips one (the server's img2img_strength)
+function imgStrength(d, steps) {
+  const s = d.strength != null ? d.strength : 1;
+  return !d.img2img || s >= 1 || steps < 2 ? s : Math.min(s, 1 - 1 / steps);
+}
+function imgStrengthHint() {
+  const d = imgModel().defaults || {};
+  const steps = d.steps_fixed ? d.steps : (+$("img-steps").value || d.steps || 1);
+  $("img-strength").placeholder = String(+imgStrength(d, steps).toFixed(2));
+}
+function imgCount() {
+  imgStrengthHint();
+  const d = imgModel().defaults || {}, n = $("img-n"), was = +n.value || 1;
+  const maxN = d.max_n || 16, budget = d.budget_s || 600, one = imgEstimate(1);
+  const most = one == null ? Math.min(maxN, 4) : Math.max(1, Math.min(maxN, Math.floor(budget / one)));
+  if (n.options.length !== most)
+    n.replaceChildren(...Array.from({length: most}, (_, i) => new Option(String(i + 1))));
+  n.value = String(Math.min(was, most));
+  const est = imgEstimate(+n.value);
+  $("img-n-est").textContent = est == null ? "" : est < 90 ? tr("img.aboutS", "about {n} s", {n: Math.max(1, Math.round(est))})
+    : tr("img.aboutMin", "about {n} min", {n: (est / 60).toFixed(est < 600 ? 1 : 0)});
+  $("img-n-f").title = one == null ? tr("img.countFirst", "Up to 4 until the server has made an image and measured its speed")
+    : tr("img.countMost", "Up to {n}: the images one request makes in {min} min at most (budget_s)", {n: most, min: Math.round(budget / 60)});
+}
+for (const id of ["img-size", "img-w", "img-h", "img-steps", "img-cfg", "img-n", "img-strength"])
+  $(id).addEventListener("input", imgCount);
+$("img-size").addEventListener("change", imgCount);
+// whether the negative prompt is used: only with guidance above 1, and some models guide only with one
+function imgNegHint() {
+  const d = imgModel().defaults || {};
+  const g = $("img-cfg").value !== "" ? Number($("img-cfg").value) : (d.guidance || 1);
+  const neg = $("img-neg").value.trim() !== "";
+  let msg = "";
+  if (d.guidance_token) msg = "";   // no negative prompt: the field is hidden
+  else if (neg && g <= 1) msg = tr("img.negUnused", "The negative prompt is used only with guidance above 1.");
+  else if (!neg && g > 1 && d.negative_prompt == null) msg = tr("img.negNeeded", "This image model guides only with a negative prompt.");
+  $("img-neg-hint").textContent = msg;
+  $("img-neg-hint").hidden = !msg;
+}
+// the mask (every model takes one): the first image (an edit's reference, or img2img's) under a canvas of its own
+// size, painted where it is to change; sent as OpenAI's mask, a PNG of that size transparent where it was painted
+let imgMaskURL = null;
+function imgMaskSetup() {
+  const d = imgModel().defaults || {};
+  const f = ($("img-ref").files || [])[0];
+  if (imgMaskURL) URL.revokeObjectURL(imgMaskURL);
+  imgMaskURL = null;
+  $("img-mask").hidden = !(f && d.mask);
+  if ($("img-mask").hidden) { imgLayoutDraw(); return; }
+  imgMaskURL = URL.createObjectURL(f);
+  const img = $("img-mask-img"), c = $("img-mask-paint");
+  img.onload = () => { c.width = img.naturalWidth; c.height = img.naturalHeight; imgLayoutDraw(); };
+  img.src = imgMaskURL;
+}
+(() => {
+  const c = $("img-mask-paint");
+  let last = null;
+  const at = (ev) => {
+    const r = c.getBoundingClientRect();
+    return [(ev.clientX - r.left) * c.width / r.width, (ev.clientY - r.top) * c.height / r.height, c.width / r.width];
+  };
+  const stroke = (a, b) => {
+    const g = c.getContext("2d");
+    g.globalCompositeOperation = $("img-erase").checked ? "destination-out" : "source-over";
+    g.strokeStyle = "#e11d48";
+    g.lineCap = g.lineJoin = "round";
+    g.lineWidth = Number($("img-brush").value) * b[2];   // the brush in screen pixels, at the image's size
+    g.beginPath();
+    g.moveTo(a[0], a[1]);
+    g.lineTo(b[0], b[1]);
+    g.stroke();
+  };
+  c.onpointerdown = (ev) => { c.setPointerCapture(ev.pointerId); last = at(ev); stroke(last, last); };
+  c.onpointermove = (ev) => { if (!last) return; const p = at(ev); stroke(last, p); last = p; };
+  c.onpointerup = c.onpointercancel = () => { last = null; };
+})();
+$("img-mask-clear").onclick = () => { const c = $("img-mask-paint"); c.getContext("2d").clearRect(0, 0, c.width, c.height); };
+// the mask as a data: URL, or null where nothing is painted
+function imgMask() {
+  const c = $("img-mask-paint");
+  if ($("img-mask").hidden || !c.width) return null;
+  const px = c.getContext("2d").getImageData(0, 0, c.width, c.height).data;
+  let painted = false;
+  for (let i = 3; i < px.length && !painted; i += 4) painted = px[i] > 0;
+  if (!painted) return null;
+  const m = document.createElement("canvas");
+  m.width = c.width;
+  m.height = c.height;
+  const g = m.getContext("2d");
+  g.fillRect(0, 0, m.width, m.height);
+  g.globalCompositeOperation = "destination-out";
+  g.drawImage(c, 0, 0);
+  return m.toDataURL("image/png");
+}
+// MOSS-Image's own fields, shown where /health's defaults have a layout: the prompt written out by the chat's model
+// (enhance), the schedule's shift, the blocks guidance's negative pass skips, skip-layer guidance, and a layout of
+// boxes drawn over the image.  A box is kept in shares of the image's sides, so a change of size keeps it in place;
+// it goes as the API's layout, [x_min, y_min, x_max, y_max] in the image's pixels from its top-left corner.
+const imgLayout = {boxes: [], sel: -1};
+const clamp01 = (v) => Math.min(1, Math.max(0, v));
+// the size the boxes are counted in: the size chosen; "auto" is 1024 x 1024, or the starting image's shape at about
+// as many pixels (sent as that size, so that the boxes and the image agree)
+function imgLayoutWH() {
+  const v = $("img-size").value;
+  if (v === "custom") return [+$("img-w").value || 1024, +$("img-h").value || 1024];
+  if (v !== "auto") return v.split("x").map(Number);
+  const im = $("img-mask-img");
+  if (!imgMaskURL || !im.naturalWidth) return [1024, 1024];
+  const s = Math.sqrt(1024 * 1024 / (im.naturalWidth * im.naturalHeight));
+  return [Math.max(256, Math.round(im.naturalWidth * s / 16) * 16), Math.max(256, Math.round(im.naturalHeight * s / 16) * 16)];
+}
+function imgMossSetup() {
+  const d = imgModel().defaults || {};
+  $("img-moss").hidden = !d.layout;
+  if (!d.layout) return;
+  const boxes = $("img-layout-on").checked;
+  $("img-enhance-f").hidden = !d.enhance || boxes;   // the layout is the prompt already: nothing to write out
+  $("img-shift").placeholder = String(d.shift);
+  $("img-uskip").placeholder = (d.uncond_skip_layers || []).join(", ") || tr("img.noBlocks", "none");
+  $("img-slg-scale").placeholder = String(d.slg_scale || 0);
+  $("img-slg-start").placeholder = String(d.slg_start || 0);
+  $("img-slg-stop").placeholder = String(d.slg_stop == null ? 1 : d.slg_stop);
+  $("img-layout").hidden = !boxes;
+  imgLayoutDraw();
+  imgLayoutFields();
+}
+function imgBoxName(label) {
+  return label === "text" ? tr("img.boxText", "Text") : label === "character" ? tr("img.boxCharacter", "Character") : tr("img.boxObject", "Object");
+}
+function imgLayoutDraw() {
+  if ($("img-layout").hidden) return;
+  const st = $("img-layout-stage"), [w, h] = imgLayoutWH();
+  st.style.aspectRatio = `${w} / ${h}`;
+  st.style.backgroundImage = imgMaskURL ? `url("${imgMaskURL}")` : "none";
+  st.replaceChildren(...imgLayout.boxes.map((b, i) => {
+    const e = document.createElement("div"), hd = document.createElement("span");
+    e.className = "img-box";
+    e.dataset.i = String(i);
+    e.dataset.label = b.label;
+    e.setAttribute("aria-selected", String(i === imgLayout.sel));
+    Object.assign(e.style, {left: `${b.x0 * 100}%`, top: `${b.y0 * 100}%`, width: `${(b.x1 - b.x0) * 100}%`, height: `${(b.y1 - b.y0) * 100}%`,
+                            zIndex: String(1 + Math.round((1 - (b.x1 - b.x0) * (b.y1 - b.y0)) * 1000))});   // a smaller box over a larger one
+    e.textContent = b.label === "text" && b.text ? `"${b.text}"` : b.caption || imgBoxName(b.label);
+    hd.className = "img-box__handle";
+    e.append(hd);
+    return e;
+  }));
+}
+// the selected box's fields (set when the selection changes, not while they are typed in)
+function imgLayoutFields() {
+  const b = imgLayout.boxes[imgLayout.sel];
+  $("img-layout-item").hidden = !b;
+  if (!b) return;
+  $("img-box-label").value = b.label;
+  $("img-box-caption").value = b.caption;
+  $("img-box-text").value = b.text;
+  $("img-box-text-f").hidden = b.label !== "text";
+}
+(() => {
+  const st = $("img-layout-stage"), least = 0.02;
+  let drag = null;   // {i, mode: "new" | "move" | "size", p: where it began, b: the box as it was}
+  st.tabIndex = 0;
+  const at = (ev) => {
+    const r = st.getBoundingClientRect();
+    return [clamp01((ev.clientX - r.left) / r.width), clamp01((ev.clientY - r.top) / r.height)];
+  };
+  st.onpointerdown = (ev) => {
+    const p = at(ev), el = ev.target.closest(".img-box");
+    st.setPointerCapture(ev.pointerId);
+    if (el) {
+      const i = +el.dataset.i;
+      drag = {i, mode: ev.target.classList.contains("img-box__handle") ? "size" : "move", p, b: {...imgLayout.boxes[i]}};
+    } else {
+      imgLayout.boxes.push({x0: p[0], y0: p[1], x1: p[0], y1: p[1], label: "object", caption: "", text: ""});
+      drag = {i: imgLayout.boxes.length - 1, mode: "new", p, b: null};
+    }
+    imgLayout.sel = drag.i;
+    imgLayoutDraw();
+    imgLayoutFields();
+  };
+  st.onpointermove = (ev) => {
+    if (!drag) return;
+    const p = at(ev), b = imgLayout.boxes[drag.i];
+    if (drag.mode === "new") {
+      [b.x0, b.x1] = [Math.min(drag.p[0], p[0]), Math.max(drag.p[0], p[0])];
+      [b.y0, b.y1] = [Math.min(drag.p[1], p[1]), Math.max(drag.p[1], p[1])];
+    } else if (drag.mode === "move") {   // kept inside the image
+      const o = drag.b, dx = Math.min(1 - o.x1, Math.max(-o.x0, p[0] - drag.p[0])), dy = Math.min(1 - o.y1, Math.max(-o.y0, p[1] - drag.p[1]));
+      Object.assign(b, {x0: o.x0 + dx, x1: o.x1 + dx, y0: o.y0 + dy, y1: o.y1 + dy});
+    } else {
+      b.x1 = Math.max(b.x0 + least, p[0]);
+      b.y1 = Math.max(b.y0 + least, p[1]);
+    }
+    imgLayoutDraw();
+  };
+  st.onpointerup = st.onpointercancel = () => {
+    if (!drag) return;
+    const b = imgLayout.boxes[drag.i], made = drag.mode === "new";
+    if (made && (b.x1 - b.x0 < least || b.y1 - b.y0 < least)) {   // a tap, not a box: nothing selected
+      imgLayout.boxes.splice(drag.i, 1);
+      imgLayout.sel = -1;
+    }
+    drag = null;
+    imgLayoutDraw();
+    imgLayoutFields();
+    if (made && imgLayout.sel >= 0) $("img-box-caption").focus();
+  };
+  st.onkeydown = (ev) => {
+    if ((ev.key === "Delete" || ev.key === "Backspace") && imgLayout.sel >= 0) { ev.preventDefault(); $("img-box-delete").click(); }
+  };
+})();
+const imgBox = () => imgLayout.boxes[imgLayout.sel];
+$("img-box-label").onchange = () => { const b = imgBox(); if (!b) return; b.label = $("img-box-label").value; imgLayoutFields(); imgLayoutDraw(); };
+$("img-box-caption").oninput = () => { const b = imgBox(); if (b) { b.caption = $("img-box-caption").value; imgLayoutDraw(); } };
+$("img-box-text").oninput = () => { const b = imgBox(); if (b) { b.text = $("img-box-text").value; imgLayoutDraw(); } };
+$("img-box-delete").onclick = () => {
+  if (imgLayout.sel < 0) return;
+  imgLayout.boxes.splice(imgLayout.sel, 1);
+  imgLayout.sel = -1;
+  imgLayoutDraw();
+  imgLayoutFields();
+};
+$("img-layout-clear").onclick = () => { imgLayout.boxes = []; imgLayout.sel = -1; imgLayoutDraw(); imgLayoutFields(); };
+$("img-layout-on").onchange = imgMossSetup;
+for (const id of ["img-size", "img-w", "img-h"]) $(id).addEventListener("input", imgLayoutDraw);
+$("img-size").addEventListener("change", imgLayoutDraw);
+// a layout made elsewhere (the prompt enhancer's, a chat's generate_image) into the boxes, at the size it was made
+// for: that size chosen, and the boxes on, for a change and another image
+function imgLayoutLoad(layout, size, prompt) {
+  const [w, h] = String(size || "").split("x").map(Number);
+  if (!(w > 0 && h > 0) || !layout || !Array.isArray(layout.items)) return;
+  const sel = $("img-size");
+  if ([...sel.options].some(o => o.value === `${w}x${h}`)) sel.value = `${w}x${h}`;
+  else { sel.value = "custom"; $("img-w").value = String(w); $("img-h").value = String(h); }
+  $("img-custom").hidden = sel.value !== "custom";
+  imgLayout.boxes = layout.items.filter(it => Array.isArray(it.bbox) && it.bbox.length === 4).map(it => {
+    const [x0, y0, x1, y1] = it.bbox.map(Number);
+    return {x0: clamp01(Math.min(x0, x1) / w), y0: clamp01(Math.min(y0, y1) / h), x1: clamp01(Math.max(x0, x1) / w), y1: clamp01(Math.max(y0, y1) / h),
+            label: ["object", "character", "text"].includes(it.label) ? it.label : "object", caption: String(it.caption || ""), text: String(it.text || "")};
+  });
+  imgLayout.sel = -1;
+  if (prompt != null) $("img-prompt").value = prompt;
+  $("img-layout-on").checked = true;
+  $("img-enhance").value = "";
+  imgCount();
+  imgMossSetup();
+  $("img-layout").scrollIntoView({block: "nearest"});
+}
+// a chat's generate_image call with a layout (MOSS-Image's): its prompt, model, size and boxes in the Images tab
+function imgLayoutFromTool(t) {
+  let a = t.arguments;
+  if (typeof a === "string") { try { a = JSON.parse(a); } catch (e) { return; } }
+  if (!a || !a.layout) return;
+  const ms = health.image_models || [];
+  const m = ms.find(x => x.id === a.model && (x.defaults || {}).layout) || ms.find(x => (x.defaults || {}).layout);
+  if (!m) return;
+  $("img-model").value = m.id;
+  imgDefaults();
+  const size = /^\d+x\d+$/.test(a.size || "") ? a.size : (String(t.result || "").match(/\((\d+x\d+),/) || [])[1] || "1024x1024";
+  showTab("images");
+  imgLayoutLoad(a.layout, size, typeof a.prompt === "string" ? a.prompt : null);
+}
+// MOSS-Image's fields into a request's body: an error's text when a box cannot go (a text box without its words)
+function imgMossBody(body) {
+  if ($("img-moss").hidden) return null;
+  const num = (id, key) => { if ($(id).value !== "") body[key] = Number($(id).value); };
+  num("img-shift", "shift");
+  num("img-slg-scale", "slg_scale");
+  num("img-slg-start", "slg_start");
+  num("img-slg-stop", "slg_stop");
+  const blocks = (id, key) => {
+    const v = $(id).value.trim();
+    if (v) body[key] = /^(none|-)$/i.test(v) ? [] : v.split(/[\s,]+/).filter(Boolean).map(Number);
+  };
+  blocks("img-uskip", "uncond_skip_layers");
+  blocks("img-slg", "slg_layers");
+  if ($("img-layout-on").checked && imgLayout.boxes.length) {
+    const [w, h] = imgLayoutWH(), items = [];
+    for (const b of imgLayout.boxes) {
+      const words = b.text.trim(), text = b.label === "text";
+      if (text && !words) return tr("img.boxNeedsWords", "A text box needs its words.");
+      items.push({label: b.label, caption: b.caption.trim() || (text ? words : imgBoxName(b.label)),
+                  ...(text ? {text: words} : {}),
+                  bbox: [Math.round(b.x0 * w), Math.round(b.y0 * h), Math.round(b.x1 * w), Math.round(b.y1 * h)]});
+    }
+    body.layout = {items};
+    if (body.size === "auto") body.size = `${w}x${h}`;
+  } else if ($("img-enhance").value && !$("img-enhance-f").hidden) {
+    body.enhance = $("img-enhance").value;
+  }
+  return null;
+}
+// what the prompt enhancer did (the response's strata.enhance), under the image: the prompt it wrote, or its layout
+// with a button that loads it into the boxes, or why it gave nothing
+function imgEnhanced(j, item) {
+  const e = j.strata && j.strata.enhance;
+  if (!e) return null;
+  const div = document.createElement("div"), p = document.createElement("span");
+  div.className = "img-enhanced";
+  if (e.error) p.textContent = tr("img.enhanceFailed", "The chat's model gave nothing usable ({error}); the prompt was used as it was.", {error: e.error});
+  else if (e.made === "layout") p.textContent = tr("img.enhancedLayout", {one: "The chat's model laid the image out in {n} box.", other: "The chat's model laid the image out in {n} boxes."}, {n: (e.layout.items || []).length});
+  else p.textContent = tr("img.enhancedCaption", "The chat's model wrote the prompt: {prompt}", {prompt: (item && item.revised_prompt) || e.prompt || ""});
+  div.append(p);
+  if (!e.error && e.made === "layout" && e.layout) {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "st-btn";
+    b.textContent = tr("img.layoutEdit", "Edit this layout");
+    b.onclick = () => imgLayoutLoad(e.layout, j.size, null);
+    div.append(b);
+  }
+  return div;
+}
+// whether this browser shows JPEG XL (a 1 x 1 image, decoded); older browsers do not
+const imgJxl = new Promise(ok => {
+  const i = new Image();
+  i.onload = () => ok(i.naturalWidth === 1);
+  i.onerror = () => ok(false);
+  i.src = "data:image/jxl;base64,/woAEBAJCAABABgASxiLFYIB";
+});
+let imgJxlOK = false;
+imgJxl.then(ok => { imgJxlOK = ok; imgFormat(); });
+const IMG_FMT_NAMES = {png: "PNG", jpeg: "JPEG", webp: "WebP", jxl: "JPEG XL"};
+// the format: the server's (/health's formats) that this browser shows; the one chosen last, else JPEG XL (lossless)
+// where it can, else PNG.  JPEG, WebP and JPEG XL take a quality (JPEG XL's 100: lossless), kept per format; a
+// transparent background has no JPEG (no alpha channel)
+function imgFormat() {
+  const d = imgModel().defaults || {};
+  const f = $("img-fmt"), bg = $("img-bg").checked && !$("img-bg-f").hidden;
+  const fmts = (d.formats || ["png", "jpeg", "webp"]).filter(x => x !== "jxl" || imgJxlOK);
+  const was = store.get("img_fmt", fmts.includes("jxl") ? "jxl" : "png");
+  if ([...f.options].map(o => o.value).join() !== fmts.join())
+    f.replaceChildren(...fmts.map(x => new Option(IMG_FMT_NAMES[x] || x, x)));
+  f.value = fmts.includes(was) ? was : "png";
+  for (const o of f.options) o.disabled = bg && o.value === "jpeg";
+  if (bg && f.value === "jpeg") f.value = "png";
+  $("img-q-f").hidden = f.value === "png";
+  $("img-q").value = String(store.get("img_q_" + f.value, f.value === "jxl" ? 100 : 90));
+  $("img-q-f").title = f.value === "jxl" ? tr("img.lossless", "100: lossless") : "";
+}
+$("img-fmt").onchange = () => { store.set("img_fmt", $("img-fmt").value); imgFormat(); };
+$("img-q").onchange = () => store.set("img_q_" + $("img-fmt").value, +$("img-q").value);
+$("img-bg").onchange = imgFormat;
+$("img-partial").checked = store.get("img_partial", false);
+$("img-partial").onchange = () => store.set("img_partial", $("img-partial").checked);
+// a streamed job (the "show partial images" setting): one figure shows the engine's partial images as they come, and
+// the completed events become the body the plain request answers with
+async function imgStream(r, prompt) {
+  const fig = document.createElement("figure"), img = document.createElement("img"), cap = document.createElement("figcaption");
+  img.alt = prompt;
+  fig.append(img, cap);
+  const j = {data: []};
+  const reader = r.body.getReader(), dec = new TextDecoder();
+  let buf = "";
+  try {
+    for (;;) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, {stream: true});
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line.startsWith("data:")) continue;              // event: lines and ": keep-alive" comments
+        let e;
+        try { e = JSON.parse(line.slice(5).trim()); } catch (err) { continue; }
+        if (e.type === "error") throw new Error((e.error && e.error.message) || tr("img.none", "No image"));
+        if (e.type.endsWith(".partial_image")) {
+          img.src = `data:image/${e.output_format || "png"};base64,` + e.b64_json;
+          cap.textContent = tr("img.partialCap", "Partial image {n}…", {n: e.partial_image_index + 1});
+          if (!fig.isConnected) $("img-results").prepend(fig);
+        } else if (e.type.endsWith(".completed")) {
+          Object.assign(j, {model: e.model, size: e.size, output_format: e.output_format, strata: e.strata});
+          j.data.push({b64_json: e.b64_json, seed: e.seed});
+        }
+      }
+    }
+  } finally {
+    fig.remove();
+  }
+  if (!j.data.length) throw new Error(tr("img.none", "No image"));
+  return j;
+}
+$("img-neg").oninput = () => { imgNegHint(); imgCount(); };
+$("img-cfg").addEventListener("input", imgNegHint);
+$("img-ref").onchange = () => { imgDefaults(); imgMaskSetup(); };
 $("img-form").onsubmit = async (ev) => {
   ev.preventDefault();
   const prompt = $("img-prompt").value.trim();
   if (!prompt) return;
   const size = $("img-size").value === "custom" ? `${$("img-w").value}x${$("img-h").value}` : $("img-size").value;
   const refs = Array.from($("img-ref").files || []);
-  const body = {prompt, size: size === "auto" && !refs.length ? "1024x1024" : size, response_format: "b64_json"};
+  // "auto" goes as it is: the server makes it 1024 x 1024, a reference's shape, or the model's own choice
+  const body = {prompt, size, response_format: "b64_json"};
+  if (!$("img-model-f").hidden) body.model = $("img-model").value;
+  const loras = imgLorasBody();
+  if (loras.length) body.lora = loras;
   if ($("img-seed").value !== "") body.seed = Number($("img-seed").value);
+  const neg = $("img-neg").value.trim();
+  if (neg) body.negative_prompt = neg;
+  if ($("img-steps").value !== "" && !$("img-steps-f").hidden) body.steps = Number($("img-steps").value);
+  if ($("img-cfg").value !== "") body.true_cfg_scale = Number($("img-cfg").value);
+  if ($("img-bg").checked && !$("img-bg-f").hidden) body.background = "transparent";
+  if (refs.length && $("img-strength").value !== "") body.strength = Number($("img-strength").value);
+  if (+$("img-n").value > 1) body.n = +$("img-n").value;
+  body.output_format = $("img-fmt").value;
+  if (body.output_format !== "png") body.output_compression = Math.max(0, Math.min(100, +$("img-q").value || 0));
+  const bad = imgMossBody(body);
+  if (bad) { toast("error", tr("img.none", "No image"), bad, 8000); return; }
+  const partial = $("img-partial").checked;
+  if (partial) Object.assign(body, {stream: true, partial_images: 2});
+  imageBusy = true;
   $("img-go").disabled = true;
+  paintLive();
   const t0 = performance.now();
-  $("img-hint").textContent = "Generating\u2026 (a minute or more on a small GPU)";
+  $("img-hint").textContent = tr("img.generatingHint", "Generating… (a minute or more on a small GPU)");
   try {
-    // with reference images: an edit, in JSON with data: URLs (without an API key the server takes only JSON from a
-    // browser page, so that another site's form cannot use it)
+    // with an image: an edit (or a model without edits, img2img), in JSON with data: URLs (without an API key the
+    // server takes only JSON from a browser page, so that another site's form cannot use it)
     if (refs.length) body.images = await Promise.all(refs.map(async f => ({image_url: await readAsDataURL(f)})));
+    const mask = refs.length ? imgMask() : null;
+    if (mask) body.mask = {image_url: mask};
     const url = refs.length ? "v1/images/edits" : "v1/images/generations";
     const r = await fetch(url, {method: "POST", headers: headers(true), body: JSON.stringify(body)});
-    const j = await r.json();
+    const j = partial && r.ok ? await imgStream(r, prompt) : await r.json();
     if (!r.ok) throw new Error((j.error && j.error.message) || r.statusText);
     for (const d of j.data) {
       const fig = document.createElement("figure");
       const img = document.createElement("img");
-      img.src = "data:image/png;base64," + d.b64_json;
+      img.src = `data:image/${j.output_format || "png"};base64,` + d.b64_json;
       img.alt = prompt;
       const cap = document.createElement("figcaption");
-      const made = j.strata && j.strata.made_size ? ` (made at ${j.strata.made_size}, middle cut out)` : "";
-      cap.textContent = `${j.size}${made}, seed ${d.seed}, ${((performance.now() - t0) / 1000).toFixed(0)} s: ${prompt}`;
+      const made = j.strata && j.strata.made_size ? ` ${tr("img.madeCut", "(made at {size}, middle cut out)", {size: j.strata.made_size})}`
+        : j.strata && j.strata.requested_size ? ` ${tr("img.madeNearest", "({size} asked: the model's nearest size)", {size: j.strata.requested_size})}` : "";
+      const by = $("img-model-f").hidden ? "" : `${j.model}, `;
+      cap.textContent = `${by}${j.size}${made}, ${tr("img.capSeed", "seed {seed}", {seed: d.seed})}, ${((performance.now() - t0) / 1000).toFixed(0)} s: ${prompt}`;
       fig.append(img, cap);
+      const note = imgEnhanced(j, d);
+      if (note) fig.append(note);
       $("img-results").prepend(fig);
     }
-    $("img-hint").textContent = "Done. Right-click an image to save it.";
+    $("img-hint").textContent = tr("img.done", "Done. Right-click an image to save it.");
     if (j.strata && j.strata.made_size)
-      toast("info", `Made at ${j.strata.made_size}`, `The image model needs sides that are multiples of 16: the middle ${j.size} was cut out.`, 8000);
+      toast("info", tr("img.madeAt", "Made at {size}", {size: j.strata.made_size}), tr("img.madeCutText", "The image model needs sides that are multiples of 16: the middle {size} was cut out.", {size: j.size}), 8000);
+    else if (j.strata && j.strata.requested_size)
+      toast("info", tr("img.madeAt", "Made at {size}", {size: j.size}), tr("img.madeNearestText", "This image model makes a fixed set of sizes: {size} is the one whose shape is nearest the {asked} asked for.", {size: j.size, asked: j.strata.requested_size}), 8000);
   } catch (e) {
     $("img-hint").textContent = "";
-    toast("error", "No image", String(e.message || e), 8000);
+    toast("error", tr("img.none", "No image"), String(e.message || e), 8000);
   } finally {
+    imageBusy = false;
     $("img-go").disabled = false;
     $("img-ref").value = "";   // the reference images go with this job only: the next Generate is a new image
+    paintLive();
+    await loadHealth();        // the speed the job measured (the count's limit and estimate)
+    imgMaskSetup();
   }
 };

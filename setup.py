@@ -28,15 +28,19 @@ Options: --family qwen|swift, --model Q2_0|IQ2_XS|IQ3_XXS|IQ3_S, --context 32768
 (--rope-scale F; past the trained 262144 setup adds yarn and the factor final context / 262144),
 --vision yes|no|gpu|cpu, --port 8095, --yes (recommended
 answers, no questions), --setup (install another model / change settings instead of starting), --no-start,
---host 0.0.0.0 --api-key KEY (reach it from other devices on your network), --experimental-speed-projection on|off
+--host 0.0.0.0 --api-key KEY (reach it over IPv4; use --host :: for IPv6), --experimental-speed-projection on|off
 (EXPERIMENTAL, off by default),
 --models-dir DIR, --gguf-dir DIR (use GGUF files you already have), --check (only check this PC), --check-update
 (whether a newer XeStrata release is out), --images qwen-image-turbo|qwen-image-base|...-uncensored|no (image
 generation on XeStrata's image engine, POST /v1/images/generations: Qwen-Image-2.1-Turbo in 8 steps, or its base
 model Qwen-Image-2.1 in 40; mage-flow-turbo|mage-flow|mage-flow-base[-uncensored]: Mage-Flow in 4, 20 or 30;
--uncensored: the text encoder with the refusal direction removed; --image-quant Q4_K_M|Q6_K|Q8_0 (Qwen-Image),
---image-dit-q8 auto|on|off and --image-dit-keep on|off (Mage-Flow), --image-ssd-offload on|off, --image-gpu-policy
-auto|keep|shrink|unload).
+magetrail[-uncensored]: MageTrail, Mage-Flow tuned on Danbooru and e621 images, in 30; -uncensored: the text
+encoder with the refusal direction removed; several, comma-separated: the first the default, the others named by a
+request's "model"; hunyuan-image-3-distil: HunyuanImage 3.0 Instruct-Distil in 8 steps, its own tokenizer and
+system prompt, no text encoder; moss-image|moss-image-base[-uncensored]: MOSS-Image in 50 with guidance, the text
+encoder Qwen3.5-9B; --image-quant Q4_K_M|Q6_K|Q8_0 (Qwen-Image) or w4a8|int8 (HunyuanImage 3.0), --image-dit-q8
+auto|on|off (Mage-Flow, MOSS-Image) and --image-dit-keep on|off (Mage-Flow), --image-ssd-offload on|off,
+--image-gpu-policy auto|keep|shrink|unload).
 
 Setup recommends, it never forces: the recommended answers are the defaults (--yes, or Enter), and a bigger choice
 than it recommends - a longer context, a size it thinks will not fit - is kept, with what it risks.  With --yes, an
@@ -67,6 +71,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import zipfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, NoReturn
 
@@ -102,7 +107,10 @@ HF_REVISIONS = {
     "unsloth/Qwen3.6-35B-A3B-MTP-GGUF": "5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",                  # 2026-10-12
     "unsloth/GLM-5.3-Flash-GGUF": "a38483c8cd5df544f53d70fb281afe97369d5ab6",                        # 2026-10-09
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": "1ada08422e404aca51ab9df665f089f34c419c6b",          # 2026-10-13
+    "agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF": "b32c7399b57f7a627b8aa9403ef06767e9a444e8",    # 2026-10-24
     "huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF": "06a318de4011598a142ee54bcfec47c6921c958e",  # 2026-10-22
+    "unsloth/Qwen3.5-9B-GGUF": "3885219b6810b007914f3a7950a8d1b469d598a5",                          # 2026-10-26
+    "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive": "0a41c68809d375475f954be12ba7c40efa56c2a9",  # 2026-10-26
 }
 
 
@@ -229,8 +237,9 @@ LLAMA_CPP_ZIP = f"https://github.com/ggml-org/llama.cpp/archive/{LLAMA_CPP_COMMI
 # tree_sha256() of the zip unpacked with zipfile.
 LLAMA_CPP_TREE_SHA256 = "87b1443f593e9b9159a61fa933e0fd4a2bc29e95f5ad6da422789d1c7cc515ae"
 
-# KV bytes per context token and attention layer: 8-bit 1056, rotated 4-bit 576, hybrid K8V4 (8-bit K, 4-bit V) 816
-KV_CELL_BYTES = {"q4_0": 576, "k8v4": 816}
+# KV bytes per context token and attention layer: 8-bit 1056 (the default), rotated 4-bit 576, hybrid K8V4 (8-bit K,
+# 4-bit V) 816, 16-bit 2112 (8K and less, and --kv fp16)
+KV_CELL_BYTES = {"q4_0": 576, "k8v4": 816, "fp16": 2112}
 PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "pillow", "psutil"]
 REQUIREMENTS = ROOT / "requirements.txt"   # the same packages and their dependencies, pinned (upstream #214)
 # the build helpers, installed into .venv only when an engine or image-encoder build finds none (upstream a24253783)
@@ -246,6 +255,17 @@ GYRO_FILES = {
         (58487015808, "c6ea1b08ca312f99095b27588ba35976b53f948268e7f91e7761926aa01d9c87"),
     "Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf":
         (91965774272, "7aa36d15131d255179ab6c87fa9c9f81a0b541fc9e81e959d4c3e29eb20feb5f"),
+    # 2026-10-12: TQP5 / TQP6 / TQP7 experts (pair trellis, as Gyro-Coder-L's), the 8-bit n-gram table of 10-13
+    "Qwen3.8-Flash-Next-Gyro-L-TQ3_0.gguf":
+        (108323559808, "5428a5646eaeaa56cc00a892f92e7546aeadb255233503969ad25cf48c7f359b"),
+}
+# agentionai's Gyro-Coder (2026-10-21): 256 of each layer's 512 experts kept for code, the rest as Gyro's.  Coder-L's
+# experts are TQP5 / TQP6 / TQP7 (pair trellis, 3.2 bits a weight), Coder's TQ2_T (2.1 bits).
+GYRO_CODER_FILES = {
+    "Qwen3.8-Flash-Next-Gyro-Coder-L-TQ3_0.gguf":
+        (83975625024, "184481733a1fc1341a05008fd0cff4fdc0cad1a1d6d12f63d7bb72cd5c69331d"),
+    "Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf":
+        (75796732256, "2ecaf3ba6ed7f142ce00bc4a3172052f01bcf4e10d3ff617d8ab4755f4f2d4c4"),
 }
 
 MODELS: dict[str, dict[str, Any]] = {
@@ -292,17 +312,32 @@ MODELS: dict[str, dict[str, Any]] = {
              "download_gb": 188.2, "ram_gb": 136, "arena_gb": 128.3, "families": ("unsloth", "huihui-unsloth"),
              "budget": True, "experimental": True, "shards": 6, "file": "Qwen3.8-Flash-Next-{q}-0000{i}-of-00006.gguf",
              "vision": True, "vision_untested": True},
-    # Gyro (agentionai): "ram_gb" is the memory the weights need in total, VRAM and RAM together ("mem_total"): Gyro-S
-    # 27.6 GB, Gyro-M 35 GB (the rest of the download is the n-gram table, read from the SSD).  Neither is anyone's
+    # Gyro (agentionai): "ram_gb" is the RAM that holds every expert with the usual room beside them ("arena_gb" +
+    # LOW_RAM_HEADROOM_GB); with less, the low-RAM mode needs RAM and VRAM together of "arena_gb" + 12 (low_ram_fits:
+    # 6 GB of each for the rest).  The rest of the download is the n-gram table, read from the SSD.  Neither is anyone's
     # default.  Images: the same mmproj as every Flash-Next model; strata-vision reads only the vocabulary and header of
     # the Gyro GGUF (tools/vision/gguf_meta.h), whose TQK6 / TQK7 tensors llama.cpp does not know.
-    "Gyro-S": {"about": "the smallest option, for PCs with little memory (27.6 GB of VRAM + RAM together); lower "
+    "Gyro-S": {"about": "for PCs with little memory (36 GB of RAM, or 38 GB of RAM and VRAM together); lower "
                         "quality than the 2-3-bit sizes, and the 2-bit Q2_0 decodes faster",
-               "download_gb": 58.5, "ram_gb": 27.6, "arena_gb": 25.8, "families": ("gyro",), "mem_total": True,
+               "download_gb": 58.5, "ram_gb": 35.8, "arena_gb": 25.8, "families": ("gyro",),
                "file": "Qwen3.8-Flash-Next-Gyro-S-TQ1_0.gguf", "shards": 1, "vision": True},
-    "Gyro-M": {"about": "about IQ3_XXS quality with about 20% less GPU memory (35 GB of VRAM + RAM together)",
-               "download_gb": 92.0, "ram_gb": 35.0, "arena_gb": 32.1, "families": ("gyro",), "mem_total": True,
+    "Gyro-M": {"about": "about IQ3_XXS quality with about 20% less GPU memory (43 GB of RAM, or 45 GB of RAM and "
+                        "VRAM together)",
+               "download_gb": 92.0, "ram_gb": 42.1, "arena_gb": 32.1, "families": ("gyro",),
                "file": "Qwen3.8-Flash-Next-Gyro-M-TQ2_0.gguf", "shards": 1, "vision": True},
+    "Gyro-L": {"about": "the best of the Gyro sizes, close to IQ3_S, slower than Gyro-M (59 GB of RAM, or 61 GB of RAM "
+                        "and VRAM together)",
+               "download_gb": 108.3, "ram_gb": 58.4, "arena_gb": 48.4, "families": ("gyro",),
+               "file": "Qwen3.8-Flash-Next-Gyro-L-TQ3_0.gguf", "shards": 1, "vision": True},
+    # Gyro-Coder (agentionai): the same memory rule
+    "Gyro-Coder-L": {"about": "half the experts, kept for code, at 3.2 bits (35 GB of RAM, or 37 GB of RAM and VRAM "
+                              "together); weaker outside coding",
+                     "download_gb": 84.0, "ram_gb": 34.2, "arena_gb": 24.2, "families": ("gyro-coder",),
+                     "file": "Qwen3.8-Flash-Next-Gyro-Coder-L-TQ3_0.gguf", "shards": 1, "vision": True},
+    "Gyro-Coder": {"about": "half the experts, kept for code, at 2.1 bits (26 GB of RAM, or 28 GB of RAM and VRAM "
+                            "together); lower quality than Gyro-Coder-L",
+                   "download_gb": 75.8, "ram_gb": 26.0, "arena_gb": 16.0, "families": ("gyro-coder",),
+                   "file": "Qwen3.8-Flash-Next-Gyro-Coder-TQ2_0.gguf", "shards": 1, "vision": True},
 }
 # The experimental Unsloth file's four shards at the pinned revision: name -> (bytes, sha256), checked after the
 # download (check_shards reads the other model files' directories; these are also hashed once).
@@ -508,14 +543,28 @@ FAMILIES: dict[str, dict[str, Any]] = {
                 "sha256": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS, **UNSLOTH_BIG_SHARDS}},
     # agentionai's Gyro quantizations (see GYRO_FILES): after the regular families, never the default
     "gyro": {"title": "Qwen3.8-Flash-Next (Gyro)", "by": "Gyro quantizations by agentionai",
-             "about": "Gyro-S (27.6 GB of memory) and Gyro-M (35 GB): the smallest sizes, for PCs with little memory; "
-                      "58 and 92 GB downloads (the files include the n-gram table)",
+             "about": "Gyro-S (36 GB of RAM, or 38 GB of RAM and VRAM together), Gyro-M (43 or 45 GB) and Gyro-L "
+                      "(59 or 61 GB): 58, 92 and 108 GB downloads (the files include the n-gram table)",
              "hf": hf("agentionai/Qwen3.8-Flash-Next-Gyro-GGUF"), "file": "Qwen3.8-Flash-Next-{q}.gguf", "shards": 1,
              "tag": "gyro-", "name": "qwen3.8-flash-next-gyro", "vision": True, "pack_args": ["--compat-bf16"],
              "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"), "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf",
              "sha256": GYRO_FILES,
              "license": "Qwen Community License 1.0 (Qwen3.8-Flash-Next's; the Gyro files are agentionai's quantization): "
                         "https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF"},
+    # agentionai's Gyro-Coder (GYRO_CODER_FILES): Gyro's format with half the experts, for code; never the default.
+    # Images: the original's vision encoder, as the Gyro files take it (agentionai ships none for the Coder)
+    "gyro-coder": {"title": "Qwen3.8-Flash-Next Gyro-Coder", "by": "agentionai's coding version, Gyro quantized",
+                   "about": "half the experts (kept for code): Gyro-Coder-L (35 GB of RAM, or 37 GB of RAM and VRAM "
+                            "together) and Gyro-Coder (26 or 28 GB); 84 and 76 GB downloads (the files include the "
+                            "n-gram table); weaker outside coding",
+                   "hf": hf("agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF"), "file": "Qwen3.8-Flash-Next-{q}.gguf",
+                   "shards": 1, "tag": "gyro-coder-", "name": "qwen3.8-flash-next-gyro-coder", "vision": True,
+                   "pack_args": ["--compat-bf16"], "mmproj_hf": hf("ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF"),
+                   "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "sha256": GYRO_CODER_FILES,
+                   "profile": "expert-profile-gyro-coder.bin",
+                   "license": "Qwen Community License 1.0 (Qwen3.8-Flash-Next's; the Gyro-Coder files are agentionai's "
+                              "pruning and quantization): "
+                              "https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF"},
     # huihui-ai's abliterated copies (HUIHUI_FILES): Swift 1.5's and Unsloth's files with the refusals removed, in
     # folders of one repository ("dirs": the folder of each size); after the regular families, never the default
     "huihui-swift": {"title": "Swift 1.5 (abliterated)", "by": "huihui-ai's uncensored version of Swift 1.5",
@@ -543,13 +592,17 @@ FAMILIES: dict[str, dict[str, Any]] = {
 # The models the engine runs other than Qwen3.8-Flash-Next (src/core/plain_model.cpp: `strata --native` with another
 # architecture): one GGUF file each, its size and SHA-256 at the pinned revision (the Hub's LFS pointers), or its
 # "parts" (a model in several files: each one's path in the repository, size and SHA-256; "file" is the first, which
-# the engine is given), no pack, no PLE table and no images yet.  "tested": the files this release was checked with
-# (the rest use the same tensor types, checked on those files and in the kernels' tests).
+# the engine is given), no pack and no PLE table.  "tested": the files this release was checked with (the rest use the
+# same tensor types, checked on those files and in the kernels' tests).  "mmproj": the picture reader's file (the
+# family reads images); "dense": a model without experts, every weight of which the engine keeps in VRAM, and
+# "kv_bytes": its K/V cache's bytes a token (setup sizes the model and the context by the GPU's memory).
 _ORNITH = "ornith-ai/Ornith-1.5-35B-A3B-GGUF"
 _ORNITH_GSQ = "pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF"
 _LLMJP = "llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf"
 _QWEN36 = "unsloth/Qwen3.6-35B-A3B-MTP-GGUF"
 _GLM53 = "unsloth/GLM-5.3-Flash-GGUF"
+_QWEN35 = "unsloth/Qwen3.5-9B-GGUF"
+_QWEN35_HAU = "HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive"
 
 
 def _glm53_parts(quant: str, parts: list[tuple[int, str]]) -> list[dict[str, Any]]:
@@ -637,6 +690,48 @@ PLAIN_FAMILIES: dict[str, dict[str, Any]] = {
                             "about": "8-bit, the closest to the full model"},
                }},
 }
+# Qwen3.5-9B (qwen35): dense, 32 blocks (a full attention every 4th, 4 K/V heads of 256: 8 x 2 x 4 x 256 x 2 bytes of
+# K/V a token), every weight in VRAM; Qwen's model as Unsloth's GGUFs, or HauhauCS's with its refusals removed.  Both
+# read pictures through Unsloth's mmproj: HauhauCS's has the same 334 tensors byte for byte (only its metadata
+# differs, 2026-10-27), so one file serves both
+_QWEN35_HAU_FILE = "Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-{}.gguf"
+_QWEN35_MMPROJ = {"repo": _QWEN35, "path": "mmproj-BF16.gguf", "size": 921705024,
+                  "sha256": "853698ce7aa6c7ba732478bad280240969ddf7b0fcbf93900046f63903a83383"}
+PLAIN_FAMILIES["qwen35"] = {
+    "title": "Qwen3.5-9B", "by": "Qwen (Apache-2.0), GGUFs by Unsloth",
+    "about": "9B, dense, reads images: for a GPU of 8 GB or more, every weight in its VRAM",
+    "tag": "qwen35-", "name": "qwen3.5-9b", "max_context": 262144, "plain": True, "dense": True, "kv_bytes": 32768,
+    "mmproj": _QWEN35_MMPROJ,
+    "models": {
+        "Q4_K_M": {"repo": _QWEN35, "file": "Qwen3.5-9B-Q4_K_M.gguf", "size": 5680522464,
+                   "sha256": "03b74727a860a56338e042c4420bb3f04b2fec5734175f4cb9fa853daf52b7e8", "about": "4-bit"},
+        "Q6_K": {"repo": _QWEN35, "file": "Qwen3.5-9B-Q6_K.gguf", "size": 7458301152,
+                 "sha256": "91898433cf5ce0a8f45516a4cc3e9343b6e01d052d01f684309098c66a326c59", "about": "6-bit"},
+        "Q8_0": {"repo": _QWEN35, "file": "Qwen3.5-9B-Q8_0.gguf", "size": 9527502048,
+                 "sha256": "809626574d0cb43d4becfa56169980da2bb448f2299270f7be443cb89d0a6ae4",
+                 "about": "8-bit, the closest to the full model"},
+        "BF16": {"repo": _QWEN35, "file": "Qwen3.5-9B-BF16.gguf", "size": 17920697312,
+                 "sha256": "daebe40eeea7057c1cdf35ac56d13f507d8bf12171bbb7a6b6b0d3f05439159a",
+                 "about": "the unquantized weights"},
+    }}
+PLAIN_FAMILIES["qwen35-uncensored"] = {
+    "title": "Qwen3.5-9B (uncensored)", "by": "HauhauCS (Apache-2.0), from Qwen's Qwen3.5-9B",
+    "about": "Qwen3.5-9B with its refusals removed (HauhauCS's Aggressive): far fewer refusals, and its safety "
+             "filtering is reduced, so check what it writes",
+    "tag": "qwen35-uncensored-", "name": "qwen3.5-9b-uncensored", "max_context": 262144, "plain": True, "dense": True,
+    "kv_bytes": 32768,
+    "mmproj": _QWEN35_MMPROJ,
+    "models": {
+        "Q4_K_M": {"repo": _QWEN35_HAU, "file": _QWEN35_HAU_FILE.format("Q4_K_M"), "size": 5627044224,
+                   "sha256": "2ca636d9e81d3d23ca9b60c234fe185d30ec082eeba69ce770fdb0c76559a4f5", "about": "4-bit"},
+        "Q6_K": {"repo": _QWEN35_HAU, "file": _QWEN35_HAU_FILE.format("Q6_K"), "size": 7359259008,
+                 "sha256": "c0ba7beb68fd3fe47891bd549486d38dcf62d00817296ea314ad37017f5a4986", "about": "6-bit"},
+        "Q8_0": {"repo": _QWEN35_HAU, "file": _QWEN35_HAU_FILE.format("Q8_0"), "size": 9527501184,
+                 "sha256": "99e7f2201c0046b05d2825e4d8be6a2efad2b87b071cd55d37bdd9fbe201a58b", "about": "8-bit"},
+        "BF16": {"repo": _QWEN35_HAU, "file": _QWEN35_HAU_FILE.format("BF16"), "size": 17920696704,
+                 "sha256": "40110026c1bd726f85f20487c54fa54b3ffef6ddfdf095e8e5901126d5a2b743",
+                 "about": "the unquantized weights"},
+    }}
 # GLM-5.3-Flash (glm5-next): 320B, 18B active, KDA and DSA attention with four residual streams (mHC), its MTP layer
 # not read yet; Unsloth's files in several parts
 PLAIN_FAMILIES["glm53"] = {
@@ -671,12 +766,16 @@ REPO_PINS: dict[str, dict[str, tuple[int, str]]] = {
     "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF": CODER_FILES,
     "unsloth/Qwen3.8-Flash-Next-GGUF": {**UNSLOTH_SHARDS, **UNSLOTH_IQ4_XS_SHARDS, **UNSLOTH_BIG_SHARDS},
     "agentionai/Qwen3.8-Flash-Next-Gyro-GGUF": GYRO_FILES,
+    "agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF": GYRO_CODER_FILES,
     "huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF": HUIHUI_FILES,
 }
 for _fam in PLAIN_FAMILIES.values():                 # the other models' files, from their own tables
     for _d in _fam["models"].values():
         for _x in plain_parts(_d):
             REPO_PINS.setdefault(_d["repo"], {})[_x["path"].rsplit("/", 1)[-1]] = (_x["size"], _x["sha256"])
+    if _fam.get("mmproj"):
+        _m = _fam["mmproj"]
+        REPO_PINS.setdefault(_m["repo"], {})[_m["path"].rsplit("/", 1)[-1]] = (_m["size"], _m["sha256"])
 
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 # EXPERIMENTAL, off by default (setup asks): a control vector shipped with the repository, see its README
@@ -804,7 +903,8 @@ def flush_typed_ahead() -> None:
         pass
 
 
-def ask(question, choices, default, yes):
+def ask(question, choices, default, yes, free=False):
+    """`question`'s answer, one of `choices` (`free`: any line, checked by the caller); the default without one."""
     if yes:
         return default
     flush_typed_ahead()
@@ -819,6 +919,8 @@ def ask(question, choices, default, yes):
             return default
         if not a:
             return default
+        if free:
+            return a
         if a.lower() in [c.lower() for c in choices]:
             return next(c for c in choices if c.lower() == a.lower())
         say(f"  please answer one of: {', '.join(choices)}")
@@ -1149,6 +1251,20 @@ def amd_uma(carve_gb: float, gtt_gb: float, ram: float) -> dict:
     return {"carve_gb": max(0.0, carve_gb), "shared_gb": shared, "uma_gb": max(0.0, carve_gb) + shared}
 
 
+def unused_apu_notes(found, used, ram) -> list:
+    """upstream 30a67051d: an APU (a Strix Halo beside a card) that is NOT in the run: its BIOS carve-out is memory
+    the OS does not have, and it is the RAM the experts live in.  Nothing is changed: a "!" line says what is lost and
+    what to set."""
+    out = []
+    for g in found:
+        if "uma_gb" in g and g["index"] not in used and g.get("carve_gb", 0.0) > 16:
+            out.append(f"!the BIOS gives {g['carve_gb']:.0f} GB of your memory to {g['name']}, which this run does "
+                       f"not use: the OS has {ram:.0f} GB left for the experts and the desktop, and the engine can "
+                       "run out of RAM. A small carve-out (512 MB - 2 GB, 'UMA Frame Buffer Size' in the BIOS) gives "
+                       "it back; the GPU reaches the shared memory anyway")
+    return out
+
+
 def strix_halo_notes(gpu, ram) -> list:
     """What setup tells a Strix Halo owner (a leading "!" = a warning): nothing is changed or refused."""
     notes = [f"  Strix Halo (gfx1151, Ryzen AI Max): the CPU and the GPU share one memory ({ram:.0f} GB seen by the "
@@ -1286,9 +1402,12 @@ PACKAGES = {
 
 # The packages of the tools setup does not install itself, for its messages, by distro_family()
 TOOL_PACKAGES = {
-    "ubuntu": {"g++": "build-essential", "glslc": "glslc", "vulkan": "libvulkan-dev", "spirv": "spirv-headers"},
-    "fedora": {"g++": "gcc-c++", "glslc": "glslc", "vulkan": "vulkan-loader-devel", "spirv": "spirv-headers-devel"},
-    "arch": {"g++": "base-devel", "glslc": "shaderc", "vulkan": "vulkan-headers", "spirv": "spirv-headers"},
+    "ubuntu": {"g++": "build-essential", "glslc": "glslc", "vulkan": "libvulkan-dev", "spirv": "spirv-headers",
+               "pdf": "poppler-utils", "jsonschema": "python3-jsonschema"},
+    "fedora": {"g++": "gcc-c++", "glslc": "glslc", "vulkan": "vulkan-loader-devel", "spirv": "spirv-headers-devel",
+               "pdf": "poppler-utils", "jsonschema": "python3-jsonschema"},
+    "arch": {"g++": "base-devel", "glslc": "shaderc", "vulkan": "vulkan-headers", "spirv": "spirv-headers",
+             "pdf": "poppler", "jsonschema": "python-jsonschema"},
 }
 
 # The command that installs distribution packages on this PC, by distro_family()
@@ -1661,18 +1780,58 @@ def rocm_win_family(gfx: str):
 
 
 def windows_amd_libs(gfx: set) -> list:
-    """pip's commands for AMD's rocBLAS and hipBLASLt the engine would not find on Windows for the AMD GPUs of `gfx`,
-    where it looks (add_library_dirs in src/prefill/gemm.cpp): the PATH, the Python beside the engine."""
+    """pip's arguments (after `pip install`) for AMD's rocBLAS and hipBLASLt the engine would not find on Windows for
+    the AMD GPUs of `gfx`, one install a family, where it looks (add_library_dirs in src/prefill/gemm.cpp): the PATH,
+    the Python beside the engine."""
     path = [Path(d) for d in os.environ.get("PATH", "").split(os.pathsep) if d]
     site = Path(sys.executable).parent / "Lib" / "site-packages"
-    commands = []
+    installs = []
     for family in sorted({f for g in gfx if g and (f := rocm_win_family(g))}):
         dirs = path + [site / f"_rocm_sdk_libraries_{family.replace('-', '_')}" / "bin"]
         if not any((d / "rocblas.dll").is_file() and (d / "libhipblaslt.dll").is_file() for d in dirs):
             # --no-deps: the HIP runtime is the AMD driver's (amdhip64_7.dll), not the SDK's core package
-            commands.append(f'"{sys.executable}" -m pip install --no-deps --index-url {ROCM_WIN_INDEX}{family}/ '
-                            f"rocm-sdk-libraries-{family.lower()}=={ROCM_WIN_VERSION}")
-    return commands
+            installs.append(["--no-deps", "--index-url", f"{ROCM_WIN_INDEX}{family}/",
+                             f"rocm-sdk-libraries-{family.lower()}=={ROCM_WIN_VERSION}"])
+    return installs
+
+
+def windows_libs(makers: set, gfx: set, yes: bool, install: bool) -> None:
+    """Windows: Intel's oneMKL, NVIDIA's cuBLAS, CUDA runtime and cuDNN, and AMD's rocBLAS and hipBLASLt for the AMD
+    GPUs' families (`gfx`), where the engine would not find them, installed with pip into the Python the 7z carries,
+    where the engine looks (add_library_dirs in src/prefill/gemm.cpp), when the user agrees; `install` false (--check)
+    only names them.  A new 7z's Python has none of them, so setup there asks again.  A failed install does not stop
+    setup: XeStrata's own kernels do the work."""
+    contrib = packaged_engine().get("license") == "contrib"
+
+    def amd_missing(args: list) -> Callable[[], list]:
+        return lambda: [x for x in windows_amd_libs(gfx) if x == args]
+    wanted: list[tuple[str, list, Callable[[], list]]] = []   # (what, pip's arguments, what is still missing after)
+    if "intel" in makers and contrib and (mkl := windows_intel_libs()):
+        wanted.append(("Intel's oneMKL for the matrix products (not free software)", ["--no-deps", *mkl],
+                       windows_intel_libs))
+    if "nvidia" in makers and contrib and (nv := windows_nvidia_libs()):
+        wanted.append(("NVIDIA's " + ", ".join(nv) + " (not free software: cuBLAS for the matrix products, cuDNN for "
+                       "the image engine's attention)", nv, windows_nvidia_libs))
+    if "amd" in makers:
+        for args in windows_amd_libs(gfx):
+            wanted.append(("AMD's rocBLAS and hipBLASLt for the matrix products", args, amd_missing(args)))
+    site = Path(sys.executable).parent / "Lib" / "site-packages"
+    writable = os.access(site, os.W_OK)
+    for what, args, missing in wanted:
+        warn(f"faster with {what}; without it XeStrata's own kernels do the work")
+        cmd = [sys.executable, "-m", "pip", "install", *args]
+        if install and not writable:
+            warn(f"the 7z's folder cannot be written ({site}), where the engine looks for it: unpack the 7z where you "
+                 "can write, or install it as a user who can:")
+        if not install or not writable or ask("  Install it now with pip, into the 7z's Python?", ["y", "n"], "y",
+                                              yes) != "y":
+            say("  " + subprocess.list2cmdline(cmd))
+            continue
+        if run(cmd, check=False).returncode != 0 or missing():
+            warn("the install did not complete (pip's lines above say why); XeStrata's own kernels do the work. "
+                 "To try again: " + subprocess.list2cmdline(cmd))
+        else:
+            ok(f"installed {what.split(' (')[0]}")
 
 
 def nvidia_libs_dir(data: Path) -> Path:
@@ -1743,34 +1902,21 @@ def linux_nvidia_libs(makers: set, data: Path, names: list) -> None:
         + " ".join(shlex.quote(n) for n in names))
 
 
-def check_runtime(makers: set, gfx: set, data: Path, yes: bool = False, explicit: bool = False) -> None:
+def check_runtime(makers: set, gfx: set, data: Path, yes: bool = False, explicit: bool = False,
+                  install: bool = True) -> None:
     """Stops when the GPUs of `makers` lack their makers' packages, and says how to install them; names oneMKL and
     cuBLAS too when they are missing, without stopping (XeStrata's own kernels do their work).  Windows: the GPU
     makers' drivers bring what the engine runs on (Level Zero, the CUDA driver), the 7z the rest, and the launcher
-    checks the Visual C++ runtime.  Intel's oneMKL, NVIDIA's cuBLAS, CUDA runtime and cuDNN, and AMD's rocBLAS and
-    hipBLASLt for the AMD GPUs' families (`gfx`, their gfx names), are named when the engine would not find them, with
-    pip's command for the Python the 7z carries."""
+    checks the Visual C++ runtime; the makers' math libraries (windows_libs) are installed with pip when the user
+    agrees (`install`: not with --check)."""
     if WIN:
-        mkl = windows_intel_libs() if "intel" in makers and packaged_engine().get("license") == "contrib" else []
-        if mkl:
-            warn("faster with Intel's oneMKL for the matrix products (not free software; without it XeStrata's own "
-                 "kernels do the work):")
-            say(f'  "{sys.executable}" -m pip install --no-deps ' + " ".join(f'"{n}"' for n in mkl))
-        missing = windows_nvidia_libs() if "nvidia" in makers and packaged_engine().get("license") == "contrib" else []
-        if missing:
-            warn("faster with NVIDIA's " + ", ".join(missing) + " (not free software: cuBLAS for the matrix products, "
-                 "cuDNN for the image engine's attention; without them XeStrata's own kernels do the work):")
-            say(f'  "{sys.executable}" -m pip install ' + " ".join(missing))
-        amd = windows_amd_libs(gfx) if "amd" in makers else []
-        if amd:
-            warn("faster with AMD's rocBLAS and hipBLASLt for the matrix products (without them XeStrata's own kernels "
-                 "do the work):")
-            for c in amd:
-                say("  " + c)
+        windows_libs(makers, gfx, yes, install)
         return
     check_igc(makers)
     check_level_zero(makers, yes, explicit)
     linux_nvidia_libs(makers, data, (packaged_engine().get("runtime") or {}).get("nvidia_pip") or [])
+    check_pdf()
+    check_jsonschema()
     need, fast, repos = runtime_missing(makers)
     if not need and not fast:
         return
@@ -1781,6 +1927,28 @@ def check_runtime(makers: set, gfx: set, data: Path, yes: bool = False, explicit
     warn("faster with " + ", ".join(fast) + " (without them XeStrata's own kernels do the work):")
     for line in lines:
         say(line)
+
+
+def check_pdf() -> None:
+    """Linux: a PDF a request sends is read with poppler's pdftotext and pdftoppm, run as programs (Windows' 7z carries
+    the Python packages instead).  Without them it is refused: said, with the command that installs them, never a
+    stop (no model needs them)."""
+    if shutil.which("pdftotext") and shutil.which("pdftoppm"):
+        return
+    warn("a PDF a request sends is read with poppler's pdftotext and pdftoppm (without them it is refused):")
+    say(f"  {install_cmd([tool_pkg('pdf')])}")
+
+
+def check_jsonschema() -> None:
+    """Linux: response_format json_schema and strict tools are checked with the Python package jsonschema - pip
+    installs it into .venv, and the deb and rpm packages depend on the distribution's.  Without it a strict request is
+    refused (400): said, with the command that installs it, never a stop."""
+    import importlib.util
+    if importlib.util.find_spec("jsonschema") is not None:
+        return
+    warn("json_schema answers and strict tool calls are checked with the Python package jsonschema (without it a "
+         "strict request is refused):")
+    say(f"  {install_cmd([tool_pkg('jsonschema')])}")
 
 
 def rocm_missing() -> list:
@@ -1939,6 +2107,12 @@ def gpu_problem(g, together=False):
     FP16, the matrix engines) is checked by the engine and the compiler's probe, not here."""
     if together:
         return "not supported together with other GPUs - the Xe engine runs on one GPU"
+    cc = g.get("cc") or ""
+    if g.get("vendor") == "nvidia" and re.fullmatch(r"\d+\.\d+", cc) and round(float(cc) * 10) < 60:
+        # Maxwell and older (upstream #3218 builds sm_52 in its experimental build): NVIDIA's SYCL runtime reports FP16,
+        # which the engine's kernels take, only from compute capability 5.3 on, and XeStrata builds code from Pascal on
+        return (f"compute capability {cc} is older than Pascal (6.0), the oldest NVIDIA GPUs the engine has code for "
+                "(below 5.3 the SYCL runtime reports no FP16, which its kernels need)")
     if g.get("vendor") == "nvidia" and PACKAGED:
         meta = packaged_engine()
         archs = [int(x[3:]) for x in meta.get("cuda_archs", []) if x[3:].isdigit()]   # "sm_75" -> 75
@@ -1946,7 +2120,6 @@ def gpu_problem(g, together=False):
             return (f"{meta.get('package', 'this package')} has no NVIDIA code: an NVIDIA GPU needs "
                     "xestrata-contrib-cuda<version> in its place")
         # unknown without nvidia-smi: the engine says so if it has no code for the card
-        cc = g.get("cc") or ""
         if re.fullmatch(r"\d+\.\d+", cc) and round(float(cc) * 10) < min(archs):
             return (f"compute capability {g.get('cc')} is older than the sm_{min(archs)} {meta.get('package')} has "
                     "code for: xestrata-contrib-cuda12.4 in its place has code for it (from Pascal, sm_60)")
@@ -2048,21 +2221,57 @@ def gpu_info(pick=None):
     return {**g, "count": len(found)}
 
 
+CMAKE_MIN = (3, 24)                    # CMakeLists.txt: cmake_minimum_required(VERSION 3.24)
+
+
+def _tool_version(path, name):
+    """(ok, version tuple) of `path --version`: ok False when it does not run (a pip launcher whose Python is gone)."""
+    try:
+        done = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False, ()
+    if done.returncode != 0:
+        return False, ()
+    found = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", done.stdout or "")
+    return True, tuple(int(x) for x in found.groups() if x) if found else ()
+
+
 def find_tool(name):
-    """A tool on PATH, or the one pip installed next to this Python (cmake, ninja).  A PATH copy that does not run
-    (a pip launcher whose Python is gone) is skipped for the one next to this Python."""
-    p = shutil.which(name)
-    if p:
-        try:
-            if subprocess.run([p, "--version"], capture_output=True, timeout=30).returncode == 0:
-                return p
-        except (OSError, subprocess.SubprocessError):
-            pass
-    for d in (Path(sys.executable).parent, Path.home() / ".local" / "bin"):
-        c = d / name
-        if c.exists():
-            return str(c)
-    return None
+    """The tool the build uses (cmake, ninja), after upstream 5bfce4bea (#3822): the one pip installed next to this
+    Python first (the virtualenv's own), then PATH, then ~/.local/bin.  One that does not run (a pip launcher whose
+    Python is gone) is skipped, and so is a cmake older than CMakeLists.txt needs while another is found; with only an
+    older one it is returned and the build says so."""
+    exe = name + (".exe" if WIN else "")
+    candidates = [str(d / exe) for d in (Path(sys.executable).parent / "Scripts", Path(sys.executable).parent)
+                  if (d / exe).exists()]
+    on_path = shutil.which(name)
+    if on_path and on_path not in candidates:
+        candidates.append(on_path)
+    local = Path.home() / ".local" / "bin" / exe
+    if local.exists() and str(local) not in candidates:
+        candidates.append(str(local))
+    older = None
+    for c in candidates:
+        runs, version = _tool_version(c, name)
+        if not runs:
+            continue
+        if name == "cmake" and version and version[:2] < CMAKE_MIN:
+            older = older or c
+            continue
+        return c
+    return older
+
+
+def tool_usable(name):
+    """find_tool found one that runs and (cmake) is new enough: an older system cmake counts as missing, so pip puts
+    the right one in the virtualenv."""
+    found = find_tool(name)
+    if found is None:
+        return False
+    if name == "cmake":
+        runs, version = _tool_version(found, name)
+        return runs and (not version or version[:2] >= CMAKE_MIN)
+    return True
 
 
 def free_gb(path):
@@ -2475,6 +2684,29 @@ def _piece_worker(src: _Source, st: _Pieces, todo: list, part: Path):
         st.stop.set()
 
 
+class StallNote:
+    """A download that gets no byte for a while says so (upstream ed0c8939a, #3567): "stalled at 69%" instead of a
+    silent line that never moves.  `check` is called often with the bytes so far; it answers a sentence at most once a
+    minute while nothing arrives, and None otherwise."""
+
+    AFTER = 120.0
+
+    def __init__(self, now: float = 0.0):
+        self.have, self.since, self.said = -1, now, 0.0
+
+    def check(self, have: int, total: int, now: float) -> str | None:
+        if have != self.have:
+            self.have, self.since, self.said = have, now, 0.0
+            return None
+        idle = now - self.since
+        if idle < self.AFTER or now - self.said < 60:
+            return None
+        self.said = now
+        return (f"no data for {int(idle // 60)} min at {100 * have // max(1, total)}%: the connection is stuck. "
+                "It keeps trying; to stop, press Ctrl+C, and run the same command again: the download continues "
+                "where it stopped")
+
+
 def parallel_download(url: str, part: Path, total: int, label: str, conns: int, name: str) -> bool:
     """Fill `part` (total bytes) over `conns` ranged connections.  True when every byte is there; False when the server
     does not do ranges (the caller reads the file in one stream)."""
@@ -2494,13 +2726,19 @@ def parallel_download(url: str, part: Path, total: int, label: str, conns: int, 
     if not part.with_name(part.name + ".chunks").is_file() and not _save_pieces(part, total, done):
         return False                                    # no piece list can be kept: pieces would not be told from holes
     last_print = last_save = 0.0
+    stall = StallNote(time.time())
 
     def report(force=False):
         nonlocal last_print, last_save
         now = time.time()
         if now - last_print > 2 or force:
             last_print = now
-            progress(label, st.have(), total)
+            have = st.have()
+            progress(label, have, total)
+            note = stall.check(have, total, now)
+            if note:
+                progress_end()
+                warn(note)
         if now - last_save > DL_SAVE_EVERY:
             last_save = now
             _save_pieces(part, total, st.snapshot())
@@ -2788,12 +3026,14 @@ def download(url, dst: Path, what=None):
             time.sleep(5)
     if not total:
         total = range_total(url)
+    meta = ms_meta(*ms) if ms is not None else None
+    if not total:       # the published size stands in, so an early EOF is not a finished file (upstream a1d2fd7ed)
+        total = pin[0] if pin else (meta[0] if meta else 0)
     if pin and total and total != pin[0]:              # not the pinned file: stop before the download, not after
         fail(f"{what or dst.name} is {total:,} bytes on {url.split('/')[2]}, not the pinned {pin[0]:,}",
              "update XeStrata (the file there has changed since this version pinned it)")
     label = what or dst.name
     conns = dl_connections()
-    meta = ms_meta(*ms) if ms is not None else None
     fixed = pin if pin else (meta if meta is not None and meta[1] else None)
     again = (lambda: repair_download(url, dst, total, label, conns)) if total >= DL_MIN_PARALLEL and conns > 1 else None
     if dst.exists() and total and dst.stat().st_size == total:    # finished by an older setup (no mark yet), or
@@ -3059,13 +3299,27 @@ def req_name(line: str) -> str:
 
 
 def requirement_lines(path: Path | None = None) -> list[str]:
-    """A requirements file's requirements, comments and blank lines left out."""
+    """A requirements file's requirements, comments and blank lines left out, and those whose environment marker
+    this Python does not meet (Windows' alone, on Linux): pip would ignore them, and an install that has the rest
+    needs no pip run for them."""
     lines = []
     for raw in (path or REQUIREMENTS).read_text(encoding="utf-8").splitlines():
         line = raw.split("#", 1)[0].strip()
-        if line:
+        if line and _marker_met(line):
             lines.append(line)
     return lines
+
+
+def _marker_met(line: str) -> bool:
+    """A requirement line's environment marker ("; sys_platform == 'win32'") is met here; True without one, or
+    without pip's own copy of `packaging` to read it (pip then decides)."""
+    if ";" not in line:
+        return True
+    try:
+        from pip._vendor.packaging.markers import Marker
+    except ImportError:
+        return True
+    return Marker(line.split(";", 1)[1]).evaluate()
 
 
 def _installed(name: str) -> bool:
@@ -3077,6 +3331,21 @@ def _installed(name: str) -> bool:
         return False
 
 
+def pip_stamp_is_ours(stamp: Path) -> bool:
+    """The list of installed packages was written for this system (upstream fb3bae20c, #3634): a .venv on a disk that
+    Windows and Linux both start from keeps the other one's list, which then says "already installed" about packages
+    this Python does not have.  A marker beside the list names the system that wrote it; an older list without one is
+    believed only while the packages every run needs can be imported."""
+    marker = stamp.with_name(stamp.name + ".os")
+    try:
+        if marker.exists():
+            return marker.read_text(encoding="utf-8").strip() == sys.platform
+    except OSError:
+        return False
+    import importlib.util
+    return all(importlib.util.find_spec(m) is not None for m in ("numpy", "jinja2", "regex", "yaml"))
+
+
 def pip_install(packages, what):
     """pip install into .venv, skipped when the same list was installed before.  An install from before the pinned
     requirements recorded bare names: those packages are kept as they are (nothing is reinstalled), and the pinned
@@ -3084,7 +3353,7 @@ def pip_install(packages, what):
     # a Python whose prefix this user cannot write (the system's, run without setup.sh's .venv): pip installs into the
     # user's site, and the list is kept there
     stamp = (Path(sys.prefix) if os.access(sys.prefix, os.W_OK) else Path(site.getuserbase())) / ".strata-pip.json"
-    have = json.loads(stamp.read_text()) if stamp.exists() else []
+    have = json.loads(stamp.read_text()) if stamp.exists() and pip_stamp_is_ours(stamp) else []
     bare = {p.lower() for p in have if req_name(p) == p.lower()}
     need = [p for p in packages if p not in have and req_name(p) not in bare
             and not (bare and "==" in p and _installed(req_name(p)))]
@@ -3096,6 +3365,7 @@ def pip_install(packages, what):
     try:
         stamp.parent.mkdir(parents=True, exist_ok=True)
         stamp.write_text(json.dumps(sorted(set(have) | set(need)), indent=0))
+        stamp.with_name(stamp.name + ".os").write_text(sys.platform, encoding="utf-8")
     except OSError as e:                                 # only costs asking pip again next time
         warn(f"could not record the installed packages in {stamp} ({e}): the next run checks them again")
     ok(f"{what} installed")
@@ -3513,7 +3783,7 @@ def cmake_build(src, bdir, target, defs, env=None):
     """Configure `src` in `bdir` and build `target` (a name, or a list of names).  The build helpers already there
     are used (the distribution's, offline too); a missing one is installed from requirements-build.txt."""
     build_packages = requirement_lines(BUILD_REQUIREMENTS) if BUILD_REQUIREMENTS.exists() else BUILD_PACKAGES
-    missing = [package for package in build_packages if find_tool(req_name(package)) is None]
+    missing = [package for package in build_packages if not tool_usable(req_name(package))]
     if missing:
         pip_install(missing, "CMake and Ninja build tools")
     cmake, ninja = find_tool("cmake"), find_tool("ninja")
@@ -3745,12 +4015,200 @@ def text_ram_gb(args: list, ram: float, model: str | None = None) -> float:
     return gb
 
 
-def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | None = None) -> dict | None:
-    """--images (qimage.IMAGE_MODELS): the image model's four files for the image engine in `eng` -> the run
-    config's "images" section (serve/images.py); None for --images no, or when not wanted after all.  `text_gb`:
-    the RAM the text model keeps (text_ram_gb): the denoiser's and the text encoder's quants are the largest whose
-    files fit the rest (the user's decision of 2026-10-15), the encoder lowered first (2026-10-19), or the ones asked
-    for with --image-ssd-offload on (what does not fit read from the SSD)."""
+def shared_text_quant(QI, dit: str, enc: str, chat_gguf: Path | None) -> str | None:
+    """The size of an image model's text encoder that is the chat model's own file (`chat_gguf`, its GGUF; MOSS-Image's
+    Qwen3.5-9B beside a Qwen3.5-9B chat model of the same maker and size), else None: that file is shared (linked, not
+    fetched again; serve's text_states has the chat engine encode the prompts) and its RAM already counted."""
+    if chat_gguf is None or not enc:
+        return None
+    return next((q for q in QI.text_quants(dit) if QI.FILES[QI.text_file(enc, q)][1] == Path(chat_gguf).name), None)
+
+
+def image_plan(a, choice: str, text_gb: float | None, size: str | None = None,
+               chat_gguf: Path | None = None) -> dict:
+    """One --images choice (qimage.IMAGE_MODELS) and the size asked after its name (`size`; else --image-quant's):
+    its sizes and files -> {choice, quant, tquant, lowered, names}.
+    `text_gb`: the RAM the text model keeps (text_ram_gb): the denoiser's and the text encoder's quants are the largest
+    whose files fit the rest (the user's decision of 2026-10-15), the encoder lowered first (2026-10-19), or the ones
+    asked for with --image-ssd-offload on (what does not fit read from the SSD).  One image model runs at a time, so
+    each is fitted to that RAM on its own.  HunyuanImage 3.0 has no text encoder: its two quantizations are lowered
+    (int8 to w4a8), and its system prompt is read out of the model's own `system_prompt.py` once the files are there
+    (setup_images).  A text encoder the chat model's own file (shared_text_quant, `chat_gguf`) keeps that size: its
+    RAM is the chat model's."""
+    QI = _qimage()
+    _, dit, enc = QI.IMAGE_MODELS[choice]
+    label, steps, _ = QI.DITS[dit]
+    q8 = {"on": True, "off": False}.get(getattr(a, "image_dit_q8", None) or "auto")   # None: by the VRAM
+    asked = size or a.image_quant or QI.default_quant(dit)
+    hunyuan = QI.is_hunyuanimage3(dit)
+    if hunyuan and asked not in QI.HUNYUANIMAGE3_QUANTS:   # Qwen-Image's --image-quant, given for this model too
+        warn(f"--image-quant {asked}: {label} comes as w4a8 or int8 (Tencent's quantizations); w4a8 taken (int8 is "
+             "the nearer the model's bf16 weights, and about twice as slow a step)")
+        asked = QI.default_quant(dit)
+    if QI.engine_quantized(dit):   # Mage-Flow's and MOSS-Image's DiT: one size (bf16: FP16 or 8 bits, --image-dit-q8)
+        q8 = QI.mage_q8(size) if size else q8      # :int8 / :bf16 after its name, for this model alone
+        if a.image_quant and not size:
+            warn(f"--image-quant {a.image_quant}: {label} comes in one size, which the engine quantizes itself "
+                 "(--image-dit-q8 auto|on|off)")
+        asked = QI.dit_quants(dit)[-1]
+    dit_keep = getattr(a, "image_dit_keep", None) != "off"
+    tasked = "" if hunyuan else QI.DEFAULT_TEXT_QUANT       # HunyuanImage 3.0 has no text encoder
+    shared = shared_text_quant(QI, dit, enc, chat_gguf)
+    if shared:
+        tasked = shared
+    ssd = getattr(a, "image_ssd_offload", None) == "on"
+    quant, tquant = asked, tasked
+    lowered = None
+    # the text encoder in the messages, where the model has one
+    was, now = (f" (text encoder {tasked})", f" (text encoder {tquant})") if tasked else ("", "")
+    if not ssd and text_gb is not None:
+        left = ram_gb() - text_gb
+        if shared:   # the chat model's file: counted in text_gb already, so not twice
+            left += QI.FILES[QI.text_file(enc, shared)][2] / 1e9
+        quant, tquant, fits = QI.fit_ram(left, enc, asked, tasked, dit, dit_keep, q8)
+        if (quant, tquant) != (asked, tasked):
+            # kept in the config: the server says it at start and on the web page (the user's decision, 2026-10-15)
+            need = QI.ram_need_gb(asked, enc, tasked, dit, dit_keep, q8)
+            lowered = {"from": asked, "to": quant, "need_gb": round(need, 1), "ram_left_gb": round(max(left, 0.0), 1)}
+            if tasked:
+                lowered.update({"text_from": tasked, "text_to": tquant})
+            now = f" (text encoder {tquant})" if tasked else ""
+            warn(f"{label} lowered from {asked}{was} to {quant}{now}: {asked}{was} needs ~{need:.0f} GB of RAM "
+                 f"beside the text model, which leaves ~{max(left, 0):.0f} GB. --image-ssd-offload on "
+                 f"{'keeps both' if tasked else 'keeps it'} and reads what does not fit from the SSD (slower)")
+        if not fits:
+            least = QI.ram_need_gb(quant, enc, tquant, dit, dit_keep, q8)
+            what = f" with a {tquant} text encoder" if tasked else ""
+            warn(f"even {label} {quant}{what} (~{least:.0f} GB) does not fit the ~{max(left, 0):.0f} GB of RAM the "
+                 "text model leaves: images read part of the model from the SSD (slower), and the PC may run short "
+                 "of RAM while one is made")
+    elif ssd:
+        ok(f"{label} {quant}{now} with SSD offload: what does not fit in RAM is read from the SSD")
+    say(f"  Image generation: {label} {quant} on XeStrata's image engine ({steps} steps; "
+        "POST /v1/images/generations)")
+    if enc:
+        tfile = QI.FILES[QI.text_file(enc, tquant)]
+        base = "Qwen3.5-9B" if QI.is_moss(dit) else f"Qwen3-VL-{'4B' if QI.is_mage(dit) else '8B'}"
+        say(f"  Text encoder: {Path(tfile[1]).name} ({tfile[0]}"
+            + (f", {base} with its refusal direction removed)" if enc.endswith("uncensored") else ")")
+            + (", the chat model's own file" if shared == tquant else ""))
+    else:
+        say(f"  Prompt: the model's own tokenizer ({QI.FILES['hunyuanimage3-tokenizer'][1]}) and its system prompt")
+    say("  " + QI.license_note(dit))
+    return {"choice": choice, "quant": quant, "tquant": tquant, "lowered": lowered, "q8": q8,
+            "names": QI.file_names(quant, enc, tquant, dit)}
+
+
+def ask_images(cfg_path: Path) -> str | None:
+    """Image generation asked on the console: the image models (numbers, comma-separated), the default of several, and
+    their -uncensored text encoder -> an --images value; None to leave the config's as it is (none before, none now).
+    The answers the model's config `cfg_path` was written with are the defaults."""
+    QI = _qimage()
+    plain = [c for c in QI.IMAGE_MODELS if not c.endswith("-uncensored")]
+    by_name = {v[0]: k for k, v in QI.IMAGE_MODELS.items()}
+    now: list[str] = []
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        cfg = {}
+    if isinstance(cfg, dict) and isinstance(cfg.get("images"), dict):
+        now = [by_name[s["model_name"]] for s in [cfg["images"], *(cfg.get("image_models") or [])]
+               if isinstance(s, dict) and s.get("model_name") in by_name]
+    had = [c.removesuffix("-uncensored") for c in now]
+    say()
+    say("  Image generation: models that make images besides the text model (POST /v1/images/generations and the")
+    say("  web page's Images tab). One runs on the GPU at a time; with several, the web page and the API's \"model\"")
+    say("  choose, and a request that names none gets the default.")
+    for i, c in enumerate(plain, 1):
+        _, dit, enc = QI.IMAGE_MODELS[c]
+        names = QI.file_names(QI.default_quant(dit), enc, QI.DEFAULT_TEXT_QUANT, dit)
+        need = QI.ram_need_gb(QI.default_quant(dit), enc, QI.DEFAULT_TEXT_QUANT, dit)
+        say(f"    {i}. {c}: {QI.ABOUT.get(c, '')} (download {sum(QI.FILES[n][2] for n in names) / 1e9:.0f} GB, "
+            f"~{need:.0f} GB of RAM)")
+    default = ",".join(str(plain.index(c) + 1) for c in had if c in plain) or "none"
+    while True:
+        got = ask("Which image models? (numbers, comma-separated; none: no image generation)", [], default, False,
+                  free=True)
+        if got.lower() in ("none", "no", "n", ""):
+            return "no" if now else None
+        try:
+            picks = [plain[int(x) - 1] for x in got.replace(" ", "").split(",")]
+            if len(set(picks)) == len(picks) and all(int(x) >= 1 for x in got.replace(" ", "").split(",")):
+                break
+        except (ValueError, IndexError):
+            pass
+        say(f"  please answer numbers from 1 to {len(plain)}, comma-separated, or none")
+    if len(picks) > 1:
+        first = had[0] if had and had[0] in picks else picks[0]
+        say("  " + ", ".join(f"{i}. {c}" for i, c in enumerate(picks, 1)))
+        d = int(ask("Which is the default?", [str(i) for i in range(1, len(picks) + 1)], str(picks.index(first) + 1),
+                    False))
+        picks = [picks[d - 1], *(c for i, c in enumerate(picks, 1) if i != d)]
+    if any(c + "-uncensored" in QI.IMAGE_MODELS for c in picks):
+        unc = ask("Their text encoder with its refusal direction removed (-uncensored)?", ["y", "n"],
+                  "y" if any(c.endswith("-uncensored") for c in now) else "n", False) == "y"
+        picks = [c + "-uncensored" if unc and c + "-uncensored" in QI.IMAGE_MODELS else c for c in picks]
+    return ",".join(picks)
+
+
+def write_ratio_head(QI, models_dir: Path) -> None:
+    """HunyuanImage 3.0's ratio head (its own size choice: the final norm and the 37 ratio tokens' output rows) out of
+    the bf16 shards by range requests, 300 KB, checked against its pinned SHA-256."""
+    import hashlib
+    dst = QI.ratio_head_path(models_dir)
+    if dst.exists() and hashlib.sha256(dst.read_bytes()).hexdigest() == QI.HUNYUANIMAGE3_RATIO_HEAD_SHA:
+        ok(f"{dst.name} already there")
+        return
+
+    def read(url: str, start: int, end: int) -> bytes:
+        for attempt in range(5):
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "strata-setup",
+                                                           "Range": f"bytes={start}-{end}"})
+                data = urllib.request.urlopen(req, timeout=120).read()
+                if len(data) == end - start + 1:
+                    return data
+            except (urllib.error.URLError, OSError):
+                pass
+            time.sleep(2 ** attempt)
+        fail(f"cannot read {url} (bytes {start}-{end})", "check the connection to Hugging Face and run setup again")
+
+    data = QI.ratio_head_bytes(read, hf_endpoint())
+    if hashlib.sha256(data).hexdigest() != QI.HUNYUANIMAGE3_RATIO_HEAD_SHA:
+        fail(f"{dst.name}: not the bytes XeStrata pins", "the model's files on Hugging Face changed; update XeStrata")
+    part = dst.with_name(dst.name + ".part")
+    part.write_bytes(data)
+    os.replace(part, dst)
+    ok(f"{dst.name}: the model's size choice ({len(data) >> 10} KiB out of the bf16 shards)")
+
+
+def link_identical(dst: Path, sha: str, candidates: list, models_dir: Path) -> None:
+    """`dst` linked to a copy already on the disk with the pinned SHA-256 in its finish mark (`candidates`, then the
+    models folder's files of the same name one folder down: the chat model's GGUF that an image model's text encoder
+    is), not fetched again; nothing when `dst` is there, or no such copy, or the link fails (another drive)."""
+    if dst.exists():
+        return
+    for p in [*candidates, *Path(models_dir).glob("*/" + dst.name)]:
+        if p == dst or not p.exists() or not done(p) or f"sha256 {sha}" not in \
+                p.with_name(p.name + ".done").read_text(encoding="utf-8", errors="replace"):
+            continue
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            os.link(p, dst)
+            mark(dst, f"sha256 {sha}")
+            ok(f"{dst.name} shared with {p.parent.name} (identical file)")
+            return
+        except OSError:
+            continue
+
+
+def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | None = None,
+                 chat_gguf: Path | None = None) -> tuple[dict, list[dict]] | None:
+    """--images (one choice of qimage.IMAGE_MODELS, or several, comma-separated): their files for the image engine in
+    `eng` -> the run config's "images" section (serve/images.py; the first choice, the default) and its
+    "image_models" (the others, which a request names by "model"); None for --images no, or when not wanted after
+    all.  The models' sizes as image_plan fits them to the RAM; `chat_gguf`, the chat model's GGUF, which a text
+    encoder of the same file shares (shared_text_quant)."""
     if not a.images or a.images == "no":
         return None
     remove_old_image_engine()
@@ -3758,66 +4216,39 @@ def setup_images(a, gpu: dict, models_dir: Path, eng: Path, text_gb: float | Non
     exe = eng / IMAGE_EXE
     if not exe.exists():
         fail(f"the image engine is missing ({exe})", "run setup again to compile the engine (it builds both)")
-    _, dit, enc = QI.IMAGE_MODELS[a.images]
-    label, steps, _ = QI.DITS[dit]
-    asked = a.image_quant or QI.DEFAULT_QUANT
-    if QI.is_mage(dit):   # Mage-Flow's DiT comes in one size (bf16: the engine's FP16 or 8 bits of it, --image-dit-q8)
-        if a.image_quant:
-            warn(f"--image-quant {a.image_quant}: {label} comes in one size, which the engine quantizes itself "
-                 "(--image-dit-q8 auto|on|off)")
-        asked = QI.dit_quants(dit)[-1]
-    dit_q8 = {"on": True, "off": False}.get(getattr(a, "image_dit_q8", None) or "auto")   # None: by the VRAM
-    dit_keep = getattr(a, "image_dit_keep", None) != "off"
-    tasked = QI.DEFAULT_TEXT_QUANT
-    ssd = getattr(a, "image_ssd_offload", None) == "on"
-    quant, tquant = asked, tasked
-    lowered = None
-    if not ssd and text_gb is not None:
-        left = ram_gb() - text_gb
-        quant, tquant, fits = QI.fit_ram(left, enc, asked, tasked, dit, dit_keep)
-        if (quant, tquant) != (asked, tasked):
-            # kept in the config: the server says it at start and on the web page (the user's decision, 2026-10-15)
-            need = QI.ram_need_gb(asked, enc, tasked, dit, dit_keep)
-            lowered = {"from": asked, "to": quant, "text_from": tasked, "text_to": tquant,
-                       "need_gb": round(need, 1), "ram_left_gb": round(max(left, 0.0), 1)}
-            warn(f"image model lowered from {asked} (text encoder {tasked}) to {quant} (text encoder {tquant}): "
-                 f"{asked} with a {tasked} text encoder needs ~{need:.0f} GB of RAM beside the text model, which "
-                 f"leaves ~{max(left, 0):.0f} GB. --image-ssd-offload on keeps both and reads what does not fit "
-                 "from the SSD (slower)")
-        if not fits:
-            least = QI.ram_need_gb(quant, enc, tquant, dit, dit_keep)
-            warn(f"even {quant} with a {tquant} text encoder (~{least:.0f} GB) "
-                 f"does not fit the ~{max(left, 0):.0f} GB of RAM the text model leaves: images read part of the model "
-                 "from the SSD (slower), and the PC may run short of RAM while one is made")
-    elif ssd:
-        ok(f"image model {quant} (text encoder {tquant}) with SSD offload: what does not fit in RAM is read from "
-           "the SSD")
-    say(f"  Image generation: {label} {quant} on XeStrata's image engine ({steps} steps; "
-        "POST /v1/images/generations)")
-    tfile = QI.FILES[QI.text_file(enc, tquant)]
-    say(f"  Text encoder: {Path(tfile[1]).name} ({tfile[0]}"
-        + (f", Qwen3-VL-{'4B' if QI.is_mage(dit) else '8B'} with its refusal direction removed)"
-           if enc.endswith("uncensored") else ")"))
-    say("  " + QI.license_note(dit))
-    names = QI.file_names(quant, enc, tquant, dit)
+    plans = [image_plan(a, choice, text_gb, size, chat_gguf) for choice, size in QI.parse_choices(a.images)]
+    names = list(dict.fromkeys(n for p in plans for n in p["names"]))   # the files the models share, once
     need = sum(QI.FILES[k][2] for k in names) / 1e9
-    if ask(f"Download the image model ({need:.1f} GB) and set up image generation?", ["y", "n"], "y", a.yes) != "y":
+    what = "the image model" if len(plans) == 1 else f"the {len(plans)} image models"
+    if ask(f"Download {what} ({need:.1f} GB) and set up image generation?", ["y", "n"], "y", a.yes) != "y":
         return None
     models_dir.mkdir(parents=True, exist_ok=True)
     if free_gb(models_dir) < need + 5:
-        warn(f"less than {need + 5:.0f} GB free for the image model: the download may run out of disk space")
+        warn(f"less than {need + 5:.0f} GB free for {what}: the download may run out of disk space")
     for name in names:
         repo, path, size, sha = QI.FILES[name]
         dst = QI.local_path(models_dir, name)
+        link_identical(dst, sha, [Path(chat_gguf)] if chat_gguf else [], models_dir)
         download(QI.file_url(name, hf_endpoint()), dst, f"image model: {Path(path).name}")
         verify_sha256(dst, size, sha)
-    cfg = QI.image_config(quant, exe, models_dir, model=a.images, uma=bool((gpu or {}).get("integrated")),
-                          policy=a.image_gpu_policy or "auto", ssd_offload=ssd, text_quant=tquant, dit_q8=dit_q8,
-                          dit_keep=dit_keep)
-    if lowered:
-        cfg["quant_lowered"] = lowered
-    ok(f"image generation: {quant}, text encoder {tquant}, GPU policy {cfg['gpu_policy']}")
-    return cfg
+    if "hunyuanimage3-system-prompt" in names:   # the system prompt, out of the model's own file (parsed, never run)
+        prompt = QI.write_system_prompt(models_dir)
+        ok(f"system prompt: {prompt.name} ({len(prompt.read_text(encoding='utf-8'))} characters) out of "
+           f"{QI.local_path(models_dir, 'hunyuanimage3-system-prompt').name}")
+        write_ratio_head(QI, models_dir)
+    cfgs = []
+    for p in plans:
+        cfg = QI.image_config(p["quant"], exe, models_dir, model=p["choice"],
+                              uma=bool((gpu or {}).get("integrated")), policy=a.image_gpu_policy or "auto",
+                              ssd_offload=getattr(a, "image_ssd_offload", None) == "on", text_quant=p["tquant"],
+                              dit_q8=p["q8"], dit_keep=getattr(a, "image_dit_keep", None) != "off")
+        if p["lowered"]:
+            cfg["quant_lowered"] = p["lowered"]
+        cfgs.append(cfg)
+        ok(f"image generation: {cfg['model_name']} {p['quant']}"
+           + (f", text encoder {p['tquant']}" if p['tquant'] else "")
+           + f", GPU policy {cfg['gpu_policy']}" + ("" if p is plans[0] else " (a request names it by \"model\")"))
+    return cfgs[0], cfgs[1:]
 
 
 # ------------------------------------------------------------------------------------------------ the data folder
@@ -3899,23 +4330,15 @@ def gpu_drives_display(g) -> bool:
     return (text or "").strip().lower() == "enabled"
 
 
-def small_card_note(ctx: int, draft_vocab: str | None) -> list[str]:
-    """#496 (upstream e1ee248, 4731a9b): what frees VRAM on a card under 8 GB when the start stops with "no VRAM is
-    left for the expert cache" (the engine already lowers its own reserve on such a card) - a recommendation, setup
-    changes none of it.  (The draft layer stays: the server needs it.)"""
-    tips = []
-    if ctx > 8192:
-        tips.append("an 8K context (a smaller KV cache)")
-    if draft_vocab != "en":
-        tips.append("--draft-vocab en (a smaller draft head)")
-    lines = ["If the start stops with \"no VRAM is left for the expert cache\" (the engine's log says how much is "
-             "short):"]
-    if tips:
-        lines.append(f"  run {SETUP_CMD} again with " + " and ".join(tips) +
-                     ", or close other programs that use the GPU.")
-    else:
-        lines.append("  close other programs that use the GPU.")
-    return lines
+def small_card_note() -> list[str]:
+    """#41: on a card under 8 GB, Qwen3.8-Flash-Next's draft head, KV cache and buffers leave its experts little or no
+    VRAM, and the start can stop with "no VRAM is left for the expert cache": the models that run on such a card
+    instead (#496's 8K context and smaller draft head only moved where it stopped) - a recommendation, setup changes
+    nothing."""
+    titles = [PLAIN_FAMILIES[f]["title"] for f in ("qwen36", "ornith", "llmjp")]
+    return ["This GPU has under 8 GB of VRAM: Qwen3.8-Flash-Next leaves its experts little or "
+            "no room there, and its start may stop with \"no VRAM is left for the expert cache\".",
+            "  These models run on such a GPU: " + ", ".join(titles) + f" (run {SETUP_CMD} again and choose one)."]
 
 
 IMAGES_GPU_ENCODER_MIN_VRAM_GB = 23.5   # upstream 45752724 (#2406): below this the images answer "yes" gets the CPU
@@ -4603,12 +5026,24 @@ def hybrid_pool_workers(cores) -> int | None:
     return max(1, p - 1 + e // 2)
 
 
+# The most CPU expert workers the engine takes by default (default_worker_cap in src/kernels/cpu/pool.cpp), and the
+# most threads setup gives the CPU image encoder: a 256-thread server does not need 128 of them (upstream 5ece068f7).
+POOL_WORKERS_CAP = 32
+VISION_THREADS_CAP = 16
+
+
+def vision_threads(logical: int | None = None) -> int:
+    """The CPU image encoder's threads: one per physical core (half the logical threads), at most VISION_THREADS_CAP."""
+    return max(1, min((logical if logical is not None else (os.cpu_count() or 8)) // 2, VISION_THREADS_CAP))
+
+
 def recommend_pool_workers(args: list) -> list:
     """`args` with setup's recommended `--pool-workers` for a hybrid CPU, unless they set one already (a calibration's
     measured count, or the user's own).  A recommendation: the config line can be edited or removed."""
     n = hybrid_pool_workers(cpu_cores())
     if n is None or "--pool-workers" in args:
         return args
+    n = min(n, POOL_WORKERS_CAP)   # setup never writes more workers than the engine's own default takes
     p, e = cpu_cores()
     ok(f"hybrid CPU ({p} performance + {e} efficiency cores): {n} CPU expert workers - the performance cores and half "
        f"of the efficiency cores (--pool-workers in the config; {SETUP_CMD} --calibrate measures it on this PC)")
@@ -4909,7 +5344,7 @@ def update_install(have: list) -> int:
         return 0
     if not PACKAGED:
         pip_install(requirement_lines() if REQUIREMENTS.exists() else PY_PACKAGES,
-                    "numpy, jinja2, regex, pyyaml, tqdm, requests, pillow, psutil")
+                    "numpy, jinja2, regex, pyyaml, tqdm, requests, pillow, psutil, jsonschema")
     update_installed_engine()
     mtp_done: set = set()
     for cfg_path in have:
@@ -5048,6 +5483,26 @@ def tiny_png(w=64, h=48) -> bytes:
             + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
 
 
+WARM_UP_SAY_S = 30         # how often the warm-up says where the engine is
+# The engine's log unchanged this long ends the warm-up: the whole of it takes 1-3 minutes, so five without a line is
+# a start that stopped (#34: 15 minutes waited out, the engine idle), not a slow compile
+WARM_UP_STALL_S = 300
+
+
+def log_last_line(path: str, since: int) -> tuple[int, str]:
+    """The size of the log at `path` and its last non-empty line after byte `since` ((-1, "") when it cannot be
+    read)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(since, size - 4096))
+            lines = [x.strip() for x in f.read().decode("utf-8", "replace").splitlines() if x.strip()]
+    except OSError:
+        return -1, ""
+    return size, lines[-1] if lines else ""
+
+
 def warm_up(cfg_path: Path) -> None:
     """Start the model once and answer a long prompt (and a picture): the GPU code is SPIR-V that the driver compiles
     on first use and keeps in its cache (~/.cache/neo_compiler_cache), so the first real request does not wait for it
@@ -5073,24 +5528,66 @@ def warm_up(cfg_path: Path) -> None:
     except OSError:
         since = 0
     share = None
-    say("  Compiling the GPU code for this model: starting it once and asking two questions (1-3 minutes) ...")
+    say("  Compiling the GPU code for this model: starting it once and asking two questions (1-3 minutes; Ctrl+C "
+        "skips it) ...")
+    say(f"  its logs: {log}" + (f" and {elog}" if elog else ""))
     t0 = time.time()
+    watched = (elog, since) if elog else (str(log), 0)  # the engine's own lines say where it is
+
+    def wait(what: str, done: Callable[[], bool], limit_s: float) -> None:
+        """Until done(): a line every WARM_UP_SAY_S with the engine's last log line; an error when the server ends,
+        when the engine's log stays the same for WARM_UP_STALL_S, or after limit_s."""
+        size, changed, said, end = -1, time.time(), time.time(), time.time() + limit_s
+        while not done():
+            if proc.poll() is not None:
+                raise RuntimeError(f"the model stopped while {what} (see {log.name})")
+            now = time.time()
+            n, line = log_last_line(*watched)
+            if n != size:
+                size, changed = n, now
+            elif now - changed > WARM_UP_STALL_S:
+                raise RuntimeError(f"nothing new in the engine's log for {WARM_UP_STALL_S // 60} minutes while {what}"
+                                   f" (its last line: {line or 'none'}; see {log.name})")
+            if now > end:
+                raise RuntimeError(f"the model was still {what} after {limit_s / 60:.0f} minutes (see {log.name})")
+            if now - said >= WARM_UP_SAY_S:
+                said = now
+                say(f"    {now - t0:.0f} s, {what}: {line[:90] or '...'}")
+            time.sleep(2)
+
+    def started() -> bool:
+        try:
+            urllib.request.urlopen(urllib.request.Request(base + "/v1/models", headers=auth), timeout=5).read()
+            return True
+        except (urllib.error.URLError, OSError):
+            return False
+
+    def ask(body: dict, what: str) -> dict:
+        """The server's answer to one chat request, waited for as wait() does."""
+        req = urllib.request.Request(base + "/v1/chat/completions",
+                                     headers={"Content-Type": "application/json", **auth},
+                                     data=json.dumps(body).encode())
+        box: dict[str, Any] = {}
+
+        def go() -> None:
+            try:
+                box["answer"] = json.loads(urllib.request.urlopen(req, timeout=900).read())
+            except Exception as e:                     # handed to the waiting thread
+                box["error"] = e
+        th = threading.Thread(target=go, daemon=True)
+        th.start()
+        wait(what, lambda: not th.is_alive(), 900)
+        err = box.get("error")
+        if err is not None:
+            raise err if isinstance(err, (RuntimeError, OSError, ValueError)) else RuntimeError(str(err))
+        return box["answer"]
+
     with open(log, "w", encoding="utf-8") as out:
         proc = subprocess.Popen([sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config",
                                  str(cfg_path), "--port", str(port)], stdout=out, stderr=subprocess.STDOUT,
                                 stdin=subprocess.DEVNULL, **new_process_group())
         try:
-            deadline = time.time() + 900
-            while True:
-                if proc.poll() is not None:
-                    raise RuntimeError(f"the model stopped while starting (see {log.name})")
-                try:
-                    urllib.request.urlopen(urllib.request.Request(base + "/v1/models", headers=auth), timeout=5).read()
-                    break
-                except (urllib.error.URLError, OSError):
-                    if time.time() > deadline:
-                        raise RuntimeError(f"the model did not start within 15 minutes (see {log.name})")
-                    time.sleep(2)
+            wait("starting", started, 900)
             notes = " ".join(f"Note {i}: the {c} sensor read {i * 7 % 100} at step {i}."
                              for i, c in zip(range(60), ["red", "blue", "green", "amber"] * 15))
             asks: list[list[dict[str, Any]]] = [
@@ -5099,26 +5596,20 @@ def warm_up(cfg_path: Path) -> None:
                 url = "data:image/png;base64," + base64.b64encode(tiny_png()).decode()
                 asks.append([{"role": "user", "content": [{"type": "text", "text": "What colours are in this picture?"},
                                                           {"type": "image_url", "image_url": {"url": url}}]}])
-            for messages in asks:
-                req = urllib.request.Request(base + "/v1/chat/completions",
-                                             headers={"Content-Type": "application/json", **auth},
-                                             data=json.dumps({"messages": messages, "max_tokens": 32,
-                                                              "temperature": 0}).encode())
-                json.loads(urllib.request.urlopen(req, timeout=900).read())
+            for i, messages in enumerate(asks):
+                ask({"messages": messages, "max_tokens": 32, "temperature": 0}, f"answering question {i + 1}")
             ok(f"GPU code compiled for this model ({time.time() - t0:.0f} s)")
             # a text prompt of the same length again, the code compiled (other numbers: no cached prefix): the CPU's
             # share of its experts measured now is the one kept
             notes2 = " ".join(f"Note {i}: the {c} sensor read {i * 11 % 100} at step {i}."
                               for i, c in zip(range(60), ["red", "blue", "green", "amber"] * 15))
             again = [{"role": "user", "content": "Summarize these notes in two sentences.\n" + notes2}]
-            req = urllib.request.Request(base + "/v1/chat/completions",
-                                         headers={"Content-Type": "application/json", **auth},
-                                         data=json.dumps({"messages": again, "max_tokens": 1,
-                                                          "temperature": 0}).encode())
-            json.loads(urllib.request.urlopen(req, timeout=900).read())
+            ask({"messages": again, "max_tokens": 1, "temperature": 0}, "measuring the prompt's CPU share")
             share = measured_cpu_share(elog, since)
         except (RuntimeError, OSError, ValueError) as e:
             warn(f"the warm-up did not finish ({e}): the first request will take longer")
+        except KeyboardInterrupt:                       # the config is written: the next start compiles instead
+            warn("the warm-up was skipped (Ctrl+C): the first request will take longer")
         finally:
             end_process_group(proc)
     if share is not None:
@@ -5406,10 +5897,13 @@ def derived_factor(ctx: int, trained: int = 262144) -> float:
 def resolve_rope(ctx: int, scaling, scale, trained: int = 262144):
     """The rope configuration for the context actually served: (scaling, scale); scaling None = no flags.
 
-    An explicit --rope-scaling / --rope-scale wins, a given factor verbatim.  Past the trained range an omitted method
-    is yarn and an omitted factor final / trained; inside it nothing turns on by itself and a chosen method without a
-    factor gets 1 (the trained angles).  An explicit none past the trained range is refused, not overridden.
+    An explicit --rope-scaling / --rope-scale wins, a valid given factor (finite, at least 1) verbatim.  Past the
+    trained range an omitted method is yarn and an omitted factor final / trained; inside it nothing turns on by
+    itself and a chosen method without a factor gets 1 (the trained angles).  An explicit none past the trained range
+    is refused, not overridden.
     """
+    if scale is not None and (not math.isfinite(scale) or scale < 1.0):     # upstream a332cc95d, #3393
+        raise ValueError("--rope-scale must be a finite value >= 1, e.g. --rope-scale 4")
     if ctx <= trained:
         if scale is not None and scaling in (None, "none"):
             raise ValueError("--rope-scale needs --rope-scaling linear or yarn (the chosen context fits the "
@@ -5435,7 +5929,7 @@ def prepare_engine(a, gpu: dict, vision: str) -> tuple[Path, Path, str, list]:
         ok("the distribution's Python packages (installed with XeStrata's package)")
     else:
         pip_install(requirement_lines() if REQUIREMENTS.exists() else PY_PACKAGES,
-                    "numpy, jinja2, regex, pyyaml, tqdm, requests, pillow, psutil")
+                    "numpy, jinja2, regex, pyyaml, tqdm, requests, pillow, psutil, jsonschema")
 
     # ---- 4. the engine
     step(4, "the Strata engine")
@@ -5466,12 +5960,29 @@ def prepare_engine(a, gpu: dict, vision: str) -> tuple[Path, Path, str, list]:
     return llama, eng, enc, lib_dirs
 
 
+# A dense model's VRAM beside its weights and K/V cache: the prompt's buffers (Qwen3.5-9B's for 4096-token chunks are
+# about 1.9 GB, counted from prompt_carve, not measured; the engine halves the chunk until they fit, down to 16 tokens),
+# the products' libraries and the driver's reserve.  The least that lets the engine start.
+DENSE_MARGIN_GB = 1.0
+# ... and its RAM: the model file's pages pass through the OS cache once while the weights go to the GPU, and the
+# token embedding stays mapped (rows read on the host); an estimate, not measured
+DENSE_RAM_GB = 8
+
+
+def dense_vram_gb(fam: dict, d: dict, ctx: int) -> float:
+    """The VRAM (GB) a dense model of PLAIN_FAMILIES needs at a context of `ctx`: its weights, its K/V and the margin"""
+    return d["size"] / 1e9 + fam["kv_bytes"] * ctx / 1e9 + DENSE_MARGIN_GB
+
+
 def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, found: list, gpu_chosen: bool,
                 ram: float, roots: list, elsewhere: list, port: int, adopted: Path | None) -> int:
     """Steps 2-7 for a model of PLAIN_FAMILIES: its size and context, the engine, the GGUF file (size and SHA-256 at
     the pinned revision), its tokenizer and chat template written out, and the config: `strata --native` with no pack,
-    PLE table or MTP layer.  Images, the layer split and the Qwen3.8-Flash-Next options (KV precision, low-RAM modes,
-    the speed projection) do not apply; --gpus with several cards splits the layers across them (docs/MULTIGPU.md)."""
+    PLE table or MTP layer.  Images where the family has a picture reader ("mmproj"), as for Qwen3.8-Flash-Next.  The
+    Qwen3.8-Flash-Next options (KV precision, low-RAM modes, the speed projection) do not apply; --low-ram on|mmap reads
+    the experts from the model file instead of RAM (--mmap-experts), the engine's own choice when the RAM is short;
+    --gpus with several cards splits the layers across them (docs/MULTIGPU.md).  A dense model's sizes are recommended
+    by the GPU's memory, which holds all of its weights."""
     models = fam["models"]
     names = list(models)
     if a.model and a.model not in names:
@@ -5479,26 +5990,52 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     # the experts the GPUs hold need no copy in RAM (every card of --gpus: the layer split)
     vram = sum(max(0.0, gpu_info(i).get("vram_gb", 0.0) - 5) for i in sel) if len(sel) > 1 \
         else max(0.0, gpu.get("vram_gb", 0.0) - 5)
+    dense = bool(fam.get("dense"))
+    gpu_gb = sum(gpu_expert_vram(gpu_info(i)) for i in sel) if len(sel) > 1 else gpu_expert_vram(gpu)
+    rec_ctx = min(vram_ctx(chosen), fam["max_context"])
     for i, m in enumerate(names, 1):
         d = models[m]
         gb = d["size"] / 1e9
-        fit = "" if ram + vram >= gb + 8 else f"   <- {gb:.0f} GB of weights, this PC has {ram:.0f} GB of RAM"
+        if dense:
+            need = dense_vram_gb(fam, d, rec_ctx)
+            fit = "" if gpu_gb >= need else \
+                f"   <- needs ~{need:.0f} GB of VRAM at {rec_ctx // 1024}K, the GPU has {gpu_gb:.0f} GB"
+        else:
+            fit = "" if ram + vram >= gb + 8 else f"   <- {gb:.0f} GB of weights, this PC has {ram:.0f} GB of RAM"
         say(f"  {i}) {m:15s} {d['about']}; download {gb:.0f} GB" + ("" if d.get("tested") else "   [untested]") + fit)
-    rec = next((str(i) for i, m in enumerate(names, 1) if models[m].get("tested")), "1")
+    if dense:   # the largest that fits the GPU, else the smallest
+        fits = [i for i, m in enumerate(names, 1) if gpu_gb >= dense_vram_gb(fam, models[m], rec_ctx)]
+        rec = str(max(fits, key=lambda i: models[names[i - 1]]["size"])) if fits else \
+            str(min(range(1, len(names) + 1), key=lambda i: models[names[i - 1]]["size"]))
+    else:
+        rec = next((str(i) for i, m in enumerate(names, 1) if models[m].get("tested")), "1")
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
     d = models[model]
     if not d.get("tested"):
         warn(f"{model} has not been run with this release (its tensor types are checked with the tested files)")
-    if ram + vram < d["size"] / 1e9 + 8:
+    if not dense and ram + vram < d["size"] / 1e9 + 8:
         warn(f"{model}'s {d['size'] / 1e9:.0f} GB of weights do not fit this PC's RAM and GPU with room to spare: "
              "the engine reads the experts neither holds from the model file through the OS file cache (slower)")
     ok(f"size: {model}")
     tag = fam["tag"] + model
-    if a.vision not in (None, "no", "none"):
-        warn(f"images are not available with {fam['title']} yet: off")
+    # images: the family's picture reader, asked as for Qwen3.8-Flash-Next (the GPU encoder from 24 GB of VRAM)
+    vision = "none"
+    if not fam.get("mmproj"):
+        if a.vision not in (None, "no", "none"):
+            warn(f"images are not available with {fam['title']} yet: off")
+    elif a.vision:
+        vision = "none" if a.vision in ("no", "none") else images_encoder(a.vision, gpu)
+    else:
+        say()
+        say("  Images: the model can also read pictures (screenshots, photos, scanned pages). This adds a 0.9 GB")
+        say("  download; the image encoder runs on the GPU from 24 GB of VRAM, else on the CPU (a few seconds a"
+            " picture).")
+        vision = images_encoder("yes", gpu) if ask("Do you want images?", ["y", "n"], "y", a.yes) == "y" else "none"
+    if fam.get("mmproj"):
+        ok("images: " + {"none": "off", "gpu": "on (encoder on the GPU, the CPU encoder as fallback)",
+                         "cpu": "on (encoder on the CPU)"}[vision])
     # the context: up to the model's, recommended by the smallest card's memory as for Qwen3.8-Flash-Next
     contexts = [c for c in CONTEXTS if c <= fam["max_context"]]
-    rec_ctx = vram_ctx(chosen)
     if a.context:
         ctx = a.context
         if ctx > fam["max_context"]:
@@ -5513,6 +6050,10 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         ctx = contexts[int(ask("Context?", [str(i) for i in range(1, len(contexts) + 1)],
                                str(contexts.index(rec_ctx) + 1), a.yes)) - 1]
     ok(f"context: {ctx} tokens")
+    if dense and gpu_gb < dense_vram_gb(fam, d, ctx):
+        warn(f"{fam['title']} {model} keeps every weight in VRAM: ~{dense_vram_gb(fam, d, ctx):.0f} GB at a "
+             f"{ctx // 1024}K context, and the GPU has {gpu_gb:.0f} GB, so the engine may not start; a smaller size "
+             "or context fits")
     parts = plain_parts(d)
     names_of = [Path(x["path"]).name for x in parts]   # side by side in one folder: the engine finds them by name
     models_dir = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
@@ -5528,6 +6069,10 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
     gguf = models_dir / names_of[0]
     have = all_there(models_dir)
     left = 0 if have else d["size"] / 1e9
+    mm = fam.get("mmproj") if vision != "none" else None
+    mmproj = models_dir / Path(mm["path"]).name if mm else None   # the picture reader, beside the model
+    if mm is not None and mmproj is not None and not (mmproj.exists() and (done(mmproj) or a.gguf_dir)):
+        left += mm["size"] / 1e9
     if left and free_gb(models_dir) < left:
         fail(f"not enough free disk space in {models_dir}: need ~{left:.0f} GB, {free_gb(models_dir):.0f} GB free",
              "use --models-dir on a bigger drive")
@@ -5535,7 +6080,7 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         warn(f"little free disk space in {models_dir}: {free_gb(models_dir):.1f} GB free for about {left:.1f} GB. "
              "Setup goes on and should fit")
 
-    llama, eng, enc, lib_dirs = prepare_engine(a, gpu, "none")
+    llama, eng, enc, lib_dirs = prepare_engine(a, gpu, vision)
 
     # ---- 5. the model file
     step(5, f"downloading {fam['title']} {model}")
@@ -5548,6 +6093,23 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         verify_sha256(models_dir / n, x["size"], x["sha256"], own=bool(a.gguf_dir))
     more = f" and {len(parts) - 1} more beside it" if len(parts) > 1 else ""
     ok(f"model file present: {gguf}{more}")
+    if mm is not None and mmproj is not None:
+        # the same file beside another size or the other family (Qwen3.5-9B's two share one): linked, not fetched
+        # (only a copy whose finish mark holds the pinned SHA-256: GLM-5.3-Flash's is named mmproj-BF16.gguf too)
+        other = [p for p in Path(a.models_dir).glob("*/" + mmproj.name) if p != mmproj and done(p)
+                 and f"sha256 {mm['sha256']}" in p.with_name(p.name + ".done").read_text(encoding="utf-8",
+                                                                                         errors="replace")]
+        if other and not mmproj.exists() and not a.gguf_dir:
+            try:
+                os.link(other[0], mmproj)
+                mark(mmproj, f"sha256 {mm['sha256']}")
+                ok(f"{mmproj.name} shared with {other[0].parent.name} (identical file)")
+            except OSError:
+                pass
+        if not (mmproj.exists() and (done(mmproj) or a.gguf_dir)):
+            download(hf(mm["repo"]) + mm["path"], mmproj, "vision encoder")
+        verify_sha256(mmproj, mm["size"], mm["sha256"], own=bool(a.gguf_dir))
+        ok(f"vision encoder: {mmproj}")
 
     # ---- 6. the tokenizer and the chat template, for the server
     step(6, "preparing the model for Strata")
@@ -5565,8 +6127,19 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         args += ["--expert-profile", str(ROOT / "data" / fam["profile"])]
     if fam.get("draft_vocab"):                         # the MTP layer's drafts over a token subset (--draft-vocab)
         args += ["--draft-vocab", str(ROOT / "data" / DRAFT_VOCABS.get(a.draft_vocab or "cjk", "draft_vocab.bin"))]
+    if vision != "none":   # the GPU encoder warms up before the engine, which then sizes itself around it
+        args += ["--vision"]
     if a.vram_reserve_mib is not None:
         args += ["--vram-reserve-mib", str(a.vram_reserve_mib)]
+    elif vision != "none":
+        args += ["--vram-reserve-mib", str(VISION[vision]["reserve_mib"])]
+    # --low-ram: the engine keeps in RAM what the VRAM does not hold as far as the RAM allows and reads the rest from
+    # the file by itself (resident and auto); on and mmap read every expert the VRAM misses from the file
+    if a.low_ram in ("on", "mmap"):
+        args += ["--mmap-experts"]
+        ok("low-RAM mode: the experts the GPU does not hold are read from the model file (--mmap-experts)")
+    elif a.low_ram == "resident":
+        ok("low-RAM mode: the engine keeps in RAM what the GPU does not hold as far as the RAM allows (its default)")
     cfg: dict[str, Any] = {"exe": str(eng / EXE), "args": args, "cwd": str(STATE),
                            "tokenizer": str(tok_dir / "tokenizer"), "model_name": f"{fam['name']}-{model.lower()}",
                            "log": str(STATE / f"xestrata-{tag.lower()}.log"), "lib_dirs": lib_dirs, "port": port}
@@ -5585,7 +6158,28 @@ def setup_plain(a, family: str, fam: dict, gpu: dict, chosen: list, sel: list, f
         cfg["open_browser"] = a.browser
     if a.parallel is not None and a.parallel >= 2:
         warn("--parallel is not available for this model yet: one request at a time")
-    return finish_setup(a, cfg, tag, port, adopted, False, tune=False)
+    if vision != "none" and mmproj is not None:   # as Qwen3.8-Flash-Next's (setup's main path)
+        vt = vision_tokens(a.vision_tokens, vision, CONF / f"xestrata-{tag.lower()}.json")
+        cpu_enc = {"exe": str(eng / VEXE["cpu"]), "gpu": False,
+                   "max_tokens": vt if vision == "cpu" else VISION["cpu"]["max_tokens"],
+                   "threads": vision_threads()}
+        cfg["vision"] = {"mmproj": str(mmproj), "model": str(gguf), **cpu_enc}
+        if vision == "gpu":
+            cfg["vision"] = {"mmproj": str(mmproj), "model": str(gguf), "exe": str(eng / VEXE[enc]), "gpu": True,
+                             "gpu_pci": gpu["pci"], "max_tokens": vt, "fallback": cpu_enc}
+    elif a.vision_tokens is not None:
+        warn("--vision-tokens: images are off for this model, so it is not used")
+    if a.images is None and not a.yes and not JSON_OUT:   # as for Qwen3.8-Flash-Next: asked only interactively
+        a.images = ask_images(CONF / f"xestrata-{tag.lower()}.json")
+    if a.images:   # only when given: else an earlier "images" is carried over
+        # the RAM the chat model keeps, as --describe estimates it (a dense model's DENSE_RAM_GB, the others' file and
+        # 8 GB); an image model's text encoder of the same file shares it (shared_text_quant)
+        text_gb = DENSE_RAM_GB if dense else d["size"] / 1e9 + 8
+        got = setup_images(a, gpu, Path(a.models_dir), eng, text_gb, gguf)
+        cfg["images"], cfg["image_models"] = got if got is not None else (None, None)
+        if not cfg["image_models"]:
+            cfg["image_models"] = None
+    return finish_setup(a, cfg, tag, port, adopted, vision != "none", tune=False)
 
 
 def finish_setup(a, cfg: dict, tag: str, port: int, adopted: Path | None, images: bool, tune: bool = True,
@@ -5650,8 +6244,9 @@ def describe() -> dict:
     """What a front end (the Windows launcher) shows before it asks anything, as one object: this PC (RAM, CPU, the
     GPUs and why one cannot be used, the one setup takes by default), every model family and size with the RAM it
     needs, whether it fits and which is recommended (the rules the questions of step 2 use, for that GPU), the data
-    folder and the installed models.  It reports only: nothing is made, moved or saved.  The front end passes its
-    choices back as --family, --model, --context, --gpu and --data-dir."""
+    folder, the installed models (and their image models), and the image models one can add.  It reports only:
+    nothing is made, moved or saved.  The front end passes its choices back as --family, --model, --context, --gpu,
+    --data-dir and --images (an installed model's image models through tools/image/install.py)."""
     ram = ram_gb()
     found = gpus()
     # the card choose_gpus takes without --gpu: the supported one with the most VRAM
@@ -5665,13 +6260,19 @@ def describe() -> dict:
         if fam.get("plain"):
             names = list(fam["models"])
             rec = next((m for m in names if fam["models"][m].get("tested")), names[0])
+            ctx_f = min(by_vram, fam["max_context"])
+            if fam.get("dense"):   # every weight in VRAM: the largest size that fits the GPU
+                fit_d = [m for m in names if vram >= dense_vram_gb(fam, fam["models"][m], ctx_f)]
+                rec = max(fit_d, key=lambda m: fam["models"][m]["size"]) if fit_d else names[0]
             for m in names:
                 d = fam["models"][m]
                 gb = d["size"] / 1e9
-                models.append({"id": m, "about": d["about"], "download_gb": round(gb, 1), "ram_gb": round(gb + 8),
-                               "fits": "yes" if ram + vram >= gb + 8 else "slow", "tested": bool(d.get("tested")),
-                               "experimental": False, "recommended": m == rec,
-                               "context": min(by_vram, fam["max_context"])})
+                fits = ("yes" if vram >= dense_vram_gb(fam, d, ctx_f) else "no") if fam.get("dense") \
+                    else "yes" if ram + vram >= gb + 8 else "slow"
+                models.append({"id": m, "about": d["about"], "download_gb": round(gb, 1),
+                               "ram_gb": DENSE_RAM_GB if fam.get("dense") else round(gb + 8),
+                               "fits": fits, "tested": bool(d.get("tested")),
+                               "experimental": False, "recommended": m == rec, "context": ctx_f})
             max_ctx = fam["max_context"]
         else:
             names = sorted((m for m in MODELS if f in MODELS[m].get("families", ("qwen", "swift"))),
@@ -5688,20 +6289,43 @@ def describe() -> dict:
             max_ctx = CONTEXTS[-1]
         families.append({"id": f, "title": fam["title"], "by": fam["by"], "about": fam["about"],
                          "license": fam.get("license"), "experimental": bool(fam.get("experimental")),
+                         "images": not fam.get("plain"),             # setup_plain sets up no image generation
                          "contexts": [c for c in CONTEXTS if c <= max_ctx], "models": models})
+    QI = _qimage()
+    images = []
+    for choice, (_, dit, enc) in QI.IMAGE_MODELS.items():
+        if choice.endswith("-uncensored"):
+            continue
+        names = QI.file_names(QI.default_quant(dit), enc, QI.DEFAULT_TEXT_QUANT, dit)
+        images.append({"id": choice, "title": QI.DITS[dit][0], "about": QI.ABOUT.get(choice, ""),
+                       "download_gb": round(sum(QI.FILES[n][2] for n in names) / 1e9, 1),
+                       "ram_gb": round(QI.ram_need_gb(QI.default_quant(dit), enc, QI.DEFAULT_TEXT_QUANT, dit), 1),
+                       "edits": dit in QI.MF_EDIT or not QI.engine_quantized(dit),
+                       "license": QI.license_note(dit),
+                       "uncensored": choice + "-uncensored" in QI.IMAGE_MODELS,
+                       # the sizes one can ask for after its name (--images qwen-image-turbo:Q6_K, magetrail:int8,
+                       # hunyuan-image-3-distil:int8), largest first; Mage-Flow's: 8 bits always (int8) or 16 (bf16),
+                       # not the file's
+                       "quants": list(QI.size_choices(dit)) if QI.engine_quantized(dit)
+                       else list(reversed(QI.size_choices(dit)))})
+    by_name = {v[0]: k for k, v in QI.IMAGE_MODELS.items()}   # a config's model_name -> its --images choice
     installed = []
     for c in installed_configs():
         ch = choices_from_config(c)
         cfg = json.loads(c.read_text(encoding="utf-8-sig"))
+        secs = [cfg.get("images"), *(cfg.get("image_models") or [])] if isinstance(cfg.get("images"), dict) else []
         installed.append({"config": str(c), "model_name": cfg.get("model_name", c.stem), "family": ch["family"],
-                          "model": ch["model"], "context": ch["context"], "port": ch["port"] or 8095})
+                          "model": ch["model"], "context": ch["context"], "port": ch["port"] or 8095,
+                          "images": [by_name[s["model_name"]] for s in secs
+                                     if isinstance(s, dict) and s.get("model_name") in by_name]})
     return {"type": "describe", "version": source_version(), "packaged": bool(PACKAGED),
             "ram_gb": round(ram, 1), "cpu": dict(zip(("name", "avx2", "avx512"), cpu_info())),
             "gpu": gpu["index"] if gpu else None,
             "gpus": [{"index": g["index"], "name": g["name"], "vendor": g.get("vendor"),
                       "vram_gb": round(g["vram_gb"], 1), "integrated": bool(g.get("integrated")), "pci": g.get("pci"),
                       "problem": gpu_problem(g)} for g in found],
-            "data_dir": str(data_folder_path(None, load_settings())), "families": families, "installed": installed}
+            "data_dir": str(data_folder_path(None, load_settings())), "families": families, "installed": installed,
+            "images": images}
 
 
 def main() -> int:
@@ -5723,11 +6347,12 @@ def main() -> int:
                          "interpolation) or yarn, llama.cpp's types. Omitted with such a context, setup takes yarn; "
                          "none is refused there")
     ap.add_argument("--rope-scale", type=float,
-                    help="the extension factor (default: the final context over the trained 262144, at least 1: "
-                         "1.5 for 384K, 2 for 512K, 1 inside the trained range)")
-    ap.add_argument("--kv", choices=["int8", "q4_0", "k8v4"],
+                    help="the extension factor, finite and >= 1 (default: the final context over the trained "
+                         "262144, at least 1: 1.5 for 384K, 2 for 512K, 1 inside the trained range)")
+    ap.add_argument("--kv", choices=["int8", "q4_0", "k8v4", "fp16"],
                     help="KV cache precision above 8K context: int8 (default), q4_0 (half the memory, a little less "
-                         "precise) or k8v4 (8-bit keys and 4-bit values: about three quarters of the memory)")
+                         "precise), k8v4 (8-bit keys and 4-bit values: about three quarters of the memory) or fp16 "
+                         "(16-bit, twice the memory of int8)")
     ap.add_argument("--vision", choices=["yes", "no", "none", "gpu", "cpu"],
                     help="let the model read images (on by default where the model can; yes = the reader for this "
                          "card: the CPU under 24 GB of VRAM, the GPU from 24 GB; gpu = the encoder on the GPU, the CPU "
@@ -5737,21 +6362,32 @@ def main() -> int:
                          "the CPU): more reads small text and charts better, and takes longer to encode; remembered "
                          "for this model")
     ap.add_argument("--images", metavar="qwen-image-turbo|qwen-image-base|mage-flow-turbo|mage-flow|"
-                    "mage-flow-base[-uncensored]|no",
+                    "mage-flow-base|magetrail|moss-image|moss-image-base[-uncensored]|hunyuan-image-3-distil|no",
                     help="image generation (POST /v1/images/generations) on XeStrata's image engine: "
                          "qwen-image-turbo (Qwen-Image-2.1-Turbo, 8 steps) or qwen-image-base (its base model "
                          "Qwen-Image-2.1, 40 steps by default, about 5 times as long an image); the text encoder "
                          "Unsloth's Qwen3-VL-8B or, -uncensored, AtomicChat's with its refusal direction removed "
                          "(either Q8_0, lowered first (Q6_K, Q5_K, Q4_K) when the files would not fit the RAM the "
                          "text model leaves); mage-flow-turbo (Mage-Flow-Turbo, 4 steps), mage-flow (20 steps, "
-                         "guidance 5) or mage-flow-base (30 steps, guidance 5), the text encoder Unsloth's "
-                         "Qwen3-VL-4B or, -uncensored, huihui-ai's abliterated one; no = take it out of the config")
-    ap.add_argument("--image-quant", choices=["Q4_K_M", "Q6_K", "Q8_0"],
-                    help="the image model's size (default Q8_0, lowered when its files would not fit the RAM the "
-                         "text model leaves, after its text encoder; the GPU's memory does not decide it)")
+                         "guidance 5) or mage-flow-base (30 steps, guidance 5), or magetrail (MageTrail, Mage-Flow "
+                         "tuned on Danbooru and e621 images, 30 steps, guidance 5; no edits), the text encoder "
+                         "Unsloth's Qwen3-VL-4B or, -uncensored, huihui-ai's abliterated one; hunyuan-image-3-distil "
+                         "(HunyuanImage 3.0 Instruct-Distil, 8 steps, guidance 2.5, about 50 GB of RAM), which reads "
+                         "its own prompt with the model's tokenizer and system prompt (no text encoder); moss-image "
+                         "(MOSS-Image, 50 steps, guidance 3; text and a layout of boxes in the prompt) or "
+                         "moss-image-base (its base model), the text encoder Qwen3.5-9B (Unsloth's or, -uncensored, "
+                         "HauhauCS's; Q8_0, lowered first (Q6_K, Q4_K_M), or the chat model's own file when that is "
+                         "Qwen3.5-9B of the same maker); several, "
+                         "comma-separated (qwen-image-turbo,magetrail): the first the default, the others named by a "
+                         "request's \"model\" (one on the GPU at a time); no = take it out of the config")
+    ap.add_argument("--image-quant", choices=["Q4_K_M", "Q6_K", "Q8_0", "w4a8", "int8"],
+                    help="the image model's size (default Q8_0, or w4a8 for HunyuanImage 3.0, lowered when its files "
+                         "would not fit the RAM the text model leaves, after its text encoder; the GPU's memory does "
+                         "not decide it)")
     ap.add_argument("--image-dit-q8", choices=["auto", "on", "off"],
-                    help="Mage-Flow: auto (default) keeps its image model in VRAM as 16-bit when it fits there "
-                         "with the text encoder (nearer the reference) and quantizes it to 8 bits when it does not "
+                    help="Mage-Flow, MOSS-Image: auto (default) keeps its image model in VRAM as 16-bit when it "
+                         "fits there with the text encoder (nearer the reference) and quantizes it to 8 bits when it "
+                         "does not "
                          "(half the VRAM and the bytes streamed; int8 products where the GPU's math library has "
                          "them, else Q8_0); on always 8 bits, off always 16-bit")
     ap.add_argument("--image-dit-keep", choices=["on", "off"],
@@ -5777,15 +6413,15 @@ def main() -> int:
     ap.add_argument("--layer-split", help="with --gpus: the first layer of each later GPU's share (e.g. 36, or 16,32 "
                                           "for 3 GPUs), one rising number per GPU after the first - not layers per "
                                           "card; or auto (the default: measured on this PC)")
-    ap.add_argument("--host", help="where the server listens: 127.0.0.1 = this PC only (default), 0.0.0.0 = also other "
-                                   "devices on your network (issue #26; set --api-key too)")
+    ap.add_argument("--host", help="where the server listens: 127.0.0.1 = this PC only (default), 0.0.0.0 = all IPv4 "
+                                   "interfaces, :: = all IPv6 interfaces (issue #26; set --api-key too)")
     ap.add_argument("--no-browser", dest="browser", action="store_false", default=None,
                     help="do not open the chat page in the browser when the model is ready (for a harness or an app "
                          "that uses the API; remembered for this model, also in run-<model>.sh)")
     ap.add_argument("--browser", dest="browser", action="store_true",
                     help="open the chat page again when the model is ready (the default; undoes --no-browser)")
-    ap.add_argument("--api-key", help="require this key from clients (recommended with --host 0.0.0.0); several "
-                                      "keys: key1,key2")
+    ap.add_argument("--api-key", help="require this key from clients (recommended with --host 0.0.0.0 or --host ::); "
+                                      "several keys: key1,key2")
     ap.add_argument("--data-dir", help="where the model files go (~70-120 GB): default XeStrata-data next to this "
                                        "folder, remembered for every Strata folder on this PC")
     ap.add_argument("--move-data", action="store_true",
@@ -5907,11 +6543,17 @@ def main() -> int:
         fail("--license contrib-icpx: the contrib-icpx mode (Intel oneAPI's icpx) was removed",
              "use --license contrib (contrib-llvm: intel/llvm, for Intel, AMD and NVIDIA GPUs), or --license free")
     images = ("no", *_qimage().IMAGE_MODELS)
-    if a.image_text_encoder is not None or (a.images is not None and a.images not in images):
-        fail(f"--images {a.images}: no such choice" if a.image_text_encoder is None
-             else "--image-text-encoder was removed: --images names the text encoder",
-             "use --images " + "|".join(images) + " (qwen-image is qwen-image-turbo, --image-text-encoder "
-             "uncensored is qwen-image-turbo-uncensored)")
+    if a.images is not None and a.images != "no" and a.image_text_encoder is None:
+        try:
+            _qimage().parse_choices(a.images)
+        except ValueError as e:
+            fail(f"--images {a.images}: {e}",
+                 "use --images " + "|".join(images) + " (qwen-image is qwen-image-turbo); several, comma-separated "
+                 "(qwen-image-turbo,magetrail: the first the default); a size after a model's name to choose it "
+                 "(qwen-image-turbo:Q6_K; Mage-Flow's and MageTrail's :int8 or :bf16, 8 or 16 bits on the GPU)")
+    if a.image_text_encoder is not None:
+        fail("--image-text-encoder was removed: --images names the text encoder",
+             "use --images " + "|".join(images) + " (--image-text-encoder uncensored is qwen-image-turbo-uncensored)")
     if a.source:
         os.environ["STRATA_SOURCE"] = a.source
     if a.inspect:                                      # upstream #911: headers only, nothing is installed
@@ -6107,6 +6749,8 @@ def main() -> int:
     if gpu.get("gfx") == STRIX_HALO_GFX and "uma_gb" in gpu:
         for line in strix_halo_notes(gpu, ram_gb()):
             (warn if line.startswith("!") else say)(line.lstrip("!"))
+    for line in unused_apu_notes(found, set(sel), ram_gb()):
+        (warn if line.startswith("!") else say)(line.lstrip("!"))
     for i in sel[1:]:                                  # --gpus: the later layers' cards
         x = gpu_info(i)
         ok(f"then GPU {i}: {x['name']}, {x['vram_gb']:.0f} GB VRAM, PCI {x['pci']} (layer split, "
@@ -6117,7 +6761,7 @@ def main() -> int:
     makers = {x["vendor"] for x in chosen} | {gpu_info(i)["vendor"] for i in sel[1:]}
     amd_gfx = {x.get("gfx") for x in [*chosen, *(gpu_info(i) for i in sel[1:])] if x["vendor"] == "amd"}
     if PACKAGED:                                       # the GPU makers' packages the package only suggests
-        check_runtime(makers, amd_gfx, data, a.yes, a.old_driver)
+        check_runtime(makers, amd_gfx, data, a.yes, a.old_driver, install=not a.check)
     elif not WIN and (majors := [v for t in cuda_toolkits() if (v := cuda_major(t))]):   # a contrib build: its CUDA
         linux_nvidia_libs(makers, data, nvidia_pip_names(max(majors)))
     if not WIN and (gpu["render"] is None or not os.access(gpu["render"], os.R_OK | os.W_OK)):
@@ -6170,6 +6814,12 @@ def main() -> int:
         for fam in PLAIN_FAMILIES.values():
             for m, d in fam["models"].items():
                 gb = d["size"] / 1e9
+                if fam.get("dense"):   # every weight in VRAM, at the context the card recommends
+                    c = min(vram_ctx([gpu]), fam["max_context"])
+                    need = dense_vram_gb(fam, d, c)
+                    verdict = "fits" if gpu_expert_vram(gpu) >= need else "does not fit the GPU"
+                    say(f"  {fam['title']} {m}: ~{need:.0f} GB of VRAM at {c // 1024}K: {verdict}")
+                    continue
                 verdict = "fits" if ram >= gb + 8 else "fits with the GPU's VRAM" if ram + plain_vram >= gb + 8 \
                     else "slow (the experts that do not fit are read from the SSD)"
                 say(f"  {fam['title']} {m}: ~{gb + 8:.0f} GB of RAM and VRAM: {verdict}")
@@ -6333,7 +6983,7 @@ def main() -> int:
         kv = ["int8", "q4_0"][int(ask("KV cache?", ["1", "2"], "1", a.yes)) - 1]
     if ctx > 8192:
         ok("KV cache: " + {"int8": "8-bit", "q4_0": "4-bit (Hadamard-rotated)",
-                           "k8v4": "8-bit keys, 4-bit values"}[kv])
+                           "k8v4": "8-bit keys, 4-bit values", "fp16": "16-bit"}[kv])
     if MODELS[model].get("vision", fam.get("vision")) is False:     # a size without images
         vision = "none"
         if a.vision not in (None, "no", "none"):
@@ -6360,6 +7010,8 @@ def main() -> int:
     if vision != "none" and MODELS[model].get("vision_untested"):
         warn(f"images with {model} are untested: users report them working upstream, but this file has not been run "
              "with images (upstream #967); tell us if the answers look wrong")
+    if a.images is None and not a.yes and not JSON_OUT:   # asked here only interactively: --images says it, and the
+        a.images = ask_images(CONF / f"xestrata-{tag.lower()}.json")   # launcher (--json) passes it
     # The low-RAM mode's two variants.  resident: the experts the GPU's cache does not hold are copied from the model
     # files into RAM once (--resident-experts; the engine keeps what fits the RAM it finds free and reads the rest
     # from the files).  mmap: they are read through the OS file cache.  The GPU's share: its VRAM less the dense
@@ -6648,9 +7300,11 @@ def main() -> int:
         ok(f"VRAM kept free for other programs: {a.vram_reserve_mib} MiB (--vram-reserve-mib; the expert cache takes "
            "that much less)")
     if 0 < gpu_expert_vram(gpu) < SMALL_CARD_GB:
-        # #496: on a 6 GB card the expert cache can get no room at all; the engine lowers its own reserve when that
-        # is what it takes, and says what is short when even that is not enough.  Setup only says what helps.
-        for line in small_card_note(ctx, draft_vocab):   # a recommendation: nothing changes
+        # #496, #41: on a 6 GB card the expert cache can get no room at all; the engine lowers its own reserve when
+        # that is what it takes, and says what is short when even that is not enough.  Setup names the models instead.
+        lines = small_card_note()                       # a recommendation: nothing changes
+        warn(lines[0])
+        for line in lines[1:]:
             say("  " + line)
     elif gpu.get("vendor") == "amd" and a.vram_reserve_mib is None and linux_desktop():
         for line in desktop_reserve_note():              # upstream #560 #516: a recommendation: nothing changes
@@ -6715,7 +7369,7 @@ def main() -> int:
         vt = vision_tokens(a.vision_tokens, vision, CONF / f"xestrata-{tag.lower()}.json")
         cpu_enc = {"exe": str(eng / VEXE["cpu"]), "gpu": False,
                    "max_tokens": vt if vision == "cpu" else VISION["cpu"]["max_tokens"],
-                   "threads": max(1, (os.cpu_count() or 8) // 2)}
+                   "threads": vision_threads()}
         cfg["vision"] = {"mmproj": str(mmproj), "model": str(shards[0]), **cpu_enc}
         if vision == "gpu":
             # the GPU encoder takes the card by PCI address: with Vulkan the first GPU can be another card
@@ -6725,8 +7379,10 @@ def main() -> int:
     elif a.vision_tokens is not None:
         warn("--vision-tokens: images are off for this model, so it is not used")
     if a.images:                                       # only when given: else an earlier "images" is carried over
-        cfg["images"] = setup_images(a, gpu, Path(a.models_dir), Path(cfg["exe"]).parent,
-                                     text_ram_gb(cfg["args"], ram, model))
+        got = setup_images(a, gpu, Path(a.models_dir), Path(cfg["exe"]).parent, text_ram_gb(cfg["args"], ram, model))
+        cfg["images"], cfg["image_models"] = got if got is not None else (None, None)
+        if not cfg["image_models"]:
+            cfg["image_models"] = None
     return finish_setup(a, cfg, tag, port, adopted, vision != "none")
 
 

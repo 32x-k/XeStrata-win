@@ -561,7 +561,8 @@ class Telemetry:
         }
         self._disk_prev = None
         self._stop = threading.Event()
-        threading.Thread(target=self._loop, daemon=True).start()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
 
     def _disk(self):
         if not self.ps:
@@ -625,8 +626,19 @@ class Telemetry:
         self._stop.set()
 
     def _loop(self):
+        """One sample a second, for as long as the server lives.  A failing sample (a machine whose GPU or psutil
+        source is not readable) must not end the thread, or `GET /metrics` silently stops updating: it says so once
+        and keeps trying (upstream b3db5a1c8, #3590)."""
+        complained = False
         while not self._stop.is_set():
-            s = self.sample()
+            try:
+                s = self.sample()
+            except Exception as e:                    # noqa: BLE001 - a monitor must outlive its source
+                if not complained:                    # once, not once a second
+                    print(f"[strata] metrics: a sample failed ({e}); the sampler keeps trying", flush=True)
+                    complained = True
+                self._stop.wait(1.0)
+                continue
             with self.lock:
                 self.now = s
                 for k in ("gpu_util", "gpu_mem_used", "gpu_temp", "gpu_power", "gpu_pcie_rx_mb", "cpu", "ram_used",

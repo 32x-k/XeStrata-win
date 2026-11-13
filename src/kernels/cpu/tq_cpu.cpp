@@ -51,11 +51,13 @@ int env_isa_cap() {
     return 2;
 }
 
-template <int KB>
+template <int TY>
 void rows_scalar_t(const uint8_t* w, size_t row_bytes, int n, const tq_detail::TqAct* const* a, int nt,
                    float* const* out, int r0, int r1) {
+    using F = tq_detail::TqFmt<TY>;
+    constexpr int NS = F::NS, WPS = 128 / NS, SPK = 32 / WPS;   // weights per step, steps per Q8_0 sub-block
     const int nb = n / 128;
-    constexpr size_t bsz = 2 + 4 * KB;
+    constexpr size_t bsz = 2 + F::NB;
     const int16_t* tab = tq_state_table();
     for (int r = r0; r < r1; ++r) {
         const uint8_t* x = w + (size_t) r * row_bytes;
@@ -63,16 +65,16 @@ void rows_scalar_t(const uint8_t* w, size_t row_bytes, int n, const tq_detail::T
         for (int i = 0; i < nb; ++i) {
             const uint8_t* blk = x + (size_t) i * bsz;
             const float dx = tq_detail::tq_half_to_float(tq_detail::tq_ld16(blk));
-            uint32_t st[32];
-            tq_detail::tq_states<KB>(blk + 2, st);
+            uint32_t st[NS];
+            tq_detail::tq_states<TY>(blk + 2, st);
             for (int t = 0; t < nt; ++t) {
                 const int16_t* q = a[t]->q + 128 * i;
                 for (int k = 0; k < 4; ++k) {
                     int32_t s = 0;
-                    for (int j = 0; j < 8; ++j) {
-                        const int16_t* wv = tab + 4 * st[8 * k + j];
-                        const int16_t* qv = q + 32 * k + 4 * j;
-                        s += wv[0] * qv[0] + wv[1] * qv[1] + wv[2] * qv[2] + wv[3] * qv[3];
+                    for (int j = 0; j < SPK; ++j) {
+                        const int16_t* wv = tab + 4 * st[SPK * k + j];   // a TQP step: the row's first two weights
+                        const int16_t* qv = q + 32 * k + WPS * j;
+                        for (int e = 0; e < WPS; ++e) s += wv[e] * qv[e];
                     }
                     const float sc = dx * a[t]->d[4 * i + k];
                     acc[t][k] = std::fma((float) s, sc, acc[t][k]);
@@ -92,9 +94,9 @@ const int16_t* tq_state_table() {
     return g_table;
 }
 
-bool tq_supported(int t) noexcept { return t == 144 || t == 145 || t == 146; }
+bool tq_supported(int t) noexcept { return t >= 144 && t <= 149; }
 
-int tq_kbits(int t) noexcept { return t == 144 ? 8 : t == 145 ? 6 : t == 146 ? 7 : 0; }
+int tq_kbits(int t) noexcept { return t == 144 ? 8 : t == 145 ? 6 : t == 146 ? 7 : t >= 147 && t <= 149 ? t - 142 : 0; }
 
 bool tq_isa_ok(TqIsa isa) {
 #if defined(STRATA_TQ_X86)
@@ -143,11 +145,17 @@ void unpack_act(const void* q8_0, int n, TqAct& a) {
     }
 }
 
-void tq_rows_scalar(int kb, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
+void tq_rows_scalar(int ty, const uint8_t* w, size_t row_bytes, int n, const TqAct* const* a, int nt,
                     float* const* out, int r0, int r1) {
-    if (kb == 8) rows_scalar_t<8>(w, row_bytes, n, a, nt, out, r0, r1);
-    else if (kb == 6) rows_scalar_t<6>(w, row_bytes, n, a, nt, out, r0, r1);
-    else rows_scalar_t<7>(w, row_bytes, n, a, nt, out, r0, r1);
+    switch (ty) {
+        case 144: rows_scalar_t<144>(w, row_bytes, n, a, nt, out, r0, r1); break;
+        case 145: rows_scalar_t<145>(w, row_bytes, n, a, nt, out, r0, r1); break;
+        case 146: rows_scalar_t<146>(w, row_bytes, n, a, nt, out, r0, r1); break;
+        case 147: rows_scalar_t<147>(w, row_bytes, n, a, nt, out, r0, r1); break;
+        case 148: rows_scalar_t<148>(w, row_bytes, n, a, nt, out, r0, r1); break;
+        case 149: rows_scalar_t<149>(w, row_bytes, n, a, nt, out, r0, r1); break;
+        default: std::abort();   // a caller bug: tq_supported() was not asked
+    }
 }
 
 }  // namespace tq_detail
@@ -170,14 +178,14 @@ ActSet& unpack_all(const void* const* act, int n, int nt) {
     return *set;
 }
 
-void rows_on(TqIsa isa, int kb, const uint8_t* w, size_t row_bytes, int n, const tq_detail::TqAct* const* a, int nt,
+void rows_on(TqIsa isa, int ty, const uint8_t* w, size_t row_bytes, int n, const tq_detail::TqAct* const* a, int nt,
              float* const* out, int r0, int r1) {
     switch (isa) {
 #if defined(STRATA_TQ_X86)
-        case TqIsa::avx512: tq_detail::tq_rows_avx512(kb, w, row_bytes, n, a, nt, out, r0, r1); break;
-        case TqIsa::avx2: tq_detail::tq_rows_avx2(kb, w, row_bytes, n, a, nt, out, r0, r1); break;
+        case TqIsa::avx512: tq_detail::tq_rows_avx512(ty, w, row_bytes, n, a, nt, out, r0, r1); break;
+        case TqIsa::avx2: tq_detail::tq_rows_avx2(ty, w, row_bytes, n, a, nt, out, r0, r1); break;
 #endif
-        default: tq_detail::tq_rows_scalar(kb, w, row_bytes, n, a, nt, out, r0, r1); break;
+        default: tq_detail::tq_rows_scalar(ty, w, row_bytes, n, a, nt, out, r0, r1); break;
     }
 }
 
@@ -188,7 +196,7 @@ void tq_rows(TqIsa isa, int ggml_type, const uint8_t* w, size_t row_bytes, int n
     if (!tq_isa_ok(isa)) std::abort();   // a caller bug: asked for an ISA this CPU does not have
     tq_state_table();
     const ActSet& s = unpack_all(act, n, nt);
-    rows_on(isa, tq_kbits(ggml_type), w, row_bytes, n, s.ptr, nt, out, r0, r1);
+    rows_on(isa, ggml_type, w, row_bytes, n, s.ptr, nt, out, r0, r1);
 }
 
 void tq_gu_rows(TqIsa isa, int ggml_type, const uint8_t* blob, size_t gu_row, size_t up_off, int n,
@@ -205,9 +213,8 @@ void tq_gu_rows(TqIsa isa, int ggml_type, const uint8_t* blob, size_t gu_row, si
         gp[t] = gbuf.data() + (size_t) t * nr;
         up[t] = ubuf.data() + (size_t) t * nr;
     }
-    const int kb = tq_kbits(ggml_type);
-    rows_on(isa, kb, blob, gu_row, n, s.ptr, nt, gp, r0, r1);
-    rows_on(isa, kb, blob + up_off, gu_row, n, s.ptr, nt, up, r0, r1);
+    rows_on(isa, ggml_type, blob, gu_row, n, s.ptr, nt, gp, r0, r1);
+    rows_on(isa, ggml_type, blob + up_off, gu_row, n, s.ptr, nt, up, r0, r1);
     for (int t = 0; t < nt; ++t)
         for (int r = r0; r < r1; ++r) {
             const float g = gp[t][r], u = up[t][r];

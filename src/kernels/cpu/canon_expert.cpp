@@ -23,6 +23,7 @@
 
 #include <immintrin.h>
 
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <type_traits>
@@ -225,7 +226,10 @@ template <class F> void with_nt(int nt, F&& f) {
         case 5: f(std::integral_constant<int, 5>{}); break;
         case 6: f(std::integral_constant<int, 6>{}); break;
         case 7: f(std::integral_constant<int, 7>{}); break;
-        default: f(std::integral_constant<int, 8>{}); break;
+        case 8: f(std::integral_constant<int, 8>{}); break;
+        default:   // the arrays a job's tokens fill hold 8 (#45: a ninth wrote past them, and the pool faulted)
+            std::fprintf(stderr, "strata: an expert job of %d tokens reached the CPU kernels, which take 1 to 8\n", nt);
+            std::abort();
     }
 }
 

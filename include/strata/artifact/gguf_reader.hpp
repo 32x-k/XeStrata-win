@@ -123,6 +123,12 @@ inline const char* ggml_type_name(uint32_t t) {
         return "TQK6";
     case 146:
         return "TQK7";
+    case 147:
+        return "TQP5";
+    case 148:
+        return "TQP6";
+    case 149:
+        return "TQP7";
     default:
         return "?";
     }
@@ -229,8 +235,8 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
         elems = 64;
         bytes = 18;
         return true;
-    // APR trellis types: 128 values = fp16 scale + 32 steps of K bits (K = 8 TQ2_T, 6 TQK6, 7 TQK7);
-    // PTQ1_0 = 26 B of base-3 digits + fp16 scale
+    // APR trellis types: 128 values = fp16 scale + 32 steps of K bits (K = 8 TQ2_T, 6 TQK6, 7 TQK7) or 64 steps
+    // of K bits (K = 5 TQP5, 6 TQP6, 7 TQP7); PTQ1_0 = 26 B of base-3 digits + fp16 scale
     case 143:
         elems = 128;
         bytes = 28;
@@ -246,6 +252,18 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
     case 146:
         elems = 128;
         bytes = 30;
+        return true;
+    case 147:
+        elems = 128;
+        bytes = 42;
+        return true;
+    case 148:
+        elems = 128;
+        bytes = 50;
+        return true;
+    case 149:
+        elems = 128;
+        bytes = 58;
         return true;
     default:
         return false;
@@ -403,6 +421,30 @@ public:
     const MetaValue* get(const std::string& key) const {
         auto it = meta_.find(key);
         return it == meta_.end() ? nullptr : &it->second;
+    }
+    /// The index of `text` in the string array `key` (get() holds an array's first 64 items only: a vocabulary's
+    /// token is looked up here), read from the header again; -1 when the array has no such string or there is none.
+    int64_t string_index(const std::string& key, const std::string& text) const {
+        Cursor c(base_, size_);
+        c.read<uint32_t>();
+        c.read<uint32_t>();
+        c.read<uint64_t>();
+        const uint64_t n_kv = c.read<uint64_t>();
+        for (uint64_t i = 0; i < n_kv; ++i) {
+            const std::string k = c.str();
+            const MetaType t = (MetaType)c.read<uint32_t>();
+            if (k != key || t != MetaType::ARRAY) {
+                read_value(c, t);
+                continue;
+            }
+            const MetaType e = (MetaType)c.read<uint32_t>();
+            const uint64_t n = c.read<uint64_t>();
+            if (e != MetaType::STRING) return -1;
+            for (uint64_t j = 0; j < n; ++j)
+                if (c.str() == text) return (int64_t)j;
+            return -1;
+        }
+        return -1;
     }
     const uint8_t* tensor_data(const TensorInfo& t) const { return base_ + data_start_ + t.offset; }
 

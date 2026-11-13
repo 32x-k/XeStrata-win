@@ -75,7 +75,7 @@ bool native_row_to_float(int type, const void* src, float* dst, int64_t n) {
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err, int up_type) {
     init_once();
     if (up_type < 0) up_type = gu_type;
-    // The trellis types (Gyro, ggml types 144-146) are not in a ggml built from upstream (and an upstream ggml indexes its
+    // The trellis types (Gyro, ggml types 144-149) are not in a ggml built from upstream (and an upstream ggml indexes its
     // type table by the id, so asking it about 144 reads past the table): their geometry and activation format (Q8_0)
     // are known here, and their rows run on tq_cpu.hpp.
     const bool tq_g = tq_supported(gu_type), tq_d = tq_supported(d_type);
@@ -291,8 +291,8 @@ void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* 
         kq256_gu_rows(f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
         return;
     }
-    // The trellis types (TQ2_T / TQK6 / TQK7): Strata's own kernels (tq_cpu.hpp), for every group size - they decode
-    // a block once for all the tokens and give each token the same bits whatever the group (no #152 rule needed).
+    // The trellis types (TQ2_T / TQK6 / TQK7 / TQP5-7): Strata's own kernels (tq_cpu.hpp), for every group size - they
+    // decode a block once for all the tokens and give each token the same bits whatever the group (no #152 rule needed).
     if (tq_rows_own(f.gu_type)) {
         tq_gu_rows(tq_isa(), f.gu_type, blob, f.gu_row, f.up_off, (int) f.n_embd, act, nt, ff, r0, r1);
         return;

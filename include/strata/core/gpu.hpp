@@ -62,7 +62,7 @@ void* alloc_host(size_t bytes);
 /// Pinned memory as a budget (upstream 4f74de9cd): Windows (WDDM) lets a process page-lock about half the RAM, and the
 /// expert arena, pinned until the driver refuses, left nothing for the few MiB of pinned buffers allocated after it
 /// ("mapped staging allocation failed").  pin_reserve_take holds two reserves before the arena pins (by default on
-/// Windows with a CUDA GPU: 640 MiB and a quarter of it, at least 64 MiB; STRATA_PIN_RESERVE_MIB=N sets the first on
+/// Windows, any GPU: 640 MiB and a quarter of it, at least 64 MiB; STRATA_PIN_RESERVE_MIB=N sets the first on
 /// any system, 0 none), a reserve that cannot be had being halved or skipped; the soft one goes back once the arena is
 /// placed, the hard one at the first refused alloc_host or once the engine is up (pin_reserve_release).
 void pin_reserve_take();
@@ -133,6 +133,9 @@ bool host_register_on(int device, void* p, size_t bytes);
 /// Whether engine device `a`'s kernels can access device `b`'s memory directly (sycl_ext_oneapi_peer_access: NVLink
 /// or PCIe peer-to-peer, one backend); false for devices of different backends or without the extension.
 bool peer_access(int a, int b);
+/// Whether engine devices `a` and `b` are run by the same backend (Level Zero, CUDA, HIP): one maker's runtime, whose
+/// host USM and registrations the other device's runtime may not take.
+bool same_backend(int a, int b);
 /// The device's name as the runtime reports it.
 std::string device_name(int device);
 void host_unregister_on(int device, void* p);

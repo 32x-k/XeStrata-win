@@ -76,7 +76,7 @@ A change that does not meet them, a pull request among others, does not go in as
 
 ## Licenses
 
-XeStrata as a whole is under the LGPL, version 3 or later (`COPYING.LESSER`, `COPYING`); copyright and license notices are in `NOTICE`.
+XeStrata's own code is under the LGPL, version 3 or later (`COPYING.LESSER`, `COPYING`), and XeStrata as a combined work is distributed under it; the code from other projects keeps its own license (below). Copyright and license notices are in `NOTICE`.
 `NOTICE` also grants an additional permission (GPL version 3, section 7): XeStrata linked with a GPU or CPU maker's math or compute library and its runtime libraries (oneMKL, cuBLAS, the CUDA runtime), or with the C and C++ runtime libraries of the operating system or its standard compiler (Microsoft's Universal C Runtime and Visual C++ runtime), may be conveyed.
 
 Each file carries the license of the code in it, by where that code comes from:
@@ -134,6 +134,12 @@ A change goes into the Japanese file first and then into the English one in the 
 The English files keep the headings that code, records and links point to (`docs/BUILD.md#packages`, for example); a Japanese file's anchors come from its own headings.
 Where the README or a document states something that was not checked, do not add that it is unverified (`unverified`, 未検証); that mark is for reports and commit messages.
 The two stages of generation are prefill and decode, the LLM terms, in Japanese as in English (the README, the documents, the release notes): not プロンプト・出力・デコード or prompt and output speed. 推測デコード (speculative decoding) and a prompt as the text that is read stay as they are.
+
+## Model names: written out, never abbreviated
+
+A model's name is written in full everywhere, in code and in text: `HunyuanImage 3.0` in prose (the README, the documents, commit messages, release notes, comments, the engine's messages) and `hunyuanimage3` where an identifier needs it - `hunyuanimage3_dit.cpp`, `HunyuanImage3Dit`, `hunyuanimage3_layer_run`, `HUNYUANIMAGE3_VAE_DUMP`. Its abbreviations (`hy3`, `Hy3`, `HY3`) are not used: a reader of a log line or a commit message should not have to know a short form, and the short form of a model's name is how two models' files start to look alike. The same holds of every model the image engine takes.
+
+What already exists keeps its name: Qwen-Image-2.1's `qi_*` and Mage-Flow's `mf_*` parts (`qi_dit.cpp`, `QiPipeline`) stay as they are - renaming them would churn the whole image engine for no reading gain, and this rule is about names given from now on. So does everything outside the repository: the data folder's `hy3/`, the records' scripts (`hy3_conform.py`, `hy3_vae_ref.py`) and any path quoted from them; a comment that cites one of those says it is a record's or the data folder's path, so it does not read as a name for the model.
 
 ## Measurement records
 

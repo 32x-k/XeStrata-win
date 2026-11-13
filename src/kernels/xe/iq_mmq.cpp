@@ -343,6 +343,27 @@ template<> struct Dec<6> {   // Q5_0: d ((5-bit value) - 16), the high bits in q
         return r;
     }
 };
+template<> struct Dec<7> {   // Q5_1: d (5-bit value) + m: Q5_0's bits without its offset, and a min
+    static constexpr int QK = 32, BSZ = (int) sizeof(block_q5_1);
+    static Sub get(const uint8_t* row, int sb, [[maybe_unused]] size_t row_bytes) {
+        const block_q5_1* b = reinterpret_cast<const block_q5_1*>(row) + sb;
+        const uint32_t qh = (uint32_t) get_int_b2(b->qh, 0);
+        Sub r;
+        for (int k = 0; k < 4; ++k) {   // values 4k .. 4k + 3 in the low nibbles, 16 + 4k .. in the high ones
+            const uint32_t ql = (uint32_t) get_int_b2(b->qs, k);
+            uint32_t h0 = 0, h1 = 0;
+            for (int t = 0; t < 4; ++t) {
+                h0 |= ((qh >> (4 * k + t)) & 1u) << (8 * t + 4);
+                h1 |= ((qh >> (4 * k + t + 16)) & 1u) << (8 * t + 4);
+            }
+            r.v[k] = (ql & 0x0F0F0F0Fu) | h0;
+            r.v[4 + k] = ((ql >> 4) & 0x0F0F0F0Fu) | h1;
+        }
+        r.s0 = r.s1 = (float) b->dm[0];
+        r.m = -(float) b->dm[1];   // the products take the block's values less m
+        return r;
+    }
+};
 // Q4_K and Q5_K's 6-bit scale and min of block j (get_scale_min_k4)
 inline void scale_min_k4(int j, const uint8_t* q, int& d, int& m) {
     if (j < 4) {
@@ -476,7 +497,7 @@ template<> struct Dec<kNativeQ8Rows> {   // Q8_0 split by row (native_mmvq.hpp):
 template<int TY>
 constexpr bool half_scales() { return TY == 17 || TY == 22 || TY == 29 || TY == 14 || TY == kNativeQ6KRows || TY == 10 || TY == 11; }
 template<int TY>
-constexpr bool has_min() { return TY == 12 || TY == 13; }
+constexpr bool has_min() { return TY == 7 || TY == 12 || TY == 13; }
 
 // ---------------------------------------------------------------- the products
 template<typename T>
@@ -1256,11 +1277,11 @@ const char* iq_mmq_path(sycl::queue& q) {
     return iq_mmq_dp4a_usable(q) ? "DP4a" : nullptr;
 }
 
-bool iq_mmq_type_sums(int t) { return t == 12 || t == 13; }   // has_min
+bool iq_mmq_type_sums(int t) { return t == 7 || t == 12 || t == 13; }   // has_min
 
 bool iq_mmq_type_ok(int t) {
     switch (t) {
-        case 6: case 8: case 10: case 11: case 12: case 13: case 14: case kNativeQ6KRows: case kNativeQ8Rows:
+        case 6: case 7: case 8: case 10: case 11: case 12: case 13: case 14: case kNativeQ6KRows: case kNativeQ8Rows:
         case 16: case 17: case 18: case 19: case 20: case 21: case 22: case 23: case 29: case 42: return true;
         default: return false;
     }
@@ -1269,6 +1290,7 @@ bool iq_mmq_type_ok(int t) {
 size_t iq_mmq_row_bytes(int t, int64_t cols) {
     switch (t) {
         case 6: return (size_t) (cols / Dec<6>::QK) * Dec<6>::BSZ;
+        case 7: return (size_t) (cols / Dec<7>::QK) * Dec<7>::BSZ;
         case 10: return (size_t) (cols / 256) * Dec<10>::BSZ;   // the row's own values (read twice as long)
         case 11: return (size_t) (cols / Dec<11>::QK) * Dec<11>::BSZ;
         case 12: return (size_t) (cols / Dec<12>::QK) * Dec<12>::BSZ;
@@ -1380,6 +1402,7 @@ sycl::event iq_mmq_grouped(sycl::queue& q, int t, const void* w, size_t expert_b
                            dst, ld_dst, rows > 0 ? rows : total_rows)
     switch (t) {
         STRATA_MMQ_CASE(6);
+        STRATA_MMQ_CASE(7);
         STRATA_MMQ_CASE(8);
         STRATA_MMQ_CASE(10);
         STRATA_MMQ_CASE(11);

@@ -37,7 +37,7 @@ namespace strata::image {
 namespace {
 
 using AotFn = bool (*)(void*, const uint16_t*, const uint16_t*, const uint16_t*, int64_t, int64_t, int64_t, int64_t,
-                       int64_t, uint16_t*);
+                       int64_t, uint16_t*, bool);
 
 // The aotriton module (src/image/qi_sdpa_aotriton.cpp), opened at an AMD GPU's first attention from the engine's
 // folder or its lib/ (the packages'), with the libraries it needs beside it; null when it does not open (no HIP
@@ -88,17 +88,27 @@ AotFn aotriton_module() {
 }  // namespace
 #endif
 
+bool qi_sdpa_causal([[maybe_unused]] void* stream) {
+#if STRATA_AOTRITON
+    return core::Runtime::get().stream(stream).get_device().get_backend() == sycl::backend::ext_oneapi_hip &&
+           aotriton_module() != nullptr;
+#else
+    return false;
+#endif
+}
+
 bool qi_sdpa(const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t q0, int64_t q1, int64_t T,
-             int64_t heads, int64_t head_dim, uint16_t* out16, void* stream) {
+             int64_t heads, int64_t head_dim, uint16_t* out16, void* stream, bool causal) {
     if (q1 <= q0) return true;
     sycl::queue& q = core::Runtime::get().stream(stream);
     [[maybe_unused]] const sycl::backend be = q.get_device().get_backend();
 #if STRATA_AOTRITON
     if (be == sycl::backend::ext_oneapi_hip) {
         const AotFn fn = aotriton_module();
-        return fn != nullptr && fn(&q, q16, k16, v16, q0, q1, T, heads, head_dim, out16);
+        return fn != nullptr && fn(&q, q16, k16, v16, q0, q1, T, heads, head_dim, out16, causal);
     }
 #endif
+    if (causal) return false;   // the other makers' kernels take the unmasked rows only
 #if STRATA_CUDNN
     if (be == sycl::backend::ext_oneapi_cuda) return sdpa::cudnn(q, q16, k16, v16, q0, q1, T, heads, head_dim, out16);
 #endif

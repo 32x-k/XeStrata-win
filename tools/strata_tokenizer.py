@@ -94,6 +94,13 @@ CHATGLM4_PATTERN = (
     r"|\s+"
 )
 
+# `hunyuanimage3` (HunyuanImage 3.0, the image model that reads its own prompt): the regex its HF
+# `tokenizer.json` carries is QWEN2's shape (`\p{N}` alone, no combining marks) - 20 probe strings split the same
+# way with the two patterns, measured 2026-10-24 - but the file sets `model.ignore_merges`, which `qwen2` does not.
+# So it is its own entry rather than a reuse of `qwen2`: the same pieces, and a piece that is itself a vocabulary
+# token (a CJK string, a whole word) taken as that one token instead of run through the merges.
+HUNYUANIMAGE3_PRE = "hunyuanimage3"
+
 # The GGUF's `tokenizer.ggml.pre` -> (pattern, ignore_merges, where the pattern was transcribed from).  A `pre` not
 # listed is refused: tokenizing it with another type's pattern gives plausible tokens the model was not trained on.
 PRE_TYPES = {
@@ -101,7 +108,19 @@ PRE_TYPES = {
     "qwen2": (QWEN2_PATTERN, False, "llama.cpp de7fa0a3 src/llama-vocab.cpp L389 (LLAMA_VOCAB_PRE_TYPE_QWEN2)"),
     "glm4": (CHATGLM4_PATTERN, True, "llama.cpp de7fa0a3 src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4)"),
     "glm5": (CHATGLM4_PATTERN, True, "llama.cpp de7fa0a3 src/llama-vocab.cpp L406 (LLAMA_VOCAB_PRE_TYPE_CHATGLM4)"),
+    HUNYUANIMAGE3_PRE: (QWEN2_PATTERN, True, "tencent/HunyuanImage-3.0*'s tokenizer.json, 2026-10-24"),
 }
+
+# The strings a file's pre-tokenizer regex is compared against another shape's on: enough of the classes
+# (contractions, letters, digits, punctuation runs, every kind of whitespace run, CJK, marks, emoji) that two
+# regexes which agree here agree on the shapes that differ.  The comparison is by what they split, not by their
+# text: `(?i:'s|'t|...)` and the spelled-out alternatives of the same machine are written differently.
+_PRE_PROBES = (
+    "A red fox in the snow", "日本語 abc123", "hello, world!", "x  y\n\nz", "don't stop",
+    "2026-10-24 12:34:56", "(a+b)*c", "éclair naïve", "1 23 456 7890", "  leading", "trailing  ",
+    "\U0001f642 emoji", "tab\there", "\r\n crlf", "User: hi\n\nAssistant: ok", "e.g. i.e. etc.",
+    "MiXeD_CaSe and-dash", "かな漢字カナカンジ", "\u1eb0\u1eb1 with macrons", "\u0660\u0661 arabic-indic digits",
+)
 
 
 class Tokenizer:
@@ -185,6 +204,80 @@ class Tokenizer:
         return cls(list(md["tokenizer.ggml.tokens"]), list(md["tokenizer.ggml.merges"]),
                    list(md.get("tokenizer.ggml.token_type") or []) or None,
                    md.get("tokenizer.ggml.pre", "qwen35"), special)
+
+    # -------------------------------------------------------------- Hugging Face's tokenizer.json
+    @staticmethod
+    def _hf_regex(pre_tokenizer) -> str:
+        """The file's pre-tokenizer regex, out of the `Split` (or the `Sequence` that starts with one)."""
+        pt = pre_tokenizer
+        while isinstance(pt, dict) and pt.get("type") == "Sequence":
+            pt = (pt.get("pretokenizers") or [None])[0]
+        if not isinstance(pt, dict) or pt.get("type") != "Split":
+            raise ValueError("tokenizer.json has no Split pre-tokenizer (got %r)" % (pre_tokenizer,))
+        pat = pt.get("pattern")
+        regex_str = pat.get("Regex") if isinstance(pat, dict) else pat
+        if not isinstance(regex_str, str):
+            raise ValueError("tokenizer.json's Split pre-tokenizer has no Regex: %r" % (pat,))
+        return regex_str
+
+    @classmethod
+    def _hf_pre(cls, regex_str: str, ignore_merges: bool) -> str:
+        """Which `pre` of PRE_TYPES the file's regex is: the shape whose pattern splits the probe strings the same
+        way, preferring the one whose ignore_merges agrees with the file's (two shapes can share a pattern:
+        `qwen2` and `hunyuanimage3` do, and they differ only in that).  Unknown is refused, as an unlisted `pre`
+        is: pieces the model was not trained with give plausible tokens."""
+        try:
+            theirs = regex.compile(regex_str)
+        except regex.error as e:
+            raise ValueError("tokenizer.json's pre-tokenizer regex does not compile: %s" % e)
+        hits = []
+        for name, (pattern, im, _where) in PRE_TYPES.items():
+            if im != ignore_merges:
+                continue
+            if all(theirs.findall(s) == regex.compile(pattern).findall(s) for s in _PRE_PROBES):
+                hits.append(name)
+        if not hits:
+            raise ValueError("tokenizer.json's pre-tokenizer is not a shape XeStrata knows (%s)" % regex_str[:80])
+        return sorted(hits)[0]
+
+    @classmethod
+    def from_hf(cls, path) -> "Tokenizer":
+        """Hugging Face's `tokenizer.json` (a byte-level BPE: HunyuanImage 3.0 ships one, and no GGUF): `model.vocab`
+        and `model.merges` the vocabulary and the merge list, `added_tokens` the literals (a `special` one a CONTROL,
+        matched only with parse_special, as llama.cpp's GGUF types say), the `pre_tokenizer`'s Regex classified
+        against PRE_TYPES by what it splits.  `path` is the file or the folder that holds it."""
+        f = pathlib.Path(path)
+        if f.is_dir():
+            f = f / "tokenizer.json"
+        j = json.loads(f.read_text(encoding="utf-8"))
+        model = j.get("model") or {}
+        vocab = model.get("vocab")
+        if not isinstance(vocab, dict):
+            raise ValueError("%s: no model.vocab (a BPE tokenizer.json is expected)" % f)
+        added = j.get("added_tokens") or []
+        n = len(vocab) + len(added)
+        for a in added:
+            n = max(n, int(a["id"]) + 1)
+        tokens = [""] * n
+        for t, i in vocab.items():
+            tokens[int(i)] = t
+        types = [1] * n
+        special_ids: dict[str, int] = {}
+        for a in added:
+            i = int(a["id"])
+            tokens[i] = a["content"]
+            special_ids[a["content"]] = i
+            types[i] = 3 if a.get("special") else 1
+        raw_merges = model.get("merges") or []
+        merges = [m if isinstance(m, str) else " ".join(m) for m in raw_merges]
+        pre = cls._hf_pre(cls._hf_regex(j.get("pre_tokenizer")), bool(model.get("ignore_merges")))
+        if model.get("dropout") not in (None, 0, 0.0):
+            raise ValueError("%s: a BPE dropout of %r is not supported" % (f, model["dropout"]))
+        if model.get("continuing_subword_prefix") or model.get("end_of_word_suffix"):
+            raise ValueError("%s: word-suffix / subword-prefix BPE is not this shape" % f)
+        if j.get("normalizer") is not None:
+            raise ValueError("%s: a normalizer (%s) is not applied here" % (f, j["normalizer"].get("type")))
+        return cls(tokens, merges, types, pre, special_ids)
 
     @classmethod
     def from_dir(cls, path):
