@@ -5299,8 +5299,12 @@ struct Model::Impl {
         // THP arena registers 4 KB pages and the DMA rate was erratic on the 12 GB cell: 11.9 s one prompt, 30.4 s the next), or (b) the
         // cards hold at least half the routed experts on RDNA4 (4 x R9700: the pin was reliable in 4/4 runs there, see above).  =0 is the off
         // switch, =1 pins any arena.
-        const bool pin_copies = strata::ds4::copy_pin_default(env_tri("DS4_COPY_PIN"), arena_all_huge, strata::gpu::kernels_read_registered(), gpu_expert_share(),
-                                                              !ram_chunks.empty(), defaults_026());
+        // (not where a copy from registered memory may overtake the kernels after it - Windows' HIP: the expert DMA'd from
+        // its copy was read before it landed and the first token came out -1, at 80 and 93 GB pinned on an R9700; the
+        // staging is host USM, which that runtime copies by a kernel, in order)
+        const bool pin_copies = strata::gpu::registered_copies_ordered() &&
+                                strata::ds4::copy_pin_default(env_tri("DS4_COPY_PIN"), arena_all_huge, strata::gpu::kernels_read_registered(),
+                                                              gpu_expert_share(), !ram_chunks.empty(), defaults_026());
         if (pin_copies) {
             const bool ro = std::getenv("DS4_COPY_PIN_RO") != nullptr && std::atoi(std::getenv("DS4_COPY_PIN_RO")) != 0;
             const double tr = now_ms();

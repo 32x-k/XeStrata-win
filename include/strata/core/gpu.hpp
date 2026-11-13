@@ -84,6 +84,10 @@ inline bool device_pointer(void** d, const void* h) {
 /// nor a registration, which is for copies only.
 bool kernels_read_host(const void* p);
 bool kernels_read_registered();
+/// Whether a copy between registered host memory (host_register) and the current GPU is ordered before the work queued
+/// after it.  Not on Windows' HIP: PAL may lose an SDMA -> compute dependency (rocm-systems #12571), and such a copy is a
+/// DMA (copies between memory the GPU's kernels read are kernels there, which keep the order: readback.cpp).
+bool registered_copies_ordered();
 
 /// Synchronous copy, ordered after the work already on the compute queue (the CUDA legacy stream).
 bool copy(void* dst, const void* src, size_t bytes);
