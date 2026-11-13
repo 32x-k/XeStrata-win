@@ -176,7 +176,6 @@ int main(int argc, char** argv) {
     // ask the OS for the projector file up front (128 KiB steps) so the loader's sequential reads find it cached;
     // STRATA_READ_AHEAD=0 turns it off, as in the engine.  Windows has no posix_fadvise: its cache manager reads
     // ahead of the loader's sequential reads by itself
-#if !defined(_WIN32)
     if (const char* ra = std::getenv("STRATA_READ_AHEAD"); ra == nullptr || std::strtol(ra, nullptr, 10) != 0) {
         const int fd = open(mmproj.c_str(), O_RDONLY);
         if (fd >= 0) {
