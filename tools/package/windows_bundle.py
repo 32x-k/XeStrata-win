@@ -297,8 +297,13 @@ def main() -> None:
     sycl_rec = json.loads((a.sycl / "XESTRATA.json").read_text())
     versions["intel-llvm"] = f"{sycl_rec['tag']} ({sycl_rec['commit'][:12]}, with XeStrata's patches)"
     # the fork's tag the engine's build fetched (CMakeLists.txt pins it)
-    m = re.search(r"tags/([\w.-]+)\.tar\.gz", (a.engine / "CMakeCache.txt").read_text())
+    cache = (a.engine / "CMakeCache.txt").read_text()
+    m = re.search(r"tags/([\w.-]+)\.tar\.gz", cache)
     versions["onemath"] = m.group(1) if m else "the archive CMakeLists.txt pins"
+    # a source of its own (STRATA_ONEMATH_SOURCE): the archive's name
+    own = re.search(r"^STRATA_ONEMATH_SOURCE:\w+=(.+)$", cache, re.M)
+    if own and own.group(1).strip():
+        versions["onemath"] = f"{Path(own.group(1).strip()).name} (STRATA_ONEMATH_SOURCE)"
     for pkg in ("avalonia", "avalonia.angle.windows.natives", "skiasharp", "harfbuzzsharp", "fsharp.core",
                 "microcom.runtime", "tmds.dbus.protocol"):
         versions[pkg] = nuget_version(a.nuget, pkg)
