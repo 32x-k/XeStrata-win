@@ -4,9 +4,13 @@
 """tools/package/windows_bundle.py - the Windows 7z's folder and archive, from what tools/package/windows.sh built.
 
     windows_bundle.py --src DIR --engine DIR --sycl DIR --launcher DIR --nuget DIR --python-zip ZIP --wheels DIR
-                      --llama DIR --jxl DIR --version V --cuda-archs A;B --out DIR
+                      --llama DIR --jxl DIR --version V --cuda-archs A;B --out DIR [--license free|contrib]
 
-The folder (XeStrata-<version>-windows-x64/):
+It also takes an engine built natively on Windows: --license free for one without NVIDIA's code and oneMKL
+(--cuda-archs and --mkl-version empty), and the engine's optional parts (the DeepSeek-V4.1 engine strata-dsv41.exe,
+oneDNN, AOTriton, the SYCL runtime's adapters and oneMath's backends) go in when the build has them.
+
+The folder (XeStrata-<version>-windows-x64/, with -free at the end for a free engine):
 
     xestrata.exe, xestrata-cli.exe and their .NET libraries   the launchers (windows/launcher)
     app/                  setup.py, serve/, tools/, data/ and gguf-py, read-only, with the PACKAGED record
@@ -32,8 +36,10 @@ from pathlib import Path
 # The SYCL runtime's DLLs a Windows engine loads (sycl-jit.dll, the runtime compiler, is not: 120 MB the engine does
 # not use).  ze_loader.dll comes with Intel's driver, nvcuda.dll and nvml.dll with NVIDIA's, amdhip64_7.dll with AMD's.
 SYCL_DLLS = ("sycl9.dll", "ur_win_proxy_loader.dll", "ur_adapter_cuda.dll", "ur_adapter_hip.dll",
-             "ur_adapter_level_zero.dll", "ur_adapter_level_zero_v2.dll", "xptifw.dll")
+             "ur_adapter_level_zero.dll", "ur_adapter_level_zero_v2.dll", "xptifw.dll", "ur_loader.dll")
 ENGINE_EXES = ("strata.exe", "strata-device.exe", "strata-image.exe", "strata-vision-cpu.exe")
+# the DeepSeek-V4.1 engine (-DSTRATA_BUILD_DSV41=ON), beside the engine, where setup.py's dsv41_exe() looks for it
+OPTIONAL_EXES = ("strata-dsv41.exe",)
 # oneMath and its oneMKL backend (the engine's build folder's bin/), which loads oneMKL where the user installed it
 ONEMATH_DLLS = ("onemath.dll", "onemath_blas_mklgpu.dll", "onemath_blas_cublas.dll", "onemath_blas_rocblas.dll")
 # AMD GPUs' image attention: the engine's module that opens aotriton (on an AMD GPU only), aotriton's library (built
@@ -56,11 +62,11 @@ WHEELS = ("numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "pillow", "p
 COMPONENTS = [
     ("XeStrata", "version", "LGPL-3.0-or-later (with MIT parts: NOTICE)", "https://github.com/MistVVK/XeStrata",
      [], ["xestrata.exe", "xestrata-cli.exe", "xestrata.dll", "xestrata-cli.dll", "Xestrata.Launcher.Core.dll",
-          *(f"app/engine/{e}" for e in ENGINE_EXES), f"app/engine/{AOTRITON_DLLS[0]}"]),
+          *(f"app/engine/{e}" for e in ENGINE_EXES + OPTIONAL_EXES), f"app/engine/{AOTRITON_DLLS[0]}"]),
     ("oneMath (XeStrata's fork)", "onemath", "Apache-2.0", "https://github.com/MistVVK/oneMath", ["onemath:LICENSE"],
      [f"app/engine/{d}" for d in ONEMATH_DLLS]),
     ("ROCm BLAS headers (rocBLAS, hipBLASLt and hipblas-common; compiled into onemath_blas_rocblas.dll)",
-     "ROCm 7.1 (Ubuntu 26.04's)", "MIT",
+     "rocm", "MIT",
      "https://github.com/ROCm/rocm-libraries", ["rocm:LICENSE-*.txt"], []),
     ("intel/llvm (DPC++) SYCL runtime, with Unified Runtime, UMF and hwloc", "intel-llvm",
      "Apache-2.0 WITH LLVM-exception; UMF Apache-2.0 WITH LLVM-exception; hwloc BSD-3-Clause; Level Zero loader "
@@ -148,6 +154,16 @@ def nuget_version(nuget: Path, package: str) -> str:
     return versions[-1]
 
 
+def seven_zip() -> str:
+    """7-Zip: the 7z on PATH (Linux's 7zip), else Windows' 7-Zip where its installer puts it."""
+    for c in ("7z", r"C:\Program Files\7-Zip\7z.exe", r"C:\Program Files (x86)\7-Zip\7z.exe"):
+        found = shutil.which(c) or (c if Path(c).is_file() else None)
+        if found:
+            return found
+    fail("no 7z (7-Zip) on PATH")
+    return ""
+
+
 def unbundle_runtime(site: Path) -> None:
     """A wheel's own copy of the Visual C++ runtime (numpy's numpy.libs/msvcp140-<hash>.dll, renamed by delvewheel so
     it loads beside another copy) removed, and its binaries' imports of it renamed back to the runtime's own name, so
@@ -173,12 +189,21 @@ def main() -> None:
         ap.add_argument(f"--{name}", type=Path, required=True)
     ap.add_argument("--python-zip", type=Path, required=True)
     ap.add_argument("--version", required=True)
-    ap.add_argument("--cuda-archs", required=True, help="the engine's NVIDIA architectures, sm_60;sm_61;...")
+    ap.add_argument("--license", choices=("contrib", "free"), default="contrib",
+                    help="the engine's mode (STRATA_LICENSE): free has no NVIDIA code and no oneMKL")
+    ap.add_argument("--cuda-archs", required=True, help="the engine's NVIDIA architectures, sm_60;sm_61;... (free: '')")
     ap.add_argument("--hip-archs", required=True, help="the engine's AMD architectures, gfx1030;gfx1100;...")
-    ap.add_argument("--mkl-version", required=True, help="the oneMKL the engine was built with, 2026.2.0")
+    ap.add_argument("--mkl-version", required=True, help="the oneMKL the engine was built with, 2026.2.0 (free: '')")
+    ap.add_argument("--rocm-version", default="ROCm 7.1 (Ubuntu 26.04's)",
+                    help="the ROCm whose rocBLAS and hipBLASLt headers the engine was built with")
     a = ap.parse_args()
+    if a.license == "free" and (a.cuda_archs or a.mkl_version):
+        fail("a free engine has no NVIDIA code and no oneMKL: --cuda-archs and --mkl-version are empty")
+    if a.license == "contrib" and not a.mkl_version:
+        fail("--mkl-version: the oneMKL the contrib engine was built with")
 
-    top_name = f"XeStrata-{a.version}-windows-x64"
+    # the free one apart from the contrib one (whose name is the Linux-built 7z's)
+    top_name = f"XeStrata-{a.version}-windows-x64" + ("-free" if a.license == "free" else "")
     top = a.out / top_name
     shutil.rmtree(top, ignore_errors=True)
     top.mkdir(parents=True)
@@ -207,26 +232,38 @@ def main() -> None:
     eng.mkdir()
     for e in ENGINE_EXES:
         shutil.copy2(a.engine / e, eng / e)
+    for e in OPTIONAL_EXES:
+        if (a.engine / e).is_file():
+            shutil.copy2(a.engine / e, eng / e)
+    # the runtime's adapters, oneMath's backends and the image attention's libraries the build has: a native Windows
+    # build has no CUDA adapter without the CUDA target, no cuBLAS or oneMKL backend in the free mode, and neither
+    # oneDNN nor AOTriton
     for d in SYCL_DLLS:
+        # (ur_loader.dll: a runtime built on Windows, whose ur_win_proxy_loader.dll opens it)
+        if d.startswith(("ur_adapter_", "ur_loader")) and not (a.sycl / "bin" / d).is_file():
+            continue
         shutil.copy2(a.sycl / "bin" / d, eng / d)
     for d in ONEMATH_DLLS:
-        shutil.copy2(a.engine / "bin" / d, eng / d)
+        if d == "onemath.dll" or (a.engine / "bin" / d).is_file():
+            shutil.copy2(a.engine / "bin" / d, eng / d)
     for d in ONEDNN_DLLS:
-        shutil.copy2(a.engine / "onednn" / "bin" / d, eng / d)
-    shutil.copy2(a.jxl / "bin" / "cjxl.exe", eng / "cjxl.exe")   # the images' JPEG XL (serve/images.py cjxl)
+        if (a.engine / "onednn" / "bin" / d).is_file():
+            shutil.copy2(a.engine / "onednn" / "bin" / d, eng / d)
     aot = a.engine / "_deps" / "aotriton" / "aotriton"
-    shutil.copy2(a.engine / AOTRITON_DLLS[0], eng / AOTRITON_DLLS[0])
-    shutil.copy2(aot / "lib" / AOTRITON_DLLS[1], eng / AOTRITON_DLLS[1])
-    shutil.copytree(aot / "lib" / "aotriton.images", eng / "aotriton.images")
+    if (a.engine / AOTRITON_DLLS[0]).is_file():
+        shutil.copy2(a.engine / AOTRITON_DLLS[0], eng / AOTRITON_DLLS[0])
+        shutil.copy2(aot / "lib" / AOTRITON_DLLS[1], eng / AOTRITON_DLLS[1])
+        shutil.copytree(aot / "lib" / "aotriton.images", eng / "aotriton.images")
+    shutil.copy2(a.jxl / "bin" / "cjxl.exe", eng / "cjxl.exe")   # the images' JPEG XL (serve/images.py cjxl)
     archs = [x for x in a.cuda_archs.split(";") if x]
+    # oneMKL's pip packages for the Python the 7z carries (setup names them), the version the engine was built with,
+    # without the SYCL runtime they depend on (the 7z's)
+    runtime = {"onemkl_pip": [f"onemkl-sycl-blas=={a.mkl_version}", f"mkl=={a.mkl_version}", "tbb==2023.*",
+                              f"onemkl-license=={a.mkl_version}"]} if a.license == "contrib" else {}
     (eng / "BUILD.json").write_text(json.dumps({
-        "source": "package", "backend": "xe", "package": top_name, "version": a.version, "license": "contrib",
-        "cuda_archs": archs, "hip_archs": [x for x in a.hip_archs.split(";") if x],
-        # oneMKL's pip packages for the Python the 7z carries (setup names them), the version the engine was built with,
-        # without the SYCL runtime they depend on (the 7z's)
-        "runtime": {"onemkl_pip": [f"onemkl-sycl-blas=={a.mkl_version}", f"mkl=={a.mkl_version}", "tbb==2023.*",
-                                   f"onemkl-license=={a.mkl_version}"]}, "lib_dirs": []},
-        indent=1) + "\n")
+        "source": "package", "backend": "xe", "package": top_name, "version": a.version, "license": a.license,
+        "cuda_archs": archs, "hip_archs": [x for x in a.hip_archs.split(";") if x], "runtime": runtime,
+        "lib_dirs": []}, indent=1) + "\n")
 
     # ---- Python: the embeddable distribution without its Visual C++ runtime (the user's, which xestrata.exe checks)
     # and its ._pth (which would leave the script's folder off sys.path: setup.py imports serve/ from beside it), and
@@ -255,7 +292,8 @@ def main() -> None:
     versions = {"version": a.version, "dotnet": "10", "llama.cpp": "the commit setup.py pins",
                 "outfit": "third_party/main/outfit", "quantscope": "bfdf205",
                 "python": a.python_zip.stem.split("-")[1],
-                "jxl": a.jxl.parent.name.removeprefix("jxl-")}   # windows.sh's jxl-<version>/x64-windows-static
+                "jxl": a.jxl.parent.name.removeprefix("jxl-"),   # windows.sh's jxl-<version>/x64-windows-static
+                "rocm": a.rocm_version}
     sycl_rec = json.loads((a.sycl / "XESTRATA.json").read_text())
     versions["intel-llvm"] = f"{sycl_rec['tag']} ({sycl_rec['commit'][:12]}, with XeStrata's patches)"
     # the fork's tag the engine's build fetched (CMakeLists.txt pins it)
@@ -270,6 +308,13 @@ def main() -> None:
     covered: set = set()
     files = [p.relative_to(top).as_posix() for p in top.rglob("*") if p.is_file()]
     for name, ver_key, license_, source, texts, globs in COMPONENTS:
+        if globs and not any(fnmatch.fnmatch(f, g) for g in globs for f in files):
+            continue   # a part the build does not have (a native Windows build's oneDNN and AOTriton)
+        # and the parts compiled into one of those, or into the engine only when the build fetched them
+        if name.startswith("liblzma") and f"app/engine/{AOTRITON_DLLS[1]}" not in files:
+            continue
+        if name.startswith("cuDNN Frontend") and not (a.engine / "_deps" / "strata_cudnn_fe-src").is_dir():
+            continue
         version = versions.get(ver_key, ver_key)
         slug = "".join(c if c.isalnum() else "-" for c in name.split(" (")[0].lower()).strip("-")
         kept = []
@@ -342,7 +387,7 @@ def main() -> None:
 
     archive = a.out / f"{top_name}.7z"
     archive.unlink(missing_ok=True)
-    subprocess.run(["7z", "a", "-t7z", "-mx=9", "-bd", str(archive), top_name], cwd=a.out, check=True,
+    subprocess.run([seven_zip(), "a", "-t7z", "-mx=9", "-bd", str(archive), top_name], cwd=a.out, check=True,
                    stdout=subprocess.DEVNULL)
     say(f"{archive} ({archive.stat().st_size / 2**20:.0f} MiB)")
 
