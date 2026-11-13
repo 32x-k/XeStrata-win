@@ -4,13 +4,13 @@
 """tools/package/windows_bundle.py - the Windows 7z's folder and archive, from what tools/package/windows.sh built.
 
     windows_bundle.py --src DIR --engine DIR --sycl DIR --launcher DIR --nuget DIR --python-zip ZIP --wheels DIR
-                      --llama DIR --version V --cuda-archs A;B --out DIR
+                      --llama DIR --jxl DIR --version V --cuda-archs A;B --out DIR
 
 The folder (XeStrata-<version>-windows-x64/):
 
     xestrata.exe, xestrata-cli.exe and their .NET libraries   the launchers (windows/launcher)
     app/                  setup.py, serve/, tools/, data/ and gguf-py, read-only, with the PACKAGED record
-    app/engine/           the engine, its SYCL runtime (intel/llvm's) and BUILD.json
+    app/engine/           the engine, its SYCL runtime (intel/llvm's), libjxl's cjxl.exe and BUILD.json
     python/               Python's embeddable distribution with the packages setup and the server use
     NOTICE, COPYING, COPYING.LESSER, THIRD-PARTY-NOTICES.md, licenses/
 
@@ -47,8 +47,9 @@ FORBIDDEN = ("vcruntime*.dll", "msvcp*.dll", "concrt*.dll", "ucrtbase*.dll", "ap
              "*hipblaslt*.dll")
 # the Python packages the 7z carries (requirements.txt, and colorama, which tqdm takes on
 # Windows): a wheel not named here stops the script
-WHEELS = ("numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "pillow", "psutil", "markupsafe", "certifi",
-          "charset-normalizer", "charset_normalizer", "idna", "urllib3", "colorama", "pip")
+WHEELS = ("numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "pillow", "psutil", "pypdf", "pypdfium2",
+          "jsonschema", "markupsafe", "certifi", "charset-normalizer", "charset_normalizer", "idna", "urllib3",
+          "typing_extensions", "attrs", "jsonschema_specifications", "referencing", "rpds_py", "colorama", "pip")
 
 # name, version (a key of `versions`, or the text), license, source, license texts (paths relative to `roots`' keys, or
 # URLs), the files in the folder it covers (globs relative to its top)
@@ -108,6 +109,9 @@ COMPONENTS = [
      "https://github.com/NVIDIA/cudnn-frontend", ["src:third_party/main/cudnn-frontend/LICENSE.txt"], []),
     ("stb_image (compiled into strata-image.exe)", "2.30", "MIT OR Unlicense", "https://github.com/nothings/stb",
      ["src:third_party/main/stb/LICENSE"], []),
+    ("libjxl's cjxl (statically linked with Highway, Brotli, skcms, libpng, zlib, libjpeg-turbo, giflib, libwebp and "
+     "sjpeg)", "jxl", "BSD-3-Clause; the libraries under their own licenses (Apache-2.0, BSD-3-Clause, MIT, zlib, IJG, "
+     "libpng)", "https://github.com/libjxl/libjxl", ["jxl:licenses/LICENSE.*"], ["app/engine/cjxl.exe"]),
     ("quantscope", "quantscope", "MIT OR Apache-2.0", "https://github.com/1872183316/quantscope",
      ["src:third_party/main/quantscope/LICENSE-MIT", "src:third_party/main/quantscope/LICENSE-APACHE"], []),
 ]
@@ -165,7 +169,7 @@ def unbundle_runtime(site: Path) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    for name in ("src", "engine", "sycl", "launcher", "nuget", "wheels", "llama", "rocm", "out"):
+    for name in ("src", "engine", "sycl", "launcher", "nuget", "wheels", "llama", "rocm", "jxl", "out"):
         ap.add_argument(f"--{name}", type=Path, required=True)
     ap.add_argument("--python-zip", type=Path, required=True)
     ap.add_argument("--version", required=True)
@@ -209,6 +213,7 @@ def main() -> None:
         shutil.copy2(a.engine / "bin" / d, eng / d)
     for d in ONEDNN_DLLS:
         shutil.copy2(a.engine / "onednn" / "bin" / d, eng / d)
+    shutil.copy2(a.jxl / "bin" / "cjxl.exe", eng / "cjxl.exe")   # the images' JPEG XL (serve/images.py cjxl)
     aot = a.engine / "_deps" / "aotriton" / "aotriton"
     shutil.copy2(a.engine / AOTRITON_DLLS[0], eng / AOTRITON_DLLS[0])
     shutil.copy2(aot / "lib" / AOTRITON_DLLS[1], eng / AOTRITON_DLLS[1])
@@ -249,7 +254,8 @@ def main() -> None:
     lic.mkdir()
     versions = {"version": a.version, "dotnet": "10", "llama.cpp": "the commit setup.py pins",
                 "outfit": "third_party/main/outfit", "quantscope": "bfdf205",
-                "python": a.python_zip.stem.split("-")[1]}
+                "python": a.python_zip.stem.split("-")[1],
+                "jxl": a.jxl.parent.name.removeprefix("jxl-")}   # windows.sh's jxl-<version>/x64-windows-static
     sycl_rec = json.loads((a.sycl / "XESTRATA.json").read_text())
     versions["intel-llvm"] = f"{sycl_rec['tag']} ({sycl_rec['commit'][:12]}, with XeStrata's patches)"
     # the fork's tag the engine's build fetched (CMakeLists.txt pins it)
@@ -259,7 +265,7 @@ def main() -> None:
                 "microcom.runtime", "tmds.dbus.protocol"):
         versions[pkg] = nuget_version(a.nuget, pkg)
     roots = {"sycl": a.sycl, "python": py, "llama": a.llama, "src": a.src, "nuget": a.nuget, "rocm": a.rocm,
-             "onemath": a.engine / "_deps" / "strata_onemath-src"}
+             "jxl": a.jxl, "onemath": a.engine / "_deps" / "strata_onemath-src"}
     rows = []
     covered: set = set()
     files = [p.relative_to(top).as_posix() for p in top.rglob("*") if p.is_file()]
@@ -294,8 +300,10 @@ def main() -> None:
         meta = (dist / "METADATA").read_text(errors="replace")
         field = lambda key: next((ln.split(":", 1)[1].strip() for ln in meta.splitlines()  # noqa: E731
                                   if ln.startswith(key + ":")), "")
-        wheel_texts = [f for f in dist.rglob("*") if f.is_file() and f.name.upper().startswith(
-            ("LICEN", "COPYING", "NOTICE", "AUTHORS"))]
+        # by name, or anything in the licenses/ folder (PEP 639: pypdfium2 keeps PDFium's and its parts' texts there
+        # under their own names)
+        wheel_texts = [f for f in dist.rglob("*") if f.is_file() and (f.name.upper().startswith(
+            ("LICEN", "COPYING", "NOTICE", "AUTHORS")) or f.relative_to(dist).parts[0] == "licenses")]
         if not wheel_texts:
             fail(f"{dist.name}: no license text in the wheel")
         kept = []
@@ -321,7 +329,8 @@ def main() -> None:
         fail("programs or libraries of no component (COMPONENTS in this script): " + ", ".join(unknown))
 
     lines = ["# Third-party notices", "",
-             f"XeStrata {a.version} for Windows carries the components below. XeStrata itself is under the LGPL "
+             f"XeStrata {a.version} for Windows carries the components below. XeStrata's own code is under the LGPL "
+             "and its parts from other projects keep their licenses "
              "(`NOTICE`, `COPYING`, `COPYING.LESSER`); its source is at https://github.com/MistVVK/XeStrata. "
              "The license texts are in `licenses/`.", "",
              "The Microsoft Visual C++ runtime, the GPU makers' drivers and NVIDIA's libraries are not part of it: "
