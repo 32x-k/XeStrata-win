@@ -84,7 +84,8 @@ function(strata_cuda_candidates out)
   set(${out} "${found}" PARENT_SCOPE)
 endfunction()
 
-# The toolkit's version ("12.4"): its version.json, else its nvcc (Debian's is /usr/bin/nvcc for /usr/lib/cuda).
+# The toolkit's version ("12.4"): its version.json, else its nvcc (Debian's is /usr/bin/nvcc for /usr/lib/cuda; on
+# Windows nvcc.exe, as in NVIDIA's redistributable archives, which have no version.json).
 function(strata_cuda_version dir out)
   set(version "")
   if(EXISTS "${dir}/version.json")
@@ -96,7 +97,9 @@ function(strata_cuda_version dir out)
   endif()
   if(NOT version)
     set(nvcc "${dir}/bin/nvcc")
-    if(NOT EXISTS "${nvcc}" AND EXISTS /usr/bin/nvcc)
+    if(NOT EXISTS "${nvcc}" AND EXISTS "${dir}/bin/nvcc.exe")
+      set(nvcc "${dir}/bin/nvcc.exe")
+    elseif(NOT EXISTS "${nvcc}" AND EXISTS /usr/bin/nvcc)
       set(nvcc /usr/bin/nvcc)
     endif()
     if(EXISTS "${nvcc}")
@@ -119,10 +122,12 @@ function(strata_cuda_root dir out)
   endif()
 endfunction()
 
-# Whether the toolkit has cuBLAS (its header and library), which oneMath's cuBLAS backend links.
+# Whether the toolkit has cuBLAS (its header and library: Windows' import library in lib/x64), which oneMath's cuBLAS
+# backend links.
 function(strata_cuda_has_cublas dir out)
   strata_cuda_root("${dir}" root)
-  file(GLOB libs "${dir}/lib64/libcublas.so*" "${dir}/lib/libcublas.so*" "${dir}/targets/*/lib/libcublas.so*")
+  file(GLOB libs "${dir}/lib64/libcublas.so*" "${dir}/lib/libcublas.so*" "${dir}/targets/*/lib/libcublas.so*"
+                 "${dir}/lib/x64/cublas.lib")
   if(root STREQUAL "/usr")
     file(GLOB more "/usr/lib/*/libcublas.so*" "/usr/lib64/libcublas.so*" "/usr/lib/libcublas.so*")
     list(APPEND libs ${more})
