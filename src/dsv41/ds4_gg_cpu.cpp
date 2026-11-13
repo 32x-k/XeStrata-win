@@ -142,10 +142,14 @@ static bool own_ok(int type, int impl) {
 }
 // Select only instruction sets reported by the CPU. The comparison below keeps ggml-cpu's arithmetic
 // when this build's vector kernel accumulates its products in a different order.
+// The environment is read once: dots() asks for every 64 rows, and Windows' getenv takes the CRT's environment lock, which
+// the lane's threads then wait on together.
 static bool want_512(int type) {
-    const char* v = std::getenv("DS4_GG_IQ512");
-    return (v == nullptr || std::strtol(v, nullptr, 10) != 0) && strata::kernels::cpu::cpu_avx512_ok() &&
-           strata::kernels::cpu::iq512_supported(type);
+    static const bool on = [] {
+        const char* v = std::getenv("DS4_GG_IQ512");
+        return (v == nullptr || std::strtol(v, nullptr, 10) != 0) && strata::kernels::cpu::cpu_avx512_ok();
+    }();
+    return on && strata::kernels::cpu::iq512_supported(type);
 }
 // 0: ggml-cpu's dot, 1: the AVX2 rows, 2: the AVX-512 rows
 static int use_iq256(int type) {
