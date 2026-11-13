@@ -15,6 +15,18 @@ This branch ports upstream Strata's DeepSeek-V4.1-Flash engine (`strata-dsv41`, 
 On a Radeon AI PRO R9700 (Windows, free mode) it loads the UD-IQ1_S GGUF of DeepSeek-V4.1-Flash and answers questions about text and about a picture. Asked the same question, it generated the same tokens as upstream's HIP build. Speculative decoding with the draft model (DSpark) works as well.
 Its speed is still being tuned. It has run on one R9700 only.
 
+### Upstreams and thanks
+
+This branch is built on the work of the projects below. Our thanks go to their authors and contributors.
+
+- [Strata](https://github.com/Niko1221/Strata) (Niko1221 and the Strata contributors, MIT): the DeepSeek-V4.1-Flash engine `strata-dsv41` (upstream commit `870aedd9`) and its picture reader (`ds4_vision`). This branch ports them to SYCL.
+- [Project Maya](https://github.com/mw00/project-maya) (Peasant Smith, mw00, and the Project Maya contributors, including needmorevram, MIT): the origin of Strata's DeepSeek engine (maya-ds4, v1.1.17, commit `8d9a9b5d`) and the approaches of its later releases. The copyright and license notice is in `third_party/main/project-maya/NOTICE.md`.
+- [XeStrata](https://github.com/MistVVK/XeStrata) (MistVVK and the XeStrata contributors, LGPL-3.0-or-later): this branch's base (xe0.2.2-1) and the way its Windows package is made.
+- [exllamav3](https://github.com/turboderp-org/exllamav3) (turboderp, MIT): EXL3's file layout and codebooks, and the origin of the CPU expert kernels.
+- [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (the ggml authors, MIT): GGUF's quantized formats and the origin of the kernels that read them.
+- A report we drew on: zephel01's [Abyss](https://github.com/zephel01/Abyss). Its measurements of DeepSeek V4's prefill with `GPU_MAX_HW_QUEUES` on a Linux R9700 led us to check the same setting with Windows' HIP (no code was taken from it).
+- Model: DeepSeek's DeepSeek-V4.1-Flash, and its GGUF (UD-IQ1_S) by [Unsloth](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF).
+
 ---
 
 Run a 125-billion-parameter AI model on one Intel Arc, AMD Radeon or NVIDIA GPU and an ordinary PC.

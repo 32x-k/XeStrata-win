@@ -15,6 +15,18 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 Radeon AI PRO R9700（Windows、free モード）で、DeepSeek-V4.1-Flash の UD-IQ1_S の GGUF を読み込み、文章の問いと画像についての問いに答えます。上流の HIP 版と同じ問いで比べると、生成したトークンは一致しました。下書きのモデル（DSpark）を使う推測デコードも動きます。
 速さはまだ調整の途中です。動かしたのは R9700 の 1 枚だけです。
 
+### 参考にした上流と謝辞
+
+このブランチは、次のプロジェクトの成果の上に作りました。作者と貢献者のみなさんに感謝します。
+
+- [Strata](https://github.com/Niko1221/Strata)（Niko1221 と Strata の貢献者、MIT）: DeepSeek-V4.1-Flash のエンジン `strata-dsv41`（上流のコミット `870aedd9`）と、画像を読む部分（`ds4_vision`）。このブランチはこれを SYCL に移しました。
+- [Project Maya](https://github.com/mw00/project-maya)（mw00 の Peasant Smith と、needmorevram をはじめとする Project Maya の貢献者、MIT）: Strata の DeepSeek のエンジンの元（maya-ds4、v1.1.17 のコミット `8d9a9b5d`）と、その後の版の考え方。著作権とライセンスの表記は `third_party/main/project-maya/NOTICE.md` にあります。
+- [XeStrata](https://github.com/MistVVK/XeStrata)（MistVVK と XeStrata の貢献者、LGPL-3.0-or-later）: このブランチの元（xe0.2.2-1）と、Windows の配布物の作り方。
+- [exllamav3](https://github.com/turboderp-org/exllamav3)（turboderp、MIT）: EXL3 のファイルの形とコードブック、CPU のエキスパートのカーネルの元。
+- [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)（ggml の作者、MIT）: GGUF の量子化の形と、それを読むカーネルの元。
+- 参考にした報告: zephel01 の [Abyss](https://github.com/zephel01/Abyss)。Linux の R9700 で `GPU_MAX_HW_QUEUES` を変えて DeepSeek V4 の prefill を測った報告を見て、Windows の HIP でも同じ設定を確かめました（コードは取り込んでいません）。
+- モデル: DeepSeek の DeepSeek-V4.1-Flash と、[Unsloth](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) による GGUF（UD-IQ1_S）。
+
 ---
 
 1,250 億パラメーターの AI モデルを、Intel Arc、AMD Radeon、NVIDIA のどれかの GPU 1 枚と普通の PC で動かします。
