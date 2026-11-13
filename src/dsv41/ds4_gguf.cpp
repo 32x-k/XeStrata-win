@@ -219,19 +219,24 @@ TokenScratch* token_scratch(const x3::MoeArgs& a, const TokenCaps& caps, sycl::q
 // Upstream mv's BF16/Q8_0 job partition and quant_add/quant_flush. Keep unsupported
 // formats or column counts on the existing path; all metadata below is copied by value.
 // A set of jobs is independent, as in upstream's batching by format rather than job order.
-// Q5_K matrices (the dense attention outputs and shared expert) take upstream's
-// low-bit GEMV on the same int8 activations as Q8_0.
-bool mv_q5(const x3::Mat& m) { return m.fmt == kFmtGG && m.K == iq::kQ5_K && m.k % 256 == 0; }
+// The K types that decode without a table (Q2_K to Q6_K: the dense attention and shared expert) take upstream's
+// low-bit GEMV on the same int8 activations as Q8_0, the jobs of one type in one launch.
+template <int T> constexpr bool kMvNoTable = iq::sycl_decode::Ty<T>::TAB == 0 && T != iq::sycl_decode::kMXFP4;
+bool mv_k(const x3::Mat& m) {
+    bool ok = false;
+    if (m.fmt == kFmtGG && m.k % 256 == 0) iq::sycl_decode::dispatch(m.K, [&](auto t) { ok = kMvNoTable<t.value>; });
+    return ok;
+}
 bool mv_iq(const x3::Mat& m) { return m.fmt == kFmtGG && m.K != kTypeMXFP4 && iq_tiled_set_type(m.K) && m.k % 256 == 0; }
-// The other ggml block types ds4_iq decodes (Q6_K, Q4_K, IQ4_NL and the like: the dense attention and shared expert of
-// unsloth's UD quants) take the same int8 GEMV, as upstream's mv sends every such matrix to iq::mv; Q5_K keeps q5_mv.
+// The other ggml block types ds4_iq decodes (IQ4_NL, IQ4_XS, IQ3_S and the like), and a K type mv_batch left, take the
+// same int8 GEMV a job at a time, as upstream's mv sends every such matrix to iq::mv; Q5_K keeps q5_mv.
 bool mv_low(const x3::Mat& m) {
     return m.fmt == kFmtGG && m.K != kTypeMXFP4 && m.K != iq::kQ5_K && iq::supported(m.K) && m.k % 256 == 0;
 }
 unsigned mv_batch(const x3::MvJob* jobs, int n, sycl::queue& s) {
     bool any = false;
     for (int i = 0; i < n; ++i)
-        any = any || ((jobs[i].m->fmt == kFmtBF16 || jobs[i].m->fmt == kFmtQ8_0 || mv_q5(*jobs[i].m) || (mv_iq(*jobs[i].m) && jobs[i].ncol > 1)) &&
+        any = any || ((jobs[i].m->fmt == kFmtBF16 || jobs[i].m->fmt == kFmtQ8_0 || mv_k(*jobs[i].m) || (mv_iq(*jobs[i].m) && jobs[i].ncol > 1)) &&
                       jobs[i].ncol <= x3::kMaxMvCols);
     if (!any) return 0;
     const auto& caps = token_caps(s);
@@ -241,14 +246,15 @@ unsigned mv_batch(const x3::MvJob* jobs, int n, sycl::queue& s) {
     int counts[4] = {}, max_n[4] = {}, max_cols[4] = {};
     bool aligned[3] = {true, true, true};
     size_t offsets[x3::kMaxMvJobs] = {}, code_count = 0;
-    int iq_types[x3::kMaxMvJobs] = {};
+    int iq_types[x3::kMaxMvJobs] = {}, k_types[x3::kMaxMvJobs] = {};
     unsigned accepted = 0;
     for (int i = 0; i < n; ++i) {
         const auto& job = jobs[i];
         const auto& m = *job.m;
-        if ((m.fmt != kFmtBF16 && m.fmt != kFmtQ8_0 && !mv_q5(m) && !(mv_iq(m) && job.ncol > 1)) || job.ncol > x3::kMaxMvCols) continue;
+        if ((m.fmt != kFmtBF16 && m.fmt != kFmtQ8_0 && !mv_k(m) && !(mv_iq(m) && job.ncol > 1)) || job.ncol > x3::kMaxMvCols) continue;
         const int kind = m.fmt == kFmtQ8_0 ? 1 : m.fmt == kFmtGG ? (mv_iq(m) ? 3 : 2) : 0;
         if (kind == 3) iq_types[counts[kind]] = m.K;
+        if (kind == 2) k_types[counts[kind]] = m.K;
         auto& b = batch[kind].j[counts[kind]++];
         b.w = m.raw; b.ld = row_stride(m); b.x = job.xf; b.xcs = job.xf_cs ? job.xf_cs : size_t(m.k);
         b.y = job.y; b.ycs = job.y_cs ? job.y_cs : size_t(m.n); b.bias = job.bias; b.alpha = job.alpha;
@@ -313,8 +319,23 @@ unsigned mv_batch(const x3::MvJob* jobs, int n, sycl::queue& s) {
             mv_detail::launch<32>(kind != 0, batch[kind], counts[kind], max_n[kind], max_cols[kind], aligned[kind], warps[kind], s);
         else mv_detail::launch<16>(kind != 0, batch[kind], counts[kind], max_n[kind], max_cols[kind], aligned[kind], warps[kind], s);
     }
-    if (caps.subgroup == 32) mv_detail::launch_iq<iq::kQ5_K, 32>(batch[2], counts[2], max_n[2], max_cols[2], warps[2], s);
-    else mv_detail::launch_iq<iq::kQ5_K, 16>(batch[2], counts[2], max_n[2], max_cols[2], warps[2], s);
+    for (unsigned left = (1u << counts[2]) - 1; left;) {   // a launch for each K type among the jobs
+        int type = 0, count = 0, rows = 0, cols = 0;
+        mv_detail::Jobs group;
+        for (int j = 0; j < counts[2]; ++j) {
+            if (!(left >> j & 1u) || (count && k_types[j] != type)) continue;
+            type = k_types[j];
+            group.j[count++] = batch[2].j[j];
+            rows = std::max(rows, batch[2].j[j].n); cols = std::max(cols, batch[2].j[j].ncol);
+            left &= ~(1u << j);
+        }
+        iq::sycl_decode::dispatch(type, [&](auto t) {
+            if constexpr (kMvNoTable<t.value>) {
+                if (caps.subgroup == 32) mv_detail::launch_iq<t.value, 32>(group, count, rows, cols, warps[2], s);
+                else mv_detail::launch_iq<t.value, 16>(group, count, rows, cols, warps[2], s);
+            }
+        });
+    }
     if (counts[3]) {
         iq::MvJob jobs_iq[x3::kMaxMvJobs] = {};
         for (int i = 0; i < counts[3]; ++i) {
