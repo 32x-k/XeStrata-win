@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <stdexcept>
@@ -28,7 +29,7 @@ struct SafeTensor {
 
 class SafeTensors {
 public:
-    explicit SafeTensors(const std::string& path) : path_(path), f_(path, std::ios::binary) {
+    explicit SafeTensors(const std::string& path) : path_(path), f_(utf8_stream(path)) {
         if (!f_) throw std::runtime_error("cannot open " + path);
         uint64_t n = 0;
         f_.read(reinterpret_cast<char*>(&n), 8);
@@ -102,6 +103,16 @@ public:
     }
 
 private:
+    // the file's stream: on Windows a narrow path is opened in the system's codepage, and the engine's paths are
+    // UTF-8 (a request's, decoded), so the wide form is given (as moss_text.cpp's reads do); elsewhere the path as
+    // it is
+    static std::ifstream utf8_stream(const std::string& path) {
+#ifdef _WIN32
+        return std::ifstream(std::filesystem::path(std::u8string(path.begin(), path.end())), std::ios::binary);
+#else
+        return std::ifstream(path, std::ios::binary);
+#endif
+    }
     // #30: the character at i, or '\0' past the end (a header cut short reads as one that ends there)
     static char at(const std::string& h, size_t i) { return i < h.size() ? h[i] : '\0'; }
     void ws(const std::string& h, size_t& i) {

@@ -451,7 +451,12 @@ public:
 private:
     void open() {
 #ifdef _WIN32
-        HANDLE h = CreateFileA(path_.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+        // a path is UTF-8 in the engine (a request's, decoded): to UTF-16 for CreateFile, or a name with
+        // non-ASCII characters (a Japanese adapter file's) opens as mojibake and fails
+        const int wlen = MultiByteToWideChar(CP_UTF8, 0, path_.c_str(), -1, nullptr, 0);
+        std::wstring wpath((size_t) (wlen > 0 ? wlen : 1), L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, path_.c_str(), -1, wpath.data(), wlen);
+        HANDLE h = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                                FILE_ATTRIBUTE_NORMAL, nullptr);
         if (h == INVALID_HANDLE_VALUE) throw std::runtime_error("cannot open " + path_);
         LARGE_INTEGER size{};
