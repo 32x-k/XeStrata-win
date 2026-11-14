@@ -36,13 +36,20 @@ inline Result last_error() { return Result::error; }
 // A model owns the handle; the runtime owns its in-order queue and context. Kernel APIs receive the queue itself.
 struct Queue {
     gpu::Stream handle = nullptr;
+    // The stream's queue, resolved on first use: owner_of_stream is a mutex and a scan of every runtime's streams,
+    // paid per kernel launch otherwise.  Only a real stream is cached: the null one's queue is the current device's
+    // compute queue, and the current device can change.  A copy carries the resolved queue with it.
+    mutable sycl::queue* resolved = nullptr;
     Queue() = default;
     Queue(std::nullptr_t) {}
     explicit Queue(gpu::Stream s) : handle(s) {}
     operator sycl::queue&() const {
-        auto* owner = handle ? core::Runtime::owner_of_stream(handle) : &core::Runtime::get();
+        if (resolved) return *resolved;
+        if (!handle) return core::Runtime::get().stream(nullptr);
+        auto* owner = core::Runtime::owner_of_stream(handle);
         if (!owner) throw core::DeviceError("DeepSeek queue has no owning runtime");
-        return owner->stream(handle);
+        resolved = &owner->stream(handle);
+        return *resolved;
     }
     explicit operator bool() const { return handle != nullptr; }
     bool operator==(std::nullptr_t) const { return handle == nullptr; }
@@ -58,7 +65,7 @@ inline Result device_count(int* n) {
     return checked("device_count", [&] { *n = core::Runtime::count(); return result(true); });
 }
 inline Result device_sync() { return result(gpu::device_sync()); }
-inline Result stream_create(Queue* q, bool high_priority = false) { q->handle = gpu::stream_create(high_priority); return result(q->handle != nullptr); }
+inline Result stream_create(Queue* q, bool high_priority = false) { q->handle = gpu::stream_create(high_priority); q->resolved = nullptr; return result(q->handle != nullptr); }
 inline Result stream_destroy(Queue q) { gpu::stream_destroy(q.handle); return Result::success; }
 inline Result stream_sync(Queue q) { return result(gpu::stream_sync(q.handle)); }
 inline Result stream_status(Queue q) { return result(gpu::stream_status(q.handle)); }

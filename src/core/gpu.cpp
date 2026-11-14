@@ -26,6 +26,8 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #if defined(_WIN32)
@@ -122,18 +124,33 @@ sycl::event memset_pieces(sycl::queue& queue, void* dst, int value, size_t bytes
     for (size_t o = 0; o < bytes; o += kPiece) e = queue.memset((uint8_t*) dst + o, value, std::min(kPiece, bytes - o));
     return e;
 }
+// The stream->owner lookup behind q()/rt_of(): owner_of_stream is a mutex and a scan of every runtime's streams,
+// paid on each launch, copy and event call otherwise.  Each stream's lookup is kept per thread and stream_destroy
+// drops it; a stream not used after it is destroyed keeps its queue's lookup, which still resolves to the queue it
+// always did (a use after destroy is one whether the lookup was cached or not).  An address a new stream reuses
+// resolves to the new queue, the right one.
+thread_local std::unordered_set<const void*> g_q_valid;
+thread_local std::unordered_map<const void*, core::Runtime*> g_stream_owner;
+
 // A stream is a queue of the device it was created on, whichever device is current (null: the current device's
 // compute queue).
 sycl::queue& q(Stream s) {
     if (!s) return rt().stream(nullptr);
-    core::Runtime* owner = core::Runtime::owner_of_stream(s);
-    if (!owner) throw core::DeviceError("the stream is not a queue of the Xe runtime");
-    return owner->stream(s);
+    if (!g_q_valid.contains(s)) {
+        if (!core::Runtime::owner_of_stream(s))
+            throw core::DeviceError("the stream is not a queue of the Xe runtime");
+        g_q_valid.insert(s);
+    }
+    return *static_cast<sycl::queue*>(s);   // Runtime::stream(s) returns *q after the check the cache stands for
 }
 core::Runtime& rt_of(Stream s) {
     if (!s) return rt();
+    auto it = g_stream_owner.find(s);
+    if (it != g_stream_owner.end()) return *it->second;
     core::Runtime* owner = core::Runtime::owner_of_stream(s);
-    return owner ? *owner : rt();
+    if (!owner) return rt();
+    g_stream_owner.emplace(s, owner);
+    return *owner;
 }
 
 
@@ -184,6 +201,8 @@ Stream stream_create_copy() {
 void stream_destroy(Stream s) {
     try { rt_of(s).destroy_stream(static_cast<sycl::queue*>(s)); }
     catch (const std::exception& e) { fail("stream_destroy", e); }
+    g_q_valid.erase(s);
+    g_stream_owner.erase(s);
 }
 
 bool stream_sync(Stream s) {
