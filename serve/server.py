@@ -1090,6 +1090,13 @@ class StrataEngine:
                 except OSError:
                     pass
                 break                           # publish EOF, never the trailing DONE
+            # END (dsv41, ahead of a request's DONE): a GPU's state is unknown and the engine ends once that DONE
+            # is out - taken as ended now, so the next request, even one already waiting, starts a fresh engine
+            # instead of writing to this one while it exits
+            if line.startswith("END "):
+                print("[strata] " + line[4:].strip(), flush=True)
+                self.ended = True
+                continue
             if line.startswith(("BT ", "BDONE ")) and slot_q:   # --batch: a batch slot's own lines
                 try:
                     slot_q[int(line.split()[1])].put(line)
@@ -1114,7 +1121,8 @@ class StrataEngine:
             q.put(None)
 
     def death_note(self) -> str:
-        """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), else RAM."""
+        """Why the engine most likely ended, from the end of its log: its own watchdog (issue #29), a GPU's fault it
+        caught after a request (exit 3), else RAM."""
         if self.silent_note:                            # #481: the server ended it, not the OS or the engine itself
             return self.silent_note
         tail = wide = ""
@@ -1133,6 +1141,11 @@ class StrataEngine:
             if "issue #29" in line:
                 return ("The engine stopped itself because it had stopped making progress - a hang it caught. Its log "
                         "line: " + line.strip() + " - please report it at github.com/Niko1221/Strata/issues.")
+            if "a GPU's state is unknown" in line:
+                return ("The engine stopped itself because a GPU took a fault inside a kernel (an illegal address or "
+                        "the like), after which that GPU's state is lost; a fresh engine starts with the next "
+                        "request. Its log line: " + line.strip() + " - the lines above it name the GPU and the "
+                        "error; please report it at github.com/Niko1221/Strata/issues.")
         proc = self.proc                                 # None while a restart has not started the next one yet
         rc = proc.poll() if proc is not None else None
         if rc is not None and rc >= 0 and self.last_err:  # its own last words on stdout: they say why
@@ -2048,6 +2061,8 @@ class StrataEngine:
         has gone.  A consumer that stops early (or `cancel`) makes the engine STOP, so it does not run to max_new."""
         if not self.alive():
             raise EngineDied("the engine is unavailable; this request was not sent")
+        # ignore_eos (vLLM's and llama.cpp's): the tokens that end a reply are banned, through the logit bias
+        bias_api.apply_ignore_eos(sampling or {}, self, set(self.eos_ids or ()) | EOS_IDS)
         bias_api.validate_request(sampling or {}, self, None)
         if getattr(self, "batch", 0):
             yield from self.generate_batched(ids, max_new, sampling, cancel, embeddings)

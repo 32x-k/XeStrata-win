@@ -260,6 +260,9 @@ struct Req {
     float cum = -1.0f;      // dspark_cum=F: the cut on the product of the confidences (-1: the engine's, dspark_cum_default)
     std::string file;   // GENI: the pictures
     std::vector<int> ids;
+    // logit_bias=<id>:<bias>,... (OpenAI's logit_bias; the server's ignore_eos bans the end tokens with -100): added
+    // to the logits of every pick of the answer (Model::set_logit_bias); none: the picks exactly as without
+    std::vector<std::pair<int, float>> bias;
 };
 
 // A prompt's picture: where its span starts, its pixels (the server's resize: RGB rows, both sides multiples of the
@@ -355,13 +358,35 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
         else if (k == "dspark_conf") r.conf = std::strtof(v.c_str(), nullptr);
         else if (k == "pin") r.pin = std::atoll(v.c_str());
         else if (k == "dspark_cum" || k == "spec_cum") r.cum = std::strtof(v.c_str(), nullptr);
+        else if (k == "logit_bias") {   // <id>:<bias>,... (the server checked them: ids in the vocabulary, -100..100)
+            size_t at = 0;
+            while (at < v.size()) {
+                const size_t end = std::min(v.find(',', at), v.size()), colon = v.find(':', at);
+                if (colon != std::string::npos && colon < end)
+                    r.bias.emplace_back(std::atoi(v.substr(at, colon - at).c_str()),
+                                        std::strtof(v.substr(colon + 1, end - colon - 1).c_str(), nullptr));
+                at = end + 1;
+            }
+        }
     }
     return !r.ids.empty() && (!geni || !r.file.empty());
 }
 
+// upstream 8c34c00: a request that left a GPU in a fault (every later call on it fails) can serve no later one -
+// END ahead of the request's DONE marks the engine ended to the server, which starts a fresh one, and once the
+// DONE is out the engine exits 3
+bool end_broken(strata::ds4::Model& m) {
+    if (!m.broken()) return false;
+    std::printf("END a GPU's state is unknown after this request - the engine ends (exit 3); the next request "
+                "starts a fresh one\n");
+    // (on stderr too: stdout is the protocol, the server's death_note reads the engine's stderr log)
+    std::fprintf(stderr, "ds4 serve: a GPU's state is unknown after this request - the engine ends (exit 3)\n");
+    return true;
+}
 int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min, const std::string& pack) {
     std::vector<int> eos = parse_ids(eos_list);
     for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
+    std::printf("INFO logit_bias=1\n");   // (GEN logit_bias=<id>:<bias>,...: added to the logits of every pick)
     std::printf("READY %lld stop\n", (long long) m.max_context());
     std::fflush(stdout);
     std::fprintf(stderr, "strata-dsv41 serve: GEN <max_new> [keys] <ids>; GENI <max_new> [keys] <pictures> <ids>; SAVE / RESTORE <path>; STOP, QUIT\n");
@@ -685,6 +710,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         std::signal(SIGTERM, SIG_IGN);
         std::signal(SIGINT, SIG_IGN);
         std::signal(SIGPIPE, SIG_IGN);
+#else
+        // (Windows sends a console's Ctrl+C and Ctrl+Break to every process on it, the engine too; the server stops
+        // on them and ends the engine with QUIT - upstream 4df5f9d)
+        std::signal(SIGINT, SIG_IGN);
+        std::signal(SIGBREAK, SIG_IGN);
 #endif
     }
     // WP-8's option (1): the post-prompt cache settle runs in the gaps between requests and gives way the moment one arrives
@@ -878,8 +908,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                         e = "a picture's span does not start at an image token of the prompt";
             if (!e.empty()) {
                 std::printf("ERR %s\n", e.c_str());
+                const bool broken = end_broken(m);
                 std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", r.ids.size());
                 std::fflush(stdout);
+                if (broken) std::exit(3);
                 continue;
             }
         }
@@ -1026,15 +1058,19 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
             std::fprintf(stderr, "ds4 serve: stopped while reading the prompt of %zu tokens, after %.0f ms%s\n",
                          total, now_ms() - t0, back ? "; the conversation before it is kept" : "");
+            const bool broken = end_broken(m);
             std::printf("DONE 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0\n", r.ids.size(), now_ms() - t0, back ? from : (size_t) 0);
             std::fflush(stdout);
+            if (broken) std::exit(3);
             continue;
         }
         if (!ok) {
             std::fprintf(stderr, "ds4: %s\n", err.c_str());
             std::printf("ERR %s\n", err.c_str());
+            const bool broken = end_broken(m);
             std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", r.ids.size());
             std::fflush(stdout);
+            if (broken) { std::fflush(stdout); std::exit(3); }
             m.reset();
             held.clear();
             continue;
@@ -1048,6 +1084,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         const long long limit = r.max_new > 0 ? r.max_new : m.max_context() - (long long) r.ids.size();
         long long d_off = 0, d_acc = 0;
         bool cool = false;
+        m.set_logit_bias(r.bias);
         int tok = m.sample(r.temperature, r.top_p, r.top_k, r.min_p, r.seed, counter++);
         std::vector<int> got;
         // STAT for the Monitor every 8 tokens and at the end, over this answer so far: the GLM engine's keys (speed, the
@@ -1140,9 +1177,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         //  the checkpoint at this prompt's end)
         stat_line();
         const double t2 = now_ms();
+        const bool broken = end_broken(m);
         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", produced, r.ids.size(), t1 - t0, t2 - t1, finish,
                     d_acc, d_off, from);
         std::fflush(stdout);
+        if (broken) std::exit(3);
         const auto& s = m.stats();
         std::fprintf(stderr,
                      "strata-dsv41 serve: prompt %zu tokens = %zu reused + %zu read in %.0f ms (%.1f tok/s), %lld generated "

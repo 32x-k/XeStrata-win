@@ -122,3 +122,32 @@ def validate_request(req, engine, vocab_size):
         if getattr(engine, "batch", 0):
             raise ValueError("logit_bias: continuous batching is not supported; run without --batch")
     return normalized
+
+
+def apply_ignore_eos(sampling, engine, stop_ids):
+    """ignore_eos (vLLM's and llama.cpp's, upstream 807f3f0): the tokens that end a reply are banned, so the answer
+    runs to its token cap - as llama.cpp does it, through the logit bias, so the text past the model's natural end
+    stays text it would write.  `sampling` is the request (its logit_bias merges with the bans, an explicit one wins
+    over a ban of the same token); `stop_ids` are the tokens that end a reply (the tokenizer's stop ids and the
+    engine's defaults)."""
+    ignore = sampling.get("ignore_eos")
+    if ignore is None:
+        return
+    if not isinstance(ignore, bool):
+        raise ValueError("ignore_eos: true or false")
+    if not ignore:
+        return
+    try:
+        limit = int(sampling.get("max_completion_tokens") or sampling.get("max_output_tokens")
+                    or sampling.get("max_tokens") or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    if limit <= 0:
+        raise ValueError("ignore_eos: needs max_tokens (the answer would run until the context is full)")
+    if getattr(engine, "info", {}).get("logit_bias") != 1:
+        raise ValueError("ignore_eos: this engine does not apply token biases; update the engine (it reports "
+                         "logit_bias=1)")
+    if getattr(engine, "batch", 0):
+        raise ValueError("ignore_eos: continuous batching is not supported; run without --batch")
+    bias = normalize(sampling.get("logit_bias"))
+    sampling["logit_bias"] = {**bias, **{t: -100.0 for t in sorted(stop_ids)}}

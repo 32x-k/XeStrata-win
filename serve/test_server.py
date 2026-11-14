@@ -5726,3 +5726,50 @@ class PrepareCancelled(unittest.TestCase):
             ids, _, _ = svc.prepare(self.msgs(), None, {}, cancel=threading.Event())
             self.assertEqual(ids.count(ByteTokenizer().encode("<|image_pad|>", parse_special=True)[0]), 6)
             svc.embeddings.path.unlink(missing_ok=True)
+class EngineEndTests(unittest.TestCase):
+    """An engine that ends itself (dsv41 after a GPU's fault): the server takes it as ended from its END line, and
+    why it ended, as the server prints it for a request it took down, comes from the end of its log."""
+
+    def note(self, tail: str, returncode=3) -> str:
+        from types import SimpleNamespace
+        from serve.server import StrataEngine
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "engine.log")
+            with open(log, "w", encoding="utf-8") as f:
+                f.write(tail)
+            e = StrataEngine.__new__(StrataEngine)
+            e.silent_note, e.last_err = None, None
+            e.log_path = log
+            e.proc = SimpleNamespace(poll=lambda: returncode)
+            return e.death_note()
+
+    def test_a_gpu_fault_the_engine_caught_is_not_read_as_ram(self):
+        n = self.note("ds4: device 0: an illegal memory access was encountered - the device's state is unknown" + chr(10) +
+                      "END a GPU's state is unknown after this request - the engine ends (exit 3); the next request "
+                      "starts a fresh one" + chr(10))
+        self.assertIn("a GPU took a fault inside a kernel", n)
+        self.assertIn("the engine ends (exit 3)", n)
+        self.assertNotIn("RAM", n)
+
+    def test_end_ahead_of_done_marks_the_engine_ended_before_the_request_ends(self):
+        from types import SimpleNamespace
+        from serve.server import StrataEngine
+        e = StrataEngine.__new__(StrataEngine)
+        e.proc = SimpleNamespace(stdout=io.StringIO("ERR a copy failed: an illegal memory access was encountered" + chr(10) +
+                                                    "END a GPU's state is unknown after this request - the engine "
+                                                    "ends (exit 3); the next request starts a fresh one" + chr(10) +
+                                                    "DONE 0 12 0.0 0.0 cancel 0 0 0 0 0" + chr(10)),
+                                 poll=lambda: None)
+        e.lines, e.ended, e.last_err = queue.Queue(), False, None
+        e._pump()
+        got = []
+        while (line := e.lines.get_nowait()) is not None:
+            got.append(line.split()[0])
+        self.assertEqual(got, ["ERR", "DONE"])           # END is the server's, not the request's
+        self.assertTrue(e.ended)
+        self.assertFalse(e.alive())                      # (the process may still be exiting: the next request restarts)
+
+    def test_the_watchdog_and_ram_notes_are_unchanged(self):
+        self.assertIn("a hang it caught", self.note("ds4: no progress for 600 s during a request - stopping "
+                                                    "the engine so the server starts it again (issue #29)" + chr(10)))
+        self.assertIn("running out of RAM", self.note("ds4: something else" + chr(10), returncode=None))
