@@ -200,8 +200,8 @@ class DsmlOutputParser(OutputParser):
             props[name] = {**(props.get(name) or {}), "type": "string"}
             params["properties"] = props
             self.schemas[tool] = {**spec, "parameters": params}
-        if self.scall is not None and self.scall.name == tool:
-            self.sdeclared[name] = "string"
+        if self.scall is not None and self.scall.name == tool:   # (the call being streamed: its parameter's schema too)
+            self.sprops = {**self.sprops, name: {**(self.sprops.get(name) or {}), "type": "string"}}
 
     def feed(self, delta: str):
         return self._watch(super().feed(self.dsml.feed(delta)))
