@@ -2574,13 +2574,18 @@ struct Model::Impl {
                         rt::DeviceProperties ip{};
                         if (rt::device_properties(&ip, dv.id) == rt::Result::success && ip.integrated) integrated = true;
                     }
-                    // Two or more devices with F16 matrix engines use faster defaults when they hold at least half the experts.
+                    // Two or more devices with F16 matrix engines use faster defaults when they hold at least half the experts;
+                    // one card does too (upstream's rdna4() is matrix_capable() here - by capability, not by model name).
                     const bool multi_f16_devices = matrix_capable() && devs.size() >= 2 && gpu_expert_share() >= 0.5;
-                    const int n = experts_test_override(experts_per_word(o.experts, vram_all, l.k_exp, integrated, multi_f16_devices, defaults_026()), l.k_exp);
+                    const bool single_f16_device = matrix_capable() && devs.size() == 1;
+                    const int n = experts_test_override(experts_per_word(o.experts, vram_all, l.k_exp, integrated, multi_f16_devices,
+                                                                       defaults_026(), single_f16_device), l.k_exp);
                     experts_used = n;
                     if (n < l.k_exp)
                         std::fprintf(stderr, "ds4: experts per word: %d (%s; full quality: --experts %d)\n", n,
-                                     o.experts >= 1 ? "as asked" : multi_f16_devices ? "faster mode: the cards hold most of the experts" : "faster mode", l.k_exp);
+                                     o.experts >= 1 ? "as asked" : multi_f16_devices ? "faster mode: the cards hold most of the experts" :
+                                     single_f16_device && !integrated && vram_all > kFasterModeVramMax ?
+                                     "faster mode: one matrix card, the CPU lane does most of the experts" : "faster mode", l.k_exp);
                     else if (o.experts >= 1)
                         std::fprintf(stderr, "ds4: experts per word: %d (full quality)\n", n);
                 }
