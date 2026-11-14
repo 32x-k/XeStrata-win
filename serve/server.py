@@ -2971,6 +2971,10 @@ def deepseek_engine_args(cfg: dict) -> list[str]:
             raise ValueError("DeepSeek-V4.1 --gpus must name one SYCL GPU index")
     if not positions and cards and not cfg.get("gpu_pci"):
         args += ["--gpus", str(cards[0])]
+    # #533 (the opt-in from engine_args, which this engine's args bypass): "vram_elastic": true - the expert
+    # cache resizable through POST /v1/vram (no --vram-segment-mib: this engine sizes its own pieces)
+    if cfg.get("vram_elastic") is True and "--vram-elastic" not in args:
+        args.append("--vram-elastic")
     return args
 
 
