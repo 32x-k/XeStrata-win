@@ -24,12 +24,28 @@ inline bool defaults_026() {
     return on;
 }
 
-// A smaller expert count changes the model's answer, so it is selected only by the explicit request.
-inline int experts_per_word(int requested, uint64_t vram_bytes, int model_k, bool integrated = false,
-                            bool matrix_engines = false, bool v026 = false) {
-    (void) vram_bytes, (void) integrated, (void) matrix_engines, (void) v026;
+constexpr uint64_t kFasterModeVramMax = 16ull << 30;   // GiB of graphics memory in all, at most
+constexpr int kFasterModeExperts = 5;
+
+// requested: --experts (-1: not given, the rule decides); vram_bytes: the total memory of the cards the engine uses;
+// model_k: the experts a word takes in the model; integrated: a GPU that shares the PC's RAM (Strix Halo: part of the experts live only on
+// the SSD, each expert dropped is less read - measured 5 against 6 on a Radeon 8065S: decode +11..13%, prompts +5..7%).  The result is in 1 .. model_k.
+// multi_rdna4: two or more RDNA4 cards (gfx1200 / gfx1201: R9700, RX 9000) that together hold at least half of the routed experts - the 4 x R9700 box
+// the Marlin stream measured: 5 against 6 experts, 2.25 bpw, 8K prompt 1339 -> 1419 ppts (+6%) and decode 78.1 -> 81.2 tok/s (+4%), reference KL
+// 0.10987 against 0.10833 and top-1 87.59% against 87.53% (the gate is 0.006).  Faster mode there too, by default.
+// single_rdna4: ONE RDNA4 card (a 32 GB R9700 holds under a fifth of a 2.25 bpw set, the CPU lane does the rest: 29-65% of the experts, 12-18 tok/s).
+// 1 x R9700 on p620 (125 GB RAM), 2.25 bpw, frozen profile, 5 interleaved pairs, 5 against 6 experts: decode 15.24 against 13.08 tok/s (+16%, 5 of 5
+// pairs), a scripted agent loop -24% wall time (5 of 5), the long-read loop -12% (5 of 5); KL against the 6-expert run 0.030 (6 against 6: 0.008),
+// against the original model 0.1106 against 0.1067-0.1071.  The multi-card rule above needs the cards to hold half of the experts; this one does not.
+// (the SYCL port derives the rdna4 flags from the devices' reported F16 matrix engines, matrix_capable(), not the arch name)
+inline int experts_per_word(int requested, uint64_t vram_bytes, int model_k, bool integrated = false, bool multi_rdna4 = false,
+                            bool v026 = false, bool single_rdna4 = false) {
     if (model_k <= 1) return model_k;
-    return requested > 0 ? std::min(requested, model_k) : model_k;
+    if (v026) multi_rdna4 = single_rdna4 = false;   // 0.2.6: Faster by default on a small card or an integrated GPU only
+    int n = requested;
+    if (n < 1) n = integrated || multi_rdna4 || single_rdna4 || (vram_bytes != 0 && vram_bytes <= kFasterModeVramMax) ? kFasterModeExperts : model_k;
+    if (n > model_k) n = model_k;
+    return n < 1 ? 1 : n;
 }
 
 // budget_bytes is the available scratch budget after persistent tensors and memory reserves.
