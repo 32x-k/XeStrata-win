@@ -8097,10 +8097,10 @@ def make_handler(svc: Service):
             asked = req.get("max_tokens")                     # Anthropic's required field (the shared settings' own
             if isinstance(asked, bool) or not isinstance(asked, int) or asked < 1:   # default does not stand in)
                 raise ValueError("max_tokens: a whole number of 1 or more is required")
-            svc.load()
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
-            self._no_local_images(messages)
+            self._no_local_images(messages)   # (before the load: a refused picture loads no model)
+            svc.load()
             if tool_choice_of(req.get("tool_choice"))[0] == "none":   # Anthropic's {"type": "none"}: no tools offered
                 tools = None
             force = forced_call(req.get("tool_choice"), tools,        # "any" / {"type": "tool", "name": N}

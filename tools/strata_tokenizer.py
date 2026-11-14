@@ -270,7 +270,7 @@ class Tokenizer:
             raise ValueError("tokenizer.json's pre-tokenizer regex does not compile: %s" % e)
         hits = []
         for name, (pattern, im, _where) in PRE_TYPES.items():
-            if im != ignore_merges:
+            if im != ignore_merges or not isinstance(pattern, str):   # (DeepSeek's splits in turn: no one regex)
                 continue
             if all(theirs.findall(s) == regex.compile(pattern).findall(s) for s in _PRE_PROBES):
                 hits.append(name)

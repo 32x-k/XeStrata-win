@@ -38,6 +38,21 @@ int kbits_of(int type) {
 }
 constexpr int kActTq = 100;   // IqCpu::gu_act / d_act of these types: the layout below
 
+// The 32 states of a block of 32 steps of KB bits (KB 4 to 7): the 16 stream bits from bit (31 - t)*KB, LSB first,
+// circular modulo 32*KB bits, masked to 15 bits - upstream Strata's tq_states<KB> (src/kernels/cpu/tq_states.hpp),
+// which now takes the ggml trellis types (144-149) and has no 4- and 5-bit blocks of 32 steps.
+template <int KB>
+inline void states32(const uint8_t* qs, uint32_t* st) {
+    namespace td = kc::tq_detail;
+    constexpr int NB = 4 * KB;
+    const uint64_t wrap = (uint64_t) td::tq_ld32(qs + NB - 4) | ((uint64_t) td::tq_ld32(qs) << 32);
+    for (int t = 0; t < 32; ++t) {
+        const int off = (31 - t) * KB, b = off >> 3;
+        const uint32_t v = b + 4 <= NB ? td::tq_ld32(qs + b) >> (off & 7) : (uint32_t) (wrap >> (off - 8 * (NB - 4)));
+        st[t] = v & td::kTqStateMask;
+    }
+}
+
 // an activation of k values: k / 32 F32 scales, then k int8
 size_t act_bytes_of(int k) { return (size_t) k / 32 * 4 + (size_t) k; }
 
@@ -72,10 +87,10 @@ void dots(int type, const uint8_t* w, size_t rb, int n, const void* const* act, 
         }
         switch (kc::tq_isa()) {
 #if defined(__x86_64__) || defined(_M_X64)
-            case kc::TqIsa::avx512: kc::tq_detail::tq_rows_avx512(kb, w, rb, n, ap, nt, out, r0, r1); return;
-            case kc::TqIsa::avx2: kc::tq_detail::tq_rows_avx2(kb, w, rb, n, ap, nt, out, r0, r1); return;
+            case kc::TqIsa::avx512: kc::tq_detail::tq_rows_avx512(type, w, rb, n, ap, nt, out, r0, r1); return;
+            case kc::TqIsa::avx2: kc::tq_detail::tq_rows_avx2(type, w, rb, n, ap, nt, out, r0, r1); return;
 #endif
-            default: kc::tq_detail::tq_rows_scalar(kb, w, rb, n, ap, nt, out, r0, r1); return;
+            default: kc::tq_detail::tq_rows_scalar(type, w, rb, n, ap, nt, out, r0, r1); return;
         }
     }
     const int16_t* table = state_table(type);
@@ -89,10 +104,10 @@ void dots(int type, const uint8_t* w, size_t rb, int n, const void* const* act, 
                 const float d = kc::tq_detail::tq_half_to_float(kc::tq_detail::tq_ld16(block));
                 uint32_t states[32];
                 switch (kb) {
-                    case 4: kc::tq_detail::tq_states<4>(block + 2, states); break;
-                    case 5: kc::tq_detail::tq_states<5>(block + 2, states); break;
-                    case 6: kc::tq_detail::tq_states<6>(block + 2, states); break;
-                    default: kc::tq_detail::tq_states<7>(block + 2, states); break;
+                    case 4: states32<4>(block + 2, states); break;
+                    case 5: states32<5>(block + 2, states); break;
+                    case 6: states32<6>(block + 2, states); break;
+                    default: states32<7>(block + 2, states); break;
                 }
                 for (int k = 0; k < 4; ++k) {
                     int32_t sum = 0;
