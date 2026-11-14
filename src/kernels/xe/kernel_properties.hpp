@@ -16,7 +16,8 @@ namespace sycl::ext::oneapi::experimental::detail {
 template<size_t N> struct HasCompileTimeEffect<strata::kernels::xe::kernel_properties::FlatKey::value_t<N>>:std::true_type {};
 template<size_t N> struct PropertyMetaInfo<strata::kernels::xe::kernel_properties::FlatKey::value_t<N>> {
  static constexpr const char* name="amdgpu-flat-work-group-size";
- static constexpr const char* value=SizeListToStr<1,N>::value;
+ // Newer LLVM requires the flat range to equal the product of reqd_work_group_size.
+ static constexpr const char* value=SizeListToStr<N,N>::value;
 };
 }
 namespace strata::kernels::xe::kernel_properties {
