@@ -84,6 +84,9 @@ public:
     virtual void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) = 0;
     virtual void set_head_sampling(bool on) = 0;
     virtual bool set_logit_bias(const std::vector<float>& bias, std::string& err) = 0;
+    /// The grammar's allowed tokens for the next window's T rows (host bitmask rows), uploaded on the last stage's
+    /// device; null clears them.
+    virtual bool set_allowed(const uint32_t* rows, int T, std::string& err) = 0;
     /// Same process: the penalty rows the last stage's head reads, a buffer the engine fills before every window.
     virtual void set_history(const int32_t* history, int history_len) = 0;
     virtual bool read_logits(int rows, float* host, std::string& err) const = 0;
@@ -116,6 +119,7 @@ public:
     void set_slot_sampling(int slot, const strata::kernels::SamplerParams& sp) override;
     void set_head_sampling(bool on) override;
     bool set_logit_bias(const std::vector<float>& bias, std::string& err) override;
+    bool set_allowed(const uint32_t* rows, int T, std::string& err) override;
     void set_history(const int32_t* history, int history_len) override;
     bool read_logits(int rows, float* host, std::string& err) const override;
     bool copy_logits(int t, float* host) const override;
@@ -167,10 +171,15 @@ public:
     void set_sampling(const strata::kernels::SamplerParams& sp) {
         sampling_ = sp;   // row t of a window at pos0 draws Philox(seed, pos0 + t): see run()
         sampling_.logit_bias = logit_bias_host_.empty() ? nullptr : logit_bias_device_;
+        sampling_.allowed = allowed_on_ ? allowed_device_ : nullptr;
         if (next_) next_->set_sampling(sp);
     }
     // One request's fixed vocabulary bias. Empty clears it; copied only when changed, on the final stage's device.
     bool set_logit_bias(const std::vector<float>& bias, std::string& err);
+    // Grammar-constrained decoding (src/core/grammar.cpp): row t's allowed tokens for the next window, T rows of
+    // (n_vocab + 31) / 32 words from the host, copied before every window to the final stage's device.  Null clears
+    // them; set, the head samples outside the captured graph as for a logit_bias.
+    bool set_allowed(const uint32_t* rows, int T, std::string& err);
 
     /// The penalty histories for `sampling_.penalty_last_n`: ONE ROW PER WINDOW ROW, T rows of `history_len`
     /// int32 slots at that stride (`strata::kernels::penalty_rows` builds them), most recent token LAST, unused
@@ -200,6 +209,9 @@ public:
     void set_stage(int64_t layer_begin, int64_t layer_end, const float* handoff_in, float* handoff_out) {
         lb_ = layer_begin; le_ = layer_end; hand_in_ = handoff_in; hand_out_ = handoff_out;
     }
+    /// The rows the hand-off buffers of `set_stage` hold (0: kVerifyMaxT, the default).  STRATA_PIPED_MTP's groups write
+    /// their slots' token and proposal rows at hbase = group * rows-per-group, past kVerifyMaxT with enough slots.
+    void set_handoff_rows(int rows) { handoff_rows_ = rows; }
     /// The next stage: `run` and `commit` continue into it (its pool calls get `next_user`); sampling settings
     /// and `final_R` are the last stage's.  Everything goes through a StageLink (an InProcessStage here).
     void set_next(Verifier* next, void* next_user) {
@@ -306,6 +318,28 @@ public:
     int batch_poll(PoolMultiFn pool, void* user, std::string& err);
     bool batch_busy() const { return b_running_; }
     const int32_t* batch_out() const { return b_out_; }
+    // ---- STRATA_PIPED_MTP (upstream 17878ac57): the pipelined groups with --batch-mtp's drafts.  A group's window holds
+    // each of its slots' token and proposals, so how many rows to keep is known only once the LAST stage has picked -
+    // and by then this stage may run another group's window, which reuses the scratch the commit replays from.  So
+    // right behind the window a save graph copies those rows (each GDN layer's conv and recurrence inputs, each QSA
+    // layer's raw indexer keys, the PLE history snapshot) to the group's own rows [hbase, hbase + S) of the saved
+    // buffers, and the commit, queued after the verdict, replays from there.  Everything else the commit reads is per
+    // slot already.
+    /// The saved buffers for `rows` hand-off rows (after init_slots).
+    bool init_deferred_commit(int rows, std::string& err);
+    bool deferred_commit_on() const { return dc_rows_ > 0; }
+    /// The window over the slots `rows` (a slot's rows contiguous) at hand-off rows [hbase, hbase + S), its save right
+    /// behind it, and no commit (batch_commit_rows, after the verdict).  The PLE history advances at the commit.
+    bool batch_launch_rows(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
+                           std::string& err);
+    /// The commit of that window's accepted prefixes, `keep` per slot ID (1..the slot's rows), in two halves: the host's
+    /// (the accepted prefixes staged, the PLE hash's last two tokens) now, and `batch_commit_rows_submit` queueing the
+    /// graph on this stage's stream, with no host wait.  The caller submits it only while no window waits on the host
+    /// on this card (a graph queued behind such a window did not return on the B70), and before the slots' next window
+    /// on this stage.  `rows`, `S`, `hbase`, `tokens` and `pos` are the window's, as batch_launch_rows got them.
+    bool batch_commit_rows(const int* rows, int S, int hbase, const int* keep, const int32_t* tokens,
+                           const int64_t* pos, std::string& err);
+    bool batch_commit_rows_submit(const int* rows, int S, int hbase, std::string& err);
     bool last_stage() const { return g_ != nullptr && le_ == g_->n_layers; }
     /// A slot's sampling (temperature / top_p / top_k / min_p / seed; penalties are not applied in batch windows):
     /// its row is drawn again with Philox(seed, position), as a solo window draws it.  Greedy by default.  Set on
@@ -381,6 +415,8 @@ private:
     bool head_sampling_ = true;          ///< set_head_sampling
     std::vector<float> logit_bias_host_;
     float* logit_bias_device_ = nullptr;
+    uint32_t* allowed_device_ = nullptr;   ///< kVerifyMaxT rows of the grammar's mask (set_allowed)
+    bool allowed_on_ = false;
     int device_ = -1;                    ///< the device `init` ran on: run/commit switch to it (layer split)
     unsigned long long* rr_stats_ = nullptr;   ///< STRATA_ROUTE_RESIDENT: this GPU's counters (nullptr: none)
     bool device_plan_ = false;            ///< E-6: resident-only layers planned on the device (STRATA_VERIFY_DEVICE_PLAN)
@@ -423,6 +459,16 @@ private:
     int64_t last_pos_b_[8] = {};
     bool capture_batch(const int* rows, int S, int hbase, std::string& err);
     bool capture_commit_batch(const int* rows, int S, int hbase, std::string& err);
+    // STRATA_PIPED_MTP (init_deferred_commit): the saved rows, laid out as the window scratch (global layer index) with
+    // dc_rows_ rows per layer instead of max_t_; the slots' accepted prefixes (mapped and device, 2 + max_t_ per slot)
+    int dc_rows_ = 0;
+    bool staging_deferred_ = false;   ///< stage_batch for batch_launch_rows: no capture_commit_batch
+    float *dc_qkv_ = nullptr, *dc_h_ = nullptr, *dc_gate_ = nullptr, *dc_beta_ = nullptr, *dc_idx_ = nullptr;
+    float* dc_hist_ = nullptr;
+    void* dc_arena_ = nullptr;
+    int32_t *h_commitd_ = nullptr, *m_commitd_ = nullptr, *commitd_ = nullptr;
+    std::map<std::vector<int>, strata::gpu::Graph*> save_bm_, dcommit_bm_;
+    bool capture_deferred(const int* rows, int S, int hbase, std::string& err);
     bool sample_rows(int S, std::string& err);
     bool res_graph_ = false;
     bool recording_res_ = false;
@@ -430,6 +476,7 @@ private:
     bool all_resident() const;
     bool capture_res(int T, std::string& err);
     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
+    int handoff_rows_ = 0;               ///< set_handoff_rows (0: kVerifyMaxT)
     const float* hand_in_ = nullptr;
     float* hand_out_ = nullptr;
     StageLink* next_ = nullptr;          ///< set_next: the next stage, through this link only
@@ -505,6 +552,14 @@ private:
     int32_t* h_ids_ = nullptr;   int32_t* m_ids_ = nullptr;     // T * k
     int32_t* h_route_ = nullptr; int32_t* m_route_ = nullptr;   // n_layers * T * k: each layer's ids (add_routing)
     bool route_rec_ = false;
+    // STRATA_ROUTE_DUMP / STRATA_ROUTE_REPLAY (verify.cpp's RouteTrace): the routed weights beside h_route_'s ids, the
+    // replayed ids and weights (n_layers * T * k each), and the request and position the last window was in
+    float* h_rw_ = nullptr;      float* m_rw_ = nullptr;
+    int32_t* h_rpl_ids_ = nullptr; int32_t* m_rpl_ids_ = nullptr;
+    float* h_rpl_w_ = nullptr;   float* m_rpl_w_ = nullptr;
+    bool rt_dump_ = false, rt_replay_ = false;
+    int rt_req_ = -1;
+    int64_t rt_pos0_ = INT64_MAX;
     float* h_w_ = nullptr;       float* m_w_ = nullptr;         // T * k
     uint32_t* h_seq_ = nullptr;  uint32_t* m_seq_ = nullptr;
     uint32_t* h_flag_ = nullptr; uint32_t* m_flag_ = nullptr;

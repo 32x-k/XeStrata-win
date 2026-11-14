@@ -20,7 +20,7 @@ namespace strata::kernels {
 /// attn[t, h, :] = softmax(q[t, h, :] . K[c, h / G, :] / sqrt(head_dim), c <= pos0 + t) . V for the T queries at
 /// positions pos0 .. pos0 + T - 1, whose cells are already in the pools: q and attn [T, n_head, head_dim] FP32, the
 /// pools `[page][kv_head][page_size][head_dim]` FP16 through `page_table`.  False, nothing launched, for a shape it is
-/// not built for (head_dim 128 with 10 query heads a KV head, 256 with 8 or 12): the caller keeps the decode kernel.
+/// not built for (head_dim 128 with 10 query heads a KV head, 256 with 4, 8 or 12): the caller keeps the decode kernel.
 bool prompt_attn(const float* q, const uint16_t* k_pool, const uint16_t* v_pool, const int32_t* page_table,
                  int64_t pos0, int64_t T, const QsaShapes& s, float* attn, void* stream);
 

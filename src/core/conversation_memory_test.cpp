@@ -58,5 +58,20 @@ int main() {
     // Test the real provider without assuming any particular amount of free RAM.
     const auto available = available_host_bytes();
     check(!available || conversation_memory_admit(available, 0, 0), "provider returns bytes or unknown");
+    // #4518: after the load, does the PLE table's lock leave the automatic conversation cache no room?  (min free 2560 MiB,
+    // cache 40% of the rest, 8192 MiB at most, 1024 MiB at least)
+    {
+        const uint64_t table = GiB(26) + 870ull * (1ull << 20);   // IQ3_S's table, 26.8 GiB
+        const int64_t floor_mib = 2560;
+        check(!ple_lock_blocks_cache(std::nullopt, table, floor_mib), "unknown telemetry: leave the lock");
+        check(!ple_lock_blocks_cache(GiB(40), 0, floor_mib), "unknown table size: leave the lock");
+        check(ple_lock_blocks_cache(GiB(4), table, floor_mib), "4 GiB left with the table locked (cache off), 30 GiB without");
+        check(ple_lock_blocks_cache(GiB(10), table, floor_mib), "10 GiB left: cache 1.9 GiB with the lock, 8 GiB without");
+        check(!ple_lock_blocks_cache(GiB(40), table, floor_mib), "40 GiB left: the cache is already at its 8 GiB cap");
+        check(!ple_lock_blocks_cache(GiB(23), table, floor_mib), "23 GiB: the cap is just reached with the lock");
+        check(ple_lock_blocks_cache(GiB(22), table, floor_mib), "22 GiB: the lock costs the cache some of its 8 GiB");
+        check(!ple_lock_blocks_cache(GiB(1), 1ull << 20, floor_mib), "a tiny table cannot make a cache");
+        check(!ple_lock_blocks_cache(std::numeric_limits<uint64_t>::max(), table, floor_mib), "no overflow");
+    }
     std::printf("conversation_memory_test: %d checks passed\n", checks);
 }

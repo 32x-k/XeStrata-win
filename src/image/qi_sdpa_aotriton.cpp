@@ -36,7 +36,7 @@ std::unordered_map<sycl::device, Aot> g_aot;
 }  // namespace
 
 bool aotriton(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const uint16_t* v16, int64_t q0, int64_t q1,
-              int64_t T, int64_t heads, int64_t hd, uint16_t* out16) {
+              int64_t T, int64_t heads, int64_t hd, uint16_t* out16, bool causal) {
     namespace ao = aotriton;
     std::lock_guard<std::mutex> lock(g_mu);
     Aot& d = g_aot[q.get_device()];
@@ -65,9 +65,10 @@ bool aotriton(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const ui
     p.philox_offset_output = ao::TensorView<0>::get_null_tensor(ao::kUInt64);
     p.encoded_softmax = ao::TensorView<4>::get_null_tensor(ao::kFloat16);
     p.persistent_atomic_counter = ao::TensorView<0>(reinterpret_cast<intptr_t>(d.counter), ao::kInt32);
-    p.causal_type = ao::v3::flash::CausalType::None;
-    p.window_left = 0;
-    p.window_right = 0;
+    // causal: the windowed form, both edges the top-left aligned diagonal (the binary kernels have no other causal)
+    p.causal_type = causal ? ao::v3::flash::CausalType::WindowedAttention : ao::v3::flash::CausalType::None;
+    p.window_left = causal ? ao::v3::flash::WindowValue::TopLeftAligned : 0;
+    p.window_right = causal ? ao::v3::flash::WindowValue::TopLeftAligned : 0;
     p.Max_seqlen_q = (int32_t) (q1 - q0);
     p.Max_seqlen_k = (int32_t) T;
     q.memset(d.counter, 0, sizeof(int32_t));
@@ -92,6 +93,7 @@ bool aotriton(sycl::queue& q, const uint16_t* q16, const uint16_t* k16, const ui
 #endif
 STRATA_SDPA_EXPORT bool strata_sdpa_aotriton(void* q, const uint16_t* q16, const uint16_t* k16, const uint16_t* v16,
                                              int64_t q0, int64_t q1, int64_t T, int64_t heads, int64_t hd,
-                                             uint16_t* out16) {
-    return strata::image::sdpa::aotriton(*static_cast<sycl::queue*>(q), q16, k16, v16, q0, q1, T, heads, hd, out16);
+                                             uint16_t* out16, bool causal) {
+    return strata::image::sdpa::aotriton(*static_cast<sycl::queue*>(q), q16, k16, v16, q0, q1, T, heads, hd, out16,
+                                         causal);
 }

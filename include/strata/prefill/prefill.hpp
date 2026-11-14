@@ -20,6 +20,7 @@
 #include "strata/core/weights.hpp"
 
 #include <cstdint>
+#include <cstdlib>
 #include <functional>
 #include <future>
 #include <memory>
@@ -55,6 +56,32 @@ void set_cpu_share(double share);
 /// The share in use: STRATA_PREFILL_CPU_SHARE's, else set_cpu_share's; -1 measured.
 double cpu_share_setting();
 
+/// The prompt chunks --prefill auto picks from, the largest first, for both engines (generate.cpp's plan_lend and
+/// PlainModel's): every chunk streams again each expert it routes to, so fewer chunks stream fewer experts.  32768 and
+/// 16384 after upstream ae652b2: on the B70 a 26,292-token IQ3_S prompt read at 1,080 tok/s in 8192-token chunks
+/// (50,356 experts streamed), 1,303 in 16384 and 1,545 in one chunk (17,728), the same logits.
+inline constexpr int64_t kAutoChunks[] = {32768, 16384, 8192, 6144, 4096, 3072, 2048, 1024, 512, 256};
+/// The largest of kAutoChunks that `take(chunk)` accepts (0: none), at most STRATA_PREFILL_AUTO_MAX (32768 unset) and,
+/// past 8192, none above `max_context`.
+template <class Take>
+int64_t auto_chunk(int64_t max_context, Take&& take) {
+    static const int64_t auto_max = [] {
+        const char* v = std::getenv("STRATA_PREFILL_AUTO_MAX");
+        return v ? (int64_t) std::strtoll(v, nullptr, 10) : (int64_t) 32768;
+    }();
+    for (const int64_t c : kAutoChunks) {
+        if (c > auto_max || (c > 8192 && c > max_context)) continue;
+        if (take(c)) return c;
+    }
+    return 0;
+}
+/// The percent of the expert tier's slots a prompt chunk's buffers may borrow (a lent slot's expert is streamed during
+/// the prompt and refilled after it): STRATA_PREFILL_LEND_PCT, else `fallback` (the engine's own, measured).
+inline int64_t lend_pct(int64_t fallback) {
+    const char* v = std::getenv("STRATA_PREFILL_LEND_PCT");
+    return v ? (int64_t) std::strtol(v, nullptr, 10) : fallback;
+}
+
 }  // namespace strata::prefill
 namespace strata::core { class MtpDrafter; class RemoteExperts; }
 namespace strata::prefill {
@@ -77,6 +104,8 @@ public:
     /// them all here.
     virtual bool chunk_pieces(const float* rows, gpu::Event* const* landed, int pieces, const int64_t* tokens,
                               int64_t T, int64_t p0, std::string& err);
+    /// The next stage when it is in this process (null: elsewhere).  The layer-major prefill drives it directly.
+    virtual Prefill* local_next() const { return nullptr; }
 };
 
 /// STRATA_HANDOFF_PIPE: rows [r0, r0 + nr) of piece i of a T-row chunk in P pieces (both sides of a hand-off).
@@ -94,6 +123,7 @@ public:
     bool wait(std::string& err) override;
     bool chunk_pieces(const float* rows, gpu::Event* const* landed, int pieces, const int64_t* tokens, int64_t T,
                       int64_t p0, std::string& err) override;
+    Prefill* local_next() const override { return next_; }
 
 private:
     bool start(const int64_t* tokens, int64_t T, int64_t p0);
@@ -223,7 +253,30 @@ public:
         hand_pieces_ = pieces;
     }
 
+    /// Layer-major prefill (STRATA_PREFILL_LAYER_MAJOR=1): true while `on_chunk` reports a sub-chunk before the end of
+    /// its super-chunk.  The session state is already at the super-chunk's end then, so no checkpoint may be taken.
+    /// On a layer split it is the last stage's (the one that reports the rows), asked through the first.
+    bool layer_major_mid() const {
+        const Prefill* p = this;
+        while (p->lm_next() != nullptr) p = p->lm_next();
+        return p->lm_mid_;
+    }
+
 private:
+    /// The default walk: each chunk through all the stage's layers.
+    bool run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
+    // Layer-major prefill: the super-chunk's buffers for an n-token prompt (its size, 0 = not this prompt: `why`), the
+    // run, and the buffers given back after it.  `cap` (> 0): at most that many tokens.
+    int64_t lm_prepare(int64_t n, std::string& why, int64_t cap = 0);
+    int64_t lm_prepare_chain(int64_t n, std::string& why);
+    void lm_release_chain();
+    bool run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err);
+    void lm_release();
+    bool lm_drain(std::string& err);
+    Prefill* lm_next() const { return next_ != nullptr ? next_->local_next() : nullptr; }
+    bool lm_mid_ = false;
+    std::future<bool> lm_next_run_;   ///< a layer split: the next stage's run of the last super-chunk handed on
+    std::string lm_next_err_;
     int64_t stage_lb_ = 0, stage_le_ = -1;
     PrefillLink* next_ = nullptr;       ///< set_stage: the next stage, through this link only
     InProcessPrefill local_next_;

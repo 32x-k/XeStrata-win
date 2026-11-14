@@ -9,9 +9,11 @@
 // text rows not), and adds each stream's projection and MLP (GELU, tanh form) back through its gates.  The text stream
 // changes with the time, so nothing of it is kept between steps beyond its input projection.
 //
-// The weights come from the bf16 safetensors (Comfy-Org/Mage-Flow's files as they are).  With q8 each block is
-// quantized to 8 bits on the host as it is read, once, and the file's pages are dropped from the page cache: half the
-// VRAM and the bytes a streamed block moves.  Where the GPU's library takes int8 products (prefill::Gemm::i8_usable) the
+// The weights come from the bf16 safetensors (Comfy-Org/Mage-Flow's files as they are).  A file with a shared low-rank
+// modulation (MageTrail's, bluvoll's mageflow-lowrank-modulation-v1) projects SiLU(temb) once a step to a few hundred
+// values (modulation_down) and each block's modulations from those: its FP32 factors stay FP32, as the format asks.
+// With q8 each block is quantized to 8 bits on the host as it is read, once, and the file's pages are dropped from the
+// page cache: half the VRAM and the bytes a streamed block moves.  Where the GPU's library takes int8 products (prefill::Gemm::i8_usable) the
 // weights are rotated in groups and quantized with a scale a row, and so are the activations a token at each product
 // (W8A8, qi_rows_i8: ComfyUI's int8 form, the rotation spreading the outlier channels below); elsewhere as Q8_0, the
 // products dequantizing it to FP16 each time.  Without q8 the bf16 bytes
@@ -30,15 +32,23 @@
 // each context, [target, reference 1, ..., reference N], and take part in every block; each image's rows are rotated
 // by its own size's centred positions and by its frame (0 the target, j reference j), and only the target's rows
 // give the velocity.
+//
+// Adapters (image_lora.hpp): a request's files are bound to the weights' products (set_loras) and their delta added to
+// the product's output there (y += strength (x A^T) B^T), in the input's own units as the readers take it: the whole
+// weight, every block's, and the ones outside the blocks.  A weight with an adapter keeps its sums in FP32 (a delta
+// cannot be added to an int32 sum) and its rows' scale is the delta's input's, as the plain product's is.
 #pragma once
 
+#include "strata/image/image_lora.hpp"
 #include "strata/image/qi_stream.hpp"
 #include "strata/prefill/gemm.hpp"
 
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace strata::image {
@@ -68,6 +78,7 @@ struct MfOut {
 };
 
 class MappedFile;
+class SafeTensors;
 
 class MfDit {
 public:
@@ -77,8 +88,13 @@ public:
     MfDit& operator=(const MfDit&) = delete;
 
     /// `q8`: the blocks as Q8_0 (the default), else FP16 on the GPU from the file's bf16.  `dry`: read for its sizes
-    /// only.
-    bool open(const std::string& path, void* stream, std::string& err, bool dry = false, bool q8 = true);
+    /// only.  `reuse`: the blocks' host bytes an earlier open of the same file in the same form left (take_host),
+    /// taken instead of quantizing the file again.
+    bool open(const std::string& path, void* stream, std::string& err, bool dry = false, bool q8 = true,
+              std::vector<std::vector<uint8_t>>* reuse = nullptr);
+    /// The blocks' host bytes (8 bits: their quantized weights and FP32 vectors), handed over for a later open's
+    /// `reuse`: the part is closed afterwards.
+    std::vector<std::vector<uint8_t>> take_host() { return std::move(host_); }
 
     /// Context i (0: the prompt, 1: the negative prompt) from the text encoder's states [rows][2560] (host FP32, the
     /// rows after the system turn): their norm and input projection, kept on the GPU.
@@ -97,11 +113,22 @@ public:
 
     /// Sampling: x [h w][128] (device FP32, the initial noise) stepped through sigmas (descending, the last 0) by
     /// Euler; with cfg > 1 and a negative context, the velocity neg + cfg (pos - neg).  step(i, n) after each step:
-    /// false stops (QiStopped).
+    /// false stops (QiStopped).  `after` (if set) is given x and the step's new sigma first, on the sampler's stream
+    /// (a mask: img_start.hpp's blend).
+    /// `peek` (if set) is called after each step with the steps done and a function that writes the step's x0, the
+    /// sampler's prediction of the finished latent (x - sigma * v), into a buffer of x's size: a partial image's
+    /// latent, on the sampler's stream; the sampling itself is not changed.
     void sample(float* x, int64_t h, int64_t w, const std::vector<float>& sigmas, float cfg,
-                const std::function<bool(int, int)>& step = {});
+                const std::function<bool(int, int)>& step = {},
+                const std::function<void(float*, float)>& after = {},
+                const std::function<void(int, const std::function<void(float*)>&)>& peek = {});
 
     int64_t hidden() const { return C_; }
+    /// The time of `rows` image rows through the MLP's first product (the hidden width to the MLP's, a block's largest)
+    /// in each of the two forms on this stream's GPU, the best of three after one: {FP16 weights and activations, FP32
+    /// sums; W8A8: the activations rotated and quantized, int32 sums scaled} in seconds, 0 for a form the GPU's library
+    /// does not take (W8A8: prefill::Gemm::i8_usable) or the memory for it short.  Needs only the file's sizes (dry).
+    std::pair<double, double> time_forms(int64_t rows) const;
     int64_t latent_channels() const { return in_ch_; }
     bool q8() const { return q8_; }
     int64_t text_dim() const { return txt_dim_; }
@@ -109,8 +136,10 @@ public:
     uint64_t block_min() const { return blocks_stream_.min_budget(); }
     void set_block_budget(uint64_t bytes) { blocks_stream_.configure(bytes, s_); }
     int resident_blocks() const { return blocks_stream_.resident(); }
+    int blocks() const { return (int) blocks_.size(); }
     uint64_t blocks_vram() const { return blocks_stream_.vram(); }
     void drop_blocks() { blocks_stream_.drop(); }
+    void drop_block_homes() { blocks_stream_.drop_homes(); }
     uint64_t weight_bytes() const { return weight_bytes_; }   // what stays on the GPU besides the blocks
     /// The working buffers n contexts of hw image rows (an edit's references' included) take (text rows up to
     /// max_text a context), with the MLP a band of mlp_rows image rows at a time (0: all).
@@ -121,6 +150,28 @@ public:
     }
     void drop_activations();
 
+    /// An adapter as a file names it: a weight of the DiT, the rows of the weight a file's entry changes, and the rows
+    /// of the entry they are (one name a weight here: no weight is fused or split).
+    struct LoraTarget {
+        std::string name;
+        int64_t row0 = 0, rows = 0, cols = 0, src_row = 0;
+    };
+    /// The weights adapters may change: what a file's keys are matched against (the probe's map, the server's list).
+    std::vector<LoraTarget> lora_targets() const;
+
+    /// The adapters the next steps apply, each with its strength, bound to the weights' products: a key the DiT does
+    /// not take (or a shape that is not its weight's, or a form the engine does not apply) is false with err, and
+    /// nothing bound.  The contexts' rows are made from the other adapters' weights, so set_context again before the
+    /// next forward.  The same set again (its files and strengths) changes nothing.
+    bool set_loras(const std::vector<LoraUse>& loras, std::string& err);
+    /// The set bound, as its files' paths and strengths (empty: none).
+    const std::string& lora_key() const { return lora_key_; }
+    /// The bound entries' A and B on the GPU.
+    uint64_t lora_bytes() const;
+    /// The adapter files bound (a set whose strengths are all 0 binds none).
+    int lora_count() const { return (int) lora_files_.size(); }
+    void drop_loras();
+
     /// The image and text streams after block 0 of the last forward's context 0 (device FP32 [h w][C], [rows][C]), for
     /// the probe (kept when keep_block0(true)).
     void keep_block0(bool on) { keep0_ = on; }
@@ -129,16 +180,24 @@ public:
 
 private:
     struct W {
-        int type = 0;            // 8 Q8_0, 30 BF16, 1 F16
+        int type = 0;            // 8 Q8_0, 1 F16, 32 F32 (the low-rank modulations)
         int64_t n = 0, k = 0;    // n rows of k
         const void* d = nullptr; // a block's: its offset in the block's region; else a device pointer
         uint64_t row_bytes = 0;
+        LoraLayer* lora = nullptr;   // the adapters' deltas for its products (null: none: the product is unchanged)
     };
     struct Block {
         W imod, tmod, q, k, v, tq, tk, tv, o, to, imlp1, imlp2, tmlp1, tmlp2;
         uint64_t b_imod = 0, b_tmod = 0, b_q = 0, b_k = 0, b_v = 0, b_tq = 0, b_tk = 0, b_tv = 0, b_o = 0, b_to = 0,
                  b_imlp1 = 0, b_imlp2 = 0, b_tmlp1 = 0, b_tmlp2 = 0;   // the FP32 biases' offsets
         uint64_t nq = 0, nk = 0, ntq = 0, ntk = 0;                     // the FP32 q / k norms' offsets
+    };
+    /// A weight and the rows of a file's entry it takes (Mage-Flow's DiT has no fused or split weight: one name is one
+    /// weight, all of them with a bias, which an entry's bias's delta is added beside).
+    struct LoraSlot {
+        std::string name;
+        W* w = nullptr;
+        int64_t row0 = 0, rows = 0, src_row = 0;
     };
     struct Ctx {
         int64_t rows = 0;
@@ -149,14 +208,23 @@ private:
     // y is left the product's sums, for the reader to scale and add the bias to as the view says.
     MfOut product(const uint16_t* x16, const float* rs, const W& w, const uint8_t* base, float* y, int64_t T,
                   const float* bias, bool same_input = false, bool defer = false);
-    // a block's modulation y [w.n] = SiLU(temb) . w^T + bias (tsil: its FP16 copy, for a 16-bit w)
+    // a block's modulation y [w.n] = SiLU(temb) . w^T + bias (tsil: its FP16 copy, for a 16-bit w); an F32 w (the
+    // low-rank form) reads the shared projection mlow_ instead
     void modulation(const uint16_t* tsil, const W& w, const uint8_t* base, float* y, const float* bias);
+    void build_lora_targets();
+    void lora_scratch(int64_t T);
+    /// A DoRA's row norms: the norms of a slot's weight, one a row of it, from the file's tensor, cached a tensor
+    /// (open drops the cache).
+    bool dora_norms(const LoraSlot& slot, std::vector<float>& out, std::string& err);
+    /// One of the file's tensors' row norms, FP32, cached (`name`: the file's own name).
+    bool tensor_norms(const std::string& name, const std::vector<float>*& out, std::string& err);
     void ensure(int64_t hw, int n, int64_t max_text);
     void rope_tables(int64_t h, int64_t w);
     void drop_refs();
     void time_embedding(float sigma);
 
     std::unique_ptr<MappedFile> file_;
+    std::unique_ptr<SafeTensors> st_;   // the file's header (a DoRA's row norms read its tensors)
     std::vector<std::vector<uint8_t>> host_;   // the blocks' Q8_0 (and every block's FP32 vectors), when not in place
     void* s_ = nullptr;
     prefill::Gemm gemm_;
@@ -167,6 +235,8 @@ private:
     std::vector<int64_t> axes_{16, 56, 56};
     // the parts outside the blocks, FP16 on the GPU
     W img_in_, txt_in_, t1_, t2_, nout_, pout_;
+    W mdown_;   // the shared low-rank modulation's projection (F32, device; n 0 without one)
+    float *b_mdown_ = nullptr, *mlow_ = nullptr;
     const float *b_img_in_ = nullptr, *b_txt_in_ = nullptr, *b_t1_ = nullptr, *b_t2_ = nullptr, *b_nout_ = nullptr,
                 *b_pout_ = nullptr, *txt_norm_ = nullptr;
     std::vector<Block> blocks_;
@@ -196,6 +266,30 @@ private:
     int64_t ref_rows_ = 0, refs_gen_ = 0;
     std::vector<std::pair<int64_t, int64_t>> ref_sizes_;
     float* xin_ = nullptr;    // the image rows' input [hw + ref_rows_][in_ch_]
+    // the adapters bound
+    std::vector<LoraSlot> lora_slots_;
+    std::vector<std::unique_ptr<LoraLayer>> lora_layers_;
+    std::vector<std::shared_ptr<const LoraFile>> lora_files_;
+    std::string lora_key_;
+    int64_t lora_cols_ = 0, lora_tmp_t_ = 0;   // the deltas' scratch's columns and rows (the largest lora_scratch_cols)
+    std::map<std::string, std::vector<float>> norm_cache_;   // DoRA's row norms, a file's tensor (open clears them)
+    float* lora_f32_ = nullptr;
+    uint16_t* lora16_ = nullptr;
+    // a GLoRA's own path: its input's columns, the weight's rows it is added over, and the buffers a band of its
+    // products takes (the rows' table, a W8A8 weight's int8 input and its scales)
+    int64_t lora_glora_cols_ = 0, lora_glora_rows_ = 0;
+    float* lora_glora_y_ = nullptr;
+    int8_t* lora_glora_x8_ = nullptr;
+    float* lora_glora_sx_ = nullptr;
+    void lora_glora_scratch();   // allocates them, once a set with a GLoRA is bound
+    void free_glora_scratch();
+    /// A GLoRA's own path: the weight's rows [r0, r0 + n) product of v (nt tokens, the first of them t0), added to
+    /// the product's output y at those rows (the weight's own path, as product takes it).
+    void glora_weight(const uint16_t* v, const W& w, const uint8_t* d, int64_t r0, int64_t n, int64_t nt, int64_t t0,
+                      float* y);
+    /// The layer's GLoRAs on the product's T rows of y (none: nothing), through glora_weight.
+    void add_glora(const LoraLayer* lora, const uint16_t* x16, const float* rs, const W& w, const uint8_t* d,
+                   int64_t T, float* y);
 };
 
 }  // namespace strata::image

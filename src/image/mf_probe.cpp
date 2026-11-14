@@ -5,9 +5,12 @@
 //
 //   strata-image-mf-probe text TEXT_ENCODER.gguf GOLDEN_DIR [MMPROJ.gguf]   (an edit's run: its images vl0.png ..
 //       through the vision encoder, the system turn 64 ids)
-//   strata-image-mf-probe vae VAE.safetensors GOLDEN_DIR   (golden_vae.py's vae_cond, vae_s, vae_img)
+//   strata-image-mf-probe vae VAE.safetensors GOLDEN_DIR [OUT.f32]   (golden_vae.py's vae_cond, vae_s, vae_img;
+//       the Flux2 VAE: golden_f2vae.py's f2_img of the run's latent, whole and in tiles, the tiled image as FP32
+//       [3][H][W] to OUT.f32)
 //   strata-image-mf-probe vae-enc VAE.safetensors GOLDEN_DIR   (golden_edit.py's ref0_pix: its posterior's mean,
-//       log-variance and, with the run's own noise, the sample)
+//       log-variance and, with the run's own noise, the sample; the Flux2 VAE: golden_f2enc.py's ref0_z, the latent
+//       of ref0_pix as FLUX.2's pipelines take it)
 //   strata-image-mf-probe dit DIT.safetensors GOLDEN_DIR [q8|bf16 [VAE.safetensors OUT.f32]]
 //       (block 0, the first velocity, the final latent; with the VAE the image as FP32 [3][H][W] to OUT.f32)
 //
@@ -197,13 +200,61 @@ float* put(const std::vector<float>& h) {
 }
 
 // the VAE's decode of the run's latent, its condition, blocks' state and image against golden_vae.py's
-int vae(const std::string& path, const std::string& dir) {
+// the image's PSNR (8-bit) against the reference's, both clamped to -1 .. 1
+void psnr(const std::vector<float>& got, const std::vector<float>& img) {
+    double se = 0;
+    for (size_t i = 0; i < img.size(); ++i) {
+        const double a = std::min(1.0, std::max(-1.0, (double) got[i]));
+        const double b = std::min(1.0, std::max(-1.0, (double) img[i]));
+        se += (a - b) * (a - b) * 127.5 * 127.5;
+    }
+    std::printf("image PSNR %.2f dB (8-bit)\n", 10 * std::log10(255.0 * 255.0 / (se / (double) img.size())));
+}
+
+int vae(const std::string& path, const std::string& dir, const std::string& out_path = "") {
     void* s = strata::core::Runtime::get().create_stream();
     strata::image::MfVae v;
     std::string err;
     if (!v.open(path, s, err)) throw std::runtime_error(err);
     std::vector<int64_t> shape;
     const auto lat = npy<float>(dir + "/latent.npy", &shape);   // [1][h w][128]
+    if (v.flux2()) {   // the image alone: [1][3][H][W]
+        std::vector<int64_t> is;
+        const auto img = npy<float>(dir + "/f2_img.npy", &is);
+        const int64_t h = is[2] / 16, w = is[3] / 16;
+        if (shape.size() != 3 || shape[1] != h * w) throw std::runtime_error("latent.npy is not [1][h w][128]");
+        float* z = put(lat);
+        float* rgb = nullptr;
+        if (!strata::gpu::alloc_device(&rgb, img.size() * 4)) throw std::runtime_error("GPU memory");
+        v.decode_raw(z, h, w, rgb);   // warm
+        strata::gpu::stream_sync(s);
+        const auto t0 = std::chrono::steady_clock::now();
+        v.decode_raw(z, h, w, rgb);
+        strata::gpu::stream_sync(s);
+        std::printf("decode %lld x %lld: %.1f ms (Flux2 VAE, scratch %.0f MiB)\n", 16 * (long long) h,
+                    16 * (long long) w, 1e3 * seconds_since(t0), (double) v.scratch_bytes(h, w) / 1048576.0);
+        const auto got = fetch(rgb, img.size());
+        compare("image", got.data(), img.data(), img.size());
+        psnr(got, img);
+        // in tiles: decode within a quarter of the whole's scratch (rgba 0 .. 1, back to -1 .. 1 for the PSNR)
+        const uint64_t limit = v.scratch_bytes(h, w) / 4;
+        float* rgba = nullptr;
+        if (!strata::gpu::alloc_device(&rgba, img.size() / 3 * 4 * 4)) throw std::runtime_error("GPU memory");
+        v.drop_scratch();
+        const auto t1 = std::chrono::steady_clock::now();
+        v.decode(z, h, w, rgba, limit);
+        strata::gpu::stream_sync(s);
+        std::printf("tiled within %.0f MiB: %.1f ms, scratch held %.0f MiB\n", (double) limit / 1048576.0,
+                    1e3 * seconds_since(t1), (double) v.scratch_held() / 1048576.0);
+        auto tiled = fetch(rgba, img.size());
+        for (float& x : tiled) x = 2.f * x - 1.f;
+        psnr(tiled, img);
+        if (!out_path.empty()) {
+            std::ofstream o(out_path, std::ios::binary);
+            o.write(reinterpret_cast<const char*>(tiled.data()), (std::streamsize) (tiled.size() * 4));
+        }
+        return 0;
+    }
     std::vector<int64_t> cs;
     const auto cond = npy<float>(dir + "/vae_cond.npy", &cs);   // [1][384][h][w]
     const int64_t h = cs[2], w = cs[3], C = cs[1], HW = h * w;
@@ -223,13 +274,7 @@ int vae(const std::string& path, const std::string& dir) {
     const auto img = npy<float>(dir + "/vae_img.npy");
     const auto got = fetch(rgb, img.size());
     compare("image", got.data(), img.data(), img.size());
-    double se = 0;
-    for (size_t i = 0; i < img.size(); ++i) {
-        const double a = std::min(1.0, std::max(-1.0, (double) got[i]));
-        const double b = std::min(1.0, std::max(-1.0, (double) img[i]));
-        se += (a - b) * (a - b) * 127.5 * 127.5;
-    }
-    std::printf("image PSNR %.2f dB (8-bit)\n", 10 * std::log10(255.0 * 255.0 / (se / (double) img.size())));
+    psnr(got, img);
     return 0;
 }
 
@@ -346,10 +391,27 @@ int vae_enc(const std::string& path, const std::string& dir) {
     std::vector<int64_t> ps, ms;
     const auto pix = npy<float>(dir + "/ref0_pix.npy", &ps);    // [3][H][W]
     const auto mean = npy<float>(dir + "/ref0_mean.npy", &ms);  // [1][128][h][w]
-    const auto lv = npy<float>(dir + "/ref0_logvar.npy");
     const auto zg = npy<float>(dir + "/ref0_z.npy");
     const int64_t Z = ms[1], h = ms[2], w = ms[3], HW = h * w;
     float* rgb = put(pix);
+    float* z = nullptr;
+    if (!strata::gpu::alloc_device(&z, (size_t) (HW * Z) * 4)) throw std::runtime_error("GPU memory");
+    if (v.flux2()) {   // golden_f2enc.py's latent: the posterior's mode, patchified and normalized as FLUX.2 takes it
+        v.encode(rgb, h, w, nullptr, z);   // warm
+        strata::gpu::stream_sync(s);
+        const auto t0 = std::chrono::steady_clock::now();
+        v.encode(rgb, h, w, nullptr, z);
+        strata::gpu::stream_sync(s);
+        std::printf("encode %lld x %lld: %.1f ms (Flux2 VAE, scratch %.0f MiB)\n", (long long) ps[2],
+                    (long long) ps[1], 1e3 * seconds_since(t0), (double) v.encode_scratch_bytes(h, w) / 1048576.0);
+        const auto zt = fetch(z, (size_t) (HW * Z));
+        std::vector<float> zc((size_t) (HW * Z));
+        for (int64_t p = 0; p < HW; ++p)
+            for (int64_t c = 0; c < Z; ++c) zc[(size_t) (c * HW + p)] = zt[(size_t) (p * Z + c)];
+        compare("latent", zc.data(), zg.data(), zg.size());
+        return 0;
+    }
+    const auto lv = npy<float>(dir + "/ref0_logvar.npy");
     float* mom = nullptr;
     if (!strata::gpu::alloc_device(&mom, (size_t) (HW * 2 * Z) * 4)) throw std::runtime_error("GPU memory");
     v.encode_moments(rgb, h, w, mom);   // warm
@@ -377,8 +439,6 @@ int vae_enc(const std::string& path, const std::string& dir) {
             eps[(size_t) (p * Z + c)] = (zg[g] - mean[g]) / std::exp(0.5f * lv[g]);
         }
     float* e = put(eps);
-    float* z = nullptr;
-    if (!strata::gpu::alloc_device(&z, (size_t) (HW * Z) * 4)) throw std::runtime_error("GPU memory");
     v.encode(rgb, h, w, e, z);
     const auto zt = fetch(z, (size_t) (HW * Z));
     std::vector<float> zc((size_t) (HW * Z));
@@ -392,12 +452,12 @@ int main(int argc, char** argv) {
     try {
         const std::string what = argc > 1 ? argv[1] : "";
         if (what == "text" && (argc == 4 || argc == 5)) return text(argv[2], argv[3], argc == 5 ? argv[4] : "");
-        if (what == "vae" && argc == 4) return vae(argv[2], argv[3]);
+        if (what == "vae" && (argc == 4 || argc == 5)) return vae(argv[2], argv[3], argc == 5 ? argv[4] : "");
         if (what == "vae-enc" && argc == 4) return vae_enc(argv[2], argv[3]);
         if (what == "dit" && (argc == 4 || argc == 5 || argc == 7))
             return dit(argv[2], argv[3], argc == 4 || std::string(argv[4]) != "bf16", argc == 7 ? argv[5] : "",
                        argc == 7 ? argv[6] : "");
-        std::fprintf(stderr, "usage: %s text TEXT_ENCODER.gguf GOLDEN_DIR | vae VAE.safetensors GOLDEN_DIR | "
+        std::fprintf(stderr, "usage: %s text TEXT_ENCODER.gguf GOLDEN_DIR | vae VAE.safetensors GOLDEN_DIR [OUT.f32] | "
                      "vae-enc VAE.safetensors GOLDEN_DIR | "
                      "dit DIT.safetensors GOLDEN_DIR [q8|bf16 [VAE.safetensors OUT.f32]]\n", argv[0]);
         return 2;

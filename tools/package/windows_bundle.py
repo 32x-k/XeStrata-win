@@ -100,6 +100,14 @@ COMPONENTS = [
     ("gguf-py (llama.cpp)", "llama.cpp", "MIT", "https://github.com/ggml-org/llama.cpp", ["llama:LICENSE"], []),
     ("Outfit (the web app's font)", "outfit", "OFL-1.1", "https://github.com/Outfitio/Outfit-Fonts",
      ["src:third_party/main/outfit/OFL.txt"], []),
+    ("KaTeX (the web chat's math)", "0.19.0", "MIT", "https://katex.org/", ["src:third_party/main/katex/LICENSE"], []),
+    ("XGrammar (compiled into the engine: grammar-constrained decoding)", "0.2.8", "Apache-2.0",
+     "https://github.com/mlc-ai/xgrammar",
+     ["src:third_party/main/xgrammar/LICENSE", "src:third_party/main/xgrammar/NOTICE"], []),
+    ("picojson (in XGrammar, compiled into the engine)", "XGrammar 0.2.8's copy", "BSD-2-Clause",
+     "https://github.com/kazuho/picojson", ["src:third_party/main/picojson/LICENSE"], []),
+    ("DLPack (a header XGrammar reads)", "bbd2f4d", "Apache-2.0", "https://github.com/dmlc/dlpack",
+     ["src:third_party/main/dlpack/LICENSE"], []),
     ("AOTriton (its library and kernels' images)", "0.14.2b", "MIT; the images can carry parts of aiter (MIT), "
      "FlyDSL's kernels (Apache-2.0) and Triton (MIT)", "https://github.com/ROCm/aotriton",
      ["src:third_party/main/aotriton/LICENSE", "src:third_party/main/aotriton/LICENSE.aiter",
@@ -124,7 +132,8 @@ COMPONENTS = [
 
 # the program's files from the source tree (as cmake/packaging.cmake installs them on Linux)
 APP_FILES = ("setup.py", "chat.py", "requirements.txt")
-APP_DIRS = ("serve", "tools", "ref", "data", "third_party/main/outfit", "third_party/main/quantscope")
+APP_DIRS = ("serve", "tools", "ref", "data", "third_party/main/outfit", "third_party/main/katex",
+            "third_party/main/quantscope")
 APP_SKIP = ("__pycache__", "test_*", "mcp_fake_server.py", "lint", "vision", "package")
 
 
@@ -249,6 +258,7 @@ def main() -> None:
     for d in ONEDNN_DLLS:
         if (a.engine / "onednn" / "bin" / d).is_file():
             shutil.copy2(a.engine / "onednn" / "bin" / d, eng / d)
+    shutil.copy2(a.jxl / "bin" / "cjxl.exe", eng / "cjxl.exe")   # the images' JPEG XL (serve/images.py cjxl)
     aot = a.engine / "_deps" / "aotriton" / "aotriton"
     if (a.engine / AOTRITON_DLLS[0]).is_file():
         shutil.copy2(a.engine / AOTRITON_DLLS[0], eng / AOTRITON_DLLS[0])

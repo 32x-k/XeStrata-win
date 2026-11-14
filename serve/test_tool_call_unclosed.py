@@ -1,6 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
-# SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
-# SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
+# SPDX-License-Identifier: MIT
 """A missing wrapper closer ends before a following call, but prose alone does not confirm a call.
 
 A call's own </function> separates it from the next wrapper without merging their arguments.

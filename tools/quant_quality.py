@@ -3,24 +3,31 @@
 # SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """The quant quality yardstick (MODEL-UPDATE.md, Phase 0): teacher-forced top-1 agreement and KL of a quant against
-Q8_0, on one fixed text set (data/quant_quality/v1: code, docs, English, other languages, an agent transcript).
+a reference run (Q8_0, or the most exact quant the box holds), on a fixed text set: data/quant_quality/v1 (code, docs,
+English, other languages, an agent transcript; 1000 tokens each) or data/quant_quality/long (three documents of 15K
+to 30K tokens for the long-context positions: a novel, third_party/main/aozora-bunko).
 
     python tools/quant_quality.py ids --tokenizer DIR [--set data/quant_quality/v1] [--out set.ids.json]
-        tokenizes the set (each segment cut to --seg-tokens, default 1000) - the ids file is committed with the set
-        (data/quant_quality/v1/set.ids.json), so a box without the tokenizer scores the same positions
+        tokenizes the set (each segment cut to --seg-tokens, default 1000; 0 keeps the whole segment) - the ids file
+        is committed with the set (set.ids.json), so a box without the tokenizer scores the same positions.  The
+        segments are v1's five, or a set's *.txt files in name order (the long set: ids --set
+        third_party/main/aozora-bunko --seg-tokens 0 --out data/quant_quality/long/set.ids.json).
     python tools/quant_quality.py run --config CFG.json --out RUN.tsv [--ids set.ids.json] [--env K=V ...]
-        [--gpu-experts]
+        [--gpu-experts] [--route-dump ROUTES.bin | --route-lock ROUTES.bin]
         one `strata --serve` engine (the config's exe and args), every segment one request whose tokens are all read
         through the decode windows (--short-read), where STRATA_LOGPOS / STRATA_LOGPOS_TOPK=64 write, per position,
         the log-probability of the text's next token and the 64 most likely tokens.  Fixed: the experts on the CPU
         (one VRAM slot, --expert-cache 1: the verify windows need a profile-filled tier, so the config must have
         --expert-profile; --gpu-experts: 1500 slots), no expert adaptation, no PCIe share, no suffix drafts, no prompt
         cache, FP16 K/V, STRATA_ROUTE_TAIL_SKIP=0, STRATA_PREFILL_CPU_SHARE=0.  RUN.tsv + RUN.tsv.seg.json (line
-        ranges).
-    python tools/quant_quality.py compare REF.tsv RUN.tsv [...]   (REF = the Q8_0 run)
+        ranges).  --route-dump writes the run's routed experts and weights (STRATA_ROUTE_DUMP); --route-lock reads a
+        reference run's and routes every position as it did (STRATA_ROUTE_REPLAY, the same --ids), so the KL of a
+        locked run against that reference is the quant's rounding alone and the free run's excess is the routing it
+        flipped.
+    python tools/quant_quality.py compare REF.tsv RUN.tsv [...]   (REF = the reference run)
         per segment and overall: top-1 agreement (same argmax), mean / p99 KL(REF || RUN) over REF's 64 most likely
-        tokens (both renormalized to that set; a token RUN does not list gets RUN's 64th log-probability), and the
-        perplexity of the text under each.
+        tokens (both renormalized to that set; a token RUN does not list gets RUN's 64th log-probability), the
+        perplexity of the text under each, and the run's NLL against the reference's in percent.
 
 The RUN.tsv rows are the engine's STRATA_LOGPOS format: pos, target id, logp(target), argmax id, logp(argmax),
 argmax==target, logp(<|im_end|>), logp(target without <|im_end|>), then 64 `id:logp` fields (natural log).
@@ -61,16 +68,20 @@ def cmd_ids(a) -> int:
         toks[i] = t
     tok = ST.Tokenizer(toks, (tp / "merges.txt").read_text(encoding="utf-8").split("\n"),
                        json.loads((tp / "token_type.json").read_text()))
+    sd = pathlib.Path(a.set)
+    names = SEGMENTS if all((sd / f"{n}.txt").exists() for n in SEGMENTS) else sorted(p.stem for p in sd.glob("*.txt"))
     segs = []
-    for name in SEGMENTS:
-        text = (pathlib.Path(a.set) / f"{name}.txt").read_text(encoding="utf-8")
+    for name in names:
+        text = (sd / f"{name}.txt").read_text(encoding="utf-8")
         ids = tok.encode(text, parse_special=(name == "agent"))
         if len(ids) < a.seg_tokens:
             raise SystemExit(f"{name}: only {len(ids)} tokens (< {a.seg_tokens})")
-        segs.append({"name": name, "ids": ids[:a.seg_tokens]})
-        print(f"{name}: {len(ids)} tokens, kept {a.seg_tokens}")
-    out = pathlib.Path(a.out or (pathlib.Path(a.set) / "set.ids.json"))
-    out.write_text(json.dumps({"version": pathlib.Path(a.set).name, "seg_tokens": a.seg_tokens, "segments": segs}))
+        keep = a.seg_tokens or len(ids)
+        segs.append({"name": name, "ids": ids[:keep]})
+        print(f"{name}: {len(ids)} tokens, kept {keep}")
+    out = pathlib.Path(a.out or (sd / "set.ids.json"))
+    # seg_tokens: the longest segment (the run's context and short-read size)
+    out.write_text(json.dumps({"version": sd.name, "seg_tokens": max(len(s["ids"]) for s in segs), "segments": segs}))
     print(f"wrote {out}")
     return 0
 
@@ -122,6 +133,14 @@ def cmd_run(a) -> int:
         env[k] = v
     env["STRATA_LOGPOS"] = str(out)
     env["STRATA_LOGPOS_TOPK"] = str(TOPK)
+    if a.route_dump and a.route_lock:
+        raise SystemExit("--route-dump and --route-lock: one of them")
+    if a.route_dump:
+        env["STRATA_ROUTE_DUMP"] = str(pathlib.Path(a.route_dump).resolve())
+    if a.route_lock:
+        if not pathlib.Path(a.route_lock).is_file():
+            raise SystemExit(f"--route-lock {a.route_lock}: no such file (a reference run's --route-dump)")
+        env["STRATA_ROUTE_REPLAY"] = str(pathlib.Path(a.route_lock).resolve())
     if mem_available_gb() < a.min_free_gb:
         raise SystemExit(f"only {mem_available_gb():.0f} GB available (< {a.min_free_gb}): not starting an engine")
     args = engine_args(cfg, a.gpu_experts, st["seg_tokens"])
@@ -172,6 +191,7 @@ def cmd_run(a) -> int:
     cache = [ln for ln in err.splitlines() if "expert cache" in ln][:3]
     pathlib.Path(str(out) + ".seg.json").write_text(json.dumps({"segments": segs, "config": a.config,
                                                                 "args": args, "env": a.env or [],
+                                                                "route_dump": a.route_dump, "route_lock": a.route_lock,
                                                                 "expert_cache_lines": cache}, indent=1))
     return 0
 
@@ -331,7 +351,8 @@ def compare(ref: dict, run: dict) -> dict:
 def cmd_compare(a) -> int:
     ref = read_run(a.ref)
     print(f"reference: {a.ref}")
-    print(f"{'run':40s} {'segment':13s} {'pos':>5s} {'top1':>7s} {'KL':>8s} {'KL p99':>8s} {'PPL':>7s} {'PPL ref':>7s}")
+    print(f"{'run':40s} {'segment':13s} {'pos':>5s} {'top1':>7s} {'KL':>8s} {'KL p99':>8s} {'PPL':>7s} {'PPL ref':>7s} "
+          f"{'NLL':>7s}")
     allres = {}
     for path in a.runs:
         r = compare(ref, read_run(path))
@@ -340,7 +361,8 @@ def cmd_compare(a) -> int:
             if seg != "all" and not a.segments:
                 continue
             print(f"{pathlib.Path(path).name[:40]:40s} {seg:13s} {v['positions']:5d} {100 * v['top1']:6.2f}% "
-                  f"{v['kl']:8.5f} {v.get('kl_p99', float('nan')):8.4f} {v['ppl']:7.3f} {v['ppl_ref']:7.3f}")
+                  f"{v['kl']:8.5f} {v.get('kl_p99', float('nan')):8.4f} {v['ppl']:7.3f} {v['ppl_ref']:7.3f} "
+                  f"{100 * (math.log(v['ppl']) / math.log(v['ppl_ref']) - 1):+6.2f}%")
     if a.json:
         pathlib.Path(a.json).write_text(json.dumps(allres, indent=1))
     return 0
@@ -365,6 +387,8 @@ def main() -> int:
     p.add_argument("--min-free-gb", type=float, default=16)
     p.add_argument("--wrap",
                    help="a command prefix for the engine, e.g. 'systemd-run --user --scope -p MemoryMax=200G'")
+    p.add_argument("--route-dump", help="write this run's routing (the reference run, for --route-lock)")
+    p.add_argument("--route-lock", help="route every position as the reference run's --route-dump did")
     p = sub.add_parser("prompt", help="the batched prompt path's next-token logits after 20 prompts (a directory)")
     p.add_argument("--config", required=True)
     p.add_argument("--out", required=True)

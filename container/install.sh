@@ -44,8 +44,9 @@ case " $runtime " in
       'gpgcheck=1' 'repo_gpgcheck=1' "gpgkey=$intel_key" > /etc/yum.repos.d/oneAPI.repo
     ;;
 esac
+# (libjxl-utils: cjxl, the images' JPEG XL, which the package only recommends)
 # shellcheck disable=SC2086
-dnf install -y -q $runtime mesa-vulkan-drivers python3-pip
+dnf install -y -q $runtime mesa-vulkan-drivers python3-pip libjxl-utils
 # NVIDIA's from pip, where xestrata --setup would name them for the data folder: into the image, whose linker finds
 # them (setup then names nothing); without its dependencies, which are among them or the host's driver
 pip=$(python3 -c 'import json, sys

@@ -159,6 +159,10 @@ bool PlainModel::load_gblock(const GgufModel& m, int64_t l, GBlock& b, std::stri
 bool PlainModel::load_glm5(std::string& err) {
     const ModelSpec& s = spec_;
     glm_ = true;
+    if (opt_.kv_int8) {   // its MLA latent and indexer caches have no int8 kernels yet
+        err = "plain model: --kv int8 is not available for GLM-5.3-Flash yet";
+        return false;
+    }
     // the shapes the kernels are written for (glm5.hpp: four streams, KDA heads of 128, the MLA's 512-wide latent and
     // 256-wide heads, the indexer's 128-wide keys in pools of 4, at most 32 routed experts)
     if (s.hc != 4 || s.kda_head_dim != 128 || s.ssm_d_conv != 4 || s.kv_lora_rank != 512 || s.key_length_mla != 256 ||
@@ -290,15 +294,18 @@ bool PlainModel::load_glm5(std::string& err) {
         if (!mine(false, i)) continue;
         float *ic = nullptr, *pl = nullptr;
         uint16_t* lat = nullptr;
+        void* lat_host = nullptr;   // --kv-ram: the cells in host memory the GPU reads (lat its device address)
         if (!strata::gpu::alloc_device(&ic, (size_t) (cells * 2 * ID) * 4) ||
             !strata::gpu::alloc_device(&pl, (size_t) (g_max_blocks_ * ID) * 4) ||
-            !strata::gpu::alloc_device(&lat, (size_t) (cells * KVR) * 2)) {
-            err = "plain model: no VRAM for the DSA caches (" + std::to_string(cells) + " cells)";
+            !(opt_.kv_ram ? mapped((size_t) (cells * KVR) * 2, &lat_host, (void**) &lat)
+                          : strata::gpu::alloc_device(&lat, (size_t) (cells * KVR) * 2))) {
+            err = "plain model: no " + std::string(opt_.kv_ram ? "RAM" : "VRAM") + " for the DSA caches (" +
+                  std::to_string(cells) + " cells)";
             return false;
         }
         allocs_.push_back(ic);
         allocs_.push_back(pl);
-        allocs_.push_back(lat);
+        allocs_.push_back(opt_.kv_ram ? lat_host : (void*) lat);
         g_idx_cache_[(size_t) i] = ic;
         g_pooled_[(size_t) i] = pl;
         g_latent_[(size_t) i] = lat;
@@ -308,6 +315,19 @@ bool PlainModel::load_glm5(std::string& err) {
         qs.idx_block = s.idx_kpool;
         qs.idx_top_k = s.idx_top_k;
         g_cap_ = k::qsa_selection_width(k::kTopkMaxCells, qs);
+    }
+    if (opt_.kv_ram && n_dsa > 0) {   // the window's gathered rows and the prompt's layer of cells, in VRAM
+        g_gather_stride_ = g_cap_ + (s.idx_kpool_select_tail && s.idx_kpool > 1 ? s.idx_kpool - 1 : 0);
+        if (!strata::gpu::alloc_device(&g_lat_gather_, (size_t) (opt_.max_t * g_gather_stride_ * KVR) * 2) ||
+            !strata::gpu::alloc_device(&g_lat_stage_, (size_t) (cells * KVR) * 2)) {
+            err = "plain model: no VRAM for --kv-ram's buffers";
+            return false;
+        }
+        allocs_.push_back(g_lat_gather_);
+        allocs_.push_back(g_lat_stage_);
+        std::fprintf(stderr, "strata plain: --kv-ram: the DSA latent cells in RAM (%.1f MiB), %.1f MiB of VRAM for them\n",
+                     (double) (n_dsa * cells * KVR * 2) / 1048576.0,
+                     (double) ((opt_.max_t * g_gather_stride_ + cells) * KVR * 2) / 1048576.0);
     }
 
     // the window's buffers
@@ -319,7 +339,7 @@ bool PlainModel::load_glm5(std::string& err) {
     if (!mapped(T * N * 4, (void**) &h_emb_, (void**) &m_emb_) ||
         !mapped(T * k::kStepCount * 4, (void**) &h_step_, (void**) &m_step_) ||
         !mapped(T * (NH + 1) * 4, (void**) &h_pos_, (void**) &m_pos_) ||
-        !mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_) ||
+        !mapped(T * 4 + 16, (void**) &h_out_, (void**) &m_out_) || !mapped(16, (void**) &h_prob_, (void**) &m_prob_) ||
         (!first() && !mapped(T * kHC * N * 4, (void**) &h_in_, (void**) &m_in_)) ||
         (!last() && !mapped(T * kHC * N * 4, (void**) &h_hand_, (void**) &m_hand_))) {
         err = "plain model: mapped staging allocation failed";
@@ -364,6 +384,7 @@ bool PlainModel::load_glm5(std::string& err) {
     }
     xq_ = g_xq_;   // the head's q8_1 rows (head_logits)
     if (!strata::gpu::stream_sync(cs_)) { err = "plain model: the uploads failed"; return false; }
+    setup_int2();   // before the expert tier takes what VRAM is left
     if (!open_experts(err)) return false;
     exec_.assign((size_t) opt_.max_t + 1, nullptr);
     segs_.assign((size_t) opt_.max_t + 1, {});
@@ -509,8 +530,16 @@ void PlainModel::record_dsa(const GBlock& b, int T, strata::gpu::Stream cs) {
                            g_xq_ + k::native_q8_1_rows_bytes((int) QK, h * T), g_absT_ + h * T * KVR, (int) QK,
                            (int) KVR, T, cs);
         k::glm5_transpose_abd(g_absT_, g_abs_, H, T, KVR, cs);
-        k::glm5_mla_attn(g_abs_, g_latent_[(size_t) d], g_ids_, g_cap_, g_steps_, (int) H, 1.0f / std::sqrt((float) QK),
-                         T, g_lat_, cs, s.idx_kpool_select_tail ? (int) s.idx_kpool : 0);
+        const int tail = s.idx_kpool_select_tail ? (int) s.idx_kpool : 0;
+        if (g_lat_gather_ != nullptr) {   // --kv-ram: each token's cells from RAM once, the attention over them
+            k::glm5_latent_gather(g_latent_[(size_t) d], g_ids_, g_cap_, g_steps_, T, tail, g_gather_stride_, g_lat_gather_,
+                                  cs);
+            k::glm5_mla_attn(g_abs_, g_lat_gather_, g_ids_, g_cap_, g_steps_, (int) H, 1.0f / std::sqrt((float) QK), T,
+                             g_lat_, cs, tail, g_gather_stride_);
+        } else {
+            k::glm5_mla_attn(g_abs_, g_latent_[(size_t) d], g_ids_, g_cap_, g_steps_, (int) H,
+                             1.0f / std::sqrt((float) QK), T, g_lat_, cs, tail);
+        }
         k::glm5_transpose_abd(g_lat_, g_latT_, T, H, KVR, cs);
         k::native_quantize_q8_1_rows(g_latT_, g_xq_, (int) KVR, H * T, cs);
         for (int64_t h = 0; h < H; ++h)
@@ -579,7 +608,7 @@ bool PlainModel::record_mtp_glm5(int T, strata::gpu::Stream cs, std::string& err
     // the last row only: its norm is the next step's trunk row, and its logits pick the draft
     k::native_qsa_rms_norm_weighted(x_ + (size_t) (T - 1) * N, mtp_head_norm_, hn_, (int) N, 1, eps, cs);
     k::copy_from_mapped(mtp_h_, hn_, N, cs);
-    head_logits(hn_, 1, cs);
+    draft_logits(step_ + (size_t) (T - 1) * k::kStepCount + k::kStepPos, cs);
     return true;
 }
 

@@ -28,6 +28,15 @@ namespace strata::core {
 /// made: its pieces are cut to the smallest largest allocation of these and the current device.
 void arena_copy_devices(const std::vector<int>& devices);
 
+/// The bytes this process may still page-lock for engine device `device` (-1: the current one), registered for its
+/// copies or host USM.
+/// Windows (WDDM) charges them to the GPU's shared (non-local) memory budget, about half the RAM, and past it refused
+/// the later device allocations (upstream #243: 28 GiB on a 63 GB PC; #36, a 40 GiB arena on 64 GB that failed with
+/// OUT_OF_RESOURCES at the first prompt, looks the same): that budget less its use less 4 GiB, or half the RAM less
+/// 8 GiB less what the arenas hold when DXGI does not say.  UINT64_MAX elsewhere (the RAM checks decide).  `why`
+/// names the source.
+uint64_t pin_room(int device, std::string& why);
+
 enum class PageBacking { LargePages, NormalPages };
 
 struct PinnedArena {

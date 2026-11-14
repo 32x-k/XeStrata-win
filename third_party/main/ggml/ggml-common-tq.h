@@ -1,5 +1,6 @@
 // third_party/ggml/ggml-common-tq.h - the trellis (APR) expert formats of Agention's llama.cpp fork
-// (agentionai/llama.cpp 073bc9e68, ggml/src/ggml-common.h; MIT, the same license as the rest of third_party/ggml).
+// (agentionai/llama.cpp 073bc9e68, ggml/src/ggml-common.h; TQP5 / TQP6 / TQP7 from its 9aa51ce, 2026-10-12, gitlab.com/
+// agentionai-group/llama.cpp; MIT, the same license as the rest of third_party/ggml).
 // The block structs and the 2048-point "Hyb" codebook, unchanged, for Strata's device kernels and its CPU trellis
 // kernels (src/kernels/cpu/tq_*.cpp).  ggml-cpu takes them from the fork itself (-DSTRATA_GGML_DIR).
 //
@@ -7,6 +8,10 @@
 // TQ2_T byte-aligned, TQK bit-packed LSB-first, circular, step t's 16-bit window at bit (31 - t)*K; TQ2_T's state
 // s_t = qs[(t + 31) % 32] << 8 | qs[t]).  Step t gives weights 4t..4t+3: x = (s & 0x7fff) * 0x9e3779b1, points
 // lut[x >> 21] and lut[(x >> 10) & 2047] (fp16 pairs), times d.
+//
+// TQP5 / TQP6 / TQP7 (pair trellis): 128 weights per block, {fp16 d; qs}, qs a circular 64*K-bit stream (K = 5 / 6 / 7)
+// of 64 steps; step t's state is the 16 stream bits from bit (63 - t)*K, LSB first, and gives weights 2t, 2t+1: the
+// first point of the same hash, lut[x >> 21], times d.
 #pragma once
 
 #include <stdint.h>
@@ -31,6 +36,22 @@ typedef struct {
     uint8_t  qs[4*7];         // 32 steps x 7 bits
 } block_tqk7;
 static_assert(sizeof(block_tqk7) == 30, "wrong tqk7 block size/padding");
+#define QK_TQP 128
+typedef struct {
+    uint16_t d;
+    uint8_t  qs[8*5];         // 64 steps x 5 bits
+} block_tqp5;
+static_assert(sizeof(block_tqp5) == 42, "wrong tqp5 block size/padding");
+typedef struct {
+    uint16_t d;
+    uint8_t  qs[8*6];         // 64 steps x 6 bits
+} block_tqp6;
+static_assert(sizeof(block_tqp6) == 50, "wrong tqp6 block size/padding");
+typedef struct {
+    uint16_t d;
+    uint8_t  qs[8*7];         // 64 steps x 7 bits
+} block_tqp7;
+static_assert(sizeof(block_tqp7) == 58, "wrong tqp7 block size/padding");
 
 // device memory in a CUDA / HIP translation unit, ordinary host data everywhere else
 #if defined(__CUDACC__) || defined(__HIPCC__)
