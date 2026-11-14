@@ -16,6 +16,33 @@ Radeon AI PRO R9700（Windows、free モード）で、DeepSeek-V4.1-Flash の U
 サーバーの画像の生成（`POST /v1/images/generations`、会話からの `generate_image`）でも文章のモデルとして使えます。`--image-gpu-policy` の `unload`（`auto` が選ぶこともあります）では、画像の仕事の前に会話をディスクに保存してエンジンを外し、次の起動で会話を戻します。`shrink`（`--vram-elastic`）にはこのエンジンは対応していません。
 速さはまだ調整の途中です。動かしたのは R9700 の 1 枚だけです。
 
+### 読める量子化の型
+
+エキスパートの型ごとの対応です。「GPU」はこのエンジンにデバイスのカーネルがある型、「CPU レーン」は ggml-cpu の行の計算に任せる型（その層は遅くなります）です。
+
+| 型 | 対応 |
+| --- | --- |
+| IQ1_S, IQ1_M | GPU |
+| IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL | GPU |
+| Q2_K, Q3_K, Q4_K, Q5_K, Q6_K | GPU |
+| Q8_0, Q8_K | GPU と CPU レーン |
+| Q2_0（GSQ-RCO の型 42） | GPU と CPU レーン |
+| TQK4X, TQK5X, TQK4T, TQK5T, TQK6, TQK7 | GPU |
+| MXFP4 | GPU |
+| それ以外（Q4_0、FP8 のエキスパートなど） | ggml-cpu に行の計算があれば CPU レーン、なければ読めません |
+
+エキスパート以外のテンソルは BF16・F32・F16・MXFP8・Q8_0 をそのまま読み、K 量子の密な行列も上の表の型で動きます。
+
+### XeStrata の機能への対応
+
+| 機能 | 対応 |
+| --- | --- |
+| 画像生成の `unload` / `auto` ポリシー（`POST /v1/images/generations`、`generate_image`） | 対応（`SAVE` / `RESTORE` で会話をファイルに保存し、次の起動で戻します） |
+| 画像生成の `shrink` ポリシー（`--vram-elastic`） | 未対応（実装の途中です） |
+| 会話の保存と復帰（serve の session_file プロトコル） | 対応 |
+| 画像を読む質問 | 対応 |
+| 推測デコード（DSpark） | 対応 |
+
 ### 参考にした上流と謝辞
 
 このブランチは、次のプロジェクトの成果の上に作りました。作者と貢献者のみなさんに感謝します。
@@ -25,7 +52,6 @@ Radeon AI PRO R9700（Windows、free モード）で、DeepSeek-V4.1-Flash の U
 - [XeStrata](https://github.com/MistVVK/XeStrata)（MistVVK と XeStrata の貢献者、LGPL-3.0-or-later）: このブランチの元（xe0.2.2-1）と、Windows の配布物の作り方。
 - [exllamav3](https://github.com/turboderp-org/exllamav3)（turboderp、MIT）: EXL3 のファイルの形とコードブック、CPU のエキスパートのカーネルの元。
 - [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)（ggml の作者、MIT）: GGUF の量子化の形と、それを読むカーネルの元。
-- 参考にした報告: zephel01 の [Abyss](https://github.com/zephel01/Abyss)。Linux の R9700 で `GPU_MAX_HW_QUEUES` を変えて DeepSeek V4 の prefill を測った報告を見て、Windows の HIP でも同じ設定を確かめました（コードは取り込んでいません）。
 - モデル: DeepSeek の DeepSeek-V4.1-Flash と、[Unsloth](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) による GGUF（UD-IQ1_S）。
 
 ---

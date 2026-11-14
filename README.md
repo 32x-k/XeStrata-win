@@ -16,6 +16,33 @@ On a Radeon AI PRO R9700 (Windows, free mode) it loads the UD-IQ1_S GGUF of Deep
 It also serves as the text model for the server's image generation (`POST /v1/images/generations`, and `generate_image` from a chat). Under `--image-gpu-policy` `unload` (which `auto` may pick) the conversation is saved to disk before the engine leaves the GPU for the image job and brought back at the next start. `shrink` (`--vram-elastic`) is not supported by this engine.
 Its speed is still being tuned. It has run on one R9700 only.
 
+### Quantization types it reads
+
+Per routed-expert type: "GPU" means the engine has a device kernel for it, "CPU lane" means ggml-cpu's row dots take it (that layer is slower).
+
+| Type | Support |
+| --- | --- |
+| IQ1_S, IQ1_M | GPU |
+| IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL | GPU |
+| Q2_K, Q3_K, Q4_K, Q5_K, Q6_K | GPU |
+| Q8_0, Q8_K | GPU and CPU lane |
+| Q2_0 (GSQ-RCO's type 42) | GPU and CPU lane |
+| TQK4X, TQK5X, TQK4T, TQK5T, TQK6, TQK7 | GPU |
+| MXFP4 | GPU |
+| anything else (Q4_0, FP8 experts, ...) | the CPU lane where ggml-cpu has a row dot, unreadable otherwise |
+
+Tensors outside the experts are read as BF16, F32, F16, MXFP8 or Q8_0, and dense K-quant matrices run in the table's types as well.
+
+### XeStrata features
+
+| Feature | Support |
+| --- | --- |
+| image generation under the `unload` / `auto` policy (`POST /v1/images/generations`, `generate_image`) | yes (`SAVE` / `RESTORE` park the conversation in a file for the next start) |
+| image generation under the `shrink` policy (`--vram-elastic`) | not yet (work in progress) |
+| conversation save and restore (serve's session_file protocol) | yes |
+| questions about a picture | yes |
+| speculative decoding (DSpark) | yes |
+
 ### Upstreams and thanks
 
 This branch is built on the work of the projects below. Our thanks go to their authors and contributors.
@@ -25,7 +52,6 @@ This branch is built on the work of the projects below. Our thanks go to their a
 - [XeStrata](https://github.com/MistVVK/XeStrata) (MistVVK and the XeStrata contributors, LGPL-3.0-or-later): this branch's base (xe0.2.2-1) and the way its Windows package is made.
 - [exllamav3](https://github.com/turboderp-org/exllamav3) (turboderp, MIT): EXL3's file layout and codebooks, and the origin of the CPU expert kernels.
 - [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (the ggml authors, MIT): GGUF's quantized formats and the origin of the kernels that read them.
-- A report we drew on: zephel01's [Abyss](https://github.com/zephel01/Abyss). Its measurements of DeepSeek V4's prefill with `GPU_MAX_HW_QUEUES` on a Linux R9700 led us to check the same setting with Windows' HIP (no code was taken from it).
 - Model: DeepSeek's DeepSeek-V4.1-Flash, and its GGUF (UD-IQ1_S) by [Unsloth](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF).
 
 ---
