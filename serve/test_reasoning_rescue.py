@@ -228,7 +228,8 @@ class OverHttp(unittest.TestCase):
                 "name": "write", "parameters": {"type": "object", "properties": PROPS}}}], "messages": msgs,
                 "max_tokens": max_tokens}),
             "anthropic": ("/v1/messages", {"tools": [{"name": "write", "input_schema": {
-                "type": "object", "properties": PROPS}}], "messages": msgs, "max_tokens": max_tokens}),
+                "type": "object", "properties": PROPS}}], "messages": msgs, "max_tokens": max_tokens,
+                "thinking": {"type": "adaptive"}}),          # it thinks only when asked
             "responses": ("/v1/responses", {"tools": [{"type": "function", "name": "write", "parameters": {
                 "type": "object", "properties": PROPS}}], "input": "save my notes", "max_output_tokens": max_tokens}),
         }

@@ -10,9 +10,10 @@ serve/images.py starts it (its environment the server's engine's: the same GPU a
 server of the same image model and GPU finds it at the same address (images.daemon_address).  ADDR: a Unix socket's
 path, or on Windows a file the daemon writes its loopback port and a random token to (a client sends the token
 first).  The lines are strata-image's own (src/image/strata_image.cpp): on connecting a client gets READY (or ERROR,
-and the daemon ends); a request line (IMG, NEED, FREE, FIT, BUDGET, RELEASE) waits for the engine and gets its lines
-up to the answer (STEP lines before an IMAGE); STOP ends the client's running image after its step; QUIT closes the
-connection; SHUTDOWN ends the engine and the daemon.  Without a client and a request for --idle seconds (default 1800)
+and the daemon ends); a request line (IMG, NEED, FREE, FIT, BUDGET, RELEASE, RATIO) waits for the engine and gets
+its lines up to the answer (STEP lines before an IMAGE); STOP ends the client's running image after its step; QUIT
+closes the connection; SHUTDOWN ends the engine (after a running request) and the daemon, and answers STOPPED once
+the engine is gone.  Without a client and a request for --idle seconds (default 1800)
 the daemon ends, and so it does when the engine ends.
 """
 from __future__ import annotations
@@ -29,7 +30,7 @@ import threading
 import time
 
 ANSWERS = {"IMG": ("IMAGE",), "NEED": ("NEED",), "FREE": ("FREE",), "FIT": ("BUDGET",), "BUDGET": ("BUDGET",),
-           "RELEASE": ("RELEASE",)}
+           "RELEASE": ("RELEASE",), "RATIO": ("RATIO",)}
 START_TIMEOUT_S = 600
 # An engine silent this long within a request (an image says STEP at each step; reading a prompt's layers from a hard
 # disk took 80 s) is taken as stuck: it is ended, the request answered ERROR, and the daemon ends with it (the next
@@ -149,8 +150,12 @@ class Daemon:
                 line = requests.get()
                 if line is None or line == "QUIT":
                     return
-                if line == "SHUTDOWN":
-                    self.done.set()
+                if line == "SHUTDOWN":   # the engine ended (after a running request) before the answer, so that
+                    self.done.set()      # the asker can take the GPU at once
+                    with self.lock:
+                        self.stop()
+                    with contextlib.suppress(OSError, ValueError):
+                        write(f, "STOPPED")
                     return
                 if line:
                     self.request(conn, f, line)

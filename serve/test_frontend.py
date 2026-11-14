@@ -3,10 +3,13 @@
 # SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 """Chat history normalization before rendering the model's prompt."""
 import copy
+import json
 from pathlib import Path
+import tempfile
 import unittest
 
-from serve.frontend import ChatTemplate, anthropic_to_messages, openai_to_messages
+from serve.frontend import (HARMONY_NO_THINKING, HARMONY_TURN, ChatTemplate, anthropic_to_messages, effort_kwargs,
+                            legacy_functions, openai_to_messages, require_messages)
 from serve.server import ByteTokenizer, MockEngine, Service
 
 
@@ -89,24 +92,23 @@ class UnreadContentParts(unittest.TestCase):
         tok = ByteTokenizer()
         self.service = Service(MockEngine(tok, "ok"), tok, self.template)
 
-    def test_chat_file_and_audio_parts_are_left_out(self):
-        parts = ({"type": "file", "file": {"filename": "a.pdf", "file_data": "data:application/pdf;base64,AA"}},
-                 {"type": "input_audio", "input_audio": {"data": "AA", "format": "wav"}})
-        for part in parts:
-            with self.subTest(kind=part["type"]):
-                got = openai_to_messages({"messages": [
-                    {"role": "user", "content": "summarize"},
-                    {"role": "user", "content": [{"type": "text", "text": "this one"}, part]}]})
-                want = openai_to_messages({"messages": [
-                    {"role": "user", "content": "summarize"},
-                    {"role": "user", "content": [{"type": "text", "text": "this one"}]}]})
-                self.assertEqual(got, want)
+    def test_chat_file_part_is_kept_and_audio_refused(self):
+        audio = {"type": "input_audio", "input_audio": {"data": "AA", "format": "wav"}}
+        with self.assertRaisesRegex(ValueError, "input_audio"):   # the model reads no audio: a 400, as OpenAI's
+            openai_to_messages({"messages": [{"role": "user", "content": [{"type": "text", "text": "this"}, audio]}]})
+        # a file stays in the content as a "file" item, which Service.expand_files reads into text and pages
+        part = {"type": "file", "file": {"filename": "a.pdf", "file_data": "data:application/pdf;base64,AA"}}
+        got = openai_to_messages({"messages": [{"role": "user", "content": [{"type": "text", "text": "this"}, part]}]})
+        self.assertEqual(got[0][0]["content"][1], {"type": "file", "data": "data:application/pdf;base64,AA",
+                                                   "url": None, "name": "a.pdf", "mime": "application/pdf"})
+        with self.assertRaisesRegex(ValueError, "file_id"):       # no Files API here
+            only_id = {"type": "file", "file": {"file_id": "f"}}
+            openai_to_messages({"messages": [{"role": "user", "content": [only_id]}]})
 
     def test_messages_blocks_real_clients_send_are_left_out(self):
-        # tool_reference (Claude Code's tool search), documents, search results, server tool blocks, signed thinking
-        extra = [{"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "AA"}},
-                 {"type": "search_result", "source": "s", "title": "t", "content": [{"type": "text", "text": "x"}]},
-                 {"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {}},
+        # tool_reference (Claude Code's tool search), server tool blocks, signed thinking (documents and search
+        # results are read: _anthropic_documents)
+        extra = [{"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {}},
                  {"type": "web_search_tool_result", "tool_use_id": "s1", "content": []},
                  {"type": "container_upload", "file_id": "f"}]
         for block in extra:
@@ -120,6 +122,59 @@ class UnreadContentParts(unittest.TestCase):
                     {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
                     {"role": "user", "content": [{"type": "text", "text": "go"}]}]})
                 self.assertEqual(got, want)
+
+    def test_parameter_types_that_allow_a_string(self):
+        # a parameter whose schema allows a string keeps what the model wrote when reading it as JSON gives a type the
+        # schema does not allow: ["string", "null"]'s and anyOf's "1" stays "1", as do a string enum's and const's
+        from serve.frontend import OutputParser, parse_tool_call
+        body = "<function=f>\n<parameter=x>\n1\n</parameter>\n</function>"
+        nullable = {"anyOf": [{"type": "string"}, {"type": "null"}]}
+        for schema, want in (({"type": ["string", "null"]}, "1"), (nullable, "1"), ({"enum": ["1", "2"]}, "1"),
+                             ({"const": "1"}, "1"), ({"type": "string"}, "1"), ({"type": ["integer", "null"]}, 1),
+                             ({"type": ["string", "integer"]}, 1), (True, 1)):
+            tool = {"name": "f", "parameters": {"type": "object", "properties": {"x": schema}}}
+            with self.subTest(schema=schema):
+                self.assertEqual(parse_tool_call(body, tool).arguments, {"x": want})
+                p = OutputParser(thinking=False, tools=[tool], stream_tools=True)
+                evs = p.feed("<tool_call>\n" + body + "\n</tool_call>") + p.finish()
+                self.assertEqual([e.call.arguments for e in evs if e.kind == "tool_call"], [{"x": want}])
+                streamed = "".join(e.text for e in evs if e.kind == "tool_args")    # the arguments as they stream
+                self.assertEqual(json.loads(streamed), {"x": want})
+
+    def test_responses_results_follow_calls_split_by_reasoning(self):
+        # Responses: a reasoning or a message between two calls makes two assistant messages; the results, sent in the
+        # order they finished, still follow the calls (the template pairs them by position)
+        from serve.responses import input_messages
+        call = [{"type": "function_call", "call_id": f"c{n}", "name": n, "arguments": "{}"} for n in "ab"]
+        between = ({"type": "reasoning", "summary": [], "content": [{"type": "reasoning_text", "text": "then b"}]},
+                   {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "and b"}]})
+        results = [{"type": "function_call_output", "call_id": f"c{n}", "output": f"RESULT-{n}"} for n in "ba"]
+        for item in between:
+            with self.subTest(item["type"]):
+                got = input_messages({"input": [{"role": "user", "content": "go"}, call[0], item, call[1], *results]})
+                self.assertEqual([m["content"] for m in got if m["role"] == "tool"], ["RESULT-a", "RESULT-b"])
+
+    def test_function_call_none_or_null_without_functions(self):
+        # a null is no field, and function_call "none" without functions is OpenAI's default: an ordinary request
+        for req in ({"function_call": "none"}, {"functions": None, "function_call": None}, {"functions": None}):
+            self.assertIsNone(legacy_functions({"messages": [], **req}), req)
+        with self.assertRaisesRegex(ValueError, "functions must be"):
+            legacy_functions({"function_call": "auto"})
+        # "none" beside the new tools is the old and the new shape mixed: a 400, as any other mix
+        tool = {"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}
+        for req in ({"function_call": "none", "tools": [tool]}, {"function_call": "none", "tool_choice": "auto"}):
+            with self.assertRaisesRegex(ValueError, "cannot be used with tools"):
+                legacy_functions(req)
+        self.assertIsNone(legacy_functions({"functions": None, "function_call": None, "tools": [tool]}))
+
+    def test_messages_document_images_are_read(self):
+        # a "content" document's images reach the model as the message's own images do, after its text
+        img = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AA"}}
+        doc = {"type": "document", "title": "T",
+               "source": {"type": "content", "content": [img, {"type": "text", "text": "body"}]}}
+        got = anthropic_to_messages({"messages": [{"role": "user", "content": [doc]}]})[0]
+        self.assertEqual(got[0]["content"], [{"type": "text", "text": "Document: T\n\nbody"},
+                                             {"type": "image", "source": "data:image/png;base64,AA"}])
 
     def test_messages_tool_reference_in_a_tool_result_is_left_out(self):
         def run(extra):
@@ -275,3 +330,59 @@ class FencedJsonCallInWrapper(unittest.TestCase):
         other = [{"name": "other", "parameters": {}}]
         calls, text = self.run_parser(raw, len(raw), False, tools=other)
         self.assertEqual((calls, text), ([], raw))
+
+
+class EmptyConversation(unittest.TestCase):
+    def test_no_message_is_an_error_a_message_is_not(self):
+        with self.assertRaises(ValueError):
+            require_messages(openai_to_messages({"messages": []})[0])
+        with self.assertRaises(ValueError):
+            require_messages(openai_to_messages({})[0])
+        require_messages(openai_to_messages({"messages": [{"role": "user", "content": "hi"}]})[0])
+
+
+# the lines of each model's template that take its thinking (a stand-in, not the model's own file)
+GLM_TPL = ("{%- set e = reasoning_effort if reasoning_effort is defined and reasoning_effort in ['low', 'high'] "
+           "else 'max' -%}Reasoning Effort: {{ e | capitalize }}<arg_key>{%- for m in messages %}{{ m.content }}"
+           "{%- endfor %}{%- if add_generation_prompt %}<|assistant|><think>{%- endif %}")
+HARMONY_TPL = ("Reasoning: {{ reasoning_effort | default('medium') }}<|channel|>{%- for m in messages %}{{ m.content }}"
+               "{%- endfor %}{%- if add_generation_prompt %}<|start|>assistant{%- endif %}")
+QWEN38_TPL = ("{{ reasoning_effort | default('xhigh') }}{%- for m in messages %}{{ m.content }}{%- endfor %}"
+              "{%- if enable_thinking is defined and enable_thinking is false %}off{%- endif %}")
+ONOFF_TPL = ("{%- for m in messages %}{{ m.content }}{%- endfor %}{%- if add_generation_prompt %}<|im_start|>"
+             "assistant\n{%- if enable_thinking is defined and enable_thinking is false %}<think>\n\n</think>"
+             "{%- else %}<think>{%- endif %}{%- endif %}")
+
+
+class ThinkingLevels(unittest.TestCase):
+    """Each template's thinking levels by their own names (/health's "thinking") and the efforts it is given."""
+
+    def template(self, source: str) -> ChatTemplate:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "chat_template.jinja"
+            p.write_text(source, encoding="utf-8")
+            return ChatTemplate(p)
+
+    def render(self, t: ChatTemplate, **kw) -> str:
+        return t.render([{"role": "user", "content": "hi"}], add_generation_prompt=True, **kw)
+
+    def test_levels_by_template(self):
+        for source, levels, default in ((GLM_TPL, ["none", "low", "high", "max"], "max"),
+                                        (HARMONY_TPL, ["none", "low", "medium", "high"], "medium"),
+                                        (QWEN38_TPL, ["none", "low", "medium", "high"], "high"),
+                                        (ONOFF_TPL, ["none", "on"], "on")):
+            self.assertEqual(self.template(source).thinking, {"levels": levels, "default": default})
+
+    def test_glm_takes_its_efforts_by_name(self):
+        t = self.template(GLM_TPL)
+        for given, level in (("low", "Low"), ("medium", "High"), ("high", "High"), ("xhigh", "Max"),
+                             ("max", "Max"), (None, "Max")):
+            self.assertIn(f"Reasoning Effort: {level}", self.render(t, **effort_kwargs(given)), given)
+
+    def test_harmony_high_and_no_thinking(self):
+        t = self.template(HARMONY_TPL)
+        for given, level in (("high", "high"), ("xhigh", "high"), ("max", "high"), ("low", "low"), (None, "medium")):
+            self.assertIn(f"Reasoning: {level}", self.render(t, **effort_kwargs(given)), given)
+        no_thinking = HARMONY_TURN + HARMONY_NO_THINKING + HARMONY_TURN
+        self.assertTrue(self.render(t, **effort_kwargs("none")).endswith(no_thinking))
+        self.assertTrue(self.render(t).endswith("hi" + HARMONY_TURN))

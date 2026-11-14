@@ -59,3 +59,7 @@ windows/launcher/*/obj/
 /.ccache/
 # notes about this machine for coding agents (AGENTS.md)
 /LOCAL.md
+
+# Optional MCP raster cache
+*.tool-media/
+/.tool-media/

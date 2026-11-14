@@ -481,7 +481,7 @@ void glm5_latent_store(const float* kv, const int32_t* steps, int64_t n_tokens, 
 }
 
 void glm5_mla_attn(const float* q, const uint16_t* latent, const int32_t* ids, int64_t cap, const int32_t* steps,
-                   int n_heads, float scale, int64_t n_tokens, float* out, void* stream, int tail_kpool) {
+                   int n_heads, float scale, int64_t n_tokens, float* out, void* stream, int tail_kpool, int64_t compact) {
     constexpr int L = 512, WG = 256, NSG = WG / WARP, PER = L / WARP;
     if (n_tokens <= 0) return;
     if (n_heads <= 0 || cap <= 0 || n_tokens * n_heads > 0x7fffffff || tail_kpool < 0 || tail_kpool == 1)
@@ -510,7 +510,9 @@ void glm5_mla_attn(const float* q, const uint16_t* latent, const int32_t* ids, i
             float qr[PER];
             for (int i = 0; i < PER; ++i) qr[i] = qh[lane * PER + i];
             const int32_t* sel = ids + t * cap;
-            auto cell = [&](int64_t j) { return j < chosen ? (int64_t) sel[j] : tail0 + (j - chosen); };
+            auto cell = [&](int64_t j) {
+                return compact > 0 ? t * compact + j : j < chosen ? (int64_t) sel[j] : tail0 + (j - chosen);
+            };
             for (int64_t j = warp; j < width; j += NSG) {   // a sub-group a cell
                 const uint16_t* row = latent + cell(j) * L + (int64_t) lane * PER;
                 float d = 0.0f;
@@ -536,6 +538,29 @@ void glm5_mla_attn(const float* q, const uint16_t* latent, const int32_t* ids, i
         });
     });
     sync_if_needed(stream, event, "glm5_mla_attn");
+}
+
+void glm5_latent_gather(const uint16_t* latent, const int32_t* ids, int64_t cap, const int32_t* steps,
+                        int64_t n_tokens, int tail_kpool, int64_t stride, uint16_t* out, void* stream) {
+    constexpr int L = 512, W = L / 8;   // a work-item a 16-byte quarter-row
+    if (n_tokens <= 0) return;
+    if (cap <= 0 || stride < cap + (tail_kpool > 1 ? tail_kpool - 1 : 0) || tail_kpool < 0 || tail_kpool == 1)
+        throw core::DeviceError("glm5_latent_gather: cap " + std::to_string(cap) + ", stride " + std::to_string(stride));
+    const int KP = tail_kpool;
+    const auto event = queue_for(stream).parallel_for(
+        sycl::range<2>((size_t) (n_tokens * stride), (size_t) W), [=](sycl::id<2> id) {
+            const int64_t t = (int64_t) id[0] / stride, j = (int64_t) id[0] % stride;
+            const int64_t chosen = sycl::min<int64_t>(steps[t * kStepCount + kStepWidth], cap);
+            const int32_t pos = steps[t * kStepCount + kStepPos];
+            const int64_t tail0 = KP > 0 && pos >= 0 ? (int64_t) ((pos + 1) / KP) * KP : 0;
+            const int64_t width = chosen + (KP > 0 && pos >= 0 ? (int64_t) pos + 1 - tail0 : 0);
+            if (j >= width) return;
+            const int64_t c = j < chosen ? (int64_t) ids[t * cap + j] : tail0 + (j - chosen);
+            const auto* src = reinterpret_cast<const sycl::uint4*>(latent + c * L);
+            auto* dst = reinterpret_cast<sycl::uint4*>(out + (t * stride + j) * L);
+            dst[id[1]] = src[id[1]];
+        });
+    sync_if_needed(stream, event, "glm5_latent_gather");
 }
 
 void glm5_swiglu_clamp(const float* gate, const float* up, float* out, int64_t n, float limit, void* stream) {

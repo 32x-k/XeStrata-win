@@ -22,6 +22,11 @@
 #include <vector>
 
 namespace strata::kernels {
+
+template <int THREADS, typename D> class SampleKernel;   // asked for its work-group (work_group_upto_1024)
+template <int THREADS> using SampleKernelDouble = SampleKernel<THREADS, double>;
+template <int THREADS> using SampleKernelFloat = SampleKernel<THREADS, float>;
+
 namespace {
 
 constexpr int WARP = 32;
@@ -74,6 +79,14 @@ inline int history_count(const int* h, int n, int v) {
     int c = 0;
     for (int i = 0; i < n; ++i) if (h[i] == v) ++c;
     return c;
+}
+
+// row t's logit of token v with the request's logit_bias added, -inf where the grammar's mask bans v
+inline float biased(const SamplerParams& p, const float* l, int v, int t, int n_vocab) {
+    if (p.allowed != nullptr &&
+        !((p.allowed[(size_t) t * (size_t) ((n_vocab + 31) / 32) + (size_t) (v >> 5)] >> (v & 31)) & 1u))
+        return -std::numeric_limits<float>::infinity();
+    return p.logit_bias ? l[v] + p.logit_bias[v] : l[v];
 }
 
 // llama_sampler_penalties_apply: the repeat penalty multiplies non-positive logits and divides positive ones; the
@@ -229,7 +242,7 @@ sycl::event sample_launch(sycl::queue& q, const float* logits, int n_tokens, int
         sycl::local_accessor<int, 1> si(sycl::range<1>(THREADS / WARP), h);
         sycl::local_accessor<int, 1> sel_ids(sycl::range<1>(KMAX), h);
         sycl::local_accessor<float, 1> sel_logit(sycl::range<1>(KMAX), h);
-        h.parallel_for(sycl::nd_range<1>((size_t) n_tokens * THREADS, THREADS),
+        h.parallel_for<SampleKernel<THREADS, D>>(sycl::nd_range<1>((size_t) n_tokens * THREADS, THREADS),
                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const int t = (int) it.get_group(0);
             const int tid = (int) it.get_local_id(0);
@@ -241,7 +254,7 @@ sycl::event sample_launch(sycl::queue& q, const float* logits, int n_tokens, int
                 float wv;
                 int wi;
                 block_argmax<THREADS>(it, n_vocab, &sv[0], &si[0], [&](int v, float& s) {
-                    s = apply_penalties(pp.logit_bias ? l[v] + pp.logit_bias[v] : l[v], hit_count(w, b, v), pp);
+                    s = apply_penalties(biased(pp, l, v, t, n_vocab), hit_count(w, b, v), pp);
                     return true;
                 }, wv, wi);
                 // a tie between two -inf candidates leaves wi == n_vocab, and the serial version answered 0
@@ -258,7 +271,7 @@ sycl::event sample_launch(sycl::queue& q, const float* logits, int n_tokens, int
                 int wi;
                 block_argmax<THREADS>(it, n_vocab, &sv[0], &si[0], [&](int v, float& s) {
                     for (int j = 0; j < i; ++j) if (sel_ids[j] == v) return false;
-                    s = apply_penalties(pp.logit_bias ? l[v] + pp.logit_bias[v] : l[v], hit_count(w, b, v), pp);
+                    s = apply_penalties(biased(pp, l, v, t, n_vocab), hit_count(w, b, v), pp);
                     return true;
                 }, wv, wi);
                 if (tid == 0) { sel_ids[i] = (wi < n_vocab) ? wi : 0; sel_logit[i] = wv; }
@@ -343,7 +356,7 @@ sycl::event split_stage1(sycl::queue& q, const float* logits, int n_tokens, int 
             }
             for (int c = tid; c < n; c += SPLIT_T) {
                 const int cnt = use_bits && (bits[c >> 5] & (1u << (c & 31))) ? history_count(hrow, hlen, base + c) : 0;
-                sc[c] = apply_penalties(pp.logit_bias ? l[base + c] + pp.logit_bias[base + c] : l[base + c], cnt, pp);
+                sc[c] = apply_penalties(biased(pp, l, base + c, t, n_vocab), cnt, pp);
                 taken[c] = 0;
             }
             sycl::group_barrier(it.get_group());
@@ -466,7 +479,8 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
                              ? (size_t) ((n_vocab + 31) / 32) : 1;   // the penalty bitmap
     const SamplerParams pp = p;
     const bool greedy = p.greedy || p.temperature <= 0.0f;
-    const int wg = xe::work_group_upto_1024(q);
+    const int wg = xe::has_fp64(q) ? xe::work_group_upto_1024<SampleKernelDouble>(q)
+                                   : xe::work_group_upto_1024<SampleKernelFloat>(q);
     auto launch = xe::has_fp64(q)
                       ? (wg == 1024 ? sample_launch<1024, double> : wg == 512 ? sample_launch<512, double>
                                                                        : sample_launch<256, double>)

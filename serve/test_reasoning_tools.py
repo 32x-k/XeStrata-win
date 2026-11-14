@@ -174,6 +174,7 @@ class OverHttp(unittest.TestCase):
         httpd = serve(svc, port=0)
         try:
             body = {"model": "x", "max_tokens": 500, "stream": True, "messages": [{"role": "user", "content": "hi"}],
+                    "thinking": {"type": "adaptive"},       # Anthropic's requests think only when asked
                     "tools": [{"name": "write", "input_schema": {"type": "object", "properties": helper.PROPS}}]}
             req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/messages",
                                          data=json.dumps(body).encode(), headers={"Content-Type": "application/json",

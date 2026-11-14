@@ -6,8 +6,8 @@ project(XeStrata LANGUAGES CXX)
 if(NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Windows)$")
   message(FATAL_ERROR "XeStrata builds for Linux and Windows")
 endif()
-set(STRATA_UPSTREAM_VERSION "0.2.2")
-set(STRATA_UPSTREAM_COMMIT "011c9e6")
+set(STRATA_UPSTREAM_VERSION "0.2.8")
+set(STRATA_UPSTREAM_COMMIT "870aedd")
 # XeStrata's version follows the upstream version it has integrated, marked "xe" so it is not taken for upstream's.
 # XESTRATA_REVISION counts XeStrata's releases on that upstream version from 1, as a Debian revision does, and the
 # version is <upstream>-<revision> everywhere: the version name (the tag, what the engine says) xe<upstream>-<revision>
@@ -333,7 +333,9 @@ if(STRATA_ENABLE_XE)
     string(JOIN " " _strata_cuda_str ${_strata_cuda_opts})
     string(MD5 _strata_ckey "${_strata_sycl_targets} ${_strata_cuda_str}")
     list(JOIN _strata_sycl_targets "," _strata_sycl_targets)
-    set(CMAKE_REQUIRED_FLAGS "-fsycl -fsycl-targets=${_strata_sycl_targets} ${_strata_cuda_str}")
+    strata_try_compile_defs("${_strata_cuda_opts}" _strata_cuda_req)   # a command line: a toolkit path's space quoted
+    string(JOIN " " _strata_cuda_req ${_strata_cuda_req})
+    set(CMAKE_REQUIRED_FLAGS "-fsycl -fsycl-targets=${_strata_sycl_targets} ${_strata_cuda_req}")
     check_cxx_source_compiles("#include <sycl/sycl.hpp>\nint main() { sycl::queue q; q.single_task([] {}); }"
                               STRATA_HAVE_SYCL_CUDA_${_strata_ckey})
     unset(CMAKE_REQUIRED_FLAGS)
@@ -414,7 +416,8 @@ if(STRATA_ENABLE_XE)
                                     src/kernels/xe/xmx_gemm.cpp src/kernels/xe/dp4a_gemm.cpp
                                     src/kernels/xe/mma_gemm.cpp src/kernels/xe/iq_mmq.cpp src/kernels/xe/prompt_attn.cpp
                                     src/kernels/xe/q8_mma.cpp
-                                    src/kernels/xe/matrix_report.cpp src/kernels/xe/glm5.cpp)
+                                    src/kernels/xe/matrix_report.cpp src/kernels/xe/glm5.cpp
+                                    src/kernels/xe/draft_head.cpp)
   target_link_libraries(strata_kernels PUBLIC strata_core strata_ngram)
   # plan v0.3 P6: llama.cpp's block layouts and codebook grids for the i-quant formats (MIT, third_party/main/ggml)
   target_include_directories(strata_kernels PRIVATE third_party/main/ggml)
@@ -429,9 +432,38 @@ if(STRATA_ENABLE_XE)
                                    src/core/plain_model.cpp src/core/plain_glm5.cpp src/core/pcie_split.cpp
                                    src/core/mtp.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
                                    src/core/conversation_memory.cpp src/core/conversation_disk.cpp
-                                   src/core/conversation_file.cpp src/core/vmm.cpp)
+                                   src/core/conversation_file.cpp src/core/vmm.cpp src/core/draft_head.cpp
+                                   src/core/grammar.cpp)
   target_include_directories(strata_engine PUBLIC include)
-  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu)
+  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu strata_spec)
+  # grammar-constrained decoding (src/core/grammar.cpp, --serve's grammar=): xgrammar (Apache-2.0) at a pinned release
+  # and dlpack (Apache-2.0), the one header it reads, both checked by SHA-256.  Built here from xgrammar's C++ sources
+  # alone: its own CMakeLists builds Python bindings and compiles with -flto.  OFF: the engine builds without it and
+  # serve checks a structured reply after it is written, as before.
+  option(STRATA_GRAMMAR "grammar-constrained decoding (xgrammar)" ON)
+  if(STRATA_GRAMMAR)
+    include(FetchContent)
+    FetchContent_Populate(strata_xgrammar QUIET
+      URL https://github.com/mlc-ai/xgrammar/archive/refs/tags/v0.2.8.tar.gz
+      URL_HASH SHA256=16c06f7cef8f13ae597b007cce515991725603bded6ebce5f1828e6a9c9685be
+      DOWNLOAD_EXTRACT_TIMESTAMP FALSE SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/strata_xgrammar-src
+      SUBBUILD_DIR ${CMAKE_BINARY_DIR}/_deps/strata_xgrammar-subbuild)
+    FetchContent_Populate(strata_dlpack QUIET
+      URL https://github.com/dmlc/dlpack/archive/bbd2f4d32427e548797929af08cfe2a9cbb3cf12.tar.gz
+      URL_HASH SHA256=f5dcb30f8a3d1a41d48b5d5b3fe1631dfce11de76f9e7e5bd22c6dc75a758885
+      DOWNLOAD_EXTRACT_TIMESTAMP FALSE SOURCE_DIR ${CMAKE_BINARY_DIR}/_deps/strata_dlpack-src
+      SUBBUILD_DIR ${CMAKE_BINARY_DIR}/_deps/strata_dlpack-subbuild)
+    file(GLOB_RECURSE _strata_xg_src ${strata_xgrammar_SOURCE_DIR}/cpp/*.cc)
+    list(FILTER _strata_xg_src EXCLUDE REGEX "/cpp/tvm_ffi/")   # its Python bindings
+    add_library(strata_xgrammar STATIC ${_strata_xg_src})
+    target_include_directories(strata_xgrammar SYSTEM PUBLIC ${strata_xgrammar_SOURCE_DIR}/include
+                               ${strata_xgrammar_SOURCE_DIR}/3rdparty/picojson ${strata_dlpack_SOURCE_DIR}/include)
+    target_compile_definitions(strata_xgrammar PUBLIC XGRAMMAR_ENABLE_CPPTRACE=0)
+    set_target_properties(strata_xgrammar PROPERTIES CXX_STANDARD 17 POSITION_INDEPENDENT_CODE ON)
+    target_compile_options(strata_xgrammar PRIVATE -w)   # another project's code: its warnings are not ours
+    target_link_libraries(strata_engine PRIVATE strata_xgrammar)
+    target_compile_definitions(strata_engine PRIVATE STRATA_GRAMMAR=1)
+  endif()
   # c-blosc2 (libblosc2-dev; free, BSD-3), optional: --conversation-save-compress stores the saved conversations'
   # floating-point parts compressed.  Without it the engine builds and runs, and refuses that option.
   find_path(STRATA_BLOSC2_INCLUDE blosc2.h)
@@ -628,8 +660,8 @@ if(STRATA_ENABLE_XE)
       set(_strata_onemath_url URL ${STRATA_ONEMATH_SOURCE})
     else()
       set(_strata_onemath_url
-        URL https://github.com/MistVVK/oneMath/archive/refs/tags/xestrata-10.tar.gz
-        URL_HASH SHA256=efda4bf89d1624fc8c70c63508489ed8eef24ad62c962d80b3f52717abd0841b)
+        URL https://github.com/MistVVK/oneMath/archive/refs/tags/xestrata-12.tar.gz
+        URL_HASH SHA256=ce060040a8a710618856717f994ee00480e872877ac4bbaf815e9b55e8b849de)
     endif()
     # another archive is another tree: start from it again
     if(NOT "${_strata_onemath_url}" STREQUAL "${_STRATA_ONEMATH_KEY}")
@@ -671,26 +703,6 @@ if(STRATA_ENABLE_XE)
       target_compile_options(onemath_blas_cublas_obj PRIVATE ${_strata_cuda_base_opts})
       target_link_options(onemath_blas_cublas PRIVATE ${_strata_cuda_base_opts})
     endif()
-    # Windows: oneMKL's MKLConfig.cmake links its SYCL targets with -fsycl-allow-device-image-dependencies, and with it
-    # intel/llvm v7.2.0's driver puts /INCLUDE:__imp_<a symbol> of every library on the line into the link - of the MSVC
-    # runtime's, time_get<...>::_Getvals (which every SYCL object also defines: a duplicate), HUGE of oldnames.lib and a
-    # 32-bit _set_invalid_parameter_handler of msvcrt.lib (not resolved), and onemath_blas_mklgpu.dll's link stopped.
-    # The backend's device code calls no device function of another library, so the dependencies are not needed there.
-    if(WIN32)
-      foreach(mkl_t MKL::MKL_SYCL MKL::MKL_SYCL::BLAS MKL::MKL_DPCPP)
-        if(TARGET ${mkl_t})
-          get_target_property(_strata_mkl_real ${mkl_t} ALIASED_TARGET)
-          if(NOT _strata_mkl_real)
-            set(_strata_mkl_real ${mkl_t})
-          endif()
-          get_target_property(_strata_mkl_libs ${_strata_mkl_real} INTERFACE_LINK_LIBRARIES)
-          if(_strata_mkl_libs)
-            list(REMOVE_ITEM _strata_mkl_libs -fsycl-allow-device-image-dependencies)
-            set_target_properties(${_strata_mkl_real} PROPERTIES INTERFACE_LINK_LIBRARIES "${_strata_mkl_libs}")
-          endif()
-        endif()
-      endforeach()
-    endif()
     unset(BUILD_SHARED_LIBS)
     if(_strata_libcuda_stubs)
       list(REMOVE_ITEM CMAKE_LIBRARY_PATH "${_strata_libcuda_stubs}")
@@ -703,11 +715,14 @@ if(STRATA_ENABLE_XE)
   # The experts' quantized products (moe_mmq.cpp) run on the int8 matrix engines where the GPU reports the shape
   # src/kernels/xe/iq_mmq.cpp is written for, and the FP16 GEMM path elsewhere.  Upstream 0.1.38's quantized and fused
   # expert products on the decode kernels' DP4a dots ran at 0.34x and 0.25x of it on the B70 and were dropped.
-  add_library(strata_prefill STATIC src/prefill/gemm.cpp src/prefill/kernels.cpp src/prefill/prefill.cpp
-                                    src/prefill/moe_mmq.cpp src/prefill/plain_prompt.cpp
+  add_library(strata_prefill STATIC src/prefill/gemm.cpp src/prefill/kernels.cpp src/prefill/gdn_tc.cpp
+                                    src/prefill/prefill.cpp src/prefill/moe_mmq.cpp src/prefill/plain_prompt.cpp
                                     src/prefill/plain_prompt_glm5.cpp)
   target_include_directories(strata_prefill PUBLIC include)
   target_link_libraries(strata_prefill PUBLIC strata_engine)
+  # mmq::swiglu_quantize writes the bytes kernels::iq_mmq_quantize writes, and swiglu feeds both: the same
+  # floating-point rules as strata_kernels, or the two paths round differently (an AMD build parted the greedy text)
+  set_source_files_properties(src/prefill/moe_mmq.cpp PROPERTIES COMPILE_OPTIONS "-fno-fast-math;-ffp-contract=off")
   if(TARGET onemath)
     # the library and its headers without its usage requirements: oneMath's cuBLAS backend puts
     # -fsycl-targets=nvptx64-nvidia-cuda on them, which would replace the engine's own targets
@@ -736,11 +751,19 @@ if(STRATA_ENABLE_XE)
   # DiT against tools/image/qi21_ref.py's NumPy reference, and strata-image-dit-probe, the whole DiT and its sampler
   # against stable-diffusion.cpp's values, timed
   add_library(strata_image STATIC src/image/qi_kernels.cpp src/image/qi_attn.cpp src/image/qi_dit.cpp
+                           src/image/image_lora.cpp
                            src/image/qi_vae.cpp src/image/qi_text.cpp src/image/qi_pipeline.cpp
+                           src/image/img_start.cpp
                            src/image/mf_vae.cpp src/image/mf_dit.cpp
-                           src/image/mf_pipeline.cpp
+                           src/image/mf_pipeline.cpp src/image/moss_text.cpp src/image/moss_dit.cpp
+                           src/image/moss_pipeline.cpp
                            src/image/qi_stream.cpp src/image/qi_vision.cpp src/image/qi_image_io.cpp
-                           src/image/qi_sdpa.cpp)
+                           src/image/qi_sdpa.cpp src/image/hunyuanimage3_file.cpp
+                           src/image/hunyuanimage3_host.cpp src/image/hunyuanimage3_kernels.cpp
+                           src/image/hunyuanimage3_gpu.cpp src/image/hunyuanimage3_dit.cpp
+                           src/image/hunyuanimage3_vae.cpp src/image/hunyuanimage3_entry_exit.cpp
+                           src/image/hunyuanimage3_pipeline.cpp src/image/hunyuanimage3_refs.cpp
+                           src/image/hunyuanimage3_vision.cpp)
   target_include_directories(strata_image PUBLIC include)
   # The image attention's vendors' kernels (src/image/qi_sdpa.cpp), the engine's own kernel where none takes it.
   # Intel GPUs: oneDNN's SDPA (Apache-2.0, https://github.com/uxlfoundation/oneDNN at the tag pinned here; Ubuntu's
@@ -971,6 +994,11 @@ if(STRATA_ENABLE_XE)
   target_include_directories(strata_image SYSTEM PRIVATE third_party/main/stb)
   set_source_files_properties(src/image/qi_image_io.cpp PROPERTIES COMPILE_OPTIONS "-w")
   target_link_libraries(strata_image PUBLIC strata_prefill)
+  add_executable(strata-image-lora-probe src/image/lora_probe.cpp)
+  target_link_libraries(strata-image-lora-probe PRIVATE strata_image)
+  # the adapter's delta (y += scale (x A^T) B^T) against an FP64 reference: the plain form, a fused weight's rows, a
+  # rank the matrix engines' accumulating product takes (fill the selftest's shapes with xmx_gemm's)
+  add_test(NAME image_lora_selftest COMMAND strata-image-lora-probe selftest)
   add_executable(strata-image-probe src/image/qi_block_probe.cpp)
   target_link_libraries(strata-image-probe PRIVATE strata_image)
   add_executable(strata-image-dit-probe src/image/qi_dit_probe.cpp)
@@ -979,8 +1007,24 @@ if(STRATA_ENABLE_XE)
   target_link_libraries(strata-image-vae-probe PRIVATE strata_image)
   add_executable(strata-image-text-probe src/image/qi_text_probe.cpp)
   target_link_libraries(strata-image-text-probe PRIVATE strata_image)
+  # the image attention (its 16-bit path and the int8 kernel) against FP64 (synthetic; --bench: a benchmark too)
+  add_executable(qi_attn_parity src/image/qi_attn_parity.cpp)
+  target_link_libraries(qi_attn_parity PRIVATE strata_image)
+  add_test(NAME qi_attn_parity COMMAND qi_attn_parity)
   add_executable(strata-image-mf-probe src/image/mf_probe.cpp)
   target_link_libraries(strata-image-mf-probe PRIVATE strata_image)
+  add_executable(strata-image-moss-text-probe src/image/moss_text_probe.cpp)
+  target_link_libraries(strata-image-moss-text-probe PRIVATE strata_image)
+  add_executable(strata-image-moss-dit-probe src/image/moss_dit_probe.cpp)
+  target_link_libraries(strata-image-moss-dit-probe PRIVATE strata_image)
+  add_executable(moss_text_parity src/image/moss_text_parity.cpp)
+  target_link_libraries(moss_text_parity PRIVATE strata_image)
+  add_test(NAME moss_text_parity COMMAND moss_text_parity)
+  add_executable(moss_dit_parity src/image/moss_dit_parity.cpp)
+  target_link_libraries(moss_dit_parity PRIVATE strata_image)
+  add_test(NAME moss_dit_parity COMMAND moss_dit_parity)
+  add_executable(strata-image-hunyuanimage3-probe src/image/hunyuanimage3_probe.cpp)
+  target_link_libraries(strata-image-hunyuanimage3-probe PRIVATE strata_image)
   add_executable(strata-image-vision-probe src/image/qi_vision_probe.cpp)
   target_link_libraries(strata-image-vision-probe PRIVATE strata_image)
   add_executable(strata-image src/image/strata_image.cpp)
@@ -1036,10 +1080,18 @@ if(STRATA_ENABLE_XE)
     # as in the CUDA build)
     add_executable(qsa_prompt_attn_parity src/kernels/qsa_prompt_attn_parity.cpp)
     target_link_libraries(qsa_prompt_attn_parity PRIVATE strata_kernels)
-    # the decode attention over every cell (Ornith-1.5's and llm-jp-4.1's full attention) against FP64 (synthetic)
+    # the decode attention over every cell (Ornith-1.5's, Qwen3.5-9B's and llm-jp-4.1's full attention) against FP64
+    # (synthetic)
     add_executable(qsa_dense_attn_parity src/kernels/qsa_dense_attn_parity.cpp)
     target_link_libraries(qsa_dense_attn_parity PRIVATE strata_kernels)
     add_test(NAME qsa_dense_attn_parity COMMAND qsa_dense_attn_parity)
+    # the plain models' prompt attention (Qwen3.5-9B's 16/4 heads of 256) against FP64 (synthetic): the device's kernel
+    # (WMMA on RDNA3 and RDNA4), and the FMA one
+    add_executable(prompt_attn_parity src/kernels/prompt_attn_parity.cpp)
+    target_link_libraries(prompt_attn_parity PRIVATE strata_kernels)
+    add_test(NAME prompt_attn_parity COMMAND prompt_attn_parity)
+    add_test(NAME prompt_attn_parity_fma COMMAND prompt_attn_parity)
+    set_tests_properties(prompt_attn_parity_fma PROPERTIES ENVIRONMENT "STRATA_PROMPT_ATTN_MMA=0")
     # Plan v0.3 P7 / PR #21: INT8 and Q4_0 KV storage against host references (synthetic, no model).
     add_executable(kv_q8_parity src/kernels/kv_q8_parity.cpp)
     target_link_libraries(kv_q8_parity PRIVATE strata_kernels)

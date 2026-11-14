@@ -13,6 +13,9 @@
 #include <limits>
 
 namespace strata::kernels {
+
+class DoorbellPublishKernel;   // asked for its work-group (work_group_upto_1024_of)
+
 namespace {
 sycl::queue& queue_for(void* stream) {
     auto& queue = core::Runtime::get().stream(stream);
@@ -219,8 +222,8 @@ void doorbell_publish(const float* x, const int32_t* ids, const float* weights, 
     if (k > 1024) throw core::DeviceError("doorbell_publish: k too large");
     const int ni = (int) n, ki = (int) k;
     auto& q = queue_for(stream);
-    const int wg = xe::work_group_upto_1024(q);
-    q.parallel_for(sycl::nd_range<1>((size_t) wg, (size_t) wg), [=](sycl::nd_item<1> it) {
+    const int wg = xe::work_group_upto_1024_of<DoorbellPublishKernel>(q);
+    q.parallel_for<DoorbellPublishKernel>(sycl::nd_range<1>((size_t) wg, (size_t) wg), [=](sycl::nd_item<1> it) {
         const int t = (int) it.get_local_id(0);
         for (int i = t; i < ni; i += wg) x_out[i] = x[i];
         for (int i = t; i < ki; i += wg) { ids_out[i] = ids[i]; weights_out[i] = weights[i]; }

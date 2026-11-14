@@ -57,6 +57,11 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream, int64_t h_k = 16,
                     int64_t h_v = 48, bool silu = false);
+/// KVA (kva.hpp): the same recurrence kernels as gdn_recurrence, the same state bits, without the output
+/// normalization: state, h, gate, beta and the scratch `y` only.  A state-only late layer has no reader for the output
+/// projection or the gated residual write, nor for their input (z, the gate projection).
+void gdn_recurrence_state_only(float* state, const float* h, const float* gate, const float* beta, float* y, int64_t T,
+                               void* stream, int64_t h_k = 16, int64_t h_v = 48);
 // ---- MoE
 /// softmax over 512, top-10 (ties to the lower id), weights renormalised over the ten (the native router).
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream);
@@ -76,6 +81,14 @@ void scatter_rows(const float* src, const int32_t* dst_row, float* dst, int64_t 
 /// bo[t, :] = shared[t, :] * sigmoid(sg[t]) + sum_k w[t, k] * D[slot[t, k], :]
 void moe_combine(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, float* bo,
                  int64_t T, void* stream);
+/// Layer-major prefill (STRATA_PREFILL_LAYER_MAJOR=1): acc[t, :] = shared[t, :] * sigmoid(sg[t]) - the shared expert's
+/// part of moe_combine, written before the routed experts are known.
+void moe_shared_init(const float* shared, const float* sg, float* acc, int64_t T, void* stream);
+/// Layer-major prefill: one expert group's rows added into the super-chunk's accumulator, per token in a fixed order
+/// (deterministic, no atomics): for each u < n_u, acc[u_tok[u], :] += sum_{j in [u_off[u], u_off[u+1])} u_w[j] *
+/// Dm[u_rows[j], :].  The sum runs in the group's row order, not moe_combine's k order (FP32 rounding only).
+void moe_scatter_add(const float* Dm, const int32_t* u_tok, const int32_t* u_off, const int32_t* u_rows,
+                     const float* u_w, int64_t n_u, float* acc, void* stream);
 
 // ---- QSA helpers
 /// In place: x[r, :] = x[r, :] * rsqrt(mean x^2 + eps) * w  over rows of `cols` (row stride `ld`).

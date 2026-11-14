@@ -290,11 +290,18 @@ void xmx_gemm(XmxType t, const uint16_t* X, const uint16_t* W, float* Y, int64_t
         return;
     }
     if (accumulate) {
-        // the opt-in remainder products (STRATA_PREFILL_BF16X2): one tile shape, BF16 only
-        if (t != XmxType::bf16) throw core::DeviceError("xmx_gemm: accumulate is built for BF16 only");
-        finish(stream, launch<bf16_t, 128, 256, true>(q, reinterpret_cast<const bf16_t*>(X),
-                                                         reinterpret_cast<const bf16_t*>(W), Y, T, N, K, ldy),
-               "xmx_gemm");
+        // the opt-in remainder products (STRATA_PREFILL_BF16X2) and the image engine's adapters (a LoRA's delta into
+        // a product's output): one tile shape; the accumulator is FP32 for both input types, so only the operands'
+        // type differs
+        if (t == XmxType::bf16)
+            finish(stream, launch<bf16_t, 128, 256, true>(q, reinterpret_cast<const bf16_t*>(X),
+                                                          reinterpret_cast<const bf16_t*>(W), Y, T, N, K, ldy),
+                   "xmx_gemm");
+        else
+            finish(stream, launch<sycl::half, 128, 256, true>(q, reinterpret_cast<const sycl::half*>(X),
+                                                              reinterpret_cast<const sycl::half*>(W), Y, T, N, K,
+                                                              ldy),
+                   "xmx_gemm");
         return;
     }
     const sycl::event e = t == XmxType::f16
