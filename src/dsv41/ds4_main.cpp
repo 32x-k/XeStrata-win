@@ -92,7 +92,7 @@ std::vector<int> parse_ids(const std::string& s) {
 void usage() {
     std::fprintf(stderr,
                  "strata-dsv41 --pack <pack> [--gpus N] [--context N] [--reserve-mib N]\n"
-                 "           [--vram-experts F] [--cpu-threads N] [--expert-profile FILE|none] [--profile-readonly] [--ssd-cache GB] [--ssd-policy lru|lfu|lfulru] [--no-expert-cache] [--verbose]\n"
+                 "           [--vram-experts F] [--vram-elastic] [--cpu-threads N] [--expert-profile FILE|none] [--profile-readonly] [--ssd-cache GB] [--ssd-policy lru|lfu|lfulru] [--no-expert-cache] [--verbose]\n"
                  "           [--tp 1] [--threads off] [--prefill-chunk N] [--dspark on|off|none|auto] [--dspark-block N] [--dspark-conf F] [--experts N|auto]\n"
                  "           [--vision on|off] [--mmap-experts on|off|auto]\n"
                  "           (--ids I,J,... [--n N] [--dump-logits FILE] | --serve\n"
@@ -712,6 +712,22 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         settle_stop();    // (a line arrived, or the input closed)
         if (!have_line) break;
         if (line == "QUIT") break;
+        // serve's POST /v1/vram (StrataEngine::vram), between requests: `VRAM [reserve_mib]` shrinks the expert cache
+        // until that much of the device is free (the slots' experts return to the files and the CPU lane, the
+        // conversation untouched) or grows it back towards its start; bare VRAM: the reserve it started with.
+        // Answers `VRAM k=v ...` (the main engine's fields) or `ERR <reason>`.
+        if (line.rfind("VRAM", 0) == 0) {
+            char* end = nullptr;
+            const bool bare = line.find_first_not_of(' ', 4) == std::string::npos;
+            const long long reserve = bare ? -1 : std::strtoll(line.c_str() + 4, &end, 10);
+            std::string out, e;
+            if (!bare && (end == line.c_str() + 4 || reserve < 0)) e = "expected: VRAM [reserve_mib]";
+            else if (!m.vram_reserve(reserve, out, e) && e.empty()) e = "the resize failed";
+            if (!e.empty()) std::printf("ERR %s\n", e.c_str());
+            else std::printf("%s\n", out.c_str());
+            std::fflush(stdout);
+            continue;
+        }
         // Disk sessions (serve/images.py's "unload" policy, through StrataEngine::session_file: the engine stops for
         // the image job and this file brings the conversation back after it): the same bytes a conversation slot
         // holds, to or from the path the command names.  Answers: SAVED / RESTORED <tokens> <bytes> <ms>; SERR
@@ -840,7 +856,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         }
         const bool geni = line.rfind("GENI ", 0) == 0;
         if (!geni && line.rfind("GEN ", 0) != 0) {
-            std::printf("ERR unsupported command '%s' (GEN, GENI, SAVE, RESTORE, STOP and QUIT)\n", line.substr(0, line.find(' ')).c_str());
+            std::printf("ERR unsupported command '%s' (GEN, GENI, SAVE, RESTORE, VRAM, STOP and QUIT)\n", line.substr(0, line.find(' ')).c_str());
             std::fflush(stdout);
             continue;
         }
@@ -1426,6 +1442,7 @@ int main(int argc, char** argv) try {
             }
         }
         else if (a == "--reserve-mib") o.reserve_mib = std::atoll(val("--reserve-mib").c_str());
+        else if (a == "--vram-elastic") o.vram_elastic = true;   // (serve's VRAM command resizes the expert cache)
         else if (a == "--vram-experts") { o.vram_experts = std::atof(val("--vram-experts").c_str()); o.vram_experts_auto = false; }
         else if (a == "--cpu-threads") o.cpu_threads = std::atoi(val("--cpu-threads").c_str());
         else if (a == "--expert-profile") o.profile = val("--expert-profile");

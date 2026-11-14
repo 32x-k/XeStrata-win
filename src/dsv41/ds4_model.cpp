@@ -772,6 +772,7 @@ struct Layer {
     // the expert cache: one VRAM slot and one set of host parts kept free, so an expert can move in while the one it
     // replaces moves out; heat is how much each expert was used lately (the profile's share to start with)
     int n_slots = 0, spare_vram = -1;
+    int full_slots = 0;      // the slots the layer started with: the most a VRAM grow maps again (--vram-elastic)
     std::array<uint8_t*, 4> spare_host = {nullptr, nullptr, nullptr, nullptr};
     std::vector<float> heat;
     std::vector<int> cpu_hits;                  // CPU-lane experts used since the cache last looked
@@ -1251,6 +1252,7 @@ struct Model::Impl {
     std::condition_variable sw_cv;
     std::deque<Swap> sw_queue;
     std::vector<Swap> sw_ready;
+    std::vector<std::pair<int, int>> vram_evicted;   // (layer, expert) the VRAM command's shrinks took, for its grows
     struct SwapBufs {
         uint8_t *a = nullptr, *b = nullptr, *h = nullptr;
         std::vector<rt::Queue> st;   // a copy stream a device
@@ -4875,6 +4877,7 @@ struct Model::Impl {
                     x.vram_pieces.push_back((uint8_t*) v);
                 }
             }
+            l.full_slots = l.n_slots;
             l.heat.assign((size_t) l.n_exp, 0.0f);
             {   // the profile as the starting heat: its counts scaled to ~512 hits a layer
                 double sum = 0;
@@ -10658,6 +10661,300 @@ struct Model::Impl {
         if (!ok || !os::replace_file(tmp, o.profile)) std::remove(tmp.c_str());
     }
 
+    // ---- serve's VRAM command (--vram-elastic): the expert cache as elastic device memory ----
+
+    // an expert's slot table entries on every member (0: the miss the device hands the CPU lane)
+    void tab_write(Layer& l, int e, int s) {
+        for (int m = 0; m < l.nm; ++m) {
+            Layer& x = member(l, m);
+            const unsigned long long p = s < 0 ? 0ull : (unsigned long long) slot_ptr(x, s);
+            rt::set_device(devs[(size_t) x.dev].id);
+            rt::copy(x.vram_tab + e, &p, 8);
+        }
+    }
+    // expert e out of VRAM: the files are its CPU-lane place, as at start (a GGUF's MXFP4 by its own mapping)
+    void evict_to_file(Layer& l, int e) {
+        l.slot[(size_t) e] = -1;
+        tab_write(l, e, -1);
+        if (l.lay.fmt == gg::kFmtMXFP4)
+            l.host[(size_t) e] = (uint8_t*) mx_mat(l, e, 0);
+        else {
+            l.hh[(size_t) e] = {file_part(l, e), nullptr, nullptr, nullptr};
+            l.host[(size_t) e] = l.hh[(size_t) e][0];
+        }
+    }
+    // the swap machinery's idea of a layer that keeps a slot free to move experts through, as at start
+    static int cache_res(const Layer& l, int live, bool cache) {
+        return cache && live >= 2 && live < l.n_exp ? live - 1 : live;
+    }
+    // layer l's cache down to `live` slots: the experts past the line back to the files, the pieces wholly past it
+    // freed, a straddling one re-allocated smaller (kept whole if that fails - its tail only goes unused)
+    void cache_shrink(Layer& l, int live) {
+        if (live >= l.n_slots) return;
+        const int keep = cache_res(l, live, o.expert_cache);
+        for (int e = 0; e < l.n_exp; ++e)
+            if (l.slot[(size_t) e] >= keep) {
+                vram_evicted.push_back({l.il, e});
+                evict_to_file(l, e);
+            }
+        for (int m = 0; m < l.nm; ++m) {
+            Layer& x = member(l, m);
+            Dev& d = devs[(size_t) x.dev];
+            rt::set_device(d.id);
+            std::vector<uint8_t*> pieces;
+            int s0 = 0;
+            for (uint8_t* p : x.vram_pieces) {
+                const int have = std::min(x.piece_slots, l.n_slots - s0);
+                if (s0 >= live) {   // wholly over the line
+                    rt::free(p);
+                    d.experts -= (size_t) have * unit(x);
+                    d.allocs.erase(std::find(d.allocs.begin(), d.allocs.end(), p));
+                } else if (s0 + have > live) {   // straddling: a smaller piece keeps the live prefix
+                    const size_t nb = (size_t) (live - s0) * unit(x);
+                    void* v = nullptr;
+                    if (rt::alloc_device(&v, nb) == rt::Result::success &&
+                        rt::copy(v, p, nb) == rt::Result::success) {
+                        rt::free(p);
+                        d.experts -= (size_t) have * unit(x) - nb;
+                        *std::find(d.allocs.begin(), d.allocs.end(), p) = v;
+                        pieces.push_back((uint8_t*) v);
+                    } else {
+                        if (v != nullptr) rt::free(v);
+                        pieces.push_back(p);
+                    }
+                } else pieces.push_back(p);
+                s0 += have;
+            }
+            x.vram_pieces.swap(pieces);
+        }
+        // a re-allocated piece moves the slots it kept: every resident's device table entry and decode
+        // view is pointed at the pieces again (a kept piece's writes are a no-op: the address is the same)
+        for (int e = 0; e < l.n_exp; ++e)
+            if (l.slot[(size_t) e] >= 0) {
+                tab_write(l, e, l.slot[(size_t) e]);
+                if (l.nm == 1) set_vm(l, e, l.slot[(size_t) e]);
+            }
+        l.n_vram = keep;
+        l.spare_vram = o.expert_cache && live >= 2 && live < l.n_exp ? live - 1 : -1;
+        l.n_slots = live;
+        l.swap_pending = false;
+    }
+    // expert e into slot s: its blob read again (a GGUF's MXFP4 by its reader, another pack's file region repacked to
+    // the device layout), every member's part copied, the tables pointed at it
+    bool cache_fill(Layer& l, int e, int s, uint8_t* stage, uint8_t* stage2, std::string& err) {
+        const bool ok = l.lay.fmt == gg::kFmtMXFP4 ? read_mx(l, e, stage) : (repack(l, file_part(l, e), stage), true);
+        if (!ok) {
+            err = "reading layer " + std::to_string(l.il) + " expert " + std::to_string(e) + " failed";
+            return false;
+        }
+        for (int m = 0; m < l.nm; ++m) {
+            Layer& x = member(l, m);
+            rt::set_device(devs[(size_t) x.dev].id);
+            if (l.nm > 1) blob_to_half(l, stage, m, stage2);
+            if (rt::copy(slot_ptr(x, s), l.nm > 1 ? stage2 : stage, unit(x)) != rt::Result::success) {
+                err = "uploading layer " + std::to_string(l.il) + " expert " + std::to_string(e) + " failed";
+                return false;
+            }
+        }
+        if (!l.zc.empty() && l.zc[(size_t) e]) {   // (in VRAM again: not the store's to compute, as a swap's `in`)
+            l.zc[(size_t) e] = 0;
+            if (l.zc_tab != nullptr) {
+                rt::set_device(devs[0].id);
+                rt::memset_async(l.zc_tab + e, 0, 8, devs[0].st);
+            }
+            store->unmark(l.il, e);
+        }
+        l.slot[(size_t) e] = s;
+        tab_write(l, e, s);
+        if (l.nm == 1) set_vm(l, e, s);
+        l.hh[(size_t) e] = {nullptr, nullptr, nullptr, nullptr};
+        l.host[(size_t) e] = nullptr;
+        return true;
+    }
+    // layer l's cache up to `live` slots: the tail's pieces allocated (nothing moves where an allocation fails), the
+    // free slots - the spare the smaller cache kept included - filled from the files
+    bool cache_grow(Layer& l, int live, std::string& err) {
+        if (live <= l.n_slots) return true;
+        const int old_n = l.n_slots;
+        struct Took { int m; uint8_t* p; size_t b; };   // (member, piece, bytes) this grow mapped, for a roll-back
+        std::vector<Took> took;
+        std::vector<int> mapped((size_t) l.nm, old_n);   // (slots each member's pieces cover: the boundary re-growth counts too)
+        for (int m = 0; m < l.nm; ++m) {
+            Layer& x = member(l, m);
+            Dev& d = devs[(size_t) x.dev];
+            rt::set_device(d.id);
+            const int ps = x.piece_slots;
+            int s0 = old_n;
+            // slot_ptr maps s / ps to a piece, so a grow can only add at piece boundaries: a shrink's smaller
+            // straddling piece (covering [p*ps, old_n) mid-piece) first goes back to its boundary's size, the slots
+            // it keeps copied over - on failure the piece stays small and this member just cannot grow
+            if (old_n % ps != 0) {
+                const int p = old_n / ps, to = std::min((p + 1) * ps, live);
+                const size_t nb = (size_t) (to - p * ps) * unit(x), ob = (size_t) (old_n - p * ps) * unit(x);
+                void* v = nullptr;
+                if (rt::alloc_device(&v, nb) == rt::Result::success &&
+                    rt::copy(v, x.vram_pieces[(size_t) p], ob) == rt::Result::success) {
+                    rt::free(x.vram_pieces[(size_t) p]);
+                    d.allocs.erase(std::find(d.allocs.begin(), d.allocs.end(), x.vram_pieces[(size_t) p]));
+                    d.experts += nb - ob;
+                    d.allocs.push_back(v);
+                    x.vram_pieces[(size_t) p] = (uint8_t*) v;
+                    s0 = to;
+                } else {
+                    if (v != nullptr) rt::free(v);
+                    live = old_n;   // (this member cannot map past its piece: the layer stays as it is)
+                }
+            }
+            for (; s0 < live; s0 += ps) {
+                const size_t bytes = (size_t) std::min(ps, live - s0) * unit(x);
+                void* v = nullptr;
+                if (rt::alloc_device(&v, bytes) != rt::Result::success) break;
+                d.allocs.push_back(v);
+                d.experts += bytes;
+                x.vram_pieces.push_back((uint8_t*) v);
+                took.push_back({m, (uint8_t*) v, bytes});
+            }
+            mapped[(size_t) m] = s0;
+        }
+        // every member must map the same slots: one that could not ends the grow (what this grow took goes back)
+        bool all = true;
+        for (int m = 0; m < l.nm && all; ++m) all = mapped[(size_t) m] >= live;
+        if (!all) {
+            for (const Took& t : took) {
+                Layer& x = member(l, t.m);
+                Dev& d = devs[(size_t) x.dev];
+                rt::set_device(d.id);
+                rt::free(t.p);
+                d.experts -= t.b;
+                d.allocs.erase(std::find(d.allocs.begin(), d.allocs.end(), t.p));
+                x.vram_pieces.pop_back();
+            }
+            return true;
+        }
+        for (int e = 0; e < l.n_exp; ++e)   // (a re-grown piece moved its slots: the tables follow, as after a shrink)
+            if (l.slot[(size_t) e] >= 0) {
+                tab_write(l, e, l.slot[(size_t) e]);
+                if (l.nm == 1) set_vm(l, e, l.slot[(size_t) e]);
+            }
+        const int res = cache_res(l, live, o.expert_cache);
+        uint8_t *stage = nullptr, *stage2 = nullptr;
+        rt::alloc_host((void**) &stage, l.blob);
+        if (l.nm > 1) rt::alloc_host((void**) &stage2, l.blob);
+        if (stage == nullptr || (l.nm > 1 && stage2 == nullptr)) {
+            err = "no host staging for the refills";
+            if (stage != nullptr) rt::free(stage);
+            if (stage2 != nullptr) rt::free(stage2);
+            return false;
+        }
+        for (int s = l.n_vram; s < res; ++s) {
+            int e = -1;
+            for (size_t i = 0; i < vram_evicted.size(); ++i)   // the expert a shrink took from this layer first
+                if (vram_evicted[i].first == l.il && l.slot[(size_t) vram_evicted[i].second] < 0) {
+                    e = vram_evicted[i].second;
+                    vram_evicted.erase(vram_evicted.begin() + (long) i);
+                    break;
+                }
+            if (e < 0)   // else its hottest expert still on the CPU lane
+                for (int c = 0; c < l.n_exp; ++c)
+                    if (l.slot[(size_t) c] < 0 && (e < 0 || l.heat[(size_t) c] > l.heat[(size_t) e])) e = c;
+            if (e < 0 || stage == nullptr || !cache_fill(l, e, s, stage, stage2, err)) break;
+        }
+        if (stage != nullptr) rt::free(stage);
+        if (stage2 != nullptr) rt::free(stage2);
+        l.n_slots = live;
+        l.n_vram = 0;
+        for (int e = 0; e < l.n_exp; ++e)
+            if (l.slot[(size_t) e] >= 0) ++l.n_vram;
+        l.spare_vram = o.expert_cache && live >= 2 && live < l.n_exp ? live - 1 : -1;
+        l.swap_pending = false;
+        return err.empty();
+    }
+
+    // `VRAM [reserve_mib]`: the expert cache gives device memory back until `mib` MiB is free, or grows back towards
+    // the size it started with.  (Between requests: the swaps stilled and the streams synced before anything moves.)
+    bool vram_reserve(int64_t mib, std::string& out, std::string& err) {
+        if (!o.vram_elastic) {
+            err = "VRAM needs an engine started with --vram-elastic";
+            return false;
+        }
+        if (!file_experts) {
+            err = "the expert cache resizes only where the CPU lane's experts stay in the files";
+            return false;
+        }
+        if (mib < 0) mib = std::max<int64_t>(0, o.reserve_mib);   // (bare VRAM: the reserve the engine started with)
+        for (;;) {   // the swaps in flight and the queued ones land first
+            cache_tick_swaps(0);
+            {
+                std::lock_guard<std::mutex> lk(sw_mu);
+                if (sw_queue.empty() && sw_ready.empty() && ram_queue.empty() && ram_ready.empty() &&
+                    sw_inflight == 0 && ram_inflight == 0)
+                    break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        for (const Dev& d : devs) {
+            rt::set_device(d.id);
+            if (rt::stream_sync(d.st) != rt::Result::success) {
+                err = "stream sync failed";
+                return false;
+            }
+        }
+        const auto mapped_bytes = [&] {
+            int64_t b = 0;
+            for (const Layer& l : L) b += (int64_t) l.n_slots * (int64_t) unit(l) * l.nm;
+            return b;
+        };
+        size_t free_b = 0, total_b = 0;
+        rt::mem_info(&free_b, &total_b);
+        const int64_t want = mib << 20, mapped = mapped_bytes();
+        int64_t full = 0;
+        for (const Layer& l : L) full += (int64_t) l.full_slots * (int64_t) unit(l) * l.nm;
+        if ((int64_t) free_b < want) {
+            const int64_t keep = std::max<int64_t>(0, mapped - (want - (int64_t) free_b));
+            std::vector<int> live(L.size(), 0);
+            int64_t live_b = 0;
+            for (size_t i = 0; i < L.size(); ++i) {   // every layer keeps its share, at least the floor
+                Layer& l = L[i];
+                const int floor_s = std::min(l.full_slots, 2);
+                live[i] = (int) std::max<int64_t>(
+                    floor_s, (int64_t) l.n_slots * keep / std::max<int64_t>(1, mapped));
+                live[i] = std::min(live[i], l.n_slots);
+                live_b += (int64_t) live[i] * unit(l) * l.nm;
+            }
+            while (live_b > keep) {   // the rounding's slack off the largest holder still over its floor
+                int best = -1;
+                for (size_t i = 0; i < L.size(); ++i)
+                    if (live[i] > std::min(L[i].full_slots, 2) && (best < 0 || live[i] > live[best])) best = (int) i;
+                if (best < 0) break;
+                live_b -= (int64_t) unit(L[(size_t) best]) * L[(size_t) best].nm;
+                --live[best];
+            }
+            for (size_t i = 0; i < L.size(); ++i) cache_shrink(L[i], live[i]);
+        } else if (mapped < full) {
+            int64_t budget = (int64_t) free_b - want;
+            for (Layer& l : L) {
+                const int64_t u = (int64_t) unit(l) * l.nm;
+                const int grow = (int) std::min<int64_t>(l.full_slots - l.n_slots, budget / std::max<int64_t>(1, u));
+                if (grow <= 0) continue;
+                if (!cache_grow(l, l.n_slots + grow, err)) return false;
+                rt::mem_info(&free_b, &total_b);   // (fresh: the pieces and the refills came and went)
+                budget = (int64_t) free_b - want;
+            }
+        }
+        rt::mem_info(&free_b, &total_b);
+        int64_t slots = 0, full_slots = 0;
+        for (const Layer& l : L) slots += l.n_slots, full_slots += l.full_slots;
+        const int64_t now = mapped_bytes();
+        char b[384];
+        std::snprintf(b, sizeof b,
+                      "VRAM reserve_mib=%lld expert_slots=%lld expert_slots_full=%lld expert_cache_mib=%lld "
+                      "expert_cache_full_mib=%lld vram_free_mib=%lld prompt_chunk=%lld",
+                      (long long) mib, (long long) slots, (long long) full_slots, (long long) (now >> 20),
+                      (long long) (full >> 20), (long long) (free_b >> 20), (long long) o.prefill_chunk);
+        out = b;
+        return true;
+    }
+
     std::vector<std::string> info_lines() const {
         std::vector<std::string> v;
         int nh = 0;
@@ -10665,8 +10962,9 @@ struct Model::Impl {
         char b[512];
         // kv=fp4: DeepSeek's own cache layout (the compressed KV and the index keys FP4, the window FP8)
         std::snprintf(b, sizeof b, "INFO context=%lld kv=fp4 kv_resident=%lld expert_slots=%d engine_kind=ds4 "
-                                   "cpu_experts=%d ram_experts=%d engine=ds4-0.1",
-                      (long long) o.max_context, (long long) o.max_context, g.nl * g.n_exp - nh, nh, ram_held);
+                                   "cpu_experts=%d ram_experts=%d vram_elastic=%d engine=ds4-0.1",
+                      (long long) o.max_context, (long long) o.max_context, g.nl * g.n_exp - nh, nh, ram_held,
+                      o.vram_elastic ? 1 : 0);
         v.push_back(b);
         if (commit_kept > 0) {   // (Windows, an integrated GPU: the commit kept experts off the GPU - the server says so)
             std::snprintf(b, sizeof b,
@@ -10827,6 +11125,9 @@ const Stats& Model::stats() const {
     return st;
 }
 std::string Model::describe() const { return p_->describe(); }
+bool Model::vram_reserve(int64_t mib, std::string& out, std::string& err) {
+    return p_->vram_reserve(mib, out, err);
+}
 std::vector<std::string> Model::info_lines() const { return p_->info_lines(); }
 
 }  // namespace strata::ds4

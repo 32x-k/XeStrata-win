@@ -40,6 +40,9 @@ struct Options {
     // counts go into the file, so the next run places experts differently and greedy output / KL move between runs.
     bool profile_readonly = false;
     bool expert_cache = true;         // experts move between VRAM and the CPU lane as they are used
+    // the expert cache resizes between requests: serve's `VRAM [reserve_mib]` shrinks it until that much of the
+    // device is free and grows it back towards its start (--vram-elastic, #533's shape)
+    bool vram_elastic = false;
     // the CPU lane's experts read in place from the model's files, the page cache keeping what fits, instead of
     // copied into RAM: 1 on, 0 off, -1 (auto) where the RAM this process can get does not hold them
     int mmap_experts = -1;
@@ -191,6 +194,11 @@ public:
     /// What a saved conversation must match: this engine's version, this model's geometry and files and the drafter's
     /// blocks - a slot naming anything else is not this model's state (a file's .meta says so; slot_load refuses).
     std::string slot_identity() const;
+
+    /// serve's `VRAM [reserve_mib]` between requests: the expert cache gives device memory back until `mib` MiB is
+    /// free (its slots' experts return to the files and run on the CPU lane, as any miss does), or grows back towards
+    /// its start when more is free; -1: the reserve the engine started with.  `out` takes the response's k=v fields; false and err: the command was refused.
+    bool vram_reserve(int64_t mib, std::string& out, std::string& err);
 
     /// The image token, or -1 when the tower is absent or off. Image rows are BF16 bits.
     int image_token() const;
