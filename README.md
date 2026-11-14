@@ -13,7 +13,7 @@ English | [日本語](README.ja.md)
 
 This branch ports upstream Strata's DeepSeek-V4.1-Flash engine (`strata-dsv41`, upstream commit `870aedd9`) to SYCL.
 On a Radeon AI PRO R9700 (Windows, free mode) it loads the UD-IQ1_S GGUF of DeepSeek-V4.1-Flash and answers questions about text and about a picture. Asked the same question, it generated the same tokens as upstream's HIP build. Speculative decoding with the draft model (DSpark) works as well.
-It also serves as the text model for the server's image generation (`POST /v1/images/generations`, and `generate_image` from a chat). Under `--image-gpu-policy` `unload` (which `auto` may pick) the conversation is saved to disk before the engine leaves the GPU for the image job and brought back at the next start. `shrink` (`--vram-elastic`) is not supported by this engine.
+It also serves as the text model for the server's image generation (`POST /v1/images/generations`, and `generate_image` from a chat). Under `--image-gpu-policy` `unload` (which `auto` may pick) the conversation is saved to disk before the engine leaves the GPU for the image job and brought back at the next start. Under `shrink` (`--vram-elastic`) the expert cache gives VRAM back for the image job and grows back afterwards (serve's `VRAM` command); the conversation is untouched.
 Its speed is still being tuned. It has run on one R9700 only.
 
 ### Quantization types it reads
@@ -38,7 +38,7 @@ Tensors outside the experts are read as BF16, F32, F16, MXFP8 or Q8_0, and dense
 | Feature | Support |
 | --- | --- |
 | image generation under the `unload` / `auto` policy (`POST /v1/images/generations`, `generate_image`) | yes (`SAVE` / `RESTORE` park the conversation in a file for the next start) |
-| image generation under the `shrink` policy (`--vram-elastic`) | not yet (work in progress) |
+| image generation under the `shrink` policy (`--vram-elastic`) | supported (serve's `VRAM` command shrinks the expert cache and grows it back) |
 | conversation save and restore (serve's session_file protocol) | yes |
 | questions about a picture | yes |
 | speculative decoding (DSpark) | yes |

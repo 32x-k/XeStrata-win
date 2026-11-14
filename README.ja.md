@@ -13,7 +13,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 
 このブランチは上流 Strata の DeepSeek-V4.1-Flash 用のエンジン（`strata-dsv41`、上流のコミット `870aedd9`）を SYCL に移したものです。
 Radeon AI PRO R9700（Windows、free モード）で、DeepSeek-V4.1-Flash の UD-IQ1_S の GGUF を読み込み、文章の問いと画像についての問いに答えます。上流の HIP 版と同じ問いで比べると、生成したトークンは一致しました。下書きのモデル（DSpark）を使う推測デコードも動きます。
-サーバーの画像の生成（`POST /v1/images/generations`、会話からの `generate_image`）でも文章のモデルとして使えます。`--image-gpu-policy` の `unload`（`auto` が選ぶこともあります）では、画像の仕事の前に会話をディスクに保存してエンジンを外し、次の起動で会話を戻します。`shrink`（`--vram-elastic`）にはこのエンジンは対応していません。
+サーバーの画像の生成（`POST /v1/images/generations`、会話からの `generate_image`）でも文章のモデルとして使えます。`--image-gpu-policy` の `unload`（`auto` が選ぶこともあります）では、画像の仕事の前に会話をディスクに保存してエンジンを外し、次の起動で会話を戻します。`shrink`（`--vram-elastic`）では、画像の仕事のあいだエキスパートのキャッシュを VRAM から縮め、終わると大きく戻します（serve の `VRAM` コマンド）。会話はそのままです。
 速さはまだ調整の途中です。動かしたのは R9700 の 1 枚だけです。
 
 ### 読める量子化の型
@@ -38,7 +38,7 @@ Radeon AI PRO R9700（Windows、free モード）で、DeepSeek-V4.1-Flash の U
 | 機能 | 対応 |
 | --- | --- |
 | 画像生成の `unload` / `auto` ポリシー（`POST /v1/images/generations`、`generate_image`） | 対応（`SAVE` / `RESTORE` で会話をファイルに保存し、次の起動で戻します） |
-| 画像生成の `shrink` ポリシー（`--vram-elastic`） | 未対応（実装の途中です） |
+| 画像生成の `shrink` ポリシー（`--vram-elastic`） | 対応（serve の `VRAM` コマンドでエキスパートのキャッシュを縮めて戻します） |
 | 会話の保存と復帰（serve の session_file プロトコル） | 対応 |
 | 画像を読む質問 | 対応 |
 | 推測デコード（DSpark） | 対応 |
