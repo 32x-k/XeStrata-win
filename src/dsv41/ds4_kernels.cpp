@@ -148,7 +148,24 @@ void gemv_rows(const Weight* W, const float* x, size_t ldx, int n, int k, int T,
     });
 }
 float route_score(float l) { return sycl::sqrt(l > 20.f ? l : sycl::log1p(sycl::exp(l))); }
-void route_row(const float* logits, const float* bias, int n, int k, float scale, int* ids, float* weights) {
+// Upstream route_fallback_pick: a pick that never came out - every score left is NaN (the gate's input went
+// non-finite), so nothing beat -FLT_MAX and the pick kept its sentinel.  Publishing it read vram[-1] /
+// vs[-1] in the kernels after it - a fault far from the cause.  The lowest expert not picked yet instead -
+// a valid index, so nothing reads outside its tables; the weight stays NaN as before, and `bad` (when given)
+// tells the host the router met a non-finite input (router_nonfinite_take).  route_ahead passes nullptr and
+// keeps its -1 sentinel, as upstream does; one compare a pick on the finite path.
+int route_fallback_pick(const int* pick, int r, int n, int* bad) {
+    *bad = 1;
+    int ix = 0;
+    for (bool again = true; again;) {   // (the picks are few and unsorted: start over when one of them is the candidate)
+        again = false;
+        for (int q = 0; q < r && !again; ++q)
+            if (pick[q] == ix) ++ix, again = true;
+    }
+    return ix < n ? ix : 0;
+}
+void route_row(const float* logits, const float* bias, int n, int k, float scale, int* ids, float* weights,
+               int* bad) {
     float sum = 0.f;
     for (int r = 0; r < k; ++r) {
         float best = -FLT_MAX;
@@ -159,6 +176,7 @@ void route_row(const float* logits, const float* bias, int n, int k, float scale
             const float v = route_score(logits[i]) + bias[i];
             if (!used && (v > best || (v == best && (ix < 0 || i < ix)))) { best = v; ix = i; }
         }
+        if (ix < 0 && bad != nullptr) ix = route_fallback_pick(ids, r, n, bad);
         ids[r] = ix;
         if (weights) {
             weights[r] = ix < 0 ? 0.f : route_score(logits[ix]);
@@ -198,7 +216,7 @@ bool route_groups(sycl::queue& s, int T, int n, F f) {
 }
 void route_group(sycl::nd_item<1> item, sycl::local_accessor<float, 1> scores,
                  sycl::local_accessor<float, 1> biased, const float* logits, const float* bias,
-                 int n, int k, float scale, int* ids, float* weights) {
+                 int n, int k, float scale, int* ids, float* weights, int* bad) {
     const size_t lane = item.get_local_linear_id(), local = item.get_local_range(0);
     const auto group = item.get_group();
     for (size_t i = lane; i < size_t(n); i += local) {
@@ -217,6 +235,7 @@ void route_group(sycl::nd_item<1> item, sycl::local_accessor<float, 1> scores,
         const float top = sycl::reduce_over_group(group, best, sycl::maximum<float>());
         ix = sycl::reduce_over_group(group, best == top ? ix : std::numeric_limits<int>::max(), sycl::minimum<int>());
         if (lane == 0) {
+            if (ix >= n && bad != nullptr) ix = route_fallback_pick(ids, r, n, bad);
             const bool valid = ix < n;
             ids[r] = valid ? ix : -1;
             if (weights) { weights[r] = valid ? scores[ix] : 0.f; sum += weights[r]; }
@@ -229,7 +248,7 @@ void route_group(sycl::nd_item<1> item, sycl::local_accessor<float, 1> scores,
 }
 void route_group_packed(sycl::nd_item<1> item, sycl::local_accessor<float, 1> scores,
                  sycl::local_accessor<float, 1> biased, const float* logits, const float* bias,
-                 int n, int k, float scale, int* ids, float* weights) {
+                 int n, int k, float scale, int* ids, float* weights, int* bad) {
     const size_t lane = item.get_local_linear_id(), local = item.get_local_range(0);
     const auto group = item.get_group();
     for (size_t i = lane; i < size_t(n); i += local) {
@@ -253,6 +272,7 @@ void route_group_packed(sycl::nd_item<1> item, sycl::local_accessor<float, 1> sc
         const uint64_t winner = sycl::reduce_over_group(group, key, sycl::maximum<uint64_t>());
         ix = int(0xffffffffu - uint32_t(winner));
         if (lane == 0) {
+            if (ix >= n && bad != nullptr) ix = route_fallback_pick(ids, r, n, bad);
             const bool valid = ix < n;
             ids[r] = valid ? ix : -1;
             if (weights) { weights[r] = valid ? scores[ix] : 0.f; sum += weights[r]; }
@@ -1625,18 +1645,31 @@ void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int
     }
     gemv_rows(W, x, size_t(k), n, k, T, 1.f, y, size_t(ldy), s);
 }
+// Upstream g_router_bad: one word a device's route kernels set when the fallback pick fires (the gate's input
+// went non-finite) and the host takes with router_nonfinite_take - a device allocation standing in for the
+// device symbol, per device like it.
+int* router_bad_flag(sycl::queue& s) {
+    static core::PerDevice<int*> flags;
+    return flags.get(s.get_device(), [&] {
+        int* flag = sycl::malloc_device<int>(1, s);
+        if (flag != nullptr) s.memset(flag, 0, sizeof(int));   // in order, ahead of the kernels that set it
+        return flag;
+    });
+}
 void route(const float* logits, const float* bias, int n, int k, int T, float scale, int* idx, float* w,
            sycl::queue& s, const float* bias_vl, const VlBits* vl) {
     if (k < 0 || k > kPicks || k > n) throw std::invalid_argument("ds4 route: invalid pick count");
     const VlBits bits = vl ? *vl : VlBits{};
+    int* bad = router_bad_flag(s);
     const bool launched = route_groups(s, T, n, [=](sycl::nd_item<1> item, auto scores, auto biased) {
         const size_t t = item.get_group_linear_id();
         const float* b = bias_vl && ((bits.w[t >> 5] >> (t & 31)) & 1u) ? bias_vl : bias;
-        route_group_packed(item, scores, biased, logits + t * 1024, b, n, k, scale, idx + t * kPicks, w + t * kPicks);
+        route_group_packed(item, scores, biased, logits + t * 1024, b, n, k, scale, idx + t * kPicks,
+                           w + t * kPicks, bad);
     });
     if (!launched) parallel(s, size_t(T), [=](size_t t) {
         const float* b = bias_vl && ((bits.w[t >> 5] >> (t & 31)) & 1u) ? bias_vl : bias;
-        route_row(logits + t * 1024, b, n, k, scale, idx + t * kPicks, w + t * kPicks);
+        route_row(logits + t * 1024, b, n, k, scale, idx + t * kPicks, w + t * kPicks, bad);
     });
 }
 void swiglu(const float* g, const float* u, int n, float lim, float* h, sycl::queue& s) {
@@ -1939,10 +1972,11 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
         }
         return cpu;
     };
+    int* bad = router_bad_flag(s);
     const bool launched = route_groups(s, T, n, [=](sycl::nd_item<1> item, auto scores, auto biased) {
         const size_t t = item.get_group_linear_id(), lane = item.get_local_linear_id();
         const float* b = bias_vl && ((vl >> t) & 1u) ? bias_vl : bias;
-        route_group(item, scores, biased, logits + t * 1024, b, n, k, scale, idx + t * kPicks, w + t * kPicks);
+        route_group(item, scores, biased, logits + t * 1024, b, n, k, scale, idx + t * kPicks, w + t * kPicks, bad);
         bool cpu = lane == 0 ? publish(t) : false;
         cpu = sycl::group_broadcast(item.get_group(), cpu, 0);
         if (req && cpu)
@@ -1951,7 +1985,7 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
     });
     if (!launched) parallel(s, size_t(T), [=](size_t t) {
         const float* b = bias_vl && ((vl >> t) & 1u) ? bias_vl : bias;
-        route_row(logits + t * 1024, b, n, k, scale, idx + t * kPicks, w + t * kPicks);
+        route_row(logits + t * 1024, b, n, k, scale, idx + t * kPicks, w + t * kPicks, bad);
         const bool cpu = publish(t);
         if (req && cpu) for (int e = 0; e < dim; ++e) req->x[t][e] = x[t * dim + e];
     });
@@ -1982,10 +2016,10 @@ void route_ahead(const float* logits, const float* bias, int n, int m, int T, Re
     if (T > kWin || off < 0 || off + m > kAhead) throw std::invalid_argument("ds4 route_ahead: invalid request dimensions");
     const bool launched = route_groups(s, T, n, [=](sycl::nd_item<1> item, auto scores, auto biased) {
         const size_t t = item.get_group_linear_id();
-        route_group(item, scores, biased, logits + t * 1024, bias, n, m, 1.f, req->ahead[t] + off, nullptr);
+        route_group(item, scores, biased, logits + t * 1024, bias, n, m, 1.f, req->ahead[t] + off, nullptr, nullptr);
     });
     if (!launched) parallel(s, size_t(T), [=](size_t t) {
-        route_row(logits + t * 1024, bias, n, m, 1.f, req->ahead[t] + off, nullptr);
+        route_row(logits + t * 1024, bias, n, m, 1.f, req->ahead[t] + off, nullptr, nullptr);
     });
 }
 void zc_stage(unsigned long long* plan, const int* idx, const unsigned long long* zc_tab, int k,
@@ -1997,6 +2031,17 @@ void zc_stage(unsigned long long* plan, const int* idx, const unsigned long long
     parallel(s, size_t(k), [=](size_t i) {
         if (!plan[i] && zc_tab[idx[i]]) plan[i] = reinterpret_cast<unsigned long long>(stage + i * stride);
     });
+}
+bool router_nonfinite_take(sycl::queue& s) {
+    int* flag = router_bad_flag(s);
+    if (flag == nullptr) return false;
+    int v = 0;
+    s.memcpy(&v, flag, sizeof(v));
+    // Upstream's stream sync: the take runs where the host has the stream's results anyway (ds4_main polls it a
+    // few tokens apart), and the in-order copy reads the flag behind the kernels that set it.
+    s.wait();
+    if (v != 0) s.memset(flag, 0, sizeof(int));
+    return v != 0;
 }
 void wait_seq(const unsigned* seq_ptr, unsigned seq, sycl::queue& s) {
     sycl_detail::require_in_order(s);

@@ -1082,12 +1082,29 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
             std::printf("%s\n", out.c_str());
         };
+        bool nan_stop = false;
+        // test only: STRATA_TEST_NAN_STOP_AT=<n> takes the NaN stop (the same ERR, reset and state drop) once, on the n-th request
+        // this engine serves, at its first poll.  Unset (or 0) it does nothing at all.
+        static const long test_nan_at = [] { const char* v = std::getenv("STRATA_TEST_NAN_STOP_AT"); return v != nullptr ? std::atol(v) : 0L; }();
+        static long served = 0;
+        const bool test_nan = test_nan_at > 0 && ++served == test_nan_at;
         for (;;) {
             if (in->stop.load()) {
                 finish = "cancel";
                 break;
             }
+            // (the router had no pick to make: every score it met was NaN, so the model's numbers are gone and what follows is
+            //  nonsense: said once in the log by the model, here the request ends with an error instead of streaming it.  Polled at
+            //  the first token and every 8 - one small copy from the device, not a per-token sync)
+            if ((produced == 0 || produced % 8 == 0) && ((test_nan && produced == 0) || m.router_nonfinite())) {
+                std::printf("ERR the model's numbers went non-finite (NaN reached the router), so the answer would be nonsense: the request is stopped and the conversation dropped\n");
+                std::fflush(stdout);
+                nan_stop = true;
+                finish = "cancel";
+                break;
+            }
             std::printf("T %d\n", tok);
+
             ++produced;
             if (produced % 8 == 0) stat_line();
             std::fflush(stdout);
@@ -1136,6 +1153,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                      s.experts ? 100.0 * (double) s.cpu_experts / (double) s.experts : 0.0);
         if (d_off > 0) std::fprintf(stderr, "strata-dsv41 serve: drafts %lld of %lld kept; %s\n", d_acc, d_off,
                                     per_position(s_dec, s).c_str());
+        if (nan_stop) {   // (its state holds the NaNs: the next request starts from nothing)
+            m.reset();
+            held.clear();
+        }
         m.save_profile();
     }
     // the engine ends (QUIT or the end of its input): the conversation in the model is set aside, and every one in

@@ -5888,6 +5888,24 @@ struct Model::Impl {
         }
     }
 
+    // a device's router that had no pick to make (every score NaN: the gate's input went non-finite) since the last call: the
+    // kernels took a stand-in expert so nothing read out of bounds, and this is how the request hears of it (ds4_main polls
+    // it a few tokens apart) - once per device in the log, and the caller ends the request with an error
+    bool router_nonfinite() {
+        bool bad = false;
+        for (Dev& d : devs) {
+            if (d.st == nullptr) continue;
+            if (router_nonfinite_take(d.st)) {
+                static std::atomic<bool> said{false};
+                if (!said.exchange(true))
+                    std::fprintf(stderr, "ds4: WARNING: the router met scores that are not numbers (NaN) on device %d - the model's "
+                                         "activations went non-finite; its picks are stand-ins and the answer is not reliable\n", d.id);
+                bad = true;
+            }
+        }
+        return bad;
+    }
+
     // the state at pos into checkpoint `slot` (the window rings and the compressors' partial groups: the rest of the
     // state is indexed by position, and what lies past a restored position is written again)
     void checkpoint(int slot) {
@@ -10519,6 +10537,12 @@ struct Model::Impl {
                     err = "router picked expert " + std::to_string(e) + " (layer " + std::to_string(l.il) + ", token " + std::to_string(t) + ", pick " + std::to_string(i) + ", of " + std::to_string(l.k_exp) + ")";
                     return false;
                 }
+                // (a non-finite gate input: the router then gave a valid pick but a NaN weight - the layer's output would be
+                //  garbage; said here, where the picks are on the host anyway, instead of a request that answers nonsense)
+                if (!std::isfinite(h_w[t * kPicks + i])) {
+                    err = "the router's weight is not finite (layer " + std::to_string(l.il) + ", token " + std::to_string(t) + ", pick " + std::to_string(i) + "): the gate's input went NaN or infinite";
+                    return false;
+                }
                 ++pr[e];
                 l.heat[(size_t) e] += 1.0f;
                 if (l.slot[(size_t) e] < 0) l.cpu_hits.push_back(e);
@@ -11160,6 +11184,7 @@ int64_t Model::max_context() const { return p_->o.max_context; }
 int Model::vocab() const { return p_->g.vocab; }
 const std::vector<int32_t>& Model::tokens() const { return p_->toks; }
 void Model::reset() { p_->reset(); }
+bool Model::router_nonfinite() { return p_->router_nonfinite(); }
 void Model::checkpoint(int slot) { p_->checkpoint(slot); }
 bool Model::restore(int64_t limit) { return p_->restore(limit); }
 void Model::pin() { p_->pin(); }
