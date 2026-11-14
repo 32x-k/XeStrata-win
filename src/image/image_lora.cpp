@@ -46,6 +46,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <thread>
 #include <fstream>
 #include <stdexcept>
@@ -1038,7 +1039,13 @@ uint64_t LoraFile::host_bytes() const {
 }
 
 std::unique_ptr<LoraFile> LoraFile::open(const std::string& path) {
+    // the magic's stream: on Windows a narrow path is opened in the system's codepage, and the engine's paths are
+    // UTF-8, so the wide form is given (as moss_text.cpp's reads do); elsewhere the path as it is
+#ifdef _WIN32
+    std::ifstream f(std::filesystem::path(std::u8string(path.begin(), path.end())), std::ios::binary);
+#else
     std::ifstream f(path, std::ios::binary);
+#endif
     if (!f) throw std::runtime_error("cannot open " + path);
     char magic[4] = {};
     f.read(magic, 4);

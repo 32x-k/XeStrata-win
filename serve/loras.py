@@ -39,8 +39,8 @@ server's log; the human's decision of 2026-10-29, as A1111 and Forge do).  A mod
 takes neither the field nor a tag: both are refused, so no image is made without what was asked for.
 
 The folder is the config's "lora_dir" (setup writes it: <data>/models/loras), else "loras" beside the DiT's file.  Its
-listing is kept CACHE_S seconds and read again at once when the folder's mtime changes: /health asks for it with each
-page load.
+listing is kept CACHE_S seconds and read again at once when a file of the folder is added, removed or changed:
+/health asks for it with each page load.
 """
 from __future__ import annotations
 
@@ -471,7 +471,7 @@ class Folder:
         self._by_name: dict[str, dict] = {}
         self._by_path: dict[str, dict] = {}
         self.skipped: dict[str, str] = {}   # a file that is not this model's, and why (a request's error says so)
-        self._mtime: int | None = None
+        self._sig: frozenset | None = None
         self._read = 0.0
         self._scan(force=True)
 
@@ -479,16 +479,29 @@ class Folder:
         return f"Folder({self.family}, {str(self.dir)!r}, {len(self._listing)} adapters)"
 
     def _scan(self, force: bool = False) -> None:
+        # what the listing is read against: each file's name, size and mtime.  The folder's own mtime cannot stand
+        # for it: a file system may bump it at a grain coarser than a write's, and a file's content changes nothing
+        # of it (the same on Windows' NTFS).
+        sig: frozenset | None = None
         try:
-            mtime = self.dir.stat().st_mtime_ns if self.dir.is_dir() else None
+            if self.dir.is_dir():
+                files: set = set()
+                for p in self.dir.rglob("*"):
+                    try:
+                        if p.is_file():
+                            s = p.stat()
+                            files.add((str(p.relative_to(self.dir)), s.st_mtime_ns, s.st_size))
+                    except OSError:
+                        continue
+                sig = frozenset(files)
         except OSError:
-            mtime = None
-        if not force and mtime == self._mtime and time.monotonic() - self._read < CACHE_S:
+            sig = None
+        if not force and sig == self._sig and time.monotonic() - self._read < CACHE_S:
             return
-        self._mtime, self._read = mtime, time.monotonic()
+        self._sig, self._read = sig, time.monotonic()
         made: list[dict] = []
         skipped: dict[str, str] = {}
-        if self.takes and mtime is not None:
+        if self.takes and sig is not None:
             for p in sorted(self.dir.rglob("*")):
                 parts = p.relative_to(self.dir).parts
                 if p.suffix.lower() not in EXTS or not p.is_file() or any(x.startswith(".") for x in parts):
