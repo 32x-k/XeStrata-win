@@ -14,6 +14,8 @@
 #include <cstdint>
 #include <string>
 
+namespace strata::gpu { struct Event; }
+
 namespace strata::prefill {
 
 class Gemm {
@@ -32,8 +34,12 @@ public:
     void bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
               bool accumulate = false);
 
-    /// Y = X . W^T with both in FP16 (bits).
-    void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0);
+    /// Y = X . W^T with both in FP16 (bits).  `half_sums`: the sums in FP16 where oneMath takes the product (its
+    /// half GEMM, then widened into Y), for products whose sums stay in FP16's range (inputs after a norm); else, and
+    /// in XeStrata's own kernels, in FP32.  `accumulate`: Y += (read before the product, in FP32; with `half_sums`
+    /// the sums stay FP32, the half GEMM taking no beta).
+    void f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
+             bool half_sums = false, bool accumulate = false);
 
     /// Strided projections, including an output slice: Y = alpha X W^T + beta Y.
     /// beta == 0 leaves the previous output unread.
@@ -54,9 +60,10 @@ public:
     /// where i8_usable says yes.
     static void i8(const int8_t* X, const int8_t* W, int32_t* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
                    void* stream);
-    /// W given as native GGUF blocks of `ggml_type`, dequantized to FP16 in the scratch, X in FP16.
+    /// W given as native GGUF blocks of `ggml_type`, dequantized to FP16 in the scratch, X in FP16; `half_sums` as
+    /// f16's.
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
-                int64_t ldy = 0);
+                int64_t ldy = 0, bool half_sums = false);
 
     /// Loads the products' library ahead of the first prompt (oneMath's backend for the current GPU), on a thread of
     /// its own: call once for each GPU at startup.
@@ -69,6 +76,13 @@ public:
 
     /// Caller-owned buffer only: the scratch moved (the prompt path laid its buffers out again).
     void rebind(uint16_t* scratch, int64_t scratch_elems);
+
+    /// STRATA_DEQUANT_SIDE=1 (gemm_dequant_side): a second dequant scratch of scratch_elems() elements, caller-owned
+    /// like the first.  native() then dequantizes on a side stream into the two in turn, so a weight's dequant runs
+    /// while the kernels queued ahead of its product do; events order every write and read of each scratch, so the
+    /// products are the serial form's, bit for bit.  nullptr: the serial form.  Called after init_external and after
+    /// every rebind, on the device of the Gemm's stream.
+    bool set_dequant_side(uint16_t* scratch2, std::string& err);
 
     uint16_t* scratch() const { return scratch_; }
     int64_t scratch_elems() const { return scratch_elems_; }
@@ -84,6 +98,18 @@ private:
     uint16_t* tc_w_ = nullptr;   // bf16_through_f16's FP16 images of W and of a slice of X, grown on demand
     uint16_t* tc_x_ = nullptr;
     int64_t tc_w_elems_ = 0, tc_x_elems_ = 0;
+    // STRATA_DEQUANT_SIDE (set_dequant_side): the second scratch, the side stream and, per scratch, "the dequant
+    // landed" (recorded on the side stream) and "the product read it" (recorded on the compute stream); side_cur_ is
+    // the scratch the next native() dequantizes into (0: scratch_, 1: side_scratch_)
+    uint16_t* side_scratch_ = nullptr;
+    void* side_stream_ = nullptr;
+    strata::gpu::Event* side_ready_[2] = {};
+    strata::gpu::Event* side_free_[2] = {};
+    int side_cur_ = 0;
 };
+
+/// STRATA_DEQUANT_SIDE=1: the prompt path's dense-weight dequant on a side stream with a second GEMM scratch
+/// (Gemm::set_dequant_side; the prompt path takes the scratch from its region when this is on).  Off by default.
+bool gemm_dequant_side();
 
 }  // namespace strata::prefill

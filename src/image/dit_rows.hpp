@@ -1,0 +1,496 @@
+// SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// src/image/dit_rows.hpp - the parts Mage-Flow's DiT (mf_dit.cpp) and MOSS-Image's (moss_dit.cpp) share: the blocks'
+// bf16 weights quantized on the host (Q8_0, or W8A8's rotated int8 rows), and the row-wise kernels that write a
+// product's FP16 input with each row's power-of-two scale, scale its output back and add it through a gate.
+//
+// The kernels' helpers are in a namespace of their own, not an anonymous one: SYCL names a lambda's kernel by its
+// mangled type, and an anonymous namespace mangles the same in every file (_GLOBAL__N_1).
+#pragma once
+
+#include "strata/core/per_device.hpp"
+#include "strata/core/runtime.hpp"
+#include "strata/image/mf_dit.hpp"
+#include "strata/image/qi_kernels.hpp"
+#include "strata/kernels/f16_bits.hpp"
+
+#include <sycl/sycl.hpp>
+
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+namespace strata::image::dit_rows {
+
+namespace syclex = sycl::ext::oneapi::experimental;
+using strata::kernels::f16_from_f32;
+
+inline sycl::queue& q_of(void* s) { return core::Runtime::get().stream(s); }
+
+inline float bf16_value(uint16_t b) {
+    const uint32_t u = (uint32_t) b << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+
+// x rounded to the nearest bf16 (ties to even), as a float
+inline float round_bf16(float x) {
+    uint32_t u;
+    std::memcpy(&u, &x, 4);
+    u += 0x7FFFu + ((u >> 16) & 1u);
+    u &= 0xFFFF0000u;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+
+// row of K bf16 values -> Q8_0 (ggml's reference rounding): blocks of an FP16 scale and 32 int8 values
+inline void quantize_row(const uint16_t* src, int64_t K, uint8_t* dst) {
+    for (int64_t b = 0; b < K / 32; ++b) {
+        float v[32], amax = 0.f;
+        for (int j = 0; j < 32; ++j) {
+            v[j] = bf16_value(src[b * 32 + j]);
+            amax = std::max(amax, std::fabs(v[j]));
+        }
+        const float d = amax / 127.f, id = d != 0.f ? 1.f / d : 0.f;
+        const uint16_t dh = f16_from_f32(d);
+        int8_t* qs = reinterpret_cast<int8_t*>(dst + b * 34 + 2);
+        for (int j = 0; j < 32; ++j) qs[j] = (int8_t) std::lround(v[j] * id);
+        std::memcpy(dst + b * 34, &dh, 2);
+    }
+}
+
+// row of K bf16 values -> int8 values and their scale as qi_rows_i8 makes them: each group of kQiRotate times the
+// normalized Hadamard matrix (Sylvester's, the same butterflies), then one scale for the row
+inline void quantize_row_w8(const uint16_t* src, int64_t K, int8_t* dst, float* scale) {
+    std::vector<float> v((size_t) K);
+    float amax = 0.f;
+    for (int64_t g = 0; g < K; g += kQiRotate) {
+        float* x = v.data() + g;
+        for (int64_t j = 0; j < kQiRotate; ++j) x[j] = bf16_value(src[g + j]);
+        for (int64_t m = 1; m < kQiRotate; m <<= 1)
+            for (int64_t i = 0; i < kQiRotate; i += 2 * m)
+                for (int64_t j = i; j < i + m; ++j) {
+                    const float a = x[j], b = x[j + m];
+                    x[j] = a + b;
+                    x[j + m] = a - b;
+                }
+        for (int64_t j = 0; j < kQiRotate; ++j) {
+            x[j] *= 1.f / 16.f;
+            amax = std::max(amax, std::fabs(x[j]));
+        }
+    }
+    const float d = amax / 127.f, id = amax > 0.f ? 1.f / d : 0.f;
+    for (int64_t j = 0; j < K; ++j) dst[j] = (int8_t) std::lround(v[(size_t) j] * id);
+    *scale = d;
+}
+
+// the rows of a [n][k] bf16 matrix quantized on the host's threads: Q8_0, or with w8 as quantize_row_w8 (the n rows'
+// int8 values, then their n scales)
+inline void quantize_matrix(const uint16_t* src, int64_t n, int64_t k, uint8_t* dst, bool w8) {
+    const uint64_t row = w8 ? (uint64_t) k : (uint64_t) (k / 32 * 34);
+    auto* scales = reinterpret_cast<float*>(dst + (uint64_t) n * row);
+    const int nt = (int) std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+    std::vector<std::thread> th;
+    th.reserve((size_t) nt);
+    for (int t = 0; t < nt; ++t)
+        th.emplace_back([=] {
+            for (int64_t r = t; r < n; r += nt) {
+                if (w8) quantize_row_w8(src + r * k, k, reinterpret_cast<int8_t*>(dst + r * row), scales + r);
+                else quantize_row(src + r * k, k, dst + r * row);
+            }
+        });
+    for (auto& x : th) x.join();
+}
+
+// Mage-Flow's activations pass FP16's range (its model ran in bf16: the image stream's normed rows up to 1.9e5, the
+// attention's v up to 6.1e5, a text MLP's output 5.7e6 at the first steps of a 1024 x 1024 Turbo run).  So a product's
+// FP16 input holds each row divided by a power of two (rs, at least 1) that brings its largest value under kRowLim, and
+// the product's output rows are multiplied back by it; the attention's v is divided by one power of two a head over a
+// context's rows (its output is a weighted sum of them), and the output multiplied back.  Powers of two leave the
+// rounding as it is; FP16 keeps 3 more bits than bf16.
+constexpr float kRowLim = 16384.f;
+
+inline float pow2_scale(float amax) {
+    return amax > kRowLim ? sycl::exp2(sycl::ceil(sycl::log2(amax / kRowLim))) : 1.f;
+}
+
+inline bool has_sg32(sycl::queue& q) {
+    static core::PerDevice<bool> sg32;
+    return sg32.get(q.get_device(), [&q] {
+        const auto sizes = q.get_device().get_info<sycl::info::device::sub_group_sizes>();
+        return std::find(sizes.begin(), sizes.end(), (size_t) 32) != sizes.end();
+    });
+}
+
+// A row-wise kernel writing FP16 with each row's scale: Op (LnMod, Gelu, Heads below) gives a row's statistics and its
+// values; a sub-group of 32 a row, 8 rows a work-group (or, without sub-groups of 32, a work-item a row).
+constexpr int64_t kSG = 32, kRows = 8;
+
+// the row's scale is taken from a bound of |op.value| where the op has a cheaper one than the value itself
+template<class Op, class St> float bound(const Op& op, int64_t t, int64_t c, const St& st) {
+    if constexpr (requires { op.bound(t, c); }) return op.bound(t, c);
+    else return sycl::fabs(op.value(t, c, st));
+}
+
+template<class Op> struct Rows16 {
+    Op op;
+    int64_t T, C;
+    uint16_t* y16;
+    float* rs;
+    void operator()(sycl::nd_item<1> it) const {
+        const auto sg = it.get_sub_group();
+        const int64_t t = static_cast<int64_t>(it.get_group_linear_id()) * kRows + sg.get_group_linear_id();
+        const int64_t lane = sg.get_local_linear_id();
+        if (t >= T) return;
+        const auto sum = [&](float v) { return sycl::reduce_over_group(sg, v, sycl::plus<float>()); };
+        const auto st = op.stats(t, lane, kSG, sum);
+        float m = 0.f;
+        for (int64_t c = lane; c < C; c += kSG) m = sycl::fmax(m, bound(op, t, c, st));
+        const float sc = pow2_scale(sycl::reduce_over_group(sg, m, sycl::maximum<float>()));
+        const float inv = 1.f / sc;
+        for (int64_t c = lane; c < C; c += kSG) y16[t * C + c] = f16_from_f32(op.value(t, c, st) * inv);
+        if (lane == 0) rs[t] = sc;
+    }
+    auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<kSG>}; }
+};
+
+template<class Op> inline void rows16(const Op& op, int64_t T, int64_t C, uint16_t* y16, float* rs, void* s) {
+    if (T <= 0) return;
+    sycl::queue& q = q_of(s);
+    if (has_sg32(q)) {
+        q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) ((T + kRows - 1) / kRows * kRows * kSG)),
+                                         sycl::range<1>((size_t) (kRows * kSG))),
+                       Rows16<Op>{op, T, C, y16, rs});
+        return;
+    }
+    q.parallel_for(sycl::range<1>((size_t) T), [=](sycl::id<1> id) {
+        const auto t = static_cast<int64_t>(id[0]);
+        const auto st = op.stats(t, 0, 1, [](float v) { return v; });
+        float m = 0.f;
+        for (int64_t c = 0; c < C; ++c) m = sycl::fmax(m, bound(op, t, c, st));
+        const float sc = pow2_scale(m), inv = 1.f / sc;
+        for (int64_t c = 0; c < C; ++c) y16[t * C + c] = f16_from_f32(op.value(t, c, st) * inv);
+        rs[t] = sc;
+    });
+}
+
+struct Stats {
+    float mean = 0.f, inv = 1.f;
+};
+
+// A W8A8 product's int8 input straight from a row-wise op, rotated and quantized as qi_rows_i8 quantizes FP16 rows
+// (qi_kernels.cpp: kQiRotate values at a time through Sylvester's Hadamard butterflies, times 1 / 16, then one scale a
+// row), without the FP16 rows and their second pass between: on the RX 9060 XT those two passes were a fifth of
+// MOSS-Image's step (2026-10-29).  A work-group a row, a sub-group of 32 a group of kQiRotate values (8 a lane, in
+// registers), up to kMaxG groups each.  A lane holds its 8 values W side by side (value j at (j / W) 32 W + lane W +
+// j % W of the group): its butterflies within the lane over j's bits and across the lanes over lane's, Sylvester's
+// Hadamard matrix whatever W is, and the same int8 values.  Op: raw(t, c), the value before the row's statistic
+// (keep(t, c, v) writes it back where kKeep); where kRms, inv(sum of the squares) of the row; out(t, c, v, inv), the
+// value given it.
+template<class Op, int W> struct RowsI8Of {
+    static constexpr int SG = 32, V = kQiRotate / SG, kMaxG = 4;
+    static_assert(W == 1 || W == 4 || W == V);
+    Op op;
+    int64_t K, gpr, nsg;
+    int8_t* q;
+    float* s;
+    void operator()(sycl::nd_item<1> it) const {
+        const auto sg = it.get_sub_group();
+        const auto r = static_cast<int64_t>(it.get_group_linear_id());
+        const auto si = static_cast<int64_t>(sg.get_group_linear_id());
+        const int lane = static_cast<int>(sg.get_local_linear_id());
+        auto off = [](int j) { return (int64_t) (j / W) * SG * W + j % W; };   // value j past the lane's first
+        float v[kMaxG][V];
+        float ss = 0.f;
+        for (int c = 0; c < kMaxG; ++c) {
+            const int64_t g = si + c * nsg;
+            if (g >= gpr) break;   // the whole sub-group
+            const int64_t k0 = g * kQiRotate + (int64_t) lane * W;
+            for (int j = 0; j < V; ++j) {
+                v[c][j] = op.raw(r, k0 + off(j));
+                if constexpr (Op::kKeep) op.keep(r, k0 + off(j), v[c][j]);
+                if constexpr (Op::kRms) ss += v[c][j] * v[c][j];
+            }
+        }
+        float inv = 1.f;
+        if constexpr (Op::kRms) inv = op.inv(sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>()));
+        float amax = 0.f;
+        for (int c = 0; c < kMaxG; ++c) {
+            const int64_t g = si + c * nsg;
+            if (g >= gpr) break;
+            const int64_t k0 = g * kQiRotate + (int64_t) lane * W;
+            for (int j = 0; j < V; ++j) v[c][j] = op.out(r, k0 + off(j), v[c][j], inv);
+            for (int m = 1; m < V; m <<= 1)
+                for (int j = 0; j < V; ++j)
+                    if ((j & m) == 0) {
+                        const float a = v[c][j], b = v[c][j + m];
+                        v[c][j] = a + b;
+                        v[c][j + m] = a - b;
+                    }
+            for (int l = 1; l < SG; l <<= 1)
+                for (int j = 0; j < V; ++j) {
+                    const float o = sycl::permute_group_by_xor(sg, v[c][j], l);
+                    v[c][j] = (lane & l) != 0 ? o - v[c][j] : v[c][j] + o;
+                }
+            for (int j = 0; j < V; ++j) {
+                v[c][j] *= 1.f / 16.f;
+                amax = sycl::fmax(amax, sycl::fabs(v[c][j]));
+            }
+        }
+        amax = sycl::reduce_over_group(it.get_group(), amax, sycl::maximum<float>());
+        const float d = amax / 127.f, id = amax > 0.f ? 1.f / d : 0.f;
+        for (int c = 0; c < kMaxG; ++c) {
+            const int64_t g = si + c * nsg;
+            if (g >= gpr) break;
+            int8_t* qg = q + r * K + g * kQiRotate + (int64_t) lane * W;
+            for (int h = 0; h < V / W; ++h) {
+                sycl::vec<int8_t, W> o;
+                for (int p = 0; p < W; ++p) o[p] = (int8_t) (int) sycl::round(v[c][h * W + p] * id);
+                *reinterpret_cast<sycl::vec<int8_t, W>*>(qg + (int64_t) h * SG * W) = o;
+            }
+        }
+        if (si == 0 && lane == 0) s[r] = d;
+    }
+    auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<SG>}; }
+};
+
+template<class Op, int W>
+inline void rows_i8_as(const Op& op, int64_t T, int64_t K, int8_t* q, float* s, sycl::queue& qu) {
+    constexpr int64_t SG = RowsI8Of<Op, W>::SG, kMaxG = RowsI8Of<Op, W>::kMaxG;
+    const int64_t gpr = K / kQiRotate;
+    const auto max_sg =
+        static_cast<int64_t>(qu.get_device().get_info<sycl::info::device::max_work_group_size>()) / SG;
+    if (K % kQiRotate != 0 || gpr > max_sg * kMaxG)
+        throw std::runtime_error("image engine: a W8A8 product takes rows of a multiple of 256 values, up to " +
+                                 std::to_string(max_sg * kMaxG * kQiRotate));
+    // the fewest sub-groups a row: a work-group of 1024 items (SiTU's 8192 values a sub-group's group each) took
+    // MOSS-Image's SiTU 2.76 ms a block on the RX 9060 XT, a quarter of them with 4 groups each 1.83 ms (2026-10-29)
+    const int64_t nsg = (gpr + kMaxG - 1) / kMaxG;
+    qu.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) (T * nsg * SG)), sycl::range<1>((size_t) (nsg * SG))),
+                    RowsI8Of<Op, W>{op, K, gpr, nsg, q, s});
+}
+
+// rows_i8's timing passes, as a block's: x[t] += gate y[t] (a product's int32 sums, scaled), written back, then
+// RMS-normed and modulated (gate_add into the MLP's input), over 4096 rows of 3072, twice; FP16 rows of 3072 (the
+// attention's output); an activation of two int32 sums side by side F apart (SiTU's hidden value and gate), over 1024
+// rows of F = 8192
+struct TimedI8 {
+    static constexpr bool kRms = true, kKeep = true;
+    float* x;
+    MfOut y;
+    const float* w;   // the norm's weights, then the modulation's scale and shift
+    int64_t C;
+    float raw(int64_t t, int64_t c) const { return x[t * C + c] + w[c] * y.at(t, c); }
+    void keep(int64_t t, int64_t c, float v) const { x[t * C + c] = v; }
+    float inv(float ss) const { return 1.f / sycl::sqrt(ss / (float) C + 1e-6f); }
+    float out(int64_t, int64_t c, float v, float inv) const { return v * inv * w[c] * (1.f + w[C + c]) + w[2 * C + c]; }
+};
+struct TimedHalfI8 {
+    static constexpr bool kRms = false, kKeep = false;
+    const uint16_t* h;
+    int64_t C;
+    float raw(int64_t t, int64_t c) const { return kernels::f32_from_f16(h[t * C + c]); }
+    void keep(int64_t, int64_t, float) const {}
+    float inv(float) const { return 1.f; }
+    float out(int64_t, int64_t, float v, float) const { return v; }
+};
+struct TimedPairI8 {
+    static constexpr bool kRms = false, kKeep = false;
+    MfOut y;
+    int64_t F;
+    float raw(int64_t t, int64_t c) const { return y.at(t, c) * sycl::tanh(y.at(t, c + F)); }
+    void keep(int64_t, int64_t, float) const {}
+    float inv(float) const { return 1.f; }
+    float out(int64_t, int64_t, float v, float) const { return v; }
+};
+
+// The values a lane holds side by side, the fastest of 8, 4 and 1 on the timing passes once a GPU.  MOSS-Image's step
+// (2026-10-29): the B70 754 ms with 1 (4: 781, 8: 848), the RTX 4070 874 with 4 (1: 876, 8: 979), the RX 9060 XT
+// 1474 with 4 (8: 1479, 1: 1497); the passes took 1, 4 and 8.  The int8 values are the same whichever it is.
+inline int rows_i8_width(sycl::queue& qu) {
+    static core::PerDevice<int> width;
+    return width.get(qu.get_device(), [&qu] {
+        constexpr int64_t T = 4096, C = 3072, TF = 1024, F = 8192;   // y: T x C or TF x 2F int32 sums
+        float* x = sycl::malloc_device<float>((size_t) (T * C), qu);
+        auto* y = sycl::malloc_device<int32_t>((size_t) (TF * 2 * F), qu);
+        float* sxw = sycl::malloc_device<float>((size_t) (T + 2 * F + 3 * C), qu);
+        int8_t* q = sycl::malloc_device<int8_t>((size_t) (T * C), qu);
+        float* s = sycl::malloc_device<float>((size_t) T, qu);
+        int best = 8;
+        if (x != nullptr && y != nullptr && sxw != nullptr && q != nullptr && s != nullptr) {
+            qu.fill(x, 1.f, (size_t) (T * C));
+            qu.fill(y, 1, (size_t) (TF * 2 * F));
+            qu.fill(sxw, 1e-3f, (size_t) (T + 2 * F + 3 * C)).wait();
+            MfOut yc, yf;
+            yc.i = yf.i = y;
+            yc.sx = yf.sx = sxw;
+            yc.sw = yf.sw = sxw + T;
+            yc.C = C;
+            yf.C = 2 * F;
+            const TimedI8 gate{x, yc, sxw + T + 2 * F, C};
+            const TimedHalfI8 half{reinterpret_cast<const uint16_t*>(y), C};
+            const TimedPairI8 pair{yf, F};
+            auto run = [&](auto w) {
+                rows_i8_as<TimedI8, decltype(w)::value>(gate, T, C, q, s, qu);
+                rows_i8_as<TimedI8, decltype(w)::value>(gate, T, C, q, s, qu);
+                rows_i8_as<TimedHalfI8, decltype(w)::value>(half, T, C, q, s, qu);
+                rows_i8_as<TimedPairI8, decltype(w)::value>(pair, TF, F, q, s, qu);
+            };
+            double best_ms = 1e30;
+            std::string said;
+            std::vector<std::pair<int, double>> took;
+            for (const int w : {8, 4, 1}) {
+                double ms = 1e30;
+                for (int i = 0; i < 4; ++i) {   // each time 4 passes, the first time to build the kernels
+                    const auto t0 = std::chrono::steady_clock::now();
+                    for (int k = 0; k < 4; ++k) {
+                        if (w == 1) run(std::integral_constant<int, 1>{});
+                        else if (w == 4) run(std::integral_constant<int, 4>{});
+                        else run(std::integral_constant<int, 8>{});
+                    }
+                    qu.wait();
+                    const auto t1 = std::chrono::steady_clock::now();
+                    if (i > 0) ms = std::min(ms, std::chrono::duration<double, std::milli>(t1 - t0).count());
+                }
+                said += (said.empty() ? "" : ", ") + std::to_string(w) + ": " + std::to_string(ms).substr(0, 5) + " ms";
+                took.emplace_back(w, ms);
+                best_ms = std::min(best_ms, ms);
+            }
+            // the first of 8, 4, 1 within 3% of the fastest: the RX 9060 XT's three within 2% took one or another
+            // from start to start
+            for (const auto& [w, ms] : took)
+                if (ms <= best_ms * 1.03) {
+                    best = w;
+                    break;
+                }
+            std::fprintf(stderr, "image engine: the W8A8 inputs' rows %d values side by side a lane (%s)\n", best,
+                         said.c_str());
+        }
+        for (void* p : {(void*) x, (void*) y, (void*) sxw, (void*) q, (void*) s})
+            if (p != nullptr) sycl::free(p, qu);
+        return best;
+    });
+}
+
+template<class Op> inline void rows_i8(const Op& op, int64_t T, int64_t K, int8_t* q, float* s, void* st) {
+    if (T <= 0) return;
+    sycl::queue& qu = q_of(st);
+    switch (rows_i8_width(qu)) {
+    case 1: rows_i8_as<Op, 1>(op, T, K, q, s, qu); break;
+    case 4: rows_i8_as<Op, 4>(op, T, K, q, s, qu); break;
+    default: rows_i8_as<Op, 8>(op, T, K, q, s, qu); break;
+    }
+}
+
+// the attention's output o16 [T][C] times its heads' scales hs (head_dim channels a head)
+struct Heads {
+    const uint16_t* o16;
+    const float* hs;
+    int64_t C, hd;
+    template<class R> Stats stats(int64_t, int64_t, int64_t, R) const { return {}; }
+    float value(int64_t t, int64_t c, const Stats&) const { return kernels::f32_from_f16(o16[t * C + c]) * hs[c / hd]; }
+};
+
+// The per-head kernels below: a sub-group of 32 a row's head (its values read side by side, kSG apart), kRows heads a
+// work-group; a work-item a row's head without sub-groups of 32.
+
+// part[r][h] = the largest |v| of row r's head h, rows of a ([na][C]) then b ([nb][C])
+struct HeadMax {
+    MfOut a, b;
+    int64_t na, nb, heads, hd;
+    float* part;
+    void operator()(sycl::nd_item<1> it) const {
+        const auto sg = it.get_sub_group();
+        const int64_t i = static_cast<int64_t>(it.get_group_linear_id()) * kRows + sg.get_group_linear_id();
+        if (i >= (na + nb) * heads) return;
+        const int64_t r = i / heads, h = i - r * heads;
+        float m = 0.f;
+        for (int64_t d = sg.get_local_linear_id(); d < hd; d += kSG)
+            m = sycl::fmax(m, sycl::fabs(r < na ? a.at(r, h * hd + d) : b.at(r - na, h * hd + d)));
+        m = sycl::reduce_over_group(sg, m, sycl::maximum<float>());
+        if (sg.get_local_linear_id() == 0) part[i] = m;
+    }
+    auto get(syclex::properties_tag) const { return syclex::properties{syclex::sub_group_size<kSG>}; }
+};
+
+inline void head_max(const MfOut& a, int64_t na, const MfOut& b, int64_t nb, int64_t heads, int64_t hd, float* part,
+              void* s) {
+    const int64_t n = (na + nb) * heads;
+    if (n <= 0) return;
+    sycl::queue& q = q_of(s);
+    if (has_sg32(q)) {
+        q.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) ((n + kRows - 1) / kRows * kRows * kSG)),
+                                         sycl::range<1>((size_t) (kRows * kSG))),
+                       HeadMax{a, b, na, nb, heads, hd, part});
+        return;
+    }
+    q.parallel_for(sycl::range<1>((size_t) n), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t r = i / heads, h = i - r * heads;
+        float m = 0.f;
+        for (int64_t d = 0; d < hd; ++d)
+            m = sycl::fmax(m, sycl::fabs(r < na ? a.at(r, h * hd + d) : b.at(r - na, h * hd + d)));
+        part[i] = m;
+    });
+}
+
+// hs[h] = the scale of head h over the rows' part: a work-group a head, its items striding the rows
+inline void head_scale(const float* part, int64_t rows, int64_t heads, float* hs, void* s) {
+    constexpr size_t kWG = 256;
+    q_of(s).parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t) heads * kWG), sycl::range<1>(kWG)),
+                         [=](sycl::nd_item<1> it) {
+        const auto h = static_cast<int64_t>(it.get_group_linear_id());
+        float m = 0.f;
+        for (auto r = static_cast<int64_t>(it.get_local_linear_id()); r < rows; r += (int64_t) kWG)
+            m = sycl::fmax(m, part[r * heads + h]);
+        m = sycl::reduce_over_group(it.get_group(), m, sycl::maximum<float>());
+        if (it.get_local_linear_id() == 0) hs[h] = pow2_scale(m);
+    });
+}
+
+// y[t] = y[t] * rs[t] * col + b (rs null: 1; b null: none; col null: 1, a DoRA's factor of the weight's row, the
+// bias not scaled)
+inline void rows_back(float* y, const float* rs, const float* b, int64_t T, int64_t N, void* s,
+                      const float* col = nullptr) {
+    q_of(s).parallel_for(sycl::range<1>((size_t) (T * N)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        const int64_t t = i / N, r = i - t * N;
+        float v = y[i];
+        if (rs != nullptr) v *= rs[t];
+        if (col != nullptr) v *= col[r];
+        if (b != nullptr) v += b[r];
+        y[i] = v;
+    });
+}
+
+// y[t] += b (the weight's own bias, after a product whose output an OFT turned: a rotation of the weight's rows is
+// not one of its bias's)
+inline void bias_add(float* y, const float* b, int64_t T, int64_t N, void* s) {
+    if (T <= 0 || b == nullptr) return;
+    q_of(s).parallel_for(sycl::range<1>((size_t) (T * N)), [=](sycl::id<1> id) {
+        const auto i = static_cast<int64_t>(id[0]);
+        y[i] += b[i % N];
+    });
+}
+
+// x[t] += gate * h[t] (per channel; gate null: 1)
+inline void gate_add(float* x, const MfOut& h, const float* gate, int64_t T, int64_t C, void* s) {
+    if (T <= 0) return;
+    q_of(s).parallel_for(sycl::range<2>((size_t) T, (size_t) C), [=](sycl::id<2> id) {
+        const auto t = static_cast<int64_t>(id[0]), c = static_cast<int64_t>(id[1]);
+        x[t * C + c] += (gate != nullptr ? gate[c] : 1.f) * h.at(t, c);
+    });
+}
+
+}  // namespace strata::image::dit_rows

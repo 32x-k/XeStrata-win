@@ -121,7 +121,7 @@ class OnlyDeclaredTools(unittest.TestCase):
         self.assertEqual((calls(evs), text(evs)), ([], raw))
         evs, p = run(raw, 3, tools=[], declared_only=True)
         self.assertEqual((calls(evs), text(evs)), ([], raw))
-        # without the flag (the Responses route: a Codex compaction request keeps its tools in the prompt only)
+        # without the flag (a Codex compaction request on the Responses route keeps its tools in the prompt only)
         evs, p = run(raw, 3, tools=None)
         self.assertEqual(calls(evs), [("search", {"q": "2+2"})])
 

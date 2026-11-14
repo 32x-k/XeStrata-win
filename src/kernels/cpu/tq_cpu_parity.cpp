@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: 2026 Niko1221 and the Strata contributors
 // SPDX-FileCopyrightText: 2026 MistVVK and the XeStrata contributors
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
-// src/kernels/cpu/tq_cpu_parity.cpp - the CPU trellis kernels (tq_cpu.hpp: TQ2_T / TQK6 / TQK7) against their scalar
-// reference, against ggml-cpu's own vec_dot and to_float, and their speed.  CPU only (no GPU runtime needed).
+// src/kernels/cpu/tq_cpu_parity.cpp - the CPU trellis kernels (tq_cpu.hpp: TQ2_T / TQK6 / TQK7 / TQP5-7) against their
+// scalar reference, against ggml-cpu's own vec_dot and to_float, and their speed.  CPU only (no GPU runtime needed).
 //
-//   tq_cpu_parity                                  every check below for tqk6/tqk7 and tq2_t/tq2_t, plain and Hadamard
+//   tq_cpu_parity                                  every check below for tqk6/tqk7, tq2_t/tq2_t and each TQP type,
+//                                                  plain and Hadamard
 //   tq_cpu_parity --synthetic GU/DOWN              one expert pair (types by ggml name, e.g. tqk6/tqk7)
 //   tq_cpu_parity --synthetic-hadamard GU/DOWN     the same with the block-128 Hadamard rotation of the activations
 //   tq_cpu_parity --bench [--quick] [--only K]     the micro-benchmark (run it pinned: taskset -c <cores>);
@@ -50,20 +51,23 @@ constexpr int H = 2560, FF = 640;
 
 // XeStrata builds against llama.cpp's own ggml, which has no trellis types: the rows' sizes and names are the kernels'
 // own here, and the checks against ggml-cpu's trellis vec_dot, to_float and encoder run only on a ggml that has them
-// (agention's fork as STRATA_GGML_DIR)
+// (agention's fork as STRATA_GGML_DIR; TQP5-7 from its 9aa51ce)
 bool ggml_has_tq() { return GGML_TYPE_COUNT > 146; }
+bool ggml_has_type(int type) { return GGML_TYPE_COUNT > type; }
 
 size_t row_bytes(int type, int n) {
-    if (type >= 144 && type <= 146) return (size_t) (n / 128) * tq_block_bytes(type);   // the trellis types
+    if (tq_supported(type)) return (size_t) (n / 128) * tq_block_bytes(type);   // the trellis types
     return ggml_row_size((ggml_type) type, n);  // NOLINT(clang-analyzer-optin.core.EnumCastOutOfRange): ggml's ids
 }
 
 const char* type_name(int t) {
-    return t == 144 ? "tq2_t" : t == 145 ? "tqk6" : t == 146 ? "tqk7" : ggml_type_name((ggml_type) t);
+    static const char* const tq[] = {"tq2_t", "tqk6", "tqk7", "tqp5", "tqp6", "tqp7"};
+    // NOLINTNEXTLINE(clang-analyzer-optin.core.EnumCastOutOfRange): ggml's ids
+    return t >= 144 && t <= 149 ? tq[t - 144] : ggml_type_name((ggml_type) t);
 }
 
 int type_by_name(const std::string& s) {
-    for (int t : {144, 145, 146})
+    for (int t = 144; t <= 149; ++t)
         if (s == type_name(t)) return t;
     for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
         const char* n = type_name(t);
@@ -83,7 +87,7 @@ std::vector<uint8_t> make_matrix(int type, int rows, int n, uint32_t seed) {
     std::uniform_int_distribution<int> byte(0, 255);
     std::uniform_real_distribution<float> scale(0.002f, 0.05f);
     const size_t bsz = rb / (size_t) (n / 128);
-    const int half = ggml_has_tq() ? rows - std::min(rows / 2, 32) : rows;
+    const int half = ggml_has_type(type) ? rows - std::min(rows / 2, 32) : rows;
     for (int r = 0; r < half; ++r)
         for (int b = 0; b < n / 128; ++b) {
             uint8_t* blk = m.data() + (size_t) r * rb + (size_t) b * bsz;
@@ -157,8 +161,8 @@ int check_matrix(int type, int rows, int n, uint32_t seed, bool hadamard) {
         fails += !ok;
     }
     // (3) ggml-cpu's vec_dot, (4) to_float in double
-    if (!ggml_has_tq()) {
-        std::printf("    vs ggml-cpu vec_dot and to_float: skipped (this ggml has no trellis types)\n");
+    if (!ggml_has_type(type)) {
+        std::printf("    vs ggml-cpu vec_dot and to_float: skipped (this ggml has no %s)\n", type_name(type));
         return fails;
     }
     const auto* tc = ggml_get_type_traits_cpu((ggml_type) type);
@@ -229,7 +233,7 @@ int check_expert(int gu, int dn, bool hadamard) {
     native_gu_rows(f, blob.data(), a, NT, ffp, 0, FF);
     for (int t = 0; t < NT; ++t) native_quant_h(f, ffs[t].data(), hqs[t].data());
     native_down_rows(f, blob.data(), hp, NT, op, 0, H);
-    const bool ref = ggml_has_tq();
+    const bool ref = ggml_has_type(gu) && ggml_has_type(dn);
     const auto* tg = ref ? ggml_get_type_traits_cpu((ggml_type) gu) : nullptr;
     const auto* td = ref ? ggml_get_type_traits_cpu((ggml_type) dn) : nullptr;
     for (int t = 0; t < NT; ++t) {
@@ -408,7 +412,7 @@ int bench(bool quick, const std::string& only) {
                                     tc->vec_dot(FF, &out[r], 0, e.dn.data() + (size_t) r * e.d_row, 0, h.data(), 0, 1);
                             }
                         },
-                        ggml_has_tq()});
+                        ggml_has_type(type)});
     };
     auto add_q2 = [&](bool avx512) {
         vars.push_back({avx512 ? "strata Q2_0 avx512" : "strata Q2_0 avx2", 42,
@@ -436,7 +440,7 @@ int bench(bool quick, const std::string& only) {
                         },
                         avx512 ? cpu_avx512_ok() : cpu_avx2_ok()});
     };
-    for (int type : {145, 146, 144}) add_tq(type);
+    for (int type : {145, 146, 144, 147, 148, 149}) add_tq(type);
     add_q2(false);
     add_q2(true);
     // the Q2_0 pack's own AVX-512 kernel (the repacked 1,382,400-byte blob that setup makes on AVX-512 CPUs)
@@ -489,7 +493,7 @@ int bench(bool quick, const std::string& only) {
     const double slice_ms = quick ? 40 : 60;
     std::printf("%-6s %-24s %9s %8s %8s %8s | %10s %8s\n", "type", "kernel", "us/expert", "ns/blk", "cyc/blk", "GB/s",
                 "x3: us/tok", "cyc/blk");
-    for (int type : {145, 146, 144, 42}) {
+    for (int type : {145, 146, 144, 147, 148, 149, 42}) {
         const auto cold = make_experts(type, ncold);
         const double eb = (double) (cold[0].gu_row * 2 * FF + cold[0].dn.size());   // weight bytes per expert
         std::vector<const Variant*> vs;
@@ -529,7 +533,7 @@ int bench(bool quick, const std::string& only) {
     // several workers at once (as the pool runs a layer's misses): aggregate GB/s on the cold set
     const int nthr = (int) std::max(1u, std::min(4u, std::thread::hardware_concurrency()));
     std::printf("\n%d threads at once, cold experts, one token: aggregate weight GB/s (us per expert per thread)\n", nthr);
-    for (int type : {145, 146, 144, 42}) {
+    for (int type : {145, 146, 144, 147, 148, 149, 42}) {
         const auto cold = make_experts(type, ncold);
         const double eb = (double) (cold[0].gu_row * 2 * FF + cold[0].dn.size());
         std::vector<const Variant*> vs;
@@ -586,6 +590,7 @@ int main(int argc, char** argv) {
     for (bool had : {false, true}) {
         f += synthetic(145, 146, had);   // Gyro-S
         f += synthetic(144, 144, had);   // Gyro-M
+        for (int t : {147, 148, 149}) f += synthetic(t, t, had);   // Gyro-Coder-L's layers
     }
     std::printf("%d failures\n", f);
     return f ? 1 : 0;

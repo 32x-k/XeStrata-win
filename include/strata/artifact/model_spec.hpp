@@ -9,6 +9,7 @@
 //
 //   qwen4exp   Qwen3.8-Flash-Next and its fine-tunes (the engine's model)
 //   qwen35moe  Qwen3.5 MoE (Ornith-1.5-35B-A3B): gated delta-net + full attention every 4th layer, MTP
+//   qwen35     Qwen3.5 (Qwen3.5-9B): qwen35moe's block with a dense SwiGLU FFN in place of the MoE, MTP
 //   qwen3moe   Qwen3 MoE (llm-jp-4.1-32b-a3b): full attention only, no shared expert
 //   glm5-next  GLM-5.3-Flash: KDA + NoPE MLA with a k-pool indexer, mHC, leading dense layers, MTP.  Also spelled
 //              `glm5next` (Project Maya's quants, after unsloth's first GGUFs), with the same keys under that name.
@@ -23,12 +24,13 @@
 #include "strata/artifact/gguf_reader.hpp"
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
 namespace strata {
 
-enum class ModelArch { Qwen4Exp, Qwen35Moe, Qwen3Moe, Glm5Next };
+enum class ModelArch { Qwen4Exp, Qwen35Moe, Qwen3Moe, Glm5Next, Qwen35 };
 
 /// llama.cpp's `llama_expert_gating_func_type`
 enum class ExpertGating : uint32_t { None = 0, Softmax = 1, Sigmoid = 2 };
@@ -137,15 +139,20 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
     const std::string& A = s.arch_name;
     if (A == "qwen4exp") s.arch = ModelArch::Qwen4Exp;
     else if (A == "qwen35moe") s.arch = ModelArch::Qwen35Moe;
+    else if (A == "qwen35") s.arch = ModelArch::Qwen35;
     else if (A == "qwen3moe") s.arch = ModelArch::Qwen3Moe;
     else if (A == "glm5-next" || A == "glm5next") s.arch = ModelArch::Glm5Next;
-    else { err = "architecture '" + A + "' is not supported (qwen4exp, qwen35moe, qwen3moe, glm5-next)"; return false; }
+    else { err = "architecture '" + A + "' is not supported (qwen4exp, qwen35moe, qwen35, qwen3moe, glm5-next)"; return false; }
 
-    // the keys every architecture here needs
+    // the keys every architecture here needs; the experts' all but the dense qwen35
+    const bool dense = s.arch == ModelArch::Qwen35;
     const char* required[] = {"block_count", "embedding_length", "attention.head_count", "expert_count",
                               "expert_used_count", "attention.layer_norm_rms_epsilon"};
     for (const char* k : required)
-        if (!spec_get(g, A, k)) { err = "missing " + A + "." + k; return false; }
+        if (!(dense && std::strncmp(k, "expert_", 7) == 0) && !spec_get(g, A, k)) {
+            err = "missing " + A + "." + k;
+            return false;
+        }
 
     const int64_t n_all = spec_int(g, A, "block_count");
     s.n_nextn = spec_int(g, A, "nextn_predict_layers");
@@ -194,7 +201,8 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
     s.recurrent.assign((size_t) n_all, false);
     switch (s.arch) {
     case ModelArch::Qwen4Exp:
-    case ModelArch::Qwen35Moe: {
+    case ModelArch::Qwen35Moe:
+    case ModelArch::Qwen35: {
         // qwen35moe.cpp: attention.recurrent_layers when written, else every layer but each interval-th
         std::vector<double> r;
         if (spec_per_layer(g, A, "attention.recurrent_layers", n_all, r)) {
@@ -235,7 +243,12 @@ inline bool read_model_spec(const GgufFile& g, ModelSpec& s, std::string& err) {
     s.expert_weights_scale = spec_num(g, A, "expert_weights_scale");
     spec_per_layer(g, A, "swiglu_clamp_exp", n_all, s.swiglu_clamp_exp);
     spec_per_layer(g, A, "swiglu_clamp_shexp", n_all, s.swiglu_clamp_shexp);
-    if (s.n_expert <= 0 || s.n_expert_used <= 0 || s.n_expert_used > s.n_expert || s.n_ff_exp <= 0) {
+    if (dense) {   // llama.cpp's qwen35: ffn_gate, ffn_up and ffn_down in every block, n_ff wide
+        if (s.n_expert != 0 || s.n_ff <= 0) {
+            err = A + ": expert_count " + std::to_string(s.n_expert) + ", feed_forward_length " + std::to_string(s.n_ff);
+            return false;
+        }
+    } else if (s.n_expert <= 0 || s.n_expert_used <= 0 || s.n_expert_used > s.n_expert || s.n_ff_exp <= 0) {
         err = A + ": expert_count " + std::to_string(s.n_expert) + ", expert_used_count " +
               std::to_string(s.n_expert_used) + ", expert_feed_forward_length " + std::to_string(s.n_ff_exp);
         return false;

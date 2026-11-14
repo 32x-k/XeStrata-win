@@ -158,6 +158,12 @@ def strata(m: dict, out: list, lab: str):
                              ("gpu_power_watts", "power", "GPU power draw (hardware.gpu_power).")):
         for g in gpus:                                   # a family's samples together, one per card
             metric(name, "gauge", help_, g.get(key), f',gpu="{g.get("index")}"')
+    guard = m.get("loop_guard") or {}
+    for key, help_ in (("detected", "Loops the loop guard saw in answers (loop_guard.detected)."),
+                       ("penalised", "Loops broken with a short repetition penalty (loop_guard.penalised)."),
+                       ("thinking_closed", "Loops in the thinking that closed it (loop_guard.thinking_closed)."),
+                       ("stopped", "Answers the loop guard ended, a loop that came back (loop_guard.stopped).")):
+        metric(f"loop_guard_{key}_total", "counter", help_, guard.get(key))
     metric("cpu", "gauge", "CPU busy, percent (hardware.cpu).", hw.get("cpu"))
     metric("ram_used_bytes", "gauge", "RAM in use (hardware.ram_used).", hw.get("ram_used"))
     metric("ram_total_bytes", "gauge", "RAM (hardware.ram_total).", hw.get("ram_total"))

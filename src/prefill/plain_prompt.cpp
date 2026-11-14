@@ -12,9 +12,11 @@
 // The state is left as the windows leave it: the GDN recurrent state and conv history (the same layouts), the K/V
 // cells of the chunk's positions.  The decode then continues at the next position.
 #include "strata/core/plain_model.hpp"
+#include "strata/core/expert_tier.hpp"
 
 #include "strata/core/gpu.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/per_device.hpp"
 #include "strata/core/runtime.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -28,6 +30,7 @@
 #include "strata/kernels/prompt_attn.hpp"
 #include "strata/kernels/native_rope.hpp"
 #include "strata/kernels/qsa.hpp"
+#include "strata/kernels/kv_q8.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/rope_scaling.hpp"
 #include "strata/kernels/router_top10.hpp"
@@ -36,6 +39,7 @@
 #include "strata/kernels/xmx_gemm.hpp"
 #include "strata/prefill/gemm.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#include "strata/prefill/prefill.hpp"
 #include "strata/prefill/kernels.hpp"
 #include "plain_prompt.hpp"
 
@@ -48,6 +52,9 @@
 #include <exception>
 #include <functional>
 #include <future>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <set>
 #include <tuple>
 #include <vector>
@@ -55,6 +62,18 @@
 namespace strata::core {
 
 namespace k = strata::kernels;
+
+namespace {
+
+bool dense_int8_env() {   // STRATA_PLAIN_DENSE_MMQ=0: every dense product through Gemm::native
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_PLAIN_DENSE_MMQ");
+        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
+    }();
+    return on;
+}
+
+}  // namespace
 
 
 void PlainModel::prompt_gemm_free(PromptGemm* g) { delete g; }
@@ -82,16 +101,32 @@ PlainModel::PromptGemm& PlainModel::prompt_gemm() {
 
 bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
     if (!settle_swaps(true, err)) return false;   // the tier's copies may still be writing the slots lent below
-    const int64_t L = n_moe_, E = spec_.n_expert, n = n_slots_;
+    if (dense_) {   // no tier: the buffers of its own (open_dense), in even chunks of up to their length
+        if (borrow_first_ >= 0 || prompt_dev_.at.empty() || prompt_dev_T_ < 1) {
+            err = "plain prompt: no buffers for the prompt's chunks";
+            return false;
+        }
+        const int64_t pieces = (T + prompt_dev_T_ - 1) / prompt_dev_T_;
+        uint64_t db = 0, hb = 0;
+        borrow_short_ = false;
+        borrowed_res_.clear();
+        borrow_first_ = 0;
+        prompt_carve((T + pieces - 1) / pieces, pb_, nullptr, (uint8_t*) prompt_host_, db, hb, &prompt_dev_);
+        PromptGemm& g = prompt_gemm();
+        g.gemm.rebind(pb_.gemm_scratch, pb_.gemm_elems);
+        g.identity = false;
+        return true;
+    }
+    const int64_t L = n_moe_, E = spec_.n_expert, n = cache_.slots();   // the live slots (--vram-elastic's shrinks)
     const uint64_t* off = cache_.slot_offsets();
     if (borrow_first_ >= 0 || off == nullptr || L <= 0 || n < 2) { err = "plain prompt: no tier to borrow from"; return false; }
-    // the chunk's device bytes from the tier's last slots: halved until they take at most half the tier, within its
-    // last piece (the slots lie back to back only inside one)
+    // the chunk's device bytes from the tier's last slots: halved until they take at most the share lend_lowest
+    // allows, within its last piece (the slots lie back to back only inside one)
     borrow_short_ = false;
     uint64_t db = 0, hb = 0;
     const int64_t want = T;
     int64_t first = n;
-    const int64_t lowest = std::max<int64_t>(n / 2, cache_.last_piece_first());
+    const int64_t lowest = lend_lowest(n);
     const int64_t least = std::clamp<int64_t>(want, 1, 16);   // a prompt under 16 tokens: one chunk of its length
     for (;; T /= 2) {
         if (T < least) break;
@@ -102,12 +137,12 @@ bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
     }
     // the buffers of their own when their chunk is no shorter than the borrowed one: no slot lent, prompt_return
     // gives back none
-    if (prompt_dev_ != nullptr && (T < least || std::min(want, prompt_dev_T_) >= T)) {
+    if (!prompt_dev_.at.empty() && (T < least || std::min(want, prompt_dev_T_) >= T)) {
         const int64_t pieces = (want + prompt_dev_T_ - 1) / prompt_dev_T_;   // even chunks: no short last one
         T = (want + pieces - 1) / pieces;
         borrowed_res_.clear();
         borrow_first_ = n;
-        prompt_carve(T, pb_, (uint8_t*) prompt_dev_, (uint8_t*) prompt_host_, db, hb);
+        prompt_carve(T, pb_, nullptr, (uint8_t*) prompt_host_, db, hb, &prompt_dev_);
         PromptGemm& g = prompt_gemm();
         g.gemm.rebind(pb_.gemm_scratch, pb_.gemm_elems);
         g.identity = false;
@@ -139,11 +174,12 @@ bool PlainModel::prompt_borrow(int64_t T, std::string& err) {
 }
 
 bool PlainModel::prompt_return(std::string& err) {
-    const int64_t LS = (int64_t) moe_local_.size(), n = n_slots_;
+    const int64_t LS = (int64_t) moe_local_.size(), n = cache_.slots();
+    if (dense_) borrow_first_ = -1;   // its own buffers: nothing to give back
     if (borrow_first_ < 0 || LS <= 0) return true;   // a borrow needs slots, and slots need MoE layers
     const auto& lay = k::cpu::expert_layout();
     if (!strata::gpu::stream_sync(cs_)) { err = std::string("plain prompt: ") + strata::gpu::last_error(); return false; }
-    for (int64_t s = borrow_first_; s < n; ++s) free_[(size_t) moe_local_[(size_t) (s % LS)]].push_back((int32_t) s);
+    for (int64_t s = borrow_first_; s < n; ++s) free_[(size_t) slot_layer_[(size_t) s]].push_back((int32_t) s);
     borrow_first_ = -1;
     // the experts the prompt displaced, back into the slots: straight from pinned RAM, else through fill_slot
     for (const auto& [l, e] : borrowed_res_) {
@@ -165,6 +201,23 @@ bool PlainModel::prompt_return(std::string& err) {
     borrowed_res_.clear();
     if (!strata::gpu::stream_sync(cs_)) { err = std::string("plain prompt: ") + strata::gpu::last_error(); return false; }
     return true;
+}
+
+// After a prompt, as Qwen3.8-Flash-Next's tier (generate.cpp): the counts seeded from its routing at the steady state
+// (seed_usage), and the free slots - which Qwen3.8's cache admits misses into as they come - take what the prompt
+// routed most (an empty tier, no profile, took a hundred windows to fill a round at a time).  Unlike Qwen3.8's, a
+// round's worth of the experts in VRAM (--adapt-swaps) is evicted for them here as well: without it a profiled tier
+// kept the profile's experts through the first rounds, Qwen3.6 UD-Q4_K_XL in 8 GB of the B70 (256 tokens, 2026-10-26)
+// 90.9 -> 92.9 tok/s with it (Ornith-1.5, llm-jp-4.1 and GLM-5.3-Flash equal).  No more than a round's: up to 2,048,
+// after upstream's q36 engine, took the RAM's and the link's bandwidth from GLM-5.3-Flash's decode after a 1K prompt,
+// B70 9.5 -> 13.5 tok/s with one round's (2026-10-20).
+bool PlainModel::prompt_settle(std::string& err) {
+    if (disp_.usage.empty()) return true;
+    seed_usage(disp_.usage, prompt_routed_, spec_.n_expert_used, prompt_seen_, spec_.n_expert, 4 * (int64_t) opt_.adapt_every,
+               opt_.adapt_decay);
+    int64_t n_free = 0;
+    for (const auto& f : free_) n_free += (int64_t) f.size();
+    return (n_free == 0 && opt_.adapt_swaps <= 0) || adapt(err, std::max<int64_t>(n_free, opt_.adapt_swaps), opt_.adapt_swaps);
 }
 
 bool PlainModel::prompt_cpu_experts(int64_t ml, const std::vector<int32_t>& experts, const std::vector<int32_t>& count,
@@ -218,6 +271,7 @@ bool PlainModel::prompt_warm(std::string& err) {
     if (opt_.prompt_chunk <= 0 || prompt_host_ == nullptr) return true;
     if (!prompt_borrow(std::min<int64_t>(opt_.prompt_chunk, 512), err)) return false;
     const bool ok = prompt_warm_products(err);
+    if (ok && dense_) prompt_dense_calibrate();
     std::string err2;
     if (!prompt_return(err2) && ok) { err = err2; return false; }
     return ok;
@@ -248,6 +302,8 @@ bool PlainModel::prompt_warm_products(std::string& err) {
             warm(mtp_eh_, P.x);
         }
         for (const Block* bp : all) {
+            const int64_t l = bp == &mtp_ ? -1 : bp - blocks_.data();   // the MTP layer: nothing to bind
+            bind_block(l);
             const Block& b = *bp;
             if (b.recurrent) {
                 warm(b.qkv, P.qkv);
@@ -261,11 +317,12 @@ bool PlainModel::prompt_warm_products(std::string& err) {
                 warm(b.v, P.vcur);
                 warm(b.o, P.mix);
             }
-            if (has_shared_) {
+            if (has_shared_ || dense_) {   // the shared expert, or the dense FFN in its fields
                 warm(b.sh_gate, P.sh_gate);
                 warm(b.sh_up, P.sh_up);
                 warm(b.sh_down, P.shared);
             }
+            unbind_block(l);
         }
     } catch (const std::exception& e) {
         err = std::string("plain prompt: warming: ") + e.what();
@@ -276,6 +333,142 @@ bool PlainModel::prompt_warm_products(std::string& err) {
         return false;
     }
     return true;
+}
+
+bool PlainModel::dense_int8_ok(const W& w) const {
+    return dense_int8_env() && prefill::mmq::chosen() && w.data != nullptr && prefill::mmq::supported(w.type) &&
+           w.n_out % 128 == 0 && w.n_in % 32 == 0;
+}
+
+bool PlainModel::prompt_dense_int8(const W& w, const float* x, int64_t ldx, float* y, int64_t T, int64_t ldy) {
+    if (!dense_int8_ok(w)) return false;
+    PromptBufs& P = pb_;
+    prefill::mmq::quantize(x, nullptr, P.xq, w.type, w.n_in, ldx, T, cs_);
+    prefill::mmq::Product p;
+    p.w = w.data; p.type = w.type; p.w_rows = w.n_out; p.w_cols = w.n_in; p.n = 1; p.xq = P.xq;
+    p.bounds = P.dense_bounds; p.ids = P.identity; p.total_rows = T; p.max_rows = T;
+    p.dst = y; p.ld_dst = ldy > 0 ? ldy : w.n_out;
+    prompt_gemm().mmq.run(p, cs_);
+    return true;
+}
+
+// The int8 products read the weight in its blocks a row tile at a time; Gemm::native dequantizes it to FP16 once a
+// product (a time of its own, whatever the rows) and multiplies it in the products' library.  Each is timed as
+// a + b rows from 16 rows and the chunk's (the best of three, after one), and dense_native_rows_ is where they cross.
+// The RX 9060 XT, Qwen3.5-9B Q4_K_M (2026-10-27): int8 faster at 16 and 23 tokens, FP16 at 128 and above (2289 tok/s
+// at 1K against 843).  Gemm::native is timed with its sums in FP32 and in FP16 too: the RTX 4070 takes FP16's (1K
+// 2842 -> 3572 tok/s warm, 32K 1524 -> 1681); on the B70 the two are close in the timing and FP32's ahead in the
+// prompt (1K 3476 against 3304; 2026-10-29: 1K 3125 against 2945, 32K 1276 against 1248), where FP32's are kept
+// (below).
+void PlainModel::prompt_dense_calibrate() {
+    PromptBufs& P = pb_;
+    if (blocks_.empty() || P.T < 32) return;
+    bind_block(0);
+    struct Unbind {
+        PlainModel* m;
+        ~Unbind() { m->unbind_block(0); }
+    } unbind{this};
+    const W& w = blocks_.front().sh_gate;   // the dense FFN's gate: the largest of the products a chunk takes
+    if (!dense_int8_ok(w)) return;
+    // timed once a GPU and a shape: a model opened again in the same process (MOSS-Image's text encoder, after each
+    // image) takes what the first open chose, its timings beside the image engine's other work having moved the choice
+    // and the same prompt's states with it (the B70, 2026-10-29: FP16 from 320 rows at the first open, 2816 at the next)
+    struct Chosen {
+        int64_t rows;
+        bool half;
+    };
+    struct Chosens {
+        std::mutex mu;
+        std::map<std::tuple<int, int64_t, int64_t, int64_t>, Chosen> of;
+    };
+    static PerDevice<std::shared_ptr<Chosens>> chosen_of;
+    Chosens& chosen = *chosen_of.get(Runtime::get().stream(cs_).get_device(), [] { return std::make_shared<Chosens>(); });
+    const auto key = std::make_tuple((int) w.type, w.n_in, w.n_out, P.T);
+    {
+        std::lock_guard<std::mutex> lock(chosen.mu);
+        const auto it = chosen.of.find(key);
+        if (it != chosen.of.end()) {
+            dense_native_rows_ = it->second.rows;
+            dense_half_sums_ = it->second.half;
+            return;
+        }
+    }
+    prefill::Gemm& gm = prompt_gemm().gemm;
+    PromptGemm& pg = prompt_gemm();
+    const int64_t lo = 16, hi = P.T;
+    using Clock = std::chrono::steady_clock;
+    auto best1 = [&](const std::function<void()>& run) {   // one run's time
+        const auto t0 = Clock::now();
+        run();
+        if (!strata::gpu::stream_sync(cs_)) return -1.0;
+        return std::chrono::duration<double>(Clock::now() - t0).count();
+    };
+    auto best = [&](const std::function<void()>& run) {
+        double t = 1e30;
+        for (int i = 0; i < 4; ++i) {
+            const double r = best1(run);
+            if (r < 0) return -1.0;
+            if (i > 0) t = std::min(t, r);
+        }
+        return t;
+    };
+    try {
+        if (!strata::gpu::memset_async(P.hn, 0, (size_t) (hi * w.n_in) * 4, cs_) ||
+            !strata::gpu::memset_async(P.x16, 0, (size_t) (hi * w.n_in) * 2, cs_))
+            return;
+        if (!pg.identity) {
+            prefill::mmq::iota(P.identity, P.T, cs_);
+            pg.identity = true;
+        }
+        // Gemm::native with its sums in FP32 and in FP16 (h), the faster at the chunk's rows taken for the products
+        // from the normed rows
+        double n[2], h[2], q[2];
+        for (int i = 0; i < 2; ++i) {
+            const int64_t T = i == 0 ? lo : hi;
+            P.h_dense_bounds[0] = 0;
+            P.h_dense_bounds[1] = (int32_t) T;
+            if (!strata::gpu::copy_async(P.dense_bounds, P.h_dense_bounds, 2 * sizeof(int32_t), cs_)) return;
+            // the two sums timed in turn, so that the GPU's clocks rising over the timings favour neither (the B70,
+            // MOSS-Image's text encoder just opened, 2026-10-29: the products 2.4 times slower in one start of five,
+            // FP16's timed after FP32's and taken)
+            n[i] = h[i] = 1e30;
+            for (int k = 0; k < 4; ++k) {
+                const auto sums = [&](bool half) {
+                    return best1([&] { gm.native(P.x16, w.type, w.data, P.sh_gate, T, w.n_out, w.n_in, 0, half); });
+                };
+                const double a = sums(false), b = sums(true);
+                if (a < 0 || b < 0) return;
+                if (k > 0) {
+                    n[i] = std::min(n[i], a);
+                    h[i] = std::min(h[i], b);
+                }
+            }
+            q[i] = best([&] { prompt_dense_int8(w, P.hn, w.n_in, P.sh_gate, T, 0); });
+            if (n[i] < 0 || h[i] < 0 || q[i] < 0) return;
+        }
+        // FP32's sums unless FP16's are clearly the faster (the GeForce's twice): the two form different values (the
+        // GDN blocks' ssm_out takes them at every length), and a near tie (the B70, 2026-10-29: FP16's 0.80 ms at 512
+        // rows, FP32's 0.83 in one start of five, 0.89 in the others) picked one or the other from start to start, the
+        // same prompt's states, and an image made from them, changing with it
+        dense_half_sums_ = h[1] * 1.2 < n[1];
+        if (dense_half_sums_) { n[0] = h[0]; n[1] = h[1]; }
+        // native - int8 = d0 + d1 (T - lo): FP16 from where it turns negative, at a multiple of 64 rows, so that the
+        // timings' noise (the B70: 304 to 322 rows from start to start) leaves a prompt of a given length on one side
+        const double d0 = n[0] - q[0], d1 = ((n[1] - q[1]) - d0) / (double) (hi - lo);
+        if (d0 <= 0) dense_native_rows_ = 0;
+        else if (d1 < 0) dense_native_rows_ = std::max<int64_t>(64, (lo + (int64_t) std::ceil(d0 / -d1) + 32) / 64 * 64);
+        std::fprintf(stderr, "strata plain: dense products in FP16 (the products' library, %s sums) from %s rows, in "
+                             "int8 below (%.2f / %.2f ms at %lld rows, %.2f / %.2f at %lld)\n",
+                     dense_half_sums_ ? "FP16" : "FP32",
+                     dense_native_rows_ == INT64_MAX ? "no" : std::to_string(dense_native_rows_).c_str(), 1e3 * n[0],
+                     1e3 * q[0], (long long) lo, 1e3 * n[1], 1e3 * q[1], (long long) hi);
+        std::lock_guard<std::mutex> lock(chosen.mu);
+        chosen.of[key] = {dense_native_rows_, dense_half_sums_};
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "strata plain: timing the dense products: %s (int8 kept)\n", e.what());
+        dense_native_rows_ = INT64_MAX;
+        dense_half_sums_ = false;
+    }
 }
 
 bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* routes,
@@ -310,15 +503,18 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
     std::vector<char> on_cpu((size_t) E, 0);
     std::vector<int32_t> cpu_experts;
     if (cpu_share && f.gu_type != 42) {
-        std::vector<std::pair<int32_t, int32_t>> missed;
         int hits = 0;
-        for (int64_t e = 0; e < E; ++e)
-            if (count[(size_t) e] > 0) {
-                if (res_[(size_t) (ml * E + e)] >= 0) ++hits;
-                else missed.emplace_back(count[(size_t) e], (int32_t) e);
-            }
-        int want = (int) missed.size() - pcie_split_m(split_, true, (int) missed.size(), hits);
-        std::sort(missed.begin(), missed.end());
+        for (int64_t e = 0; e < E; ++e) hits += count[(size_t) e] > 0 && res_[(size_t) (ml * E + e)] >= 0;
+        // the candidates (core/expert_tier, as Qwen3.8-Flash-Next's prompt path takes them)
+        const CpuShareCandidates cc = cpu_share_candidates(
+            count.data(), E, ml, *src_, [&](int32_t e) { return res_[(size_t) (ml * E + e)] >= 0; },
+            [](int32_t) { return false; });
+        const std::vector<std::pair<int32_t, int32_t>>& missed = cc.cand;
+        const int n_missed = (int) cc.missed;
+        // a fixed share (--prefill-cpu-share S) gives the CPU S of the missed experts, else the times decide
+        const double fixed = strata::prefill::cpu_share_setting();
+        int want = fixed > 0.0 ? (int) std::lround(fixed * (double) n_missed)
+                               : n_missed - pcie_split_m(split_, true, n_missed, hits);
         int64_t rows = 0;
         for (const auto& [c, e] : missed) {
             if (want <= 0 || c > k::cpu::MAXT || rows + c > P.cpu_cap) break;
@@ -370,23 +566,34 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
     if (use_mmq && up_xq2) prefill::mmq::quantize(P.hn, P.src, P.xq2, up_type, N, N, T * K, cs);
     else prefill::gather_rows16(P.x16, P.src, P.xs16, T * K, N, cs);
     mark(1);
-    const bool transient = src_->transient(ml, experts.empty() ? 0 : experts[0]);
+    // whether a missed expert's blob is assembled into a short-lived buffer, asked of each: with a RAM copy of part
+    // of the layer the first expert says nothing of the others (as the read-ahead below)
+    bool transient = false;
+    for (int32_t e : experts)
+        if (res_[(size_t) (ml * E + e)] < 0 && src_->transient(ml, e)) {
+            transient = true;
+            break;
+        }
     int64_t max_rows = 0;
     for (int32_t e : experts) max_rows = std::max<int64_t>(max_rows, count[(size_t) e]);
     // a source that assembles its experts from the files (transient: GGUF read in place): each group's missed experts
     // read ahead on the source's threads (prefetch, its page faults side by side), the next group's while this one is
     // copied and multiplied.  Group gi of the loop below takes the gi-th kGroup of the missed experts in order.
     // (GLM-5.3-Flash UD-IQ3_XXS on the B70, a 1K-token prompt: its 11,735 missed experts took 22 s read one by one.)
+    // (each expert asked: with a RAM copy of part of the layer the first expert says nothing of the others - the
+    // layer's file reads went one by one whenever its lowest routed expert was in RAM)
     std::vector<std::vector<int64_t>> ahead;
-    if (use_mmq && transient)
+    if (use_mmq) {
+        int64_t missed = 0;   // the loop's groups count every missed expert: a group's read-ahead takes its file ones
         for (int32_t e : experts)
             if (res_[(size_t) (ml * E + e)] < 0) {
-                if (ahead.empty() || (int) ahead.back().size() == PromptBufs::kGroup) ahead.emplace_back();
-                ahead.back().push_back(e);
+                if (missed++ % PromptBufs::kGroup == 0) ahead.emplace_back();
+                if (src_->transient(ml, e)) ahead.back().push_back(e);
             }
+    }
     std::future<void> fetch;
     auto fetch_group = [&](size_t i) {
-        if (i < ahead.size())
+        if (i < ahead.size() && !ahead[i].empty())
             fetch = std::async(std::launch::async, [this, ml, &ahead, i] {
                 src_->prefetch(ml, ahead[i].data(), (int64_t) ahead[i].size());
             });
@@ -467,9 +674,16 @@ bool PlainModel::prompt_routed(int64_t ml, int64_t T, bool cpu_share, int32_t* r
             gu.type = up_type; gu.xq = up_xq2 ? P.xq2 : P.xq; gu.dst = P.gu + FF; gu.woff = f.up_off;
         }
         pg.mmq.run(gu, cs);
-        prefill::mmq::swiglu(P.gu + (int64_t) r0 * 2 * FF, P.hh + (int64_t) r0 * FF, nr, FF,
-                             /*interleaved=*/false, cs);
-        prefill::mmq::quantize(P.hh + (int64_t) r0 * FF, nullptr, P.hq, f.d_type, FF, FF, nr, cs);
+        // STRATA_SWIGLU_QUANT=1: swiglu and the down product's int8 rows in one kernel, the same bytes (upstream
+        // dd97421d3); opt-in, as in prefill.cpp
+        static const bool sq = [] { const char* e = std::getenv("STRATA_SWIGLU_QUANT"); return e != nullptr && e[0] == '1'; }();
+        if (sq && FF % 32 == 0) {
+            prefill::mmq::swiglu_quantize(P.gu + (int64_t) r0 * 2 * FF, P.hq, f.d_type, nr, FF, /*interleaved=*/false, cs);
+        } else {
+            prefill::mmq::swiglu(P.gu + (int64_t) r0 * 2 * FF, P.hh + (int64_t) r0 * FF, nr, FF,
+                                 /*interleaved=*/false, cs);
+            prefill::mmq::quantize(P.hh + (int64_t) r0 * FF, nullptr, P.hq, f.d_type, FF, FF, nr, cs);
+        }
         prefill::mmq::Product dn;
         dn.type = f.d_type; dn.w_rows = N; dn.w_cols = FF; dn.n = G; dn.xq = P.hq;
         dn.bounds = P.rbounds + g0 + gi; dn.ids = P.entry + r0; dn.total_rows = nr; dn.max_rows = mr;
@@ -546,6 +760,20 @@ bool PlainModel::prompt(const int32_t* tokens, int64_t n, int64_t pos, int32_t* 
     return next_.empty() ? prompt_one(tokens, n, pos, out, logits, err) : prompt_split(tokens, n, pos, out, logits, err);
 }
 
+bool PlainModel::encode(const int32_t* tokens, int64_t n, float* hidden, std::string& err) {
+    if (!dense_ || !next_.empty() || hidden == nullptr || n <= 0 || n > opt_.max_cells) {
+        err = "plain model: encode takes 1 .. max_cells tokens of a dense model on one GPU";
+        return false;
+    }
+    if (!reset(err)) return false;
+    enc_out_ = hidden;
+    int32_t next = 0;
+    const bool ok = prompt_one(tokens, n, 0, &next, nullptr, err);
+    enc_out_ = nullptr;
+    if (!ok && err.empty()) err = "plain model: the device cannot lend the prompt's buffers";
+    return ok;
+}
+
 // A layer split's prompt: every stage's buffers for chunks as long as its GPU's tier lends them, then each chunk of the
 // longest through the stages in turn, the rows handed on through pinned memory, a stage of shorter chunks reading them
 // in its own.  Chunks of the shortest everywhere made the RTX 4070's 1K the B70's too, which then read every missed
@@ -600,11 +828,9 @@ bool PlainModel::prompt_split(const int32_t* tokens, int64_t n, int64_t pos, int
         if (!st->prompt_return(err2) && ok) { err = err2; ok = false; }
     }
     if (!ok) return false;
-    for (PlainModel* st : c) {   // each tier to the experts its layers routed most (prompt_one)
+    for (PlainModel* st : c) {   // each tier's counts from the prompt, its free slots filled (prompt_one)
         const OnDevice on(st->dev_);
-        int64_t n_free = 0;
-        for (const auto& f : st->free_) n_free += (int64_t) f.size();
-        if (!st->disp_.usage.empty() && !st->adapt(err, std::max<int64_t>(2048, n_free), st->opt_.adapt_swaps)) return false;
+        if (!st->prompt_settle(err)) return false;
     }
     return true;
 }
@@ -641,16 +867,8 @@ bool PlainModel::prompt_one(const int32_t* tokens, int64_t n, int64_t pos, int32
     if (!prompt_return(err2) && ok) { err = err2; return false; }
     if (profile)
         std::fprintf(stderr, "strata plain: the chunks %.1f ms, giving the tier its slots back %.1f ms\n", chunks_ms, since(tc));
-    // the tier to the experts the prompt routed most, at once (upstream's q36 engine: up to 2048 slot replacements
-    // after a prompt): the rounds between windows move at most adapt_swaps each, so an empty tier (no profile) took
-    // a hundred windows to fill.  The copies run on the copy stream beside the first windows.  The free slots take
-    // what the prompt routed; of the experts in VRAM no more are evicted than a round between windows does: GLM-5.3-
-    // Flash's 2,048 evictions after a 1K prompt (17 GB of 8.5 MB experts) took the RAM's and the link's bandwidth from
-    // the decode, 9.5 -> 13.5 tok/s on the B70 and 11.3 -> 12.0 on the RTX 4070 with all of them left out (2026-10-20)
-    int64_t n_free = 0;   // and every free slot: those copies displace nothing
-    for (const auto& f : free_) n_free += (int64_t) f.size();
     const auto t0 = std::chrono::steady_clock::now();
-    if (ok && !disp_.usage.empty() && !adapt(err, std::max<int64_t>(2048, n_free), opt_.adapt_swaps)) return false;
+    if (ok && !prompt_settle(err)) return false;
     if (profile)
         std::fprintf(stderr, "strata plain: the tier after the prompt: %.1f ms\n",
                      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
@@ -664,7 +882,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
     const ModelSpec& s = spec_;
     const int64_t N = s.n_embd, NH = s.n_head, HD = s.key_length, NKV = nkv_, HV = s.ssm_dt_rank, HK = s.ssm_n_group;
     const int64_t E = s.n_expert, K = s.n_expert_used;
-    const int64_t FS = s.n_ff_shexp, qw = (has_gate_ ? 2 : 1) * NH * HD;
+    const int64_t FS = dense_ ? s.n_ff : s.n_ff_shexp, qw = (has_gate_ ? 2 : 1) * NH * HD;
     const float eps = (float) s.rms_eps;
     const k::QsaShapes qs = [&] {
         k::QsaShapes q = k::qsa_real_shapes();
@@ -675,45 +893,36 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
     strata::gpu::Stream cs = cs_;
     prefill::Gemm& gm = prompt_gemm().gemm;
     auto f16 = [&](const float* x, int64_t rows, int64_t cols) { prefill::to_f16(x, P.x16, rows * cols, cs); };
-    // a dense product from float rows x (ldx a row) in int8 (iq_mmq, as one expert of T rows) where the weight's type
-    // and shape are the int8 products'; false: the caller takes Gemm::native from the FP16 copy
-    static const bool dense_env = [] {   // STRATA_PLAIN_DENSE_MMQ=0: every dense product through Gemm::native
-        const char* v = std::getenv("STRATA_PLAIN_DENSE_MMQ");
-        return v == nullptr || std::strtol(v, nullptr, 10) != 0;
-    }();
-    const bool dense_on = dense_env && prefill::mmq::chosen();   // as for the experts: PlainModel::prompt_int8
+    // a dense product from float rows x (ldx a row) in int8 below dense_native_rows_ rows where the weight is the int8
+    // products'; false: the caller takes Gemm::native from the FP16 copy
+    const bool dense_on = dense_int8_env() && prefill::mmq::chosen();   // as for the experts: PlainModel::prompt_int8
     auto dense = [&](const W& w, const float* x, int64_t ldx, float* y, int64_t T, int64_t ldy = 0) {
-        if (!dense_on || w.data == nullptr || !prefill::mmq::supported(w.type) || w.n_out % 128 != 0 || w.n_in % 32 != 0)
-            return false;
-        prefill::mmq::quantize(x, nullptr, P.xq, w.type, w.n_in, ldx, T, cs);
-        prefill::mmq::Product p;
-        p.w = w.data; p.type = w.type; p.w_rows = w.n_out; p.w_cols = w.n_in; p.n = 1; p.xq = P.xq;
-        p.bounds = P.dense_bounds; p.ids = P.identity; p.total_rows = T; p.max_rows = T;
-        p.dst = y; p.ld_dst = ldy > 0 ? ldy : w.n_out;
-        prompt_gemm().mmq.run(p, cs);
-        return true;
+        return T < dense_native_rows_ && prompt_dense_int8(w, x, ldx, y, T, ldy);
     };
-    auto proj = [&](const W& w, float* y, int64_t T, int64_t ldy = 0) {
-        gm.native(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, ldy);
+    auto proj = [&](const W& w, float* y, int64_t T, int64_t ldy = 0, bool half_sums = false) {
+        gm.native(P.x16, w.type, w.data, y, T, w.n_out, w.n_in, ldy, half_sums);
     };
     // the routed experts in their quantized blocks (int8 products, iq_mmq: on the matrix engines, else by dp4a where the
     // FP16 products have none either) where every layer's types are theirs (prompt_int8, decided with the buffers),
     // else dequantized to FP16
     const bool use_mmq = P.int8;
     // the CPU's share of the missed experts needs the split's times (measured at load from pinned RAM, on the decode
-    // window's kernels: the int8 and the FP16 path take them alike); STRATA_PLAIN_CPU_SHARE=0: every expert on the GPU
+    // window's kernels: the int8 and the FP16 path take them alike); STRATA_PLAIN_CPU_SHARE=0, or
+    // --prefill-cpu-share 0 (STRATA_PREFILL_CPU_SHARE, as Qwen3.8-Flash-Next's): every expert on the GPU
     static const bool cpu_env = [] {
         const char* v = std::getenv("STRATA_PLAIN_CPU_SHARE");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
-    const bool cpu_share = cpu_env && split_.c > 0.0 && split_.p > 0.0 && P.cpu_cap > 0;
+    const bool cpu_share = cpu_env && strata::prefill::cpu_share_setting() != 0.0 && split_.c > 0.0 && split_.p > 0.0 &&
+                           P.cpu_cap > 0;
     static const bool prompt_attn_on = [] {   // STRATA_PLAIN_PROMPT_ATTN=0: the decode's attention kernel
         const char* v = std::getenv("STRATA_PLAIN_PROMPT_ATTN");
         return v == nullptr || std::strtol(v, nullptr, 10) != 0;
     }();
     PromptGemm& pg = prompt_gemm();
+    const int64_t rows_id = P.T * std::max<int64_t>(K, 1);   // the identity's rows: the routed ones, or a dense chunk's
     if (use_mmq && !pg.identity) {
-        prefill::mmq::iota(P.identity, P.T * K, cs);
+        prefill::mmq::iota(P.identity, rows_id, cs);
         pg.identity = true;
     }
     // STRATA_PROMPT_PROFILE=1: the time of each stage, the stream synchronized after each (slower; for finding where it
@@ -744,8 +953,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
             // positions
             for (int64_t t = 0; t < T; ++t) {
                 const int32_t tok = tokens[c0 + t];
-                if (tok < 0 || tok >= n_vocab_ ||
-                    (first() && !k::cpu::native_row_to_float(emb_type_, emb_ + (size_t) tok * emb_row_, P.emb + t * N, N))) {
+                if (tok < 0 || tok >= n_vocab_ || (first() && !embed(tok, p0 + t, P.emb + t * N))) {
                     err = "plain prompt: a token is out of the vocabulary";
                     return false;
                 }
@@ -767,16 +975,17 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                 return false;
             }
             if (dense_on && !pg.identity) {   // the dense products' row map (the experts' sets it too)
-                prefill::mmq::iota(P.identity, P.T * K, cs);
+                prefill::mmq::iota(P.identity, rows_id, cs);
                 pg.identity = true;
             }
-            // from the normed rows: int8 where it can, else FP16 (x16, written once a layer if any product needs it)
+            // from the normed rows: int8 where it can, else FP16 (x16, written once a layer if any product needs it),
+            // its sums in FP16 where that was measured faster (a norm's rows keep them in FP16's range)
             auto proj_hn = [&](const W& w, float* y, int64_t ldy = 0) {
-                if (!dense(w, P.hn, N, y, T, ldy)) proj(w, y, T, ldy);
+                if (!dense(w, P.hn, N, y, T, ldy)) proj(w, y, T, ldy, dense_half_sums_);
             };
-            // the last token's logits, by the decode's head
+            // the last token's logits, by the decode's head (an encoder's chunks write their rows instead, below)
             auto last_logits = [&] {
-                if (c0 + T < n) return;
+                if (c0 + T < n || enc_out_ != nullptr) return;
                 k::native_qsa_rms_norm_weighted(P.x + (T - 1) * N, out_norm_, P.hn, (int) N, 1, eps, cs);
                 if (head_.type == 30) {   // a BF16 head, as the decode reads it
                     k::bf16_gemv_fp32_mmvf_multi(P.hn, head_.n_in, static_cast<const uint16_t*>(head_.data), logits_,
@@ -805,7 +1014,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     k::native_qsa_rms_norm_weighted(P.hn, mtp_hnorm_, P.mix, (int) N, (int) T, eps, cs);
                     for (int64_t t = 0; t < T; ++t) {   // the stream has synchronized since the chunk's uploads
                         const int32_t tok = c0 + t + 1 < n ? tokens[c0 + t + 1] : tokens[n - 1];
-                        if (!k::cpu::native_row_to_float(emb_type_, emb_ + (size_t) tok * emb_row_, P.emb + t * N, N)) {
+                        if (!embed(tok, p0 + 1 + t, P.emb + t * N)) {
                             err = "plain prompt: a token is out of the vocabulary";
                             return false;
                         }
@@ -827,6 +1036,7 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                         proj(mtp_eh_, P.x, T);
                     }
                 }
+                if (!is_mtp) bind_block(l);   // a streamed block's matrices
                 const Block& b = is_mtp ? mtp_ : blocks_[(size_t) l];
                 const int64_t pa = is_mtp ? p0 + 1 : p0;   // the rows' first position
                 k::native_qsa_rms_norm_weighted(P.x, b.attn_norm, P.hn, (int) N, (int) T, eps, cs);
@@ -856,8 +1066,10 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     prefill::gdn_recurrence(gdn_state_[(size_t) b.gdn], P.h, P.gate, P.beta, P.z, b.ssm_norm, eps, P.y,
                                             P.y16, T, cs, HK, HV, /*silu=*/true);
                     part(8);
-                    // (y16, the normed and gated output, exists only in FP16: no float rows to round to int8)
-                    gm.native(P.y16, b.ssm_out.type, b.ssm_out.data, P.mix, T, b.ssm_out.n_out, b.ssm_out.n_in);
+                    // (y16, the normed and gated output, exists only in FP16: no float rows to round to int8; normed,
+                    // its sums in FP16 as proj_hn's)
+                    gm.native(P.y16, b.ssm_out.type, b.ssm_out.data, P.mix, T, b.ssm_out.n_out, b.ssm_out.n_in, 0,
+                              dense_half_sums_);
                     part(9);
                 } else {
                     const int64_t a = b.attn;
@@ -875,19 +1087,21 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     };
                     norm_rope(P.qfull, qw / NH, b.q_norm, P.qcur, NH, P.pos_q);
                     norm_rope(P.kraw, HD, b.k_norm, P.kcur, NKV, P.pos_k);
-                    k::kv_append_steps(k_pool_[(size_t) a], v_pool_[(size_t) a], page_table_, P.steps, k::kStepCount,
-                                       P.kcur, P.vcur, (int) (NKV * HD), (int) T, qs, cs);
-                    k::QsaAttnPools pools;
-                    pools.k_pool = k_pool_[(size_t) a];
-                    pools.v_pool = v_pool_[(size_t) a];
-                    pools.page_table = page_table_;
+                    if (opt_.kv_int8)
+                        k::kv_append_q8_steps(k_q_[(size_t) a], v_q_[(size_t) a], k_scale_[(size_t) a],
+                                              v_scale_[(size_t) a], page_table_, P.steps, k::kStepCount, P.kcur, P.vcur,
+                                              (int) (NKV * HD), (int) T, qs, cs);
+                    else
+                        k::kv_append_steps(k_pool_[(size_t) a], v_pool_[(size_t) a], page_table_, P.steps,
+                                           k::kStepCount, P.kcur, P.vcur, (int) (NKV * HD), (int) T, qs, cs);
+                    const k::QsaAttnPools pools = kv_pools((size_t) a);
                     // the prompt attention (prompt_attn: K and V read once a block of queries), else the decode's
                     // kernel: every query reads the cells up to its own; the grid as wide as the chunk's last context (not
                     // the cache's capacity: no graph holds it), as many queries a launch as the scratch takes
                     const int64_t cap = std::min<int64_t>(opt_.max_cells, pa + T);
                     const int64_t per_q = (int64_t) k::qsa_decode_attn_scratch_floats(cap, qs);
                     const int64_t nq_max = std::max<int64_t>(1, std::min<int64_t>((int64_t) opt_.max_t * attn_scratch_floats_ / per_q, 4096));
-                    const bool batched = prompt_attn_on &&
+                    const bool batched = prompt_attn_on && !opt_.kv_int8 &&   // prompt_attn reads FP16 pools
                                          k::prompt_attn(P.qcur, k_pool_[(size_t) a], v_pool_[(size_t) a], page_table_, pa,
                                                         T, qs, P.attn, cs);
                     for (int64_t t = 0; !batched && t < T; t += nq_max) {
@@ -902,11 +1116,33 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                     }
                     if (!dense(b.o, ao, NH * HD, P.mix, T)) {
                         f16(ao, T, NH * HD);
-                        proj(b.o, P.mix, T);
+                        proj(b.o, P.mix, T, 0, dense_half_sums_);   // averages of V's rows: in FP16's range as well
                     }
                 }
                 k::add_inplace(P.x, P.mix, T * N, cs);
                 mark(b.recurrent ? 0 : 4, t_mark);
+
+                if (dense_) {   // qwen35's FFN: gate and up from the normed rows, the SwiGLU, down; int8 where it can
+                    k::native_qsa_rms_norm_weighted(P.x, b.post_norm, P.hn, (int) N, (int) T, eps, cs);
+                    f16(P.hn, T, N);
+                    proj_hn(b.sh_gate, P.sh_gate);
+                    proj_hn(b.sh_up, P.sh_up);
+                    if (T < dense_native_rows_ && dense_int8_ok(b.sh_down)) {
+                        // the SwiGLU in FP32 rows for the int8 product: the chunk as one row (the kernel is
+                        // element-wise, and takes at most 8 rows)
+                        k::native_swiglu_f32(P.sh_gate, P.sh_up, P.sh_gate, (int) (FS * T), 1, cs);
+                        dense(b.sh_down, P.sh_gate, FS, P.moe_out, T);
+                    } else {   // into FP16 (x16 is free again) for Gemm::native
+                        prefill::swiglu_pair(P.sh_gate, P.sh_up, P.x16, T, cs, FS);
+                        // its sums in FP16 too where they were measured faster, as llama.cpp's cuBLAS products of FP16
+                        // weights take every product's (its default precision): the SwiGLU's rows are in FP16 already
+                        proj(b.sh_down, P.moe_out, T, 0, dense_half_sums_);
+                    }
+                    k::add_inplace(P.x, P.moe_out, T * N, cs);
+                    mark(3, t_mark);
+                    if (!is_mtp) unbind_block(l);
+                    continue;
+                }
 
                 // the MoE
                 k::native_qsa_rms_norm_weighted(P.x, b.post_norm, P.hn, (int) N, (int) T, eps, cs);
@@ -936,7 +1172,14 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                 k::add_inplace(P.x, P.moe_out, T * N, cs);
                 mark(3, t_mark);
             }
-            if (!last()) {   // the rows to the next stage
+            if (enc_out_ != nullptr) {   // encode: every row through the final norm, to the host
+                k::native_qsa_rms_norm_weighted(P.x, out_norm_, P.hn, (int) N, (int) T, eps, cs);
+                if (!strata::gpu::stream_sync(cs) ||
+                    !strata::gpu::copy(enc_out_ + (c0 - c_begin) * N, P.hn, (size_t) (T * N) * 4)) {
+                    err = std::string("plain prompt: the encoder's rows: ") + strata::gpu::last_error();
+                    return false;
+                }
+            } else if (!last()) {   // the rows to the next stage
                 if (!strata::gpu::copy_async(hand, P.x, (size_t) (T * N) * 4, cs)) {
                     err = std::string("plain prompt: the rows to the next GPU: ") + strata::gpu::last_error();
                     return false;
@@ -945,19 +1188,10 @@ bool PlainModel::prompt_chunks(const int32_t* tokens, int64_t n, int64_t pos, in
                 last_logits();
             }
             if (!routes.empty()) {
-                // each window's counts as the windows would leave them at the prompt's end: times the decay of every
-                // round that would come after it; the rounds themselves are left to the decode (their swaps would
-                // cost the prompt more than they save)
-                const int64_t W = opt_.max_t, last = (n - 1) / W;
-                for (int64_t t0 = 0; t0 < T; t0 += W) {
-                    const int64_t win = (c0 + t0) / W;
-                    // the adaptive rounds after this window: whole rounds, so integer divisions
-                    const int64_t rounds = (windows_ + last + 1) / opt_.adapt_every - (windows_ + win) / opt_.adapt_every;
-                    const float wgt = std::pow(opt_.adapt_decay, (float) rounds);
-                    for (int64_t ml : moe_local_)   // this stage's layers' routes
-                        for (int64_t i = t0 * K; i < std::min(T, t0 + W) * K; ++i)
-                            disp_.usage[(size_t) (ml * E + routes[(size_t) (ml * P.T * K + i)])] += wgt;
-                }
+                // the counts start from the prompt's routing at the tier's steady state (seed_usage), as Qwen3.8-
+                // Flash-Next's; the rounds themselves are left to the decode
+                for (int64_t ml : moe_local_)   // this stage's layers' routes (seed_usage at the prompt's end)
+                    for (int64_t i = 0; i < T * K; ++i) ++prompt_routed_[(size_t) (ml * E + routes[(size_t) (ml * P.T * K + i)])];
             }
         }
     } catch (const std::exception& e) {

@@ -383,6 +383,7 @@ class Api(ApiBase):
         content = "".join(c["choices"][0]["delta"].get("content") or "" for c in chunks if c["choices"])
         self.assertEqual(content.strip(), self.ANSWER)
         status, raw = self.post("/v1/messages", {"model": "x", "max_tokens": 400, "stream": True,
+                                                 "thinking": {"type": "enabled"},   # (Anthropic: thinking on request)
                                                  "messages": [{"role": "user", "content": "hi"}]}, raw=True)
         self.assertEqual(status, 200)
         self.assertIn('"text_delta"', raw)
@@ -504,6 +505,7 @@ class Api(ApiBase):
     def test_anthropic_tool_use(self):
         self.start("Weather needed.</think>" + call(("get_weather", [("city", "Oslo", True), ("days", "1", False)])))
         status, r = self.post("/v1/messages", {"model": "x", "max_tokens": 400,
+                                               "thinking": {"type": "enabled"},   # (Anthropic: thinking on request)
                                                "tools": [{"name": "get_weather", "description": "w", "input_schema":
                                                           WEATHER["function"]["parameters"]}],
                                                "messages": [{"role": "user", "content": "Oslo?"}]})

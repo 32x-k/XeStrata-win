@@ -4,8 +4,13 @@
 
 #include "strata/image/qi_stream.hpp"
 
+#include "strata/core/expert_source.hpp"
+#include "strata/platform/memory.hpp"
+
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -18,6 +23,38 @@ constexpr uint64_t kAlign = 256;
 
 void check(bool ok, const char* what) {
     if (!ok) throw std::runtime_error(std::string("image engine (layers): ") + what + ": " + gpu::last_error());
+}
+
+// A layer's spans into its relay on several threads: one thread's pass from the page cache was the streamed layer's
+// longest part.  A quarter of the hardware threads, at most 8, and at least 16 MiB each.
+void copy_spans(uint8_t* dst, const std::vector<LayerStream::Span>& spans, uint64_t bytes) {
+    static const int most = std::clamp((int) std::thread::hardware_concurrency() / 4, 1, 8);
+    const int n = (int) std::clamp<uint64_t>(bytes >> 24, 1, (uint64_t) most);
+    auto part = [&](uint64_t lo, uint64_t hi) {   // the bytes [lo, hi) of the spans laid end to end
+        uint64_t at = 0;
+        for (const LayerStream::Span& sp : spans) {
+            const uint64_t a = std::max(lo, at), b = std::min(hi, at + sp.bytes);
+            if (a < b) std::memcpy(dst + sp.offset + (a - at), (const uint8_t*) sp.host + (a - at), b - a);
+            at += sp.bytes;
+        }
+    };
+    uint64_t total = 0;
+    for (const LayerStream::Span& sp : spans) total += sp.bytes;
+    if (n == 1) { part(0, total); return; }
+    std::vector<std::thread> th;
+    for (int k = 1; k < n; ++k) th.emplace_back(part, total * (uint64_t) k / (uint64_t) n, total * (uint64_t) (k + 1) / (uint64_t) n);
+    part(0, total / (uint64_t) n);
+    for (std::thread& t : th) t.join();
+}
+
+// The process's measured choice between the file's pages and page-locked memory as a streamed layer's source:
+// -1 not measured yet, 0 page-locked, 1 the file's pages.  STRATA_IMAGE_STREAM_SOURCE=relay|home|file sets the
+// source instead (the comparisons).
+int g_from_file = -1;
+std::mutex g_from_file_mu;
+
+double seconds_since(std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count();
 }
 
 }  // namespace
@@ -36,7 +73,31 @@ LayerStream::~LayerStream() {
     } catch (const std::exception& e) {   // a destructor cannot throw: the GPU's own error is reported
         std::fprintf(stderr, "image engine (layers): %s\n", e.what());
     }
+    stop_homes();
+    free_homes(0, (int) layers_.size());
     if (copy_ != nullptr) gpu::stream_destroy(copy_);
+}
+
+void LayerStream::drop_homes() {
+    {   // the worker's queue drained and the copies from the homes done
+        std::unique_lock<std::mutex> l(mu_);
+        cv_.wait(l, [this] { return queue_.empty(); });
+    }
+    if (compute_ != nullptr) gpu::stream_sync(compute_);
+    if (copy_ != nullptr) gpu::stream_sync(copy_);
+    stop_homes();
+    free_homes(0, (int) layers_.size());
+    homes_pending_ = streaming_;   // taken again at the next streamed layer
+}
+
+void LayerStream::free_homes(int lo, int hi) {
+    for (int i = lo; i < hi; ++i) {
+        Layer& l = layers_[(size_t) i];
+        if (l.home != nullptr) gpu::free(l.home);
+        l.home = nullptr;
+        l.homed = false;
+        l.prepped = false;
+    }
 }
 
 int LayerStream::add(std::vector<Span> spans) {
@@ -84,10 +145,12 @@ void LayerStream::drop() {
         if (s.used != nullptr) gpu::event_destroy(s.used);
         s = Slot{};
     }
-    if (relay_ != nullptr) gpu::free(relay_);
-    if (relay_free_ != nullptr) gpu::event_destroy(relay_free_);
-    relay_ = nullptr;
-    relay_free_ = nullptr;
+    for (int k = 0; k < 2; ++k) {
+        if (relay_[k] != nullptr) gpu::free(relay_[k]);
+        if (relay_free_[k] != nullptr) gpu::event_destroy(relay_free_[k]);
+        relay_[k] = nullptr;
+        relay_free_[k] = nullptr;
+    }
 }
 
 void LayerStream::configure(uint64_t budget, gpu::Stream compute) {
@@ -113,12 +176,16 @@ void LayerStream::configure(uint64_t budget, gpu::Stream compute) {
     }
     gpu::stream_sync(compute_);
     gpu::stream_sync(copy_);
+    stop_homes();
+    homes_pending_ = false;
     for (int i = R; i < (int) layers_.size(); ++i) {
         Layer& l = layers_[(size_t) i];
         if (l.d != nullptr) gpu::free(l.d);
         l.d = nullptr;
         l.loaded = false;
     }
+    // a layer resident now has no use for its home, nor any once nothing streams; the rest keep theirs
+    free_homes(0, streaming ? R : (int) layers_.size());
     if (!streaming) {
         for (Slot& s : slots_) {
             if (s.d != nullptr) gpu::free(s.d);
@@ -126,8 +193,8 @@ void LayerStream::configure(uint64_t budget, gpu::Stream compute) {
             if (s.used != nullptr) gpu::event_destroy(s.used);
             s = Slot{};
         }
-        if (relay_ != nullptr) gpu::free(relay_);
-        relay_ = nullptr;
+        if (relay_[1] != nullptr) gpu::free(relay_[1]);
+        relay_[1] = nullptr;
     } else {
         for (Slot& s : slots_) {
             if (s.d == nullptr) check(gpu::alloc_device(&s.d, max_bytes_), "a slot");
@@ -140,25 +207,144 @@ void LayerStream::configure(uint64_t budget, gpu::Stream compute) {
             s.issued = false;
         }
     }
-    if (relay_ == nullptr && (streaming || R > 0)) check(gpu::alloc_host(&relay_, max_bytes_), "the relay");
-    if (relay_free_ == nullptr) {
-        check(gpu::event_create(&relay_free_), "an event");
-        check(gpu::event_record(relay_free_, copy_), "an event");
+    for (int k = 0; k < (streaming ? 2 : 1); ++k) {
+        if (relay_[k] == nullptr && (streaming || R > 0)) check(gpu::alloc_host(&relay_[k], max_bytes_), "the relay");
+        if (relay_free_[k] == nullptr) {
+            check(gpu::event_create(&relay_free_[k]), "an event");
+            check(gpu::event_record(relay_free_[k], copy_), "an event");
+        }
     }
     resident_ = R;
     streaming_ = streaming;
+    if (streaming) {
+        size_t vfree = 0, vtotal = 0;
+        gpu::mem_info(&vfree, &vtotal);
+        home_headroom_ = (8ull << 30) + (uint64_t) vtotal;
+        choose_source(slots_[0]);
+        homes_pending_ = true;   // taken once a streamed layer is first begun: a budget set ahead of its use (the
+                                 // DiT's, before the text encoder runs) does not take RAM and the copies' time early
+    }
+}
+
+void LayerStream::choose_source(Slot& s) {
+    if (const char* e = std::getenv("STRATA_IMAGE_STREAM_SOURCE")) {
+        const std::string v = e;
+        if (v == "relay" || v == "home" || v == "file") {
+            source_ = v == "relay" ? Source::relay : v == "home" ? Source::home : Source::file;
+            return;
+        }
+    }
+    std::lock_guard<std::mutex> g(g_from_file_mu);
+    if (g_from_file < 0) {
+        // the largest streamed layer, both ways, the best of two each: its pages read first (the relay's fill), so
+        // the copy from the file's pages finds them in the cache as a pass does
+        int big = resident_;
+        for (int i = resident_; i < (int) layers_.size(); ++i)
+            if (layers_[(size_t) i].bytes > layers_[(size_t) big].bytes) big = i;
+        const Layer& l = layers_[(size_t) big];
+        std::lock_guard<std::mutex> lk(relay_mu_[0]);
+        gpu::event_sync(relay_free_[0]);
+        copy_spans(relay_[0], l.spans, l.bytes);
+        double locked = 1e30, file = 1e30;
+        for (int r = 0; r < 2; ++r) {
+            auto t = std::chrono::steady_clock::now();
+            check(gpu::copy_async(s.d, relay_[0], l.bytes, copy_), "a layer's copy");
+            check(gpu::stream_sync(copy_), "a copy's wait");
+            locked = std::min(locked, seconds_since(t));
+            t = std::chrono::steady_clock::now();
+            for (const Span& sp : l.spans)
+                check(gpu::copy_async(s.d + sp.offset, sp.host, sp.bytes, copy_), "a layer's copy");
+            check(gpu::stream_sync(copy_), "a copy's wait");
+            file = std::min(file, seconds_since(t));
+        }
+        check(gpu::event_record(relay_free_[0], copy_), "an event");
+        // the file's pages when their copies run within a fifth of page-locked memory's: nothing held in RAM for a
+        // little speed (the RX 9060 XT: 25 against 26 GB/s; the B70: 4.7 against 27)
+        g_from_file = file <= 1.25 * locked ? 1 : 0;
+        std::fprintf(stderr, "image engine (layers): a streamed layer's copy from the file's pages %.1f GB/s, from "
+                             "page-locked memory %.1f GB/s: %s\n", (double) l.bytes / file / 1e9,
+                     (double) l.bytes / locked / 1e9,
+                     g_from_file ? "copied from the file's pages" : "copied from page-locked memory");
+    }
+    source_ = g_from_file ? Source::file : Source::home;
+}
+
+void LayerStream::start_homes() {
+    // the homes are taken on a thread of their own, the streamed layers in the order a pass takes them: page-locked
+    // memory comes slowly (the RX 9060 XT's host USM at 2.5 GB/s, the B70's at 16), and a pass uses the homes ready
+    // as it reaches them, the rest of its layers copied as before
+    if (source_ == Source::relay || (source_ == Source::file && !prepare_)) return;
+    homes_full_ = false;
+    {
+        std::lock_guard<std::mutex> g(mu_);
+        homes_stop_ = false;
+    }
+    homes_thread_ = std::thread([this, from = resident_] {
+        for (int i = from; i < (int) layers_.size(); ++i) {
+            {
+                std::lock_guard<std::mutex> g(mu_);
+                if (homes_stop_) return;
+                if (layers_[(size_t) i].home != nullptr) continue;
+            }
+            uint8_t* p = take_home(layers_[(size_t) i].bytes);
+            if (p == nullptr) return;
+            std::lock_guard<std::mutex> g(mu_);
+            layers_[(size_t) i].home = p;
+        }
+    });
+}
+
+void LayerStream::stop_homes() {
+    if (!homes_thread_.joinable()) return;
+    {
+        std::lock_guard<std::mutex> g(mu_);
+        homes_stop_ = true;
+    }
+    homes_thread_.join();
+}
+
+uint8_t* LayerStream::take_home(uint64_t bytes) {
+    // the RAM's room for it as the engine's pinned experts are judged (plain_model.cpp): page-locked memory past what
+    // leaves the headroom, 8 GiB and the device's memory beside it (a Level Zero device's own allocations take RAM
+    // beside the pinned memory), less the CMA no pinned page can use, faulted the GPU's copies (#11).
+    // STRATA_RESIDENT_PIN=0: never, 1: whatever the RAM, as the experts' RAM copy
+    static const int pin = [] {
+        const char* v = std::getenv("STRATA_RESIDENT_PIN");
+        return v == nullptr ? -1 : std::strtol(v, nullptr, 10) != 0 ? 1 : 0;
+    }();
+    if (homes_full_) return nullptr;
+    core::detail::HostMemory hm;
+    std::string why = pin == 0 ? "STRATA_RESIDENT_PIN=0" : "";
+    bool fits = pin != 0 && (pin == 1 || core::detail::host_available_memory(hm));
+    if (fits && pin != 1) {
+        const uint64_t cma = platform::cma_free_bytes();
+        const uint64_t avail = std::min(hm.available - std::min(hm.available, cma), hm.cgroup_limit);
+        fits = core::detail::resident_pin_fits(bytes, 0, home_headroom_, avail, why);
+    }
+    uint8_t* p = nullptr;
+    if (fits && !gpu::alloc_host(&p, bytes)) {
+        fits = false;
+        why = "host USM refused";
+    }
+    if (!fits) {
+        homes_full_ = true;
+        std::fprintf(stderr, "image engine (layers): the rest of the streamed layers go through the relay (%s)\n",
+                     why.empty() ? "the RAM available unknown" : why.c_str());
+        return nullptr;
+    }
+    return p;
 }
 
 void LayerStream::load_resident(int i) {
     Layer& l = layers_[(size_t) i];
     if (l.d == nullptr) check(gpu::alloc_device(&l.d, l.bytes), "a layer");
-    std::lock_guard<std::mutex> lk(relay_mu_);
-    gpu::event_sync(relay_free_);
-    for (const Span& s : l.spans) std::memcpy(relay_ + s.offset, s.host, s.bytes);
-    check(gpu::copy_async(l.d, relay_, l.bytes, copy_), "a layer's copy");
-    check(gpu::event_record(relay_free_, copy_), "an event");
+    std::lock_guard<std::mutex> lk(relay_mu_[0]);
+    gpu::event_sync(relay_free_[0]);
+    copy_spans(relay_[0], l.spans, l.bytes);
+    check(gpu::copy_async(l.d, relay_[0], l.bytes, copy_), "a layer's copy");
+    check(gpu::event_record(relay_free_[0], copy_), "an event");
     // the compute stream waits for the copy where it uses the layer
-    check(gpu::stream_wait_event(compute_, relay_free_), "a wait");
+    check(gpu::stream_wait_event(compute_, relay_free_[0]), "a wait");
     if (prepare_) prepare_(i, l.d);
     l.loaded = true;
 }
@@ -183,14 +369,46 @@ void LayerStream::request(int i) {
 }
 
 void LayerStream::fill(Slot& s, int i) {
-    const Layer& l = layers_[(size_t) i];
-    std::lock_guard<std::mutex> lk(relay_mu_);
-    gpu::event_sync(relay_free_);                       // the relay's last copy is done
-    for (const Span& sp : l.spans) std::memcpy(relay_ + sp.offset, sp.host, sp.bytes);
+    Layer& l = layers_[(size_t) i];
+    uint8_t* home;
+    bool prepped;
+    {
+        std::lock_guard<std::mutex> g(mu_);
+        home = l.home;
+        prepped = l.prepped;
+    }
+    if (prepped) {   // the layer as prepare_ left it on its first pass: only the DMA, and no prepare_ again
+        check(gpu::stream_wait_event(copy_, s.used), "a wait");
+        check(gpu::copy_async(s.d, home, l.bytes, copy_), "a layer's copy");
+        check(gpu::event_record(s.ready, copy_), "an event");
+        s.prepared = true;
+        return;
+    }
+    if (source_ == Source::file) {
+        check(gpu::stream_wait_event(copy_, s.used), "a wait");   // the compute stream past the slot's last layer
+        for (const Span& sp : l.spans)
+            check(gpu::copy_async(s.d + sp.offset, sp.host, sp.bytes, copy_), "a layer's copy");
+        check(gpu::event_record(s.ready, copy_), "an event");
+        return;
+    }
+    if (source_ == Source::home && !prepare_ && home != nullptr) {
+        if (!l.homed) {   // its first pass with a home: filled from the file's pages, then only the DMA
+            copy_spans(home, l.spans, l.bytes);
+            l.homed = true;
+        }
+        check(gpu::stream_wait_event(copy_, s.used), "a wait");
+        check(gpu::copy_async(s.d, home, l.bytes, copy_), "a layer's copy");
+        check(gpu::event_record(s.ready, copy_), "an event");
+        return;
+    }
+    const int k = &s == &slots_[0] ? 0 : 1;              // the slot's relay
+    std::lock_guard<std::mutex> lk(relay_mu_[k]);
+    gpu::event_sync(relay_free_[k]);                    // the relay's last copy is done
+    copy_spans(relay_[k], l.spans, l.bytes);
     check(gpu::stream_wait_event(copy_, s.used), "a wait");   // the compute stream past the slot's last layer
-    check(gpu::copy_async(s.d, relay_, l.bytes, copy_), "a layer's copy");
+    check(gpu::copy_async(s.d, relay_[k], l.bytes, copy_), "a layer's copy");
     check(gpu::event_record(s.ready, copy_), "an event");
-    check(gpu::event_record(relay_free_, copy_), "an event");
+    check(gpu::event_record(relay_free_[k], copy_), "an event");
 }
 
 void LayerStream::worker() {
@@ -234,6 +452,10 @@ const uint8_t* LayerStream::begin(int i) {
         if (!l.loaded) load_resident(i);
         return l.d;
     }
+    if (homes_pending_) {
+        homes_pending_ = false;
+        start_homes();
+    }
     request(i);
     int k = -1;
     {
@@ -258,7 +480,25 @@ const uint8_t* LayerStream::begin(int i) {
             first = !s->prepared;
             s->prepared = true;
         }
-        if (first) prepare_(i, s->d);
+        if (first) {
+            prepare_(i, s->d);
+            // its home takes the prepared bytes back, so the later passes copy them as they are: a layer's prepare_
+            // is a pass over it on the compute stream each time it is copied (Qwen-Image's int8 rows, Mage-Flow's
+            // FP16), the part of a streamed layer's cost the copy engine cannot hide
+            Layer& l = layers_[(size_t) i];
+            uint8_t* home;
+            bool prepped;
+            {
+                std::lock_guard<std::mutex> g(mu_);
+                home = l.home;
+                prepped = l.prepped;
+            }
+            if (!prepped && home != nullptr) {
+                check(gpu::copy_async(home, s->d, l.bytes, compute_), "a layer's copy back");
+                std::lock_guard<std::mutex> g(mu_);
+                l.prepped = true;
+            }
+        }
     }
     // the next streamed layer, wrapping to the first streamed one (the DiT's next step)
     int j = i + 1;

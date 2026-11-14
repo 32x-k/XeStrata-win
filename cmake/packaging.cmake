@@ -144,6 +144,16 @@ install(FILES third_party/main/rocm-device-libs/LICENSE.TXT
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME LICENSE.rocm-device-libs)
 install(FILES third_party/main/stb/LICENSE   # stb_image, compiled into strata-image
         DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME} RENAME LICENSE.stb)
+if(TARGET strata_xgrammar)   # XGrammar, picojson and DLPack, compiled into the engine (grammar-constrained decoding)
+  install(FILES third_party/main/xgrammar/LICENSE DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME}
+          RENAME LICENSE.xgrammar)
+  install(FILES third_party/main/xgrammar/NOTICE DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME}
+          RENAME NOTICE.xgrammar)
+  install(FILES third_party/main/picojson/LICENSE DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME}
+          RENAME LICENSE.picojson)
+  install(FILES third_party/main/dlpack/LICENSE DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME}
+          RENAME LICENSE.dlpack)
+endif()
 if(TARGET onemath)
   install(FILES third_party/main/oneMath/LICENSE DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${STRATA_PACKAGE_NAME}
           RENAME LICENSE.oneMath)
@@ -177,6 +187,7 @@ install(DIRECTORY serve tools ref DESTINATION ${_pkg_share}
 install(DIRECTORY serve/web DESTINATION ${_pkg_share}/serve)
 install(DIRECTORY data DESTINATION ${_pkg_share})
 install(DIRECTORY third_party/main/outfit DESTINATION ${_pkg_share}/third_party/main)
+install(DIRECTORY third_party/main/katex DESTINATION ${_pkg_share}/third_party/main)   # the web chat's math
 install(DIRECTORY third_party/main/quantscope DESTINATION ${_pkg_share}/third_party/main PATTERN "__pycache__" EXCLUDE)
 install(DIRECTORY ${STRATA_GGML_DIR}/gguf-py DESTINATION ${_pkg_share}/third_party/main/llama.cpp
         PATTERN "__pycache__" EXCLUDE PATTERN "tests" EXCLUDE)

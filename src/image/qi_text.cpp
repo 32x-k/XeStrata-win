@@ -218,6 +218,7 @@ std::vector<float> QiText::encode(const std::vector<int32_t>& ids, const std::ve
     kernels::dequant_f32(embd_type_, rows_, 0, T, C_, x_, s_);
     for (const Image& im : images)   // the image pads' rows: the vision encoder's embeddings
         gpu::copy_async(x_ + im.index * C_, im.main, (size_t) (im.rows * C_) * 4, s_);
+    const bool sdpa_causal = qi_sdpa_causal(s_);
     for (int li = 0; li < (int) layers_.size(); ++li) {
         const Layer& l = layers_[(size_t) li];
         const uint8_t* base = layers_stream_.begin(li);
@@ -229,8 +230,20 @@ std::vector<float> QiText::encode(const std::vector<int32_t>& ids, const std::ve
         gemm_.native(h16_, l.v.type, w(l.v), v_, T, l.v.n, l.v.k);
         qi_text_qk_rope16(q_, k_, v_, f(l.qn), f(l.kn), T, heads_, kv_heads_, head_dim_, theta_, q16_, k16_, v16_, s_,
                           dpos, sec_h_, sec_w_);
-        qi_attention_causal(q16_, k16_, v16_, T, heads_, kv_heads_, head_dim_, a_, s_);
-        qi_to_f16(a_, T * heads_ * head_dim_, h16_, s_);
+        // the attention through a GPU maker's kernel where one takes it causal (K and V repeated to a query head each,
+        // in a_'s room, which then is not needed), straight to FP16; else the engine's own kernel
+        bool done = false;
+        if (sdpa_causal) {
+            auto* kx = reinterpret_cast<uint16_t*>(a_);
+            uint16_t* vx = kx + T * heads_ * head_dim_;
+            qi_repeat_kv16(k16_, T, heads_, kv_heads_, head_dim_, kx, s_);
+            qi_repeat_kv16(v16_, T, heads_, kv_heads_, head_dim_, vx, s_);
+            done = qi_sdpa(q16_, kx, vx, 0, T, T, heads_, head_dim_, h16_, s_, true);
+        }
+        if (!done) {
+            qi_attention_causal(q16_, k16_, v16_, T, heads_, kv_heads_, head_dim_, a_, s_);
+            qi_to_f16(a_, T * heads_ * head_dim_, h16_, s_);
+        }
         gemm_.native(h16_, l.o.type, w(l.o), h_, T, l.o.n, l.o.k);
         qi_axpy(x_, h_, 1.0f, T * C_, s_);
         qi_rms_norm16(x_, f(l.ffn_norm), T, C_, h16_, s_);

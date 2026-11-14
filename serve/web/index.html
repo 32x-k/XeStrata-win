@@ -26,60 +26,82 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 <header class="st-header">
   <span class="st-header__brand">XeStrata</span>
   <!-- the model on the GPU, when the host swaps models (config model_switcher); hidden otherwise -->
-  <label class="model-switch" id="model-switch" hidden title="Which model is loaded. Only one fits on the GPU at a time: switching unloads this one and loads the other (about 2 minutes).">
-    <span class="model-switch__k">Model</span>
-    <select id="model-select" aria-label="Model on the GPU"></select>
+  <label class="model-switch" id="model-switch" hidden title="Which model is loaded. Only one fits on the GPU at a time: switching unloads this one and loads the other (about 2 minutes)."
+         data-i18n-title="switch.title">
+    <span class="model-switch__k" data-i18n="switch.model">Model</span>
+    <select id="model-select" aria-label="Model on the GPU" data-i18n-label="switch.label"></select>
   </label>
-  <nav class="st-tabs" role="tablist" aria-label="Views">
+  <nav class="st-tabs" role="tablist" aria-label="Views" data-i18n-label="tab.views">
     <button class="st-tab" role="tab" id="tab-btn-chat" aria-controls="view-chat" aria-selected="true" data-tab="chat">
-      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-chat"/></svg>Chat</button>
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-chat"/></svg><span data-i18n="tab.chat">Chat</span></button>
     <button class="st-tab" role="tab" id="tab-btn-images" aria-controls="view-images" aria-selected="false" data-tab="images" hidden>
-      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-image"/></svg>Images</button>
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-image"/></svg><span data-i18n="tab.images">Images</span></button>
     <button class="st-tab" role="tab" id="tab-btn-monitor" aria-controls="view-monitor" aria-selected="false" data-tab="monitor">
-      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg>Monitor</button>
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-activity"/></svg><span data-i18n="tab.monitor">Monitor</span></button>
     <button class="st-tab" role="tab" id="tab-btn-about" aria-controls="view-about" aria-selected="false" data-tab="about">
-      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-info"/></svg>About<span class="tab-dot" id="update-dot" hidden></span></button>
+      <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-info"/></svg><span data-i18n="tab.about">About</span><span class="tab-dot" id="update-dot" hidden></span></button>
   </nav>
   <span class="st-header__spacer"></span>
   <span class="st-pill" id="pill" data-state="idle" role="status" aria-live="polite">
-    <span class="st-pill__dot"></span><span id="pill-text">Connecting&hellip;</span></span>
-  <button class="st-btn st-btn--icon" id="theme-btn" title="Light / dark" aria-label="Switch between light and dark">
+    <span class="st-pill__dot"></span><span id="pill-text" data-i18n="pill.connecting">Connecting&hellip;</span></span>
+  <button class="st-btn st-btn--secondary" id="unload-btn" type="button" title="Waiting for the server" disabled>&hellip;</button>
+  <button class="st-btn st-btn--icon" id="theme-btn" title="Light / dark" aria-label="Switch between light and dark" data-i18n-title="theme.title" data-i18n-label="theme.label">
     <svg class="st-icon"><use id="theme-icon" href="web/sprite.svg#i-moon"/></svg></button>
 </header>
 
 <main>
   <!-- ============================ Chat ============================ -->
   <section class="view view--chat" id="view-chat" role="tabpanel" aria-labelledby="tab-btn-chat">
-    <div class="chat-scroll" id="chat-scroll">
-      <div class="chat" id="chat">
-        <div class="chat-empty" id="chat-empty">
-          <div class="chat-empty__title">Ask anything</div>
-          <div class="chat-empty__sub" id="chat-empty-sub">The model runs on this PC. Nothing leaves it.</div>
+    <!-- the chats kept in this browser (Chat settings > Chats): the open one is the chat on the right -->
+    <aside class="chat-sidebar" id="sidebar" data-open="true" aria-label="Chats" data-i18n-label="sidebar.title" hidden>
+      <div class="sidebar-head">
+        <button class="st-btn st-btn--icon" id="sidebar-toggle" type="button" title="Collapse the chat list" aria-label="Collapse the chat list" aria-expanded="true">
+          <svg class="st-icon"><use href="web/sprite.svg#i-chevron"/></svg></button>
+        <span class="card-title sidebar-title" data-i18n="sidebar.title">Chats</span>
+        <button class="st-btn st-btn--icon" id="sidebar-new" type="button" title="New chat" aria-label="New chat" data-i18n-title="chat.new" data-i18n-label="chat.new">
+          <svg class="st-icon"><use href="web/sprite.svg#i-new-chat"/></svg></button>
+      </div>
+      <input class="st-input sidebar-search" id="sidebar-search" type="search" placeholder="Search chats"
+             autocomplete="off" aria-label="Search chats" data-i18n-placeholder="sidebar.search" data-i18n-label="sidebar.search">
+      <div class="sidebar-list" id="sidebar-list"></div>
+      <p class="muted small sidebar-foot" id="sidebar-foot"></p>
+    </aside>
+    <div class="chat-main">
+      <div class="chat-parent" id="chat-parent" hidden></div>
+      <div class="chat-scroll" id="chat-scroll">
+        <div class="chat" id="chat">
+          <div class="chat-empty" id="chat-empty">
+            <div class="chat-empty__title" data-i18n="chat.empty">Ask anything</div>
+            <div class="chat-empty__sub" id="chat-empty-sub">The model runs on this PC. Nothing leaves it.</div>
+          </div>
         </div>
       </div>
-    </div>
-    <div class="composer-wrap">
-      <form class="st-composer" id="composer">
-        <div class="attachments" id="attachments" hidden></div>
-        <textarea id="input" rows="2" placeholder="Ask anything&hellip;" aria-label="Message"></textarea>
-        <div class="st-composer__bar">
-          <button type="button" class="st-btn st-btn--icon" id="attach-btn" title="Attach a text file (or drop it here)" aria-label="Attach a file">
-            <svg class="st-icon"><use href="web/sprite.svg#i-attach"/></svg></button>
-          <input type="file" id="file" multiple hidden>
-          <button type="button" class="st-btn st-btn--icon" id="new-btn" title="New chat" aria-label="New chat">
-            <svg class="st-icon"><use href="web/sprite.svg#i-new-chat"/></svg></button>
-          <button type="button" class="st-btn st-btn--icon" id="export-btn" title="Save this chat as Markdown" aria-label="Save this chat">
-            <svg class="st-icon"><use href="web/sprite.svg#i-download"/></svg></button>
-          <button type="button" class="st-btn st-btn--icon" id="sampling-btn" title="Sampling and thinking" aria-label="Sampling and thinking">
-            <svg class="st-icon"><use href="web/sprite.svg#i-settings"/></svg></button>
-          <span class="spacer"></span>
-          <span class="composer-hint" id="composer-hint"></span>
-          <button type="button" class="st-btn st-btn--secondary" id="stop-btn" hidden>
-            <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-stop"/></svg>Stop</button>
-          <button type="submit" class="st-btn st-btn--primary st-btn--send" id="send-btn" aria-label="Send">
-            <svg class="st-icon"><use href="web/sprite.svg#i-send"/></svg></button>
-        </div>
-      </form>
+      <div class="composer-wrap">
+        <form class="st-composer" id="composer">
+          <div class="attachments" id="attachments" hidden></div>
+          <textarea id="input" rows="2" placeholder="Ask anything&hellip;" aria-label="Message" data-i18n-placeholder="composer.placeholder" data-i18n-label="composer.message"></textarea>
+          <div class="st-composer__bar">
+            <button type="button" class="st-btn st-btn--icon" id="attach-btn" title="Attach a text file (or drop it here)" aria-label="Attach a file" data-i18n-label="composer.attachLabel">
+              <svg class="st-icon"><use href="web/sprite.svg#i-attach"/></svg></button>
+            <input type="file" id="file" multiple hidden>
+            <button type="button" class="st-btn st-btn--icon" id="new-btn" title="New chat" aria-label="New chat" data-i18n-title="chat.new" data-i18n-label="chat.new">
+              <svg class="st-icon"><use href="web/sprite.svg#i-new-chat"/></svg></button>
+            <button type="button" class="st-btn st-btn--icon" id="export-btn" title="Save this chat as Markdown" aria-label="Save this chat" data-i18n-title="composer.save" data-i18n-label="composer.saveLabel">
+              <svg class="st-icon"><use href="web/sprite.svg#i-download"/></svg></button>
+            <button type="button" class="st-btn st-btn--secondary chat-settings-button" id="sampling-btn" title="Chat settings" aria-label="Chat settings" data-i18n-title="drawer.title" data-i18n-label="drawer.title">
+              <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-settings"/></svg>
+              <span class="chat-settings-label" data-i18n="drawer.title">Chat settings</span><span class="chat-settings-short" aria-hidden="true" data-i18n="drawer.short">Settings</span></button>
+            <select class="st-input chat-images" id="chat-images" title="Images in the chat: the model makes one when the conversation asks for it" aria-label="Images in the chat"
+                    data-i18n-title="chatImages.title" data-i18n-label="chatImages.label" hidden></select>
+            <span class="spacer"></span>
+            <span class="composer-hint" id="composer-hint"></span>
+            <button type="button" class="st-btn st-btn--secondary" id="stop-btn" hidden>
+              <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-stop"/></svg><span data-i18n="composer.stop">Stop</span></button>
+            <button type="submit" class="st-btn st-btn--primary st-btn--send" id="send-btn" aria-label="Send" data-i18n-label="composer.send">
+              <svg class="st-icon"><use href="web/sprite.svg#i-send"/></svg></button>
+          </div>
+        </form>
+      </div>
     </div>
   </section>
 
@@ -87,26 +109,109 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
   <section class="view view--images" id="view-images" role="tabpanel" aria-labelledby="tab-btn-images" hidden>
     <div class="about">
       <form class="st-card img-form" id="img-form">
-        <span class="card-title" id="img-title">Make an image</span>
-        <textarea class="st-input img-prompt" id="img-prompt" rows="3" placeholder="Describe the image&hellip;" aria-label="Prompt"></textarea>
+        <span class="card-title" id="img-title" data-i18n="img.title">Make an image</span>
+        <textarea class="st-input img-prompt" id="img-prompt" rows="3" placeholder="Describe the image&hellip;" aria-label="Prompt"
+                  data-i18n-placeholder="img.prompt" data-i18n-label="img.promptLabel"></textarea>
+        <label class="st-field" id="img-neg-f"><span data-i18n="img.negative">Negative prompt (optional)</span>
+          <textarea class="st-input img-prompt" id="img-neg" rows="2" placeholder="What the image should not have&hellip;" data-i18n-placeholder="img.negativeHint"></textarea></label>
+        <span class="composer-hint" id="img-neg-hint" hidden></span>
+        <div class="img-lora" id="img-lora" hidden>
+          <div class="img-row">
+            <label class="st-field" id="img-lora-add-f"><span data-i18n="img.lora">LoRA</span>
+              <select class="st-input" id="img-lora-add"></select></label>
+            <span class="composer-hint" id="img-lora-hint" hidden></span>
+          </div>
+          <div class="img-lora-chips" id="img-lora-chips"></div>
+        </div>
         <div class="img-row">
-          <label class="st-field">Size
+          <label class="st-field" id="img-model-f" hidden><span data-i18n="img.model">Model</span>
+            <select class="st-input" id="img-model"></select></label>
+          <label class="st-field"><span data-i18n="img.size">Size</span>
             <select class="st-input" id="img-size">
               <option>1024x1024</option><option>1536x1024</option><option>1024x1536</option>
               <option>768x768</option><option>512x512</option>
               <option>1920x1080</option><option>1080x1920</option>
-              <option value="auto">auto (the reference's shape)</option>
-              <option value="custom">Custom&hellip;</option></select></label>
-          <label class="st-field" id="img-custom" hidden>Width &times; height
-            <span class="img-wh"><input class="st-input" id="img-w" type="number" min="256" max="2048" step="1" value="1024" aria-label="Width">
-            <input class="st-input" id="img-h" type="number" min="256" max="2048" step="1" value="1024" aria-label="Height"></span></label>
-          <label class="st-field">Edit an image (optional)
+              <option value="auto" data-i18n="img.sizeAuto">auto (the reference's shape)</option>
+              <option value="custom" data-i18n="img.sizeCustom">Custom&hellip;</option></select></label>
+          <label class="st-field" id="img-custom" hidden><span data-i18n="img.widthHeight">Width &times; height</span>
+            <span class="img-wh"><input class="st-input" id="img-w" type="number" min="256" max="2048" step="1" value="1024" aria-label="Width" data-i18n-label="img.width">
+            <input class="st-input" id="img-h" type="number" min="256" max="2048" step="1" value="1024" aria-label="Height" data-i18n-label="img.height"></span></label>
+          <label class="st-field" id="img-ref-f"><span id="img-ref-l">Edit an image (optional)</span>
             <input class="st-input" id="img-ref" type="file" accept="image/png,image/jpeg,image/gif,image/bmp,image/webp" multiple></label>
-          <label class="st-field">Seed
-            <input class="st-input" id="img-seed" type="number" min="0" placeholder="random"></label>
-          <button type="submit" class="st-btn st-btn--primary" id="img-go">Generate</button>
+          <label class="st-field" id="img-strength-f" hidden title="How much of the image may change: lower keeps more of it" data-i18n-title="img.strengthTitle"><span data-i18n="img.strength">Strength</span>
+            <input class="st-input" id="img-strength" type="number" min="0.01" max="1" step="0.01"></label>
+          <label class="st-field" id="img-steps-f"><span data-i18n="img.steps">Steps</span>
+            <input class="st-input" id="img-steps" type="number" min="1" max="100" step="1"></label>
+          <label class="st-field" id="img-cfg-f"><span id="img-cfg-l">Guidance (CFG)</span>
+            <input class="st-input" id="img-cfg" type="number" min="0" max="30" step="0.5"></label>
+          <label class="st-field"><span data-i18n="img.seed">Seed</span>
+            <input class="st-input" id="img-seed" type="number" min="0" placeholder="random" data-i18n-placeholder="img.seedRandom"></label>
+          <label class="st-field" id="img-n-f"><span data-i18n="img.count">Images</span>
+            <span class="img-n"><select class="st-input" id="img-n"><option>1</option></select>
+            <span class="img-n-est" id="img-n-est"></span></span></label>
+          <label class="st-field"><span data-i18n="img.format">Format</span>
+            <select class="st-input" id="img-fmt"></select></label>
+          <label class="st-field" id="img-q-f" hidden><span data-i18n="img.quality">Quality</span>
+            <input class="st-input" id="img-q" type="number" min="0" max="100" step="1" value="90" aria-label="Quality, 0 to 100" data-i18n-label="img.qualityLabel"></label>
+          <label class="st-field img-check" id="img-bg-f" hidden>
+            <input type="checkbox" id="img-bg"> <span data-i18n="img.transparent">Transparent background</span></label>
+          <label class="st-field img-check" id="img-partial-f">
+            <input type="checkbox" id="img-partial"> <span data-i18n="img.partial">Show partial images</span></label>
+          <button type="submit" class="st-btn st-btn--primary" id="img-go" data-i18n="img.generate">Generate</button>
         </div>
-        <span class="composer-hint" id="img-hint">One image at a time; a chat request waits for it (and the other way round).</span>
+        <div class="img-mask" id="img-mask" hidden>
+          <span class="img-mask-title" data-i18n="img.mask">Mask (optional): paint the part of the first image to draw again; the rest stays as it is</span>
+          <div class="img-mask-tools">
+            <label class="img-check"><span data-i18n="img.brush">Brush</span> <input type="range" id="img-brush" min="4" max="200" value="40" aria-label="Brush size" data-i18n-label="img.brushSize"></label>
+            <label class="img-check"><input type="checkbox" id="img-erase"> <span data-i18n="img.erase">Erase</span></label>
+            <button type="button" class="st-btn" id="img-mask-clear" data-i18n="img.clear">Clear</button>
+          </div>
+          <div class="img-mask-stage"><img id="img-mask-img" src="data:," alt="The image to edit"><canvas id="img-mask-paint" aria-label="Paint the mask" data-i18n-label="img.paint"></canvas></div>
+        </div>
+        <div class="img-moss" id="img-moss" hidden>
+          <div class="img-row">
+            <label class="st-field" id="img-enhance-f"><span data-i18n="img.enhance">Write the prompt out</span>
+              <select class="st-input" id="img-enhance" title="The chat's model writes the short prompt out before the image is made" data-i18n-title="img.enhanceTitle">
+                <option value="" data-i18n="img.enhanceOff">Off</option>
+                <option value="caption" data-i18n="img.enhanceCaption">As a detailed description</option>
+                <option value="layout" data-i18n="img.enhanceLayout">As a layout of boxes</option></select></label>
+            <label class="st-field img-check" id="img-layout-on-f">
+              <input type="checkbox" id="img-layout-on"> <span data-i18n="img.layoutOn">Place things with boxes</span></label>
+          </div>
+          <details class="st-collapse img-moss-more"><summary><span data-i18n="img.more">More settings</span></summary>
+            <div class="st-collapse__body img-row">
+              <label class="st-field"><span data-i18n="img.shift">Shift</span>
+                <input class="st-input" id="img-shift" type="number" min="0.01" max="20" step="0.5"></label>
+              <label class="st-field" title="The blocks the negative prompt's pass skips: block numbers, or none" data-i18n-title="img.uncondSkipTitle"><span data-i18n="img.uncondSkip">Blocks the negative pass skips</span>
+                <input class="st-input" id="img-uskip" type="text"></label>
+              <label class="st-field" title="Skip-layer guidance: a third pass with these blocks skipped" data-i18n-title="img.slgTitle"><span data-i18n="img.slgLayers">Skip-layer guidance blocks</span>
+                <input class="st-input" id="img-slg" type="text" placeholder="none" data-i18n-placeholder="img.noBlocks"></label>
+              <label class="st-field"><span data-i18n="img.slgScale">Skip-layer guidance scale</span>
+                <input class="st-input" id="img-slg-scale" type="number" min="0" max="30" step="0.5"></label>
+              <label class="st-field" title="The share of the steps the skips start and stop at, 0 to 1" data-i18n-title="img.slgWindowTitle"><span data-i18n="img.slgWindow">Skips from &ndash; to</span>
+                <span class="img-wh"><input class="st-input" id="img-slg-start" type="number" min="0" max="1" step="0.05" aria-label="Skips start" data-i18n-label="img.slgStart">
+                <input class="st-input" id="img-slg-stop" type="number" min="0" max="1" step="0.05" aria-label="Skips stop" data-i18n-label="img.slgStop"></span></label>
+            </div>
+          </details>
+          <div class="img-layout" id="img-layout" hidden>
+            <span class="img-mask-title" data-i18n="img.layoutHint">Drag on the canvas to draw a box; drag a box to move it, its corner to change its size. Select a box to say what goes in it.</span>
+            <div class="img-layout-stage" id="img-layout-stage" role="application" aria-label="The image's layout: draw boxes" data-i18n-label="img.layoutStage"></div>
+            <div class="img-row" id="img-layout-item" hidden>
+              <label class="st-field"><span data-i18n="img.boxKind">Kind</span>
+                <select class="st-input" id="img-box-label">
+                  <option value="object" data-i18n="img.boxObject">Object</option>
+                  <option value="character" data-i18n="img.boxCharacter">Character</option>
+                  <option value="text" data-i18n="img.boxText">Text</option></select></label>
+              <label class="st-field img-box-wide"><span data-i18n="img.boxCaption">What it looks like</span>
+                <input class="st-input" id="img-box-caption" type="text"></label>
+              <label class="st-field img-box-wide" id="img-box-text-f"><span data-i18n="img.boxWords">The exact words</span>
+                <input class="st-input" id="img-box-text" type="text"></label>
+              <button type="button" class="st-btn" id="img-box-delete" data-i18n="img.boxDelete">Delete the box</button>
+            </div>
+            <div class="img-mask-tools"><button type="button" class="st-btn" id="img-layout-clear" data-i18n="img.layoutClear">Delete every box</button></div>
+          </div>
+        </div>
+        <span class="composer-hint" id="img-hint" data-i18n="img.hint">One image at a time; a chat request waits for it (and the other way round).</span>
         <span class="composer-hint" id="img-note" hidden></span>
       </form>
       <div class="img-results" id="img-results"></div>
@@ -121,6 +226,7 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
           <span class="card-title">Model state</span>
           <span class="badges" id="state-badges">
             <span class="st-badge" data-s="idle">Idle</span>
+            <span class="st-badge" data-s="unloaded">Unloaded</span>
             <span class="st-badge st-badge--reading" data-s="reading">Reading</span>
             <span class="st-badge st-badge--generating" data-s="generating">Generating</span>
             <span class="st-badge st-badge--queued" data-s="queued">Queued</span>
@@ -197,10 +303,10 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
         <dl class="facts" id="facts-engine"></dl>
       </div>
       <div class="st-card">
-        <span class="card-title">Updates</span>
+        <span class="card-title" data-i18n="update.title">Updates</span>
         <dl class="facts" id="facts-update"></dl>
         <p class="muted small" id="update-how" hidden></p>
-        <div class="cfg-actions"><button class="st-btn st-btn--secondary" id="update-check" type="button">Check now</button>
+        <div class="cfg-actions"><button class="st-btn st-btn--secondary" id="update-check" type="button" data-i18n="update.check">Check now</button>
           <span class="muted small" id="update-msg" role="status"></span></div>
       </div>
       <div class="st-card">
@@ -217,6 +323,11 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
         <div class="st-field">
           <label class="st-label" for="api-key">API key <output>only if the server was started with one</output></label>
           <input class="st-input" id="api-key" type="password" autocomplete="off" placeholder="Not needed">
+        </div>
+        <div class="st-field">
+          <label class="st-label" for="lang"><span data-i18n="settings.language">Language</span></label>
+          <select class="st-input" id="lang"></select>
+          <span class="muted small" data-i18n="settings.languageNote">Chat, its settings, the buttons above and the Images view are translated. The Monitor and About views are still in English for the most part.</span>
         </div>
         <div class="toggle-row"><span>Dark theme</span>
           <button class="st-toggle" id="dark-toggle" role="switch" aria-checked="false" aria-label="Dark theme"></button></div>
@@ -235,23 +346,20 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
   </section>
 </main>
 
-<!-- ============================ Sampling drawer ============================ -->
-<aside class="st-drawer" id="drawer" data-open="false" aria-label="Sampling and thinking" aria-hidden="true">
-  <div class="st-drawer__head"><span class="card-title">Sampling</span>
-    <button class="st-btn st-btn--icon" id="drawer-close" aria-label="Close">
+<!-- ============================ Chat settings drawer ============================ -->
+<aside class="st-drawer" id="drawer" data-open="false" aria-label="Chat settings" data-i18n-label="drawer.title" aria-hidden="true">
+  <div class="st-drawer__head"><span class="card-title" data-i18n="drawer.title">Chat settings</span>
+    <button class="st-btn st-btn--icon" id="drawer-close" aria-label="Close" data-i18n-label="close">
       <svg class="st-icon"><use href="web/sprite.svg#i-chevron"/></svg></button></div>
   <div class="st-drawer__body">
     <div class="st-field">
-      <label class="st-label" for="s-thinking">Thinking <output id="o-thinking"></output></label>
-      <div class="seg" id="s-thinking" role="radiogroup" aria-label="Thinking">
-        <button type="button" role="radio" data-v="none">Off</button><button type="button" role="radio" data-v="low">Low</button>
-        <button type="button" role="radio" data-v="medium">Medium</button><button type="button" role="radio" data-v="high">High</button>
-      </div>
+      <label class="st-label" for="s-thinking"><span data-i18n="drawer.thinking">Thinking</span> <output id="o-thinking"></output></label>
+      <div class="seg" id="s-thinking" role="radiogroup" aria-label="Thinking" data-i18n-label="drawer.thinking"></div>
     </div>
     <div class="st-field">
-      <label class="st-label" for="s-temp">Temperature <output id="o-temp"></output></label>
+      <label class="st-label" for="s-temp"><span data-i18n="drawer.temperature">Temperature</span> <output id="o-temp"></output></label>
       <input class="st-slider" type="range" id="s-temp" min="0" max="1.5" step="0.05">
-      <span class="muted small">0 = always the most likely word (exact, repeatable)</span>
+      <span class="muted small" data-i18n="drawer.temperatureNote">0 = always the most likely word (exact, repeatable)</span>
     </div>
     <div class="st-field">
       <label class="st-label" for="s-topp">Top-p <output id="o-topp"></output></label>
@@ -262,32 +370,65 @@ SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
       <input class="st-slider" type="range" id="s-topk" min="1" max="64" step="1">
     </div>
     <div class="st-field">
-      <label class="st-label" for="s-max">Max tokens <output>empty = until done</output></label>
-      <input class="st-input" id="s-max" type="number" min="1" step="1" placeholder="Until done">
+      <label class="st-label" for="s-minp">Min-p <output data-i18n="drawer.minpNote">empty = the server's default</output></label>
+      <input class="st-input" id="s-minp" type="number" min="0" max="1" step="0.01" placeholder="Server's default" data-i18n-placeholder="drawer.minpDefault">
     </div>
     <div class="st-field">
-      <label class="st-label" for="s-seed">Seed <output>empty = random</output></label>
-      <input class="st-input" id="s-seed" type="number" min="1" step="1" placeholder="Random">
+      <label class="st-label" for="s-max"><span data-i18n="drawer.maxTokens">Max tokens</span> <output data-i18n="drawer.maxTokensNote">empty = until done</output></label>
+      <input class="st-input" id="s-max" type="number" min="1" step="1" placeholder="Until done" data-i18n-placeholder="drawer.untilDone">
     </div>
-    <div class="toggle-row"><span>Show thinking<br><span class="muted small">expanded while it streams</span></span>
-      <button class="st-toggle" id="s-show" role="switch" aria-checked="true" aria-label="Show thinking"></button></div>
-    <div class="toggle-row" id="mcp-row" hidden><span>Use tools from MCP servers<br><span class="muted small"
+    <div class="st-field">
+      <label class="st-label" for="s-seed"><span data-i18n="drawer.seed">Seed</span> <output data-i18n="drawer.seedNote">empty = random</output></label>
+      <input class="st-input" id="s-seed" type="number" min="1" step="1" placeholder="Random" data-i18n-placeholder="drawer.random">
+    </div>
+    <div class="toggle-row"><span><span data-i18n="drawer.showThinking">Show thinking</span><br><span class="muted small" data-i18n="drawer.showThinkingNote">expanded while it streams</span></span>
+      <button class="st-toggle" id="s-show" role="switch" aria-checked="true" aria-label="Show thinking" data-i18n-label="drawer.showThinking"></button></div>
+    <div class="toggle-row"><span><span data-i18n="drawer.math">Render math</span><br><span class="muted small"
+      data-i18n="drawer.mathNote">draw equations in answers as formulas (works offline)</span></span>
+      <button class="st-toggle" id="s-math" role="switch" aria-checked="false" aria-label="Render math" data-i18n-label="drawer.math"></button></div>
+    <div class="toggle-row" id="mcp-row" hidden><span><span data-i18n="drawer.mcp">Use tools from MCP servers</span><br><span class="muted small"
       id="mcp-row-sub">the model may call them while it answers</span></span>
-      <button class="st-toggle" id="s-mcp" role="switch" aria-checked="true" aria-label="Use tools from MCP servers"></button></div>
+      <button class="st-toggle" id="s-mcp" role="switch" aria-checked="true" aria-label="Use tools from MCP servers" data-i18n-label="drawer.mcp"></button></div>
     <div class="toggle-row" id="esp-row" hidden><span>Experimental speed projection<br><span class="muted small">the
       engine's control vector; off = the stock model. Switching reads the chat again once</span></span>
       <button class="st-toggle" id="s-esp" role="switch" aria-checked="true" aria-label="Experimental speed projection"></button></div>
-    <div class="toggle-row"><span>Use for other apps too<br><span class="muted small">omp and other API clients get
-      these settings for anything they don't set themselves</span></span>
-      <button class="st-toggle" id="s-share" role="switch" aria-checked="false" aria-label="Use for other apps too"></button></div>
+    <div class="toggle-row"><span><span data-i18n="drawer.share">Use for other apps too</span><br><span class="muted small" data-i18n="drawer.shareNote">omp and other API clients get
+      these settings for anything they do not set themselves</span></span>
+      <button class="st-toggle" id="s-share" role="switch" aria-checked="false" aria-label="Use for other apps too" data-i18n-label="drawer.share"></button></div>
+
+    <div class="drawer-group" role="group" aria-labelledby="g-chats">
+      <h3 class="drawer-group__title" id="g-chats" data-i18n="drawer.chats">Chats</h3>
+      <div class="toggle-row"><span><span data-i18n="drawer.list">Saved chats list</span><br><span class="muted small"
+        data-i18n="drawer.listNote">keeps every chat in a list on the left, in this browser only. Off: one chat, as before</span></span>
+        <button class="st-toggle" id="s-list" role="switch" aria-checked="false" aria-label="Saved chats list" data-i18n-label="drawer.list"></button></div>
+      <div class="toggle-row"><span><span data-i18n="drawer.edit">Edit and rewind messages</span><br><span class="muted small"
+        data-i18n="drawer.editNote">edit an answer, ask for a new one, or go back to an earlier message (with an Undo)</span></span>
+        <button class="st-toggle" id="s-edit" role="switch" aria-checked="false" aria-label="Edit and rewind messages" data-i18n-label="drawer.edit"></button></div>
+      <div class="st-field">
+        <label class="st-label" for="s-busy"><span data-i18n="drawer.busy">When you send while it is answering</span></label>
+        <div class="seg seg--3" id="s-busy" role="radiogroup" aria-label="When you send while it is answering" data-i18n-label="drawer.busy">
+          <button type="button" role="radio" data-v="wait" data-i18n="drawer.busyWait">Wait</button><button type="button" role="radio" data-v="queue" data-i18n="drawer.busyQueue">Send after</button>
+          <button type="button" role="radio" data-v="interject" data-i18n="drawer.busyInterject">Interrupt</button>
+        </div>
+        <span class="muted small" id="o-busy"></span>
+      </div>
+    </div>
+
     <div class="drawer-actions">
-      <button class="st-btn st-btn--secondary" id="s-reset" type="button">Reset</button>
-      <button class="st-btn st-btn--primary" id="s-apply" type="button">Apply</button>
+      <button class="st-btn st-btn--secondary" id="s-reset" type="button" data-i18n="drawer.reset">Reset</button>
+      <button class="st-btn st-btn--primary" id="s-apply" type="button" data-i18n="drawer.apply">Apply</button>
     </div>
   </div>
 </aside>
 <div class="scrim" id="scrim" hidden></div>
 <div class="st-toasts" id="toasts" aria-live="polite"></div>
+<script src="web/i18n.js"></script>
+<script src="web/preview.js"></script>
+<script src="web/math.js"></script>
+<script src="web/math-adapter.js"></script>
+<script src="web/history.js"></script>
+<script src="web/chatstore.js"></script>
+<script src="web/chats-ui.js"></script>
 <script src="web/app.js"></script>
 </body>
 </html>

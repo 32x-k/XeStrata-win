@@ -47,6 +47,14 @@ public:
         return it == t_.end() ? nullptr : &it->second;
     }
     const std::map<std::string, SafeTensor>& tensors() const { return t_; }
+    /// The header's `__metadata__`: its string values (a HunyuanImage 3.0 file names its model's config there).  Values that are
+    /// not strings are skipped.
+    const std::map<std::string, std::string>& metadata() const { return meta_; }
+    /// A metadata value, or "".
+    std::string meta(const std::string& key) const {
+        auto it = meta_.find(key);
+        return it == meta_.end() ? std::string() : it->second;
+    }
     /// Where the data section starts in the file (a tensor's bytes are at data_base() + begin .. + end).
     uint64_t data_base() const { return base_; }
 
@@ -165,7 +173,18 @@ private:
             const std::string name = str(h, i);
             expect(h, i, ':');
             if (name == "__metadata__") {
-                skip(h, i);
+                expect(h, i, '{');
+                for (;;) {
+                    ws(h, i);
+                    if (at(h, i) == '}') { ++i; break; }
+                    const std::string key = str(h, i);
+                    expect(h, i, ':');
+                    ws(h, i);
+                    if (at(h, i) == '"') meta_[key] = str(h, i);
+                    else skip(h, i);
+                    ws(h, i);
+                    if (at(h, i) == ',') ++i;
+                }
             } else {
                 SafeTensor t;
                 expect(h, i, '{');
@@ -200,6 +219,7 @@ private:
     std::ifstream f_;
     uint64_t base_ = 0, size_ = 0;
     std::map<std::string, SafeTensor> t_;
+    std::map<std::string, std::string> meta_;
 };
 
 }  // namespace strata::image

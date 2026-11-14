@@ -29,7 +29,7 @@ from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unma
 from serve.server import (ANSWER_RESERVE_MIN, CTX_SLACK, ByteTokenizer, EngineDied, EngineNonFinite,  # noqa: E402
                           MockEngine, PP_DONE_TAIL, Service,
                           StrataEngine, api_key_of, engine_args, key_matches, layer_split_value, prompt_progress,
-                          prompt_tokens_seen, request_timings, serve, start_failure_hint)
+                          parse_multipart, prompt_tokens_seen, request_timings, serve, start_failure_hint)
 from types import SimpleNamespace  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -62,6 +62,7 @@ class MaxTokens(unittest.TestCase):
         tok = ByteTokenizer()
         cls.engine = RecordingEngine(tok, "</think>\n\n" + ANSWER, max_context=CTX)
         cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
+        cls.svc.loop_guard = False  # ANSWER is a loop to serve/loop_guard.py
         cls.httpd = serve(cls.svc, port=0)
         cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
 
@@ -114,6 +115,17 @@ class MaxTokens(unittest.TestCase):
         self.assertEqual(s2, 200)
         self.assertEqual(b["input_tokens"], n_in)
 
+    def test_count_tokens_with_a_forced_tool(self):
+        # a tool_choice that names a tool: the prompt ends with the call's opening, which the count includes too
+        tool = {"tool_choice": {"type": "tool", "name": "a"},
+                "tools": [{"name": "a", "input_schema": {"type": "object", "properties": {}}}]}
+        msgs = [{"role": "user", "content": "call it"}]
+        s, b = self.post("/v1/messages/count_tokens", {"model": "m", "messages": msgs, **tool})
+        self.assertEqual(s, 200)
+        s2, _, n_in, _ = self.call("anthropic", "call it", max_tokens=8, **tool)
+        self.assertEqual(s2, 200)
+        self.assertEqual(b["input_tokens"], n_in)
+
     def test_request_line_parses_the_engine_summary(self):
         line = ("strata serve: prompt 1200 tokens = 1000 reused + 200 read in 50 ms (4000.0 tok/s), 30 generated in "
                 "300 ms (100.0 tok/s), drafts accepted 20 of 28, 2 checkpoints")
@@ -130,16 +142,19 @@ class MaxTokens(unittest.TestCase):
                          ("98179", "0", "17565", "699.6", "0"))
 
     def test_unset_budget_is_the_rest_of_the_context(self):
-        cases = {"openai": [{"max_tokens": -1}, {"max_tokens": 0}, {}, {"max_tokens": None},
-                            {"max_completion_tokens": -1}, {"max_completion_tokens": None, "max_tokens": None}],
-                 "anthropic": [{"max_tokens": -1}, {"max_tokens": 0}, {}, {"max_tokens": None}]}
-        for api, budgets in cases.items():
-            for budget in budgets:
-                with self.subTest(api=api, budget=budget):
-                    s, b, pt, ct = self.call(api, **budget)
-                    self.assertEqual(s, 200, b)
-                    self.assertEqual(self.engine.last_max_new, CTX - CTX_SLACK - pt)
-                    self.assertGreater(ct, 1024)          # the whole answer, not cut at the old 1024 fallback
+        for budget in ({"max_tokens": -1}, {"max_tokens": 0}, {}, {"max_tokens": None},
+                       {"max_completion_tokens": -1}, {"max_completion_tokens": None, "max_tokens": None}):
+            with self.subTest(api="openai", budget=budget):
+                s, b, pt, ct = self.call("openai", **budget)
+                self.assertEqual(s, 200, b)
+                self.assertEqual(self.engine.last_max_new, CTX - CTX_SLACK - pt)
+                self.assertGreater(ct, 1024)          # the whole answer, not cut at the old 1024 fallback
+        # Anthropic's max_tokens is required, a whole number of 1 or more: anything else is its 400
+        for budget in ({"max_tokens": -1}, {"max_tokens": 0}, {}, {"max_tokens": None}):
+            with self.subTest(api="anthropic", budget=budget):
+                s, b, _, _ = self.call("anthropic", **budget)
+                self.assertEqual(s, 400, b)
+                self.assertIn("max_tokens", b["error"]["message"])
 
     def test_explicit_budget_is_honoured(self):
         for api, budget in [("openai", {"max_tokens": 50}), ("openai", {"max_completion_tokens": 50}),
@@ -235,7 +250,7 @@ class MaxTokens(unittest.TestCase):
     def test_unset_budget_with_a_near_full_prompt(self):
         _, _, pt0, _ = self.call("openai", max_tokens=1)
         overhead = pt0 - len("hi")                  # the template's tokens around the user text
-        for api in ("openai", "anthropic"):
+        for api in ("openai",):                     # (Anthropic's max_tokens is required: no unset budget there)
             _, _, pa, _ = self.call(api, max_tokens=1)
             over = pa - pt0                          # the Anthropic template may differ slightly
             with self.subTest(api=api, room=5):     # a few tokens left: the budget is exactly those
@@ -255,7 +270,7 @@ class MaxTokens(unittest.TestCase):
         import io
         os.environ["STRATA_DEBUG"] = "1"
         try:
-            for api in ("openai", "anthropic"):
+            for api in ("openai",):                 # (Anthropic's max_tokens is required: no unset budget there)
                 with self.subTest(api=api):
                     out = io.StringIO()
                     with contextlib.redirect_stdout(out):
@@ -273,6 +288,7 @@ class FitMaxTokens(unittest.TestCase):
         tok = ByteTokenizer()
         cls.engine = RecordingEngine(tok, "</think>\n\n" + ANSWER, max_context=CTX)
         cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/test_chat_template.jinja"), fit_max_tokens=True)
+        cls.svc.loop_guard = False  # ANSWER is a loop to serve/loop_guard.py
         cls.httpd = serve(cls.svc, port=0)
         cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
 
@@ -367,7 +383,8 @@ class VisionTempFiles(unittest.TestCase):
             try:
                 paths = ("/v1/chat/completions", "/v1/messages")
                 for path in paths:
-                    self.assertEqual(post(path), 503)                # the engine is starting (#344); clients retry
+                    # the engine is starting (#344); clients retry (Anthropic's: its 529 overloaded_error)
+                    self.assertEqual(post(path), 529 if path == "/v1/messages" else 503)
                 engine.max_context = 48
                 for path in paths:
                     self.assertEqual(post(path), 400)                # no room to answer
@@ -412,6 +429,160 @@ class ImageMarkers(unittest.TestCase):
                     self.assertEqual(ids.count(pad), 3)          # the image's three rows, nothing else
                     self.assertIn("<|image_pad|> marks" if "docs" in text else "plain", tok.decode(ids))
             svc.embeddings.path.unlink(missing_ok=True)
+
+    def test_count_tokens_counts_the_image_tokens(self):
+        """Anthropic's count_tokens counts a picture as the image tokens it becomes, as /v1/messages reads it."""
+        import tempfile
+        tok = ByteTokenizer()
+        img = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+        body = {"model": "m", "max_tokens": 4, "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this?"}, img]}]}
+        with tempfile.TemporaryDirectory() as d:
+            svc = Service(MockEngine(tok, "</think>\n\nok", max_context=CTX), tok, ChatTemplate(TEMPLATE),
+                          vision=self.FakeVision(d))
+            httpd = serve(svc, port=0)
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            try:
+                def post(path, body):
+                    req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+                                                 headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=30) as r:
+                        return json.loads(r.read())
+                counted = post("/v1/messages/count_tokens", body)["input_tokens"]
+                usage = post("/v1/messages", body)["usage"]
+                keys = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+                read = sum(usage.get(k) or 0 for k in keys)
+                self.assertEqual(counted, read)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
+    def test_count_tokens_wakes_a_stopped_encoder(self):
+        """An idle unload stops the engine and a non-elastic encoder; count_tokens with a picture loads them back, as
+        /v1/messages does, and counts what that request reads (it was a 400: the picture reader is not running)."""
+        import tempfile
+
+        class Stoppable(self.FakeVision):
+            elastic, running = False, True
+
+            def alive(self):
+                return self.running
+
+            def unload(self):
+                self.running = False
+
+            def restart(self):
+                self.running = True
+
+            def encode(self, source, keep=()):
+                if not self.running:
+                    raise ValueError("the picture reader is not running")
+                return self.rows, 3
+
+        class Unloadable(MockEngine):
+            running = True
+
+            def alive(self):
+                return self.running
+
+            def unload(self):
+                self.running = False
+
+            def restart(self):
+                self.running = True
+
+        tok = ByteTokenizer()
+        img = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+        body = {"model": "m", "max_tokens": 4, "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what is this?"}, img]}]}
+        with tempfile.TemporaryDirectory() as d:
+            vision = Stoppable(d)
+            svc = Service(Unloadable(tok, "</think>\n\nok", max_context=CTX), tok, ChatTemplate(TEMPLATE),
+                          vision=vision)
+            httpd = serve(svc, port=0)
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            try:
+                def post(path):
+                    req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+                                                 headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(req, timeout=30) as r:
+                        return json.loads(r.read())
+                user = body["messages"]
+                tool = [{"role": "user", "content": "look"},
+                        {"role": "assistant", "content": [
+                            {"type": "tool_use", "id": "t", "name": "Read", "input": {}}]},
+                        {"role": "user", "content": [
+                            {"type": "tool_result", "tool_use_id": "t", "content": [img]}]}]
+                for messages in (user, tool):
+                    with self.subTest(tool=messages is tool):
+                        body["messages"] = messages
+                        svc.unload()
+                        self.assertFalse(vision.alive())
+                        counted = post("/v1/messages/count_tokens")["input_tokens"]
+                        self.assertTrue(vision.alive())
+                        usage = post("/v1/messages")["usage"]
+                        keys = ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
+                        self.assertEqual(counted, sum(usage.get(k) or 0 for k in keys))
+                        self.assertNotIn("image omitted", tok.decode(svc.engine.last_prompt))
+                # A reader that cannot restart is an admission failure, not a bad tool picture to omit and count.
+                svc.unload()
+                with mock.patch.object(vision, "restart", side_effect=RuntimeError("restart failed")):
+                    with self.assertRaises(urllib.error.HTTPError) as failed:
+                        post("/v1/messages/count_tokens")
+                    with failed.exception as response:
+                        self.assertEqual(response.code, 503)
+                        self.assertIn("restart failed", json.loads(response.read())["error"]["message"])
+                # Counting text does not need to start the reader or the engine after that failure.
+                body["messages"] = [{"role": "user", "content": "text only"}]
+                self.assertGreater(post("/v1/messages/count_tokens")["input_tokens"], 0)
+                self.assertFalse(vision.alive())
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+
+    def test_a_file_error_is_a_500_without_its_path(self):
+        """A file error of the server's own while a picture is read (its work file, a full disk) is a 500 that says
+        so - not a dropped connection - and neither it nor a tool picture's note shows the file's path."""
+        import tempfile
+        tok = ByteTokenizer()
+        img = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}}
+
+        class FullDisk(self.FakeVision):
+            def encode(self, source, keep=()):
+                raise IsADirectoryError(21, "Is a directory", "/secret/work/abc.img")
+
+        with tempfile.TemporaryDirectory() as d:
+            svc = Service(RecordingPrompt(tok, "</think>\n\nok", max_context=CTX), tok, ChatTemplate(TEMPLATE),
+                          vision=FullDisk(d))
+            httpd = serve(svc, port=0)
+            base = f"http://127.0.0.1:{httpd.server_address[1]}"
+            try:
+                body = {"model": "m", "max_tokens": 4, "messages": [{"role": "user", "content": [img]}]}
+                for path in ("/v1/messages", "/v1/messages/count_tokens"):
+                    with self.subTest(path):
+                        req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+                                                     headers={"Content-Type": "application/json"})
+                        with self.assertRaises(urllib.error.HTTPError) as caught:
+                            urllib.request.urlopen(req, timeout=30)
+                        with caught.exception as e:
+                            self.assertEqual(e.code, 500)
+                            text = e.read().decode()
+                        self.assertIn("Is a directory", text)
+                        self.assertNotIn("/secret", text)
+                call = {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {}}]}
+                tool_body = {"model": "m", "max_tokens": 4, "messages": [
+                    {"role": "user", "content": "look"}, call,
+                    {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": [img]}]}]}
+                req = urllib.request.Request(base + "/v1/messages", data=json.dumps(tool_body).encode(),
+                                             headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    self.assertEqual(r.status, 200)
+                prompt = tok.decode(svc.engine.last_ids)
+                self.assertIn("[image omitted: Is a directory]", prompt)
+                self.assertNotIn("/secret", prompt)
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
 
     def test_anthropic_tool_result_image(self):
         """Claude Code's Read of a picture returns it inside a tool_result: it reaches the encoder, in place."""
@@ -1130,9 +1301,10 @@ class ToolCallTagInProse(unittest.TestCase):
 
 
 class ToolCallRecovery(unittest.TestCase):
-    """Opt-in ("tool_call_recovery": true): the model sometimes writes a call in a form next to the template's.  These
-    shapes are from a corpus of 1,462 agent turns (Qwen3.8 under Claude Code, signalnine/q27): with the switch on, a
-    declared tool's call in one of them is the call; anything else stays content, verbatim."""
+    """On by default in the server (config "tool_call_recovery": false turns it off): the model sometimes writes a
+    call in a form next to the template's.  These shapes are from a corpus of 1,462 agent turns (Qwen3.8 under Claude
+    Code, signalnine/q27): with the switch on, a declared tool's call in one of them is the call; anything else stays
+    content, verbatim."""
     SCHEMA = ToolCallTerminators.SCHEMA
     PARAMS = "<parameter=path>\na.md\n</parameter>\n<parameter=content>\nhi\n</parameter>\n</function>"
     CALL = {"path": "a.md", "content": "hi"}
@@ -1215,8 +1387,8 @@ class ToolCallRecovery(unittest.TestCase):
         unknown = "<function=format_disk>\n<parameter=x>\n1\n</parameter>\n</function>"
         self.check(unknown, [], unknown)
         for text in (fenced, inline, unknown):
-            padded = (text.replace("<function=write>", "<function= write >")
-                      .replace("<function=format_disk>", "<function= format_disk >"))
+            padded = text.replace("<function=write>", "<function= write >").replace(
+                "<function=format_disk>", "<function= format_disk >")
             self.check(padded, [], padded)
 
 
@@ -1260,6 +1432,29 @@ class ToolCallRecoverySwitch(unittest.TestCase):
     def test_switch(self):
         self.assertEqual(self.run_reply(False), [])
         self.assertEqual(self.run_reply(True), [ToolCallRecovery.CALL])
+
+    def test_on_by_default_and_the_config_turns_it_off(self):
+        """A server that is told nothing reads these calls; "tool_call_recovery": false is the off switch."""
+        from serve.server import tool_call_recovery_setting
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, "x", max_context=CTX), tok, ChatTemplate(TEMPLATE))
+        self.assertIs(svc.tool_call_recovery, True)
+        self.assertIs(tool_call_recovery_setting({}), True)
+        self.assertIs(tool_call_recovery_setting({"model": "x"}), True)
+        self.assertIs(tool_call_recovery_setting({"tool_call_recovery": True}), True)
+        self.assertIs(tool_call_recovery_setting({"tool_call_recovery": False}), False)
+        for bad in ("false", 0, 1, None, "off"):
+            with self.assertRaises(SystemExit):
+                tool_call_recovery_setting({"tool_call_recovery": bad})
+
+    def test_a_fresh_service_reads_the_call_without_being_told(self):
+        tok = ByteTokenizer()
+        script = "</think>\n\n<function=write>\n" + ToolCallRecovery.PARAMS
+        svc = Service(MockEngine(tok, script, max_context=CTX), tok, ChatTemplate(TEMPLATE))
+        with contextlib.redirect_stdout(io.StringIO()):
+            evs = [x for kind, x in svc.run(tok.encode("hi"), True, ToolCallRecovery.SCHEMA, 3000, {},
+                                            threading.Event()) if kind == "event"]
+        self.assertEqual([e.call.arguments for e in evs if e.kind == "tool_call"], [ToolCallRecovery.CALL])
 
 
 class UnfinishedToolCall(unittest.TestCase):
@@ -1610,6 +1805,133 @@ class ClientShapes(unittest.TestCase):
         self.assertIn("<parameter=arguments>\n{malformed_json", rendered)
 
 
+class UnsupportedOrOld(unittest.TestCase):
+    """Chat Completions' old functions / function_call are answered in their own shape; what the server cannot do
+    (audio output) or a max_tokens that is no whole number is a 400, not a 200 that ignores it."""
+
+    def test_functions_audio_and_max_tokens(self):
+        tok = ByteTokenizer()
+        call = "</think>\n\n<tool_call>\n<function=f>\n<parameter=x>\n1\n</parameter>\n</function>\n</tool_call>"
+        svc = Service(MockEngine(tok, call, max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}/v1/chat/completions"
+
+        def post(**kw):
+            body = {"model": "m", "messages": [{"role": "user", "content": "hi"}], **kw}
+            req = urllib.request.Request(base, data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    return r.status, r.read().decode()
+            except urllib.error.HTTPError as e:
+                with e:
+                    return e.code, e.read().decode()
+        try:
+            params = {"type": "object", "properties": {"x": {"type": "string"}}}
+            fns = {"functions": [{"name": "f", "parameters": params}], "function_call": "auto"}
+            status, text = post(**fns)
+            self.assertEqual(status, 200, text)
+            choice = json.loads(text)["choices"][0]
+            self.assertEqual(choice["finish_reason"], "function_call")
+            self.assertEqual(choice["message"]["function_call"], {"name": "f", "arguments": '{"x":"1"}'})
+            self.assertNotIn("tool_calls", choice["message"])
+            status, text = post(stream=True, **fns)
+            deltas = [c["choices"][0]["delta"] for c in (json.loads(line[6:]) for line in text.splitlines()
+                                                         if line.startswith("data: {")) if c.get("choices")]
+            self.assertEqual("".join(d.get("function_call", {}).get("arguments", "") for d in deltas), '{"x":"1"}')
+            self.assertFalse(any("tool_calls" in d for d in deltas))
+            self.assertEqual(post(modalities=["text", "audio"], audio={"voice": "alloy", "format": "wav"})[0], 400)
+            self.assertEqual(post(max_tokens=2.9)[0], 400)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
+class NamedToolChoice(unittest.TestCase):
+    """Which calls count: with a tool_choice that names tool a, the reply's one call is a's, on every API (a call of b
+    written in the thinking, or after the forced call, is not returned as a call); on Responses, a declared tool's."""
+
+    def run_api(self, script, path, body):
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, script, max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}{path}",
+                                         data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.read().decode()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_only_the_named_tool_is_called(self):
+        params = {"type": "object", "properties": {"x": {"type": "string"}}}
+
+        def call(name):
+            return f"<tool_call>\n<function={name}>\n<parameter=x>\n1\n</parameter>\n</function>\n</tool_call>"
+        in_thinking = call("b") + "</think>\n\n"
+        after = "<parameter=x>\n1\n</parameter>\n</function>\n</tool_call>\n" + call("b")   # after the forced opening
+        user = [{"role": "user", "content": "go"}]
+        chat = {"model": "m", "messages": user, "max_tokens": 400,
+                "tools": [{"type": "function", "function": {"name": n, "parameters": params}} for n in "ab"],
+                "tool_choice": {"type": "function", "function": {"name": "a"}}}
+        anthropic = {"model": "m", "messages": user, "max_tokens": 400,
+                     "tools": [{"name": n, "input_schema": params} for n in "ab"],
+                     "tool_choice": {"type": "tool", "name": "a"}}
+        responses = {"model": "m", "input": "go",
+                     "tools": [{"type": "function", "name": n, "parameters": params} for n in "ab"],
+                     "tool_choice": {"type": "function", "name": "a"}}
+        for name, script, path, body in (
+                ("chat, thinking", in_thinking, "/v1/chat/completions", chat),
+                ("chat, no thinking", after, "/v1/chat/completions",
+                 {**chat, "chat_template_kwargs": {"enable_thinking": False}}),
+                ("anthropic, thinking", in_thinking, "/v1/messages",
+                 {**anthropic, "max_tokens": 4000, "thinking": {"type": "enabled", "budget_tokens": 1024}}),
+                ("anthropic, no thinking", after, "/v1/messages", anthropic),
+                ("responses, thinking", in_thinking, "/v1/responses", responses)):
+            with self.subTest(name):
+                out = json.loads(self.run_api(script, path, body))
+                if path == "/v1/chat/completions":
+                    names = [c["function"]["name"] for c in out["choices"][0]["message"].get("tool_calls") or []]
+                elif path == "/v1/messages":
+                    names = [b["name"] for b in out["content"] if b["type"] == "tool_use"]
+                else:
+                    names = [o["name"] for o in out["output"] if o["type"] == "function_call"]
+                self.assertNotIn("b", names)
+                self.assertLessEqual(len(names), 1)
+
+    def test_responses_counts_declared_calls_only(self):
+        # Responses' tool_choice none, or no tools at all: a call the model writes stays text, as on Chat and
+        # Anthropic; a Codex compaction request (no tools declared, its conversation's in the prompt) keeps its calls
+        script = ("</think>\n\n<tool_call>\n<function=a>\n<parameter=x>\n1\n</parameter>\n</function>\n"
+                  "</tool_call>")
+        params = {"type": "object", "properties": {"x": {"type": "string"}}}
+        tool = {"type": "function", "name": "a", "parameters": params}
+        turn = {"request_kind": "compaction", "session_id": "s", "thread_id": "t"}
+        meta = {"x-codex-turn-metadata": json.dumps(turn)}
+        for name, body, want in (("none", {"tools": [tool], "tool_choice": "none"}, 0), ("no tools", {}, 0),
+                                 ("compaction", {"client_metadata": meta}, 1),
+                                 ("compaction none", {"client_metadata": meta, "tool_choice": "none"}, 0),
+                                 ("compaction none with tools", {"client_metadata": meta, "tools": [tool],
+                                                                 "tool_choice": "none"}, 0)):
+            for stream in (False, True):
+                with self.subTest(name=name, stream=stream):
+                    text = self.run_api(script, "/v1/responses",
+                                        {"model": "m", "input": "go", "stream": stream, **body})
+                    if stream:
+                        events = [json.loads(line[5:]) for line in text.splitlines() if line.startswith("data:")]
+                        self.assertEqual(events[-1]["type"], "response.completed")
+                        out = events[-1]["response"]
+                        if not want:
+                            self.assertFalse(any(e["type"].startswith("response.function_call_arguments.")
+                                                 for e in events))
+                    else:
+                        out = json.loads(text)
+                    self.assertEqual(len([o for o in out["output"] if o["type"] == "function_call"]), want)
+
+
 class ToolArguments(unittest.TestCase):
     """#510: one helper for both frontends; a history whose arguments are not a JSON object is kept, not a 500."""
 
@@ -1866,7 +2188,8 @@ class IncrementalPrompts(unittest.TestCase):
             other = self.conversation(n)
             status, b = self.post("/v1/messages/count_tokens", {"model": "m", "messages": other})
             self.assertEqual(status, 200, b)
-            self.assertEqual(b["input_tokens"], len(full.encode_prompt(other, None, {})))
+            # (an Anthropic request that asks for no thinking is read without it)
+            self.assertEqual(b["input_tokens"], len(full.encode_prompt(other, None, {"enable_thinking": False})))
         self.assertTrue(svc.prompts.entries == before, "the count wrote into the kept prompts")
         main.append({"role": "assistant", "content": "ok"})
         main.append({"role": "user", "content": "and then?"})
@@ -2037,6 +2360,66 @@ class EngineDeath(unittest.TestCase):
                 self.assertIn("illegal memory access", text, path)
                 self.assertNotIn("HTTP/1", text, path)
                 self.assertEqual(svc.metrics()["requests"][0]["finish"], "error")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_an_unexpected_error_mid_stream_is_said(self):
+        """A bug after a stream started (no handler expects it) reaches the client as each API's error, not as a stream
+        that only stops (an empty answer); a boolean schema (parameters: true, a property true) is no such bug."""
+        class BuggyEngine(MockEngine):
+            def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+                yield None                                  # a prompt-progress heartbeat: the stream has started
+                raise RuntimeError("a bug")
+
+        tok = ByteTokenizer()
+        svc = Service(BuggyEngine(tok, ANSWER, max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        base = f"http://127.0.0.1:{httpd.server_address[1]}"
+
+        def post(path, body):
+            req = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.read().decode()
+        try:
+            user = [{"role": "user", "content": "hi"}]
+            for path, body, said in (("/v1/chat/completions", {"model": "m", "messages": user}, "data: [DONE]"),
+                                     ("/v1/messages", {"model": "m", "messages": user, "max_tokens": 20},
+                                      "event: error"),
+                                     ("/v1/responses", {"model": "m", "input": "hi"}, "response.failed")):
+                with self.subTest(path):
+                    text = post(path, {**body, "stream": True})
+                    self.assertIn("internal error (RuntimeError: a bug)", text)
+                    self.assertIn(said, text)
+            svc.engine = MockEngine(tok, "</think>\n\n<tool_call>\n<function=a>\n<parameter=x>\n1\n</parameter>\n"
+                                         "</function>\n</tool_call>", max_context=CTX)
+            for params in (True, {"type": "object", "properties": {"x": True}}):
+                tool = {"type": "function", "name": "a", "parameters": params}
+                out = json.loads(post("/v1/responses", {"model": "m", "input": "go", "tools": [tool]}))
+                self.assertEqual([json.loads(o["arguments"]) for o in out["output"] if o["type"] == "function_call"],
+                                 [{"x": 1}])
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_responses_failed_in_order(self):
+        """/v1/responses failing mid-stream: the error event, then response.failed, their sequence numbers rising."""
+        tok = ByteTokenizer()
+        svc = Service(DyingEngine(tok, "</think>\n\n" + ANSWER, max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
+        httpd = serve(svc, port=0)
+        try:
+            req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/responses",
+                                         data=json.dumps({"model": "m", "input": "hi", "stream": True}).encode(),
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                events = [json.loads(line[5:]) for line in r.read().decode().splitlines()
+                          if line.startswith("data:")]
+            self.assertEqual([e["type"] for e in events[-2:]], ["error", "response.failed"])
+            seq = [e["sequence_number"] for e in events]
+            self.assertEqual(seq, sorted(set(seq)))
         finally:
             httpd.shutdown()
             httpd.server_close()
@@ -2321,7 +2704,7 @@ class NonFiniteEngine(MockEngine):
 
 class NonFiniteLogits(unittest.TestCase):
     """#879: non-finite logits before the first token -> the same request once more; after tokens went out -> the
-    reply ends as "length"; again on the retry -> an error, no loop."""
+    reply ends with an error after its text (as vLLM and llama.cpp); again on the retry -> an error, no loop."""
 
     def run_reply(self, plan):
         tok = ByteTokenizer()
@@ -2353,11 +2736,13 @@ class NonFiniteLogits(unittest.TestCase):
 
     def test_mid_reply_ends_without_retry(self):
         eng, svc, ids, done, error, text, log = self.run_reply([3])    # "hel"  # codespell:ignore
-        self.assertIsNone(error)
+        self.assertIsNotNone(error)
+        self.assertIn("after 3 tokens", str(error))
         self.assertEqual(len(eng.calls), 1)
-        self.assertEqual((done["finish"], done["completion_tokens"]), ("length", 3))
+        self.assertIsNone(done)
         self.assertEqual(text, "hel")  # codespell:ignore
         self.assertIn("non-finite after 3 tokens", log)
+        self.assertEqual(svc.metrics()["requests"][0]["finish"], "error")
 
     def test_twice_is_an_error(self):
         eng, svc, ids, done, error, text, log = self.run_reply([0, 0, 0])
@@ -3289,7 +3674,8 @@ class WebApp(unittest.TestCase):
             for path in ("/models", "/v1/models"):
                 code, _, body = self.get(path)
                 self.assertEqual(code, 200)
-                self.assertEqual(json.loads(body)["data"], [])
+                # listed (OpenAI's clients look the model up before a request), but not as loaded
+                self.assertEqual([m["status"]["value"] for m in json.loads(body)["data"]], ["loading"])
             self.assertEqual(self.get("/props")[0], 503)
             self.assertEqual(json.loads(self.get("/slots")[2]), [])
         finally:
@@ -3798,6 +4184,7 @@ class ThinkingBudget(unittest.TestCase):
         self.tok = ByteTokenizer()
         self.engine = ThinkingEngine(self.tok)
         self.svc = Service(self.engine, self.tok, ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
+        self.svc.loop_guard = False      # THOUGHT is a loop to serve/loop_guard.py
         self.httpd = serve(self.svc, port=0)
         self.base = f"http://127.0.0.1:{self.httpd.server_address[1]}"
 
@@ -3924,6 +4311,7 @@ class ThinkingBudget(unittest.TestCase):
         from serve.server import REASONING_WRAP_UP
         self.svc.reasoning_budget_tokens = 20
         code, raw = self.post("/v1/messages", {"model": "m", "max_tokens": 3000, "stream": True,
+                                               "thinking": {"type": "adaptive"},   # it thinks only when asked
                                                "messages": [{"role": "user", "content": "2+2?"}]})
         self.assertEqual(code, 200)
         evs = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith("data: {")]
@@ -4211,17 +4599,18 @@ class ForcedToolChoice(unittest.TestCase):
         finish, calls, _ = self.call_of(code, b, False)
         self.assertEqual((finish, calls), ("length", []))
 
-    def test_values_it_cannot_honour_act_as_auto(self):
-        """Not a 400: an odd tool_choice is logged and the model decides."""
+    def test_values_it_cannot_honour_are_a_400(self):
+        """An odd tool_choice (an unknown shape, a name that is not a tool, "required" with no tools) is a 400 before
+        the model runs, as OpenAI and Anthropic answer it."""
         named = lambda n: {"type": "function", "function": {"name": n}}  # noqa: E731
         for choice, tools in ((named("nope"), self.TOOLS), ({"type": "function"}, self.TOOLS),
                               ("required", None), ({"type": "banana"}, self.TOOLS), ("sometimes", self.TOOLS)):
             with self.subTest(choice=choice, tools=bool(tools)):
                 self.engine.prompts = []
                 code, b = self.openai(tool_choice=choice, tools=tools)
-                self.assertEqual(code, 200, b)
-                self.assertEqual(b["choices"][0]["message"]["content"], CallingEngine.ANSWER)
-                self.assertEqual(len(self.engine.prompts), 1)
+                self.assertEqual(code, 400, b)
+                self.assertIn("tool_choice", b["error"]["message"])
+                self.assertEqual(self.engine.prompts, [])
 
     def test_the_flat_shape_names_a_function(self):
         code, b = self.openai(tool_choice={"type": "function", "name": "search"})
@@ -4234,7 +4623,7 @@ class ForcedToolChoice(unittest.TestCase):
                 "type": "object", "properties": {}}}]
         for choice, want in (({"type": "any"}, "tool_use"), ({"type": "tool", "name": "search"}, "tool_use"),
                              ({"type": "auto"}, "end_turn"), ({"type": "none"}, "end_turn"),
-                             ({"type": "tool", "name": "nope"}, "end_turn")):
+                             ({"type": "tool", "name": "nope"}, 400)):
             for stream in (False, True):
                 with self.subTest(choice=choice, stream=stream):
                     self.engine.prompts = []
@@ -4242,6 +4631,14 @@ class ForcedToolChoice(unittest.TestCase):
                             "messages": [{"role": "user", "content": "2+2?"}]}
                     req = urllib.request.Request(self.base + "/v1/messages", data=json.dumps(body).encode(), headers={
                         "Content-Type": "application/json", "anthropic-version": "2023-06-01"})
+                    if want == 400:                 # a name that is not one of the tools: Anthropic's 400
+                        with self.assertRaises(urllib.error.HTTPError) as cm:
+                            urllib.request.urlopen(req, timeout=30)
+                        with cm.exception as e:
+                            self.assertEqual((e.code, json.loads(e.read())["error"]["type"]),
+                                             (400, "invalid_request_error"))
+                        self.assertEqual(self.engine.prompts, [])
+                        continue
                     with urllib.request.urlopen(req, timeout=30) as r:
                         raw = r.read().decode()
                     if stream:
@@ -4413,7 +4810,7 @@ class RestartWindow(unittest.TestCase):
                 with self.assertRaises(urllib.error.HTTPError) as cm:
                     urllib.request.urlopen(req, timeout=30)
                 with cm.exception as e:
-                    self.assertEqual(e.code, 503, path)
+                    self.assertEqual(e.code, 529 if path == "/v1/messages" else 503, path)
                     text = e.read().decode()
                 self.assertIn("starting", text)
                 self.assertNotIn("leaves no room", text)
@@ -5011,7 +5408,8 @@ class StopStrings(unittest.TestCase):
         """-> (status, text, finish or stop_reason, stop_sequence, the streamed text pieces)"""
         path = "/v1/chat/completions" if api == "openai" else "/v1/messages"
         body = {"model": "x", "max_tokens": 200, "stream": stream, "messages": [{"role": "user", "content": "hi"}],
-                **extra}
+                # the mock ends a thinking: Anthropic's requests ask for it (they think only when asked)
+                **({"thinking": {"type": "adaptive"}} if api == "anthropic" else {}), **extra}
         req = urllib.request.Request(self.base + path, data=json.dumps(body).encode(), headers={
             "Content-Type": "application/json", "anthropic-version": "2023-06-01"})
         try:
@@ -5773,3 +6171,78 @@ class EngineEndTests(unittest.TestCase):
         self.assertIn("a hang it caught", self.note("ds4: no progress for 600 s during a request - stopping "
                                                     "the engine so the server starts it again (issue #29)" + chr(10)))
         self.assertIn("running out of RAM", self.note("ds4: something else" + chr(10), returncode=None))
+
+try:
+    import openai
+    import httpx2 as httpx                     # openai 3's HTTP client
+except ImportError:
+    openai = None
+
+
+class ImageStream(unittest.TestCase):
+    def test_streamed_size_is_the_one_made(self):
+        # size "auto": the model chooses the size once the job runs (HunyuanImage 3.0's buckets); the streamed events
+        # carry the size it made, as the JSON answer does
+        import io
+        from PIL import Image
+        from serve import images as images_api
+        buf = io.BytesIO()
+        Image.new("RGB", (64, 36)).save(buf, format="PNG")
+        png = buf.getvalue()
+
+        def make_images(svc, gen, job, cancel=None, preview=None):
+            job.update(width=1280, height=720)                       # as _choose_size does
+            if preview is not None:
+                preview(0, 0, png)
+            return [png], {"seconds": 1.0}, "keep"
+        tok = ByteTokenizer()
+        svc = Service(MockEngine(tok, ANSWER, max_context=CTX), tok,
+                      ChatTemplate(ROOT / "serve/test_chat_template.jinja"))
+        gen = SimpleNamespace(cfg={}, model="m")
+        svc.images = SimpleNamespace(pick=lambda name: gen)
+        httpd = serve(svc, port=0)
+        try:
+            with mock.patch.object(images_api, "make_images", make_images):
+                req = urllib.request.Request(f"http://127.0.0.1:{httpd.server_address[1]}/v1/images/generations",
+                                             data=json.dumps({"prompt": "p", "stream": True, "partial_images": 1,
+                                                              "response_format": "b64_json"}).encode(),
+                                             headers={"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=30) as r:
+                    events = [json.loads(line[6:]) for line in r.read().decode().splitlines()
+                              if line.startswith("data: ")]
+            self.assertEqual([(e["type"], e["size"]) for e in events], [("image_generation.partial_image", "1280x720"),
+                                                                        ("image_generation.completed", "1280x720")])
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
+@unittest.skipUnless(openai is not None, "the openai package is not installed")
+class ImageEditForm(unittest.TestCase):
+    """OpenAI's SDK sends /v1/images/edits as a multipart form, its booleans and numbers as text: parse_multipart
+    gives them back as the JSON request has them."""
+
+    def form(self, **kw):
+        sent = {}
+
+        def capture(request):
+            sent["ctype"], sent["body"] = request.headers["content-type"], request.read()
+            return httpx.Response(500)
+        client = openai.OpenAI(api_key="x", base_url="http://test/v1", max_retries=0,
+                               http_client=httpx.Client(transport=httpx.MockTransport(capture)))
+        with contextlib.suppress(openai.APIError):
+            client.images.edit(image=("a.png", b"png", "image/png"), prompt="p", **kw)
+        return parse_multipart(sent["ctype"], sent["body"])[0]
+
+    def test_stream_and_partial_images(self):
+        fields = self.form(stream=True, partial_images=2)
+        self.assertIs(fields["stream"], True)
+        self.assertEqual(fields["partial_images"], 2)
+        self.assertIs(self.form(stream=False)["stream"], False)
+
+    def test_vllm_omni_numbers(self):
+        # vLLM-Omni's fields (extra_body in the SDK) come as numbers, as in a JSON request
+        fields = self.form(extra_body={"num_inference_steps": 4, "guidance_scale": 2.5, "true_cfg_scale": 2.5})
+        self.assertEqual((fields["num_inference_steps"], fields["guidance_scale"], fields["true_cfg_scale"]),
+                         (4, 2.5, 2.5))
+        self.assertIsInstance(fields["guidance_scale"], float)
