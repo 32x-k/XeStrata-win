@@ -860,10 +860,10 @@ DSV41_SHARED = {
 MULTI_FILE_FAMILIES: dict[str, dict[str, Any]] = {
     "deepseek41": {
         "title": "DeepSeek-V4.1-Flash", "by": "DeepSeek; GGUFs by IST-DAS and Unsloth", "arch": "deepseek41",
-        "about": "text-only DeepSeek with a separate engine and an Engram table read from the model files",
+        "about": "DeepSeek with a separate engine and an Engram table read from the model files",
         "hf": hf(DSV41_REPO) + "UD-Q8_K_XL/", "tag": "deepseek-v4.1-flash-", "name": "deepseek-v4.1-flash",
         "license": "DeepSeek's model license: https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF",
-        "sha256": DSV41_ALL_FILES, "vision": False, "experimental": True, "multi_file": True,
+        "sha256": DSV41_ALL_FILES, "vision": True, "experimental": True, "multi_file": True,
         "max_context": 1048576,
         "models": {
             "IST-DAS-2.00bpw": {
@@ -6273,10 +6273,12 @@ def dsv41_pack_info(exe: Path, pack: Path, lib_dirs: list) -> tuple[bool, str]:
     return result.returncode == 0 and "MISSING" not in text and "all present" in text, text
 
 
-def dsv41_config(exe: Path, pack: Path, fam: dict, context: int, gpu: dict, lib_dirs: list, port: int) -> dict:
-    """The prototype's single GPU, text-only configuration; scheduling sizes stay with the engine."""
+def dsv41_config(exe: Path, pack: Path, fam: dict, context: int, gpu: dict, lib_dirs: list, port: int,
+                 vision: str = "on") -> dict:
+    """The prototype's single GPU configuration; scheduling sizes stay with the engine.  `vision`: on or off — the
+    engine reads pictures with its own tower (loaded with the model), no separate reader process."""
     args = ["--pack", str(pack), "--max-context", str(context), "--eos", "1",
-            "--vision", "off", "--dspark", "auto", "--tp", "1", "--threads", "off"]
+            "--vision", vision, "--dspark", "auto", "--tp", "1", "--threads", "off"]
     cfg = {"exe": str(exe), "args": args,
            "cwd": str(STATE), "tokenizer": str(pack / "tokenizer"), "model_name": fam["name"],
            "arch": "deepseek41", "backend": "xe", "env": {}, "log": str(STATE / f"xestrata-{pack.name}.log"),
@@ -6301,8 +6303,12 @@ def install_dsv41(a, family: str, gpu: dict, chosen: list, port: int, ram: float
     ctx = a.context or DSV41_CONTEXT
     if why := dsv41_context_problem(ctx):
         fail(why)
-    if a.vision not in (None, "no", "none"):
-        warn("DeepSeek's SYCL prototype reads text only: images are off")
+    # Pictures are on by default: the engine reads them with its own vision tower (loaded with the model, no
+    # separate reader process).  --vision no turns them off; gpu / cpu name a Flash-Next reader and mean "on" here.
+    ds_vision = "off" if a.vision in ("no", "off", "none") else "on"
+    if a.vision in ("gpu", "cpu"):
+        warn(f"{fam['title']} reads pictures with the engine's own tower, so --vision {a.vision} is taken as yes: "
+             "pictures on")
     if a.parallel and a.parallel > 1:
         warn("DeepSeek's SYCL prototype serves one request at a time")
     if ram < md["ram_gb"]:
@@ -6363,7 +6369,7 @@ def install_dsv41(a, family: str, gpu: dict, chosen: list, port: int, ram: float
         fail(why)
 
     step(7, "writing the model's settings")
-    cfg = dsv41_config(exe, pack, fam, ctx, gpu, lib_dirs, port)
+    cfg = dsv41_config(exe, pack, fam, ctx, gpu, lib_dirs, port, ds_vision)
     for name in ("host", "api_key"):
         if getattr(a, name, None):
             cfg[name] = getattr(a, name)
@@ -6770,7 +6776,7 @@ def main() -> int:
              "it), a pull request is welcome")
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--family", choices=list(FAMILIES),
-                    help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5, deepseek41 = DeepSeek-V4.1-Flash (text only)")
+                    help="qwen = Qwen3.8-Flash-Next, swift = Swift 1.5, deepseek41 = DeepSeek-V4.1-Flash")
     plain_models = [m for f in PLAIN_FAMILIES.values() for m in f["models"]]
     multi_models = [m for f in MULTI_FILE_FAMILIES.values() for m in f["models"]]
     ap.add_argument("--model", choices=list(dict.fromkeys([*MODELS, *plain_models, *multi_models])))
