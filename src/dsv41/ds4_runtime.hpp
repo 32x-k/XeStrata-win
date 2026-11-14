@@ -58,7 +58,7 @@ inline Result device_count(int* n) {
     return checked("device_count", [&] { *n = core::Runtime::count(); return result(true); });
 }
 inline Result device_sync() { return result(gpu::device_sync()); }
-inline Result stream_create(Queue* q) { q->handle = gpu::stream_create(); return result(q->handle != nullptr); }
+inline Result stream_create(Queue* q, bool high_priority = false) { q->handle = gpu::stream_create(high_priority); return result(q->handle != nullptr); }
 inline Result stream_destroy(Queue q) { gpu::stream_destroy(q.handle); return Result::success; }
 inline Result stream_sync(Queue q) { return result(gpu::stream_sync(q.handle)); }
 inline Result stream_status(Queue q) { return result(gpu::stream_status(q.handle)); }

@@ -68,6 +68,17 @@ bool prepare(sycl::queue& s);
 /// row), kFmtMXFP4 (raw = MXFP4 [n][k / 32] blocks, ld bytes a row; 0: mx_row_bytes(k)) - an expert's matrix in VRAM -
 /// or kFmtQ8_0 (raw = Q8_0 [n][k / 32] blocks, ld bytes a row; 0: q8_row_bytes(k)).
 bool mv(const x3::MvJob* jobs, int n, sycl::queue& s);
+/// (DS4_HC_FUSE) an F32 input x of k values already rounded to int8 as the activations' own quantization
+/// rounds them (q [rows][k] codes, d [rows][k / 32] scales): a job whose input is x, k this k and this many
+/// columns reads them instead of rounding x again; every other job rounds its own as before.
+struct PreQ8 {
+    const float* x = nullptr;
+    const int8_t* q = nullptr;
+    const float* d = nullptr;
+    int k = 0;
+    int rows = 1;
+};
+bool mv(const x3::MvJob* jobs, int n, sycl::queue& s, const PreQ8* pre);
 /// The columns [c0, c0 + nc) of such a matrix: its rows c0 .. c0 + nc - 1, a contiguous range.
 x3::Mat view(const x3::Mat& m, int c0, int nc);
 /// x3::reconstruct_rows' layout from a BF16 or Q8_0 matrix: dst[r][c] = W[c][r] (n rows of k values), F16 or BF16

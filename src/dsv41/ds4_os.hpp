@@ -17,9 +17,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <iterator>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #if defined(_WIN32)
@@ -297,6 +300,15 @@ inline bool pread_full(fd_t f, void* dst, uint64_t n, uint64_t off) {
     return true;
 }
 /// The whole file mapped read-only (nullptr: it could not be).
+#if defined(_WIN32)
+/// fd -> the view map_ro returned for it (advise's Windows branch unlocks through the view; a mapping is per fd here,
+/// and a stale entry can only name a dead or reused view - VirtualUnlock on it fails harmlessly).  Upstream d78759c.
+inline std::unordered_map<fd_t, const uint8_t*>& view_of_fd() {
+    static std::unordered_map<fd_t, const uint8_t*> r;
+    return r;
+}
+inline std::mutex& view_mu() { static std::mutex m; return m; }
+#endif
 inline void* map_ro(fd_t f, uint64_t bytes) {
     if (bytes == 0) return nullptr;
 #if defined(_WIN32)
@@ -304,6 +316,10 @@ inline void* map_ro(fd_t f, uint64_t bytes) {
     if (m == nullptr) return nullptr;
     void* v = MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
     CloseHandle(m);   // (the view keeps the mapping)
+    if (v != nullptr) {
+        const std::lock_guard<std::mutex> lk(view_mu());
+        view_of_fd()[(size_t) f] = (const uint8_t*) v;
+    }
     return v;
 #else
     void* p = ::mmap(nullptr, (size_t) bytes, PROT_READ, MAP_SHARED, (int) f, 0);
@@ -314,16 +330,70 @@ inline void unmap(void* p, uint64_t bytes) {
     if (p == nullptr) return;
 #if defined(_WIN32)
     (void) bytes;
+    {
+        const std::lock_guard<std::mutex> lk(view_mu());
+        auto& r = view_of_fd();
+        for (auto it = r.begin(); it != r.end();)
+            it = it->second == p ? r.erase(it) : std::next(it);
+    }
     UnmapViewOfFile(p);
 #else
     ::munmap(p, (size_t) bytes);
 #endif
 }
+/// Demote [p, p + n)'s whole interior pages of this process's working set to the standby list (Windows: VirtualUnlock
+/// on unlocked pages removes them from the working set even though it reports ERROR_NOT_LOCKED - the working set
+/// documentation; a clean file-backed page stays resident and soft-faults back with its contents, so this only makes
+/// it count as available again).  Returns the bytes accepted.  Interior pages only: an edge page may hold a
+/// neighbour's bytes.  Linux has no equivalent for a shared map - its page cache already counts as available.
+inline uint64_t unlock_range(const void* p, uint64_t n) {
+#if defined(_WIN32)
+    if (p == nullptr || n < 4096) return 0;
+    SYSTEM_INFO si{};
+    GetSystemInfo(&si);
+    const uint64_t pg = si.dwPageSize ? si.dwPageSize : 4096;
+    const uint64_t a = ((uint64_t) (uintptr_t) p + pg - 1) & ~(pg - 1);
+    const uint64_t b = ((uint64_t) (uintptr_t) p + n) & ~(pg - 1);
+    if (b <= a) return 0;
+    SetLastError(ERROR_SUCCESS);
+    const BOOL unlocked = VirtualUnlock((LPVOID) (uintptr_t) a, (SIZE_T) (b - a));
+    // (NOT_LOCKED is the documented success path for pages this process never locked)
+    return unlocked || GetLastError() == ERROR_NOT_LOCKED ? b - a : 0;
+#else
+    (void) p, (void) n;
+    return 0;
+#endif
+}
+/// This process's resident working-set bytes (the trimmer's measure; 0: it could not be read).
+inline uint64_t working_set_bytes() {
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS pm{};
+    pm.cb = sizeof pm;
+    return GetProcessMemoryInfo(GetCurrentProcess(), &pm, pm.cb) ? (uint64_t) pm.WorkingSetSize : 0;
+#else
+    std::FILE* f = std::fopen("/proc/self/statm", "r");
+    if (f == nullptr) return 0;
+    unsigned long long size = 0, resident = 0;
+    const int got = std::fscanf(f, "%llu %llu", &size, &resident);
+    std::fclose(f);
+    return got == 2 ? resident * 4096ull : 0;
+#endif
+}
 /// A hint that [off, off + n) of the file is needed soon (need) or not again soon (!need); nothing where the OS has
-/// no such hint for a file (Windows' page cache reads ahead on its own).
+/// no such hint for a file.  Windows' !need, where this process maps the file, demotes the range's interior pages out
+/// of its working set (Linux: the page cache is reclaimable and counts as available, so the hint stays a no-op there).
 inline void advise(fd_t f, uint64_t off, uint64_t n, bool need) {
 #if defined(_WIN32)
-    (void) f, (void) off, (void) n, (void) need;
+    if (need || f == kBadFd) return;
+    const uint8_t* base = nullptr;
+    {
+        const std::lock_guard<std::mutex> lk(view_mu());
+        const auto it = view_of_fd().find((size_t) f);
+        if (it == view_of_fd().end()) return;
+        base = it->second;
+    }
+    if (off > UINT64_MAX - n) return;
+    (void) unlock_range(base + off, n);
 #else
     if (need) strata::platform::advise_willneed((int) f, off, n);
     else posix_fadvise((int) f, (off_t) off, (off_t) n, POSIX_FADV_DONTNEED);

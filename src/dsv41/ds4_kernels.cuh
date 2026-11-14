@@ -61,6 +61,11 @@ struct Finish {
     long long dst_stride = 0;
     uint8_t* pdst = nullptr;
     long long pdst_stride = 0;
+    // (DS4_DECODE_TRIM 2) non-null: the values written to x also rounded to int8 as gguf mv rounds a Q8_0 job's input
+    // (q8_quant_block's ops on the stored value) - q8 [n_vec][len], q8d [n_vec][len / 32], dense rows whatever x's stride; len % 32 == 0,
+    // no dst / pdst (finish refuses otherwise, nothing launched)
+    int8_t* q8 = nullptr;
+    float* q8d = nullptr;
 };
 void finish(float* x, int n_vec, int len, long long stride, const Finish& f, sycl::queue& s);
 
@@ -82,6 +87,25 @@ void hc_mix_split(const float* h, const float* fn, int hcdim, int n_mix, int T, 
 /// x[t][e] = sum_s mix[t][s] h[t][s][e], then x = rmsnorm(x) * w (w null: no norm).
 void hc_pre_norm(const float* h, const float* mix, const float* w, int dim, int hc, int T, float eps, float* x,
                  sycl::queue& s);
+/// (DS4_HC_FUSE) hc_split and hc_pre_norm in one launch - they share nothing, the norm reading the lagged
+/// mix, not the split's pre.  q set: x's int8 rounding too, the matvec inputs' own quantization's bits
+/// (q [dim], qd [dim / 32] a row, dim % 32 == 0).  Returns 0 when nothing launched (take the two launches),
+/// 1 when it launched without the rounding (no 32-lane subgroup: q / qd untouched), 2 with it.
+struct HcFuse {
+    const float* mixes = nullptr;
+    const float* scale = nullptr;
+    const float* base = nullptr;
+    int hc = 4, iters = 1;
+    float hc_eps = 0.f;
+    float *pre = nullptr, *post = nullptr, *comb = nullptr;
+    const float *h = nullptr, *mix = nullptr, *w = nullptr;
+    int dim = 0;
+    float eps = 0.f;
+    float* x = nullptr;
+    int8_t* q = nullptr;
+    float* qd = nullptr;
+};
+int hc_split_pre_norm(const HcFuse& a, sycl::queue& s, int T);
 /// out[t][k][e] = post[t][k] y[t][e] + sum_j comb[t][j][k] res[t][j][e]  (out must not alias res).
 void hc_post(const float* y, const float* res, const float* post, const float* comb, int dim, int hc, int T,
              float* out, sycl::queue& s);
@@ -98,10 +122,29 @@ void gemv_f16(const uint16_t* W, const float* x, int n, int k, int T, float alph
 /// gemv_f16's bit for bit.
 void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, int T, float alpha, float* y, size_t ldy,
                    sycl::queue& s);
+/// A BF16 value stored as the pack keeps it (3ab0908's router rows: the kernels widen each where a sum takes
+/// it - exactly, so the same bits as an F32 copy, with half the bytes read and half the VRAM).
+struct Bf16 { uint16_t u; };
+/// The router's weights on the device: F32 (f), or the pack's BF16 rows as they are (h).  One is set.
+struct GateW {
+    const float* f = nullptr;
+    const uint16_t* h = nullptr;
+    bool operator==(std::nullptr_t) const { return f == nullptr && h == nullptr; }
+    bool operator!=(std::nullptr_t) const { return !(*this == nullptr); }
+};
 /// y[t ldy + r] = sum_k W[r][k] x[t][k] in F32 (W [n][k], k % 128 == 0): the router's logits, as DeepSeek's
 /// inference computes them (linear(x.float(), weight.float())) - a warp a row, the same summing order for any T, so
 /// the token, window and chunk paths get the same bits.
 void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, sycl::queue& s);
+void gemv_f32(GateW W, const float* x, int n, int k, int T, float* y, int ldy, sycl::queue& s);
+/// (DS4_ROUTE_FUSE) two gemv_f32 launches on the same x in one grid: y0 = x W0 (n0 rows), y1 = x W1 (n1
+/// rows), each row gemv_f32's bits.  False, nothing launched: a shape the warp kernel does not take
+/// (k % 4, an alignment) - the caller then takes the two launches.
+bool gemv_f32_pair(const float* W0, int n0, float* y0, const float* W1, int n1, float* y1, const float* x,
+                   int k, sycl::queue& s, int T = 1, int ldy = 0);
+/// (both matrices the same storage; false, nothing launched, when they differ or the launch did not go in)
+bool gemv_f32_pair(GateW W0, int n0, float* y0, GateW W1, int n1, float* y1, const float* x, int k,
+                   sycl::queue& s, int T = 1, int ldy = 0);
 
 /// The router, row t: scores = sqrt(softplus(logits[t])) (n experts, rows 1024 apart), the top `k` of scores + bias;
 /// weights from the unbiased scores, normalized to sum 1 (+1e-20) and times route_scale -> idx[t][i], w[t][i] (rows
@@ -115,6 +158,19 @@ void route(const float* logits, const float* bias, int n, int k, int T, float ro
 
 /// h = silu(min(g, lim)) * clamp(u, -lim, lim)  (lim <= 0: no clamp); n values.
 void swiglu(const float* g, const float* u, int n, float lim, float* h, sycl::queue& s);
+/// (DS4_DECODE_TRIM 1) swiglu, its stored values also rounded to int8 as gguf mv rounds a Q8_0 job's input: q [n],
+/// qd [n / 32], 32-blocks of the flat array (rows of k values, k % 32 == 0, are rows of q k apart).  n % 32 == 0
+/// (false, nothing launched, otherwise)
+bool swiglu_q8(const float* g, const float* u, int n, float lim, float* h, int8_t* q, float* qd, sycl::queue& s);
+/// (DS4_DECODE_TRIM 4) up to 4 copies of 4-byte multiples between 4-aligned device ranges in one launch (false,
+/// nothing launched: a range not so)
+struct CopyRegions {
+    void* dst[4] = {nullptr, nullptr, nullptr, nullptr};
+    const void* src[4] = {nullptr, nullptr, nullptr, nullptr};
+    size_t bytes[4] = {0, 0, 0, 0};
+    int n = 0;
+};
+bool copy_regions(const CopyRegions& r, sycl::queue& s);
 
 /// The ratio-r compressor over a window: token t (position p0 + t) takes slot (p0 + t) % r of the state; each token that
 /// completes a group writes the group's pooled latent (softmax over the slots, per value, then rmsnorm(w)) to the next
@@ -241,14 +297,42 @@ struct Resp {
     float part[kWin][kMaxDim];
 };
 /// route() for the T tokens of a window, plus: plan_ptr[t][i] = vram[idx[t][i]] (0: not on the device), each token's x
-/// (dim floats) and picks into the request slot, then T and seq (req null: no request, the plan alone).
+/// (dim floats) and picks into the request slot, then T and seq (req null: no request, the plan alone).  resp given
+/// (with cpu_any, a device int left 0, and host_done, the host's last answered seq): when no pick of the window is on
+/// the CPU lane the device writes the answer itself - every token's part empty, then seq - so the layer does not wait
+/// for the host to say so (the host answers the same later); not while the host is kRing / 2 requests behind.
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float route_scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, sycl::queue& s, const float* bias_vl = nullptr,
-                   unsigned vl = 0, int na0 = 0, int na1 = 0);
+                   unsigned vl = 0, int na0 = 0, int na1 = 0, Resp* resp = nullptr, int* cpu_any = nullptr,
+                   const unsigned* host_done = nullptr);
 /// Lookahead: the m picks a later layer will likely make (its gate's logits on this layer's FFN input, the routing's
 /// score + bias, the m best of n) into req->ahead[t][off ..) for the T tokens - before route_publish, which publishes them.
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, sycl::queue& s);
+/// (DS4_ROUTE_FUSE) a token's route_publish and route_ahead in one launch of two groups a token, each its
+/// own kernel's body (disjoint request fields), then the publish as route_publish submits it.  False,
+/// nothing launched: no request, a dimension out of range or the groups' local memory not enough - the
+/// caller then takes the separate calls.
+struct RoutePair {
+    const float *logits = nullptr, *bias = nullptr;   // route_publish's
+    int n = 0, k = 0;
+    float route_scale = 1.0f;
+    const unsigned long long* vram = nullptr;
+    const float* x = nullptr;
+    int dim = 0;
+    int* idx = nullptr;
+    float* w = nullptr;
+    unsigned long long* plan_ptr = nullptr;
+    Req* req = nullptr;
+    const float* bias_vl = nullptr;
+    unsigned vl = 0;
+    unsigned seq = 0;
+    int na0 = 0, na1 = 0;
+    const float *a_logits = nullptr, *a_bias = nullptr;   // route_ahead's
+    int a_n = 0, m = 0, off = 0;
+    int T = 1;
+};
+bool route_pair(const RoutePair& a, sycl::queue& s);
 /// The RAM store's picks for the device (a decode token's k plan pointers): those the VRAM table left at 0 whose expert zc_tab has (the
 /// slot's device address) are copied into stage slot i (stride apart, `bytes` each) and the plan then points there.
 void zc_stage(unsigned long long* plan, const int* idx, const unsigned long long* zc_tab, int k, uint8_t* stage, size_t stride, size_t bytes,

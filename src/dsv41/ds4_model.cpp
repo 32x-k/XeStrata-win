@@ -32,6 +32,7 @@
 #include "ds4_kernels.cuh"
 #include "ds4_mailbox.hpp"
 #include "ds4_os.hpp"
+#include "ds4_cpu_exl3.hpp"
 #include "ds4_pool.hpp"
 #include "ds4_store.hpp"
 #include "strata/dsv41/exl3_cpu.hpp"
@@ -532,8 +533,15 @@ struct Dev {
           *freqs_win = nullptr, *freqs_comp = nullptr, *xe = nullptr, *xg = nullptr, *xu = nullptr, *xhh = nullptr,
           *ed = nullptr;
     float* glog_a = nullptr;   // lookahead: the next two layers' gate logits on this layer's FFN input (rows 1024 apart)
+    int8_t* xq8 = nullptr;          // (DS4_HC_FUSE) x's int8 codes, rounded where hc_split_pre_norm made it
+    float* xd8 = nullptr;           // their scales, dim / 32 a row
+    int8_t* shq8 = nullptr;         // (DS4_DECODE_TRIM 1) the shared expert's swiglu output's int8 codes
+    float* shd8 = nullptr;          // their scales, ff / 32 a row
+    int8_t* qq8 = nullptr;          // (DS4_DECODE_TRIM 2) q's norm output's int8 codes for wq_b
+    float* qd8 = nullptr;           // their scales, q_lora / 32 a row
     int *ridx = nullptr, *topk = nullptr, *cand = nullptr, *tok = nullptr;
     unsigned long long* plan_ptr = nullptr;           // the decode path's VRAM experts (0: on the CPU lane)
+    int* cpu_any = nullptr;                           // the window's routing has a CPU-lane pick (route_publish's)
     uint8_t* eg_rows = nullptr;
     uint16_t *emb_rows = nullptr, *ext = nullptr;   // the window's embedding rows; the window attention's rows
     AttnScratch attn_scr;   // a few queries' selected compressed rows decoded (sparse_attn)
@@ -746,6 +754,9 @@ struct Layer {
           *gate_bias_vl = nullptr;   // (the image tokens' routing bias, with the vision tower)
     uint16_t* i_wproj = nullptr;
     float* gate_w = nullptr;   // the router's weights, F32 (DeepSeek's inference computes the gate in F32)
+    uint16_t* gate_w_h = nullptr;  // ... or the pack's BF16 rows kept (DS4_ROUTER_BF16; the kernels widen, the same bits)
+    GateW gate() const { return {gate_w, gate_w_h}; }
+    bool router_checked = false;                     // (DS4_ROUTER_CHECK verified this layer's BF16 rows)
     uint8_t* win = nullptr;                     // [win] rows of kKvFp8 (kv_row_bytes)
     float *c_kv = nullptr, *c_score = nullptr;  // the compressor's partial group (ratio > 1)
     // a run of chunks' mid-run checkpoint (feed_mark): the ring and the partial group as they were before a row
@@ -1043,6 +1054,16 @@ struct Model::Impl {
     float dq_temp = 0.0f, dq_top_p = 1.0f, dq_min_p = 0.0f;
     int dq_top_k = 0;
     uint64_t dq_seed = 0, dq_counter = 0;
+    // the request's logit_bias (GEN logit_bias=<id>:<bias>,...): a row of g.vocab biases on the head device that every
+    // pick of the request adds to its logits (sample, verify; not the drafter's own proposals, which the verify then
+    // judges by the biased logits).  nullptr: none.  The last few rows stay, keyed by their entries, so a new request
+    // with the same bias does not upload it again
+    const float* cur_bias = nullptr;
+    struct BiasRow {
+        std::string key;
+        float* row = nullptr;
+    };
+    std::vector<BiasRow> bias_rows;
     // (tests) DS4_DSPARK_SAMPLE=1: a sampled request's drafts drawn from the drafter's distribution through the
     // request's chain, as DeepSeek's reference does (else its argmax: the same acceptance on Uranus, 31-32% of 5
     // drafts a round either way); DS4_DSPARK_QTEMP=f: those draws at f x the request's temperature (any q keeps the
@@ -1086,6 +1107,7 @@ struct Model::Impl {
     std::atomic<int64_t> eg_rows_n{0}, eg_hits_n{0}, eg_reads_n{0}, eg_wait_ns{0}, eg_io_ns{0};
     uint16_t* h_emb = nullptr;        // the window's embedding rows
     std::vector<float> c_xh, c_xsb, c_acc, c_xhd, c_xsd, c_accd, c_yd;
+    Exl3Lane lane_x;                            // (cpu_experts' view of them, ds4_cpu_exl3.hpp)
     // the state
     int64_t pos = 0;
     std::vector<int32_t> toks, ctoks;
@@ -1111,6 +1133,10 @@ struct Model::Impl {
     // answers in resps with the CPU lane's part, and the device waits for the answer only before the expert sum
     Req* reqs = nullptr;
     Resp* resps = nullptr;
+    // the last request the service thread answered (host-mapped): how far behind it is, for the device's own answers
+    // (DS4_SELF_ANSWER=0: the device always waits for the service thread's, as before)
+    unsigned* lane_done = nullptr;
+    bool self_answer = std::getenv("DS4_SELF_ANSWER") == nullptr || std::atoi(std::getenv("DS4_SELF_ANSWER")) != 0;
     unsigned seq_issued = 0;
     std::atomic<int> layer_of[kRing];
     std::thread service;
@@ -1133,6 +1159,19 @@ struct Model::Impl {
     // picks by rank on Sun: 97 91 81 70 57 41 %, past the top 6 29 20 %: reads wasted on an SSD-bound PC).
     int ahead_mode = std::getenv("DS4_AHEAD") ? std::atoi(std::getenv("DS4_AHEAD")) : 1;
     int ahead_extra = std::getenv("DS4_AHEAD_EXTRA") ? std::atoi(std::getenv("DS4_AHEAD_EXTRA")) : 0;
+    // (DS4_HC_FUSE) a token's HC split and pre-norm in one launch, x's int8 rounding there for the GEMVs
+    // that read it; 2: the FFN input's for the shared expert's too (upstream MAYA_DS4_HC_FUSE's values).
+    // (DS4_ROUTE_FUSE) the gate's GEMVs - this layer's and the next's - in one launch and its routing and
+    // lookahead in another (route_pair); 2: a window's rows too.  Both need a device-scope fence; the pack's
+    // layers and the stream are checked where they are set (below).
+    int hc_fuse_opt = std::getenv("DS4_HC_FUSE") ? std::atoi(std::getenv("DS4_HC_FUSE")) : 0;
+    int route_fuse_opt = std::getenv("DS4_ROUTE_FUSE") ? std::atoi(std::getenv("DS4_ROUTE_FUSE")) : 0;
+    bool hc_fuse = false, hc_fuse_win = false, route_fuse = false, route_fuse_win = false;
+    // (DS4_DECODE_TRIM) upstream 387f824's four exact decode trims: 1 the shared expert's swiglu rounds to int8 for
+    // its down GEMV, 2 q's norm for wq_b, 4 the snapshot and latent copies one launch each; 8, the drafter's
+    // hand-offs between its GPUs, has no form on this build's one device and is left out of `trim`
+    int trim_opt = std::getenv("DS4_DECODE_TRIM") ? std::atoi(std::getenv("DS4_DECODE_TRIM")) : 0;
+    int trim = 0;
     // (DS4_AHEAD_ORDER=0: the CPU lane computes a layer's experts in expert order, not the ones asked for early first)
     bool ahead_order = std::getenv("DS4_AHEAD_ORDER") == nullptr || std::atoi(std::getenv("DS4_AHEAD_ORDER")) != 0;
     std::vector<uint8_t> ahead_fl;     // [layer][1024]: 1 the top-k guess, 2 any guess, a layer before; 4 two layers before;
@@ -1143,6 +1182,30 @@ struct Model::Impl {
     std::mutex pf_mu;
     std::condition_variable pf_cv;
     std::vector<std::pair<const void*, size_t>> pf_q;
+    // Windows only (upstream d78759c): the in-place experts' pages this process's own reads bring into its working
+    // set (the CPU lane's computes, the lookahead's prefetches) are counted in use until trimmed, unlike Linux where
+    // the same pages sit in the page cache and count as available.  The trimmer thread demotes the oldest noted
+    // ranges to the standby list (os::unlock_range): a clean file page stays resident and soft-faults back
+    // unchanged, it only counts as available again.  DS4_INPLACE_TRIM_GB is the working-set room the in-place pages
+    // may hold above the load's own (default 6 on Windows; 0 disables); TRIM_MS the pass interval.
+    const float ip_trim_gb = [] {
+#if defined(_WIN32)
+        const char* v = std::getenv("DS4_INPLACE_TRIM_GB");
+        return v != nullptr ? (float) std::atof(v) : 6.0f;
+#else
+        return 0.0f;
+#endif
+    }();
+    const int ip_trim_ms = [] {
+        const char* v = std::getenv("DS4_INPLACE_TRIM_MS");
+        return v != nullptr ? std::max(50, std::atoi(v)) : 250;
+    }();
+    std::atomic<bool> ip_on{false};
+    uint64_t ip_base_ws = 0, ip_unlocked = 0;
+    std::deque<std::pair<const void*, size_t>> ip_ring;
+    std::unordered_map<const void*, uint32_t> ip_live;   // range -> notes of it in the ring (0/newer note: hot)
+    std::mutex ip_mu;
+    std::thread ip_th;
     // the expert cache: swaps prepared on threads of their own (DS4_CACHE_THREADS, 1 by default - 4 measured no faster
     // on one V100 - more for a PC to try: each its staging buffers and
     // copy streams), switched between windows
@@ -1462,6 +1525,7 @@ struct Model::Impl {
         }
         pf_cv.notify_all();
         if (pf_th.joinable()) pf_th.join();
+        if (ip_th.joinable()) ip_th.join();   // (the in-place trimmer: its own quit check is the loop's sleep)
         {
             std::lock_guard<std::mutex> lk(sw_mu);
         }
@@ -1849,6 +1913,59 @@ struct Model::Impl {
         CK(rt::copy(p, v.data(), n * 4));
         return true;
     }
+    // the router's weights: the pack's BF16 rows kept where it holds them and DS4_ROUTER_BF16 is not 0 (upstream
+    // 3ab0908: the same bits, half the bytes read a token a layer); the F32 copy otherwise.  DS4_ROUTER_CHECK=1:
+    // the F32 copy too, and the two kernels' logits on a fixed input compared bitwise - a difference fails the
+    // start (the copy stays, so the check can also run again)
+    bool gate(Dev& d, const std::string& name, Layer& l, std::string& err, size_t* acct) {
+        static const bool keep = std::getenv("DS4_ROUTER_BF16") == nullptr ||
+                                 std::atoi(std::getenv("DS4_ROUTER_BF16")) != 0;
+        static const bool check = std::getenv("DS4_ROUTER_CHECK") != nullptr;
+        const size_t n = (size_t) l.n_exp * g.dim;
+        if (keep && !bf16raw(d, name, l.gate_w_h, err, acct, n)) return false;
+        if (l.gate_w_h == nullptr || (check && l.gate_w == nullptr)) {
+            if (!f32(d, name, l.gate_w, err, acct, n)) return false;
+        }
+        if (!check || l.gate_w_h == nullptr || !l.router_checked) {
+            if (!check || l.gate_w_h == nullptr) return true;
+        }
+        l.router_checked = true;
+        // one and a window's tokens over a fixed input, single and paired: the two storages' logits, bit for bit
+        rt::set_device(d.id);
+        const int T = kWin, k = g.dim, rows = l.n_exp;
+        float* x = nullptr;
+        float *y0 = nullptr, *y1 = nullptr, *y2 = nullptr;
+        if (!dalloc(d, x, (size_t) T * k, err) || !dalloc(d, y0, (size_t) T * 1024, err) ||
+            !dalloc(d, y1, (size_t) T * 1024, err) || !dalloc(d, y2, (size_t) T * 1024, err)) return false;
+        std::vector<float> xv((size_t) T * k);
+        for (size_t i = 0; i < xv.size(); ++i) xv[i] = float(int(i % 97) - 48) * 1e-3f;
+        CK(rt::copy(x, xv.data(), xv.size() * 4));
+        for (int t = 1; t <= T; t = t == 1 ? T : T + 1) {
+            gemv_f32(l.gate_w, x, rows, k, t, y0, 1024, d.st);     // the F32 copy
+            gemv_f32(l.gate(), x, rows, k, t, y1, 1024, d.st);     // the BF16 rows, single
+            const bool paired =
+                gemv_f32_pair(l.gate(), rows, y2, l.gate(), rows, y2 + 512, x, k, d.st, t, 1024);
+            CK(rt::stream_sync(d.st));
+            std::vector<float> a((size_t) t * 1024), b((size_t) t * 1024), c((size_t) t * 1024);
+            CK(rt::readback(a.data(), y0, a.size() * 4, d.st));
+            CK(rt::readback(b.data(), y1, b.size() * 4, d.st));
+            if (paired) CK(rt::readback(c.data(), y2, c.size() * 4, d.st));
+            for (int tt = 0; tt < t; ++tt)
+                for (int r = 0; r < rows; ++r) {
+                    const float ref = a[(size_t) tt * 1024 + r];
+                    const bool bad = std::memcmp(&b[(size_t) tt * 1024 + r], &ref, 4) != 0 ||
+                                     (paired &&
+                                      (std::memcmp(&c[(size_t) tt * 1024 + r], &ref, 4) != 0 ||
+                                       std::memcmp(&c[(size_t) tt * 1024 + 512 + r], &ref, 4) != 0));
+                    if (bad) {
+                        err = name + ": DS4_ROUTER_CHECK - the BF16 router's logits differ (token " +
+                              std::to_string(tt) + ", row " + std::to_string(r) + ")";
+                        return false;
+                    }
+                }
+        }
+        return true;
+    }
     bool f16raw(Dev& d, const std::string& name, uint16_t*& p, std::string& err, size_t* acct) {
         const Tensor* t = pk.get(name);
         if (t != nullptr && (t->dtype == "F32" || t->dtype == "BF16" || t->dtype == "Q8_0")) {   // (a GGUF's)
@@ -1883,6 +2000,47 @@ struct Model::Impl {
     // The markov bias's head as Q8_0 blocks of 32 (34 B: F16 d + 32 int8) instead of F16 values: the same bias sums with the
     // quantisation's error, half the bytes the drafter's five markov steps read (66 MB -> 33 MB) and half the memory.  The
     // pack is untouched: the F32 / F16 / BF16 tensor is quantised as it is loaded.
+    // f32's counterpart for the router's BF16 (3ab0908): the pack's rows verbatim on the device where it holds
+    // BF16; an F32 tensor goes to BF16 too where every value is exactly a BF16's (a pack built from a BF16 GGUF:
+    // the check is once at load), so this pack keeps the same savings.  The kernels widen each value exactly - the
+    // same sums, so the same bits, with half the bytes read.  p stays null (true) where neither holds: the caller
+    // then takes f32.
+    bool bf16raw(Dev& d, const std::string& name, uint16_t*& p, std::string& err, size_t* acct, size_t want) {
+        const Tensor* t = pk.get(name);
+        if (t == nullptr) {
+            err = name + ": not in the pack";
+            return false;
+        }
+        if (t->dtype != "BF16" && t->dtype != "F32") return true;   // (p stays null: the F32 copy below)
+        const size_t n = t->bytes / (t->dtype == "F32" ? 4 : 2);
+        if (want != 0 && n != want) {
+            err = name + ": " + std::to_string(n) + " values, expected " + std::to_string(want);
+            return false;
+        }
+        std::vector<uint8_t> raw(t->bytes);
+        if (!pk.read(*t, raw.data())) {
+            err = name + ": read failed";
+            return false;
+        }
+        std::vector<uint16_t> h;
+        const uint16_t* src = (const uint16_t*) raw.data();
+        if (t->dtype == "F32") {
+            h.resize(n);
+            const float* v = (const float*) raw.data();
+            for (size_t i = 0; i < n; ++i) {
+                uint32_t u;
+                std::memcpy(&u, v + i, 4);
+                h[i] = uint16_t(u >> 16);
+                if (bf16_to_f32(h[i]) != v[i]) return true;   // (not a BF16's value: the F32 copy)
+            }
+            src = h.data();
+        }
+        if (!dalloc(d, p, n, err, acct)) return false;
+        rt::set_device(d.id);
+        CK(rt::copy(p, src, n * 2));
+        return true;
+    }
+
     bool mk_head_q8(Dev& d, const std::string& name, uint8_t*& p, std::string& err, size_t* acct) {
         const Tensor* t = pk.get(name);
         if (t == nullptr || (t->dtype != "F32" && t->dtype != "F16" && t->dtype != "BF16")) {
@@ -2231,7 +2389,12 @@ struct Model::Impl {
             Dev& d = devs[i];
             d.id = ids[i];
             CK(rt::set_device(d.id));
-            CK(rt::stream_create(&d.st));
+            // upstream 6227775: the layers' streams at the device's greatest priority, so the expert cache's and the
+            // prompt path's copy streams never hold a multiprocessor a layer's kernel could take.  Where the SYCL
+            // build reports no queue-priority extension the stream is made at the default.  DS4_STREAM_PRIO=0: off
+            static const bool prio_on =
+                std::getenv("DS4_STREAM_PRIO") == nullptr || std::atoi(std::getenv("DS4_STREAM_PRIO")) != 0;
+            CK(rt::stream_create(&d.st, prio_on));
             sycl::queue& queue = d.st;
             mailbox_queues.push_back(&queue);
             bind_mailbox(queue, mailbox);
@@ -2701,7 +2864,48 @@ struct Model::Impl {
                       dalloc(d, d.tok, 16, err) && dalloc(d, d.emb_rows, W * D, err) &&
                       dalloc(d, d.ext, ((size_t) g.win + W) * g.hd, err) && dalloc(d, d.xe, P * D, err) &&
                       dalloc(d, d.xg, P * g.ff, err) && dalloc(d, d.xu, P * g.ff, err) && dalloc(d, d.xhh, P * g.ff, err) &&
-                      dalloc(d, d.ed, P * D, err) && dalloc(d, d.plan_ptr, P, err);
+                      dalloc(d, d.ed, P * D, err) && dalloc(d, d.plan_ptr, P, err) && dalloc(d, d.cpu_any, 1, err);
+            // DS4_HC_FUSE / DS4_ROUTE_FUSE: checked here, before a request can run - an invalid value or a
+            // pack the fused shapes do not cover refuses the model, as upstream's load checks do (the fused
+            // launches themselves keep the separate ones as a fallback).
+            if (ok) {
+                if (hc_fuse_opt < 0 || hc_fuse_opt > 2 || route_fuse_opt < 0 || route_fuse_opt > 2) {
+                    err = "DS4_HC_FUSE / DS4_ROUTE_FUSE: use 0, 1 or 2";
+                    return false;
+                }
+                if (hc_fuse_opt) {
+                    if (g.dim <= 0 || g.dim % 32 || g.dim > 8 * 1024 || g.hc <= 0 || g.hc > 4) {
+                        err = "DS4_HC_FUSE: the model's dim / hc is outside the fused split's shapes";
+                        return false;
+                    }
+                    hc_fuse = true;
+                    hc_fuse_win = hc_fuse_opt >= 2;
+                    ok = dalloc(d, d.xq8, W * D, err) && dalloc(d, d.xd8, W * (D / 32), err);
+                }
+                if (ok && route_fuse_opt) {
+                    route_fuse = true;
+                    route_fuse_win = route_fuse_opt >= 2;
+                }
+                if (ok && trim_opt) {
+                    if (trim_opt < 0 || trim_opt > 15) {
+                        err = "DS4_DECODE_TRIM: a sum of bits 1, 2, 4 and 8";
+                        return false;
+                    }
+                    trim = trim_opt & 7;
+                    if ((trim & 1) && g.ff % 32) {
+                        err = "DS4_DECODE_TRIM=1: the model's ff is not a multiple of 32";
+                        return false;
+                    }
+                    if ((trim & 2) && g.q_lora % 32) {
+                        err = "DS4_DECODE_TRIM=2: the model's q_lora is not a multiple of 32";
+                        return false;
+                    }
+                    if (ok && (trim & 1))
+                        ok = dalloc(d, d.shq8, W * g.ff, err) && dalloc(d, d.shd8, W * (g.ff / 32), err);
+                    if (ok && (trim & 2))
+                        ok = dalloc(d, d.qq8, W * g.q_lora, err) && dalloc(d, d.qd8, W * (g.q_lora / 32), err);
+                }
+            }
             if (ok && ds4_dbg("DS4_DBG_DEVH"))
                 std::fprintf(stderr, "DBG devh: id=%d h=%p h2=%p\n", d.id, (void*) d.h, (void*) d.h2);
             if (!ok) return false;
@@ -3194,6 +3398,8 @@ struct Model::Impl {
             }
             host_allocs.push_back(m);
             resps = (Resp*) m;
+            if (!hmap(lane_done, 32, err)) return false;
+            *lane_done = 0;
             std::memset((void*) reqs, 0, sizeof(Req) * kRing);
             std::memset((void*) resps, 0, sizeof(Resp) * kRing);
             for (auto& x : layer_of) x.store(-1);
@@ -3216,6 +3422,17 @@ struct Model::Impl {
                 throw;
             }
             if (ahead_mode > 0) pf_th = std::thread([this] { prefetch_loop(); });
+#if defined(_WIN32)
+            if (file_experts && ip_trim_gb > 0) {   // (the in-place pages' working-set trimmer - see its note by ip_ring)
+                ip_base_ws = os::working_set_bytes();
+                ip_on.store(true, std::memory_order_relaxed);
+                ip_th = std::thread([this] { ip_loop(); });
+                if (o.verbose)
+                    std::fprintf(stderr,
+                                 "ds4: in-place experts: working-set trim on (ceiling %.1f GB over the load's %.1f, every %d ms)\n",
+                                 (double) ip_trim_gb, (double) ip_base_ws / 1073741824.0, ip_trim_ms);
+            }
+#endif
         }
         if (o.expert_cache) {
             size_t maxb = 0;
@@ -4548,7 +4765,7 @@ struct Model::Impl {
                       f32(d, P + "hc_attn_base", l.hca_base, err, acct) && f32(d, P + "hc_ffn_fn", l.hcf_fn, err, acct) &&
                       f32(d, P + "hc_ffn_scale", l.hcf_scale, err, acct) &&
                       f32(d, P + "hc_ffn_base", l.hcf_base, err, acct) &&
-                      f32(d, P + "ffn.gate.weight", l.gate_w, err, acct, (size_t) l.n_exp * g.dim) &&
+                      gate(d, P + "ffn.gate.weight", l, err, acct) &&
                       f32(d, P + "ffn.gate.bias", l.gate_bias, err, acct, (size_t) l.n_exp) &&
                       (l.mtp || img_tok < 0 || pk.get(P + "ffn.gate.bias_vl") == nullptr ||
                        f32(d, P + "ffn.gate.bias_vl", l.gate_bias_vl, err, acct, (size_t) l.n_exp)) &&
@@ -5906,6 +6123,29 @@ struct Model::Impl {
         return bad;
     }
 
+    // upstream 8c34c00's Model::broken: after a request, no later one can trust this process - a layer device took a
+    // fault inside a kernel, after which every later call on it returns that error.  SYCL keeps such errors for
+    // throw_asynchronous (no wait: a queue still at work is not one), and a submit on a poisoned context throws at
+    // once, so a trivial kernel asks the rest
+    bool broken() {
+        bool bad = false;
+        for (Dev& d : devs) {
+            if (d.st == nullptr) continue;
+            try {
+                sycl::queue& q = d.st;
+                q.throw_asynchronous();
+                q.submit([](sycl::handler& h) { h.single_task([] {}); });
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "ds4: device %d: %s - the device's state is unknown\n", d.id, e.what());
+                bad = true;
+            } catch (...) {
+                std::fprintf(stderr, "ds4: device %d: the device's state is unknown\n", d.id);
+                bad = true;
+            }
+        }
+        return bad;
+    }
+
     // the state at pos into checkpoint `slot` (the window rings and the compressors' partial groups: the rest of the
     // state is indexed by position, and what lies past a restored position is written again)
     void checkpoint(int slot) {
@@ -6762,8 +7002,19 @@ struct Model::Impl {
                 const int r0 = X * Eh + (j % DB) * RB, r1 = std::min(X * Eh + Eh, r0 + RB);
                 const void* ap[gg::kMxCpuMaxN];
                 float* yp[gg::kMxCpuMaxN];
+                // each token's h copied to this job's stack first: read in place, a call of one or two experts - 40 jobs
+                // a node on the one row both nodes' gate/up jobs just wrote - took 200+ us a down job against 15 from
+                // the copy (upstream c7a96e8, measured on a 2-socket Xeon).  DS4_ACT_COPY=0: read in place
+                static const bool act_copy = std::getenv("DS4_ACT_COPY") == nullptr ||
+                                             std::atoi(std::getenv("DS4_ACT_COPY")) != 0;
+                constexpr size_t kAct = 3072;
+                alignas(64) uint8_t abuf[gg::kMxCpuMaxN * kAct];
                 for (int i = 0; i < en.n; ++i) {
                     ap[i] = hq + (size_t) (en.slot0 + i) * ha;
+                    if (act_copy && ha <= kAct) {
+                        std::memcpy(abuf + (size_t) i * kAct, ap[i], ha);
+                        ap[i] = abuf + (size_t) i * kAct;
+                    }
                     yp[i] = c_yd.data() + (size_t) (en.slot0 + i) * E + r0;
                 }
                 gg::mx_rows(mx_part_ptr(l, en.e, 2, X), dr, FF, r0 - X * Eh, r1 - X * Eh, ap, en.n, yp);
@@ -6946,10 +7197,8 @@ struct Model::Impl {
             }
             return;
         }
-        const int E = g.dim, FF = g.ff, FFh = FF / NH, Eh = E / NH, GQ = E / 256, DQ = FF / 128;
-        const int GB = FFh / 128, DB = Eh / 128, EB = E / 128, FB = FF / 128;
+        const int E = g.dim, FF = g.ff;
         const int ne = (int) ents.size();
-        const float lim = g.lim;
         auto part = [&](int e, int X, int r) {
             const uint8_t* b = l.hh[(size_t) e][(size_t) X];
             kc::Exl3Part p;
@@ -6961,99 +7210,39 @@ struct Model::Impl {
             p.K = l.lay.K[r];
             return p;
         };
-        auto xh = [&](int X, int sl, int r) { return c_xh.data() + ((size_t) (X * kSlots + sl) * 2 + r) * E; };
-        auto xsb = [&](int X, int sl, int r) { return c_xsb.data() + ((size_t) (X * kSlots + sl) * 2 + r) * EB; };
-        auto acc = [&](int X, int sl, int r, int q) {
-            return c_acc.data() + (((size_t) (X * kSlots + sl) * 2 + r) * GQ + q) * FFh;
-        };
-        auto xhd = [&](int sl) { return c_xhd.data() + (size_t) sl * FF; };
-        auto xsd = [&](int sl) { return c_xsd.data() + (size_t) sl * FB; };
-        auto accd = [&](int X, int sl, int q) { return c_accd.data() + ((size_t) (X * kSlots + sl) * DQ + q) * Eh; };
-        std::function<void(int)> f[4];
-        for (int X = 0; X < NH; ++X)
-            f[X] = [&, X](int j) {
-                const Ent& en = ents[(size_t) (j / (2 * GQ))];
-                const int r = (j / GQ) % 2, q = j % GQ;
-                const kc::Exl3Part p = part(en.e, X, r);
-                const float* xp[kc::kExl3CpuMaxN];
-                float* ap[kc::kExl3CpuMaxN];
-                for (int i = 0; i < en.n; ++i) {
-                    const int sl = en.slot0 + i;
-                    const float* xt = x + (size_t) en.tok[i] * ldx;
-                    for (int b = 2 * q; b < 2 * q + 2; ++b)
-                        xsb(X, sl, r)[b] = kc::exl3_cpu_prepare_block(p.suh + b * 128, xt + b * 128, xh(X, sl, r) + b * 128);
-                    xp[i] = xh(X, sl, r);
-                    ap[i] = acc(X, sl, r, q);
-                }
-                if (en.n == 1) kc::exl3_cpu_rows_acc(p, xp[0], q * 16, (q + 1) * 16, ap[0]);
-                else kc::exl3_cpu_rows_acc_n(p, xp, en.n, q * 16, (q + 1) * 16, ap);
-            };
-        run_nodes(ne * 2 * GQ, f);
-        for (int X = 0; X < NH; ++X)
-            f[X] = [&, X](int j) {
-                const Ent& en = ents[(size_t) (j / GB)];
-                const int b = j % GB;
-                const kc::Exl3Part pg = part(en.e, X, 0), pu = part(en.e, X, 1), pd = part(en.e, X, 2);
-                for (int i = 0; i < en.n; ++i) {
-                    const int sl = en.slot0 + i;
-                    float y[2][128], a[128], hb[128];
-                    for (int r = 0; r < 2; ++r) {
-                        for (int c = 0; c < 128; ++c) a[c] = 0.0f;
-                        for (int q = 0; q < GQ; ++q) {
-                            const float* aq = acc(X, sl, r, q) + b * 128;
-                            for (int c = 0; c < 128; ++c) a[c] += aq[c];
-                        }
-                        double xs = 0.0;
-                        for (int k = 0; k < EB; ++k) xs += xsb(X, sl, r)[k];
-                        kc::exl3_cpu_band_out(r == 0 ? pg : pu, a, (float) xs, b * 128, y[r]);
-                    }
-                    for (int c = 0; c < 128; ++c) {
-                        float gv = y[0][c], uv = y[1][c];
-                        if (lim > 0.0f) {
-                            gv = std::min(gv, lim);
-                            uv = std::min(std::max(uv, -lim), lim);
-                        }
-                        hb[c] = gv / (1.0f + std::exp(-gv)) * uv;
-                    }
-                    const int gb = X * GB + b;
-                    xsd(sl)[gb] = kc::exl3_cpu_prepare_block(pd.suh + gb * 128, hb, xhd(sl) + gb * 128);
-                }
-            };
-        run_nodes(ne * GB, f);
-        for (int X = 0; X < NH; ++X)
-            f[X] = [&, X](int j) {
-                const Ent& en = ents[(size_t) (j / DQ)];
-                const int q = j % DQ;
-                const kc::Exl3Part p = part(en.e, X, 2);
-                const float* xp[kc::kExl3CpuMaxN];
-                float* ap[kc::kExl3CpuMaxN];
-                for (int i = 0; i < en.n; ++i) {
-                    xp[i] = xhd(en.slot0 + i);
-                    ap[i] = accd(X, en.slot0 + i, q);
-                }
-                if (en.n == 1) kc::exl3_cpu_rows_acc(p, xp[0], q * 8, (q + 1) * 8, ap[0]);
-                else kc::exl3_cpu_rows_acc_n(p, xp, en.n, q * 8, (q + 1) * 8, ap);
-            };
-        run_nodes(ne * DQ, f);
-        for (int X = 0; X < NH; ++X)
-            f[X] = [&, X](int j) {
-                const Ent& en = ents[(size_t) (j / DB)];
-                const int b = j % DB;
-                const kc::Exl3Part pd = part(en.e, X, 2);
-                for (int i = 0; i < en.n; ++i) {
-                    const int sl = en.slot0 + i;
-                    float a[128];
-                    for (int c = 0; c < 128; ++c) a[c] = 0.0f;
-                    for (int q = 0; q < DQ; ++q) {
-                        const float* aq = accd(X, sl, q) + b * 128;
-                        for (int c = 0; c < 128; ++c) a[c] += aq[c];
-                    }
-                    double xs = 0.0;
-                    for (int k = 0; k < FB; ++k) xs += xsd(sl)[k];
-                    kc::exl3_cpu_band_out(pd, a, (float) xs, b * 128, c_yd.data() + (size_t) sl * E + (size_t) X * Eh + b * 128);
-                }
-            };
-        run_nodes(ne * DB, f);
+        Exl3Lane& c = lane_x;
+        c.E = E;
+        c.FF = FF;
+        c.NH = NH;
+        c.slots = kSlots;
+        c.lim = g.lim;
+        c.xh = c_xh.data();
+        c.xsb = c_xsb.data();
+        c.acc = c_acc.data();
+        c.xhd = c_xhd.data();
+        c.xsd = c_xsd.data();
+        c.accd = c_accd.data();
+        c.yd = c_yd.data();
+        if (!c.cnt) c.alloc_counters(2);
+        auto nodes = [&](int n, const std::function<void(int)>* f, int) { run_nodes(n, f); };
+        // DS4_CPU_FLOW=0: the four steps as four batches (as before).  DS4_CPU_FLOW_CHECK=1: each call's flow
+        // outputs against the steps', bit for bit (twice the time)
+        static const bool flow_on =
+            std::getenv("DS4_CPU_FLOW") == nullptr || std::atoi(std::getenv("DS4_CPU_FLOW")) != 0;
+        static const bool flow_check = flow_on && std::getenv("DS4_CPU_FLOW_CHECK") != nullptr;
+        exl3_experts(c, x, ldx, ents.data(), ne, part, nodes, [](int) {}, flow_on);
+        if (flow_check && ne > 0) {
+            int rows = 0;
+            for (const Ent& en : ents) rows = std::max(rows, en.slot0 + en.n);
+            std::vector<float> fl(c_yd.begin(), c_yd.begin() + (size_t) rows * E);
+            exl3_experts(c, x, ldx, ents.data(), ne, part, nodes, [](int) {}, false);
+            const bool bad = std::memcmp(fl.data(), c_yd.data(), fl.size() * 4) != 0;
+            static std::atomic<long long> calls{0}, diffs{0};
+            if (bad) ++diffs;
+            const long long nc = ++calls;
+            if (nc % 256 == 0 || bad)
+                std::fprintf(stderr, "ds4: CPU flow check: %lld calls, %lld differed\n", nc, diffs.load());
+        }
     }
 
     // ---- the expert cache.  A swap moves a CPU-lane expert (`in`) into the layer's spare VRAM slot and the VRAM expert it
@@ -7407,6 +7596,12 @@ struct Model::Impl {
             for (int m = 0; m < l.nm; ++m) {
                 Layer& x = member(l, m);
                 const Dev& dm = devs[(size_t) x.dev];
+                // tab_pin's earlier entries are read only when the copies queued on the stream run (upstream
+                // 32f3c8c's table-input sync): before an overwrite, the stream's earlier work must be done
+                if (rt::stream_sync(dm.st) != rt::Result::success) {
+                    std::fprintf(stderr, "ds4: table-input predecessor sync failed - the expert tables are unknown\n");
+                    std::abort();
+                }
                 l.tab_pin[2 * m] = (unsigned long long) slot_ptr(x, l.slot[(size_t) sw.in]);
                 l.tab_pin[2 * m + 1] = 0ull;
                 rt::set_device(dm.id);   // (stream order: before the next window)
@@ -7497,7 +7692,7 @@ struct Model::Impl {
         const int j = l0.il + a, end = l0.mtp ? g.nl + g.n_mtp : g.nl;
         if (j >= end || j >= (int) L.size()) return nullptr;
         const Layer& n = L[(size_t) j];
-        if (n.dev != l0.dev || n.mtp != l0.mtp || n.lay.fmt != gg::kFmtMXFP4 || n.gate_w == nullptr || n.n_exp > 1024 ||
+        if (n.dev != l0.dev || n.mtp != l0.mtp || n.lay.fmt != gg::kFmtMXFP4 || n.gate() == nullptr || n.n_exp > 1024 ||
             (int) n.slot.size() < n.n_exp)
             return nullptr;
         for (int e = 0; e < n.n_exp; ++e)
@@ -7544,8 +7739,12 @@ struct Model::Impl {
                     if ((fl[e] & 8) || !file_read(n, e)) continue;
                     fl[e] |= 8;
                     if (store) store->prefetch(j, e);
-                    else
+                    else {
                         for (int q = 0; q < 3; ++q) pf_want.push_back({mx_mat(n, e, q), mx_part_bytes(n, q)});
+#if defined(_WIN32)
+                        ip_note_expert(n, e);   // (the trimmer: prefetched pages enter this process's working set)
+#endif
+                    }
                     ++st.ahead_pf;
                 }
         }
@@ -7556,6 +7755,62 @@ struct Model::Impl {
         }
         pf_cv.notify_one();
     }
+
+#if defined(_WIN32)
+    // (the in-place trimmer, above) a range of a file's mapping this process is about to read or has just read:
+    // noted for the trimmer, oldest first.  Cheap (a deque push and a count under a light mutex) and skipped
+    // entirely when it is off.  Each use notes again, so a range's count reaching zero at the oldest end - the only
+    // place the trimmer demotes - means no use since that note: only genuinely cold pages ever leave the working
+    // set (a hot expert's stale older notes decrement a count that a newer use raised, and demote nothing).
+    void ip_note(const void* p, size_t n) {
+        if (!ip_on.load(std::memory_order_relaxed) || p == nullptr || n == 0) return;
+        std::lock_guard<std::mutex> lk(ip_mu);
+        if (ip_ring.size() >= 131072) ip_drop();
+        ++ip_live[p];
+        ip_ring.push_back({p, n});
+    }
+    // expert e of layer l the CPU lane reads in place (neither VRAM nor the RAM tier holds it): its matrices noted
+    void ip_note_expert(const Layer& l, int e) {
+        if (!ip_on.load(std::memory_order_relaxed) || !file_read(l, e)) return;
+        if (l.lay.fmt == gg::kFmtMXFP4)
+            for (int r = 0; r < 3; ++r) ip_note(mx_mat(l, e, r), mx_part_bytes(l, r));
+        else if ((size_t) e < l.region_file.size())
+            ip_note(pk.at(l.region_file[(size_t) e], l.region_off[(size_t) e]), l.region_bytes[(size_t) e]);
+    }
+    // (the ring's oldest note, dropped without demotion: its count kept true)
+    void ip_drop() {
+        const auto& f = ip_ring.front();
+        const auto it = ip_live.find(f.first);
+        if (it != ip_live.end() && --it->second == 0) ip_live.erase(it);
+        ip_ring.pop_front();
+    }
+    void ip_loop() {
+        const uint64_t ceiling = ip_base_ws + (uint64_t) ((double) ip_trim_gb * 1073741824.0);
+        while (!quit.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(ip_trim_ms));
+            if (quit.load(std::memory_order_relaxed)) return;
+            uint64_t ws = os::working_set_bytes();
+            for (int pass = 0; ws > ceiling && pass < 8; ++pass) {
+                std::vector<std::pair<const void*, size_t>> take;
+                {
+                    std::lock_guard<std::mutex> lk(ip_mu);
+                    for (size_t i = 0; i < 256; ++i) {
+                        if (ip_ring.empty()) break;
+                        const auto f = ip_ring.front();
+                        const auto it = ip_live.find(f.first);
+                        const bool cold = it == ip_live.end() || it->second <= 1;   // (a newer note: still hot)
+                        if (it != ip_live.end() && --it->second == 0) ip_live.erase(it);
+                        ip_ring.pop_front();
+                        if (cold) take.push_back(f);
+                    }
+                }
+                if (take.empty()) break;   // (everything noted is still in use: the growth is elsewhere)
+                for (const auto& r : take) ip_unlocked += os::unlock_range(r.first, r.second);
+                ws = os::working_set_bytes();
+            }
+        }
+    }
+#endif
 
     // the decode path's host side: each published routing in turn - its CPU lane experts (if any) into the answer's
     // part, then the answer's seq.  Spins while requests come (a token's 40 layers), then naps after DS4_LANE_SPIN_MS.
@@ -7664,6 +7919,9 @@ struct Model::Impl {
                                 ++st.ahead_cold;
                                 st.ahead_cold_hit += (fl[e] >> 3) & 1;
                             }
+#if defined(_WIN32)
+                            ip_note_expert(l, e);   // (the CPU lane computes it in place: note its pages)
+#endif
                             picks.push_back({e, t * kPicks + i});
                         }
                     }
@@ -7735,34 +7993,59 @@ struct Model::Impl {
                 }
             }
             std::atomic_ref<unsigned>(rp.seq).store(next, std::memory_order_release);
+            *(volatile unsigned*) lane_done = next;
             ++next;
             last = std::chrono::steady_clock::now();
         }
     }
 
     // a GGUF's matrices (BF16 / MXFP4) to its own kernels, EXL3 ones to x3's
-    static bool mv_any(const x3::MvJob* j, int n, rt::Queue s) {
+    static bool mv_any(const x3::MvJob* j, int n, rt::Queue s, const gg::PreQ8* pre = nullptr) {
         bool g = false;
         for (int i = 0; i < n; ++i) g = g || j[i].m->fmt != 0;
-        return g ? gg::mv(j, n, s) : x3::mv(j, n, s);
+        return g ? (pre != nullptr ? gg::mv(j, n, s, pre) : gg::mv(j, n, s)) : x3::mv(j, n, s);
     }
-    bool mv(Dev& d, std::initializer_list<x3::MvJob> jobs, std::string& err) {
+    bool mv(Dev& d, std::initializer_list<x3::MvJob> jobs, std::string& err, const gg::PreQ8* pre = nullptr) {
         x3::MvJob j[x3::kMaxMvJobs];
         int n = 0;
         for (const x3::MvJob& x : jobs) j[n++] = x;
-        if (!mv_any(j, n, d.st)) {
+        if (!mv_any(j, n, d.st, pre)) {
             err = "exl3 mv failed";
             return false;
         }
         return true;
     }
-    bool mv_n(Dev& d, x3::MvJob* j, int n, std::string& err) {
+    bool mv_n(Dev& d, x3::MvJob* j, int n, std::string& err, const gg::PreQ8* pre = nullptr) {
         for (int a = 0; a < n; a += x3::kMaxMvJobs)
-            if (!mv_any(j + a, std::min(x3::kMaxMvJobs, n - a), d.st)) {
+            if (!mv_any(j + a, std::min(x3::kMaxMvJobs, n - a), d.st, pre)) {
                 err = "exl3 mv failed";
                 return false;
             }
         return true;
+    }
+    // (DS4_HC_FUSE) hc_split_pre_norm's arguments for layer l's attention (ffn false) or FFN split:
+    // its split weights and norm, the model's constants, this token's buffers
+    HcFuse hc_args(const Layer& l, bool ffn, const float* mixes, const float* h, const float* mix, float* x,
+                   int8_t* q, float* qd, float* pre, float* post, float* comb) const {
+        HcFuse a;
+        a.mixes = mixes;
+        a.scale = ffn ? l.hcf_scale : l.hca_scale;
+        a.base = ffn ? l.hcf_base : l.hca_base;
+        a.hc = g.hc;
+        a.iters = g.sinkhorn;
+        a.hc_eps = g.hc_eps;
+        a.pre = pre;
+        a.post = post;
+        a.comb = comb;
+        a.h = h;
+        a.mix = mix;
+        a.w = ffn ? l.ffn_norm : l.attn_norm;
+        a.dim = g.dim;
+        a.eps = g.eps;
+        a.x = x;
+        a.q = q;
+        a.qd = qd;
+        return a;
     }
     // y[c] = x[c] W for the T activations x + c * x_cs (floats), into y + c * y_cs
     static x3::MvJob job(const x3::Mat& m, const float* x, float* y, int T = 1, size_t x_cs = 0, size_t y_cs = 0,
@@ -8024,6 +8307,46 @@ struct Model::Impl {
         return t;
     }
 
+    void set_logit_bias(const std::vector<std::pair<int, float>>& e) {
+        cur_bias = nullptr;
+        if (e.empty()) return;
+        std::string key;
+        for (const auto& [id, b] : e) {   // (the float's bits, not a decimal: to_string's 6 digits collide below 1e-6)
+            uint32_t bits;
+            std::memcpy(&bits, &b, 4);
+            key += std::to_string(id) + ':' + std::to_string(bits) + ',';
+        }
+        for (BiasRow& r : bias_rows)
+            if (r.key == key) {
+                cur_bias = r.row;
+                return;
+            }
+        Dev& d = devs[(size_t) head_dev];
+        rt::set_device(d.id);
+        BiasRow r;
+        if (bias_rows.size() >= 4) {   // (the oldest row again: its last pick is done before it is written)
+            r = bias_rows.front();
+            bias_rows.erase(bias_rows.begin());
+            if (rt::stream_sync(d.st) != rt::Result::success) return;
+        } else {
+            std::string err;
+            if (!dalloc(d, r.row, (size_t) g.vocab, err)) {
+                std::fprintf(stderr, "ds4: the logit_bias row: %s - this request's picks without it\n", err.c_str());
+                return;
+            }
+        }
+        std::vector<float> h((size_t) g.vocab, 0.0f);
+        for (const auto& [id, b] : e)
+            if (id >= 0 && id < g.vocab) h[(size_t) id] = b;
+        if (rt::copy(r.row, h.data(), h.size() * 4) != rt::Result::success) {
+            std::fprintf(stderr, "ds4: the logit_bias row could not be written - this request's picks without it\n");
+            return;
+        }
+        r.key = std::move(key);
+        bias_rows.push_back(r);
+        cur_bias = r.row;
+    }
+
     // [y, drafts] at positions pos ..: the trunk's verdict, its next token, and the state back to what it kept.
     // Greedy: the drafts the trunk's argmax agrees with.  Sampled: the speculative-sampling rule over the request's own
     // chain (top_k, top_p, min_p, temperature): draft d stands with probability min(1, p(d) / q(d)), q the distribution
@@ -8050,6 +8373,7 @@ struct Model::Impl {
             strata::dsv41k::SamplerParams sp;
             sp.greedy = true;
             sp.temperature = 0.0f;
+            sp.logit_bias = cur_bias;
             strata::dsv41k::sample_tokens(hd.logits, T, V, nullptr, 0, sp, d_ints + 16, hd.st);   // (the T rows at once)
             CK(rt::readback_async(h_idx, d_ints + 16, (size_t) T * 4, hd.st));
             CK(rt::stream_sync(hd.st));
@@ -8080,11 +8404,13 @@ struct Model::Impl {
             sp.min_p = min_p;
             sp.seed = seed;
             sp.counter = counter;
+            sp.logit_bias = cur_bias;
             strata::dsv41k::sample_verify(hd.logits, n, V, sp, d_specq, d_ints + 32, d_ints + 16, hd.st);
             CK(rt::readback_async(h_idx, d_ints + 16, (size_t) n * 4, hd.st));
             CK(rt::stream_sync(hd.st));
             while (m < n && h_idx[m] == drafts[(size_t) m]) ++m;
-            next = m < n ? h_idx[m] : sample_row(n, temperature, top_p, top_k, min_p, seed, counter + (uint64_t) n, nullptr);
+            next = m < n ? h_idx[m] : sample_row(n, temperature, top_p, top_k, min_p, seed, counter + (uint64_t) n,
+                                                 cur_bias);
         }
         drafts_q = false;
         rollback(p0, T, m + 1);
@@ -8411,7 +8737,7 @@ struct Model::Impl {
         hc_split(c.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, c.pre, c.f_post, c.f_comb, s);
         hc_pre_norm(c.h, c.a_pre, l.ffn_norm, D, H, T, g.eps, c.x, s);
         native_f16::rows(c.x, D, nullptr, T, D, c.x16, s, d.native_f16_output);
-        gemv_f32(l.gate_w, c.x, l.n_exp, D, T, c.glog, 1024, s);   // (F32 x: the token path's bits)
+        gemv_f32(l.gate(), c.x, l.n_exp, D, T, c.glog, 1024, s);   // (F32 x: the token path's bits)
         for (int r0 = 0; r0 < T; r0 += kVlRows) {   // (route()'s image bits cover kVlRows rows a call)
             const int nr = std::min(kVlRows, T - r0);
             VlBits vb;
@@ -10135,13 +10461,29 @@ struct Model::Impl {
         dump_sub(d, "h_in", l.il, p0, T, d.h, (size_t) T * H * D * 4);
         dump_sub(d, "ring_in", l.il, p0, T, l.win, (size_t) g.win * kv_row_bytes(kKvFp8, HD));
         // attention
-        hc_mix_split(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, d.hccnt, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps,
-                     d.a_pre, d.a_post, d.a_comb, s);
+        const bool fuse = hc_fuse && !l.mtp && (T == 1 || (hc_fuse_win && T <= kWin));
+        gg::PreQ8 xq8;
+        if (fuse) {
+            // DS4_HC_FUSE: the split and pre-norm in one launch, x's int8 rounding there; a shape the
+            // fused launch does not take (it returns 0) keeps the separate launches.
+            hc_mix(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, s);
+            const int fused = hc_split_pre_norm(hc_args(l, false, d.mix, d.h, d.pre, d.x, d.xq8, d.xd8,
+                                                        d.a_pre, d.a_post, d.a_comb), s, T);
+            if (fused) {
+                if (fused == 2) { xq8.x = d.x; xq8.q = d.xq8; xq8.d = d.xd8; xq8.k = D; xq8.rows = T; }
+            } else {
+                hc_split(d.mix, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps, T, d.a_pre, d.a_post, d.a_comb, s);
+                hc_pre_norm(d.h, d.pre, l.attn_norm, D, H, T, g.eps, d.x, s);
+            }
+        } else {
+            hc_mix_split(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, d.hccnt, l.hca_scale, l.hca_base, H, g.sinkhorn, g.hc_eps,
+                         d.a_pre, d.a_post, d.a_comb, s);
+            hc_pre_norm(d.h, d.pre, l.attn_norm, D, H, T, g.eps, d.x, s);
+        }
         dump_sub(d, "a_mix", l.il, p0, T, d.mix, (size_t) T * 32 * 4);
         dump_sub(d, "a_pre", l.il, p0, T, d.a_pre, (size_t) T * 8 * 4);
         dump_sub(d, "a_post", l.il, p0, T, d.a_post, (size_t) T * 8 * 4);
         dump_sub(d, "a_comb", l.il, p0, T, d.a_comb, (size_t) T * 64 * 4);
-        hc_pre_norm(d.h, d.pre, l.attn_norm, D, H, T, g.eps, d.x, s);
         dump_sub(d, "pre_in", l.il, p0, T, d.pre, (size_t) T * 8 * 4);
         dump_sub(d, "attn_x", l.il, p0, T, d.x, (size_t) T * D * 4);
         {
@@ -10151,17 +10493,23 @@ struct Model::Impl {
             j[nj++] = job(l.wkv, d.x, d.kvr, T, D, HD);
             if (l.kv_src) j[nj++] = job(l.c_wkv, d.x, d.ckr, T, D, HD);
             if (l.kv_src && l.ratio > 1) j[nj++] = job(l.c_wgate, d.x, d.cgr, T, D, HD);
-            if (!mv_n(d, j, nj, err)) return false;
+            if (!mv_n(d, j, nj, err, xq8.q ? &xq8 : nullptr)) return false;
         }
         dump_sub(d, "qr_raw", l.il, p0, T, d.qr, (size_t) T * g.q_lora * 4);
         dump_sub(d, "kvr_raw", l.il, p0, T, d.kvr, (size_t) T * HD * 4);
         Finish fq;
         fq.w = l.q_norm;
         fq.eps = g.eps;
+        gg::PreQ8 qq8;
+        if (trim & 2) {
+            fq.q8 = d.qq8;
+            fq.q8d = d.qd8;
+            qq8.x = d.qr; qq8.q = d.qq8; qq8.d = d.qd8; qq8.k = g.q_lora; qq8.rows = T;
+        }
         finish(d.qr, T, g.q_lora, g.q_lora, fq, s);
         dump_sub(d, "qr", l.il, p0, T, d.qr, (size_t) T * g.q_lora * 4);
         if (NHL > 0) {
-            if (!mv(d, {job(l.wq_b, d.qr, d.q, T, g.q_lora, HQ)}, err)) return false;
+            if (!mv(d, {job(l.wq_b, d.qr, d.q, T, g.q_lora, HQ)}, err, qq8.q ? &qq8 : nullptr)) return false;
             Finish fr;
             fr.rd = g.rd;
             fr.pos = (int) p0;
@@ -10215,14 +10563,30 @@ struct Model::Impl {
                     fc.w = l.c_norm;
                     fc.eps = g.eps;
                     finish(d.ckr, T, HD, HD, fc, s);
-                    CK(rt::copy_async(d.latent, d.ckr, (size_t) T * HD * 4, s));
+                    {
+                        CopyRegions cr;
+                        cr.dst[0] = d.latent;
+                        cr.src[0] = d.ckr;
+                        cr.bytes[0] = (size_t) T * HD * 4;
+                        cr.n = 1;
+                        if (!(trim & 4) || !copy_regions(cr, s))
+                            CK(rt::copy_async(d.latent, d.ckr, (size_t) T * HD * 4, s));
+                    }
                 } else {
                     if (spec_win && l.c_snap != nullptr) {   // to replay the accepted rows if drafts are rejected
                         const size_t ns = (size_t) R * HD * 4, nr = (size_t) T * HD * 4;
-                        CK(rt::copy_async(l.c_snap, l.c_kv, ns, s));
-                        CK(rt::copy_async(l.c_snap + (size_t) R * HD, l.c_score, ns, s));
-                        CK(rt::copy_async(l.c_rows, d.ckr, nr, s));
-                        CK(rt::copy_async(l.c_rows + (size_t) kWin * HD, d.cgr, nr, s));
+                        CopyRegions cr;
+                        cr.dst[0] = l.c_snap;                 cr.src[0] = l.c_kv;    cr.bytes[0] = ns;
+                        cr.dst[1] = l.c_snap + (size_t) R * HD; cr.src[1] = l.c_score; cr.bytes[1] = ns;
+                        cr.dst[2] = l.c_rows;                 cr.src[2] = d.ckr;     cr.bytes[2] = nr;
+                        cr.dst[3] = l.c_rows + (size_t) kWin * HD; cr.src[3] = d.cgr; cr.bytes[3] = nr;
+                        cr.n = 4;
+                        if (!(trim & 4) || !copy_regions(cr, s)) {
+                            CK(rt::copy_async(l.c_snap, l.c_kv, ns, s));
+                            CK(rt::copy_async(l.c_snap + (size_t) R * HD, l.c_score, ns, s));
+                            CK(rt::copy_async(l.c_rows, d.ckr, nr, s));
+                            CK(rt::copy_async(l.c_rows + (size_t) kWin * HD, d.cgr, nr, s));
+                        }
                     }
                     compress_win(d.ckr, d.cgr, l.c_kv, l.c_score, R, (int) p0, T, HD, l.c_norm, g.eps, d.latent, s);
                     dump_sub(d, "ckr", l.il, p0, T, d.ckr, (size_t) T * HD * 4);
@@ -10369,9 +10733,25 @@ struct Model::Impl {
         dump_sub(d, "h_attn", l.il, p0, T, d.h, (size_t) T * H * D * 4);
         prof_mark(d, 1);
         // the MoE
-        hc_mix_split(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, d.hccnt, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps,
-                     d.pre, d.f_post, d.f_comb, s);
-        hc_pre_norm(d.h, d.a_pre, l.ffn_norm, D, H, T, g.eps, d.x, s);
+        gg::PreQ8 fq8;
+        if (fuse) {
+            // DS4_HC_FUSE: the FFN split and pre-norm in one launch; at 2, x's int8 rounding there too,
+            // for the shared expert's GEMVs.
+            hc_mix(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, s);
+            const int fused = hc_split_pre_norm(hc_args(l, true, d.mix, d.h, d.a_pre, d.x,
+                                                        hc_fuse_win ? d.xq8 : nullptr, hc_fuse_win ? d.xd8 : nullptr,
+                                                        d.pre, d.f_post, d.f_comb), s, T);
+            if (fused) {
+                if (fused == 2) { fq8.x = d.x; fq8.q = d.xq8; fq8.d = d.xd8; fq8.k = D; fq8.rows = T; }
+            } else {
+                hc_split(d.mix, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps, T, d.pre, d.f_post, d.f_comb, s);
+                hc_pre_norm(d.h, d.a_pre, l.ffn_norm, D, H, T, g.eps, d.x, s);
+            }
+        } else {
+            hc_mix_split(d.h, l.hcf_fn, H * D, (2 + H) * H, T, g.eps, d.mix, d.hccnt, l.hcf_scale, l.hcf_base, H, g.sinkhorn, g.hc_eps,
+                         d.pre, d.f_post, d.f_comb, s);
+            hc_pre_norm(d.h, d.a_pre, l.ffn_norm, D, H, T, g.eps, d.x, s);
+        }
         dump_sub(d, "f_pre", l.il, p0, T, d.pre, (size_t) T * 8 * 4);
         dump_sub(d, "f_post", l.il, p0, T, d.f_post, (size_t) T * 8 * 4);
         dump_sub(d, "f_comb", l.il, p0, T, d.f_comb, (size_t) T * 64 * 4);
@@ -10380,27 +10760,61 @@ struct Model::Impl {
             // the routing goes to the service thread through the mailbox (a group's lead publishes it, the members
             // make the same plan) while the device runs the shared expert and the VRAM experts (from the plan the
             // router made), and waits for the answer only before the experts' sum
-            gemv_f32(l.gate_w, d.x, l.n_exp, D, T, d.glog, 1024, s);
             const unsigned sq = wp.seq[l.il];
             const int slot = (int) (sq % kRing);
             const bool lead = mi == 0 && sq != 0, wait = lead && wp.wait[l.il];   // (plan_request)
-            int na[2] = {0, 0};   // lookahead: the next layers' guesses (their gate on this FFN input), published below
-            for (int a = 1; lead && a <= std::min(2, ahead_mode); ++a) {
-                const Layer* nx = ahead_layer(L0, a);
-                if (nx == nullptr) break;
-                const int m = a == 1 ? std::max(1, std::min(kAhead1, nx->k_exp + ahead_extra)) : std::min(kPicks, nx->k_exp);
-                float* gl = d.glog_a + (size_t) (a - 1) * kWin * 1024;
-                gemv_f32(nx->gate_w, d.x, nx->n_exp, D, T, gl, 1024, s);   // (normed with the next layer's FFN
-                                                                         // weights instead: the same hit rate)
-                route_ahead(gl, nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s);
-                na[a - 1] = m;
+            // DS4_ROUTE_FUSE: this layer's and the next layer's gate GEMVs in one launch, the routing and the
+            // lookahead in another (one lookahead layer); a shape the pair launches do not take keeps the
+            // separate launches.
+            const Layer* nx1 = route_fuse && !l.mtp && lead && ahead_mode == 1 &&
+                               (T == 1 || (route_fuse_win && T <= kWin)) ? ahead_layer(L0, 1) : nullptr;
+            const int m1 = nx1 ? std::max(1, std::min(kAhead1, nx1->k_exp + ahead_extra)) : 0;
+            bool gl_pair = false, fused_route = false;
+            if (nx1 != nullptr && l.gate() != nullptr && nx1->gate() != nullptr && l.gate_bias != nullptr &&
+                nx1->gate_bias != nullptr && l.n_exp >= 1 && l.n_exp <= 1024 &&
+                nx1->n_exp >= 1 && nx1->n_exp <= 1024 && l.k_exp >= 1 && l.k_exp <= kPicks && m1 >= 1 &&
+                D >= 4 && D % 4 == 0 && D <= kMaxDim) {
+                gl_pair = gemv_f32_pair(l.gate(), l.n_exp, d.glog, nx1->gate(), nx1->n_exp, d.glog_a, d.x, D, s, T, 1024);
+                if (gl_pair) {
+                    RoutePair rp;
+                    rp.logits = d.glog; rp.bias = l.gate_bias; rp.n = l.n_exp; rp.k = l.k_exp;
+                    rp.route_scale = g.route_scale; rp.vram = l.vram_tab; rp.x = d.x; rp.dim = D;
+                    rp.idx = d.ridx; rp.w = d.rw; rp.plan_ptr = d.plan_ptr; rp.req = reqs + slot;
+                    rp.bias_vl = l.gate_bias_vl; rp.vl = l.mtp ? 0u : wp.vl; rp.seq = sq;
+                    rp.na0 = m1; rp.na1 = 0;
+                    rp.a_logits = d.glog_a; rp.a_bias = nx1->gate_bias; rp.a_n = nx1->n_exp; rp.m = m1; rp.off = 0;
+                    rp.T = T;
+                    fused_route = route_pair(rp, s);
+                }
             }
-            route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
-                          d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
-                          na[1]);
-            if (!mv(d, {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)}, err)) return false;
-            swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
-            if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, FF, D)}, err)) return false;
+            if (!fused_route) {
+                if (!gl_pair) gemv_f32(l.gate(), d.x, l.n_exp, D, T, d.glog, 1024, s);
+                int na[2] = {0, 0};   // lookahead: the next layers' guesses (their gate on this FFN input), published below
+                for (int a = 1; lead && a <= std::min(2, ahead_mode); ++a) {
+                    const Layer* nx = ahead_layer(L0, a);
+                    if (nx == nullptr) break;
+                    const int m = a == 1 ? std::max(1, std::min(kAhead1, nx->k_exp + ahead_extra)) : std::min(kPicks, nx->k_exp);
+                    float* gl = d.glog_a + (size_t) (a - 1) * kWin * 1024;
+                    // (normed with the next layer's FFN weights instead: the same hit rate)
+                    if (!(gl_pair && nx == nx1)) gemv_f32(nx->gate(), d.x, nx->n_exp, D, T, gl, 1024, s);
+                    route_ahead(gl, nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s);
+                    na[a - 1] = m;
+                }
+                route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
+                              d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl,
+                              na[0], na[1], lead && self_answer ? resps + slot : nullptr, d.cpu_any, lane_done);
+            }
+            {
+                x3::MvJob js[2] = {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)};
+                if (!mv_n(d, js, 2, err, fq8.q ? &fq8 : nullptr)) return false;
+            }
+            gg::PreQ8 sq8;
+            if ((trim & 1) && swiglu_q8(d.sg, d.su, T * FF, g.lim, d.sh, d.shq8, d.shd8, s)) {
+                sq8.x = d.sh; sq8.q = d.shq8; sq8.d = d.shd8; sq8.k = FF; sq8.rows = T;
+            } else {
+                swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
+            }
+            if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, FF, D)}, err, sq8.q ? &sq8 : nullptr)) return false;
             prof_mark(d, 2);
             const x3::ExpertLayout& lay = nm > 1 ? l.hlay : l.lay;
             if (T == 1 && moe_token_path) {
@@ -10495,7 +10909,7 @@ struct Model::Impl {
         static const bool phases = ds4_dbg("DS4_PHASES");   // debugging: where a decode layer's host time goes
         static double ph[8] = {0}, ph_prev = 0; static long ph_n = 0;
         const double ph0 = phases ? now_ms() : 0.0;
-        gemv_f32(l.gate_w, d.x, l.n_exp, D, T, d.glog, 1024, s);
+        gemv_f32(l.gate(), d.x, l.n_exp, D, T, d.glog, 1024, s);
         VlBits vb = {};
         vb.w[0] = l.mtp ? 0u : wp.vl;
         route(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, d.ridx, d.rw, s, l.gate_bias_vl,
@@ -10655,6 +11069,7 @@ struct Model::Impl {
         sp.min_p = min_p;
         sp.seed = seed;
         sp.counter = counter;
+        sp.logit_bias = cur_bias;
         strata::dsv41k::sample_tokens(d.logits + (size_t) std::max(0, n_logits - 1) * g.vocab, 1, g.vocab, nullptr, 0,
                                        sp, d.tok, d.st);
         int t = -1;
@@ -11143,6 +11558,7 @@ bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::
 int Model::feed_unit() const { return p_->chunk > 0 ? std::max(p_->chunk, (int) p_->o.max_context) : kWin; }
 void Model::set_progress(std::function<void(int64_t)> f) { p_->progress = std::move(f); }
 void Model::set_cancel(std::function<bool()> f) { p_->cancel = std::move(f); }
+void Model::set_logit_bias(const std::vector<std::pair<int, float>>& entries) { p_->set_logit_bias(entries); }
 bool Model::cancelled() const { return p_->halted; }
 int Model::sample(float t, float tp, int tk, float mp, uint64_t seed, uint64_t counter) {
     return p_->sample(t, tp, tk, mp, seed, counter);
@@ -11185,6 +11601,7 @@ int Model::vocab() const { return p_->g.vocab; }
 const std::vector<int32_t>& Model::tokens() const { return p_->toks; }
 void Model::reset() { p_->reset(); }
 bool Model::router_nonfinite() { return p_->router_nonfinite(); }
+bool Model::broken() { return p_->broken(); }
 void Model::checkpoint(int slot) { p_->checkpoint(slot); }
 bool Model::restore(int64_t limit) { return p_->restore(limit); }
 void Model::pin() { p_->pin(); }

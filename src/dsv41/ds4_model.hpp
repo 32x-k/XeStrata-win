@@ -157,6 +157,11 @@ public:
     /// on, several at a chunk all of them reach - and feed() returns false with cancelled() true.  The state past the
     /// prompt's start is then not usable: restore() a checkpoint kept before the feed, or reset().
     void set_cancel(std::function<bool()> f);
+    /// The request's logit_bias (GEN logit_bias=<id>:<bias>,...): each bias is added to its token's logit before the
+    /// request's sampling, for every pick after this - sample() and verify() alike (-100 bans the token).  The
+    /// drafter's own proposals are not biased; the verify judges them by the biased logits.  Empty: none, the picks
+    /// exactly as without.
+    void set_logit_bias(const std::vector<std::pair<int, float>>& entries);
     bool cancelled() const;   // the last feed() / feed_mark() ended early on a Stop
     int64_t pos() const;
     int64_t max_context() const;
@@ -171,6 +176,10 @@ public:
     void settle_idle(const std::atomic<bool>& cancel);
     /// true once if the router met non-finite scores on any device since the last call (see router_nonfinite_take)
     bool router_nonfinite();
+    /// After a request: true when no later one can trust this process - a layer GPU took a fault inside a kernel
+    /// (its context returns that error from then on).  The serve loop then ends the engine (exit 3) once the
+    /// request's DONE is out, and the server starts a fresh one for the next request (upstream 8c34c00).
+    bool broken();
     /// Keep the state at the current position in checkpoint slot 0 or 1 (the end of a prompt, the position before it);
     /// restore(limit) goes back to the latest one at or before limit (-1: none).
     void checkpoint(int slot = 0);

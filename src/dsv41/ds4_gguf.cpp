@@ -233,7 +233,7 @@ bool mv_iq(const x3::Mat& m) { return m.fmt == kFmtGG && m.K != kTypeMXFP4 && iq
 bool mv_low(const x3::Mat& m) {
     return m.fmt == kFmtGG && m.K != kTypeMXFP4 && m.K != iq::kQ5_K && iq::supported(m.K) && m.k % 256 == 0;
 }
-unsigned mv_batch(const x3::MvJob* jobs, int n, sycl::queue& s) {
+unsigned mv_batch(const x3::MvJob* jobs, int n, sycl::queue& s, const PreQ8* pre = nullptr) {
     bool any = false;
     for (int i = 0; i < n; ++i)
         any = any || ((jobs[i].m->fmt == kFmtBF16 || jobs[i].m->fmt == kFmtQ8_0 || mv_k(*jobs[i].m) || (mv_iq(*jobs[i].m) && jobs[i].ncol > 1)) &&
@@ -265,6 +265,13 @@ unsigned mv_batch(const x3::MvJob* jobs, int n, sycl::queue& s) {
             const bool xa = (reinterpret_cast<uintptr_t>(b.x) & 15u) == 0 && (b.ncol == 1 || b.xcs % 4 == 0);
             aligned[0] = aligned[0] && xa && m.k % 8 == 0 && b.ld % 8 == 0 &&
                          (reinterpret_cast<uintptr_t>(b.w) & 15u) == 0;
+        } else if (pre != nullptr && b.x == pre->x && b.k == pre->k && b.ncol == pre->rows &&
+                   (b.ncol == 1 || b.xcs == size_t(pre->k))) {
+            // DS4_HC_FUSE: x rounded where it was made, the activations' own quantization's bits.
+            b.xq = pre->q; b.xd = pre->d;
+            if (kind == 1)
+                aligned[1] = aligned[1] && b.ld % 4 == 0 && (reinterpret_cast<uintptr_t>(b.w) & 3u) == 0 &&
+                             (b.k / 32) % 2 == 0;
         } else {
             const size_t ldx = b.ncol == 1 ? size_t(b.k) : b.xcs;
             int item = 0;
@@ -575,7 +582,8 @@ x3::Mat view(const x3::Mat& m, int c0, int nc) {
     result.n = nc;
     return result;
 }
-bool mv(const x3::MvJob* jobs, int n, sycl::queue& s) {
+bool mv(const x3::MvJob* jobs, int n, sycl::queue& s) { return mv(jobs, n, s, nullptr); }
+bool mv(const x3::MvJob* jobs, int n, sycl::queue& s, const PreQ8* pre) {
     if (n <= 0 || n > x3::kMaxMvJobs) return fail("invalid matvec job count");
     for (int i = 0; i < n; ++i) {
         const auto& j = jobs[i];
@@ -586,7 +594,7 @@ bool mv(const x3::MvJob* jobs, int n, sycl::queue& s) {
             (m.fmt == kFmtGG && (!type_on_device(m.K) || !type_row_bytes(m.K, m.k))))
             return fail("unsupported matvec matrix");
     }
-    const unsigned batched = mv_batch(jobs, n, s);
+    const unsigned batched = mv_batch(jobs, n, s, pre);
     for (int i = 0; i < n; ++i) {
         if (batched & (1u << i)) continue;
         const x3::MvJob j = jobs[i];
@@ -595,6 +603,16 @@ bool mv(const x3::MvJob* jobs, int n, sycl::queue& s) {
         if (mv_low(*j.m)) {
             const auto& caps = token_caps(s);
             const size_t xcs = j.xf_cs ? j.xf_cs : size_t(j.m->k);
+            if (pre != nullptr && j.xf == pre->x && j.m->k == pre->k && j.ncol == pre->rows &&
+                (j.ncol == 1 || xcs == size_t(pre->k))) {
+                // DS4_HC_FUSE: the input's int8 rounding already made where x was.
+                iq::MvJob q{};
+                q.w = static_cast<const uint8_t*>(j.m->raw); q.ld = row_stride(*j.m); q.type = j.m->K;
+                q.k = j.m->k; q.n = j.m->n; q.ncol = j.ncol; q.xq = pre->q; q.xd = pre->d;
+                q.y = j.y; q.ycs = j.y_cs ? j.y_cs : size_t(j.m->n); q.bias = j.bias; q.alpha = j.alpha;
+                if (!iq::mv(&q, 1, s)) return fail("unsupported IQ matvec");
+                continue;
+            }
             if (auto* scratch = caps.subgroup ? quant_scratch(size_t(j.ncol) * j.m->k, 0, caps, s) : nullptr) {
                 if (caps.subgroup == 32)
                     q8_quant_token<32>(j.xf, xcs, j.ncol, j.m->k, scratch->codes, scratch->scales, caps.quant_group, s);

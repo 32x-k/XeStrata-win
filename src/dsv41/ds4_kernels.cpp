@@ -128,6 +128,8 @@ size_t gemv_group_size(const sycl::queue& q, int k) {
 }
 float gemv_weight(float v) { return v; }
 float gemv_weight(uint16_t v) { return f16_value(v); }
+// (3ab0908's router rows: the pack's BF16 kept on the device, each widened exactly where a sum takes it)
+float gemv_weight(Bf16 v) { return bf16_value(v.u); }
 template <class Weight>
 void gemv_rows(const Weight* W, const float* x, size_t ldx, int n, int k, int T, float alpha,
                float* y, size_t ldy, sycl::queue& s) {
@@ -1078,9 +1080,49 @@ void gemv_f16_warp(const uint16_t* W, const float* x, size_t ldx, int n, int k, 
             }
     });
 }
-// Upstream gemv_f32_kernel (the router): a subgroup a row, eight rows a group, the lanes over float4s.
-template <int SG>
-void gemv_f32_warp(const float* W, const float* x, int n, int k, int T, float* y, size_t ldy, sycl::queue& s) {
+// Upstream gate_ld (3ab0908): float4 c of a router row - F32 weights as they are, or the pack's BF16 widened
+// (exactly: the same four values).  The kernels sum the same F32 products in the same order either way, so a BF16
+// router keeps the F32 copy's bits with half its bytes read.
+sycl::float4 gate_ld(const float* w, int c) { return load_aligned<sycl::float4, 16>(w + size_t(4) * c); }
+sycl::float4 gate_ld(const uint16_t* w, int c) {
+    const auto a = load_aligned<sycl::uint2, 8>((const uint32_t*) w + size_t(2) * c);
+    return {bf16_value(uint16_t(a.x())), bf16_value(uint16_t(a.x() >> 16)), bf16_value(uint16_t(a.y())),
+            bf16_value(uint16_t(a.y() >> 16))};
+}
+sycl::float4 gate_ld(const Bf16* w, int c) { return gate_ld((const uint16_t*) w, c); }
+// A router row over the sub-group: upstream's kGateLd loads in flight before the sums (the lane's float4s still in
+// the order c = lane + SG j - the same bits; on the R9700 4, as upstream on AMD).
+template <int SG, class TW>
+float gate_row(const TW* w, const float* xv, int k4, int lane) {
+    constexpr int LD = 4;
+    float acc = 0.f;
+    int c = lane;
+    for (; c + SG * (LD - 1) < k4; c += SG * LD) {
+        sycl::float4 a[LD];
+#pragma unroll
+        for (int u = 0; u < LD; ++u) a[u] = gate_ld(w, c + SG * u);
+#pragma unroll
+        for (int u = 0; u < LD; ++u) {
+            const auto b = load_aligned<sycl::float4, 16>(xv + size_t(4) * (c + SG * u));
+            acc = sycl::fma(a[u].x(), b.x(), acc);
+            acc = sycl::fma(a[u].y(), b.y(), acc);
+            acc = sycl::fma(a[u].z(), b.z(), acc);
+            acc = sycl::fma(a[u].w(), b.w(), acc);
+        }
+    }
+    for (; c < k4; c += SG) {
+        const auto a = gate_ld(w, c), b = load_aligned<sycl::float4, 16>(xv + size_t(4) * c);
+        acc = sycl::fma(a.x(), b.x(), acc);
+        acc = sycl::fma(a.y(), b.y(), acc);
+        acc = sycl::fma(a.z(), b.z(), acc);
+        acc = sycl::fma(a.w(), b.w(), acc);
+    }
+    return acc;
+}
+// Upstream gemv_f32_kernel (the router): a subgroup a row, eight rows a group, the lanes over float4s.  TW: the
+// weights' storage (F32, or the pack's BF16 rows widened in gate_ld - the same bits).
+template <int SG, class TW>
+void gemv_f32_warp(const TW* W, const float* x, int n, int k, int T, float* y, size_t ldy, sycl::queue& s) {
     constexpr int Rows = 8, WG = Rows * SG;
     const size_t gx = (size_t(n) + Rows - 1) / Rows;
     sycl_detail::launch(s, sycl::nd_range<1>(sycl::range<1>(gx * size_t(T) * WG), sycl::range<1>(WG)),
@@ -1089,16 +1131,9 @@ void gemv_f32_warp(const float* W, const float* x, int n, int k, int T, float* y
         const int tid = int(it.get_local_linear_id()), lane = tid % SG;
         const int row = int(g % gx) * Rows + tid / SG, t = int(g / gx);
         if (row >= n) return;
-        const float* w = W + size_t(row) * k;
+        const TW* w = W + size_t(row) * k;
         const float* xv = x + size_t(t) * k;
-        float acc = 0.f;
-        for (int c = lane; c < k / 4; c += SG) {
-            const auto a = load_aligned<sycl::float4, 16>(w + size_t(4) * c), b = load_aligned<sycl::float4, 16>(xv + size_t(4) * c);
-            acc = sycl::fma(a.x(), b.x(), acc);
-            acc = sycl::fma(a.y(), b.y(), acc);
-            acc = sycl::fma(a.z(), b.z(), acc);
-            acc = sycl::fma(a.w(), b.w(), acc);
-        }
+        float acc = gate_row<SG>(w, xv, k / 4, lane);
         acc = subgroup_sum<SG>(it.get_sub_group(), acc);
         if (lane == 0) y[size_t(t) * ldy + row] = acc;
     });
@@ -1472,6 +1507,8 @@ void finish(float* x, int n_vec, int len, long long stride, const Finish& f, syc
         throw std::invalid_argument("ds4 finish: invalid vector or rotary dimensions");
     if (f.pdst && (f.quant < 1 || f.quant > 3 || len % 32))
         throw std::invalid_argument("ds4 finish: packed rows require whole quantization blocks");
+    if (f.q8 && (f.q8d == nullptr || len % 32 || f.dst || f.pdst))
+        throw std::invalid_argument("ds4 finish: int8 rows require whole unstrided blocks and no other output");
     if (finish_detail::finish(x, n_vec, len, stride, f, s)) return;
     parallel(s, size_t(n_vec), [=](size_t v) {
         float* row = x + static_cast<long long>(v) * stride;
@@ -1593,6 +1630,11 @@ void hc_pre_norm(const float* h, const float* mix, const float* w, int dim, int 
     });
     if (w) { Finish f; f.w = w; f.eps = eps; finish(x, T, dim, dim, f, s); }
 }
+int hc_split_pre_norm(const HcFuse& a, sycl::queue& s, int T) {
+    const hc_detail::SplitPreNorm args{a.mixes, a.scale, a.base, a.hc, a.iters, a.hc_eps, a.pre, a.post,
+                                       a.comb, a.h, a.mix, a.w, a.dim, a.eps, a.x, a.q, a.qd};
+    return hc_detail::split_pre_norm(args, T, s);
+}
 void hc_post(const float* y, const float* res, const float* post, const float* comb, int dim, int hc, int T,
              float* out, sycl::queue& s) {
     parallel(s, size_t(T) * hc * dim, [=](size_t i) {
@@ -1636,7 +1678,8 @@ void gemv_f16_rows(const uint16_t* W, const float* x, size_t ldx, int n, int k, 
 void gemv_f16(const uint16_t* W, const float* x, int n, int k, int T, float alpha, float* y, sycl::queue& s) {
     gemv_f16_rows(W, x, k, n, k, T, alpha, y, n, s);
 }
-void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, sycl::queue& s) {
+template <class TW>
+void gemv_f32_any(const TW* W, const float* x, int n, int k, int T, float* y, int ldy, sycl::queue& s) {
     if (T > 0 && n > 0 && gemv_warp_ready(s, W, x, size_t(k), k, 4)) {
         sycl_detail::require_in_order(s);
         if (gemv_warp_width(s) == 32) gemv_f32_warp<32>(W, x, n, k, T, y, size_t(ldy), s);
@@ -1644,6 +1687,61 @@ void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int
         return;
     }
     gemv_rows(W, x, size_t(k), n, k, T, 1.f, y, size_t(ldy), s);
+}
+void gemv_f32(const float* W, const float* x, int n, int k, int T, float* y, int ldy, sycl::queue& s) {
+    gemv_f32_any(W, x, n, k, T, y, ldy, s);
+}
+void gemv_f32(GateW W, const float* x, int n, int k, int T, float* y, int ldy, sycl::queue& s) {
+    if (W.h != nullptr) gemv_f32_any((const Bf16*) W.h, x, n, k, T, y, ldy, s);
+    else gemv_f32_any(W.f, x, n, k, T, y, ldy, s);
+}
+// Upstream gemv_f32_pair_kernel (DS4_ROUTE_FUSE): two gemv_f32 launches on the same x in one grid - the
+// first cdiv(n0, 8) blocks of a token W0's rows into y0, the rest W1's into y1, each row the warp kernel's
+// own summation, so each row's bits.
+template <int SG, class TW>
+void gemv_f32_pair_warp(const TW* W0, int n0, float* y0, const TW* W1, int n1, float* y1,
+                        const float* x, int k, int T, size_t ldy, sycl::queue& s) {
+    constexpr int Rows = 8, WG = Rows * SG;
+    const size_t b0 = (size_t(n0) + Rows - 1) / Rows, b1 = (size_t(n1) + Rows - 1) / Rows, gx = b0 + b1;
+    sycl_detail::launch(s, sycl::nd_range<1>(sycl::range<1>(gx * size_t(T) * WG), sycl::range<1>(WG)),
+                   [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
+        const size_t g = it.get_group_linear_id(), lb = g % gx;
+        const int tid = int(it.get_local_linear_id()), lane = tid % SG;
+        const bool second = lb >= b0;
+        const TW* W = second ? W1 : W0;
+        const int n = second ? n1 : n0;
+        float* y = second ? y1 : y0;
+        const int row = int(lb - (second ? b0 : 0)) * Rows + tid / SG, t = int(g / gx);
+        if (row >= n) return;
+        const TW* w = W + size_t(row) * k;
+        const float* xv = x + size_t(t) * k;
+        float acc = gate_row<SG>(w, xv, k / 4, lane);
+        acc = subgroup_sum<SG>(it.get_sub_group(), acc);
+        if (lane == 0) y[size_t(t) * ldy + row] = acc;
+    });
+}
+template <class TW>
+bool gemv_f32_pair_any(const TW* W0, int n0, float* y0, const TW* W1, int n1, float* y1, const float* x,
+                       int k, sycl::queue& s, int T, int ldy) {
+    if (n0 < 1 || n1 < 1 || T < 1 || T > kWin || (T > 1 && ldy < std::max(n0, n1))) return false;
+    if (!gemv_warp_ready(s, W0, x, size_t(k), k, 4) || !gemv_warp_ready(s, W1, x, size_t(k), k, 4))
+        return false;
+    sycl_detail::require_in_order(s);
+    const size_t l = T > 1 ? size_t(ldy) : size_t(std::max(n0, n1));
+    if (gemv_warp_width(s) == 32) gemv_f32_pair_warp<32>(W0, n0, y0, W1, n1, y1, x, k, T, l, s);
+    else gemv_f32_pair_warp<16>(W0, n0, y0, W1, n1, y1, x, k, T, l, s);
+    return true;
+}
+bool gemv_f32_pair(const float* W0, int n0, float* y0, const float* W1, int n1, float* y1, const float* x,
+                   int k, sycl::queue& s, int T, int ldy) {
+    return gemv_f32_pair_any(W0, n0, y0, W1, n1, y1, x, k, s, T, ldy);
+}
+bool gemv_f32_pair(GateW W0, int n0, float* y0, GateW W1, int n1, float* y1, const float* x, int k,
+                   sycl::queue& s, int T, int ldy) {
+    if ((W0.h != nullptr) != (W1.h != nullptr)) return false;   // (the pair wants both rows the same storage)
+    if (W0.h != nullptr)
+        return gemv_f32_pair_any((const Bf16*) W0.h, n0, y0, (const Bf16*) W1.h, n1, y1, x, k, s, T, ldy);
+    return gemv_f32_pair_any(W0.f, n0, y0, W1.f, n1, y1, x, k, s, T, ldy);
 }
 // Upstream g_router_bad: one word a device's route kernels set when the fallback pick fires (the gate's input
 // went non-finite) and the host takes with router_nonfinite_take - a device allocation standing in for the
@@ -1678,6 +1776,54 @@ void swiglu(const float* g, const float* u, int n, float lim, float* h, sycl::qu
         const float uv = lim > 0.f ? sycl::clamp(u[i], -lim, lim) : u[i];
         h[i] = gv / (1.f + sycl::exp(-gv)) * uv;
     });
+}
+
+// (DS4_DECODE_TRIM 1) the shared expert's swiglu writes its output for the down GEMV's int8 input too, the same
+// rounding the gguf path's q8 quantizer runs (ds4_gguf.cpp's amax / 127, rint, zero-block a 0 code)
+bool swiglu_q8(const float* g, const float* u, int n, float lim, float* h, int8_t* q, float* qd, sycl::queue& s) {
+    if (n <= 0) return true;
+    if (n % 32 || q == nullptr || qd == nullptr) return false;
+    parallel(s, size_t(n) / 32, [=](size_t b) {   // an item a 32-value block: its swiglu, scale and codes in registers
+        const size_t f = b * 32;
+        float hv[32], a = 0.f;
+        for (int j = 0; j < 32; ++j) {
+            const float gv = lim > 0.f ? sycl::fmin(g[f + j], lim) : g[f + j];
+            const float uv = lim > 0.f ? sycl::clamp(u[f + j], -lim, lim) : u[f + j];
+            hv[j] = gv / (1.f + sycl::exp(-gv)) * uv;
+            a = sycl::fmax(a, sycl::fabs(hv[j]));
+        }
+        const float dx = a / 127.f;
+        for (int j = 0; j < 32; ++j) {
+            h[f + j] = hv[j];
+            q[f + j] = int8_t(a > 0.f ? sycl::rint(hv[j] / dx) : 0.f);
+        }
+        qd[b] = dx;
+    });
+    return true;
+}
+
+// (DS4_DECODE_TRIM 4) the snapshot's and the latent's copies in one launch - device-to-device words
+bool copy_regions(const CopyRegions& r, sycl::queue& s) {
+    if (r.n <= 0) return true;
+    if (r.n > 4) return false;
+    uint32_t* dst[4];
+    const uint32_t* src[4];
+    size_t off[5] = {0, 0, 0, 0, 0};
+    for (int i = 0; i < r.n; ++i) {
+        if (r.dst[i] == nullptr || r.src[i] == nullptr || r.bytes[i] % 4 ||
+            (uintptr_t) r.dst[i] % 4 || (uintptr_t) r.src[i] % 4)
+            return false;
+        dst[i] = (uint32_t*) r.dst[i];
+        src[i] = (const uint32_t*) r.src[i];
+        off[i + 1] = off[i] + r.bytes[i] / 4;
+    }
+    if (off[r.n] == 0) return true;
+    parallel(s, off[r.n], [=](size_t i) {
+        int rg = 0;
+        while (rg + 1 < 4 && i >= off[rg + 1]) ++rg;
+        dst[rg][i - off[rg]] = src[rg][i - off[rg]];
+    });
+    return true;
 }
 
 void compress_win(const float* kv, const float* score, float* kv_state, float* score_state, int ratio, int p0, int T,
@@ -1955,21 +2101,80 @@ void combine(const float* ed, const float* cpu, const float* sh, const Combine& 
     });
 }
 
+void publish_req(Req* req, int T, unsigned seq, int na0, int na1, sycl::queue& s, Resp* resp, int* cpu_any,
+                 const unsigned* host_done);
+
+// STRATA_DS4_RESIDENT_SKIP_W / _TOPK (upstream 86bb00b, CHANGES THE ANSWERS - Turbo; 0 = off): which of a token's k
+// routed experts the decode keeps, wherever they live (VRAM too).  Rank = the weight order (the weights, ties by
+// pick order).  Dropped: a pick whose share of the route's weights is below rs_w, or whose rank is >= rs_k
+// (rs_k > 0); the top-1 is always kept.  The kept weights are renormalised to the route's sum, the dropped picks a
+// null plan entry - the kernels' plan_ptr==0 paths leave them out.  k <= kPicks (8): the mask fits an unsigned.
+unsigned route_keep(const float* w, int k, float wsum, float rs_w, int rs_k, float& s_keep) {
+    s_keep = wsum;
+    if ((rs_w <= 0.0f && rs_k <= 0) || k < 2) return (k >= 32) ? 0xffffffffu : ((1u << k) - 1u);
+    unsigned m = 0u;
+    float sk = 0.0f;
+    for (int r = 0; r < k; ++r) {
+        const float v = w[r];
+        int rank = 0;
+        for (int q = 0; q < k; ++q) {
+            const float u = w[q];
+            rank += (q != r) && (u > v || (u == v && q < r));
+        }
+        const bool keep = rank == 0 || ((rs_k <= 0 || rank < rs_k) && !(rs_w > 0.0f && v < rs_w * wsum));
+        if (keep) { m |= 1u << r; sk += v; }
+    }
+    s_keep = sk;
+    return m;
+}
+// the two settings, read once
+struct ResidentSkip {
+    float w;
+    int k;
+};
+const ResidentSkip& resident_skip() {
+    static const ResidentSkip rs = [] {
+        ResidentSkip r{0.0f, 0};
+        if (const char* v = std::getenv("STRATA_DS4_RESIDENT_SKIP_W"))
+            r.w = std::max(0.0f, std::min(0.9f, (float) std::atof(v)));
+        if (const char* v = std::getenv("STRATA_DS4_RESIDENT_TOPK"))
+            r.k = std::max(0, std::min(kPicks, std::atoi(v)));
+        return r;
+    }();
+    return rs;
+}
 void route_publish(const float* logits, const float* bias, int n, int k, int T, float scale,
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, sycl::queue& s,
-                   const float* bias_vl, unsigned vl, int na0, int na1) {
+                   const float* bias_vl, unsigned vl, int na0, int na1, Resp* resp, int* cpu_any,
+                   const unsigned* host_done) {
     if (T > kWin || dim > kMaxDim || k < 0 || k > kPicks || k > n)
         throw std::invalid_argument("ds4 route_publish: invalid request dimensions");
+    if (req == nullptr || host_done == nullptr) resp = nullptr;
+    if (resp == nullptr) cpu_any = nullptr;    // (self-answer only where the publish can answer)
+    const ResidentSkip rs = resident_skip();
     const auto publish = [=](size_t t) {
         const int* ids = idx + t * kPicks;
-        const float* weights = w + t * kPicks;
+        float* weights = w + t * kPicks;
+        float wsum = 0.0f;
+        if (rs.w > 0.0f || rs.k > 0)
+            for (int i = 0; i < k; ++i) wsum += weights[i];
+        float sk = wsum;   // (feature off: wsum stays 0, renorm 1 - the weights untouched, bit for bit)
+        const unsigned keep = route_keep(weights, k, wsum, rs.w, rs.k, sk);
+        const float renorm = (rs.w > 0.0f || rs.k > 0) ? wsum / (sk + 1e-20f) : 1.0f;
         bool cpu = false;
         for (int i = 0; i < k; ++i) {
-            plan_ptr[t * kPicks + i] = vram[ids[i]];
-            cpu |= vram[ids[i]] == 0;
-            if (req) { req->ids[t][i] = ids[i]; req->w[t][i] = weights[i]; }
+            const bool kept = (keep >> i) & 1u;   // (a dropped pick: no weight, off the device, not on the CPU lane)
+            const float wv = kept ? weights[i] * renorm : 0.0f;
+            weights[i] = wv;
+            plan_ptr[t * kPicks + i] = kept ? vram[ids[i]] : 0;
+            cpu |= kept && vram[ids[i]] == 0;
+            if (req) { req->ids[t][i] = kept ? ids[i] : -1; req->w[t][i] = wv; }
         }
+        // (6227775's self-answer) a pick on the CPU lane noted for the publish below
+        if (cpu && cpu_any != nullptr)
+            sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                             sycl::access::address_space::generic_space>(*cpu_any).store(1);
         return cpu;
     };
     int* bad = router_bad_flag(s);
@@ -1989,7 +2194,14 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
         const bool cpu = publish(t);
         if (req && cpu) for (int e = 0; e < dim; ++e) req->x[t][e] = x[t * dim + e];
     });
-    if (req && system_publish(s)) {
+    publish_req(req, T, seq, na0, na1, s, resp, cpu_any, host_done);
+}
+// route_publish's publish, shared with route_pair: the request's counts and sequence behind the routing
+// kernel, on the device where the report allows it, a host task otherwise.
+void publish_req(Req* req, int T, unsigned seq, int na0, int na1, sycl::queue& s, Resp* resp, int* cpu_any,
+                 const unsigned* host_done) {
+    if (req == nullptr) return;
+    if (system_publish(s)) {
         // Upstream publishes the request from the device. Where the device reports system-scope fences and
         // atomics, a one-item kernel behind the routing kernel writes the counts and releases the sequence to
         // the host; this spares a host task's round trip.
@@ -2000,10 +2212,24 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
             sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
             sycl::atomic_ref<unsigned, sycl::memory_order::relaxed, sycl::memory_scope::device,
                              sycl::access::address_space::generic_space>(req->seq).store(seq);
+            // 6227775's self-answer: no pick of the window on the CPU lane and the host not kRing / 2 requests
+            // behind - the device writes the empty answer itself (the host writes the same again later)
+            if (resp == nullptr || cpu_any == nullptr) return;
+            const int any = sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                           sycl::access::address_space::generic_space>(*cpu_any).load();
+            sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                             sycl::access::address_space::generic_space>(*cpu_any).store(0);
+            if (any || host_done == nullptr ||
+                int(seq - *(volatile const unsigned*) host_done) >= int(kRing / 2))
+                return;
+            for (int t = 0; t < T; ++t) resp->cpu[t] = 0;
+            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+            sycl::atomic_ref<unsigned, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                             sycl::access::address_space::generic_space>(resp->seq).store(seq);
         });
         return;
     }
-    if (req) s.submit([=](sycl::handler& h) {
+    s.submit([=](sycl::handler& h) {
         // Completion of the preceding kernel makes its mailbox writes visible to
         // this host task. The release store publishes the entire request at once.
         h.host_task([=] {
@@ -2011,6 +2237,74 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
             std::atomic_ref<unsigned>(req->seq).store(seq, std::memory_order_release);
         });
     });
+}
+// Upstream route_pair_kernel (DS4_ROUTE_FUSE): route_publish's and route_ahead's bodies as the two groups
+// of a token in one launch - the even group the routing and publish (route_group + the plan and request
+// writes), the odd one the guesses.  The picks' reductions are maxima and minima, so the groups' size does
+// not change the bits; the publish follows in a launch of its own, as route_publish's does.
+bool route_pair(const RoutePair& a, sycl::queue& s) {
+    if (a.req == nullptr || a.n < 1 || a.a_n < 1 || a.k < 0 || a.k > kPicks || a.k > a.n || a.m < 1 ||
+        a.off < 0 || a.off + a.m > kAhead || a.dim < 1 || a.dim > kMaxDim || a.T < 1 || a.T > kWin)
+        return false;
+    const int n_max = std::max(a.n, a.a_n);
+    const auto device = s.get_device();
+    static core::PerDevice<RouteCaps> cache;
+    const auto& caps = cache.get(device, [&] {
+        return RouteCaps{std::min(device.get_info<sycl::info::device::max_work_group_size>(),
+                                 device.get_info<sycl::info::device::max_work_item_sizes<1>>()[0]),
+                         size_t(device.get_info<sycl::info::device::local_mem_size>())};
+    });
+    const size_t bytes = size_t(n_max) * 2 * sizeof(float);
+    if (bytes >= caps.local_bytes) return false;
+    const size_t limit = std::min({size_t(n_max), caps.max_group,
+                                   (caps.local_bytes - bytes) / (sizeof(float) + sizeof(int))});
+    if (!limit) return false;
+    size_t local = 1;
+    while (local <= limit / 2) local *= 2;
+    sycl_detail::require_in_order(s);
+    const ResidentSkip rs = resident_skip();
+    const auto publish = [=](size_t t, const int* ids, float* weights) {
+        float wsum = 0.0f;
+        if (rs.w > 0.0f || rs.k > 0)
+            for (int i = 0; i < a.k; ++i) wsum += weights[i];
+        float sk = wsum;   // (feature off: wsum stays 0, renorm 1 - the weights untouched, bit for bit)
+        const unsigned keep = route_keep(weights, a.k, wsum, rs.w, rs.k, sk);
+        const float renorm = (rs.w > 0.0f || rs.k > 0) ? wsum / (sk + 1e-20f) : 1.0f;
+        bool cpu = false;
+        for (int i = 0; i < a.k; ++i) {
+            const bool kept = (keep >> i) & 1u;
+            const float wv = kept ? weights[i] * renorm : 0.0f;
+            weights[i] = wv;
+            a.plan_ptr[t * kPicks + i] = kept ? a.vram[ids[i]] : 0;
+            cpu |= kept && a.vram[ids[i]] == 0;
+            a.req->ids[t][i] = kept ? ids[i] : -1;
+            a.req->w[t][i] = wv;
+        }
+        return cpu;
+    };
+    int* bad = router_bad_flag(s);
+    sycl_detail::submit(s, [&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> scores(size_t(n_max), h), biased(size_t(n_max), h);
+        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(size_t(a.T) * 2 * local), sycl::range<1>(local)),
+                       [=](sycl::nd_item<1> item) {
+            const size_t g = item.get_group_linear_id(), t = g >> 1, lane = item.get_local_linear_id();
+            if ((g & 1u) == 0) {
+                const float* b = a.bias_vl && ((a.vl >> t) & 1u) ? a.bias_vl : a.bias;
+                route_group(item, scores, biased, a.logits + t * 1024, b, a.n, a.k, a.route_scale,
+                            a.idx + t * kPicks, a.w + t * kPicks, bad);
+                bool cpu = lane == 0 ? publish(t, a.idx + t * kPicks, a.w + t * kPicks) : false;
+                cpu = sycl::group_broadcast(item.get_group(), cpu, 0);
+                if (cpu)
+                    for (size_t e = lane; e < size_t(a.dim); e += local)
+                        a.req->x[t][e] = a.x[t * size_t(a.dim) + e];
+            } else {
+                route_group(item, scores, biased, a.a_logits + t * 1024, a.a_bias, a.a_n, a.m, 1.f,
+                            a.req->ahead[t] + a.off, nullptr, nullptr);
+            }
+        });
+    });
+    publish_req(a.req, a.T, a.seq, a.na0, a.na1, s, nullptr, nullptr, nullptr);
+    return true;
 }
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, sycl::queue& s) {
     if (T > kWin || off < 0 || off + m > kAhead) throw std::invalid_argument("ds4 route_ahead: invalid request dimensions");

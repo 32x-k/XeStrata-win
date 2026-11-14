@@ -226,6 +226,21 @@ void finish_kernel(float* x, int vectors, int len, long long stride, Finish f, s
                     }
                 }
             }
+            // (DS4_DECODE_TRIM 2) the stored values rounded to int8 too, the gguf q8 quantizer's ops (amax / 127,
+            // rint, a zero block a 0 code) - for a Q8_0 job's input without a later quantize launch
+            if (f.q8) {
+                int8_t* q8 = f.q8 + static_cast<long long>(vector) * len;
+                float* q8d = f.q8d + static_cast<long long>(vector) * (len / 32);
+                for (int j = 0; j < count; ++j) {
+                    const int e = tid + j * kThreads;
+                    const float a = group_max<SG>(item, e < len ? sycl::fabs(r[j]) : 0.f, 32, exchange);
+                    if (e < len) {
+                        const float dx = a / 127.f;
+                        q8[e] = int8_t(a > 0.f ? sycl::rint(r[j] / dx) : 0.f);
+                        if (e % 32 == 0) q8d[e / 32] = dx;
+                    }
+                }
+            }
             uint16_t* dst = f.dst ? f.dst + static_cast<long long>(vector) * f.dst_stride : nullptr;
             for (int j = 0; j < count; ++j) {
                 const int e = tid + j * kThreads;

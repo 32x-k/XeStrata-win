@@ -19,20 +19,30 @@ namespace strata::ds4::hc_detail {
 struct Caps {
     size_t group = 0, local = 0;
     std::vector<size_t> subgroups;
-    bool device_acq_rel = false;
+    bool device_fence = false;
 };
 inline const Caps& caps(const sycl::queue& q) {
     const auto device = q.get_device();
     static core::PerDevice<Caps> cache; // NOLINT(bugprone-dynamic-static-initializers)
     return cache.get(device, [&] {
-        const auto orders = device.get_info<sycl::info::device::atomic_memory_order_capabilities>();
-        const auto scopes = device.get_info<sycl::info::device::atomic_memory_scope_capabilities>();
+        // The fused mix/split publication is upstream's __threadfence + relaxed atomicAdd: device-scope
+        // release/acquire fences around a relaxed RMW. atomic_memory_order/scope_capabilities are the
+        // atomic_ref queries; some adapters report them conservatively (relaxed, work-group) while their
+        // fence report is accurate, so the fence capabilities gate the path instead.
+        const auto orders = device.get_info<sycl::info::device::atomic_fence_order_capabilities>();
+        const auto scopes = device.get_info<sycl::info::device::atomic_fence_scope_capabilities>();
+        const auto has_order = [&](sycl::memory_order o) {
+            return std::find(orders.begin(), orders.end(), o) != orders.end();
+        };
         return Caps{std::min(device.get_info<sycl::info::device::max_work_group_size>(),
                              device.get_info<sycl::info::device::max_work_item_sizes<1>>()[0]),
                     size_t(device.get_info<sycl::info::device::local_mem_size>()),
                     device.get_info<sycl::info::device::sub_group_sizes>(),
-                    std::find(orders.begin(), orders.end(), sycl::memory_order::acq_rel) != orders.end() &&
-                    std::find(scopes.begin(), scopes.end(), sycl::memory_scope::device) != scopes.end()};
+                    std::find(scopes.begin(), scopes.end(), sycl::memory_scope::device) != scopes.end() &&
+                    (has_order(sycl::memory_order::release) || has_order(sycl::memory_order::acq_rel) ||
+                     has_order(sycl::memory_order::seq_cst)) &&
+                    (has_order(sycl::memory_order::acquire) || has_order(sycl::memory_order::acq_rel) ||
+                     has_order(sycl::memory_order::seq_cst))};
     });
 }
 inline int subgroup(const Caps& c, size_t group, bool fused = false, size_t extra_bytes = 0) {
@@ -218,9 +228,11 @@ void mix_kernel(const float* h, const float* fn, int hcdim, int n_mix, int token
             if (tid == 0) {
                 mixes[token * 32 + mix] = acc * sycl::rsqrt(ss / float(hcdim) + eps);
                 if constexpr (Fused) {
-                    // The release/acquire RMW chain publishes every mix to the
-                    // last group, replacing upstream threadfence + atomicAdd.
-                    sycl::atomic_ref<unsigned, sycl::memory_order::acq_rel, sycl::memory_scope::device,
+                    // Upstream's __threadfence + relaxed atomicAdd: a device-scope release fence
+                    // publishes this group's mix ahead of the relaxed RMW, and the last group's
+                    // acquire fence below makes the other groups' mixes visible to it.
+                    sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::device);
+                    sycl::atomic_ref<unsigned, sycl::memory_order::relaxed, sycl::memory_scope::device,
                                      sycl::access::address_space::global_space> count(counters[token]);
                     last[0] = count.fetch_add(1u) == unsigned(n_mix - 1) ? 1u : 0u;
                 }
@@ -228,6 +240,7 @@ void mix_kernel(const float* h, const float* fn, int hcdim, int n_mix, int token
             if constexpr (Fused) {
                 item.barrier(sycl::access::fence_space::global_and_local);
                 if (!last[0]) return; // Uniform for the entire work-group.
+                sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::device);
                 if (tid < SG) {
                     for (size_t i = tid; i < 32; i += SG)
                         smx[i] = i < size_t(n_mix) ? mixes[token * 32 + i] : 0.f;
@@ -259,7 +272,7 @@ inline bool mix(const float* h, const float* fn, int hcdim, int n_mix, int token
     const auto& c = caps(q);
     // Non-fused instantiations still declare the one-element dummy accessors.
     const int sg = subgroup(c, 256, fused, (256 / 16 + 1) * sizeof(float) + (fused ? 0 : sizeof(float) + sizeof(unsigned)));
-    if (!sg || (fused && (!counters || !c.device_acq_rel))) return false;
+    if (!sg || (fused && (!counters || !c.device_fence))) return false;
     const Split args = fused ? *split : Split{};
     if (sg == 32) {
         if (fused) mix_kernel<32, true>(h, fn, hcdim, n_mix, tokens, eps, mixes, counters, args, q);
@@ -293,8 +306,43 @@ inline bool split(const float* mixes, int tokens, const Split& args, sycl::queue
     return false;
 }
 
-// Upstream hc_pre_norm_kernel: one 1024-item group/token, at most eight
-// retained values per item. No intermediate x write or second norm launch.
+// Upstream hc_pre_norm_kernel's body, shared by the standalone kernel and the fused split/norm
+// launch: one 1024-item group/token, at most eight retained values per item, no intermediate x
+// write or second norm launch.  q and qd (given) take x's int8 rounding on a 32-lane subgroup -
+// the same amax / 127 and rint as the matvec inputs' quantization, so a job can read them in
+// place of rounding x again (PreQ8).
+template <int SG, int WG, class Item>
+inline void pre_norm_body(Item item, const float* h, const float* mix, const float* w, int dim, int hc,
+                          size_t token, float eps, float* x, int8_t* q, float* qd,
+                          sycl::local_accessor<float, 1> red) {
+    const size_t tid = item.get_local_linear_id();
+    const float* row = h + token * size_t(hc) * dim;
+    const float* pre = mix + token * 8;
+    float r[8], ss = 0.f;
+    size_t count = 0;
+    for (size_t e = tid; e < size_t(dim); e += WG, ++count) {
+        float a = 0.f;
+        for (int stream = 0; stream < hc; ++stream) a += pre[stream] * row[size_t(stream) * dim + e];
+        r[count] = a;
+        ss += a * a;
+    }
+    const float inv = sycl::rsqrt(block_sum<SG, WG>(item, ss, red) / float(dim) + eps);
+    count = 0;
+    for (size_t e = tid; e < size_t(dim); e += WG, ++count) {
+        const float v = w != nullptr ? r[count] * inv * w[e] : r[count];
+        x[token * dim + e] = v;
+        if (q == nullptr) continue;
+        if constexpr (SG == 32) {   // (the 32-value blocks are a warp's lanes: a smaller subgroup cannot reduce one)
+            const auto sg = item.get_sub_group();
+            float am = sycl::fabs(v);
+#pragma unroll
+            for (int o = SG / 2; o > 0; o >>= 1) am = sycl::fmax(am, sycl::permute_group_by_xor(sg, am, o));
+            const float sc = am / 127.f;
+            q[token * size_t(dim) + e] = int8_t(am > 0.f ? sycl::rint(v / sc) : 0.f);
+            if (tid % SG == 0) qd[token * size_t(dim / 32) + e / 32] = sc;
+        }
+    }
+}
 template <int SG>
 void pre_norm_kernel(const float* h, const float* mix, const float* w, int dim, int hc, int tokens,
                      float eps, float* x, sycl::queue& q) {
@@ -302,21 +350,7 @@ void pre_norm_kernel(const float* h, const float* mix, const float* w, int dim, 
     sycl_detail::submit(q, [&](sycl::handler& handler) {
         sycl::local_accessor<float, 1> red(sycl::range<1>(WG / SG + 1), handler);
         auto body = [=](sycl::nd_item<1> item) {
-            const size_t token = item.get_group_linear_id(), tid = item.get_local_linear_id();
-            const float* row = h + token * hc * dim;
-            const float* pre = mix + token * 8;
-            float r[8], ss = 0.f;
-            size_t count = 0;
-            for (size_t e = tid; e < size_t(dim); e += WG, ++count) {
-                float a = 0.f;
-                for (int stream = 0; stream < hc; ++stream) a += pre[stream] * row[size_t(stream) * dim + e];
-                r[count] = a;
-                ss += a * a;
-            }
-            const float inv = sycl::rsqrt(block_sum<SG, WG>(item, ss, red) / float(dim) + eps);
-            count = 0;
-            for (size_t e = tid; e < size_t(dim); e += WG, ++count)
-                x[token * dim + e] = w ? r[count] * inv * w[e] : r[count];
+            pre_norm_body<SG, WG>(item, h, mix, w, dim, hc, item.get_group_linear_id(), eps, x, nullptr, nullptr, red);
         };
         handler.parallel_for(sycl::nd_range<1>(size_t(tokens) * WG, WG), BoundBody<SG, WG, decltype(body)>{body});
     });
@@ -331,6 +365,59 @@ inline bool pre_norm(const float* h, const float* mix, const float* w, int dim, 
     if (sg == 32) pre_norm_kernel<32>(h, mix, w, dim, hc, tokens, eps, x, q);
     else pre_norm_kernel<16>(h, mix, w, dim, hc, tokens, eps, x, q);
     return true;
+}
+
+// Upstream hc_split_pre_norm (DS4_HC_FUSE): a token's split and pre-norm in one launch - they share
+// nothing, the norm reading the lagged mix, not the split's pre.  Groups are token pairs: the norm's
+// 1024 items as pre_norm's own kernel (+ x's int8 rounding on a 32-lane subgroup), the split's one
+// subgroup, its other items returning at once.
+struct SplitPreNorm {
+    const float* mixes = nullptr;               // the token's mix rows, 32 apart
+    const float* scale = nullptr;               // the split's three scale/base stages
+    const float* base = nullptr;
+    int hc = 0, iters = 0;
+    float hc_eps = 0.f;
+    float *pre = nullptr, *post = nullptr, *comb = nullptr;   // the split's outputs, 8 / 8 / 64 a token
+    const float *h = nullptr, *mix = nullptr, *w = nullptr;   // the norm's: streams, the lagged mix, weights
+    int dim = 0;
+    float eps = 0.f;
+    float* x = nullptr;                         // the normed input, dim a token
+    int8_t* q = nullptr;                        // (SG 32: x's int8 codes, dim a token - or nullptr)
+    float* qd = nullptr;                        // their scales, dim / 32 a token
+};
+template <int SG>
+void split_pre_norm_kernel(const SplitPreNorm& a, int tokens, sycl::queue& q) {
+    constexpr int WG = 1024;
+    sycl_detail::submit(q, [&](sycl::handler& handler) {
+        sycl::local_accessor<float, 1> red(sycl::range<1>(WG / SG + 1), handler);
+        auto body = [=](sycl::nd_item<1> item) {
+            const size_t group = item.get_group_linear_id(), token = group >> 1;
+            if ((group & 1u) == 0) {
+                pre_norm_body<SG, WG>(item, a.h, a.mix, a.w, a.dim, a.hc, token, a.eps, a.x, a.q, a.qd, red);
+                return;
+            }
+            const size_t tid = item.get_local_linear_id();
+            if (tid >= SG) return;
+            const Split s{a.scale, a.base, a.hc, a.iters, a.hc_eps, a.pre, a.post, a.comb};
+            split_body<SG>(item.get_sub_group(), a.mixes + token * 32, token, s);
+        };
+        handler.parallel_for(sycl::nd_range<1>(size_t(tokens) * 2 * WG, WG), BoundBody<SG, WG, decltype(body)>{body});
+    });
+}
+// 0: nothing launched (the caller takes the separate launches); 1: launched, x left unrounded (no
+// 32-lane subgroup for the int8 blocks - q / qd are not touched); 2: launched and x rounded.
+inline int split_pre_norm(SplitPreNorm a, int tokens, sycl::queue& q) {
+    sycl_detail::require_in_order(q);
+    if (tokens <= 0) return 1;
+    if (a.hc <= 0 || a.hc > 4 || 2 * a.hc + a.hc * a.hc > 32 || a.mixes == nullptr) return 0;
+    if (a.dim <= 0 || a.dim > 8 * 1024 || a.h == nullptr || a.mix == nullptr || a.x == nullptr) return 0;
+    if ((a.q != nullptr || a.qd != nullptr) && (a.q == nullptr || a.qd == nullptr || a.dim % 32)) return 0;
+    const int sg = subgroup(caps(q), 1024);
+    if (!sg) return 0;
+    const bool round = a.q != nullptr && sg == 32;
+    if (sg == 32) split_pre_norm_kernel<32>(a, tokens, q);
+    else split_pre_norm_kernel<16>(a, tokens, q);
+    return round ? 2 : 1;
 }
 
 } // namespace strata::ds4::hc_detail
