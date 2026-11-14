@@ -52,6 +52,11 @@ set(_pkg_engine_abs ${CMAKE_INSTALL_FULL_LIBDIR}/xestrata/engine)
 # ---- the engine
 set_target_properties(strata strata-image PROPERTIES INSTALL_RPATH "$ORIGIN/lib")
 install(TARGETS strata strata-image RUNTIME DESTINATION ${_pkg_engine})
+# the DeepSeek-V4.1 engine (-DSTRATA_BUILD_DSV41=ON) beside the others, where setup.py's dsv41_exe() looks for it
+if(TARGET strata-dsv41)
+  set_target_properties(strata-dsv41 PROPERTIES INSTALL_RPATH "$ORIGIN/lib")
+  install(TARGETS strata-dsv41 RUNTIME DESTINATION ${_pkg_engine})
+endif()
 install(PROGRAMS ${STRATA_PACKAGE_VISION_DIR}/strata-vision-cpu ${STRATA_PACKAGE_VISION_DIR}/strata-vision-vulkan
         DESTINATION ${_pkg_engine})
 # the SYCL runtime the engine was built with: what libsycl loads for Level Zero and HIP (and CUDA in the contrib mode).
