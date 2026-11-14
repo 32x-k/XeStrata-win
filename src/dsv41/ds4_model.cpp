@@ -774,6 +774,7 @@ struct Layer {
     int n_slots = 0, spare_vram = -1;
     int full_slots = 0;      // the slots the layer started with: the most a VRAM grow maps again (--vram-elastic)
     std::array<uint8_t*, 4> spare_host = {nullptr, nullptr, nullptr, nullptr};
+    std::unordered_map<int, std::array<uint8_t*, 4>> evict_bufs;   // a files-less shrink's CPU-lane copies (freed on refill)
     std::vector<float> heat;
     std::vector<int> cpu_hits;                  // CPU-lane experts used since the cache last looked
     bool swap_pending = false;
@@ -7345,6 +7346,7 @@ struct Model::Impl {
             Layer& l = L[(size_t) sw.layer];
             const int old_slot = l.slot[(size_t) sw.out];
             const std::array<uint8_t*, 4> old_parts = l.hh[(size_t) sw.in];
+            l.evict_bufs.erase(sw.in);   // a shrink's host copy joins the spare's rotation with `in`'s parts below
             if (copy_mode) {   // (`out` takes the RAM place `in` leaves: through the spare, which `in`'s slot becomes)
                 const int s_in = l.ram[(size_t) sw.in];
                 l.ram[(size_t) sw.in] = -1;
@@ -10683,20 +10685,74 @@ struct Model::Impl {
             l.host[(size_t) e] = l.hh[(size_t) e][0];
         }
     }
+    // expert e out of VRAM where the lane's copy lives in RAM, not in the files: its blob is read back (a
+    // group's members into one), split into the lane's part layout in fresh host memory, and freed when a
+    // grow brings the expert back (cache_fill drops evict_bufs)
+    bool evict_to_host(Layer& l, int e, uint8_t* blob_st, uint8_t* half_st, std::string& err) {
+        const int s = l.slot[(size_t) e];
+        for (int m = 0; m < l.nm; ++m) {
+            Layer& x = member(l, m);
+            const Dev& d = devs[(size_t) x.dev];
+            rt::set_device(d.id);
+            if (rt::readback(l.nm > 1 ? half_st : blob_st, slot_ptr(x, s), unit(x), d.st) != rt::Result::success ||
+                rt::stream_sync(d.st) != rt::Result::success) {
+                err = "reading layer " + std::to_string(l.il) + " expert " + std::to_string(e) + " back failed";
+                return false;
+            }
+            if (l.nm > 1) half_to_blob(l, half_st, m, blob_st);
+        }
+        std::array<uint8_t*, 4> parts = {nullptr, nullptr, nullptr, nullptr};
+        for (int X = 0; X < NH; ++X) {
+            parts[(size_t) X] = new (std::nothrow) uint8_t[l.hl.bytes];
+            if (parts[(size_t) X] == nullptr) {
+                err = "host memory for the CPU lane's copy of layer " + std::to_string(l.il) + " expert " +
+                      std::to_string(e);
+                for (int Y = 0; Y < X; ++Y) delete[] parts[(size_t) Y];
+                return false;
+            }
+            blob_to_part(l, blob_st, X, parts[(size_t) X]);
+        }
+        l.evict_bufs[e] = parts;
+        l.hh[(size_t) e] = parts;
+        l.host[(size_t) e] = parts[0];
+        l.slot[(size_t) e] = -1;
+        tab_write(l, e, -1);
+        return true;
+    }
     // the swap machinery's idea of a layer that keeps a slot free to move experts through, as at start
     static int cache_res(const Layer& l, int live, bool cache) {
         return cache && live >= 2 && live < l.n_exp ? live - 1 : live;
     }
     // layer l's cache down to `live` slots: the experts past the line back to the files, the pieces wholly past it
     // freed, a straddling one re-allocated smaller (kept whole if that fails - its tail only goes unused)
-    void cache_shrink(Layer& l, int live) {
-        if (live >= l.n_slots) return;
+    bool cache_shrink(Layer& l, int live, std::string& err) {
+        if (live >= l.n_slots) return true;
         const int keep = cache_res(l, live, o.expert_cache);
-        for (int e = 0; e < l.n_exp; ++e)
+        uint8_t *rd = nullptr, *rd2 = nullptr;   // (the files-less lane's read-back blob and a member's half)
+        bool ok = true;
+        for (int e = 0; e < l.n_exp && ok; ++e)
             if (l.slot[(size_t) e] >= keep) {
-                vram_evicted.push_back({l.il, e});
-                evict_to_file(l, e);
+                if (file_experts || l.lay.fmt == gg::kFmtMXFP4) {
+                    evict_to_file(l, e);
+                } else {
+                    if (rd == nullptr) {
+                        rt::alloc_host((void**) &rd, l.blob);
+                        if (l.nm > 1) rt::alloc_host((void**) &rd2, l.blob);
+                    }
+                    ok = rd != nullptr && (l.nm == 1 || rd2 != nullptr);
+                    if (ok) ok = evict_to_host(l, e, rd, rd2, err);
+                    else err = "host staging for the CPU lane's copies";
+                }
+                if (ok) vram_evicted.push_back({l.il, e});
             }
+        if (rd != nullptr) rt::free(rd);
+        if (rd2 != nullptr) rt::free(rd2);
+        if (!ok) {   // the pieces are untouched: what was already evicted is a valid lane state as it is
+            l.n_vram = 0;
+            for (int e = 0; e < l.n_exp; ++e)
+                if (l.slot[(size_t) e] >= 0) ++l.n_vram;
+            return false;
+        }
         for (int m = 0; m < l.nm; ++m) {
             Layer& x = member(l, m);
             Dev& d = devs[(size_t) x.dev];
@@ -10738,11 +10794,14 @@ struct Model::Impl {
         l.spare_vram = o.expert_cache && live >= 2 && live < l.n_exp ? live - 1 : -1;
         l.n_slots = live;
         l.swap_pending = false;
+        return true;
     }
-    // expert e into slot s: its blob read again (a GGUF's MXFP4 by its reader, another pack's file region repacked to
-    // the device layout), every member's part copied, the tables pointed at it
+    // expert e into slot s: its blob read again (a GGUF's MXFP4 by its reader, any lane place's parts put back
+    // together - the file region's or a files-less copy's, the same call the swaps' `in` takes), every member's
+    // part copied, the tables pointed at it
     bool cache_fill(Layer& l, int e, int s, uint8_t* stage, uint8_t* stage2, std::string& err) {
-        const bool ok = l.lay.fmt == gg::kFmtMXFP4 ? read_mx(l, e, stage) : (repack(l, file_part(l, e), stage), true);
+        const bool ok = l.lay.fmt == gg::kFmtMXFP4 ? read_mx(l, e, stage)
+                                                 : (parts_to_blob(l, l.hh[(size_t) e], stage), true);
         if (!ok) {
             err = "reading layer " + std::to_string(l.il) + " expert " + std::to_string(e) + " failed";
             return false;
@@ -10767,6 +10826,11 @@ struct Model::Impl {
         l.slot[(size_t) e] = s;
         tab_write(l, e, s);
         if (l.nm == 1) set_vm(l, e, s);
+        auto it = l.evict_bufs.find(e);
+        if (it != l.evict_bufs.end()) {
+            for (int X = 0; X < NH; ++X) delete[] it->second[(size_t) X];
+            l.evict_bufs.erase(it);
+        }
         l.hh[(size_t) e] = {nullptr, nullptr, nullptr, nullptr};
         l.host[(size_t) e] = nullptr;
         return true;
@@ -10877,10 +10941,6 @@ struct Model::Impl {
             err = "VRAM needs an engine started with --vram-elastic";
             return false;
         }
-        if (!file_experts) {
-            err = "the expert cache resizes only where the CPU lane's experts stay in the files";
-            return false;
-        }
         if (mib < 0) mib = std::max<int64_t>(0, o.reserve_mib);   // (bare VRAM: the reserve the engine started with)
         for (;;) {   // the swaps in flight and the queued ones land first
             cache_tick_swaps(0);
@@ -10919,7 +10979,7 @@ struct Model::Impl {
                 live[i] = (int) std::max<int64_t>(
                     floor_s, (int64_t) l.n_slots * keep / std::max<int64_t>(1, mapped));
                 live[i] = std::min(live[i], l.n_slots);
-                live_b += (int64_t) live[i] * unit(l) * l.nm;
+                live_b += (int64_t) live[i] * (int64_t) unit(l) * l.nm;
             }
             while (live_b > keep) {   // the rounding's slack off the largest holder still over its floor
                 int best = -1;
@@ -10929,7 +10989,25 @@ struct Model::Impl {
                 live_b -= (int64_t) unit(L[(size_t) best]) * L[(size_t) best].nm;
                 --live[best];
             }
-            for (size_t i = 0; i < L.size(); ++i) cache_shrink(L[i], live[i]);
+            if (!file_experts) {   // the evicted experts' lane copies are RAM they have to fit (a GGUF's
+                                   // MXFP4 keeps its file mapping instead: no host copy to make)
+                uint64_t need = 0;
+                for (size_t i = 0; i < L.size(); ++i) {
+                    const Layer& l = L[i];
+                    if (l.lay.fmt == gg::kFmtMXFP4) continue;
+                    const int res = cache_res(l, live[i], o.expert_cache);
+                    int cnt = 0;
+                    for (int e = 0; e < l.n_exp; ++e)
+                        if (l.slot[(size_t) e] >= res) ++cnt;
+                    need += (uint64_t) cnt * (uint64_t) NH * (uint64_t) l.hl.bytes;
+                }
+                if (need > 0 && ram_avail() < need + (2ull << 30)) {
+                    err = "not enough RAM for the evicted experts' CPU-lane copies";
+                    return false;
+                }
+            }
+            for (size_t i = 0; i < L.size(); ++i)
+                if (!cache_shrink(L[i], live[i], err)) return false;
         } else if (mapped < full) {
             int64_t budget = (int64_t) free_b - want;
             for (Layer& l : L) {
