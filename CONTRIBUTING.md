@@ -29,7 +29,7 @@ A change that breaks this rule does not go in, however fast it is ([AGENTS.md](A
 
 ## Licenses
 
-XeStrata as a whole is under the LGPL, version 3 or later (LGPL-3.0-or-later; `COPYING.LESSER`, `COPYING`).
+XeStrata's own code is under the LGPL, version 3 or later (LGPL-3.0-or-later; `COPYING.LESSER`, `COPYING`), and XeStrata as a combined work is distributed under it; the code from other projects keeps its own license, file by file as below.
 The original Strata is under MIT; XeStrata has been under the LGPL since xe0.1.39.
 
 Each file carries the license of the code in it, by where that code comes from.

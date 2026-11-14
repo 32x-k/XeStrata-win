@@ -45,6 +45,17 @@ MTP の推測デコードはオンです。
 
 補助の GPU（`--expert-cache-device1`、または `--layer-split auto` が選んだ補助）があるときは、同じ短いチャンクで、VRAM にないエキスパートのうち補助の GPU が持っていて少しのトークンにしか選ばれないものを、補助の GPU が自分の VRAM から計算します。そのトークンの行を両方の GPU に登録したホストのメモリで渡し、結果も同じ道で戻します。何トークンまで渡すかは、行を補助のリンクで往復する時間が、エキスパートを 1 枚目の GPU に流す時間より短くなる数で、起動時に測った両方のリンクの速さから決めます（B70 と RTX 4070 の x4 で 19）。`STRATA_PREFILL_HELPER_ROWS=n` で数を決め、`0` で使いません。補助の GPU の int8 の積で計算するので、1 枚目の GPU だけのときと答えが少し変わります（1K のプロンプトの最初のトークンの KL は 0.011、CPU の分担 0.5 は 0.020）。B70 と RTX 4070 で 1K のプロンプトは 693 → 735 トークン/秒でした。
 
+prefill には、エンジンの環境で入れる opt-in の切り替えが 4 つあります。どれも答えのビットは変わりません。
+
+- `STRATA_PLE_COMPACT=1`: 塊の PLE の行を量子化したまま（IQ4_NL）GPU に送り、GPU で展開します。ホストのリンクを通るバイトが約 7 分の 1 になります。そのバッファの VRAM がなければ、これまでどおりホストで展開します。
+- `STRATA_PLE_COPY_STREAM=1`（`STRATA_PLE_COMPACT=1` と一緒に）: その行を、計算のストリームでなく専用のストリームで送ります。
+- `STRATA_EMBED_VRAM=1`: ネイティブの埋め込みの表を、マップしたホストのメモリでなく VRAM に置きます。表の大きさと 512 MiB の空きがないときはホストのメモリのままにし、ログにそう出します。
+- `STRATA_DEQUANT_SIDE=1`: 密な行列の重みの FP16 への展開を別のストリームで動かし、前の積と重ねます。作業領域をもう 1 つ使います。
+
+`STRATA_GDN_TC=1`（opt-in、答えが変わる、upstream 8c2a84694）にすると、128 トークン以上のチャンクの DeltaNet の再帰を、32 トークンの塊ごとの走査にして、行列ユニット（Intel の XMX、NVIDIA の tensor core、RDNA3・RDNA4 の WMMA）で計算します。積は FP16 の 2 つに分けた値で取り、FP32 で足すので、既定の FP32 の再帰とは丸めが変わります。行列ユニットのない GPU と `STRATA_NO_XMX=1` では既定の再帰のままです。作業用に約 60 MiB の VRAM を使います。
+
+長いプロンプトの後ろの層を近似で読んで prefill を速くする opt-in（`STRATA_KVA=1`、答えが変わる）は [KVA](KVA.ja.md) にあります。
+
 ### decode（トークン/秒）
 
 | モデル | 1K | 4K | 32K | 64K | 128K | 262K |
@@ -80,7 +91,8 @@ decode の速さは文章によっても変わります。
 | serve の decode（なし → あり、1K と 32K、greedy と温度 0.7） | −1.0〜+12.7% | +7.5〜+24.5% | +6.3〜+55.4% |
 
 `STRATA_ROUTE_RESIDENT=<margin>`（upstream 5df35dcb、実験的、opt-in）は、検証の窓で上位 10 のうち順位 6〜9 の VRAM にないエキスパートを、ロジットの差が margin 以内なら VRAM にあるエキスパートに入れ替えます（`STRATA_ROUTE_RESIDENT_RANKS=lo-hi`）。
-`STRATA_ROUTE_PRIOR=<lambda>`（upstream 2de9ae06、opt-in）は、VRAM にあるエキスパートのロジットに lambda を足して選び直します（重みはルーターのもの）。
+`STRATA_ROUTE_PRIOR=<lambda>`（upstream 2de9ae06）は、VRAM にあるエキスパートのロジットに lambda を足して選び直します（重みはルーターのもの）。
+既定では使いません。キャッシュの小さい GPU では `STRATA_ROUTE_PRIOR=1.5` で serve の decode が 2〜8 割速くなりますが、長いエージェントの作業で同じ文を繰り返し、結果も落ちます（upstream #4402）。多くが載る GPU では速くならないか遅くなります。
 どちらも答えが変わります。
 
 ### 小さい GPU と XMX のない GPU
@@ -260,18 +272,33 @@ RAM の扱いは UD-Q4_K_XL と同じで、RAM が下の目安より少なけれ
 ./setup.sh --setup --family unsloth --model UD-Q5_K_XL
 ```
 
-### Gyro-S と Gyro-M
+### Gyro-S、Gyro-M、Gyro-L
 
 **[Gyro](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)** は、agentionai による元のモデルの量子化です（upstream ba64156fd）。
-エキスパートをアダマール行列で回し、trellis の形式（TQ2_T、TQK6、TQK7）で格納しています。
-要るメモリは VRAM と RAM の合計で、Gyro-S は 27.6 GB、Gyro-M は 35 GB です。
-ファイルには n-gram の表も入っていて（SSD から読みます）、ダウンロードは 58 GB と 92 GB です。
+エキスパートをアダマール行列で回し、trellis の形式（TQ2_T、TQK6、TQK7、Gyro-L は TQP5、TQP6、TQP7）で格納しています。
+RAM だけで動かすなら、Gyro-S は 36 GB、Gyro-M は 43 GB、Gyro-L は 59 GB 要ります。RAM がそれより少なければ[省 RAM モード](#ram-がモデルより少ないとき省-ram-モード)になり、VRAM が持つエキスパートは RAM に置かないので、RAM と VRAM の合計で 38 GB、45 GB、61 GB あれば動きます。
+ファイルには n-gram の表も入っていて（SSD から読みます）、ダウンロードは 58 GB、92 GB、108 GB です。
 Gyro-M は IQ3_XXS くらいの品質で、GPU のメモリは約 20% 少なくて済みます。
+Gyro-L は Gyro の中でいちばん品質が高く、decode は Gyro-M より遅くなります。
 Gyro-S はいちばん小さく、品質は 2〜3 ビットの大きさより低く、decode は Q2_0 の方が速くなります。
 画像も使えます。モデルのライセンスは Qwen3.8-Flash-Next の Qwen Community License 1.0 です。
 
 ```sh
 ./setup.sh --setup --family gyro --model Gyro-M
+```
+
+### Gyro-Coder-L と Gyro-Coder
+
+**[Gyro-Coder](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF)** は、agentionai によるコード向けの版です。
+各層 512 個のエキスパートのうち、コードに効く 256 個を残し（1 トークンで使うのは 10 個のまま）、Gyro と同じくアダマール行列で回して trellis の形式で格納しています。
+Gyro-Coder-L のエキスパートは 1 ステップで重み 2 つを決める TQP5、TQP6、TQP7（重み 1 個あたり約 3.2 ビット）、Gyro-Coder は TQ2_T（約 2.1 ビット）です。
+RAM だけで動かすなら、Gyro-Coder-L は 35 GB、Gyro-Coder は 26 GB 要ります。Gyro と同じく、RAM がそれより少なければ[省 RAM モード](#ram-がモデルより少ないとき省-ram-モード)になり、RAM と VRAM の合計で 37 GB と 28 GB あれば動きます。
+ファイルには n-gram の表も入っていて（SSD から読みます）、ダウンロードは 84 GB と 76 GB です。
+2 つは同じエキスパートを残しているので、XeStrata は 1 つのエキスパートの順位（`data/expert-profile-gyro-coder.bin`）を同梱しています。コードの依頼の答えのルーティングから作ったものです。
+コード以外の依頼では弱くなります。画像も使えます（画像のエンコーダーは元のモデルのものです）。モデルのライセンスは Qwen Community License 1.0 です。
+
+```sh
+./setup.sh --setup --family gyro-coder --model Gyro-Coder-L
 ```
 
 ### huihui-ai の abliterated 版
@@ -289,16 +316,21 @@ Gyro-S はいちばん小さく、品質は 2〜3 ビットの大きさより低
 ./setup.sh --setup --family huihui-swift --model IQ2_XS
 ```
 
-### Qwen3.8-Flash-Next 以外のモデル（Ornith-1.5、llm-jp-4.1、Qwen3.6-35B-A3B、GLM-5.3-Flash）
+### Qwen3.8-Flash-Next 以外のモデル（Ornith-1.5、llm-jp-4.1、Qwen3.6-35B-A3B、Qwen3.5-9B、GLM-5.3-Flash）
 
-setup の最初の質問では、Qwen3.8-Flash-Next とは作りの違う 4 つの MoE モデルも選べます。
-どれも GGUF のファイル（GLM-5.3-Flash は 3〜4 つに分かれたもの）をそのまま読み、よく使うエキスパートを GPU の VRAM に、残りを RAM に置きます（VRAM にないものの扱いは Qwen3.8-Flash-Next と同じです）。
+setup の最初の質問では、Qwen3.8-Flash-Next とは作りの違う 4 つの MoE モデルと、密な Qwen3.5-9B も選べます。
+どれも GGUF のファイル（GLM-5.3-Flash は 3〜4 つに分かれたもの）をそのまま読みます。
+MoE のモデルは、よく使うエキスパートを GPU の VRAM に、残りを RAM に置きます（VRAM にないものの扱いは Qwen3.8-Flash-Next と同じです）。
+Qwen3.5-9B は、重みをすべて GPU の VRAM に置きます。
 
 - **[Ornith-1.5-35B-A3B](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)**（Ornith AI、MIT）: 35B、1 トークンで使うのは 3B の Qwen3.5 系の MoE です。文脈は 256K まで。
   公式の Q4_K_M〜BF16 と、pfeifferj による GSQ-RCO の 3 ビットと 3.5 ビット（[コミュニティの再現](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF)で、ISTA-DASLab のものではありません）があります。
 - **[llm-jp-4.1-32b-a3b-thinking](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)**（LLM-jp、Apache-2.0）: 32B、1 トークンで使うのは 3B の、日本語と英語の思考するモデルです。文脈は 256K まで。
 - **[Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)**（Qwen、Apache-2.0）: 35B、1 トークンで使うのは 3B の Qwen3.5 系の思考する MoE です。文脈は 256K まで。
   GGUF は Unsloth が MTP の層付きで作った UD-Q4_K_XL・UD-Q6_K_XL・Q8_0 です。
+- **[Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)**（Qwen、Apache-2.0）: 9B の密な思考するモデルで、画像も読めます。文脈は 256K まで。
+  GGUF は Unsloth の Q4_K_M・Q6_K・Q8_0・BF16 です。
+  HauhauCS による拒否を外した版の [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive)（Apache-2.0、同じ 4 つの大きさ）も選べます（`--family qwen35-uncensored`）。拒否がずっと少なく、安全のための絞り込みも弱いので、書いたものを確かめてください。
 - **[GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)**（Z.ai、MIT）: 320B、1 トークンで使うのは 18B の思考する MoE です。setup で選べる文脈は 256K まで。
   注意は KDA（線形の注意）と DSA（選んだトークンだけを見る注意）で、4 本の流れ（mHC）を持ちます。GGUF は Unsloth の UD-IQ1_S・UD-IQ3_XXS・UD-IQ4_XS です。
 
@@ -316,12 +348,18 @@ setup の最初の質問では、Qwen3.8-Flash-Next とは作りの違う 4 つ�
 | Qwen3.6-35B-A3B | **UD-Q4_K_XL** | 22.9 GB | 31 GB | 4 GB から |
 | | **UD-Q6_K_XL** | 32.6 GB | 41 GB | 6 GB から |
 | | Q8_0 | 37.8 GB | 46 GB | 6 GB から |
+| Qwen3.5-9B | Q4_K_M | 5.7 GB | 8 GB | 8 GB から |
+| | Q6_K | 7.5 GB | 8 GB | 10 GB から |
+| | Q8_0 | 9.5 GB | 8 GB | 12 GB から |
+| | BF16 | 17.9 GB | 8 GB | 20 GB から |
 | GLM-5.3-Flash | **UD-IQ1_S** | 93.1 GB | 101 GB | 12 GB から |
 | | **UD-IQ3_XXS** | 120.4 GB | 128 GB | 12 GB から |
 | | UD-IQ4_XS | 156.8 GB | 165 GB | 12 GB から |
 
 RAM の目安は、ダウンロードの大きさに約 8 GB を足したものです（GLM-5.3-Flash は RAM と VRAM の合計）。
 それより少ないと、RAM と VRAM に入らないエキスパートをモデルのファイルから読むので、遅くなります。
+Qwen3.5-9B の VRAM の目安は、32K の文脈で重みと KV キャッシュ（1 トークン 32 KB）に約 1 GB を足したものです（拒否を外した版も同じ）。
+setup は GPU の VRAM に入る最も大きな版を勧め、入らない組み合わせは警告します。VRAM に入らない重みを RAM から流す仕組みはまだありません。
 太字は、このリリースで llama.cpp と答えを比べた版です。
 ほかの版も同じ型のテンソルでできていて、その型は太字の版とカーネルの試験で確かめています（setup は「untested」と表示します）。
 
@@ -329,34 +367,46 @@ RAM の目安は、ダウンロードの大きさに約 8 GB を足したもの�
 ./setup.sh --setup --family ornith --model Q4_K_M
 ./setup.sh --setup --family llmjp
 ./setup.sh --setup --family qwen36 --model UD-Q4_K_XL
+./setup.sh --setup --family qwen35 --model Q4_K_M
+./setup.sh --setup --family qwen35-uncensored --model Q8_0
 ./setup.sh --setup --family glm53 --model UD-IQ3_XXS
 ```
 
 API は、思考と答えの分離、ストリーミング、ツールの呼び出しを含めて使えます。
 Ornith の公式の版（Q4_K_M〜BF16）、Qwen3.6、GLM-5.3-Flash は、モデルの MTP の層で 2 つ先までの下書きを作り、窓でまとめて確かめます（推測デコード、greedy の要求だけ。GSQ-RCO の版と llm-jp には MTP の層がありません）。
 `setup --gpus` で 2 枚以上の GPU を選ぶと、層を GPU に分けて動かします（最初の GPU が前の層、次の GPU がその後の層と head と MTP の層。分割点は各 GPU の空いたメモリの割合から決めます）。VRAM に置けるエキスパートは GPU を合わせた分になります。
-まだ使えないのは、画像、KV キャッシュの精度や省 RAM モードなど Qwen3.8-Flash-Next のためのオプションです。
+Qwen3.5-9B は画像を読めます（setup が Qwen3.8-Flash-Next と同じく聞き、24 GB 以上の GPU では GPU の、それ未満では CPU の読み手を使います）。
+まだ使えないのは、ほかのモデルの画像、画像の生成、省 RAM モードなど Qwen3.8-Flash-Next のためのオプションです（KV キャッシュの精度は `--kv int8` だけ。GLM-5.3-Flash ではまだ使えません）。
 RAM がエキスパートの全体に足りないとき、エンジンは VRAM に置かないエキスパートを RAM の空きの許す限り RAM に置き、残りをモデルのファイルから OS のファイルキャッシュ越しに読みます（遅くなります。setup は RAM と VRAM を合わせても足りないとき警告します）。
+そのとき、上の `STRATA_RAM_ADAPT=<n>` で RAM のコピーを会話に従わせられます（1 GPU のとき）。
+`STRATA_DISK_SKIP_FROM=R`（opt-in、答えが変わる、Project Maya の #109 から）にすると、VRAM にも RAM のコピーにもなくファイルから読むエキスパートを、順位 R 以下で選んだトークンでは寄与を 0 にし、窓のどのトークンもその順位でしか選ばないものは読みません（SSD を待ちません）。GLM-5.3-Flash UD-IQ3_XXS を RAM 56 GB に絞った B70 の decode は、R=6 で 4.33 → 5.11 トークン/秒（128 トークンが同じ）、R=4 で 5.93（13 トークン目から分かれる）でした。
 
 エンジンのオプション（設定の `args` に足します）:
 
 | オプション | 意味 |
 | --- | --- |
 | `--max-context N` | KV キャッシュのトークン数（setup が GPU の VRAM から選びます） |
+| `--kv-ram on\|off` | GLM-5.3-Flash の DSA の層の潜在（1 位置 1 KB）を VRAM でなく RAM に持ち、空いた VRAM をエキスパートに回す（既定 on）。decode の窓は各トークンが選んだ位置だけを VRAM に写して読み、prompt の塊は層ごとにその時点までを写して読む。128K の文脈で B70 の VRAM のエキスパートが 2,150 から 2,322 枠に増え、RTX 4070 は 128K で起動できるようになり、64K で prompt が 3.3 から 7.1 トークン/秒になりました |
+| `--kv fp16\|int8` | 注意の層の KV キャッシュを FP16（既定）か、64 値ごとに FP16 の倍率を持つ int8 で持つ。int8 は VRAM が半分になり、答えが少し変わります（GLM-5.3-Flash では使えません） |
 | `--expert-profile PATH` | 起動時に、このプロファイルの順で VRAM のエキスパートを埋める |
 | `--expert-profile-save PATH` | この実行で学んだことをプロファイルとして書き出す |
-| `--adapt-every N` | VRAM のエキスパートを入れ替える間隔。要求の 4N トークンごとに入れ替えます。CPU と GPU の丸めが違う層があれば窓をそこで切り、文章が推測の仕方で変わらないようにします。Qwen3.8 の 4 つのファイルは decode が CPU と GPU で同じビットなので切りませんが、serve の 2 ターン目からの prompt の読みは入れ替えの時期で丸めが変わり、文章が実行ごとに変わることがあります（`STRATA_ADAPT_CUT=1` で切ります）（バッチのスロット、`--pipeline-windows`、`--adapt-async` では N 窓ごと）（既定 4。0 で入れ替えない）。指定がなければ、出力の 32 トークン目に CPU のプールが検証の窓の時間の 30% 以上を使っていたとき、4 トークンごとにします。ただし、GPU が持たないエキスパートをファイルから読むとき（`--mmap-experts`）は縮めません |
+| `--adapt-every N` | VRAM のエキスパートを入れ替える間隔。要求の 4N トークンごとに入れ替えます。CPU と GPU の丸めが違う層があれば窓をそこで切り、文章が推測の仕方で変わらないようにします。Qwen3.8 の 4 つのファイルは decode が CPU と GPU で同じビットなので切りませんが、serve の 2 ターン目からの prompt の読みは入れ替えの時期で丸めが変わり、文章が実行ごとに変わることがあります（`STRATA_ADAPT_CUT=1` で切ります）（バッチのスロット、`--pipeline-windows`、`--adapt-async` では N 窓ごと）（既定 4。0 で入れ替えない）。指定がなければ、出力の 32 トークン目に CPU のプールが検証の窓の時間の 30% 以上を使っていたとき、4 トークンごとにします。ただし、GPU が持たないエキスパートをファイルから読むとき（`--mmap-experts`。Qwen3.8-Flash-Next 以外のモデルでは、RAM がエキスパートの全体に足りず、その一部を読むときも）は縮めません |
 | `--adapt-swaps N` | 1 回に入れ替えるエキスパートの最大の数（既定 96。prompt の直後の 1 回は、その prompt が多く使ったものを 2,048 個まで。空いた枠には、1 回でも使ったものを数に関わらず入れます） |
 | `--adapt-mib-per-token N` | 入れ替えで写す量の上限を、前の入れ替えから進んだトークンあたり N MiB にする（既定 48。0 で上限なし） |
-| `--mmap-experts` | エキスパートを RAM に読み込まず、モデルのファイルから読む |
+| `--adapt-min-gain F` | 入れ替えに要る差（入れるエキスパートと出すエキスパートの、減衰させた使用回数の差。既定 1.5） |
+| `--mmap-experts` | エキスパートを RAM に読み込まず、モデルのファイルから読む（setup の `--low-ram on` か `mmap` で書かれます） |
 | `--no-pcie-split` | VRAM にないエキスパートを、すべて CPU で計算する |
+| `--vram-elastic` | `--serve` で 1 GPU のとき、VRAM のエキスパートの段をセグメント（`--vram-segment-mib`、既定 512）に分けて持ち、画像の仕事の前に空けて後で戻す（`--image-gpu-policy shrink`） |
+| `--prefill-cpu-share S` | prefill で VRAM にないエキスパートのうち、CPU のプールが計算する割合（0〜1。既定の `auto` は起動時に測った時間から決める。0 ですべて GPU） |
 | `--pool-workers N` | エキスパートを計算する CPU のスレッドの数（既定は物理コアの数より 1 少なく、多くて 32。Linux のコンテナで CPU の割り当て（cgroup）があれば、その数より 1 少ない数まで） |
-| `--prompt-chunk N` | prefill で一度にまとめて計算する最大のトークン数（既定 4096、0 でまとめない） |
+| `--prompt-chunk N` | prefill で一度にまとめて計算する最大のトークン数（既定は 4096。VRAM のエキスパートの枠がもっと大きい塊を貸せるときはそれ。32768 まで、塊のバッファーが枠の 85% 以内に収まるもの。0 でまとめない） |
 | `--max-t N` | decode の窓の最大のトークン数（既定 8） |
 | `--spec N` | MTP の層の推測デコードの窓の最大のトークン数（既定 3: 下書き 2 個。0 で使わない） |
+| `--spec-window all\|auto\|min-p` | 窓で確かめる下書きの数の決め方。`all`（既定）は作った下書きをすべて、`auto` は Qwen3.8-Flash-Next と同じく、下書きの確率と測った窓の時間から 1 ms あたりの出力が増える間だけ、`min-p` は下書きの確率が `--spec-min-p P` 以上の間だけ |
 | `--draft-vocab PATH` | MTP の層の下書きを、このトークンの部分集合（`data/draft_vocab*.bin`）の中だけで作る。ヘッドを読む量が減ります（setup が Qwen3.6 の設定に、`--draft-vocab` の選択に従って書きます） |
 | `--layer-split K[,K2..]` / `auto` | 層を GPU に分ける。最初の GPU が層 K の前まで、次の GPU が K から、…（`auto`: 各 GPU の空いたメモリの割合で。setup の `--gpus` で書かれます） |
 | `--split-device D[,D2..]` | 2 枚目以降の GPU（エンジンの番号か PCI アドレス。既定はほかの単体の GPU） |
+| `--vision` | `--serve` で画像つきの要求を受ける（Qwen3.5-9B と qwen35moe のモデル。setup が画像を選んだとき書きます） |
 | `--rope-scaling none\|linear\|yarn`、`--rope-scale F`、`--yarn-orig-ctx N` | 文脈の延長 |
 
 ### RAM がモデルより少ないとき（省 RAM モード）
@@ -384,9 +434,10 @@ GPU が持つエキスパートが少ないほど、ファイルから読む分�
   `STRATA_EXCHANGE_ROTATE=1`（opt-in、upstream 1e6cec80）は、入れ替えのときに追い出したエキスパートを RAM のコピーへ写さず、交換のバッファの持ち主を渡します（同じトークンで、ホストのコピーが減ります）。
   RAM のコピーが全部ページ固定のときだけ働きます。層ごとにエキスパートの大きさが違うネイティブの pack（IQ3_XXS は 9 種類）では、大きさごとに予備のバッファを持ちます（upstream fa1d1d1e）。
   そのぶんページ固定の RAM が増えます（IQ3_XXS・`--adapt-swaps 80` で 1.20 GiB）。B70・IQ3_XXS・4K・`--resident-experts --adapt-every 1 --adapt-swaps 80` の decode は +1.4%（73.2 → 74.3 tok/s）で、トークンは同じでした。
-- `STRATA_RAM_ADAPT=<n>`（opt-in、`--serve`、1 GPU、upstream d7298883）: RAM のコピーも会話に従わせます。
+- `STRATA_RAM_ADAPT=<n>`（opt-in、`--serve`、1 GPU、upstream d7298883・2b13a4493）: RAM のコピーも会話に従わせます。
   これがないと、RAM のコピーは起動のときに一度だけ選ぶので、GPU の持たないエキスパートを RAM が全部持てないとき、コピーの外のエキスパートは選ばれるたびにファイル（SSD）から読みます。
-  これがあると、decode の窓の前で適応の回が進んでいないとき、窓が選び続けるエキスパート（適応の段の減衰した数で 2 以上）を最大 `n` 個、同じ層の選ばれていないもの（0.5 未満）の RAM の場所に入れます（層ごとに 1 組、差の大きい順、1 つにつきファイルを 1 回読む）。
+  これがあると、decode の窓の前で適応の回が進んでいないとき、窓が選び続けるエキスパート（適応の段の減衰した数で 2 以上）を、同じ層の選ばれていないもの（0.5 未満）の RAM の場所に入れます（層ごとに 4 組まで、差の大きい順）。
+  入れるエキスパートはたいてい直前の窓のために読まれていて、その読みの段の置き場にまだあればそこから写し、ファイルは読みません。`n` はファイルを 1 回読む組だけの上限です。ログは移した数と、そのうち段の置き場から写した数を言います。
   RAM の大きさ、選び方、重み、VRAM の段の規則は変わりません。適応の段（`--adapt-every`）が要り、`STRATA_EXCHANGE_ROTATE=1`、層の分割、補助の GPU、`--batch` では何もしません。
   upstream は RTX 3060 12 GB・RAM 32 GB（IQ2_XS）で decode +16.5% を測りました。B70・IQ3_XXS・RAM の予算 6 GiB の serve 32K では、ファイルの読みが OS のキャッシュから来るので同等でした。
 - 入らないなら、OS のファイルキャッシュ経由で読みます（`--mmap-experts`）。
@@ -510,6 +561,7 @@ RAM に 23〜50 GB を読み込むのに時間がかかりますが、何もダ�
 `run-<model>.sh` は、そのモデルを直接起動します。
 同じモデルに setup をやり直すと（別の文脈の長さなど）、setup が書くキー（`exe`、`args`、`port`、`gpu_pci`、`vision` など）を書き直し、あなたが足したキー（`sampling`、`mcp_servers`、`cors_origins` など）と、指定しなかった `host`・`api_key` は残します。
 前のファイルは `xestrata-<model>.json.bak` に残します。
+Qwen3.8-Flash-Next の大きさの質問では、入っている大きさを `(installed)` と示して既定にし、`--yes` もそれを選びます。やり直しても、勧める大きさに替わってダウンロードし直すことはありません。
 `"args"` に手で足したエンジンのオプションは引き継がず、setup がその名前を示すので、足し直します（upstream #629）。
 
 ```text
@@ -700,11 +752,21 @@ MTP の推測の層のヘッドは、トークンの一部だけを扱います�
 VRAM が 14 GB 未満の GPU では、setup が `--draft-vocab en` を勧めます。
 これは提案だけで、指定しなければ何も変わりません。
 
+推測のヘッドの積は、起動時にその GPU で 2 通りを測って速い方を使います。
+ひとつはヘッドの形のまま、もうひとつはヘッドの行を 2 ビットに詰めた写し（128 値ごとに最小値と刻み）で全体をおおまかに計算し、上位 16 個だけをヘッドの形で計算し直すものです。
+下書きを作るだけなので、どちらでも答えは変わりません（下書きを確かめるのは本体のヘッドです）。
+2 ビットの写しは VRAM を約 80 MiB（トークンの一部）から 180 MiB（全部）使います。
+B70 では Qwen3.8-Flash-Next の下書きの 1 歩のヘッドが 556 から 292 マイクロ秒になり、1 ラウンドの下書きが約 0.9 ms 短くなりました。
+ほかのモデルの MTP の層（GLM-5.3-Flash、Ornith-1.5、Qwen3.6-35B-A3B）でも同じです。
+`STRATA_DRAFT_INT2=0` で使わず、`1` で測らずに使います。
+
 server は `--mtp` なしでも動きます（upstream 3216d271）。
 推測は、接尾辞とプロンプトの照合だけ（当たらなければ 1 回に 1 トークン）になり、どのトークンも本体で確かめます。
 推測の層が使う VRAM（ヘッドと合わせて約 0.7〜1 GiB）は、エキスパートのキャッシュに回ります。
 upstream の 8 GB のカードでの比較では、キャッシュが 1,000 から 1,678 スロットになりました。
 退避した会話とファイルに保存した会話は推測の層の K/V を含むので、`--mtp` なしでは会話のキャッシュの退避、`--conversation-save`、セッションファイルは使えません。
+
+Qwen3.8-Flash-Next のネイティブの pack（エキスパートを GGUF のファイルから読む pack）では、`--spec` は 2 以上が要ります。`--spec 0` と `--spec 1` では、エンジンは起動しません（`it needs --native SHARD1, --spec T (T >= 2) and --prefill CHUNK`）。
 
 ---
 
@@ -718,14 +780,18 @@ server は `http://127.0.0.1:8095` で待ち受けます（setup の `--port`、
 | OpenAI の Chat Completions（ストリーミングとそうでないもの、ツール） | `POST /v1/chat/completions` |
 | Anthropic の Messages（ストリーミングとそうでないもの、ツール） | `POST /v1/messages` |
 | OpenAI の Responses（ストリーミングとそうでないもの、ツール。状態を持たない、[下](#responses-api-と-codex-cli)） | `POST /v1/responses` |
-| モデルの一覧、状態 | `GET /v1/models`、`GET /models`、`GET /health` |
+| モデルの一覧、状態 | `GET /v1/models`、`GET /models`、`GET /v1/models/{id}`、`GET /health` |
 | モデルの属性 | `GET /props`（`?model=<読み込んだモデルの id>` も受け付ける） |
 | モデルがいま何をしているか | `GET /status`、`GET /slots`（スロットは 1 つで、busy か idle） |
 | Monitor のタブが示すすべて（エンジン、いまの状態、最近の要求、ハードウェア） | `GET /metrics` |
 | 同じものを Prometheus の形で（vLLM の名前、`Accept: text/plain` か `?format=prometheus`） | `GET /metrics` |
+| 合計といま動いているものを Prometheus の形で（llama-server の名前） | `GET /metrics/prometheus` |
 | MCP サーバーとその状態とツール（[下](#mcp-サーバーのツールを使う)） | `GET /mcp` |
 
-`/models` と `/v1/models` は、読み込んだモデルだけを、文脈の上限と入力の種類とともに示します。
+`/models` と `/v1/models` は、モデルを文脈の上限と入力の種類とともに示します。
+読み込む前と起動中も並び、`status` が `loading`（遊休で下ろしたときは `unloaded`）になります。
+OpenAI の `created`（server の起動時刻）と `owned_by`（`xestrata`）も付きます。
+`GET /v1/models/{id}` は 1 つのモデルを返し、知らない id には 404（`model_not_found`）を返します。
 `/props` は、元のチャットテンプレート、文脈の上限、設定した生成の既定値（共有の設定が優先）、モデルのパス、エンジンの版を、わかる範囲で示します。
 文脈は、エンジンの文脈全体で、VRAM に置く KV の範囲ではありません。
 `n_predict: -1` は、出力の上限を決めていないという意味です。
@@ -749,14 +815,14 @@ print(r.choices[0].message.content)
 ### 思考の深さ
 
 モデルは答える前に考えます。
-思考は `reasoning_content`（Anthropic では `thinking` のブロック）としてストリーミングされます。
+思考は `reasoning_content` と `reasoning`（同じ文。Anthropic では `thinking` のブロック）としてストリーミングされます。
 深さは none、low、medium、high から要求ごとに選べます。
 チャットの画面の「Thinking」のメニュー、`chat.py` の `/think low`、API で指定します。
 
 | API | 指定の仕方 |
 | --- | --- |
 | OpenAI | `"reasoning_effort": "none" \| "low" \| "medium" \| "high"`（`"reasoning": {"effort": ...}`、`"chat_template_kwargs": {"enable_thinking": false}` も可） |
-| Anthropic | `"output_config": {"effort": "low" \| "medium" \| "high"}`、`"thinking": {"type": "disabled"}`、`"thinking": {"type": "enabled", "budget_tokens": N}`（2K 未満は low、8K 未満は medium、それ以上は high） |
+| Anthropic | `"output_config": {"effort": "low" \| "medium" \| "high"}`、`"thinking": {"type": "disabled"}`、`"thinking": {"type": "enabled", "budget_tokens": N}`（2K 未満は low、8K 未満は medium、それ以上は high）、`"thinking": {"type": "adaptive"}`（深さはモデルの既定か `effort`） |
 
 指定がなければ、モデル自身の既定の **high** になります。
 実行の設定に `"reasoning_effort": "low"`（`none`、`medium`、`high` も）を書くと、指定のない要求はその深さになります（upstream #1641）。
@@ -782,6 +848,14 @@ print(r.choices[0].message.content)
   エンジンは会話のチェックポイントをそのターンの前に置くので（`--tail-role-token`。server がエンジンが知っているかを確かめます）、次の要求は深さによらず会話を使い直せます。
   既定（`"start"`）のプロンプトは変わりません。
   既定でない深さを、モデルは学習とは違う場所で見ることになります。
+- **ループに入った返答を抜けさせます（既定）**: 返答が同じトークンの塊（8〜2,048 トークン）を続けて繰り返し始めたら、server はそれを見つけて抜けさせます（[Project Maya](https://github.com/mw00/project-maya) のループ対策を写したもの）。
+  塊が 32 トークン未満なら 4 回、それ以上なら 3 回、合わせて 96 トークン以上で、思考の中では 5 回・4 回、192 トークン以上です。表の行、配列、似たコードの行は、同じ塊がそのまま続くわけではないので当たりません。
+  見つけるまで出力は変わりません。ストリームは、繰り返しかもしれない末尾を最大 64 トークン送らずに持ちます。
+  1 回目は、まだ送っていない繰り返しを捨て、残した出力の続きから、短い repetition penalty（1.15。窓は周期の 2 倍、最低 128 トークン）を周期の 2 倍 + 128 トークンのあいだだけかけて続けます。その後は要求のサンプリングに戻ります。
+  答えで 2 回目（合わせて 4 回目）が来たら答えを終えます（`finish_reason` は `"stop"`）。思考の中では 2 回目まで penalty で、3 回目で思考を閉じて答えさせます（Harmony の思考は閉じず、penalty だけです）。
+  ツール呼び出しにかかるループは切りません。同じ呼び出しの繰り返しはそのまま、1 つの呼び出しの中のループは penalty だけです。
+  server のウィンドウに 1 行出し、`/metrics` の `loop_guard`（Prometheus では `strata:loop_guard_*_total`）で数えます。
+  `xestrata-<model>.json` の `"loop_guard": false` か環境変数 `STRATA_LOOP_GUARD=0` で切れ、要求の `"loop_guard": true` / `false` でその要求だけ変えられます。
 - **1 つのトークンを繰り返す返答は打ち切ります**: 返答が同じトークンを 256 回続けたら、server はそこで `finish_reason` を `"length"` にして終え、ウィンドウにそう表示します。
   ループに入ったモデルや、1 つのトークンを出し続ける壊れた状態のためです（upstream の #606 では `!` が 36,689 個続きました）。
   `xestrata-<model>.json` の `"repeat_stop_tokens": N` で回数を決め、`0` で止めません（本当に同じトークンを何度も求める要求のため）。
@@ -794,10 +868,10 @@ print(r.choices[0].message.content)
   引っかかったのがプロンプトの短い残り（最後のターンの境目の後、`--short-read` で窓に通す部分）を読む窓だったときは、送り直しはプロンプト全体をまとめて読みます（upstream #3465: その残りで毎回失敗し、`--short-read 0` で通った報告）。エンジンはそのことを 1 行書きます。
   カーネルはフラグを書くだけなので、NaN のない答えは `STRATA_NAN_GUARD=0`（カーネルを入れない）と同じです。
   試しのスイッチ: `STRATA_NAN_INJECT=<n>[,<n>...]` で、エンジンが確かめる n 番目の窓を NaN として扱います。
-- **思考を求めない Anthropic の要求（任意）**: 既定では、`"thinking"`、深さ、上限のどれもない `/v1/messages` の要求は、モデルのテンプレートどおりに考えます。
-  `xestrata-<model>.json` に `"anthropic_thinking": "on_request"` を書くと、そうした要求を思考なしで処理します。
-  Anthropic 自身の規則で、Claude Code の短い補助の呼び出し（数十トークンで会話の題を付けるものなど）に要ります。
-  `POST /v1/messages/count_tokens` は、要求を `/v1/messages` と同じに組み立ててトークンに分け、モデルは動かしません。
+- **思考を求めない Anthropic の要求**: `"thinking"`、深さ、上限のどれもない `/v1/messages` の要求は、Anthropic 自身の規則どおり思考なしで処理します。
+  Claude Code の短い補助の呼び出し（数十トークンで会話の題を付けるものなど）に要ります。
+  `xestrata-<model>.json` に `"anthropic_thinking": "model"` を書くと、そうした要求もモデルのテンプレートどおりに考えます。
+  `POST /v1/messages/count_tokens` は、要求を `/v1/messages` と同じに組み立ててトークンに分け、出力のトークンは生成しません。画像は読むときと同じ数の画像のトークンとして数えるので、まだ読んでいない画像は画像のエンコーダーで読みます（一度読んだ画像は覚えていて、後の要求でも使います。アイドルで止まったエンコーダーは、要求と同じくモデルの読み込みで戻します）。ツールの結果の画像も、読めない画像として省略する前にエンコーダーを戻します。読み込み自体を断るときは、画像の省略ではなく要求のエラーです。
 
 ### ストリーミングと接続
 
@@ -807,9 +881,27 @@ print(r.choices[0].message.content)
   server のウィンドウは 15 秒ごとに進み具合を出し、`GET /status` は何をしているか（`reading the prompt`、`answering`、そこまでのトークン数）を返します。
   接続を閉じるか、アプリで止めると、モデルも本当に止まるので、次の要求はすぐに始まります。
 - **呼び出しとして返すツールの呼び出し**: 呼び出しになるのは、要求が宣言したツールの名前のものだけです。
-  別の名前の呼び出しや、ツールを宣言していない Chat Completions・Anthropic の要求の呼び出しは、書かれたままの文として返すので、クライアントが差し出していないツールを動かすことはありません（Responses は Codex のまとめの要求のために前のままです）。
+  別の名前の呼び出しや、ツールを宣言していない Chat Completions・Anthropic の要求の呼び出しは、書かれたままの文として返すので、クライアントが差し出していないツールを動かすことはありません（Responses も同じです。Codex のまとめ（compaction）の要求だけは、プロンプトに会話のツールを見せるので、前のまま呼び出しを返します。ただし明示的な `tool_choice: "none"` は、この場合も呼び出しを禁止します）。
+  名前空間のツール（`mcp__filesystem.write_file`）は、モデルが `mcp__filesystem__write_file`、`mcp__filesystem=write_file`、`mcp__filesystem_write_file` と書いたときと、そのメンバーを持つツールが宣言の中に 1 つだけのときにメンバーだけ（`write_file`）を書いたときも、その呼び出しになります。
+  `__` を含む名前（`mcp__playwright__browser_navigate`）は、モデルが `__` を全部 `_` と書いたとき（`mcp_playwright_browser_navigate`）も、宣言した 2 つのツールが同じ綴りにつぶれない限り、その呼び出しになります。
+  名前は推し量りません: `bash` は `shell` ではなく、順の入れ替わった名前（`label_values_mcp_server1` に対する `server1_label_values`）は宣言した名前になりません。
   囲みが 1 トークンずれた呼び出し（`<function=NAME>` でなく `<=NAME>`、`<function:NAME>`、`<NAME>`）は、NAME が宣言したツールなら呼び出しとして読みます。
+  テンプレートの形の隣の形（`<parameter=NAME>` で始まる呼び出し、`<tool_call>` の中の JSON、`<tool_call>` のない `<function=NAME>` の塊、1 つの `<tool_call>` の中の 2 つ目の呼び出し）も、宣言したツールの呼び出しなら読みます（upstream 0.2.8 から既定）。
+  エージェントの 1,462 ターンでは、意図どおりに読めたのがこれで 98.3%、なしで 92.9% でした。
+  `xestrata-<model>.json` に `"tool_call_recovery": false` を書くと、これを切ります。
   それでも呼び出しとして読めない `<tool_call>` の塊は、server のウィンドウで数を出します。
+- **呼び出しの読み手が直すもの、直さないもの**: 文字列の引数が呼び出しを丸ごと引用していても、自分の `</parameter><parameter=NAME>` を繰り返していても、値はそのままです（upstream #4078）。
+  `</function>` の抜けた呼び出しは、回答の中でも思考の中でも呼び出しとして読みます（upstream #4427）。
+  ツールが配列かオブジェクトと宣言した引数（または型を宣言していない引数）に書き損じがあれば、書かれたとおりに読みます: 末尾や二重のカンマ、一重引用符や `True`・`False`・`None`、オブジェクトのメンバーの間の裸の文字列（`"status": "pending", "in_progress", "pending": false`）、最後に閉じていない括弧。
+  server のウィンドウに `N tool call argument(s) repaired` と出て、`/metrics/prometheus` は `strata:tool_args_repaired_total` で数えます。
+  配列でもオブジェクトでもない文、途中で切れた文字列、文字列の型の引数には手を付けません。
+  思考が閉じタグで終わった後、回答の行頭にもう一つ閉じタグがあれば、落とします（思考中にモデルがタグを引用したもの、upstream #4077）。後に続く呼び出しは残ります。
+  2 つのタグの間の思考は、ストリームが文を取り消せないので、もう回答として送られています。
+- **宣言していない名前のために文として返した呼び出し**: 文はモデルが書いたままで、`finish_reason` は `stop`（`/v1/messages` では `end_turn`）のままです。
+  その横に、中身があるときだけ、一覧 `"strata_rejected_tool_calls": [{"name": "bash", "reason": "undeclared"}]` を付けます（Chat Completions の返事の一番上と、ストリームの最後の塊、`/v1/messages` の `message_delta` のイベントとメッセージ。名前は 5 つまで）。
+  立て直したいクライアントは、持っているツールの名前をモデルに伝えて聞き直せます。要求が宣言していないツールの呼び出しを XeStrata が動かしたり渡したりすることはありません。
+  server のウィンドウにも同じ名前が出て、`/metrics/prometheus` は塊の数を `strata:tool_calls_unread_total` で数えます。
+  形の崩れた塊（宣言していない名前でないもの）もそこで数えますが、挙げる名前はありません。
 - **チャットのアプリ**: 「OpenAI 互換」の接続先を持つアプリなら使えます。
   ベース URL は `http://127.0.0.1:8095/v1`、API キーは何でも構いません。
 - **OpenCode**（upstream #543）: `opencode.jsonc`（プロジェクトの中か `~/.config/opencode/`）の出発点です。
@@ -874,6 +966,7 @@ print(r.choices[0].message.content)
 - **同じネットワークのほかの機器から**: 指定しなければ、server はこの PC（`127.0.0.1`）でだけ待ち受けます。
   `./setup.sh --host 0.0.0.0 --api-key 長い秘密の文字列` で起動するか（モデルの設定に保存され、次からも使われます）、`xestrata-<model>.json` に `"host": "0.0.0.0"` と `"api_key": "..."` を書きます。
   server のウィンドウに、この PC のアドレスが出ます（`from other devices: http://192.168.x.x:8095/`）。
+  IPv6 では `--host ::`（または `"host": "::"`。IPv6 のすべてのインターフェース）を使い、URL ではアドレスを角かっこで囲みます（例: `http://[2001:db8::7]:8095/v1`）。
   ほかの機器でそれを開くか、`.../v1` を API のベース URL に使います。
 - **インターネットから**: 前にトンネルを置きます。
   たとえば [cloudflared](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/) なら
@@ -929,6 +1022,9 @@ print(r.choices[0].message.content)
 最初から読んだプロンプトも、システムプロンプトが 2,048 トークン以上なら、その終わりでチェックポイントを取ります（upstream PR #62 と #65）。
 長いシステムプロンプトとツールの一覧を持つエージェントのクライアントにも、この起点ができます。
 エンジンの設定は `--prompt-cache N`（0 でオフ）、`--prompt-cache-every N`、`--prompt-cache-root N`（0 でシステムプロンプトのチェックポイントなし）、`--turn-token ID` です。
+`--prompt-cache-every` は、prompt を読む塊の大きさを決めません。N トークンごとのチェックポイントは prefill の塊の境目で取り、読みはそのまま続きます。
+読みを分けるのは、システムプロンプトの終わり（`--prompt-cache-root`）、最後の発言の始まり、`STRATA_CACHE_MESSAGE_BOUNDARY` の境目、`"strata_prefix"` の境目です（塊の大きさは `--prefill`）。
+`--prompt-cache-every 0` は、N トークンごとのチェックポイントも、`--prompt-cache-tail` のチェックポイントも取りません。前の発言を書き換えたクライアントは、それだけ前のチェックポイントから読み直します。
 
 続きの要求が来ない使い捨ての要求（分類や確認の呼び出し）は、本文に `"strata_checkpoint": false` を書けます。
 最後の発言の始まりと 16K トークンごとのチェックポイントを取らず、そのセッションを次の要求のために残しも置きもしません。
@@ -959,7 +1055,7 @@ B70 の IQ2_XS で 1,791 トークンのプロンプトに 3 つの問いを続�
   エージェントが長い履歴はそのままで最後の発言だけを差し替えるとき、履歴を読み直しません。
   対象は 8,192 トークン以上の履歴で、最後の発言が 1,024 トークン以下のときです。プロンプトの塊が分かれ、新しい要求に取る分の時間がかかります。
 
-### 複数の会話を置いておく（任意）
+### 複数の会話を置いておく
 
 設定の `args` に `--conversation-cache-mib 8192 --conversation-cache-slots 4` を足すと、最大 4 つの会話を、合わせて 8 GiB までの RAM に置いておけます。
 エンジンが持っているのと別の会話の続きが来ると、エンジンはまず持っている会話（K/V キャッシュ、動いている状態、チェックポイント）を脇にコピーし、
@@ -970,7 +1066,7 @@ B70 の IQ2_XS で 1,791 トークンのプロンプトに 3 つの問いを続�
   会話は、トークン、画像、制御ベクトルの設定だけで見分けます。
 - `--conversation-cache-mib` を付けないと、モデルを読み込んだ後に空いている RAM から大きさを決めます。
   `--conversation-cache-min-free-mib` を超える分の 40% を 256 MiB 刻みで取り、上限は 8192 MiB です。1024 MiB に満たないときはオフになります。
-  どちらになったかは、エンジンのログに 1 行で出ます。`--conversation-cache-mib 0` と `--prompt-cache 0` でオフになります。
+  どちらになったかは、エンジンのログに 1 行で出ます。`--conversation-cache-mib 0` と `--prompt-cache 0` でオフになります。Qwen3.8-Flash-Next では `--mtp` がないときもオフです。
   置いた会話は、[次の節](#置いた会話を再起動後も使う任意)の設定がなければ、再起動をまたいで残りません。
 - コピーの前に、`--conversation-cache-min-free-mib N`（既定 2560）の RAM が空いたままかを確かめます（使える RAM の読み方は下）。
   足りなければ、古い会話から追い出しながら確かめ直します（upstream 940011da）。
@@ -998,10 +1094,33 @@ B70 の IQ2_XS で 1,791 トークンのプロンプトに 3 つの問いを続�
 
 `--serve` で起動すると、エンジンはこの内訳を `memory guard:` の 1 行で出します。
 
+**エキスパートの領域が空いている RAM に入らないとき**（upstream #4051）: エンジンは、エキスパートを領域へ読み込む前に RAM を確かめます。
+メモリの上限が領域より小さい（コンテナ）ときは、数字を出して起動を止めます。
+空いている RAM が領域より少ない（終わりかけのエンジン、別のプログラム）ときは、最大 20 秒待ち、ログにそう出します（`STRATA_ARENA_RAM_WAIT_S` で秒数を変え、`0` ですぐに読み込みます）。
+それでも足りなければ、足りない量を言う警告を出して読み込みます。断ることはありません。
+領域の半分にも満たないときは、PC 全体がメモリの回収で止まりうることと、systemd の RAM より小さい `MemoryHigh=` で 1 つのプログラムが全部を取らないようにできることを、警告に足します。
+
 B70 の IQ2_XS で測ると、970 トークンの会話（文脈 8K、FP16 の KV）は 251 MiB で、置くのに 70〜104 ms、戻すのに 21〜23 ms かかりました。
 答えと状態は、置かない実行とバイト単位で同じでした。
 KV は FP16、INT8（KV のストリーミングありも）、Q4_0、K8V4 で、小さい GPU の設定（8 GB、XMX なし）の INT8 でも同じです。
 置くのをオフにすると、この変更の前のエンジンと同じトークンと状態になります。
+
+### 遅いホストのリンクで会話のキャッシュのコピーを隠す
+
+GPU とホストの間のリンクが遅いと、会話のキャッシュのコピーが次の要求の待ちに乗ります。
+チェックポイントは DeltaNet の状態（Qwen3.8-Flash-Next で 118 MB）を GPU から RAM へ写し、会話を置くときは、その K/V とチェックポイントを写し終えるまで次のプロンプトが始まりません。
+次の環境変数（エンジンの環境）は、このコピーを VRAM の中のコピーと裏のスレッドに移します（upstream #3779）。
+答えと置いた会話の中身は同じバイトです。
+`--serve` で GPU とのリンクが 12 GB/s に満たないと測れたときは、3 つのうちどれも指定していなければ `STRATA_CKPT_ASYNC`・`STRATA_CKPT_GATHER`・`STRATA_PARK_ASYNC` を自分で 1 にします（起動のログにそう出ます）。それ以外ではオフで、どれかを 0 にするとどれも自分では入れません。
+
+- `STRATA_CKPT_ASYNC=1`: チェックポイントの状態を VRAM の段へ写し、裏のスレッドが RAM へ運びます（アシスタントの発言の始まりのチェックポイントは、ページ固定の作業領域へ）。読む側は自分の要るコピーだけを待ちます。段は状態と同じ大きさで、最初の保存のときに取り、取れなければこれまでどおり写します。
+- `STRATA_CKPT_VRAM_SLOTS=N`（0〜16、`STRATA_CKPT_ASYNC=1` と一緒に）: 最後に保存した N 個の状態を VRAM にも残し（N × 118 MB）、それへの復元は VRAM の中で写します。
+- `STRATA_CKPT_GATHER=1`: チェックポイントの 37 個の小さなコピーを 1 つのバッファに集め、1 回で写します。
+- `STRATA_PARK_ASYNC=1`: 会話を置くとき、K/V を VRAM の段へ写し、裏で RAM へ運びます。この要求が捨てるチェックポイントは、写さずに置く会話へ移します。
+- `STRATA_PARK_VRAM_MIB=N`（`STRATA_PARK_ASYNC=1` と一緒に）: 置いた会話の K/V を VRAM の枠（64 MiB 単位、合わせて N MiB まで）にも残し、その会話に戻るときは VRAM の中で写します。K/V を伸ばす VRAM が足りなくなると、枠を先に放します。
+- `STRATA_PARK_TRACE=1`: 調べる用。保存と置く手順の待ちと時間を stderr に出します。
+
+VRAM の段と枠は、GPU の全メモリの 16 分の 1 が空いたまま残るときだけ取ります。
 
 ### 置いた会話を再起動後も使う（任意）
 
@@ -1083,12 +1202,13 @@ B70 の IQ2_XS で、4,996 トークンの会話（INT8 の KV）のファイル
 - 実行の設定の `sampling` のブロックは、項目を省いた要求の既定を決めます（`"sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}`）。
   要求自身の項目がいつも優先します。
   ブロックがなければ、サンプリングの項目のない要求はモデルカードの勧める値で生成します（upstream #2685）。
-  思考の有無で選び、Qwen3.8-Flash-Next（Swift・Gyro も）は思考ありで temperature 1.0・top_p 0.95・top_k 20、思考なしで temperature 0.7・top_p 0.8・top_k 20・presence_penalty 1.5、Qwen3.6-35B-A3B は思考ありで 1.0・0.95・20・presence_penalty 1.5、思考なしで 0.7・0.8・20・1.5 です。
+  思考の有無で選び、Qwen3.8-Flash-Next（Swift・Gyro も）は思考ありで temperature 1.0・top_p 0.95・top_k 20、思考なしで temperature 0.7・top_p 0.8・top_k 20・presence_penalty 1.5、Qwen3.6-35B-A3B と Qwen3.5-9B は思考ありで 1.0・0.95・20・presence_penalty 1.5、思考なしで 0.7・0.8・20・1.5、HauhauCS の Qwen3.5-9B は思考ありで 0.6・0.95・20、思考なしで 0.7・0.8・20 です。
   Ornith-1.5 は model card の一般用途の 0.6・0.95・20（思考の有無によらず）、GLM-5.3-Flash は generation_config の temperature 1.0・top_p 0.95 です。
   llm-jp は model card に推奨がないので表になく、これまでどおり貪欲に生成します。
   優先は要求、web の画面の共有のチャットの設定、設定の `sampling` のブロック、モデルカードの順です。
   貪欲に生成するのは、要求の `temperature: 0` か、設定の `"sampling": {"temperature": 0}` で頼んだときだけです。
   web の画面は、サンプリングの設定を変えるまで自分の値を送りません（前は 0.6 を出して送っていました）。前に保存した 0.6 と既定の top_p・top_k は、設定していないものとして扱います。
+  min_p も Chat settings の引き出しで指定でき、空欄ならサーバーの既定（設定の `sampling.min_p`）です。
 - ペナルティ（`presence_penalty`、`frequency_penalty`、`repetition_penalty`）も同じ経路で効きます。
   `penalty_last_n` は数える直近のトークン数の上限で、どれかのペナルティがあれば既定は 64 です。
   llama.cpp の名前の `repeat_penalty` と `repeat_last_n` も、設定の `sampling` と要求で使えます（upstream #1819）。
@@ -1106,6 +1226,13 @@ B70 の IQ2_XS で、4,996 トークンの会話（INT8 の KV）のファイル
   下書きが残る割合は 4070 で 64.1% から 70.8% に上がりました。
   カードで結果が分かれるので、使うカードで測ってから有効にしてください。
 - **logprobs**: `/v1/chat/completions` の `"logprobs": true` と `"top_logprobs": K`（0〜20）で、各トークンの対数確率と、確率の高い K 個の候補を `choices[].logprobs` に返します（ストリームでも、upstream の Intel 版 4ba35fd から）。
+  トークンをつなげると返事の文字列そのものになります（2 つのトークンに分かれた文字は、それを書き終えるトークンに入ります）。
+  `"allowed_token_ids": [ids]` は `top_logprobs` をその id だけにし、確率の高い順に、合計が 1 になるよう正規化し直します。
+  選ばれたトークンも、名指しされていればその中に入ります（vLLM の項目ですが、vLLM は生成をその id に縛り、ここでは返す値を絞るだけなので、名指しの外のトークンは自分の `logprob` と空の一覧を持ちます）。
+  モデルの語彙の外の id は 400 です。
+  確率が読めなかったトークンには項目がなく、返事は続きます。
+  `json_schema` の返事では、トークンが返す JSON を綴るときだけ返します。
+  `--parallel` で起動した server では `max_tokens` が 1 の要求だけが受け取れ、それより長い返事は 400 です（バッチの枠の `BT` の行は対数確率を持たず、前の一部だけの項目はクライアントがモデルの答えと見分けられないため）。
   値は、サンプリング・温度・ペナルティの前の、モデルそのものの確率です。
   思考の間のトークンは `reasoning_content` の下に並び、止めのトークンは並べません。
   B70 の IQ2_XS で、付けても付けなくても答えは同じでした。
@@ -1116,10 +1243,17 @@ B70 の IQ2_XS で、4,996 トークンの会話（INT8 の KV）のファイル
 `{"type":"json_schema","json_schema":{"name":"answer","strict":true,"schema":{"type":"object","properties":{"answer":{"type":"integer"}},"required":["answer"],"additionalProperties":false}}}` を受け付けます。
 スキーマの最上位はオブジェクトでなければなりません。
 `#` で始まるローカルの参照は使え、外部の参照は断ります。
-`json_schema` は、Python のパッケージ `jsonschema` があればそれで確かめます（`python -m pip install "jsonschema>=4.23,<5"`。setup は入れません）。
-なければ、答えが 1 つの JSON のオブジェクトであることだけを確かめ、server はそのことを一度だけ伝えます。
+`json_schema` は、Python のパッケージ `jsonschema` で確かめます（setup が `.venv` に入れ、deb と rpm はディストリビューションの python3-jsonschema に依存し、Windows の 7z には入っています）。
+なければ、`strict: true` の要求（`json_schema` の `strict: true`、Messages の `output_config.format`、`strict: true` の道具）は確かめられないので 400 で断り、ほかの `json_schema` は答えが 1 つの JSON のオブジェクトであることだけを確かめます。server はそのことを一度だけ伝え、入れ方は `xestrata --setup` が示します。
 
-これは**スキーマをプロンプトで伝え、server が確かめる**方式で、文法で生成を縛るものではありません。
+エンジンが文法で縛れるとき（連続バッチと密なモデルのエンジンを除く）は、**答えをスキーマの文法で縛って書かせ**、書いた後にも確かめます。
+思考は縛らず、思考の後の答えの JSON だけを縛ります。
+縛れないときは、スキーマをプロンプトで伝え、server が確かめるだけです。環境変数 `STRATA_GRAMMAR=0` でも縛りません。
+`strict` は true、false、null（書かないのと同じ）のどれかで、ほかの型は 400 です。
+道具の `strict: true`（Chat Completions・Responses・Messages。Responses の namespace と `additional_tools` の道具も）と、`custom` の道具の regex の文法も、呼び出しの引数を同じように縛ります（Qwen の呼び出しの形のモデル）。文と、ほかの道具の呼び出しは縛りません。
+`strict: true` の道具の呼び出しは、縛ったかどうかにかかわらず、送る前に引数をスキーマで確かめます。そのため書いている途中には送らず、書き終わった呼び出しをまとめて送ります。合わないとき、JSON に書けない数（NaN、Infinity、大きすぎる数）があるときは、答えと同じく `structured_output_failed` です。
+Qwen の呼び出しの形では、文字列のパラメーター本文はそのまま値です。型の読み取りは、同じ階層の制約と `allOf` を交差、`anyOf`・`oneOf` の枝を和集合として扱い、ローカル JSON Pointer の参照は道具の `parameters` 全体から解決します。これは値の型を戻すための手掛かりで、スキーマの検証の代わりではありません。
+文字列の `enum`・`const` では、本文が候補になく、JSON の引用符を外した文字列だけが候補にあるときに限り、引用符を外します。両方が候補なら元の本文を残します。この判定が必要なパラメーターは、ストリームでも値の終わりまでためます。
 1 つの要求に 1 回だけ生成し、隠れたやり直しはしません。
 成功した応答には、確かめた JSON のオブジェクトが入ります。
 壊れた JSON、重複したキー、有限でない数、スキーマの違反、途中で終わった生成には、`error.code: structured_output_failed` で **502** を返します。
@@ -1128,7 +1262,59 @@ JSON の形式とツールや MCP の組み合わせは、はっきり断りま�
 `response_format` がなければ、普通の文章とツールの振る舞いは変わりません。
 構造化の SSE は、keep-alive のコメントを送りながら答えをためておき、確かめてから内容を送り、使用量と時間、`[DONE]` を送ります。
 失敗したときは、正しくない内容を送らずに、SSE のエラーと `[DONE]` を送ります。
+数学の答えには `\alpha` のような LaTeX がよく入り、これは JSON のエスケープとして正しくありません。
+`response_format`（`/v1/responses` では `text.format`）に `"repair_latex_escapes": true` を足すと、厳密な読みが失敗した後に限り、server は正しいエスケープでないバックスラッシュを 2 つにして、もう一度確かめます。
+正しい出力には手を付けません。
+`\b`、`\f`、`\n`、`\r`、`\t`、`\uXXXX` は JSON として正しいのでそのままです。
+`\alpha` の横の `\beta` はバックスペースになって返ります。
+既定はオフです。
 `/v1/status.structured_output` は、形式、確かめ方、ためてから送るストリーミングを示します。
+
+### ウェブの画面（Chat、Images、Monitor、About）
+
+ブラウザーでサーバーのアドレスを開きます。
+画面はサーバー自身のファイルだけで動き、CDN や外のアドレスは使いません。
+会話・設定・API キーはブラウザーに残ります。
+
+**Chat settings**（入力欄の横のボタン）に、サンプリングと思考の設定と、下のスイッチがあります。
+下のスイッチは**どれも既定でオフ**で、全部オフなら画面は前と同じに動きます。
+
+- **Render math.** `\( ... \)`・`\[ ... \]`・`$x$`・`$$ ... $$` で書いた式を、KaTeX 0.19.0 で数式として描きます。
+  KaTeX は `third_party/main/katex` にあり（MIT。そこの `PROVENANCE.json` がパッケージとファイルごとのハッシュを示します）、サーバーが `/web/vendor/katex/` で配ります。
+  メッセージの文は変えません。コピー・Markdown の書き出し・次の要求は、どれもモデルが書いたとおりの文を使います。
+  コード、金額（`$5 and $10`）、書いている途中の式は文のままです。KaTeX が読めない式は元の文のままです。
+  式は描くだけで、リンクを作ることも、画像を読み込むことも、何かを動かすこともできません（`\href`・`\url`・`\includegraphics`・`\htmlClass` はその名前のまま出ます）。
+- **Saved chats list.** すべての会話を左の一覧に残します。題と本文の検索、名前の変更、削除（Undo 付き）ができ、日ごとに見出しが付きます。
+  会話はこのブラウザーの IndexedDB に置き、画像やファイルは名前だけを残します。サーバーには何も送りません。
+  プライベートウィンドウやブラウザーの保存先がいっぱいのときは、一覧はメモリにだけ置き、画面が一度そう伝えます。
+  オンにすると、画面の会話が一覧の最初の会話になります。オフにすると、その会話が 1 つだけの会話として残ります。
+- **Edit and rewind messages.** 各メッセージの下に **Regenerate**（同じ質問への新しい答え）、**Edit answer**（答えの文を直す。前の思考とツールの呼び出しは消え、要求は送りません）、**Rewind to here** が出ます。
+  Rewind はどうしたいかを聞きます。
+  自分のメッセージでは **Edit and send again here** が、そのメッセージとその後を隠して入力欄に戻します。答えでは **Continue from here** がその後を隠します。
+  **Branch from here**（Saved chats list が要ります）は、そこまでのメッセージから新しい会話を始め、元の会話はそのまま残します。枝の会話は「Branch of ...」のような名前を持ち、元の会話へのリンクが付きます。
+  入力欄の上の **Undo** のバーは、次の質問・別の会話・再読み込みまで、隠したものを戻せます。
+  名前だけを残した画像やファイルはもう一度は送らず、画面が付け直すよう求めます。
+- **When you send while it is answering.** *Wait*（既定）: 答えが終わるまで送信できません。
+  *Send after*: メッセージは待ち、答えが終わったら送ります。
+  *Interrupt*: 答えはそこで止まり、書いたところまでは中断の印を付けて残り、メッセージはすぐ送ります。動いているツールは終わるのを待ちます。
+  待てるメッセージは 1 つで、**Take back** で入力欄に戻せます。Stop は待っているメッセージを、自分で送れるよう残します。
+
+答えの中の ` ```svg ` や ` ```html ` のブロックには **Preview** のボタンが付きます。
+コードは画面から切り離した枠に描きます。空の sandbox（スクリプト・フォーム・ポップアップ・ダウンロードなし、画面・その保存先・サーバーに触れない）、どのアドレスも許さない枠の中のポリシー、それにモデルの HTML の中のリンクやリダイレクトが枠に Web のページを読み込まないようにするページのヘッダー（`Content-Security-Policy: frame-src 'none'`）です。
+svg は画像として出します。
+HTML のページには警告のボタン **Run scripts** もあり、確かめた後、そのブロックだけをスクリプト付きで、画面にも網にも触れないまま、プレビューを閉じるまで動かします。
+それでも CPU は使えますし、モデルが書いたコードです。
+
+ヘッダーの **Load / Unload** は、モデルを読み込むか、GPU を空けます（`POST /load`、`POST /unload`）。
+解放の前に確かめ、答えを書いている間と画像を作っている間は押せません。
+
+**Language.** About > Settings に画面の言語が並びます。英語、ドイツ語、フランス語、スペイン語、日本語、韓国語、ポルトガル語、ロシア語、中国語です。
+既定の **Automatic** は、ブラウザーの言語の設定（`navigator.languages`）を順に見て、画面にある最初の言語を使います（`ja-JP` は `ja`、`pt-BR` は `pt` のように地域を外して比べます）。どれもなければ英語です。
+言語を選ぶとこのブラウザーに残り、Automatic を選ぶとその選択を消します。
+Chat の画面とその設定、ヘッダー、Images の画面を訳し、Monitor と About はまだほとんど英語です。
+言語は `serve/web/locales/<lang>.json` のファイルで、英語の文はコードの中の鍵の横にあります。
+`python tools/web_i18n.py` がどのファイルも同じ鍵と {placeholder} を持つかを確かめます（`--write` で `en.json` を書き直します）。
+`/?lang=de` は、その回だけ言語を変えます。
 
 ### API の要求のモニター
 
@@ -1148,8 +1334,48 @@ server がネットワークから届くなら、この履歴は機密として�
 server の起動からの合計（`totals`）も示します。
 `hit_rate` は、答えを書く間に引いたエキスパートのうち VRAM にあったものの割合です。GPU が PCIe 越しに読むエキスパート（`--pcie-frac`）は入らないので、`--pcie-frac` を上げると、decode が遅くなっても上がります。
 `pcie_share` は、それらが割り振られたエキスパート全体に占める割合で、server のログと Monitor のタブがヒット率の横に示します（upstream #588）。
+Monitor のタブの最近の要求の一覧は、prefill の速さ（`Prefill t/s`）も示します。キャッシュにあった分は読み直さないので、新しく読んだトークン（`prompt_tokens` から `reused` を引いた数）を prefill の時間（`prompt_ms`）で割った値で、新しいトークンを読まなかった要求には数を出しません。
 
 ---
+
+### Chat Completions と Messages の項目
+
+エラーは API の形で返ります。OpenAI の経路は `{"error": {"message", "type", "param", "code"}}`（ない `param`・`code` は `null`）、Anthropic の経路は `{"type": "error", "error": {"type", "message"}}` です。
+知らない経路は 404（`Invalid URL`）です。
+エンジンの起動中などに断るときは、OpenAI の経路は 503、Anthropic の経路は 529（`overloaded_error`）で、どちらも `Retry-After` を付けます。
+
+**ファイル**: Chat Completions の `file`、Responses の `input_file`、Messages の `document`（PDF。`base64` か `url`）を読みます。
+PDF は、ページごとの文と、モデルが画像を読めるとき（vision を入れた設定）は各ページの画像を、ページの順に入れます。
+文のファイル（`text/*`、JSON、XML、YAML など。UTF-8）は、その文を入れます。
+1 つのファイルは 32 MiB まで、PDF は 100 ページまでで、ほかの形式、暗号化された PDF、壊れた PDF、`file_id`（Files API）は 400 です。
+PDF は、Linux では poppler の `pdftotext` と `pdftoppm` で、Windows では 7z に入っている pypdf と pypdfium2 で読みます。Linux で poppler がなければ PDF は 400 で、入れ方は `xestrata --setup` が示します。
+
+**Chat Completions**:
+
+- `tools` の `custom` のツールは、文字列の `input` を 1 つ取るツールとしてモデルに見せ、呼び出しは `{"type": "custom", "custom": {"name", "input"}}` で返します。文法（`format`）が regex なら、その引数を[文法で縛ります](#json-の応答の形式)。Lark の文法はモデルへの説明に書くだけです。
+- `tool_choice` は `none`、`auto`、`required`、名前を指定したツール、`allowed_tools`（見せるツールをその組に絞り、`mode: required` なら呼び出しを強制）です。道具にない名前や知らない形は 400 です。名前を指定したときは、そのツールの呼び出しを 1 つだけ返し、思考の中や後に書かれたほかのツールの呼び出しは文のまま残します（Messages と Responses も同じ）。
+- `parallel_tool_calls: false` では、最初の呼び出しが閉じたところで生成を止め、その 1 つを返します。
+- `n`（1〜128）は、choice ごとに 1 回ずつ生成します。`seed` があれば choice ごとに `seed + k` です。ストリームでは、全部のチャンクが同じ `id` を持ちます。
+- `stream_options.include_usage` では、`choices: []` の usage の区切りも送ります。終わりの区切りの usage（llama.cpp と同じ）も残ります。
+- usage には `completion_tokens_details.reasoning_tokens` が入り、応答には `system_fingerprint`（エンジンの版とモデルから作る値）が入ります。
+- 古い形の `role: function` と assistant の `function_call` は、道具の結果と呼び出しとして読みます。古い形の `functions` と `function_call` の要求は `tools` と `tool_choice` として読み（呼び出しは 1 つずつ）、答えも古い形（`function_call`、終わりの理由 `function_call`）で返します。`tools` や `tool_choice` と一緒には使えません。null の項目と、`functions` なしの `function_call: "none"` は、何も指定していないものとして読みます。
+- `user` と `system` の `name` は「名前: 」として発言の前に書きます。assistant の `refusal` は、本文がないときその発言の本文として読みます。
+- `image_url` の `detail: "low"` の画像は、長い辺を 512 に縮めて読みます。
+- `top_logprobs` は 0〜20 で、`logprobs: true` のときだけです。`input_audio` と、音声の出力（`modalities` の `audio`、`audio`）は 400 です（モデルは音声を読み書きできません）。
+- `max_tokens` と `max_completion_tokens` は整数です（2.9 は 400）。
+
+**Messages**:
+
+- `max_tokens` は必須で、1 以上の整数です。
+- 道具の結果は `tool_use_id` でその呼び出しに結び付けます。返す `tool_use` の id は `toolu_` で始まります。`disable_parallel_tool_use` では呼び出しを 1 つまでにします。`tool_choice` の道具にない名前や知らない形は 400 です。
+- `output_config.format`（と `output_format`）の `json_schema` は、[JSON の応答の形式](#json-の応答の形式) と同じく、答えを縛り、スキーマで確かめてから返します。合わなければ 502（ストリームでは error のイベント）です。
+- `tool_result` の `is_error: true` は、結果の前に `Error:` と書いてモデルに伝えます。
+- 文の `document`（`source` が `text` か `content`）と `search_result` は、題と一緒に文として読みます。`citations.enabled: true` は 400 です。
+- 思考のブロックには `signature` が付きます（ストリームでは `signature_delta`）。思考の文を base64 にしたもので、送り返された思考がそれと違えば 400 です。XeStrata が付けた `redacted_thinking` は読み、ほかのものは落とします。
+- ストリームの keep-alive は `event: ping` です。`"thinking": {"type": "adaptive"}` は、深さをモデルに任せます。
+- usage は `message_start` と `message_delta` の両方で、会話のキャッシュが持っていた分を `cache_read_input_tokens`、読んだ分を `cache_creation_input_tokens` に分けます。区切りの `cache_control` は、接頭辞を自動でキャッシュするので何もしません。
+- 文脈の上限で止まったときの `stop_reason` は `model_context_window_exceeded`、`max_tokens` で止まったときは `max_tokens` です。
+- ストリームでない返事で、途中で切れた道具の呼び出しは、書かれた引数を文のブロックとして返します。
 
 ### Responses API と Codex CLI
 
@@ -1161,23 +1387,31 @@ server の起動からの合計（`totals`）も示します。
 
 | 要求 | XeStrata の扱い |
 | --- | --- |
-| `input` が文字列か項目の並び | `message` の項目（`user`、`assistant`、`system`、`developer`。文字と画像）、`reasoning`、`function_call`、`function_call_output`、`custom_tool_call(_output)` |
+| `input` が文字列か項目の並び | `message` の項目（`user`、`assistant`、`system`、`developer`。文字と画像）、`reasoning`、`function_call`、`function_call_output`、`custom_tool_call(_output)`、`input_file`（[上](#chat-completions-と-messages-の項目) のファイル）、前の回の `image_generation_call`（画像を保存し、続く `edit_image` が直せます）。ホストのツールの項目（`web_search_call`、`mcp_call` など）は文として会話に入れます |
 | `instructions` | システムメッセージ（先頭の `developer` のメッセージも含む。後のものはチャットの経路と同じくユーザーのメッセージになります） |
-| `tools` | `function` のツール、`namespace` のツール（モデルには `namespace.name` に見え、呼び出しは `namespace` と `name` で返ります）、`custom` のツール（自由な文字列の `input` 1 つ）。ホストのツール（`web_search`、`file_search` など）はモデルが動かせないので外します |
-| `tool_choice` | `"none"` はツールを隠します。ほかはモデルが選びます（強制はできません） |
+| `tools` | `function` のツール、`namespace` のツール（モデルには `namespace.name` に見え、呼び出しは `namespace` と `name` で返ります）、`custom` のツール（自由な文字列の `input` 1 つ）。ホストのツール（`web_search`、`file_search` など）はモデルが動かせないので外します。`strict` を書かない（null の）`function` のツールは、パラメーターがそのまま strict モードの条件（すべてのオブジェクトが `additionalProperties: false`、すべてのプロパティが `required`）を満たし jsonschema があれば strict、そうでなければ非 strict で、応答の `tools` にどちらかを示します（OpenAI の Responses と同じ既定）。判定はスキーマの位置だけを辿り、`default`・`enum`・`examples` などの値をスキーマとは見なしません。解決できない参照は自動 strict の根拠にせず、明示的な `strict: true` の検証は別に行います。 |
+| `tool_choice` | `"none"` はツールを隠します。`required`、名前を指定したツール（`custom`、`namespace` も）、`allowed_tools` は Chat Completions と同じです。`{"type": "image_generation"}` は画像の道具の呼び出しを強制します。道具にない名前や知らない形は 400 です |
+| `parallel_tool_calls: false` | 最初の呼び出しが閉じたところで生成を止めます |
+| `max_tool_calls` | ホストのツール（ここでは画像の道具）の呼び出しの上限。超えた呼び出しは動かしません。`function` のツールには当てません |
+| `truncation: "auto"` | 文脈に入らないとき、古い項目から落とします（`instructions` は残し、道具の呼び出しはその結果と一緒に）。落としても入らなければ 400 です |
+| `text.verbosity` | `low` と `high` は、system の文の後ろに短く・詳しくの 1 文を足します |
+| `include` の `message.output_text.logprobs`、`top_logprobs` | `output_text` に `logprobs` を入れます |
 | `reasoning.effort` | `none`/`minimal`、`low`、`medium`、`high`/`xhigh`。なければ設定の `reasoning_effort`、それもなければモデルの既定（high） |
-| `max_output_tokens` | 出力の上限（思考を含む）。使い切ると応答は `incomplete`（`max_output_tokens`）で終わります |
-| `text.format` | `json_schema` と `json_object` は [JSON の応答の形式](#json-の応答の形式) を使います（確かめるだけで、出力を縛りません） |
+| `max_output_tokens` | 出力の上限（思考を含む）。使い切ると応答は `incomplete`（`max_output_tokens`）で終わります。`0` と `-1`（と、書かないこと）は `max_tokens` と同じく上限なし、`-1` より小さい値は 400 です |
+| `text.format` | `json_schema` と `json_object` は [JSON の応答の形式](#json-の応答の形式) を使います（縛って、確かめます） |
 | `temperature`、`top_p`、`reasoning_budget_tokens` など | チャットの経路と同じ |
 
+最後のイベント（`response.completed` か `response.incomplete`）とストリームでない返事は、`/v1/chat/completions` と同じ `timings` を一番上に持ちます。
+
 モデルの思考は、`reasoning_text` を中身に持つ `reasoning` の出力項目で返ります（`response.reasoning_text.delta` で流れます）。
-このモデルは別の要約を書かないので、`summary` は空です。
+このモデルは別の要約を書かないので、`reasoning.summary`（`auto`、`concise`、`detailed`）を求めると、思考の文を `summary` にも入れ、`response.reasoning_summary_*` のイベントも流します。求めなければ `summary` は空です。
+送り返された reasoning の項目で読めるのが `summary` だけなら、その要約を思考として読みます。
 `"include": ["reasoning.encrypted_content"]` を付けると、項目に `encrypted_content` も付きます。不透明な文字列（base64 で、暗号化はしていません。クライアントは文字をすでに持っています）です。
 Codex と同じく、reasoning の項目も会話の残りと一緒に送り返してください。思考がプロンプトに戻るので、モデルが書いたものと一致し、会話のキャッシュが使い直されます。
 
 `"stream": true` では、公式のイベントを順に出します。`response.created`、`response.in_progress`、続いて出力の項目ごとに `response.output_item.added`、その差分（`response.reasoning_text.delta`、`response.output_text.delta`、`response.function_call_arguments.delta`）、その `...done` のイベントと `response.output_item.done`、最後に `response.completed`、`response.incomplete`、`response.failed` のどれかです。
 長いプロンプトを読む間は 15 秒ごとに `response.in_progress` を出します。Codex はこれを動いている印と数えます。
-答えが始まる前のエラーは Responses の形（`{"error": {"message", "type", "param", "code"}}`）で、始まった後は `response.failed` で届きます。
+答えが始まる前のエラーは Responses の形（`{"error": {"message", "type", "param", "code"}}`）で、始まった後は `error` のイベントと `response.failed` で届きます。
 
 **Codex CLI**: `~/.codex/config.toml` に次を書きます。
 
@@ -1225,16 +1459,21 @@ stream_idle_timeout_ms = 600000         # 最初の長いプロンプトは読�
 - サーバーは XeStrata と一緒に裏で起動します。
   server のウィンドウに、それぞれが何を提供するか（`MCP server 'files': 14 tools (...)`）、または起動しなかった理由が出ます。
   起動しなかったサーバーのツールは外し、チャットはそれなしで動きます。
-  Monitor のタブがサーバーを並べ、Sampling の引き出しに **Use tools from MCP servers**（既定でオン）があります。
+  Monitor のタブがサーバーを並べ、Chat settings の引き出しに **Use tools from MCP servers**（既定でオン）があります。
   あとで止まったサーバーは、次に呼ぶときに起動し直します。
 - チャットでは、呼び出しごとに小さなブロック（ツール、引数、結果）が出ます。
   モデルは結果を読んで続け、1 つの答えで最大 `max_rounds` 回まで続けて呼びます。
+  `max_rounds` 回に達したら、それまでの結果を使って、ツールなしでもう 1 回だけ答えます。
   失敗したツールや `timeout_s`（既定 60 秒）より長くかかったツールは、チャットを終えずに、モデルに `error: ...` という結果を返します。
   `max_result_chars`（既定 20,000 文字）より長い結果は、モデルが読む前に注記つきで切ります。
   止めるボタンは、動いているツールも止めます。
 - ツールを使うのはチャットの画面だけです。
   API のクライアント（omp、Claude Code、OpenAI と Anthropic の SDK）から見える API はこれまでと同じで、クライアントは自分のツールを使います。
   `/v1/chat/completions` への要求は、`"strata_mcp": true` で使うことを選べます（ストリームに `strata_mcp` のツールのイベントが来ます）。
+- ツールが返す画像（PNG、JPEG、WebP）は、`"mcp": {"image_results": true}` を足すとチャットに出ます（既定はオフ）。
+  画像は起動の設定の隣の `<設定の名前>.tool-media/` に SHA-256 の名前で置き、チャットは API キーで守られた `/tool-media/<名前>` から読みます。
+  1 回の呼び出しで 4 枚まで、1 枚 18 MB ほどまでです。
+  画像を読む部品（`--vision`）があるときは、モデルも画像を読みます。ないときはこれまでどおり文字だけを読みます。
 
 **安全のこと**: MCP のツールは、この PC で自分のユーザーの権限で動き、**いつ呼ぶかはモデルが決めます**。
 モデルが読んだもの（ウェブのページやファイル）に書かれた指示が、呼び出しのきっかけになることもあります。
@@ -1295,6 +1534,9 @@ GPU のエンコーダーが VRAM を使うぶん、エキスパートのキャ�
 
 **画像があるときだけのエンコーダー**（任意、upstream ca41a6b9）: 設定に `"vram_elastic": true` があるとき、`"vision"` に `"elastic": true` を書くと、GPU のエンコーダーをサーバーと一緒には起動せず、エキスパートのキャッシュが VRAM をすべて使います。
 画像のある最初の要求で、キャッシュは予約の上に `"elastic_mib"`（既定 2048）を空けてからエンコーダーを起動します（数秒）。
+キャッシュが空けられないとき（常駐の低 RAM のモード、`--vram-elastic` のないエンジン、層の分担）もそのまま起動し、ログに理由が出ます。
+層の分担では、エンコーダーの VRAM を `--vram-reserve-mib` で空けておくよう server が起動時に伝えます。
+起動できなかったエンコーダー（VRAM の不足）は、その要求を `503` で終え、次の画像でまた試します。
 `"elastic_idle_s"`（既定 120）秒のあいだ画像がなければ、要求の合間にエンコーダーを止め、キャッシュが VRAM を取り戻します。
 エンコーダーが動いている間の `POST /v1/vram` は、エンコーダーの分の上に予約を積みます。モデルを外すとエンコーダーも止まります。
 `"vram_elastic"` がなければ、サーバーはそう言って、これまでどおりモデルと一緒にエンコーダーを起動します。
@@ -1369,6 +1611,7 @@ XeStrata はそれを、プロンプトの `<|image_pad|>` のトークンの位
 画像の注意は、Intel の GPU では oneDNN、AMD の GPU では aotriton（どちらもパッケージに入ります）、NVIDIA の GPU では cuDNN が入っていれば cuDNN（contrib-llvm。`xestrata --setup` が入れ方を示します）で取り、ほかは XeStrata の核で取ります。画像のモデルの積は、GPU の計算ライブラリが int8 の積を持つとき（contrib-llvm の Intel・NVIDIA、AMD）は重みと活性を int8 にして掛けます。
 setup は画像のモデル、VAE、文の読み手（Qwen3-VL-8B）と、編集のための画像の読み手（Qwen3-VL の mmproj）をダウンロードして、設定に `"images"` を足します。
 画像のモデルは既定で Q8_0 です。VRAM に入らない層はエンジンが RAM から流し込むので、GPU のメモリでは大きさを選びません。
+流す層は、RAM に空きがあれば（その層を除いて 8 GiB と GPU のメモリの量が残るとき）、最初に流したときにページ固定した RAM に写して持ち、2 回目からはそこから GPU に写します。GPU で並べ替えてから使う層（Qwen-Image の int8、Mage-Flow の FP16）は並べ替えた後の形で持つので、2 回目からは並べ替えもしません。Qwen-Image を 5 GiB の予算で作ると、2 枚目からのサンプリングが B70 で 4.6 → 3.5 秒、RX 9060 XT で 8.1 → 7.4 秒、文の読み手が B70 で 0.66 → 0.27 秒になりました（最初の 1 枚は RAM を取る分だけ遅くなります）。GPU がファイルのページから直接速く写せるとき（RX 9060 XT）は、並べ替えのない層はページ固定せずにそこから写します。画像のエンジンがキャッシュを手放すときは、この RAM も手放します。`STRATA_RESIDENT_PIN=0` で常にページ固定せず、`1` で常にページ固定します。
 文の読み手も既定で Q8_0 です。選ぶのは RAM です。4 つのファイル（編集のための画像の読み手を含む）とエンジンの分（両方が Q8_0 で約 20.2 GB）が文章のモデルの残す RAM に入らなければ、setup はまず文の読み手を Q6_K、Q5_K、Q4_K の順に下げ、それでも入らないときに画像のモデルを入る中で最も大きいもの（Q6_K、Q4_K_M）に下げます。画像のモデルを下げたときは、文の読み手をその横に入る中で最も大きいものにします。
 `--image-ssd-offload on` なら下げずにどちらも選んだ大きさのまま入れ、入らない分は SSD から読みます（遅くなります）。
 `--images qwen-image-turbo-uncensored` なら、文の読み手を AtomicChat の Qwen3-VL-8B（拒否の方向を取り除いたもの）に替えます。大きさの選び方は同じです。画像のモデル、VAE、画像の読み手はそのままです。作者の計測では、描けるものは変わらず、絵が全体に少し変わるだけです。
@@ -1378,25 +1621,72 @@ setup は画像のモデル、VAE、文の読み手（Qwen3-VL-8B）と、編集
 既定は 40 ステップ（Qwen の diffusers の pipeline の既定で、ガイダンスはなし）で、1 枚に Turbo の約 5 倍の時間がかかります。リクエストの `steps`（2〜100）で変えられます。各ステップの sigma は diffusers の scheduler と同じ式で、画像の大きさに合わせてずらします。
 Qwen-Image-2.1-Turbo と Qwen-Image-2.1 の重みは Qwen Research License で、自由なソフトウェアのライセンスではありません。商用に使う前にそのライセンスを読んでください。
 
-`--images mage-flow-turbo` なら、Microsoft の Mage-Flow-Turbo（4B、4 ステップ）で作ります。`mage-flow`（強化学習で調整した版、20 ステップ）と `mage-flow-base`（元のモデル、30 ステップ）は CFG を掛けます（既定の強さ 5）。
+`--images mage-flow-turbo` なら、Microsoft の Mage-Flow-Turbo（4B、4 ステップ）で作ります。`mage-flow`（強化学習で調整した版、20 ステップ）と `mage-flow-base`（元のモデル、30 ステップ）は CFG を掛けます（既定の強さ 5）。`--images magetrail` は、Mage-Flow を Danbooru と e621 の画像で微調整した RicemanT の MageTrail（30 ステップ、CFG 5、編集なし）で作ります。
 setup は生成用と編集用の画像のモデル（Comfy-Org の bf16 の safetensors）、VAE、文の読み手（Qwen3-VL-4B）、編集のための画像の読み手（Qwen3-VL-4B の mmproj）をダウンロードします。文の読み手の大きさの選び方は Qwen-Image-2.1 と同じで、画像のモデルの大きさは 1 つです。
-エンジンは画像のモデルのブロックが文の読み手の層と一緒に VRAM に全部入るときは 16 ビット（FP16）のまま置いてそのまま掛け、入らないときは読み込むときに 8 ビットにして、VRAM に入らないブロックを RAM から流します（`--image-dit-q8 on` で常に 8 ビット、`off` で常に 16 ビット）。8 ビットは、GPU の計算ライブラリが int8 の積を持つとき（contrib-llvm の Intel・NVIDIA、AMD）は重みを 256 個ずつアダマール行列で回して行ごとの尺度の int8 にし、活性も同じく回してトークンごとに int8 にして掛けます（ComfyUI の int8_convrot と同じ形。時刻の変調の層だけは Q8_0）。ほかは Q8_0 で、掛けるたびに 16 ビットに戻します。
+エンジンは画像のモデルのブロックが文の読み手の層と一緒に VRAM に全部入るときは、16 ビット（FP16）のまま掛けるのと 8 ビットで掛けるのとをその GPU で測り、速い方にします（int8 の積を持たない GPU は 16 ビット）。入らないときは読み込むときに 8 ビットにして、VRAM に入らないブロックを RAM から流します（`--image-dit-q8 on` で常に 8 ビット、`off` で常に 16 ビット）。8 ビットは、GPU の計算ライブラリが int8 の積を持つとき（contrib-llvm の Intel・NVIDIA、AMD）は重みを 256 個ずつアダマール行列で回して行ごとの尺度の int8 にし、活性も同じく回してトークンごとに int8 にして掛けます（ComfyUI の int8_convrot と同じ形。時刻の変調の層だけは Q8_0）。ほかは Q8_0 で、掛けるたびに 16 ビットに戻します。
 `-uncensored` なら、文の読み手を huihui-ai の Qwen3-VL-4B（拒否の方向を取り除いたもの、noctrex の GGUF）に替えます。
-API では `steps`（既定はそれぞれのステップ数）、CFG の強さ `true_cfg_scale` か `guidance_scale`（1 なら CFG なし）、`negative_prompt`（既定は空白 1 文字）を受けます。マスクと透明な背景はありません。
+API では `steps`（既定はそれぞれのステップ数）、CFG の強さ `true_cfg_scale` か `guidance_scale`（1 なら CFG なし）、`negative_prompt`（既定は空白 1 文字）を受けます。透明な背景はありません（マスクと strength は下の `/v1/images/edits` のとおり）。
 編集（`POST /v1/images/edits`、Web のページの Images のタブ、会話の `edit_image`）は、エンジンが編集用の画像のモデルに差し替えて作ります。参照画像は 3 枚まで（編集のモデルの学習と同じ）、ステップ数の既定は Turbo が 4、ほかの 2 つは 30 です。使っていない方の画像のモデルは 8 ビットのまま RAM に残し（`--image-dit-keep off` なら残さず、差し替えのたびにファイルから読み直します）、差し替えは数秒です。
 Mage-Flow の重みは MIT ですが、Microsoft の README は研究のためのモデルで、製品やサービスに使うことは想定していないとしています。XeStrata は Mage-Flow の内容のフィルターも透かしも入れていません。
 
+`--images magetrail` の MageTrail は、Mage-Flow の DiT を 12 ブロックに作り替えて微調整したもので、各ブロックの modulation を全ブロック共有の低ランクの射影（3072 から 256 へ、1 ステップに 1 回）とブロックごとの小さな射影に分けています（bluvoll の mageflow-lowrank-modulation-v1）。エンジンはこの形をそのまま読み、modulation の重みは形式の指定どおり FP32 のまま使います。
+VAE は作者が使っている Black Forest Labs の Flux2 VAE です。Mage-Flow の潜在はもともと Flux2 VAE の潜在空間（Mage-VAE もそれに合わせて作られています）なので、DiT の出力をそのまま渡せます。setup は、Black Forest Labs が Apache 2.0 で FLUX.2-klein-4B に置いている bf16 の版を取ります（MageTrail のリポジトリにある同じ VAE は FLUX.2-dev の非商用のライセンスのファイルです）。
+Flux2 VAE は 1024x1024 で約 4.3 GB の作業領域を使います。VRAM に入らないときは、入る限り深い段（中央の注意を含む）までを画像全体で計算し、残りの大きな段を 4 トークン（64 ピクセル）ずつ重ねたタイルに分けて、重なりを線形に混ぜます。タイルの段の GroupNorm はタイルごとの統計になるので、色味がわずかに変わることがあります。
+
+`--images hunyuan-image-3-distil` なら、Tencent の HunyuanImage 3.0 Instruct-Distil（MoE、80B、8 ステップ、ガイダンス 2.5）で作ります。文の読み手が無く、DiT がプロンプトの ids を自分で読むので、サーバーがモデル自身の `tokenizer.json`（バイト単位の BPE）で ids を組みます: `<|startoftext|>`、システム文（`system_prompt.py` から setup が取り出した `en_unified.txt` の 5,674 文字）、`User:` とプロンプト、`Assistant:`（どちらもコロンのあとに空白 1 つ）、`<answer>`・`<boi>`・`<img_size_1024>`・`<img_ratio_i>`・`<timestep>`・`<guidance>`・`<timestep_r>`、画像のブロックの `<img>`（16x16 画素に 1 個）、`<eoi>`。エンジンはその ids をそのまま読むので、`strata-image` を直に使うときも `--ids` に同じ形の列を渡します。
+大きさは、モデル自身の 37 のバケット（1024 を基準に 64 画素ずつ歩き、各辺を 16 画素に丸めた表）のうち、頼んだ縦横比にいちばん近いもので作ります。表に 1024 未満の正方形が無いので、512×512 は 1024×1024 になります。
+大きさを `auto` にするか付けないと、モデル自身が選びます。生成する画像のブロックの `<boi> <img_size_1024>` までの系列を文として 32 層に通し、最後の行を最後の正規化と出力の行に掛けて、縦横比の 37 のトークンのうち logit がいちばん大きいものを取ります（Tencent の実装の `img_ratio` と同じ、貪欲）。使う重みは bf16 のシャードにしかないので、setup が範囲を指定して取り出します（311 KB）。CPU の FP32 で Tencent のモジュールを回したものと、3 つの系列で選ぶ番号が同じでした。
+ガイダンスは時刻の埋め込みに渡す 1 個のトークンで、CFG のように 2 回計算しません（蒸留で CFG を畳んだモデルです）。ステップの sigma はエンジンがステップ数から作ります（shift 3.0）。Tencent の既定の動かし方（`bot_task: think_recaption`、描く前にモデルが最大 2048 トークンの推論とプロンプトの書き直しを生成する）は使わず、プロンプトからすぐ描きます。
+重みは Tencent の量子化した 2 つ（w4a8 が 46.9 GB、int8_convrot が 81.8 GB。bf16 は Tencent が配っていません）を使います。w4a8 は ComfyUI 向けの単一ファイルで、1 ステップが int8 の約 2.5 分の 1 の時間で、int8 のほうが bf16 の重みに近い画像になります。
+編集（参照画像、3 枚まで）はモデル自身の読み方です。参照画像を、縦横比のいちばん近いバケットの大きさに切り出して（PIL の LANCZOS と同じ値になります）VAE のエンコーダで潜在にし（参照の実装と同じく、事後分布からシードで引きます）、SigLIP2（モデル自身の `vision_model`、bf16 の最後のシャードから読みます。1024 パッチまでの naflex）で特徴にして aligner で 4096 次元にし、プロンプトの前に参照画像のブロック（`<boi> <img_size> <img_ratio> <timestep>`、VAE の格子の `<img>`、`<joint_img_sep>`、1024 個の `<img>`、`<eoi>`）として置きます。ブロックの中は全結合の注意で、VAE と SigLIP2 の格子はそれぞれ 2D の RoPE を持ちます。これらの行は要求の間変わらないので、文の行と一緒に 1 度だけ計算します。マスクと strength は、ホストに置いた潜在 [32][th][tw] の上で、ほかのモデルと同じやり方をします（元の画像は参照画像と同じ切り出しで VAE のエンコーダに通し、事後分布の平均を使います）。
+エンジンは、dense の 4 行列と VAE と出入り口（約 6.7 GB）を FP16 で VRAM に置き、32 層のエキスパートの bank（w4a8 で 1 層 1.36 GB、全部で 43.6 GB）は量子化のまま、予算に入る先頭の層を常駐させ、残りを 2 つの入れ物で毎ステップ RAM から流し、エキスパートごとにデバイスで FP16 に戻して掛けます。ルーターの softmax と top-k もデバイスで計算し（FP32、参照と同じ順位）、VRAM に入らない大きさでは VAE のデコードを参照と同じくタイルに分けます。
+B70 の w4a8 で、サンプリングは 256×256（16×16 トークン）が 3.7 秒/step・1024×1024（64×64 トークン）が 6.1 秒/step です。出入り口（patch_embed と final_layer）の 1 ステップ分は 0.074 秒で、16×16 トークンで 30 秒/step だったものを GPU に移しました。
+Tencent 公式のモジュールを CPU の FP32 で回したものと、同じ初期の潜在からの 8 ステップの画像で比べて、B70 の w4a8 が PSNR 35.67 dB（平均 2.83/255）、RTX 4070 の contrib-llvm が 33.97 dB（3.29/255）です（XeStrata がこの比較を受け入れる水準は 30 dB です）。
+HunyuanImage 3.0 の重みは Tencent Hunyuan Community License Agreement で、欧州連合・英国・韓国には適用されません（[Tencent のライセンス](https://github.com/Tencent-Hunyuan/HunyuanImage-3.0/blob/main/LICENSE)）。
+
 サーバーは `POST /v1/images/generations`（OpenAI の images API の形。`seed` と `steps` も受けます）で画像を作り、Web のページには「Images」のタブが出ます。
 画像の API は vLLM-Omni 互換（OpenAI 互換）で、vLLM-Omni の拡張の項目も受けます。`num_inference_steps` は `steps` と同じです（Turbo は 8 ステップのままで、ステップ数の指定は無視します）。`true_cfg_scale` を 1 より大きくして `negative_prompt` を付けると、Qwen-Image-2.1 と Turbo に CFG を掛けます（diffusers の Qwen-Image-2.1 と同じ式です。条件ありとネガティブの 2 つ分を計算するので、時間は 1024×1024 で約 2 倍、512×512 では約 1.5 倍です）。どちらかが欠けていればガイダンスなしで、`guidance_scale` は Qwen-Image-2.1 と Turbo では使いません。
-`output_format` は `png`（既定）、`jpeg`、`webp` で、`output_compression`（0〜100、既定 100）が jpeg と webp の画質になります。`quality` は Qwen-Image-2.1 でステップ数を決めます（`low` 20、`medium` と `standard` 30、`high`・`hd`・`auto` は既定の 40。`steps` を付けたときはそちら）。Turbo では 8 ステップのままで、Mage-Flow では使いません。応答の `usage` は画像のエンジンのトークンで数えます（プロンプトのトークンと、参照画像と作った画像の 16×16 画素で 1 つのトークン）。
-`background` を `transparent` にすると、Qwen の推奨する形でプロンプトを包み、透明な背景の画像（アルファ付きの PNG か webp）を作ります（jpeg とは組み合わせられません）。`opaque` はアルファを白の上に重ねて消し、`auto`（既定）はモデルの作ったままにします。編集の参照画像のアルファも、そのまま画像のモデルに渡します。
+`output_format` は `png`（既定）、`jpeg`、`webp`、`jxl` で、`output_compression`（0〜100、既定 100）が jpeg、webp、jxl の画質になります（jxl の 100 は可逆）。`jxl`（JPEG XL）は libjxl の cjxl（BSD-3-Clause）があるときだけ使え、`/health` の `image_defaults` の `formats` に出ます。deb と rpm は推奨のパッケージ（Ubuntu の libjxl-tools、Fedora の libjxl-utils）で入り、Podman のイメージと Windows の 7z には入っています。ソースから動かすときは、そのパッケージを入れます。可逆は cjxl の effort 3、ほかは既定の 7 で書きます。
+`n` は `max_n`（既定 16）までで、サーバーが測った速さ（大きさごとの 1 ステップの秒数と、それ以外の秒数。測った最大の大きさより大きい画像は 1 ステップの時間を画素数の 1.5 乗で伸ばします）で見積もった時間が `budget_s`（既定 600 秒）を超える数は、見積もりを添えてエラー（400）で断ります。まだ 1 枚も作っていないときは 4 枚までです。何枚も作る途中で別の要求が GPU の順番を待っていると、1 枚ごとに順番を譲ります（`unload` のときは譲りません）。`quality` は Qwen-Image-2.1 でステップ数を決めます（`low` 20、`medium` と `standard` 30、`high`・`hd`・`xhigh`・`max`・`auto` は既定の 40。`steps` を付けたときはそちら）。Turbo では 8 ステップのままで、Mage-Flow では使いません。応答の `usage` は画像のエンジンのトークンで数えます（プロンプトのトークンと、参照画像と作った画像の 16×16 画素で 1 つのトークン）。
+`background` を `transparent` にすると、Qwen の推奨する形でプロンプトを包み、透明な背景の画像（アルファ付きの PNG、webp、jxl）を作ります（jpeg とは組み合わせられません）。`opaque` はアルファを白の上に重ねて消し、`auto`（既定）はモデルの作ったままにします。編集の参照画像のアルファも、そのまま画像のモデルに渡します。
+`stream: true` を付けると、OpenAI と同じく SSE で返します。`partial_images`（0〜3、既定 0）を付けると、サンプリングの途中で予測した仕上がり（x0 = x − σ v）を VAE で画像に戻し、`image_generation.partial_image`（編集は `image_edit.partial_image`）で 1 枚あたり最大その枚数だけ送ります（最後のステップの後には作らないので、ステップが少ないと減ります）。最後に画像ごとに `image_generation.completed`（`b64_json`・`usage`、ほかに `seed` と `strata` の数字）を送ります。イベントの `size` は、モデルが選んだ大きさ（`size: auto`）も含めて、作った画像の大きさです。multipart の編集の数の項目（`n`、`seed`、`steps`、`num_inference_steps`、`output_compression`、`partial_images`、`guidance_scale`、`true_cfg_scale`）と `stream` は、JSON の要求と同じく数と真偽値として読みます。ノイズは最初に 1 回だけ引くので、途中の画像を作っても最後の画像は変わりません。途中の画像の分だけ VAE の時間が増えます。HunyuanImage 3.0 は途中の画像を作らず、最後の画像だけを送ります。`stream` のない要求は `partial_images` を無視します。Web のページは、「途中の画像を表示」（既定はオフ）で `partial_images: 2` を送ります。
 `POST /v1/images/edits`（OpenAI の形の multipart で `image` か `image[]`、または JSON の `images: [{"image_url": ...}]`）は、参照画像（10 枚まで。PNG・JPEG・GIF・BMP はそのまま、WebP などほかの形式は PNG に変えて読みます）を元に画像を作ります。`mask`（OpenAI と同じく、1 枚目の画像と同じ大きさのアルファ付き PNG）を付けると、その透明な部分だけを描き直し、残りは 1 枚目の画像の画素のまま残します（各ステップでマスクの外の潜在を元の画像のものに戻し、最後に元の画素と合成します）。参照画像は、出力の大きさにかかわらず 1 枚ずつ縦横比を保った約 1024×1024 画素で読みます（diffusers の Qwen-Image-2.1 と同じ。Mage-Flow では、画像の読み手が長い辺 384 ピクセル以下で、VAE が出力の大きさで読みます）。参照画像が多いほど時間とメモリがかかります（B70 の 1024×1024 で 3 枚は約 46 秒、10 枚は約 4 分）。参照画像のトークンの K と V のキャッシュ（1024×1024 の 1 枚で約 2 GB）は、VRAM に入らない分をピン留めした RAM に置いて毎ステップ運びます。それでも VRAM か RAM が足りない画像は、作り始める前にエラー（400）で断ります。参照画像を書き換えたり、その中の人や物を主題にしたりできます。`size` を `auto` にすると、参照画像の縦横比で約 1024×1024 画素にします。Web のページでも、Images のタブで画像を添付すると編集になります。
-会話からも画像を作れます。`/v1/chat/completions` に `"strata_images": true` を付けると（Web のページは付けます）、モデルに `generate_image` と `edit_image` の道具を渡し、モデルが呼ぶとサーバーが画像を作ってその場に出します。`edit_image` は、会話の最後の画像（添付したものか、会話で作ったもの）を直します。`/v1/responses` では OpenAI の組み込みの `image_generation` の道具を付けると同じことをし、作った画像を `image_generation_call` の項目（`result` に画像の base64、`size`・`quality`・`background`・`output_format`・`revised_prompt` も）で返します。道具の `size`・`quality`・`output_format`・`output_compression`・`background` は、その道具で作る画像に使います（`size` が `auto` ならモデルの指定した大きさ）。
+マスクと `strength`（0 より大きく 1 以下）はどのモデルでも受けます（`src/image/img_start.hpp`）。strength は diffusers の img2img と同じく、n ステップの表の先頭 floor(n (1 − strength)) を飛ばし、残りの最初の sigma s で元の画像の潜在 z0 とシードのノイズを (1 − s) z0 + s noise に混ぜて始めます（strength 1 は今までの生成や編集と同じ）。飛ばす数はサーバーの Python とエンジンの C++ がどちらも double で数えるので一致します。元の画像は、編集のあるモデルでは 1 枚目の参照画像、編集のないモデル（MageTrail、編集のモデルを入れていない Mage-Flow）では要求の 1 枚の画像（img2img、strength の既定は ComfyUI の公式の img2img の例の denoise の 0.87（1 − 1/ステップ数 を超えない）、マスクだけなら ComfyUI の KSampler の既定の 1）で、VAE のエンコーダで事後分布の平均の潜在にします（MageTrail は Flux2 VAE のエンコーダ）。
+会話からも画像を作れます。`/v1/chat/completions` に `"strata_images": true` を付けると（Web のページは付けます）、モデルに `generate_image` と `edit_image` の道具を渡し、モデルが呼ぶとサーバーが画像を作ってその場に出します。`edit_image` は、会話の最後の画像（添付したものか、会話で作ったもの）を直します。画像のモデルがいくつもあるときは、道具に `model`（入っているモデルの名前と、それぞれの向いていることの説明）が付き、モデルがユーザーの言葉に合うものを選びます（なしは既定のモデル。`edit_image` は編集のできるモデルが先で、編集のないモデルでは img2img になり、`strength` も受けます）。`"strata_images": {"model": "<名前>"}` なら、道具はそのモデルだけを使います。Web のページは、入力欄の下の「Images」でこれを選びます。`/v1/responses` では OpenAI の組み込みの `image_generation` の道具を付けると同じことをし、作った画像を `image_generation_call` の項目（`result` に画像の base64、`size`・`quality`・`background`・`output_format`・`revised_prompt` も）で返します。道具の `size`・`quality`・`output_format`・`output_compression`・`background` は、その道具で作る画像に使います（`size` が `auto` ならモデルの指定した大きさ）。道具の `model` が入っている画像のモデルの名前なら、そのモデルだけを使います（OpenAI の `gpt-image-1` などは既定のモデルか、言葉で選ぶもの）。`input_image_mask`（`image_url` に data: か http(s) の URL。`file_id` は受けません）は、その道具の編集のマスクです（`/v1/images/edits` の `mask` と同じ形）。`stream` の要求で道具の `partial_images`（1〜3）があると、途中の画像を `response.image_generation_call.partial_image`（`partial_image_b64`・`partial_image_index`）で送ります。`moderation`・`input_fidelity` は受けて無視します。
 大きさは一辺 256〜2048 ピクセルです。辺が 16 の倍数でない大きさ（1920×1080 など）は、16 の倍数に切り上げた大きさ（1920×1088）で作って真ん中を切り出し、Web のページはそのことを知らせます。
 画像のエンジンは最初の画像で起動して、そのまま残ります。エンジンはサーバーとは別のプロセスで、文章のモデルを替えても残り、どのサーバーもつながらなくなって 30 分（設定の `daemon_idle_s`）たつと終わります。カーネルの準備は 1 度だけで、同じプロンプトの文の状態と VRAM に載せた層は次の画像まで残ります。
 画像の仕事は GPU で 1 つずつ動きます。エンジンは仕事の前に、その画像に要る VRAM（最低限と、DiT を全部載せて VAE を 1 回で回せる量）を答え、文章のモデルの扱いは `--image-gpu-policy` で決めます: `keep`（そのまま）、`shrink`（`--vram-elastic` で VRAM を空ける）、`unload`（会話を保存して外し、次の起動で戻す）、`auto`（既定。全部が入れば `keep`、入らなければ空けられるときは `shrink`、最低限が入るなら層を流し込んで `keep`、それも入らなければ `unload`）。
 仕事のあと、`keep` で VRAM に余裕があるときだけ画像のエンジンは層を残し、それ以外は持っているものを手放します（待機中はプロセスだけの約 200 MiB）。
 `tools/image/install.py --config <設定>` で、入っているモデルにあとから足せます。
+
+いくつもの画像のモデル（`--images qwen-image-turbo,magetrail`）を入れると、設定の `"images"` が既定のモデル、`"image_models"` がほかのモデルになり、要求の `model`（Web のページではモデルの選択）で選びます。名前がないか知らない名前は既定のモデルです。チャットの画像の道具は既定のモデルを使います。
+同じ GPU では、画像の仕事はどのサーバーのものでも 1 つずつ順番に動きます。一時フォルダーの GPU ごと（エンジンの環境が名指す GPU）のロックのファイルを、仕事が終わるまで持ち、別のサーバーの仕事はそれを待ちます。順番を取った仕事は、同じ GPU の画像のエンジンの記録（同じ一時フォルダー）を見て、自分のモデルのもの以外を止めてから（エンジンが VRAM を放し終えるのを待って）動きます。止められたサーバーは、次の仕事でエンジンを起動し直します。同じモデルのサーバーどうしは、同じエンジンを共有します。数えるのは画像のエンジンだけで、別のサーバーの文章のエンジンの VRAM は数えません。
+Web のページの Images のタブは、モデルごとの既定値（`/health` の `image_models`）を欄に出し、ネガティブのプロンプト、ステップ数、CFG の強さ、透明な背景、マスク（1 枚目の画像の上で塗る）、strength を送れます。画像を添付すると、編集のないモデルでは img2img になります。
+
+### 画像の LoRA（アダプター）
+
+画像のエンジンは、配布されている LoRA を読むだけでなく、画像を作るたびに DiT の積に当てます（`include/strata/image/image_lora.hpp`・`src/image/image_lora.cpp`）。当てられるのは Qwen-Image-2.1（Turbo と元のモデル）、MOSS-Image、Mage-Flow、MageTrail です。HunyuanImage 3.0 の DiT にはアダプターの道がなく、`LORA:` が来たら断ります。
+
+- **読み方**: safetensors のヘッダーの JSON、GGUF のメタデータとテンソルの情報だけを読みます。キーは接頭辞（`model.diffusion_model.`・`diffusion_model.`・`transformer.`・`lora_unet_`）と役割の接尾辞（`.lora_A`・`.lora_B`・`.lora_down`・`.lora_up`・`.lokr_w1`・`.lokr_w1_a`・`.hada_w1_a`・`.oft_blocks`・`.a1`・`.diff`・`.set_weight`・`.w_norm`・`.diff_b`・`.alpha`・`.dora_scale` など）を長いものから外して、このモデルの重みの名前にします。sd-scripts の `lora_unet_` は `_` を `.` に直しますが、これらのモデルの重みの名前には当たりません。
+- **形式**: `kind_of` が役割から lora・lokr・loha・glora・oft・diff のどれかを決めます。1 つの重みに 2 つの形式が並ぶファイルは読み込みで断ります（ComfyUI はパッチの表が 1 キー 1 つなので片方を落とします）。テキストエンコーダー向けのキー（`lora_te_`・`text_encoder.`・`te.`）を含むファイルは結び付けで断ります。
+- **強さ**: alpha は `<key>.alpha` のテンソル、無ければメタデータの `lora_alpha`、無ければ 1.0（ComfyUI の既定）。重みの強さは `要求の強さ × alpha / rank` です。`use_rslora` は断ります（alpha / √rank で別の式）。PEFT の `rank_pattern` は読まず、alpha だけを使います。強さ 0 の寄与は結ばず、全部 0 の組は当てないのと同じ道です（画像はビット単位で同じ）。
+- **結び付け**: 組が変わると DiT の重みを結び直します（`QiDit::set_loras`・`MossDit::set_loras`・`MfDit::set_loras`）。各重み `W` は `LoraLayer` を持ち、積のあとに部品を足します（`product()`。呼び側は変わりません）。
+- **形式ごとの道**:
+   - LoRA・LoCon: A/B を FP16 で置き、`x16` から `B (A x)` を積んで足します。alpha は部品の強さに畳みます。
+   - LoKr: `u = x16 · w2^T` のあと、`KronRows` のカーネルで w1 の行に足します（融合した重みの行の範囲はこの対応で切れます）。
+   - DoRA: ComfyUI の `weight_decompose` と同じ `c = dora_scale / (|W| の行 + eps)` を、土台の積の行 `1 + s (c − 1)` とデルタの行 `c` に分けます。行ノルムはファイルの元の重みからホストで取り、DoRA を結ぶときだけ計算します（`dora_norms`。Qwen-Image-2.1 の Q8_0 以外のブロック形式は、積と同じ GPU の逆量子化で FP32 に戻してから）。alpha が 0 でも土台の行の係数は当てます（ComfyUI と同じ）。列方向は断ります。
+   - 全体差分: 差分を FP16 で置き、積にそのまま足します。`.set_weight` は土台の行を `1 − s` 倍して補間します（ComfyUI は強さを読まない。強さ 1 は同じ）。
+   - LoHa: 結び付けのときにホストでデルタを作り（行 64 のタイル、スレッド、FP32 の和）、FP16 で積に足します。ファイルは因子だけを持つので、デルタは `LoraFile` に残しません。
+   - バイアスの差分: 積の出力の、重みのバイアスを足す位置に足します（`add_bias`。行スケール `rs` と DoRA の `c` のあと）。alpha は掛けず、要求の強さだけです。バイアスを足さない重みでは断ります。
+   - OFT/BOFT: 積の出力を回します（`rotate`）。`Q = blocks − blocks^T`、`Q` のフロベニウスノルムをファイルの alpha に切り、`r = (I + Q)(I − Q)^−1`。OFT は転置して持ち（ComfyUI の einsum が r^T W）、BOFT は段ごとに行を交差させます。強さは 1 回だけ補間します。
+   - GLoRA: `b1 b2` を素の LoRA の対としてデルタの道に通し、`W (a1 a2 x)` を重みの積でもう一度計算します（`add_glora`、128 トークンの帯、`kLoraGloraRows`）。4 枚はファイルの向きのまま持ち、正方形の重みでは重みの行と列で 2 つの読みを選びます（`lora_glora_for_weight`）。強さと行スケールは入力の `v` に畳みます。
+- **量子化と持ち越し**: W8A8 の層でも重みの積は int8 のままで、アダプターの当たる積では `defer` を切ります（int32 の和に float を足せないため）。MOSS-Image のブロックは、アダプターが当たると入力を 16 ビットの行（`rows16`）で作ります（差分の入力に要るため。int8 の行だけを作る近道は使いません）。Q8_0 の重みは今までどおりです。ホストの重みの持ち越し（`take_host`/`reuse`）はそのまま使えます。
+- **予算**: A/B、DoRA の係数、LoHa のデルタ、OFT の回転、GLoRA の帯の表は VRAM の固定の分に数えます（`lora_bytes()`・`lora_gpu_bytes()`）。`use_loras` は `plan()` の前に結び、`need()` は結ぶ前なので `lora_gpu_bytes(loras, T_act)` で数えます。予算に入らない画像は、要る VRAM を添えて断ります。
+- **キャッシュ**: 組が変わると、Qwen-Image-2.1 はプリフィックスのキャッシュ（文の行と K・V）を捨てて組み直し、MOSS-Image は文脈（テキスト埋め込みを通した行）を捨てます。同じ組なら残ります。Mage-Flow は要求ごとに文脈を作るので、捨てるものがありません。
+- **エンジンとの受け渡し**: サーバーは IMG 行と NEED 行に `LORA:<強さ>:<道>` を繰り返して渡します（空白などを含む道は `%XX`。`strata-image` を直に使うときも同じ）。アダプターのファイルはプロセスで 1 度だけ読み（`Loras`）、`RELEASE ALL` でも持ちます（VRAM だけ手放し、次の要求でホストの写しから結び直します）。同じ組の要求では `set_loras` は何もしません。
+- **serve**: 一覧（`serve/loras.py`）は、DiT の目標表を Python に写した `TARGETS` と `_BIASED` で、そのモデルが当てられるファイルと形式だけを出し、当てないファイルは理由付きで外します（`skipped`）。`TARGETS` と C++ の `build_lora_targets` の一致は、実物の Qwen で名前を突き合わせて確かめています（264 対 264）。要求の `lora` の欄とプロンプトのタグはここで名前を引き、知らないタグは外して警告にします。エンジンが結び付けで断るファイル（rsLoRA、MageTrail の低ランクの変調、テキストエンコーダーの重みなど）は、画像を作る前の失敗になり、キーと理由が付きます。
+- **確かめ方**: 合成の小モデルで、LoRA を当てた 1 ステップと ΔW を焼き込んだ同じモデルの 1 ステップの cos が 0.9999 以上（Qwen-Image-2.1 0.9999999、MOSS-Image 0.9999709、Mage-Flow 0.9999955。8 ビットでは 0.9999076 以上。XMX のない小構成ではデルタの FP16 の丸めで下がるので、バイト列と予算で確かめます）。形式ごとの式は、強さ 1 のところで ComfyUI の `weight_adapter` を torch で走らせたものと rel 2.3e-6 以下で一致します（OFT と `set_weight` は強さを 1 回だけ補間するので、0 と 1 の間では ComfyUI と違います）。実物の Mage-Flow の 2 つの DiT に形式ごとの乱数のアダプターを当てると、強さ 1 で画像が変わり、0.5 がその間、0 が当てないのと同じバイト列になります。ほかに、当てない画像のバイト列、エンジンの端から端、API、Web の試験があります。
+- **限界**: 文章エンコーダー向けの LoRA は当てません。Qwen-Image-2.1 の `modulation.1` に当たる OFT は断ります（DiT がその重みを `C` 行ずつの帯で書き、回転は部分の行をまとめて回すため）。
 
 ---
 
@@ -1435,7 +1725,7 @@ setup は、次のエンジンの設定（llama.cpp のもの）を `xestrata-<m
 （`--cvec-mode add` は llama.cpp の普通の加算の方式で、加算用のベクトルのためのものです。）
 
 **要求ごとに切り替える**: 読み込んだベクトルは、要求が指定しない限りどの要求にも効きます。
-ウェブの画面の Sampling の引き出しに切り替えがあり、API では要求の本文に `"experimental_speed_projection": false` を書きます（OpenAI でも Anthropic でも）。
+ウェブの画面の Chat settings の引き出しに切り替えがあり、API では要求の本文に `"experimental_speed_projection": false` を書きます（OpenAI でも Anthropic でも）。
 設定の既定にするなら `"sampling": {"experimental_speed_projection": false}` です。
 切り替えると、モデルの状態が別のやり方で計算されたものになるので、会話のキャッシュを一度捨てます。
 オフにすると、出力は普通のモデルとトークン単位で同じです。
@@ -1462,7 +1752,7 @@ B70 では、`cvec_parity` が制御ベクトルのカーネルを確かめて�
 | `... rocBLAS ... has no code for gfx...`、`... has no code for gfx...` | ディストリビューションの rocBLAS（パッケージではそのエンジン）が、その GPU のコードを持っていません。Ubuntu 26.04 なら、Fedora 44 で動くことがあります（[README](../README.ja.md#amd-の-gpu)）。 |
 | `building for the AMD GPU needs ROCm's ...` | AMD の GPU のコードを作る ROCm のパッケージが足りません。示されたものを入れて、setup をやり直します（`./setup.sh --packages` も参照）。 |
 | `... has no HIP target (AMD GPUs)` | intel/llvm が、ROCm を入れる前にビルドされています。setup が尋ねたら作り直すか、`python3 tools/intel_llvm_build.py --rebuild` を実行します。 |
-| Linux で `no progress for 60 s ... reading the prompt` と出て、止まったときの報告に `threads waiting on the disk (state D): 16 ...` がある | エンジンが止まったのではなく、ドライブを待っています。n-gram の表をランダムに読む（`--ple-io direct`）のに、回転ディスクが追いつきません（upstream #605）。表が回転ディスクにあると、エンジンは起動時に警告します。`--ple-io ram`（表の分の RAM が要ります）か、モデルを SSD に置くと直ります。setup は、回転ディスクで RAM に表が入るなら、自分で `--ple-io ram` を付けます（Linux では SSD でも、RAM がモデルの分と表と 16 GB を超えれば付けます）。 |
+| Linux で `no progress for 60 s ... reading the prompt` と出て、止まったときの報告に `threads in uninterruptible sleep (state D): 16 ...`（`blk_io_schedule` など、ドライブの待ち）がある | エンジンが止まったのではなく、ドライブを待っています。n-gram の表をランダムに読む（`--ple-io direct`）のに、回転ディスクが追いつきません（upstream #605）。表が回転ディスクにあると、エンジンは起動時に警告します。`--ple-io ram`（表の分の RAM が要ります）か、モデルを SSD に置くと直ります。setup は、回転ディスクで RAM に表が入るなら、自分で `--ple-io ram` を付けます（Linux では SSD でも、RAM がモデルの分と表と 16 GB を超えれば付けます）。 |
 | `the SYCL runtime of ... lists no GPU` | GPU の Level Zero のドライバー（`libze-intel-gpu1`、Intel の compute-runtime）がないか、その GPU には古すぎます。新しいものを入れます（[BUILD.ja.md](BUILD.ja.md#パッケージ)）。 |
 | `... gives this GPU no XMX` | そのコンパイラでは GPU の XMX が使えません。setup の選択肢から選びます。XMX なしでも動き、prefill に約 1.6 倍の時間がかかります（[BUILD.ja.md](BUILD.ja.md#sycl-のコンパイラ)）。 |
 | `no SYCL compiler for the engine` | SYCL のコンパイラがありません。ディストリビューションの DPC++ を入れるか、`--intel-llvm-build` を付けます。 |
@@ -1473,9 +1763,12 @@ B70 では、`cvec_parity` が制御ベクトルのカーネルを確かめて�
 | 初回の起動に数分かかる | RAM に 23〜50 GB を読み込んでいます。ファイルが OS のキャッシュにある間は、2 回目の方が速くなります。 |
 | 起動の間、PC が数分固まる | とくに初回はよくあります（server のウィンドウに、そうなる時点が出ます）。エンジンがエキスパートを RAM に読み込み、GPU のためにその一部を登録し、エキスパートのキャッシュの大きさを決めています。ウィンドウを閉じずに待ちます。10 分たっても固まったままなら、PC を再起動し、ほかのプログラムを閉じてやり直すか、小さい大きさを選びます。 |
 | 起動に何分もかかり、その間カーネルがメモリーの圧縮（`kcompactd`）で忙しい | 透過的なヒュージページ（THP）が `madvise` のとき、エンジンはアリーナに `MADV_HUGEPAGE` を頼み、断片化した RAM では fault のたびに圧縮が走ることがあります（upstream #771）。`STRATA_NO_ARENA_THP=1` で頼まなくなります（THP が `always` のときは、エンジンは初めから頼みません）。 |
+| 起動のエラーに `the engine process ended: ...` とある | システムがエンジンのプロセスを終わらせました。エラーがその終わり方を示します（Linux では `killed by signal 4 (SIGILL, Illegal instruction)`、Windows では `exit code 0xC000001D: illegal instruction` など）。不正な命令（illegal instruction）は、CPU が実行できない命令をエンジンが使ったということで、Linux ではエラーが CPU に欠けている AVX・AVX2・FMA・F16C を挙げるか、すべてあるならエンジンのバグだと示します。CPU の型番を添えて issue を立ててください。 |
 | `the engine stopped unexpectedly (exit code ...)` | 答えの途中でエンジンのプロセスが終わりました。たいていは RAM 不足で、Linux がいちばん大きなプログラムを終わらせます（`journalctl -k \| grep -i -E 'killed process\|out of memory'`）。次の要求で、エンジンは自分で起動し直します。繰り返すなら、ほかのプログラムを閉じるか、小さい大きさを選びます。server は、モデルのエキスパートがほかのために約 6 GB の RAM を残さないとき、起動時に警告します。 |
+| Linux でエンジンが signal 9 で終わったのに、RAM は足りていた | デスクトップのセッションに実時間の CPU の制限（RLIMIT_RTTIME）があると、カーネルが signal 9 でプログラムを何も言わずに終わらせることがあります。rtkit がないとき、音声のシステム（PipeWire）がこの制限を 0 にし、デスクトップから始めたプログラムがそれを受け継ぎます。server は起動時と、エンジンが signal 9 で終わったときに、この制限を見つけると知らせます。`ulimit -R` で確かめ、rtkit を入れるか、セッションの制限の外で起動します（`systemd-run --user --collect -p LimitRTTIME=infinity -- xestrata`）。 |
 | decode が遅く、ディスクのランプが点きっぱなし | 空いている RAM が足りません。ほかのプログラムを閉じるか、Q2_0 か IQ2_XS を選びます。 |
 | `prompt ... exceeds the context` | 要求が、選んだ文脈より長くなっています。もっと大きな `--context` で setup をやり直します。 |
+| 前に空で返った答えが、会話の履歴から抜けている | server は、文章のない終わったアシスタントの発言を、次の答えの手本にしないよう履歴から外します（画像やツールの呼び出しのある発言と最後の発言は残します）。server の環境の `STRATA_KEEP_EMPTY_TURNS=1` で、外さずに読みます。 |
 | 思ったより遅い | GPU に挿したモニターやほかの GPU のプログラムが、エキスパートのキャッシュから VRAM を取っています。定格より遅い RAM（BIOS の XMP を確かめる）は、CPU の分を遅くします。XMX なしでビルドしていないかは、setup の `SYCL compiler: ...` の行で確かめます。 |
 | `this server was started without the vision encoder` | 文章だけで setup したモデルです。`--vision gpu` で setup をやり直します。 |
 | 画像が断られる、`cannot read the image` | Pillow で開けない画像のファイルです（JPEG、PNG、WebP、GIF、BMP、TIFF、AVIF は使えます）。 |
@@ -1519,9 +1812,9 @@ Strata の設計、測定、ボトルネックは、upstream の論文 **[docs/p
 
 ## クレジットとライセンス
 
-XeStrata は全体が [LGPL-3.0-or-later](../COPYING.LESSER) です。
-Strata と ggml / llama.cpp（どちらも MIT）から来たコードも XeStrata の一部として LGPL で、著作権表示と許諾表示は [NOTICE](../NOTICE) にあります。
-例外は、元のライセンスのままの intel/llvm へのパッチと oneMath への変更、`third_party/main/` の写し（`ggml-common.h`、`ggml-common-tq.h`、`quantscope.py`、`stb_image.h`、Outfit）と AOTriton へのパッチ、`third_party/nonfree/` です（下と [third_party/main/README.md](../third_party/main/README.md)）。
+XeStrata のために書いたコードは [LGPL-3.0-or-later](../COPYING.LESSER) で、組み合わせた XeStrata 全体も同じライセンスで配布します。
+Strata、ggml / llama.cpp と Project Maya（どれも MIT）から来たコードは、XeStrata の中でも MIT のままで、著作権表示と許諾表示は [NOTICE](../NOTICE) にあります。
+例外は、元のライセンスのままの intel/llvm へのパッチと oneMath への変更、`third_party/main/` の写し（`ggml-common.h`、`ggml-common-tq.h`、`quantscope.py`、`stb_image.h`、Outfit、KaTeX）と AOTriton へのパッチ、`third_party/nonfree/` です（下と [third_party/main/README.md](../third_party/main/README.md)）。
 モデルのファイルは XeStrata に含まれず、それぞれのライセンスが適用されます（下）。
 
 - **元のソフトウェア**: Niko1221 と Strata の貢献者による [Strata](https://github.com/Niko1221/Strata)。
@@ -1531,10 +1824,11 @@ Strata と ggml / llama.cpp（どちらも MIT）から来たコードも XeStra
   （カードによれば Apache-2.0）で、Strata での対応は @pjgmobile の PR #54 によるものです。
   Swift 1.5 は UkisAI の [ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)。
   UD-IQ4_XS、UD-Q4_K_XL、UD-Q5_K_XL、UD-Q6_K_XL、Q8_0 は Unsloth の [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)。
-  Gyro は agentionai の [agentionai/Qwen3.8-Flash-Next-Gyro-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)。
+  Gyro は agentionai の [agentionai/Qwen3.8-Flash-Next-Gyro-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-GGUF)、
+  Gyro-Coder は同じく [agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF](https://huggingface.co/agentionai/Qwen3.8-Flash-Next-Gyro-Coder-GGUF)。
   abliterated 版は huihui-ai の [huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF](https://huggingface.co/huihui-ai/Huihui-Qwen3.8-Flash-Next-abliterated-GGUF)。
-  ほかのモデルは、Ornith AI の [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)（GSQ-RCO は pfeifferj の[再現](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF)）、LLM-jp の [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)、Qwen の [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) と Z.ai の [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)（どちらも GGUF は Unsloth）。
-  画像のモデルは、Qwen の Qwen-Image-2.1 と Qwen-Image-2.1-Turbo（GGUF は Unsloth）、Microsoft の Mage-Flow（Comfy-Org の safetensors）、文の読み手の Qwen3-VL（Unsloth、AtomicChat、huihui-ai と noctrex の版）（[IMAGE](IMAGE.ja.md#ライセンス)）。
+  ほかのモデルは、Ornith AI の [Ornith-1.5](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF)（GSQ-RCO は pfeifferj の[再現](https://huggingface.co/pfeifferj/Ornith-1.5-35B-A3B-GSQ-RCO-GGUF)）、LLM-jp の [llm-jp-4.1](https://huggingface.co/llm-jp/llm-jp-4.1-32b-a3b-thinking-gguf)、Qwen の [Qwen3.6-35B-A3B](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF) と Z.ai の [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF)（どちらも GGUF は Unsloth）、Qwen の [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF)（GGUF は Unsloth）と HauhauCS の [Qwen3.5-9B-Uncensored-HauhauCS-Aggressive](https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive)。
+  画像のモデルは、Qwen の Qwen-Image-2.1 と Qwen-Image-2.1-Turbo（GGUF は Unsloth）、Microsoft の Mage-Flow（Comfy-Org の safetensors）、RicemanT の MageTrail と Black Forest Labs の Flux2 VAE（FLUX.2-klein-4B のもの）、Tencent の HunyuanImage 3.0（量子化は PedroMarinhoDev の ComfyUI 向けの単一ファイル）、文の読み手の Qwen3-VL（Unsloth、AtomicChat、huihui-ai と noctrex の版）（[IMAGE](IMAGE.ja.md#ライセンス)）。
   重みにはそれぞれのライセンスが適用されます。
 - **[llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)**（MIT）: i-quant の形式、`src/kernels/xe/` に書き写した GPU の内積と展開、
   i-quant のエキスパートのためにリンクする CPU のバックエンド、画像のエンコーダー（`tools/vision/`）の `mtmd` のライブラリと GPU のバックエンド（Vulkan、SYCL）、
@@ -1546,6 +1840,7 @@ Strata と ggml / llama.cpp（どちらも MIT）から来たコードも XeStra
   そのとき当てる XeStrata の修正は `third_party/main/intel-llvm/patches/` にあり、intel/llvm と同じライセンスです。`third_party/main/intel-llvm/LICENSE.TXT` を参照。
 - **画像のエンジンの部品**: 注意の計算に [oneDNN](https://github.com/uxlfoundation/oneDNN)（Apache-2.0、Intel の GPU）、[AOTriton](https://github.com/ROCm/aotriton)（MIT、AMD の GPU。中のカーネルは aiter（MIT）、FlyDSL（Apache-2.0）、Triton（MIT）の一部を含むことがあります）、[cuDNN Frontend](https://github.com/NVIDIA/cudnn-frontend)（Apache-2.0、一部 MIT、contrib-llvm の NVIDIA の GPU）、参照画像の読み込みに [stb_image](https://github.com/nothings/stb)（MIT か Unlicense）。Windows では AOTriton に [XZ Utils](https://tukaani.org/xz/) の liblzma（0BSD）をリンクします。
 - **[quantscope](https://github.com/1872183316/quantscope)**（MIT か Apache-2.0）: `setup.py --inspect` が GGUF の中身を確かめるのに使います。
+- **[Project Maya](https://github.com/mw00/project-maya)**（MIT、Peasant Smith と Project Maya の貢献者）: server のループ対策（`serve/loop_guard.py`）を写しました。
 - **[ROCm のデバイスライブラリ](https://github.com/ROCm/llvm-project/tree/f30ae3e6b680ad23dcf522e668c6d4c5c90838d0/amd/device-libs)**（University of Illinois/NCSA、AMD）: ocml・ockl などの、AMD の GPU 向けのコードがリンクするライブラリ。
   リポジトリには含めず、`tools/intel_llvm_build.py` が ROCm の llvm-project のリリースから取ってきて、intel/llvm と一緒にビルドします。`third_party/main/rocm-device-libs/LICENSE.TXT` を参照。
   そのビルドに渡す機能の指定は、Debian の [rocm-llvm](https://salsa.debian.org/rocm-team/rocm-llvm) のパッケージ（Expat、著作者は NOTICE）の `debian/rules` から写しました。
@@ -1553,10 +1848,12 @@ Strata と ggml / llama.cpp（どちらも MIT）から来たコードも XeStra
    - Inco AI と Splash の貢献者による [Splash](https://github.com/incoai/splash)。
    - Neroued による [ninfer](https://github.com/Neroued/ninfer)。
    - syv.ai と HyperQwen の貢献者による [HyperQwen](https://github.com/syv-ai/HyperQwen)。
-   - mw00 と Project Maya の貢献者による [Project Maya](https://github.com/mw00/project-maya)
+   - Peasant Smith と Project Maya の貢献者による [Project Maya](https://github.com/mw00/project-maya)
      （VRAM にないエキスパートを CPU と PCIe に分ける数の決め方、[XE](XE.ja.md#外れたエキスパートの-cpu-と-pcie-への分け方)）。
    - maxfridbe による [nextsycl](https://github.com/maxfridbe/nextsycl)（Qwen3.5 系のモデルの decode でカーネルをまとめるやり方。コードは書き起こし）。
 - **ウェブの画面のフォント**: [Outfit](https://github.com/Outfitio/Outfit-Fonts)（SIL Open Font License 1.1、`third_party/main/outfit/OFL.txt`。なければシステムのフォントを使う）。
+  チャットの数式は [KaTeX](https://katex.org/) 0.19.0（MIT、`third_party/main/katex/LICENSE`）で描きます。
+  チャットの画面の広い窓の使い方・svg と html のプレビュー・数式・Load と Unload・保存した会話・編集と巻き戻しは upstream の PR #3176（@mnott）・#1628（@thoives）・#2972 と #2974（@CC-David-CC）・#3550（@sakuumomo）・#1787（@Scotty-Hudson）・#2615（@uppet）から、巻き戻しの選び方と答えている間の送信は issue #3823 と #4004（@xvcezrqpbxtpzblrt）から来ました。
   Monitor のタブは @code-martin のダッシュボードの案（PR #22）から始まりました。
 - **`third_party/nonfree/`**: Qwen Community License 1.0 で、自由ソフトウェアではありません。XeStrata はこれなしでも動きます。
   実験的な速度向上用の射影のベクトル（モデルの活性化から作ったもの）と、元のモデルのチャットテンプレートが入っています（その README を参照）。

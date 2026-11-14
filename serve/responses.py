@@ -30,8 +30,10 @@ import json
 import time
 import uuid
 from typing import Any
+from urllib.parse import unquote
 
-from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs
+from serve.frontend import Event, _late_system_to_user, _parts_of, effort_kwargs, file_item
+from serve.structured import jsonschema_modules
 
 ENCRYPTED_PREFIX = "strata.r1:"                   # our own reasoning replay strings; others' are ignored
 HOSTED_TOOLS = ("web_search", "web_search_preview", "file_search", "computer_use_preview", "computer_use",
@@ -83,20 +85,31 @@ def _content(content, param):
                 raise ResponsesError("only images given as image_url (a data: or http(s) URL) are supported; "
                                      "this server keeps no files", f"{param}[{j}]", "unsupported_parameter")
             parts.append({"type": "input_image", "image_url": part["image_url"]})
+        elif kind == "input_file":                   # read into text and page images by Service.expand_files
+            try:
+                file_item(part, f"{param}[{j}]")
+            except ValueError as e:
+                raise ResponsesError(str(e), f"{param}[{j}]", "unsupported_parameter") from None
+            parts.append(part)
         else:
-            raise ResponsesError(f"content parts of type {kind!r} are not supported (text and images are)",
+            raise ResponsesError(f"content parts of type {kind!r} are not supported (text, images and files are)",
                                  f"{param}[{j}].type", "unsupported_parameter")
     return _parts_of(parts)
 
 
 def _reasoning_text(item, param) -> str:
-    """The thinking a reasoning item carries: its reasoning_text content, else our own encrypted_content.  A summary
-    alone, or another server's encrypted_content, carries none that can go back into the prompt."""
+    """The thinking a reasoning item carries: its reasoning_text content, else its summary (all that is known of it
+    when another server's encrypted_content, which this server cannot read, came with it), else our own
+    encrypted_content."""
     texts = [p.get("text") or "" for p in item.get("content") or [] if isinstance(p, dict)
              and p.get("type") in ("reasoning_text", "text")]
     if texts:
         return "".join(texts)
     enc = item.get("encrypted_content")
+    summary = [p.get("text") or "" for p in item.get("summary") or [] if isinstance(p, dict)
+               and p.get("type") == "summary_text"]
+    if summary and not (isinstance(enc, str) and enc.startswith(ENCRYPTED_PREFIX)):
+        return "\n\n".join(summary)                  # a summary alone: what is known of the thinking
     if isinstance(enc, str) and enc.startswith(ENCRYPTED_PREFIX):
         try:
             return json.loads(base64.b64decode(enc[len(ENCRYPTED_PREFIX):], validate=True).decode("utf-8"))["text"]
@@ -129,8 +142,10 @@ def _tool_output(item, param):
     return out if isinstance(out, str) else _content(out, param + ".output")
 
 
-def input_messages(req: dict) -> list[dict]:
-    """`instructions` + `input` -> the chat template's messages."""
+def input_messages(req: dict, keep_image=None) -> list[dict]:
+    """`instructions` + `input` -> the chat template's messages.  `keep_image(bytes)` -> the link of an earlier
+    answer's image (an image_generation_call's result) kept on this server, so edit_image can take it; None: there is
+    no image model to keep it for."""
     messages = []
     instructions = req.get("instructions")
     if instructions not in (None, ""):
@@ -196,6 +211,42 @@ def input_messages(req: dict) -> list[dict]:
             messages.append({"role": "tool", "content": _tool_output(item, param), "_call_id": item.get("call_id")})
             open_turn = None
             thinking.clear()
+        elif kind == "image_generation_call":
+            # an earlier answer's image: the call and its result, as the model saw them when it made the image
+            text = "error: no image was made"
+            result = item.get("result")
+            if isinstance(result, str) and result:
+                try:
+                    data = base64.b64decode(result, validate=True)
+                except ValueError:
+                    raise ResponsesError("an image_generation_call's result must be the image in base64",
+                                         param + ".result") from None
+                try:
+                    url = keep_image(data) if keep_image is not None else None
+                except ValueError as e:
+                    raise ResponsesError(f"an image_generation_call's result: {e}", param + ".result") from None
+                text = (f"The image is made and the user sees it: {url}. To change it, call edit_image (its image: "
+                        f"{url}).") if url else "The image is made and the user sees it."
+            prompt = item.get("revised_prompt")
+            target = open_turn if open_turn is not None and not thinking else turn()
+            target.setdefault("tool_calls", []).append({"function": {
+                "name": "edit_image" if item.get("action") == "edit" else "generate_image",
+                "arguments": {"prompt": prompt} if isinstance(prompt, str) and prompt else {}},
+                "_call_id": item.get("id")})
+            messages.append({"role": "tool", "content": text, "_call_id": item.get("id")})
+            open_turn = None
+            thinking.clear()
+        elif isinstance(kind, str) and kind in HOSTED_ITEMS:
+            # a hosted tool's call or result from an earlier answer (another server ran it): what it did and found,
+            # as text, so the conversation goes on (this server cannot run the tool again)
+            note = _hosted_note(item)
+            if HOSTED_ITEMS[kind] == "assistant":
+                target = open_turn if open_turn is not None and not thinking else turn()
+                target["content"] = (target["content"] + "\n\n" if target["content"] else "") + note
+            else:
+                open_turn = None
+                thinking.clear()
+                messages.append({"role": "user", "content": note})
         elif kind == "additional_tools":
             continue                                 # #782 (Codex): tools added as an input item; see request_tools
         elif kind == "item_reference":
@@ -215,10 +266,63 @@ def input_messages(req: dict) -> list[dict]:
     return _late_system_to_user(messages)
 
 
+# OpenAI's hosted tools' input items, read back as text: who said it (the model's calls; the results a client sends)
+HOSTED_ITEMS = {"web_search_call": "assistant", "file_search_call": "assistant", "code_interpreter_call": "assistant",
+                "computer_call": "assistant", "local_shell_call": "assistant", "mcp_call": "assistant",
+                "mcp_list_tools": "assistant", "mcp_approval_request": "assistant", "tool_search_call": "assistant",
+                "computer_call_output": "user", "local_shell_call_output": "user", "mcp_approval_response": "user",
+                "tool_search_output": "user"}
+
+
+def _hosted_note(item: dict) -> str:
+    """A hosted tool's item as one line of text: its type and its fields (not its id or status; a data: URL, a
+    screenshot, is named, not copied)."""
+    def short(v):
+        if isinstance(v, str) and v.startswith("data:"):
+            return "(" + v[5:v.find(";")] + " data)" if ";" in v else "(data)"
+        if isinstance(v, dict):
+            return {k: short(x) for k, x in v.items()}
+        if isinstance(v, list):
+            return [short(x) for x in v]
+        return v
+    fields = {k: short(v) for k, v in item.items() if k not in ("id", "type", "status")}
+    return f"[{item['type']}] " + json.dumps(fields, ensure_ascii=False)
+
+
+VERBOSITY = {"low": "Keep your answer brief and to the point.",
+             "high": "Give a thorough, detailed answer."}
+
+
+def verbosity_messages(req: dict, messages: list[dict]) -> list[dict]:
+    """text.verbosity "low" / "high": one sentence asking for it, after the system message's own text (what the
+    request says itself is kept as it is).  "medium" and none leave the messages as they are."""
+    text = req.get("text")
+    want = VERBOSITY.get(str(text.get("verbosity"))) if isinstance(text, dict) else None
+    if want is None:
+        return messages
+    if messages and messages[0]["role"] == "system" and isinstance(messages[0]["content"], str):
+        return [{**messages[0], "content": messages[0]["content"] + "\n\n" + want}] + messages[1:]
+    return [{"role": "system", "content": want}] + messages
+
+
+def drop_oldest(messages: list[dict]) -> list[dict] | None:
+    """truncation "auto": the conversation without its oldest item - after the system message (the instructions
+    stay), a turn that calls tools goes with its results - or None when only the last message is left."""
+    lead = 1 if messages and messages[0]["role"] == "system" else 0
+    if len(messages) - lead <= 1:
+        return None
+    out = messages[:lead] + messages[lead + 1:]
+    while len(out) - lead > 1 and out[lead]["role"] == "tool":
+        del out[lead]                                # the results of the call that went
+    return out
+
+
 def _order_tool_results(messages):
     """The template places tool results by position: each run of tool messages is put in the order of the calls of
-    the assistant turn before it (a client may send the results in the order they finished), then the private call
-    ids are dropped."""
+    the model's turn before it (a client may send the results in the order they finished), then the private call
+    ids are dropped.  The turn is every assistant message right before the run: a reasoning or a message between two
+    calls starts a new one.  As on Chat (_order_chat_tool_results), only a run whose results all name one of those
+    calls, each once, is reordered; anything else keeps the order received."""
     i = 0
     while i < len(messages):
         if messages[i]["role"] != "tool":
@@ -227,10 +331,15 @@ def _order_tool_results(messages):
         j = i
         while j < len(messages) and messages[j]["role"] == "tool":
             j += 1
-        prev = messages[i - 1] if i else {}
-        order = [c.get("_call_id") for c in prev.get("tool_calls") or []]
-        rank = {cid: k for k, cid in enumerate(order) if cid}
-        messages[i:j] = sorted(messages[i:j], key=lambda m: rank.get(m.get("_call_id"), len(order)))
+        calls: list = []
+        k = i - 1
+        while k >= 0 and messages[k]["role"] == "assistant":
+            calls[:0] = [c.get("_call_id") for c in messages[k].get("tool_calls") or []]
+            k -= 1
+        rank = {cid: n for n, cid in enumerate(calls) if cid}
+        results = [m.get("_call_id") for m in messages[i:j]]
+        if all(cid in rank for cid in results) and len(set(results)) == len(results):
+            messages[i:j] = sorted(messages[i:j], key=lambda m: rank[m["_call_id"]])
         i = j
     for m in messages:
         m.pop("_call_id", None)
@@ -238,9 +347,132 @@ def _order_tool_results(messages):
             c.pop("_call_id", None)
 
 
-def request_tools(req: dict):
-    """-> (template tools or None, {template name: (namespace, name, kind)}, names of hosted tools left out)."""
-    tools, names, skipped = [], {}, []
+def strict_compatible(schema) -> bool:
+    """A syntactic check of strict mode's two object rules, without rewriting parameters: every declared object
+    has additionalProperties false, and all its properties are required. This is not a schema validator or a check of
+    OpenAI's whole schema subset. Same-resource JSON-pointer references are checked as schemas too; unresolved or
+    cyclic references fall back to non-strict (explicit strict still uses the normal validator). Boolean children
+    keep the existing behaviour: no object declaration. Only schema positions are visited: a schema map's keys are
+    names, and default/enum/examples etc. are JSON data.
+    """
+    maps = ("properties", "patternProperties", "$defs", "definitions", "dependentSchemas")
+    singles = ("additionalProperties", "unevaluatedProperties", "propertyNames", "additionalItems", "contains",
+               "unevaluatedItems", "not", "if", "then", "else", "contentSchema")
+    arrays = ("allOf", "anyOf", "oneOf", "prefixItems")
+
+    memo: dict[int, bool] = {}
+    active: set[int] = set()
+
+    def ok(node, depth=0) -> bool:
+        if depth > 64:
+            return False
+        if isinstance(node, bool):
+            return True
+        if not isinstance(node, dict) or id(node) in active:
+            return False
+        key = id(node)
+        if key not in memo:
+            active.add(key)
+            try:
+                memo[key] = check(node, depth)
+            finally:
+                active.remove(key)
+        return memo[key]                     # shared reference targets are checked once, not expanded per path
+
+    def check(node, depth) -> bool:
+        if "$dynamicRef" in node or "$recursiveRef" in node or "$id" in node and node is not schema:
+            return False                            # no dynamic-scope or nested base-URI inference here
+
+        def visit(child):
+            return ok(child, depth + 1)
+
+        if "$ref" in node:
+            ref = node["$ref"]
+            if not isinstance(ref, str) or not (ref == "#" or ref.startswith("#/")):
+                return False
+            target = schema
+            for part in unquote(ref[2:]).split("/") if ref != "#" else ():
+                part = part.replace("~1", "/").replace("~0", "~")
+                if isinstance(target, dict) and (target is schema or not isinstance(target.get("$id"), str)) \
+                        and part in target:
+                    target = target[part]
+                elif isinstance(target, list) and len(part) <= len(str(len(target))) and part.isdecimal() and \
+                        str(int(part)) == part and int(part) < len(target):
+                    target = target[int(part)]
+                else:
+                    return False
+            if not ok(target, depth + 1):
+                return False
+        props = node.get("properties")
+        kind = node.get("type")
+        if kind == "object" or isinstance(kind, list) and "object" in kind or "properties" in node:
+            if node.get("additionalProperties") is not False:
+                return False
+            required = node.get("required", [])
+            if not isinstance(required, list) or not all(isinstance(x, str) for x in required):
+                return False
+            if props is not None and (not isinstance(props, dict) or not set(props) <= set(required)):
+                return False
+        for key in maps:
+            if key in node:
+                value = node[key]
+                if not isinstance(value, dict) or not all(visit(child) for child in value.values()):
+                    return False
+        for key in singles:
+            if key in node and not visit(node[key]):
+                return False
+        for key in arrays:
+            if key in node:
+                value = node[key]
+                if not isinstance(value, list) or not all(visit(child) for child in value):
+                    return False
+        if "items" in node:                         # schema today; schema array in older drafts
+            items = node["items"]
+            if not (all(visit(child) for child in items) if isinstance(items, list) else visit(items)):
+                return False
+        if "dependencies" in node:                  # older drafts mix property-name arrays and schemas
+            deps = node["dependencies"]
+            if not isinstance(deps, dict):
+                return False
+            for value in deps.values():
+                if isinstance(value, list):
+                    if not all(isinstance(x, str) for x in value):
+                        return False
+                elif not visit(value):
+                    return False
+        return True
+    return isinstance(schema, dict) and ok(schema)
+
+
+def with_strict_defaults(req: dict) -> dict:
+    """OpenAI's Responses default for a function tool whose strict is not given (or null): strict where possible,
+    else non-strict, and the response's tools show which.  "Possible" here: its parameters meet strict mode's rules
+    as they are (strict_compatible; they are not rewritten) and jsonschema is there to check the calls.  -> the
+    request with each such tool's strict set (the request's own tools, a namespace's, additional_tools')."""
+    possible = jsonschema_modules() is not None
+
+    def resolve(tools, member=False):
+        out = []
+        for t in tools:
+            if isinstance(t, dict) and t.get("type") == "namespace" and isinstance(t.get("tools"), list):
+                t = {**t, "tools": resolve(t["tools"], True)}
+            elif isinstance(t, dict) and t.get("type", "function" if member else None) == "function" \
+                    and t.get("strict") is None:
+                t = {**t, "strict": possible and strict_compatible(t.get("parameters"))}
+            out.append(t)
+        return out
+    out = dict(req)
+    if isinstance(req.get("tools"), list):
+        out["tools"] = resolve(req["tools"])
+    if isinstance(req.get("input"), list):
+        out["input"] = [{**item, "tools": resolve(item["tools"])} if isinstance(item, dict)
+                        and item.get("type") == "additional_tools" and isinstance(item.get("tools"), list) else item
+                        for item in req["input"]]
+    return out
+
+
+def given_tools(req: dict) -> list:
+    """The request's tools as sent, with those of its `additional_tools` input items after them."""
     given = req.get("tools") or []
     if not isinstance(given, list):
         raise ResponsesError("tools must be an array", "tools")
@@ -250,7 +482,13 @@ def request_tools(req: dict):
     extra = [t for item in (items if isinstance(items, list) else [])
              if isinstance(item, dict) and item.get("type") == "additional_tools"
              and isinstance(item.get("tools"), list) for t in item["tools"]]
-    given = list(given) + extra
+    return list(given) + extra
+
+
+def request_tools(req: dict):
+    """-> (template tools or None, {template name: (namespace, name, kind)}, names of hosted tools left out)."""
+    tools, names, skipped = [], {}, []
+    given = given_tools(req)
 
     def add(tool, param, namespace=None, ns_description=""):
         kind = tool.get("type")
@@ -293,6 +531,17 @@ def request_tools(req: dict):
     if choice == "none":
         return None, names, skipped
     return tools or None, names, skipped
+
+
+def forced_choice(req: dict):
+    """The request's tool_choice in the shape forced_call reads: a named function or custom tool is
+    {"type": "function", "name": N}, with a namespace tool's name as the template sees it (namespace.name)."""
+    choice = req.get("tool_choice")
+    if isinstance(choice, dict) and choice.get("type") in ("function", "custom") and \
+            isinstance(choice.get("name"), str):
+        ns = choice.get("namespace")
+        return {"type": "function", "name": f"{ns}.{choice['name']}" if ns else choice["name"]}
+    return choice
 
 
 def _turn_body(req: dict):
@@ -390,6 +639,12 @@ def _codex_turn(req: dict):
     return turn.get("request_kind"), conversation if all(isinstance(x, str) and x for x in conversation) else None
 
 
+def codex_compaction(req: dict) -> bool:
+    """A Codex compaction request (its turn metadata's request_kind): it declares no tools, but its prompt can show
+    its conversation's (prompt_tools), and a call it writes comes back as one."""
+    return _codex_turn(req)[0] == "compaction"
+
+
 def prompt_tools(req: dict, tools):
     """-> the tools the prompt is rendered with: request_tools' `tools`, or for a Codex compaction request without
     tools the ones its own conversation's last prompt was rendered with (so its prompt starts as that one did)."""
@@ -427,11 +682,12 @@ def text_format(req: dict):
     kind = fmt.get("type")
     if kind in (None, "text"):
         return None
+    extra = {"repair_latex_escapes": True} if fmt.get("repair_latex_escapes") is True else {}   # #2893, opt-in
     if kind == "json_object":
-        return {"type": "json_object"}
+        return {"type": "json_object", **extra}
     if kind == "json_schema":
         spec = {k: fmt[k] for k in ("name", "schema", "strict", "description") if k in fmt}
-        return {"type": "json_schema", "json_schema": spec}
+        return {"type": "json_schema", "json_schema": spec, **extra}
     raise ResponsesError("text.format.type must be text, json_object or json_schema", "text.format.type")
 
 
@@ -450,8 +706,10 @@ def check_request(req: dict) -> None:
         raise ResponsesError("stored prompt templates are not supported: send instructions and input",
                              "prompt", "unsupported_parameter")
     n = req.get("max_output_tokens")
-    if n is not None and (isinstance(n, bool) or not isinstance(n, int) or n < 1):
-        raise ResponsesError("max_output_tokens must be a positive whole number", "max_output_tokens")
+    # -1 and 0 mean no cap, as max_tokens does on the chat path; anything lower is a mistake (upstream 9c2d35d97, #4036)
+    if n is not None and (isinstance(n, bool) or not isinstance(n, int) or n < -1):
+        raise ResponsesError("max_output_tokens must be a whole number, 1 or more, or -1 or 0 for no cap",
+                             "max_output_tokens")
     reasoning = req.get("reasoning")
     if reasoning is not None and not isinstance(reasoning, dict):
         raise ResponsesError("reasoning must be an object", "reasoning")
@@ -482,6 +740,10 @@ class Assembler:
         self.called = False                          # a tool call was made: this turn is not the final answer
         r = req.get("reasoning")
         reasoning: dict = r if isinstance(r, dict) else {}
+        # reasoning.summary asked: the thinking is also given as the reasoning item's summary (this model writes no
+        # separate summary), with the reasoning_summary_* events
+        self.summary = reasoning.get("summary") in ("auto", "concise", "detailed")
+        self.spell = None                            # text -> its tokens' logprobs entries (include asks for them)
         self.response = {
             "id": new_id("resp"), "object": "response", "created_at": int(time.time()), "status": "in_progress",
             "background": False, "error": None, "incomplete_details": None,
@@ -492,7 +754,8 @@ class Assembler:
             "store": False, "temperature": req.get("temperature"),
             "text": req.get("text") if isinstance(req.get("text"), dict) else {"format": {"type": "text"}},
             "tool_choice": req.get("tool_choice", "auto"), "tools": req.get("tools") or [],
-            "top_p": req.get("top_p"), "truncation": "disabled", "usage": None, "user": None,
+            "top_p": req.get("top_p"), "truncation": req.get("truncation") or "disabled", "usage": None, "user": None,
+            **({"max_tool_calls": req["max_tool_calls"]} if req.get("max_tool_calls") is not None else {}),
             "metadata": req.get("metadata") or {}}
 
     # --- events
@@ -521,6 +784,14 @@ class Assembler:
             item["content"].append(part)
             out.append(self.event("response.content_part.added", item_id=item["id"], output_index=self.index,
                                   content_index=0, part=copy.deepcopy(part)))
+        elif item["type"] == "reasoning":
+            out.append(self.event("response.content_part.added", item_id=item["id"], output_index=self.index,
+                                  content_index=0, part=copy.deepcopy(item["content"][0])))
+            if self.summary:
+                item["summary"].append({"type": "summary_text", "text": ""})
+                out.append(self.event("response.reasoning_summary_part.added", item_id=item["id"],
+                                      output_index=self.index, summary_index=0,
+                                      part={"type": "summary_text", "text": ""}))
         return out
 
     @property
@@ -537,13 +808,21 @@ class Assembler:
         if item["type"] == "message":
             part = item["content"][0]
             out += [self.event("response.output_text.done", item_id=item["id"], output_index=at, content_index=0,
-                               text=part["text"], logprobs=[]),
+                               text=part["text"], logprobs=part["logprobs"]),
                     self.event("response.content_part.done", item_id=item["id"], output_index=at, content_index=0,
                                part=copy.deepcopy(part))]
         elif item["type"] == "reasoning":
             text = item["content"][0]["text"]
             out.append(self.event("response.reasoning_text.done", item_id=item["id"], output_index=at,
                                   content_index=0, text=text))
+            out.append(self.event("response.content_part.done", item_id=item["id"], output_index=at, content_index=0,
+                                  part=copy.deepcopy(item["content"][0])))
+            if self.summary:
+                part = item["summary"][0]
+                out += [self.event("response.reasoning_summary_text.done", item_id=item["id"], output_index=at,
+                                   summary_index=0, text=part["text"]),
+                        self.event("response.reasoning_summary_part.done", item_id=item["id"], output_index=at,
+                                   summary_index=0, part=copy.deepcopy(part))]
             if self.encrypted:
                 item["encrypted_content"] = ENCRYPTED_PREFIX + base64.b64encode(
                     json.dumps({"text": text}, ensure_ascii=False).encode("utf-8")).decode("ascii")
@@ -567,8 +846,14 @@ class Assembler:
                 out += self._open({"id": new_id("rs"), "type": "reasoning", "status": "in_progress", "summary": [],
                                    "content": [{"type": "reasoning_text", "text": ""}]})
             self.item["content"][0]["text"] += ev.text
+            if self.spell is not None:
+                self.spell(ev.text)                  # the thinking's tokens: read past, not listed
             out.append(self.event("response.reasoning_text.delta", item_id=self.item["id"], output_index=self.index,
                                   content_index=0, delta=ev.text))
+            if self.summary:
+                self.item["summary"][0]["text"] += ev.text
+                out.append(self.event("response.reasoning_summary_text.delta", item_id=self.item["id"],
+                                      output_index=self.index, summary_index=0, delta=ev.text))
         elif kind == "content":
             if not ev.text:
                 return out
@@ -581,8 +866,10 @@ class Assembler:
                 out += self._open({"id": new_id("msg"), "type": "message", "status": "in_progress",
                                    "role": "assistant", "content": []})
             self.item["content"][0]["text"] += ev.text
+            lps: list = (self.spell(ev.text) or []) if self.spell is not None else []
+            self.item["content"][0]["logprobs"] += lps
             out.append(self.event("response.output_text.delta", item_id=self.item["id"], output_index=self.index,
-                                  content_index=0, delta=ev.text, logprobs=[]))
+                                  content_index=0, delta=ev.text, logprobs=lps))
         elif kind == "tool_start":
             out += self.close()
             out += self._call_started()
@@ -665,6 +952,10 @@ class Assembler:
                                   output_index=self.index))
             out.append(self.event("response.image_generation_call.generating", item_id=item["id"],
                                   output_index=self.index))
+        elif x.get("event") == "partial" and self.item is not None and self.item["type"] == "image_generation_call":
+            out.append(self.event("response.image_generation_call.partial_image", item_id=self.item["id"],
+                                  output_index=self.index, partial_image_index=x.get("index", 0),
+                                  partial_image_b64=x.get("b64")))
         elif x.get("event") == "result" and self.item is not None and self.item["type"] == "image_generation_call":
             urls = x.get("images") or []
             self.item["result"] = image_b64(urls[0]) if urls else None
@@ -702,10 +993,21 @@ class Assembler:
         if length:
             self.response["status"] = "incomplete"
             self.response["incomplete_details"] = {"reason": "max_output_tokens"}
-            return out + [self.event("response.incomplete", response=self.snapshot())]
+            return out + [self._with_timings(self.event("response.incomplete", response=self.snapshot()), done)]
         self.response["status"] = "completed"
         self.response["completed_at"] = int(time.time())
-        return out + [self.event("response.completed", response=self.snapshot())]
+        return out + [self._with_timings(self.event("response.completed", response=self.snapshot()), done)]
+
+    @staticmethod
+    def _with_timings(event: dict, done: dict) -> dict:
+        """Top-level `timings` on the final event, as /v1/chat/completions has them (upstream a0fc88abd, #3291)."""
+        if done.get("timings"):
+            event["timings"] = done["timings"]
+        return event
+
+    def error(self, message: str, code: str = "server_error") -> dict:
+        """The error event that comes before response.failed in a stream that fails after it started."""
+        return self.event("error", code=code, message=message, param=None)
 
     def failed(self, message: str, code: str = "server_error") -> dict:
         """response.failed: an error after the stream started (the HTTP status is already sent)."""
@@ -723,4 +1025,6 @@ def collect(events) -> dict:
     for e in events:
         if e is not None:
             last = e
+    if last.get("timings"):                          # as on a whole /v1/chat/completions reply
+        return {**last["response"], "timings": last["timings"]}
     return last["response"]

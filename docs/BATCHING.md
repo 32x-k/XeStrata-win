@@ -66,6 +66,22 @@ At a 32K context that is 4 slots from a 24 GB card; a smaller card stays at one 
   A new conversation takes an empty slot, else the one used longest ago.
 - A client that disconnects stops its slot (`BSTOP`); the others go on.
 
+### Long prompts that move from solo to a batch slot
+
+A request that moves from the solo path into a slot is not read again because the engine's prompt cache reuses the live session.
+With `--prompt-cache 0` the moved request reads its whole prompt again.
+To trim the cache for RAM and still keep that reuse, set the model config's `args` like this (the other arguments unchanged):
+
+```text
+"args": [ ..., "--prompt-cache", "1", "--prompt-cache-every", "0",
+          "--prompt-cache-root", "0", "--conversation-cache-mib", "0" ]
+```
+
+`--prompt-cache 1` keeps one checkpoint, `--prompt-cache-every 0` takes no checkpoint every 16K tokens and `--prompt-cache-root 0` none at the end of the system prompt.
+`--conversation-cache-mib 0` only stops parking finished conversations in RAM: the checkpoint and the sessions the slots hold stay.
+If you already park conversations, keep that budget as it is: it is separate from the reuse on a move.
+This does not make new long prompts read at the same time: they are admitted one at a time.
+
 ## The VRAM expert tier keeps adapting in batch windows
 
 Batch windows count which experts they route to as well (upstream e989c671).
@@ -74,9 +90,36 @@ Every `--adapt-every` windows (default 4) the engine swaps the most-routed exper
 The swaps run beside the window's commit, emits and drafts, and have landed before the next window starts.
 The tier stands still while a long prompt is read beside decoding slots (the prompt may hold a loan of cache slots).
 With `--adapt-async` (the default in the resident RAM mode) no window waits for a round: each batch window moves the round on a step (upstream 495dc436), and a request that arrives finishes the round in flight before it starts.
-The pipelined groups of `--batch-groups` do not adapt.
+The pipelined groups of `--batch-groups` do not adapt by default: their windows count the routing, but no round starts while groups are in flight, so the tier moves only when the slots go back to the solo path.
+`STRATA_PIPE_ADAPT_EVERY=N` (opt-in; unset or 0 keeps the old behaviour) lets the pipelined path adapt (upstream a3bb38ec4).
+After N group windows it starts no new group, lets the groups in flight finish, runs one round as the serial batch windows do, and goes on. The swaps run while no card has a window waiting on the host, so no window reads a cache slot that is changing, and the swapped-in experts land before the next group starts.
+It stands still while a prompt is read beside decoding slots, and does nothing with `--adapt-async 1`. The engine says so at start, and the `strata batch (pipelined ...)` line adds the rounds, the experts swapped in and the time spent.
+Upstream measured it on 2x RTX 5090 (layer split, `--batch 6 --batch-groups 2`, `--adapt-every 16`, eight bursts of six streams right after start): 309 rows/s on average without it, 410 with 128 and 402 with 32 (32 empties the pipeline four times as often).
 The `strata batch:` log line shows the rounds, the experts swapped in and the wait per window (`adapt wait`).
 Swaps move experts between the GPU and the CPU, which round differently, so greedy output can differ from run to run; `--adapt-every 1000000` keeps the tier fixed (Exactness, below).
+
+## MTP drafts in the pipelined groups (`STRATA_PIPED_MTP`, opt-in)
+
+Grouped windows (`--batch-groups` above 1) verify no MTP proposals, and `--batch-mtp` in one group keeps one GPU busy at a time.
+`STRATA_PIPED_MTP=N` together with `--batch-mtp` gives both: the groups stay pipelined, and each slot verifies its proposals in them (upstream 17878ac57).
+Without the variable nothing changes.
+
+A group's window carries, for each of its slots, the slot's token and up to N MTP proposals (at most `--spec` - 1; the first always, each further one while the draft layer was at least `--spec-min-p` sure of the one before).
+The last GPU judges each slot's proposals on their own.
+How many rows to keep is known only then, and by then the earlier GPUs already run other groups' windows, so the rows the commit replays are copied to the group's own saved rows right behind each window, and after the verdict every GPU queues the commit of the kept rows.
+An earlier GPU's commit is queued only while no window there waits on the host (before its next window, or at once when it is idle).
+A slot's drafter catches up on its own rows and drafts the next proposals as an asynchronous chain; a group whose chain has not landed lets another group start first.
+Anything that reads a slot's state (an admission, a parked conversation, the solo path taking a slot back) first finishes the groups in flight and the queued commits.
+
+It runs on a layer split with two or more groups whose windows (the group's slots x (1 + N)) hold at most 8 rows.
+When it cannot run, the engine says why and leaves it off, and turns `--batch-mtp` off as well if the slots stay in pipelined groups.
+Every GPU keeps the saved rows (25.5 MiB at `=1` and 38.2 MiB at `=2` with 4 slots, upstream's numbers), taken from the expert cache.
+
+Upstream found `=1` the setting to use.
+On 2x RTX A6000 (every expert in VRAM, `--batch 4` in 2 groups of 2 slots, total tok/s) 2 streams went from 125.7 without drafts to 146.3 at `=1` (+16%) and 145.1 at `=2`, and 4 streams from 171.4 to 188.8 at `=1` (+10%), 179.5 at `=2` and 165.6 at `=3`.
+On 2x RTX A4000 (Q2_0, the experts do not all fit in VRAM) `=1` gained 18-20% at 2 streams and 6-8% at 4, and `=2` was slower than no drafts at 4.
+One stream runs on the solo path and does not change.
+Greedy outputs were each slot's solo tokens (upstream, on the A6000 box). Where the experts do not all fit, the drafters' VRAM changes which experts are cached, and with it the output can change.
 
 ## Exactness
 

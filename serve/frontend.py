@@ -18,9 +18,11 @@ and the formats change often; the engine boundary is token ids in, text deltas o
 """
 from __future__ import annotations
 
+import base64
 import datetime
 import json
 import logging
+import mimetypes
 import os
 import re
 import threading
@@ -28,6 +30,7 @@ import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import unquote
 
 import jinja2
 from jinja2.sandbox import ImmutableSandboxedEnvironment
@@ -70,6 +73,22 @@ class ChatTemplate:
         # </tool_call>`, read through GlmCallRewriter; the thinking always opened, its effort low, high or max
         self.call_form = "dsml" if "｜DSML｜" in self.source else "glm" if "<arg_key>" in self.source else "qwen"
         self.caps = self._detect_caps()
+        self.thinking = self._thinking_levels()
+
+    def _thinking_levels(self) -> dict:
+        """The thinking levels this template takes, by their own names, and the one a request that names none gets
+        (/health's "thinking", the web page's buttons): GLM-5.3-Flash's low, high and max; Harmony's (llm-jp-4.1's)
+        low, medium and high, medium its default; Qwen3.8-Flash-Next's low, medium and high (xhigh); a template that
+        only turns its thinking on and off, on; none at all, no levels."""
+        if self.call_form == "glm":
+            return {"levels": ["none", "low", "high", "max"], "default": "max"}
+        if self.harmony:
+            return {"levels": ["none", "low", "medium", "high"], "default": "medium"}
+        if "reasoning_effort" in self.source:
+            return {"levels": ["none", "low", "medium", "high"], "default": "high"}
+        if "enable_thinking" in self.source:
+            return {"levels": ["none", "on"], "default": "on"}
+        return {"levels": [], "default": None}
 
     def render(self, messages: list[dict], tools: list[dict] | None = None, add_generation_prompt: bool = True,
                **kwargs) -> str:
@@ -93,14 +112,21 @@ class ChatTemplate:
             messages = adjusted
         if tools and self.wrapped_tools:   # the template reads OpenAI's form, `tool.function` (llm-jp-4.1's)
             tools = [t if "function" in t else {"type": "function", "function": t} for t in tools]
-        if self.call_form == "glm":        # its efforts: low, high and max (the default)
+        if self.call_form == "glm":        # its efforts: low, high and max (the default), taken by name
             effort = kwargs.get("reasoning_effort")
-            kwargs = {**kwargs, "reasoning_effort": {"low": "low", "medium": "high"}.get(str(effort))}
+            kwargs = {**kwargs, "reasoning_effort": {"low": "low", "medium": "high", "high": "high"}.get(str(effort))}
+        elif self.harmony and kwargs.get("reasoning_effort") == "xhigh":   # Harmony's efforts: low, medium and high
+            kwargs = {**kwargs, "reasoning_effort": "high"}
         text = self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                     **kwargs)
         if (self.call_form == "glm" and add_generation_prompt and kwargs.get("enable_thinking", True) is False
                 and text.endswith("<think>")):   # GLM's template always opens the thinking: closed at once
             text += THINK_END
+        if (self.harmony and add_generation_prompt and kwargs.get("enable_thinking", True) is False
+                and text.endswith(HARMONY_TURN)):
+            # Harmony has no switch for thinking: an empty analysis message, so the model goes on with the final
+            # answer or a call (a forced final channel would leave it no call)
+            text += HARMONY_NO_THINKING + HARMONY_TURN
         return text
 
     def _detect_caps(self) -> dict[str, bool]:
@@ -179,10 +205,11 @@ def _text_of(content) -> str:
 
 IMAGE_PARTS = ("image_url", "input_image", "image")
 
-# Thinking levels.  The model's template knows low, medium and xhigh (its default; "high" means xhigh), and
-# enable_thinking=false for none.  Clients spell these many ways; everything maps onto those four.
+# Thinking levels.  Qwen3.8-Flash-Next's template knows low, medium and xhigh (its default; "high" means xhigh), and
+# enable_thinking=false for none.  Clients spell these many ways; everything maps onto none, low, medium, high and
+# xhigh, high kept apart from xhigh for the templates whose high is below their top (GLM-5.3-Flash's max).
 EFFORT = {"none": None, "off": None, "minimal": None, "disabled": None, "false": None,
-          "low": "low", "medium": "medium", "high": "xhigh", "xhigh": "xhigh", "max": "xhigh", "maximum": "xhigh"}
+          "low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh", "max": "xhigh", "maximum": "xhigh"}
 
 
 # DeepSeek-V4.1's template takes low, medium, high (its default) and max, or a whole number 1..100 (the "Reasoning
@@ -228,8 +255,34 @@ def budget_effort(tokens) -> dict:
     return {"reasoning_effort": "low" if n < 2048 else "medium" if n < 8192 else EFFORT["high"]}
 
 
+# A file a request sends (Chat's "file", Responses' "input_file", an Anthropic PDF document as converted by
+# _anthropic_documents): a "file" item of the template's content until Service.expand_files reads it into text and
+# page images
+FILE_PARTS = ("file", "input_file")
+
+
 def _has_image(content) -> bool:
-    return isinstance(content, list) and any(isinstance(p, dict) and p.get("type") in IMAGE_PARTS for p in content)
+    """Content that must stay a list of parts: a picture in it (or a file, which becomes text and pictures)."""
+    return isinstance(content, list) and any(isinstance(p, dict) and p.get("type") in IMAGE_PARTS + FILE_PARTS
+                                             for p in content)
+
+
+def file_item(part: dict, path: str) -> dict:
+    """A file part -> {"type": "file", "data": a data: URL or None, "url": an http(s) URL or None, "name", "mime"}.
+    A file_id (OpenAI's and Anthropic's Files APIs) is a ValueError: this server keeps no files."""
+    inner = part.get("file")
+    src: dict = inner if part.get("type") == "file" and isinstance(inner, dict) else part
+    if src.get("file_id"):
+        raise ValueError(f"{path}: a file_id needs a Files API, which this server does not have: send the file "
+                         "itself (file_data)")
+    data, url, name = src.get("file_data"), src.get("file_url"), str(src.get("filename") or "")
+    if not (isinstance(data, str) and data) and not (isinstance(url, str) and url):
+        raise ValueError(f"{path}: a file needs file_data (a data: URL or base64) or file_url")
+    if isinstance(data, str) and data and not data.startswith("data:"):
+        guess = mimetypes.guess_type(name)[0] or "application/octet-stream"   # bare base64: the name's type
+        data = f"data:{guess};base64,{data}"
+    mime = data[5:data.find(";")] if isinstance(data, str) and data and ";" in data else None
+    return {"type": "file", "data": data or None, "url": None if data else url, "name": name, "mime": mime}
 
 
 def _image_source(part: dict) -> str:
@@ -257,8 +310,14 @@ def _parts_of(content):
     for part in content:
         if not isinstance(part, dict):
             continue
-        if part.get("type") in IMAGE_PARTS:
-            items.append({"type": "image", "source": _image_source(part)})
+        if part.get("type") in FILE_PARTS:
+            items.append(file_item(part, "content"))
+        elif part.get("type") in IMAGE_PARTS:
+            item = {"type": "image", "source": _image_source(part)}
+            url = part.get("image_url")
+            if (url.get("detail") if isinstance(url, dict) else part.get("detail")) == "low":
+                item["detail"] = "low"               # OpenAI's low detail: read at a smaller size (Service.prepare)
+            items.append(item)
         elif part.get("type") in TEXT_PARTS and "text" in part:
             items.append({"type": "text", "text": part.get("text", "")})
     return items
@@ -268,7 +327,7 @@ def _parts_of(content):
 # redacted_thinking is allowed only to be dropped without an error: another server's encrypted reasoning, which
 # carries nothing this server can read - the same reason responses.py's _reasoning_text gives for another server's
 # encrypted_content.
-ANTHROPIC_BLOCKS = ("text",) + IMAGE_PARTS + ("thinking", "tool_use", "tool_result", "redacted_thinking")
+ANTHROPIC_BLOCKS = ("text",) + IMAGE_PARTS + FILE_PARTS + ("thinking", "tool_use", "tool_result", "redacted_thinking")
 
 
 def _check_parts(content, path: str, kinds):
@@ -592,6 +651,65 @@ def tool_arguments(raw) -> dict:
     return {"arguments": json.dumps(raw, ensure_ascii=False)}
 
 
+def require_messages(messages: list) -> None:
+    """A chat request with no message at all is a 400 (OpenAI: "empty array. Expected an array with minimum length
+    1"); the template would otherwise render just the assistant turn and the model would answer nothing."""
+    if not messages:
+        raise ValueError("messages must be a non-empty list: send at least one message")
+
+
+def _order_chat_tool_results(messages: list[dict]) -> None:
+    """The template pairs tool results with the calls by position, so a run of results the client returned in another
+    order is put back in the order of the calls while their ids are still there (upstream 11237f831, #3395).  Only a
+    complete, unambiguous run is reordered: the calls' and the results' ids non-empty unique strings, the same set.
+    Anything else keeps the order received.  The ids are private to this conversion and never reach the template."""
+    i = 0
+    while i < len(messages):
+        if messages[i]["role"] != "tool":
+            i += 1
+            continue
+        j = i + 1
+        while j < len(messages) and messages[j]["role"] == "tool":
+            j += 1
+        prev = messages[i - 1] if i else {}
+        calls = [c.get("_call_id") for c in prev.get("tool_calls") or []] if prev.get("role") == "assistant" else []
+        results = [m.get("_call_id") for m in messages[i:j]]
+        if len(calls) == len(results) and all(isinstance(cid, str) and cid for cid in calls + results):
+            if len(set(calls)) == len(calls) and len(set(results)) == len(results) and set(calls) == set(results):
+                rank = {cid: n for n, cid in enumerate(calls)}
+                messages[i:j] = sorted(messages[i:j], key=lambda m: rank[m["_call_id"]])
+        i = j
+    for message in messages:
+        message.pop("_call_id", None)
+        for call in message.get("tool_calls") or []:
+            call.pop("_call_id", None)
+
+
+def custom_tool_names(req: dict) -> set[str]:
+    """The names of a Chat Completions request's custom tools ({"type": "custom", "custom": {"name": ...}}): their
+    calls are answered as {"type": "custom", "custom": {"name", "input"}}."""
+    tools = req.get("tools")
+    return {t["custom"]["name"] for t in tools if isinstance(t, dict) and t.get("type") == "custom"
+            and isinstance(t.get("custom"), dict) and isinstance(t["custom"].get("name"), str)} \
+        if isinstance(tools, list) else set()
+
+
+def _chat_tool(t):
+    """A Chat Completions tool -> the template's.  A custom tool takes free text, maybe in a grammar the model reads
+    (it is not enforced: the text is checked by nothing), as /v1/responses' custom tools."""
+    if not isinstance(t, dict) or t.get("type") != "custom" or not isinstance(t.get("custom"), dict):
+        return t.get("function", t) if isinstance(t, dict) and t.get("type") == "function" else t
+    c = t["custom"]
+    description = c.get("description") or ""
+    fmt = c.get("format") if isinstance(c.get("format"), dict) else {}
+    grammar = fmt.get("grammar") if isinstance(fmt.get("grammar"), dict) else fmt
+    if fmt.get("type") == "grammar" and grammar.get("definition"):
+        description += f"\n\nThe input must follow this {grammar.get('syntax', '')} grammar:\n{grammar['definition']}"
+    return {"name": c.get("name"), "description": description,
+            "parameters": {"type": "object", "required": ["input"],
+                           "properties": {"input": {"type": "string", "description": "the raw input"}}}}
+
+
 def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
     """OpenAI Chat Completions -> (template messages, template tools, template kwargs)."""
     messages = []
@@ -599,24 +717,60 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
         role = m.get("role")
         if role == "developer":
             role = "system"
-        # an image is read in a user, tool or assistant message; the system prompt takes text only, as _text_of reads
+        if role == "function":                       # the old shape of a tool's result: the call it answers by name
+            role = "tool"
+        raw_content = m.get("content")
+        for j, part in enumerate(raw_content if isinstance(raw_content, list) else []):
+            if isinstance(part, dict) and part.get("type") == "input_audio":
+                raise ValueError(f"messages[{i}].content[{j}]: input_audio is not supported: this model does not "
+                                 "read audio")
+            if isinstance(part, dict) and part.get("type") == "file":
+                file_item(part, f"messages[{i}].content[{j}]")   # a file_id or no data is a 400 here
+        # an image (or a file) is read in a user, tool or assistant message; the system prompt takes text only, as
+        # _text_of reads
         images = role in ("user", "tool", "assistant")
         content = _check_parts(m.get("content"), f"messages[{i}].content",
-                               TEXT_PARTS + IMAGE_PARTS if images else TEXT_PARTS)
+                               TEXT_PARTS + IMAGE_PARTS + FILE_PARTS if images else TEXT_PARTS)
+        if role == "assistant" and content in (None, "") and isinstance(m.get("refusal"), str):
+            content = m["refusal"]                   # a refusal the client sends back is what the model said
         out = {"role": role, "content": _parts_of(content) if images else _text_of(content)}
+        name = m.get("name")
+        if role in ("user", "system") and isinstance(name, str) and name:
+            # the speaker's name, which the template has no place for: written before what they said
+            said = out["content"]
+            out["content"] = f"{name}: {said}" if isinstance(said, str) else \
+                [{"type": "text", "text": f"{name}: "}] + list(said or [])
+        if role == "tool":
+            out["_call_id"] = m.get("tool_call_id")
         if m.get("reasoning_content"):
             out["reasoning_content"] = m["reasoning_content"]
-        if m.get("tool_calls"):
+        raw = m.get("tool_calls")
+        if not raw and isinstance(m.get("function_call"), dict):   # the old shape of one call
+            raw = [{"function": m["function_call"]}]
+        if raw:
             calls = []
-            for c in _object_list(m["tool_calls"], "tool_calls"):
+            for c in _object_list(raw, "tool_calls"):
+                if c.get("type") == "custom" and isinstance(c.get("custom"), dict):
+                    calls.append({"function": {"name": c["custom"].get("name"),
+                                               "arguments": {"input": str(c["custom"].get("input") or "")}},
+                                  "_call_id": c.get("id")})
+                    continue
                 fn = c.get("function", c)
                 if not isinstance(fn, dict):
                     raise ValueError("tool_calls must be a list of objects (each with a \"function\" object)")
-                calls.append({"function": {"name": fn.get("name"), "arguments": tool_arguments(fn.get("arguments"))}})
+                calls.append({"function": {"name": fn.get("name"), "arguments": tool_arguments(fn.get("arguments"))},
+                              "_call_id": c.get("id")})
             out["tool_calls"] = calls
         messages.append(out)
-    tools = [t.get("function", t) if t.get("type") == "function" else t
-             for t in _tool_list(req.get("tools"), "function")] or None
+    _order_chat_tool_results(messages)
+    given = req.get("tools")
+    plain = [t for t in given if not (isinstance(t, dict) and t.get("type") == "custom")] \
+        if isinstance(given, list) else given
+    listed = [_chat_tool(t) for t in _tool_list(plain, "function")]
+    if isinstance(given, list):                      # the custom tools, after the function tools
+        listed += [_chat_tool(t) for t in given if isinstance(t, dict) and t.get("type") == "custom"
+                   and isinstance(t.get("custom"), dict) and isinstance(t["custom"].get("name"), str)]
+    tools = listed or None
     kwargs = {}
     # OpenAI Chat Completions: "reasoning_effort"; Responses style: "reasoning": {"effort": ...}
     reasoning = req["reasoning"] if isinstance(req.get("reasoning"), dict) else {}
@@ -661,17 +815,88 @@ def pin_billing_stamp(system: str) -> str:
     return "".join(s)
 
 
+# Anthropic's thinking signature, and the data of a redacted_thinking block: the thinking's text in the form of
+# responses.py's encrypted_content (base64, not encrypted: the client already holds the text), so a block this
+# server wrote can be read back and checked against its text.  Another server's signature is opaque and ignored.
+THINKING_PREFIX = "strata.r1:"
+
+
+def thinking_signature(text: str) -> str:
+    return THINKING_PREFIX + base64.b64encode(json.dumps({"text": text}, ensure_ascii=False).encode()).decode("ascii")
+
+
+def _signed_thinking(signature, where: str) -> str | None:
+    """The text a signature of this server's carries; None for another server's (or none)."""
+    if not isinstance(signature, str) or not signature.startswith(THINKING_PREFIX):
+        return None
+    try:
+        return str(json.loads(base64.b64decode(signature[len(THINKING_PREFIX):], validate=True).decode())["text"])
+    except (ValueError, KeyError, TypeError, UnicodeError):
+        raise ValueError(f"{where}: the thinking's signature is damaged") from None
+
+
+def _anthropic_documents(content, path: str):
+    """Anthropic's text documents and search results -> text blocks the template reads: a document's text
+    (source "text", or "content" blocks) under its title and context, a "content" document's images after it as image
+    blocks of their own, a search result's text under its title and source.  A PDF document is left as it is (not
+    read yet).  citations.enabled: true is a 400: no citations are made."""
+    if not isinstance(content, list):
+        return content
+    out = []
+    for j, block in enumerate(content):
+        kind = block.get("type") if isinstance(block, dict) else None
+        if kind in ("document", "search_result"):
+            cite = block.get("citations")
+            if isinstance(cite, dict) and cite.get("enabled") is True:
+                raise ValueError(f"{path}[{j}].citations: citations are not supported by this server")
+        text, images = None, []
+        if kind == "document":
+            src = block.get("source") if isinstance(block.get("source"), dict) else {}
+            if src.get("type") == "text":
+                text = str(src.get("data") or "")
+            elif src.get("type") == "content":
+                inner = src.get("content")
+                text = inner if isinstance(inner, str) else "\n\n".join(
+                    b.get("text") or "" for b in inner or [] if isinstance(b, dict) and b.get("type") == "text")
+                images = [] if isinstance(inner, str) else [
+                    b for b in inner or [] if isinstance(b, dict) and b.get("type") == "image"]
+            if text is not None:
+                head = [x for x in (block.get("title"), block.get("context")) if isinstance(x, str) and x]
+                text = "\n".join(["Document: " + head[0]] + head[1:] + ["", text]) if head else text
+            elif src.get("type") in ("base64", "url", "file"):   # a PDF: read by Service.expand_files
+                name = str(block.get("title") or "")
+                part: dict = {"type": "input_file", "filename": name}
+                if src.get("type") == "base64":
+                    part["file_data"] = f"data:{src.get('media_type') or 'application/pdf'};base64,{src.get('data')}"
+                elif src.get("type") == "url":
+                    part["file_url"] = str(src.get("url") or "")
+                else:
+                    part["file_id"] = src.get("file_id") or "?"
+                file_item(part, f"{path}[{j}]")     # a file_id is a 400 here
+                out.append(part)
+                continue
+        elif kind == "search_result":
+            body = "\n\n".join(b.get("text") or "" for b in block.get("content") or []
+                               if isinstance(b, dict) and b.get("type") == "text")
+            text = f"Search result: {block.get('title') or ''} ({block.get('source') or ''})\n\n{body}"
+        out.append({"type": "text", "text": text} if text is not None else block)
+        out += images
+    return out
+
+
 def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[dict], list[dict] | None, dict]:
     """Anthropic Messages -> (template messages, template tools, template kwargs).  `think_unasked`: a request
-    without "thinking", an effort or a budget gets the template's default (it thinks), as through 0.1.31; False
-    renders it without thinking (#278, the config's "anthropic_thinking": "on_request")."""
+    without "thinking", an effort or a budget gets the template's default (it thinks), as through 0.1.31 (the
+    config's "anthropic_thinking": "model"); False renders it without thinking, Anthropic's rule (#278, the server's
+    default "on_request")."""
     messages = []
     system = req.get("system")
     if system:
         messages.append({"role": "system",
                          "content": pin_billing_stamp(_text_of(_check_parts(system, "system", TEXT_PARTS)))})
     for i, m in enumerate(_object_list(req.get("messages"), "messages")):
-        content = _check_parts(m.get("content"), f"messages[{i}].content", ANTHROPIC_BLOCKS)
+        content = _check_parts(_anthropic_documents(m.get("content"), f"messages[{i}].content"),
+                               f"messages[{i}].content", ANTHROPIC_BLOCKS)
         if isinstance(content, str):
             messages.append({"role": m["role"], "content": content})
             continue
@@ -685,17 +910,32 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
             if kind == "text":
                 text.append(block.get("text", ""))
                 parts.append(block)
-            elif kind in IMAGE_PARTS:
+            elif kind in IMAGE_PARTS + FILE_PARTS:
                 parts.append(block)
             elif kind == "thinking":
-                reasoning.append(block.get("thinking", ""))
+                said = block.get("thinking", "")
+                signed = _signed_thinking(block.get("signature"), f"messages[{i}].content[{j}]")
+                if signed is not None and signed != said:
+                    raise ValueError(f"messages[{i}].content[{j}]: the thinking does not match its signature")
+                reasoning.append(said)
+            elif kind == "redacted_thinking":     # one of this server's is read; another server's carries nothing
+                signed = _signed_thinking(block.get("data"), f"messages[{i}].content[{j}]")
+                if signed is not None:
+                    reasoning.append(signed)
             elif kind == "tool_use":
-                calls.append({"function": {"name": block.get("name"), "arguments": tool_arguments(block.get("input"))}})
+                calls.append({"function": {"name": block.get("name"), "arguments": tool_arguments(block.get("input"))},
+                              "_call_id": block.get("id")})
             elif kind == "tool_result":
                 # A tool's image (Claude Code's Read of a picture) reaches the encoder like a user's, as the OpenAI
-                # path's tool messages already do; a text-only result is one string, as before.
-                messages.append({"role": "tool", "content": _parts_of(_check_parts(
-                    block.get("content"), f"messages[{i}].content[{j}].content", TEXT_PARTS + IMAGE_PARTS))})
+                # path's tool messages already do; a text-only result is one string, as before.  Its tool_use_id
+                # puts it beside its call (_order_chat_tool_results): parallel results may come in any order.
+                where = f"messages[{i}].content[{j}].content"
+                result = _parts_of(_check_parts(_anthropic_documents(block.get("content"), where), where,
+                                                TEXT_PARTS + IMAGE_PARTS + FILE_PARTS))
+                if block.get("is_error") is True:   # the tool failed: the model is told so, not only its text
+                    result = "Error: " + result if isinstance(result, str) else \
+                        [{"type": "text", "text": "Error: "}] + list(result or [])
+                messages.append({"role": "tool", "content": result, "_call_id": block.get("tool_use_id")})
         if text or calls or reasoning or parts:
             # an image sent beside tool results stays in this turn instead of being dropped
             out = {"role": m["role"], "content": _parts_of(parts) if _has_image(parts) else "".join(text)}
@@ -704,12 +944,18 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
             if calls:
                 out["tool_calls"] = calls
             messages.append(out)
+    _order_chat_tool_results(messages)
     tools = [{"name": t["name"], "description": t.get("description", ""), "parameters": t.get("input_schema", {})}
              for t in _tool_list(req.get("tools"), None)] or None
     kwargs = {}
     # Anthropic: "thinking": {"type": "disabled"} or {"type": "enabled", "budget_tokens": N};
     # "output_config": {"effort": "low" | "medium" | "high"}
     thinking = req.get("thinking")
+    if thinking is not None and (not isinstance(thinking, dict)
+                                 or thinking.get("type") not in ("enabled", "disabled", "adaptive")):
+        raise ValueError('thinking must be {"type": "enabled", "budget_tokens": N}, {"type": "adaptive"} or '
+                         '{"type": "disabled"}')
+    # "adaptive": the model decides how much to think (the template's default, an effort if output_config has one)
     effort = (req.get("output_config") or {}).get("effort") if isinstance(req.get("output_config"), dict) else None
     # 0.1.45: Anthropic's budget_tokens is a real budget, not only a level: the thinking is closed (wrap-up, </think>,
     # the answer) after that many tokens.  A reasoning_budget_tokens of the request's own wins.
@@ -723,14 +969,32 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
     elif isinstance(thinking, dict) and thinking.get("budget_tokens"):
         kwargs.update(budget_effort(thinking["budget_tokens"]))
     elif thinking is None and not req.get("reasoning_budget_tokens") and not think_unasked:
-        # Opt-in (the config's "anthropic_thinking": "on_request"; the default thinks as 0.1.31 did, since a
-        # client that never asks would otherwise lose the thinking on every turn).  Anthropic's thinking is
-        # opt-in there. Claude Code's helper calls (a session title, a topic check) ask for none
+        # The server's default (the config's "anthropic_thinking": "on_request"; "model" thinks as 0.1.31 did, for
+        # a client that never asks).  Anthropic's thinking is opt-in. Claude Code's helper calls (a session title,
+        # a topic check) ask for none
         # and allow a few dozen tokens, which the model otherwise spent thinking and answered with no text at all.
         # A config's reasoning_effort still applies: Service.with_shared sets output_config before this runs.  A
         # request that gives its own reasoning_budget_tokens (#123) asks for thinking, so it thinks as before.
         kwargs["enable_thinking"] = False
     return _env_to_user(_late_system_to_user(messages)), tools, kwargs
+
+
+def anthropic_format(req: dict):
+    """Anthropic's structured output, `output_config.format` (or the beta's name for it, `output_format`):
+    {"type": "json_schema", "schema": {...}} -> the Chat Completions response_format prepare_format reads, or None."""
+    config = req.get("output_config")
+    fmt = config.get("format") if isinstance(config, dict) else None
+    if fmt is not None and req.get("output_format") is not None:
+        raise ValueError("give the format once: output_config.format or output_format, not both")
+    fmt = req.get("output_format") if fmt is None else fmt
+    if fmt is None:
+        return None
+    if not isinstance(fmt, dict) or fmt.get("type") != "json_schema":
+        raise ValueError('output_config.format must be {"type": "json_schema", "schema": {...}}')
+    if not isinstance(fmt.get("schema"), dict):
+        raise ValueError("output_config.format needs a schema object")
+    # Anthropic's structured output always follows its schema: strict, as OpenAI's strict: true
+    return {"type": "json_schema", "json_schema": {"name": "output", "strict": True, "schema": fmt.get("schema")}}
 
 
 # ------------------------------------------------------------------------------------------------ output parser
@@ -762,17 +1026,31 @@ _LOOSE_OPEN = re.compile(r"<\s*(?:function\s*[=:]\s*|=\s*)?([A-Za-z0-9_.\-]+)\s*
 _LOOSE_PART = re.compile(r"<\s*(?:function[ \t]*[=:]?\s*|=\s*)?[A-Za-z0-9_.\-]*\s*$")
 
 
-def param_end(text: str, final: bool = False) -> int:
+# a quoted call's opener in a value: `<function=NAME>` and its first parameter or close; a bare FUNC_START is text
+_QUOTED_OPEN = re.compile(r"<function=[^<>\s]+>\s*(?:<parameter=|</function>)")
+
+
+def param_end(text: str, final: bool = False, name: str | None = None) -> int:
     """Where a parameter value in `text` ends: the first `</parameter>` followed (after whitespace) by the next
-    `<parameter=` or `</function>` - the same text inside a value (a file that documents the call format, #210) is
-    part of the value.  -1: none yet; -2: a candidate whose follower has not arrived (streaming; `final` accepts it)."""
+    `<parameter=` or `</function>`, or by the wrapper's `</tool_call>` when the call's `</function>` was left out
+    (#4427) - the same text inside a value (a file that documents the call format, #210) is part of the value.
+    #4078: a close inside a call the value itself quotes (more _QUOTED_OPEN than `</function>` before it), or one
+    followed by the same parameter `name` again, is part of the value too.  `text` starts at the value.  -1: none yet;
+    -2: a candidate whose follower has not arrived (streaming; `final` accepts it)."""
     at = text.find(PARAM_END)
     while at >= 0:
-        after = text[at + len(PARAM_END):].lstrip()
-        if after.startswith(("<parameter=", FUNC_END)):
-            return at
-        if not after or "<parameter=".startswith(after) or FUNC_END.startswith(after):
-            return at if final else -2
+        if len(_QUOTED_OPEN.findall(text, 0, at)) <= text.count(FUNC_END, 0, at):
+            after = text[at + len(PARAM_END):].lstrip()
+            if after.startswith(PARAM_START):
+                gt = after.find(">")
+                if gt < 0:
+                    return at if final else -2
+                if name is None or after[len(PARAM_START):gt].strip() != name:
+                    return at
+            elif after.startswith((FUNC_END, CALL_END)):          # #4427: the model left out its `</function>`
+                return at
+            elif not after or any(tag.startswith(after) for tag in (PARAM_START, FUNC_END, CALL_END)):
+                return at if final else -2
         at = text.find(PARAM_END, at + 1)
     return -1
 
@@ -797,7 +1075,7 @@ def call_end(text: str) -> int:
             gt = text.find(">", pos)
             if gt < 0:
                 return -1
-            end = param_end(text[gt + 1:])
+            end = param_end(text[gt + 1:], name=text[pos:gt].split("=", 1)[1].strip())
             if end < 0:
                 return -1
             pos = gt + 1 + end + len(PARAM_END)
@@ -883,20 +1161,94 @@ def tool_choice_of(tool_choice) -> tuple[str, str | None]:
             return kind, None
         if kind in ("any", "required"):
             return "required", None
-        if kind in ("function", "tool"):
-            fn = tool_choice.get("function")
+        if kind in ("function", "tool", "custom"):
+            fn = tool_choice.get("function") or tool_choice.get("custom")
             name = (fn.get("name") if isinstance(fn, dict) else None) or tool_choice.get("name")
             if isinstance(name, str) and name:
                 return "named", name
     return "unknown", None
 
 
+def allowed_tools(tool_choice, tools: list[dict] | None, more: dict | None = None):
+    """OpenAI's {"type": "allowed_tools"} tool_choice (Chat: {"allowed_tools": {"mode", "tools"}}; Responses: "mode"
+    and "tools" beside the type) -> (the tools the model is offered: those it lists, the tool_choice to apply:
+    "auto" or "required").  Any other tool_choice comes back as it is, with all the tools.  `more`: a listed tool
+    type's template names (Responses' {"type": "image_generation"}: the image tools).  A list naming a tool the
+    request does not have, or an unknown mode, is a ValueError (a 400)."""
+    if not (isinstance(tool_choice, dict) and tool_choice.get("type") == "allowed_tools"):
+        return tools, tool_choice
+    spec = tool_choice["allowed_tools"] if isinstance(tool_choice.get("allowed_tools"), dict) else tool_choice
+    mode, listed = spec.get("mode", "auto"), spec.get("tools")
+    if mode not in ("auto", "required"):
+        raise ValueError('tool_choice.allowed_tools: mode must be "auto" or "required"')
+    if not isinstance(listed, list) or not listed:
+        raise ValueError("tool_choice.allowed_tools: tools must be a non-empty list of the request's tools")
+    names: set = set()
+    for t in listed:
+        if not isinstance(t, dict):
+            raise ValueError("tool_choice.allowed_tools: each tool is an object")
+        if t.get("type") in (more or {}):
+            names |= set((more or {})[t["type"]])
+            continue
+        fn = t.get("function") or t.get("custom") or t
+        name = fn.get("name") if isinstance(fn, dict) else None
+        if not isinstance(name, str) or not name:
+            raise ValueError("tool_choice.allowed_tools: each tool names a tool of the request")
+        names.add(f"{t['namespace']}.{name}" if t.get("namespace") else name)
+    have = {t.get("name") for t in tools or [] if isinstance(t, dict)}
+    unknown = sorted(names - have)
+    if unknown:
+        raise ValueError(f"tool_choice.allowed_tools names tools the request does not have: {', '.join(unknown)}")
+    return [t for t in tools or [] if t.get("name") in names], mode
+
+
+def legacy_functions(req: dict) -> dict | None:
+    """OpenAI's deprecated `functions` and `function_call` (before tools) -> the request with `tools` and `tool_choice`
+    in their place and one call at a time (the old shape answers with one), or None when it asks for neither (a null
+    is no field, and function_call "none" without functions is the default).  Mixed with tools or tool_choice, or a
+    function_call "auto" or name without functions, it is a 400."""
+    fns, choice = req.get("functions"), req.get("function_call")
+    if fns is None and choice is None:
+        return None
+    if req.get("tools") is not None or req.get("tool_choice") is not None:
+        raise ValueError("functions and function_call cannot be used with tools or tool_choice")
+    if fns is None and choice == "none":
+        return None
+    if not isinstance(fns, list) or not fns or not all(isinstance(f, dict) for f in fns):
+        raise ValueError("functions must be a non-empty array of function objects")
+    if isinstance(choice, dict) and isinstance(choice.get("name"), str):
+        choice = {"type": "function", "function": {"name": choice["name"]}}
+    elif choice not in (None, "none", "auto"):
+        raise ValueError('function_call must be "none", "auto" or {"name": ...}')
+    out = {k: v for k, v in req.items() if k not in ("functions", "function_call")}
+    out.update(tools=[{"type": "function", "function": f} for f in fns], parallel_tool_calls=False)
+    if choice is not None:
+        out["tool_choice"] = choice
+    return out
+
+
+def legacy_function_call(choice: dict) -> dict:
+    """A reply's choice (a message or a stream's delta) for a `functions` request: its call as the old function_call
+    and finish_reason "function_call", as OpenAI answers one."""
+    for key in ("message", "delta"):
+        m = choice.get(key)
+        if not isinstance(m, dict):
+            continue
+        calls = m.pop("tool_calls", None)
+        if calls:
+            fn = calls[0].get("function") or {}
+            m["function_call"] = {k: fn[k] for k in ("name", "arguments") if k in fn}
+    if choice.get("finish_reason") == "tool_calls":
+        choice["finish_reason"] = "function_call"
+    return choice
+
+
 def forced_call(tool_choice, tools: list[dict] | None, form: str = "qwen") -> str | None:
     """`tool_choice` -> the text that opens the call the reply must make, or None (the model decides).
     There is no grammar here: the server writes this opening itself, so the model can only go on with a call.
-    "required" / Anthropic "any": any of the tools; a named function: that one.  A value it cannot honour (an
-    unknown shape, a name that is not one of the tools, "required" with no tools) is logged and acts as "auto",
-    not a 400: a client's odd choice must not stop its request.  "none" is handled by the caller (no tools)."""
+    "required" / Anthropic "any": any of the tools; a named function: that one.  "none" is handled by the caller
+    (no tools).  A value it cannot honour (an unknown shape, a name that is not one of the tools, "required" with no
+    tools) is a ValueError - a 400, as OpenAI and Anthropic answer it - not a request that runs as "auto"."""
     kind, name = tool_choice_of(tool_choice)
     names = {t.get("name") for t in tools or [] if isinstance(t, dict)}
     if kind in ("auto", "none"):
@@ -907,9 +1259,11 @@ def forced_call(tool_choice, tools: list[dict] | None, form: str = "qwen") -> st
         return CALL_START if form == "glm" else CALL_START + "\n<function="
     if kind == "named" and name in names:
         return CALL_START + str(name) if form == "glm" else CALL_START + f"\n<function={name}>\n"
-    print(f"[strata] tool_choice {json.dumps(tool_choice)[:200]} is not supported here (or names no tool of the "
-          "request): the model decides, as with \"auto\"", flush=True)
-    return None
+    if kind == "named":
+        raise ValueError(f"tool_choice names {name!r}, which is not one of the request's tools")
+    if kind == "required":
+        raise ValueError("tool_choice asks for a tool call, but the request has no tools")
+    raise ValueError(f"tool_choice {json.dumps(tool_choice)[:200]} is not a tool_choice this server takes")
 
 
 PARAM_START = "<parameter="
@@ -934,7 +1288,7 @@ def function_end(text: str) -> int:
             gt = text.find(">", pos)
             if gt < 0:
                 return -1
-            end = param_end(text[gt + 1:])
+            end = param_end(text[gt + 1:], name=text[pos:gt].split("=", 1)[1].strip())
             if end < 0:
                 return -1
             pos = gt + 1 + end + len(PARAM_END)
@@ -972,7 +1326,245 @@ def json_tool_call(body: str, schemas: dict) -> ToolCall | None:
     return ToolCall(name=obj["name"], arguments=args) if isinstance(args, dict) else None
 
 
-def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
+LENIENT_MAX = 1 << 20           # the longest value lenient_json will try (it is a python loop)
+
+
+class _Lenient:
+    """A JSON reader for the slips a model makes inside an array or object argument (#4427): a trailing or doubled
+    comma, single quotes and Python's True/False/None, a bare string between two members of an object (`"status":
+    "pending", "in_progress", "pending": false`), brackets left open at the end, extra closers at the end.  It is only
+    asked about text json.loads has refused.  It never guesses at a value: a string cut short, an unknown word, a
+    missing colon after a key, anything else raises ValueError."""
+
+    _WORDS = {"true": True, "false": False, "null": None, "True": True, "False": False, "None": None}
+    _ESC = {'"': '"', "'": "'", "\\": "\\", "/": "/", "b": "\b", "f": "\f", "n": "\n", "r": "\r", "t": "\t"}
+    _TOKEN = re.compile(r"[^\s,\]}:]+")
+
+    def __init__(self, text: str):
+        self.s, self.i = text, 0
+
+    def peek(self) -> str:
+        s, n = self.s, len(self.s)
+        while self.i < n and s[self.i] in " \t\r\n":
+            self.i += 1
+        return s[self.i:self.i + 1]
+
+    def string(self) -> str:
+        s, q = self.s, self.s[self.i]
+        self.i += 1
+        out: list[str] = []
+        while self.i < len(s):
+            c = s[self.i]
+            if c == q:
+                self.i += 1
+                return "".join(out)
+            if c == "\\":
+                self.i += 1
+                e = s[self.i:self.i + 1]
+                if e == "u" and re.fullmatch(r"[0-9a-fA-F]{4}", s[self.i + 1:self.i + 5]):
+                    out.append(chr(int(s[self.i + 1:self.i + 5], 16)))
+                    self.i += 5
+                    continue
+                if e not in self._ESC:
+                    raise ValueError("bad escape")
+                out.append(self._ESC[e])
+            else:
+                out.append(c)
+            self.i += 1
+        raise ValueError("string not closed")
+
+    def value(self, depth: int = 0):
+        if depth > 64:
+            raise ValueError("too deep")
+        c = self.peek()
+        if c == "{":
+            return self.obj(depth + 1)
+        if c == "[":
+            return self.arr(depth + 1)
+        if c in ('"', "'"):
+            return self.string()
+        m = self._TOKEN.match(self.s, self.i)
+        if not m:
+            raise ValueError("no value")
+        self.i = m.end()
+        if m.group() in self._WORDS:
+            return self._WORDS[m.group()]
+        return json.loads(m.group())            # a number, or ValueError
+
+    def obj(self, depth: int):
+        self.i += 1
+        out: dict = {}
+        while True:
+            c = self.peek()
+            if not c or c == "}":               # (no closer: the brackets were left open at the end)
+                self.i += 1
+                return out
+            if c == ",":
+                self.i += 1
+                continue
+            if c not in ('"', "'"):
+                raise ValueError("object member")
+            key = self.string()
+            if self.peek() == ":":
+                self.i += 1
+                out[key] = self.value(depth)
+            elif self.peek() not in (",", "}", ""):     # a bare string where a member belongs is dropped
+                raise ValueError("object member")
+
+    def arr(self, depth: int):
+        self.i += 1
+        out: list = []
+        while True:
+            c = self.peek()
+            if not c or c == "]":
+                self.i += 1
+                return out
+            if c == ",":
+                self.i += 1
+                continue
+            out.append(self.value(depth))
+            if self.peek() not in (",", "]", ""):
+                raise ValueError("array element")
+
+
+def lenient_json(text: str):
+    """The JSON array or object `text` was meant to be, read past the slips of _Lenient; ValueError for anything else
+    (and for text that is not an array or object).  Valid JSON is not its business: callers try json.loads first."""
+    t = text.strip()
+    m = _JSON_FENCE.match(t)
+    if m:
+        t = t[m.end():].rstrip()
+        t = t[:-3].rstrip() if t.endswith("```") else t
+    if not t.startswith(("[", "{")) or len(t) > LENIENT_MAX:
+        raise ValueError("not an array or object")
+    r = _Lenient(t)
+    v = r.value()
+    if t[r.i:].strip("]}) \t\r\n"):
+        raise ValueError("text after the value")
+    return v
+
+
+def _json_type(value) -> str:
+    # JSON Schema treats 1.0 as an integer too; Python's representation must not turn a valid enum number into text.
+    return ("null" if value is None else "boolean" if isinstance(value, bool)
+            else "integer" if isinstance(value, int) or isinstance(value, float) and value.is_integer()
+            else "number" if isinstance(value, float) else "string" if isinstance(value, str)
+            else "array" if isinstance(value, list) else "object")
+
+
+def _schema_hints(schema, root=None, depth: int = 0, refs: tuple = ()) -> tuple:
+    """Upper bounds on JSON types and on string enum/const values, not validation. None means unconstrained or
+    unknown; an empty set means impossible. Siblings (including $ref) intersect; anyOf/oneOf branches union.
+    Only same-resource JSON pointers are followed, from the supplied parameters root, never from a property.
+    Anchors, remote refs, nested resource IDs and cycles are unknown; strict validation remains the final check."""
+    if schema is False:
+        return set(), set()
+    if not isinstance(schema, dict) or depth > 8:
+        return None, None
+    if "$id" in schema and schema is not root:
+        root = None                         # a nested resource changes the base of its references
+
+    def intersect(a, b):
+        return b if a is None else a if b is None else a & b
+
+    def merge(a, b):
+        return intersect(a[0], b[0]), intersect(a[1], b[1])
+
+    def types_of(values):
+        kinds = set(values)
+        if "number" in kinds:
+            kinds.add("integer")            # JSON Schema's number includes integer
+        return kinds
+
+    t = schema.get("type")
+    types = types_of([t]) if isinstance(t, str) else types_of(t) if isinstance(t, list) and \
+        all(isinstance(x, str) for x in t) else None
+    hint = types, None
+    for key in ("enum", "const"):
+        values = schema.get(key) if key == "enum" else [schema[key]] if key in schema else None
+        if isinstance(values, list):
+            hint = merge(hint, (types_of(_json_type(v) for v in values),
+                                {v for v in values if isinstance(v, str)}))
+    ref = schema.get("$ref")
+    if isinstance(ref, str) and root is not None and ref not in refs and (ref == "#" or ref.startswith("#/")):
+        target = root
+        for part in unquote(ref[2:]).split("/") if ref != "#" else ():
+            part = part.replace("~1", "/").replace("~0", "~")
+            if isinstance(target, dict) and (target is root or not isinstance(target.get("$id"), str)):
+                target = target.get(part)
+            elif isinstance(target, list) and len(part) <= len(str(len(target))) and part.isdecimal() and \
+                    str(int(part)) == part and int(part) < len(target):
+                target = target[int(part)]
+            else:
+                target = None
+                break
+        hint = merge(hint, _schema_hints(target, root, depth + 1, refs + (ref,)))
+    for key in ("allOf", "anyOf", "oneOf"):
+        branches = schema.get(key)
+        if not isinstance(branches, list):
+            continue
+        combined: tuple = (None, None) if key == "allOf" else (set(), set())
+        for branch in branches:
+            more = _schema_hints(branch, root, depth + 1, refs)
+            if key == "allOf":
+                combined = merge(combined, more)
+            else:
+                combined = tuple(None if a is None or b is None else a | b for a, b in zip(combined, more))
+        hint = merge(hint, combined)
+    return hint
+
+
+def _schema_types(schema, depth: int = 0, *, root=None) -> set | None:
+    """A conservative type bound; unknown branches cannot erase a sibling's explicit type constraint."""
+    return _schema_hints(schema, root, depth)[0]
+
+
+def _text_only(schema, root=None) -> bool:
+    """Raw string text can stream immediately only when no enum/const may disambiguate JSON quoting."""
+    types, strings = _schema_hints(schema, root)
+    return types == {"string"} and strings is None
+
+
+def param_value(text: str, schema, root=None, notes: list | None = None):
+    """Restore parameter types, not validity. Plain string schemas keep raw text. An enum/const permits removing
+    JSON string quotes only when the raw text is excluded and the decoded string is a candidate; ambiguity keeps
+    the original. Nullable strings still decode null, but keep e.g. 1 as text when numbers are not allowed.
+    #4427: where no string is allowed, an array or object json.loads refuses is read with lenient_json (a note says
+    so in `notes`), and one that arrived as a JSON string of itself is decoded once more."""
+    types, strings = _schema_hints(schema, root)
+    if types == {"string"} and (strings is None or text in strings):
+        return text
+    try:
+        value = json.loads(text)
+    except ValueError:
+        if not text.lstrip().startswith(("[", "{", "`")) or (types is not None and "string" in types):
+            return text
+        try:
+            value = lenient_json(text)
+        except (ValueError, RecursionError):
+            return text
+        if notes is not None:
+            notes.append("a damaged JSON " + ("array" if isinstance(value, list) else "object")
+                         + " argument was read as written")
+        return value
+    kind = _json_type(value)
+    if kind == "string" and types and types <= {"array", "object"} and value.lstrip().startswith(("[", "{")):
+        return param_value(value, schema, root, notes)
+    if kind == "string" and strings is not None and (text in strings or value not in strings):
+        return text
+    if types is not None and "string" in types and kind not in types:
+        return text
+    return value
+
+
+def _properties(schema) -> dict:
+    """A tool's parameters' properties, {} where the schema has none or is not an object (a boolean schema)."""
+    params = schema.get("parameters") if isinstance(schema, dict) else None
+    props = params.get("properties") if isinstance(params, dict) else None
+    return props if isinstance(props, dict) else {}
+
+
+def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = None) -> ToolCall:
     """`<function=NAME>\\n<parameter=P>\\nVALUE\\n</parameter>...</function>` -> ToolCall. Values are JSON-decoded
     when the tool's schema says the parameter is not a string (or, without a schema, when they parse as JSON
     objects/arrays/numbers/booleans)."""
@@ -981,33 +1573,29 @@ def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
         raise ValueError("malformed tool call: " + body[:80])
     name = body[len("<function="):body.index(">")].strip()      # `<function= capture>`: the model's stray space
     rest = body[body.index(">") + 1:]
-    props = ((schema or {}).get("parameters") or {}).get("properties") or {}
+    props = _properties(schema)
+    root = schema.get("parameters") if isinstance(schema, dict) else None
     args = {}
     while "<parameter=" in rest:
         rest = rest[rest.index("<parameter=") + len("<parameter="):]
         pname = rest[:rest.index(">")]
         rest = rest[rest.index(">") + 1:]
-        end = param_end(rest, final=True)
+        end = param_end(rest, final=True, name=pname.strip())
         value = rest[:end] if end >= 0 else rest
         rest = rest[end + len(PARAM_END):] if end >= 0 else ""
         if value.startswith("\n"):
             value = value[1:]
         if value.endswith("\n"):
             value = value[:-1]
-        declared = (props.get(pname) or {}).get("type")
-        if declared == "string":
-            args[pname] = value
-        else:
-            try:
-                args[pname] = json.loads(value)
-            except ValueError:
-                args[pname] = value
+        args[pname] = param_value(value, props.get(pname), root, notes)
     return ToolCall(name=name, arguments=args)
 
 
 # ------------------------------------------------------------------------------------------------ harmony
 HARMONY_ENDS = ("<|end|>", "<|return|>", "<|call|>")
 HARMONY_MESSAGE = "<|message|>"
+HARMONY_TURN = "<|start|>assistant"                    # the generation prompt's end
+HARMONY_NO_THINKING = "<|channel|>analysis<|message|><|end|>"
 
 
 class HarmonyParser:
@@ -1140,21 +1728,30 @@ class OutputParser:
         # #804/#3075: in the answer too, a call counts only for a tool the request declared.  With tools declared a
         # call for another name stays text (the Responses spelling `namespace__tool` of a `namespace.tool` counts as
         # that tool); `declared_only` extends the rule to a request that declared none (Chat Completions, Anthropic:
-        # the client has no tool to run).  The Responses route leaves it off: a Codex compaction request keeps its
-        # conversation's tools in the prompt only, and its calls come back as before.
+        # the client has no tool to run; Responses but for a Codex compaction request, which keeps its conversation's
+        # tools in the prompt only, and whose calls come back as before).
         self.declared_only = declared_only
-        # PR #3556: the native namespace__member spelling of a declared namespace.member tool is accepted without
-        # advertising a duplicate tool.  Only an unambiguous alias counts (two namespaces can end in the same
-        # member), and an exactly declared name always wins over an alias.
+        # A declared namespace.member tool is also accepted as namespace__member (PR #3556), namespace=member (Qwen
+        # writes the <function= tag's equals sign into the name), namespace_member (one underscore dropped) and the
+        # bare member (upstream fd8d37e93, #3972), without advertising a duplicate tool.  Only an unambiguous alias
+        # counts (two namespaces can end in the same member), and an exactly declared name always wins over an alias.
         aliases: dict[str, set[str]] = {}
         for name in self.schemas:
             if isinstance(name, str) and "." in name:
                 namespace, member = name.rsplit(".", 1)
-                aliases.setdefault(f"{namespace}__{member}", set()).add(name)
+                for alias in (f"{namespace}__{member}", f"{namespace}={member}", f"{namespace}_{member}", member):
+                    aliases.setdefault(alias, set()).add(name)
+        # #3796 (upstream 805ebe17b): the same tool written with every `__` collapsed to `_`
+        # (`mcp__playwright__browser_navigate` as `mcp_playwright_browser_navigate`, the way Qwen often flattens a
+        # name) is that tool.  Only a spelling of a declared name: a reordered or renamed tool (`server1_label_values`
+        # for `label_values_mcp_server1`) is not guessed.
+        for name in self.schemas:
+            if isinstance(name, str) and "__" in name:
+                aliases.setdefault(name.replace("__", "_"), set()).add(name)
         self.aliases = {alias: next(iter(names)) for alias, names in aliases.items()
                         if len(names) == 1 and alias not in self.schemas}
         self.unread = 0              # #3441: `<tool_call>` blocks that opened like a call and were returned as text
-        self.unread_names: list[str] = []   # the names (first few) of those that named a tool not declared
+        self.unread_names: list[str] = []   # the names (first few) of those naming a tool the request did not declare
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
         # soon as the name is known, then "tool_args" pieces of its JSON arguments (string parameters character by
         # character; other types whole, once complete) - before the final "tool_call".  Without it, a client sees
@@ -1165,9 +1762,13 @@ class OutputParser:
         # reasoning text before them is tracked (code fence, inline code, current line) to tell an act from a quote.
         self.pending: list[list] = []
         self.rescued = 0             # calls delivered from the reasoning
+        self.notes: list[str] = []   # #4427: what was repaired in the calls' arguments (a damaged JSON array or object)
+        self.after_think = False     # #4077: the reasoning ended at a bare `</think>` (another in the answer: a stray)
+        self.stray_think = 0         # ... and the strays of that kind dropped from the answer
         self.refused = 0             # declared calls kept as reasoning text (quoted, or the turn was cut)
         self.fence, self.line, self.ticks = "", "", 0
-        # recover (opt-in, the config's "tool_call_recovery"): a declared tool's call written next to the template's
+        # recover (on in the server, off for a bare OutputParser; the config's "tool_call_recovery": false turns it
+        # off): a declared tool's call written next to the template's
         # form is the call - `<parameter=NAME>` as the opener, JSON inside <tool_call>, a bare <function=NAME> at the
         # start of a line outside code, or a second call in the same <tool_call> (which otherwise merges into one).
         self.recover = recover
@@ -1328,6 +1929,18 @@ class OutputParser:
             return None
         return after[0] not in "\r\n"
 
+    def _stray_think_at(self) -> int:
+        """#4077: where self.buf has a `</think>` at the start of a line, in the answer of a turn whose reasoning
+        already ended at one; -1 for none.  A fence or backtick is no reason to keep it: the reasoning may have left
+        one open, and the answer's own tracking of code is wrong from there on."""
+        k = self.buf.find(THINK_END)
+        while k >= 0:
+            before = self.buf[:k]
+            if not (before.rsplit("\n", 1)[1] if "\n" in before else self.line + before).strip():
+                return k
+            k = self.buf.find(THINK_END, k + 1)
+        return -1
+
     def _release(self, deliver: bool) -> list[Event]:
         """Settle the calls waiting in self.pending: events for real calls, or all of it back as reasoning text."""
         out = []
@@ -1350,7 +1963,10 @@ class OutputParser:
         self.scall = None            # the ToolCall being streamed (its id is reused by the final event)
         self.sfirst = True
         self.sval_started = False
-        self.sdeclared = {}
+        self.sprops = {}             # the streamed call's parameters' schemas
+        self.sroot = None            # their reference resolution root (the full parameters schema)
+        self.spname = ""             # the parameter being streamed
+        self.svstart = 0             # where its string value starts in self.buf (#4078)
 
     def _wrapped_call_end(self) -> int:
         # Without a closing tag the structural walk cannot finish. Search only
@@ -1386,8 +2002,9 @@ class OutputParser:
                 if raw_name != raw_name.strip() and name not in self.schemas:
                     return out
                 self.scall = ToolCall(name=name, arguments={})
-                props = ((self.schemas.get(name) or {}).get("parameters") or {}).get("properties") or {}
-                self.sdeclared = {k: (v or {}).get("type") for k, v in props.items()}
+                tool = self.schemas.get(name)
+                self.sprops = _properties(tool)
+                self.sroot = tool.get("parameters") if isinstance(tool, dict) else None
                 out.append(Event("tool_start", call=self.scall))
                 args("{")
                 self.sp += b + 1
@@ -1399,11 +2016,11 @@ class OutputParser:
                     b = stripped.find(">")
                     if b < 0:
                         return out
-                    pname = stripped[11:b]
+                    pname = self.spname = stripped[11:b]
                     args(("" if self.sfirst else ",") + json.dumps(pname) + ":")
                     self.sfirst = False
                     self.sp += b + 1
-                    if self.sdeclared.get(pname) == "string":
+                    if _text_only(self.sprops.get(pname), self.sroot):
                         args('"')
                         self.ss, self.sval_started = "str", False
                     else:
@@ -1421,7 +2038,10 @@ class OutputParser:
                         self.sp += 1
                         rest = rest[1:]
                     self.sval_started = True
-                end = param_end(rest)
+                    self.svstart = self.sp
+                # the walk starts at the value (a quoted call's opener counts); only a close in the new text can end it
+                end = param_end(self.buf[self.svstart:], name=self.spname.strip()) if PARAM_END in rest else -1
+                end = end - (self.sp - self.svstart) if end >= 0 else end
                 if end >= 0:
                     value = rest[:end]
                     if value.endswith("\n"):
@@ -1439,7 +2059,7 @@ class OutputParser:
                     self.sp += safe
                 return out
             elif self.ss == "raw":
-                end = param_end(rest)
+                end = param_end(rest, name=self.spname.strip())
                 if end < 0:
                     return out
                 value = rest[:end]
@@ -1447,11 +2067,7 @@ class OutputParser:
                     value = value[1:]
                 if value.endswith("\n"):
                     value = value[:-1]
-                try:
-                    v = json.loads(value)
-                except ValueError:
-                    v = value
-                args(json.dumps(v, ensure_ascii=False))
+                args(json.dumps(param_value(value, self.sprops.get(self.spname), self.sroot), ensure_ascii=False))
                 self.sp += end + len(PARAM_END)
                 self.ss = "between"
             else:
@@ -1499,22 +2115,28 @@ class OutputParser:
                 # as a call) until it ends: a declared name is then a tool call, anything else stays reasoning text.
                 body = self.buf[len(CALL_START):]
                 end, think = call_end(body), body.find(THINK_END)
+                drop = len(CALL_END)
+                # #4427: as in the answer, a following call opener confirms an omitted closer
+                f = function_end(body)
+                if f >= 0 and (end < 0 or f < end) and re.match(r"<tool_call>\s*<function=\s*[^<>\s]+\s*>",
+                                                                body[f:].lstrip()):
+                    end, drop = f, 0
                 if end >= 0 and (think < 0 or think >= end):
                     call = None
                     try:
                         name = body[:end].strip()[len("<function="):].split(">", 1)[0].strip()
                         name = self.aliases.get(name, name)
                         if name in self.schemas:
-                            call = parse_tool_call(body[:end], self.schemas.get(name))
+                            call = parse_tool_call(body[:end], self.schemas.get(name), self.notes)
                             call.name = name
                     except ValueError:
                         pass
-                    raw = self.buf[:len(CALL_START) + end + len(CALL_END)]
+                    raw = self.buf[:len(CALL_START) + end + drop]
                     if call is not None or self.pending:
                         self.pending.append([raw, call])    # settled by what follows it (see __init__)
                     else:
                         out.append(Event("reasoning", self._track(raw)))
-                    self.buf = body[end + len(CALL_END):]
+                    self.buf = body[end + drop:]
                     self.state = "reasoning"
                 elif think >= 0:                     # the thinking ended inside it: it never was a call
                     out += self._release(False)
@@ -1578,7 +2200,7 @@ class OutputParser:
                 if i:
                     out.append(Event("reasoning", self._track(self.buf[:i])))
                 self.buf = self.buf[i + len(THINK_END):]
-                self.state, self.lead = "content", True
+                self.state, self.lead, self.after_think = "content", True, True
                 self.fence, self.line, self.ticks = "", "", 0     # the answer's own text starts here
             elif self.state == "content":
                 if self.lead:                                   # newlines right after </think> or a call
@@ -1588,6 +2210,19 @@ class OutputParser:
                         return out
                     self.buf, self.lead = stripped, False
                 i = self.buf.find(CALL_START)
+                stray = self._stray_think_at() if self.after_think else -1
+                if stray >= 0 and (i < 0 or stray < i):
+                    # #4077: the reasoning ended at a `</think>` the model wrote while thinking (quoting the format on a
+                    # line of its own), and this is the one that ends it.  What came between was reasoning, already sent
+                    # as the answer; the tag is dropped and the text after it starts over, so a call that follows is
+                    # not taken for a quote by the code fence or backtick the reasoning left open.
+                    if stray:
+                        out.append(Event("content", self._track(self.buf[:stray])))
+                    self.buf = self.buf[stray + len(THINK_END):]
+                    self.fence, self.line, self.ticks = "", "", 0
+                    self.lead = True
+                    self.stray_think += 1
+                    continue
                 b, decided = self._bare_opener() if self.recover and self.schemas else (-1, False)
                 if b >= 0 and (i < 0 or b < i):
                     # recover: <function=NAME> alone at the start of a line - the call without its <tool_call>.
@@ -1606,7 +2241,8 @@ class OutputParser:
                 if i < 0:
                     # Hold a partial tag AND the newlines before it: if a tool call follows, they are dropped,
                     # so emitting them early would make streamed and whole outputs differ.
-                    j = len(self.buf) - self._hold(self.buf, (CALL_START,))
+                    j = len(self.buf) - self._hold(self.buf, (CALL_START, THINK_END) if self.after_think
+                                                   else (CALL_START,))
                     if self.recover and self.schemas:            # a line that may be becoming a bare <function=
                         k = self.buf.rfind("\n") + 1
                         tail = self.buf[k:]
@@ -1768,6 +2404,21 @@ class OutputParser:
         how the turn ended: calls waiting from the reasoning become real calls only on a natural stop (None = stop);
         a turn cut by max tokens (or cancelled, or failed) keeps them as reasoning text (#1058)."""
         out = []
+        if self.state == "rcall" and reason in (None, "stop"):
+            # #4427: a call in the reasoning whose `</function>` is the end of the output (the `</tool_call>` left out)
+            # is as whole as one in the answer: it waits for the turn's end like the others
+            body = self.buf[len(CALL_START):]
+            f = function_end(body)
+            name = body.lstrip()[len(FUNC_START):].split(">", 1)[0].strip() if f >= 0 else ""
+            name = self.aliases.get(name, name)
+            if f >= 0 and not body[f:].strip() and name in self.schemas:
+                try:
+                    call = parse_tool_call(body[:f], self.schemas.get(name), self.notes)
+                    call.name = name
+                    self.pending.append([self.buf, call])
+                    self.buf, self.state = "", "reasoning"
+                except ValueError:
+                    pass
         if self.pending:
             out += self._release(reason in (None, "stop") and self.state == "reasoning" and not self.buf)
         if self.state == "call" and self.bare and function_end(self.buf) >= 0:
@@ -1783,7 +2434,13 @@ class OutputParser:
             if self.ss == "function_done" and not self.buf[self.sp:].strip() and reason in (None, "stop"):
                 # A natural end immediately after </function> retains native streaming recovery.
                 out += self._close_scan()
-                out.append(Event("tool_call", call=self.scall))
+                call = self.scall
+                try:            # the final event carries the call's arguments, as the one _finish_call sends does
+                    call = parse_tool_call(self.buf, self.schemas.get(call.name), self.notes)
+                    call.name, call.id = self.scall.name, self.scall.id
+                except ValueError:
+                    pass
+                out.append(Event("tool_call", call=call))
             elif self.ss == "function_done":
                 out.append(Event("content", self._track(CALL_START + self.buf)))
             self.buf = ""
@@ -1809,7 +2466,7 @@ class OutputParser:
         try:
             if raw_name != raw_name.strip() and name not in self.schemas:
                 raise ValueError("whitespace tool name is not declared")
-            call = parse_tool_call(body, self.schemas.get(name))
+            call = parse_tool_call(body, self.schemas.get(name), self.notes)
             call.name = name
         except ValueError:
             if not self.recover:

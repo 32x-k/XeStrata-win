@@ -111,6 +111,12 @@ class GGUFWriter:
         a = np.ascontiguousarray(arr, dtype="<f4")
         self.tensors.append(_Tensor(name, list(a.shape), "F32", a.tobytes()))
 
+    def add_f16(self, name: str, arr: np.ndarray) -> None:
+        """`arr` in GGUF order, as `add_f32` takes it: a model's weights in half precision (what the image engine's
+        tiny synthetic DiT holds: its products take F16 rows and its files carry no quantization)."""
+        a = np.ascontiguousarray(arr, dtype="<f2")
+        self.tensors.append(_Tensor(name, list(a.shape), "F16", a.tobytes()))
+
     def add_q2_0(self, name: str, arr: np.ndarray, shape: list[int]) -> None:
         """`arr` is (rows, in_features) row-major with every row `shape[0]` long; `shape` is the FULL
         GGUF shape. The shape must be passed explicitly, not inferred as [in, rows]: a fused expert

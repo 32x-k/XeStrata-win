@@ -154,12 +154,21 @@ class Structured(unittest.TestCase):
             load.assert_not_called()
 
     def test_without_jsonschema_an_object_is_still_required(self):
-        # jsonschema is optional: without it json_schema answers are checked to be one JSON object, json_object
-        # never needs it, and nothing is imported at server start
+        # without jsonschema a strict request (strict: true, a strict tool) is refused, as its reply could not be
+        # checked; another json_schema answer is checked to be one JSON object, and json_object never needs it
+        loose = {"type": "json_schema", "json_schema": {"name": "h3_story", "schema": STORY_SCHEMA}}
+        tool = {"type": "function", "function": {"name": "f", "strict": True, "parameters": {"type": "object"}}}
         with mock.patch.object(structured, "_jsonschema", False):
-            self.assertEqual(self.chat()[0], 200)
+            code, reply = self.chat()
+            self.assertEqual(code, 400)
+            self.assertIn("jsonschema", reply["error"]["message"])
+            code, reply = self.request("/v1/chat/completions", {"messages": [{"role": "user", "content": "go"}],
+                                                                "tools": [tool], "reasoning_effort": "none"})
+            self.assertEqual(code, 400)
+            self.assertIn("jsonschema", reply["error"]["message"])
+            self.assertEqual(self.chat(response_format=loose)[0], 200)
             for script in ("## Film Plan - Photobooth", "[1, 2]"):
-                code, reply = self.chat(script)
+                code, reply = self.chat(script, response_format=loose)
                 self.assertEqual(code, 502, script)
                 self.assertEqual(reply["error"]["code"], "structured_output_failed")
             self.assertEqual(self.chat('{"answer":4}', response_format={"type": "json_object"})[0], 200)
@@ -207,6 +216,89 @@ class Structured(unittest.TestCase):
                     self.assertEqual(code, 400)
                     self.assertIn("only JSON objects", reply["error"]["message"])
             load.assert_not_called()
+
+    @unittest.skipUnless(HAVE_JSONSCHEMA, "jsonschema is not installed")
+    def test_strict_tool_calls_are_checked(self):
+        # a strict tool's call is checked against its parameters before it is sent, with no grammar on the engine (the
+        # mock has none, as another call form or an engine without grammars); a Responses namespace's and
+        # additional_tools' strict tools are found under the names the template has
+        tool = {"type": "function", "function": {"name": "f", "strict": True, "parameters": object_schema(
+            {"days": {"type": "integer"}})}}
+
+        def call(days):
+            return f"<tool_call>\n<function=f>\n<parameter=days>\n{days}\n</parameter>\n</function>\n</tool_call>"
+        req = {"messages": [{"role": "user", "content": "plan"}], "tools": [tool], "reasoning_effort": "none"}
+        self.engine = self.svc.engine = MockEngine(self.tok, call(3), max_context=16384)
+        code, reply = self.request("/v1/chat/completions", req)
+        self.assertEqual(code, 200, reply)
+        self.assertEqual(json.loads(reply["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]),
+                         {"days": 3})
+        self.engine = self.svc.engine = MockEngine(self.tok, call("three"), max_context=16384)
+        code, reply = self.request("/v1/chat/completions", req)
+        self.assertEqual(code, 502)
+        self.assertEqual(reply["error"]["code"], "structured_output_failed")
+        _, raw = self.request("/v1/chat/completions", {**req, "stream": True})
+        self.assertIn('"structured_output_failed"', raw)
+        self.assertNotIn('"tool_calls"', raw)
+        from serve.responses import given_tools
+        member = {"name": "g", "strict": True, "parameters": {"type": "object"}}
+        ns = {"model": "m", "tools": [{"type": "namespace", "name": "ns", "tools": [member]}],
+              "input": [{"type": "additional_tools", "tools": [{"type": "function", **member, "name": "h"}]}]}
+        self.assertEqual(structured.constrained_tools(given_tools(ns))[0], {"ns.g", "h"})
+
+    def test_strict_tool_numbers_must_be_finite(self):
+        # NaN, Infinity and a number too large for a float (it reads as Infinity) are no JSON: a strict call with one
+        # is refused, though jsonschema's "number" takes them
+        tool = {"type": "function", "function": {"name": "f", "strict": True, "parameters": object_schema(
+            {"x": {"type": "number"}})}}
+        req = {"messages": [{"role": "user", "content": "go"}], "tools": [tool], "reasoning_effort": "none"}
+        for value in ("NaN", "Infinity", "1e999"):
+            with self.subTest(value=value):
+                self.engine = self.svc.engine = MockEngine(self.tok, "<tool_call>\n<function=f>\n<parameter=x>\n"
+                                                           f"{value}\n</parameter>\n</function>\n</tool_call>",
+                                                           max_context=16384)
+                code, reply = self.request("/v1/chat/completions", req)
+                self.assertEqual(code, 502, reply)
+                self.assertIn("not finite", reply["error"]["message"])
+
+    def test_strict_of_another_type(self):
+        # a tool's strict that is not true, false or null is a 400 (count_tokens too), not a silent non-strict; null
+        # is not given, for a tool and for response_format (OpenAI's SDKs send it)
+        def tool(strict):
+            return {"type": "function", "function": {"name": "f", "strict": strict, "parameters": {"type": "object"}}}
+        user = [{"role": "user", "content": "go"}]
+        for strict in ("true", 1, {}, []):
+            with self.subTest(strict=strict):
+                code, reply = self.request("/v1/chat/completions", {"messages": user, "tools": [tool(strict)]})
+                self.assertEqual(code, 400, reply)
+                self.assertIn("strict must be", reply["error"]["message"])
+                code, _ = self.request("/v1/messages/count_tokens", {
+                    "model": "m", "messages": user,
+                    "tools": [{"name": "f", "strict": strict, "input_schema": {"type": "object"}}]})
+                self.assertEqual(code, 400)
+        self.assertEqual(self.request("/v1/chat/completions", {"messages": user, "tools": [tool(None)],
+                                                               "reasoning_effort": "none"})[0], 200)
+        fmt = {"type": "json_schema", "json_schema": {"name": "h3_story", "strict": None, "schema": STORY_SCHEMA}}
+        self.assertEqual(self.chat(response_format=fmt)[0], 200)
+
+    @unittest.skipUnless(HAVE_JSONSCHEMA, "jsonschema is not installed")
+    def test_responses_strict_by_default_where_possible(self):
+        # Responses: a function tool without strict is strict when its parameters meet strict mode's rules (every
+        # object additionalProperties false, every property required), else not - and the response's tools say which
+        def call(days):
+            return (f"</think>\n\n<tool_call>\n<function=f>\n<parameter=days>\n{days}\n</parameter>\n</function>\n"
+                    "</tool_call>")
+        exact = object_schema({"days": {"type": "integer"}})
+        loose = {"type": "object", "properties": {"days": {"type": "integer"}}}
+        for params, strict in ((exact, True), (loose, False)):
+            with self.subTest(strict=strict):
+                body = {"model": "m", "input": "go", "tools": [{"type": "function", "name": "f", "parameters": params}]}
+                self.engine = self.svc.engine = MockEngine(self.tok, call(3), max_context=16384)
+                code, reply = self.request("/v1/responses", body)
+                self.assertEqual(code, 200, reply)
+                self.assertIs(reply["tools"][0]["strict"], strict)
+                self.engine = self.svc.engine = MockEngine(self.tok, call("three"), max_context=16384)
+                self.assertEqual(self.request("/v1/responses", body)[0], 502 if strict else 200)
 
     def test_the_server_does_not_import_jsonschema_at_start(self):
         import subprocess

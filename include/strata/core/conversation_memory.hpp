@@ -80,6 +80,16 @@ inline int64_t auto_conversation_cache_mib(std::optional<uint64_t> available, in
     return mib >= 1024 ? mib : 0;
 }
 
+/// #4518 (upstream 587a47443): the PLE table was locked in RAM at start by the residency policy (STRATA_PLE_AUTO_RAM), but what
+/// the rest of the load takes after that is not known then; on a 128 GB two-GPU PC it left the automatic conversation cache too
+/// little and the cache turned itself off.  Does giving the lock back make the automatic cache bigger?  `available` is the RAM
+/// the cache sees now (the table locked); the table's pages count as available again once unlocked (clean file pages).
+/// Unknown telemetry: no.
+inline bool ple_lock_blocks_cache(std::optional<uint64_t> available, uint64_t table_bytes, int64_t min_free_mib) {
+    if (!available || table_bytes == 0 || *available > UINT64_MAX - table_bytes) return false;
+    return auto_conversation_cache_mib(*available + table_bytes, min_free_mib) > auto_conversation_cache_mib(available, min_free_mib);
+}
+
 std::optional<uint64_t> conversation_mem_available(std::istream& meminfo);
 
 inline bool conversation_memory_admit(std::optional<uint64_t> available,

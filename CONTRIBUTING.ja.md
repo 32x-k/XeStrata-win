@@ -28,7 +28,7 @@ contrib-llvm では NVIDIA と AMD の GPU でも動きます。そのため、�
 
 ## ライセンス
 
-XeStrata は全体が LGPL 3 以降（LGPL-3.0-or-later）です（`COPYING.LESSER`、`COPYING`）。
+XeStrata のために書いたコードは LGPL 3 以降（LGPL-3.0-or-later）で、組み合わせた XeStrata 全体も同じライセンスで配布します（`COPYING.LESSER`、`COPYING`）。ほかのプロジェクトから来たコードは、下のとおりファイルごとに元のライセンスのままです。
 元の Strata は MIT で、xe0.1.39 から XeStrata は LGPL にしました。
 
 各ファイルは、中のコードがどこから来たかでライセンスが決まります。

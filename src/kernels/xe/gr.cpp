@@ -26,6 +26,9 @@
 #include <string>
 
 namespace strata::kernels {
+
+template <int BlockSize> class GrRmsNormKernel;   // asked for its work-group (work_group_upto_1024)
+
 namespace {
 
 constexpr int THREADS = 256;
@@ -179,7 +182,7 @@ void launch_weighted_rms_norm(sycl::queue& q, const float* input, const float* g
                               int n_rows, float epsilon) {
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> sums(sycl::range<1>(32), h);
-        h.parallel_for(sycl::nd_range<1>((size_t) n_rows * BlockSize, BlockSize),
+        h.parallel_for<GrRmsNormKernel<BlockSize>>(sycl::nd_range<1>((size_t) n_rows * BlockSize, BlockSize),
                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(WARP)]] {
             const sycl::sub_group sg = it.get_sub_group();
             const int tid = (int) it.get_local_id(0);
@@ -219,7 +222,7 @@ void native_gr_rms_norm_weighted(const float* input, const float* gamma, float* 
     check_pointer(output, msg);
     auto& q = queue_for(stream);
     // a device that takes no 1024-item work-group sums the long rows in another order
-    const int wg = n_cols < 1024 ? 256 : xe::work_group_upto_1024(q);
+    const int wg = n_cols < 1024 ? 256 : xe::work_group_upto_1024<GrRmsNormKernel>(q);
     if (wg == 1024) launch_weighted_rms_norm<1024>(q, input, gamma, output, n_cols, n_rows, epsilon);
     else if (wg == 512) launch_weighted_rms_norm<512>(q, input, gamma, output, n_cols, n_rows, epsilon);
     else launch_weighted_rms_norm<256>(q, input, gamma, output, n_cols, n_rows, epsilon);

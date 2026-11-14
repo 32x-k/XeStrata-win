@@ -226,6 +226,24 @@ bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t
     return true;
 }
 
+bool wait_for_ram(uint64_t need, double max_wait_s, double step_s, double note_s,
+                  const std::function<bool(uint64_t&)>& sample, const std::function<void(double)>& sleep,
+                  const std::function<void(double, uint64_t)>& progress, double& waited, uint64_t& available) {
+    waited = 0.0;
+    if (!sample(available)) return false;
+    double next_note = 0.0;
+    while (available < need && waited < max_wait_s) {
+        if (progress && waited >= next_note) {
+            progress(waited, available);
+            next_note = waited + note_s;
+        }
+        sleep(step_s);
+        waited += step_s;
+        if (!sample(available)) return false;
+    }
+    return available >= need;
+}
+
 }  // namespace detail
 
 namespace {
@@ -947,12 +965,19 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
 
 bool FileExpertSource::register_on(int device, std::string& err) {
     if (registered_on(device) || (!complement_ready_ && xstage_ == nullptr)) return true;
+    // layer_devices: a part in the device's own host USM needs no registration, and another maker's part holds
+    // layers this device does not run
+    const bool by_device = !complement_chunks_.empty() && complement_chunks_[0].owner >= 0;
     std::vector<std::pair<void*, size_t>> blocks;
-    if (!complement_chunks_.empty())
-        for (const ComplementChunk& c : complement_chunks_) blocks.emplace_back(c.host, (size_t) (c.end - c.start));
-    else if (complement_arena_ != nullptr && complement_bytes_ > 0)
+    if (!complement_chunks_.empty()) {
+        for (const ComplementChunk& c : complement_chunks_)
+            if (!by_device || (c.owner != device && strata::gpu::same_backend(c.owner, device)))
+                blocks.emplace_back(c.host, (size_t) (c.end - c.start));
+    } else if (complement_arena_ != nullptr && complement_bytes_ > 0)
         blocks.emplace_back(complement_arena_, (size_t) complement_bytes_);
-    if (xstage_ != nullptr && xstage_cap_ > 0) blocks.emplace_back(xstage_, (size_t) xstage_cap_ * (size_t) xstage_blob_);
+    // the exchange buffers: another maker's host USM is not registered here, and their copies stay pageable
+    if (xstage_ != nullptr && xstage_cap_ > 0 && !(xstage_pinned_ && !strata::gpu::same_backend(xstage_dev_, device)))
+        blocks.emplace_back(xstage_, (size_t) xstage_cap_ * (size_t) xstage_blob_);
     std::vector<void*> regs;
     for (const auto& [p, n] : blocks) {
         if (!strata::gpu::host_register_on(device, p, n)) {
@@ -964,6 +989,55 @@ bool FileExpertSource::register_on(int device, std::string& err) {
         regs.push_back(p);
     }
     stage_reg_.emplace_back(device, std::move(regs));
+    return true;
+}
+
+bool FileExpertSource::pin_by_device(std::vector<uint64_t>& offsets, std::vector<ComplementChunk>& chunks,
+                                     std::string& note) const {
+    if (layer_dev_.empty()) return false;
+    const int here = current_device();
+    auto owner_of = [&](size_t i) {
+        const size_t l = i / (size_t) n_expert_;
+        return l < layer_dev_.size() && layer_dev_[l] >= 0 ? layer_dev_[l] : here;
+    };
+    std::vector<int> owners;
+    for (size_t i = 0; i < offsets.size(); ++i)
+        if (offsets[i] != kNoComplement && std::find(owners.begin(), owners.end(), owner_of(i)) == owners.end())
+            owners.push_back(owner_of(i));
+    if (owners.size() < 2) return false;
+    std::vector<size_t> order;   // the blobs in their offsets' order, which each device's part keeps
+    for (size_t i = 0; i < offsets.size(); ++i)
+        if (offsets[i] != kNoComplement) order.push_back(i);
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return offsets[a] < offsets[b]; });
+    std::vector<uint64_t> packed(offsets.size(), kNoComplement);
+    std::vector<ComplementChunk> got;
+    uint64_t at = 0;
+    bool ok = true;
+    for (size_t k = 0; k < owners.size() && ok; ++k) {
+        const uint64_t start = at;
+        for (const size_t i : order)
+            if (owner_of(i) == owners[k]) {
+                packed[i] = at;
+                at += layer_blob_bytes_[i / (size_t) n_expert_];
+            }
+        const OnDevice on(owners[k]);
+        void* h = nullptr;
+        void* d = nullptr;
+        ok = strata::gpu::alloc_host(&h, (size_t) (at - start));
+        if (h != nullptr) got.push_back({start, at, (uint8_t*) h, nullptr, owners[k]});
+        ok = ok && strata::gpu::device_pointer(&d, h) && d != nullptr;
+        if (ok) got.back().device = (const uint8_t*) d;
+    }
+    if (!ok) {
+        std::fprintf(stderr, "FileExpertSource: a part of the page-locked copy for GPU %d was refused (%s): one copy\n",
+                     got.empty() ? owners[0] : got.back().owner, strata::gpu::last_error());
+        for (const ComplementChunk& c : got) (void) strata::gpu::free(c.host);
+        return false;
+    }
+    chunks.swap(got);
+    offsets.swap(packed);
+    note = "page-locked and mapped, one part per GPU's runtime (" + std::to_string(chunks.size()) +
+           ": each GPU's layers in its own host USM)";
     return true;
 }
 
@@ -1998,8 +2072,9 @@ bool FileExpertSource::pin_complement(
                     in_place += layer_blob_bytes_[(size_t) l];
             }
         if (physical == 0 && !available_memory_bytes(physical)) physical = 0;
+        const uint64_t cma = strata::platform::cma_free_bytes();   // not for pinned pages (upstream #3698)
         std::string why;
-        lock = detail::resident_pin_fits(bytes, in_place, headroom_bytes, physical, why);
+        lock = detail::resident_pin_fits(bytes, in_place, headroom_bytes, physical > cma ? physical - cma : 0, why);
         std::fprintf(stderr, "FileExpertSource: %s\n", why.c_str());
     }
 
@@ -2030,8 +2105,15 @@ bool FileExpertSource::pin_complement(
                      (double) bytes / 1073741824.0, lock ? "page-locked" : "pageable resident");
         std::fflush(stderr);
         if (lock) {
-            const bool allocated = strata::gpu::alloc_host(&arena, (size_t) bytes);
-            if (allocated == true) {
+            // #38, upstream #3681: page-locked memory the driver took while the kernel reclaimed the model files' page
+            // cache came slowly (a 71 GiB copy took 43 minutes after a few starts, 59 s after a reboot) and read slowly
+            // from the GPU; the reclaim done first, on ordinary memory, leaves the driver free pages
+            strata::platform::make_free_ram(bytes + (2ull << 30));
+            const bool by_device = pin_by_device(offsets, chunks, note);
+            const bool allocated = !by_device && strata::gpu::alloc_host(&arena, (size_t) bytes);
+            if (by_device) {
+                pinned_ok = true;
+            } else if (allocated == true) {
                 void* alias = nullptr;
                 const bool aliased = strata::gpu::device_pointer(&alias, arena);
                 if (aliased == true && alias != nullptr) {
@@ -2323,6 +2405,7 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err, int64_t bo
     void* p = nullptr;
     if (strata::gpu::alloc_host(&p, total) == true && p != nullptr) {
         xstage_pinned_ = true;
+        xstage_dev_ = current_device();
     } else {
 
         p = std::malloc(total);
@@ -2430,9 +2513,33 @@ bool FileExpertSource::replace_resident(int64_t layer, int64_t in, int64_t out) 
     file_us_.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count(),
                        std::memory_order_relaxed);
     file_read_bytes_.fetch_add(bytes, std::memory_order_relaxed);
-    std::memcpy((uint8_t*) complement_host_ + (size_t) at, ram_adapt_buf_.data(), (size_t) bytes);
+    std::memcpy(complement_at(at), ram_adapt_buf_.data(), (size_t) bytes);
     if (!detail::exchange_cache_complement(complement_offsets_, i_out, i_in)) return false;
     ++ram_adapts_;
+    return true;
+}
+
+bool FileExpertSource::replace_resident_staged(int64_t layer, int64_t in, int64_t out) {
+    if (!complement_ready_ || complement_host_ == nullptr || exchange_storage_.active() || !staged_.empty() ||
+        layer < 0 || layer >= n_layers_ || in < 0 || out < 0 || in >= n_expert_ || out >= n_expert_ || in == out)
+        return false;
+    const size_t i_in = (size_t) layer * (size_t) n_expert_ + (size_t) in;
+    const size_t i_out = (size_t) layer * (size_t) n_expert_ + (size_t) out;
+    if (i_in >= complement_offsets_.size() || i_out >= complement_offsets_.size()) return false;
+    if (!override_.empty() && (override_[i_in] != nullptr || override_[i_out] != nullptr)) return false;
+    const uint64_t at = complement_offsets_[i_out], bytes = layer_blob_bytes_[(size_t) layer];
+    if (at == kNoComplement || complement_offsets_[i_in] != kNoComplement || at > complement_bytes_ ||
+        bytes > complement_bytes_ - at || bytes > stage_blob_) return false;
+    {
+        // held across the copy: claim_stage cannot hand the buffer to another blob meanwhile
+        std::lock_guard<std::mutex> lk(stage_mu_);
+        const auto it = stage_of_.find((int64_t) i_in);
+        if (it == stage_of_.end() || stage_busy_[it->second] || stage_key_[it->second] != (int64_t) i_in) return false;
+        std::memcpy(complement_at(at), stage_buf_[it->second].get(), (size_t) bytes);
+    }
+    if (!detail::exchange_cache_complement(complement_offsets_, i_out, i_in)) return false;
+    ++ram_adapts_;
+    ++ram_staged_;
     return true;
 }
 
@@ -2891,9 +2998,14 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     d.cold_mode = cold_env >= 0 ? cold_env : (d.src->linux_file_defaults() ? 4 : 0);
     d.src->begin_layer(d.layers, ids, n_tok * k);
     pt("begun");
-    if (!d.usage.empty() && !d.usage_by_window)
+    if (!d.usage.empty() && d.usage_by_window && !d.route_rec.empty() && d.layers < d.route_rec_layers &&
+        n_tok <= d.route_rec_t) {
+        int32_t* rec = d.route_rec.data() + (size_t) d.layers * (size_t) (d.route_rec_t * k);
+        std::copy(ids, ids + n_tok * k, rec);
+    } else if (!d.usage.empty() && (!d.usage_by_window || !d.route_rec.empty())) {
         for (int64_t i = 0; i < n_tok * k; ++i)
             if (ids[i] >= 0 && ids[i] < d.n_expert) d.usage[(size_t) d.layers * (size_t) d.n_expert + (size_t) ids[i]] += 1.0f;
+    }
     // ---- plan v0.3 P6: the GPU's share, decided and published FIRST so the GPU starts while the CPU works.
     // Distinct experts in routing order; resident ones and the last pcie_num/256 of the missed ones go to the GPU.
     const int64_t n = n_tok * k;
@@ -2930,9 +3042,17 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
         // only when no other token of the window needed it, so a token's output depended on the window's other rows
         // (window-invariant output, #152).  Not with a helper GPU, which may hold it.
         const int tail_rank = tail_skip_rank();
+        // STRATA_DISK_SKIP_FROM=R (Project Maya's STRATA_GLM_DISK_SKIP_FROM, #109; opt-in, changes the output): the
+        // same for a missed expert the RAM copy does not hold either, read from the model file (`transient`), routed at
+        // rank >= R by every token of the window: the SSD is not waited for.  Maya also skips such an expert by its
+        // route weight; the dispatch has the ids only, so the rank alone here
+        static const int disk_rank = [] {
+            const char* v = std::getenv("STRATA_DISK_SKIP_FROM");
+            return v != nullptr ? std::max(0, (int) std::strtol(v, nullptr, 10)) : 0;
+        }();
         bool skip_d[kMaxWindowEntries];
         for (int q = 0; q < nd; ++q) skip_d[q] = false;
-        if (tail_rank > 0 && tail_rank < k && d.remote_count == 0) {
+        if (((tail_rank > 0 && tail_rank < k) || (disk_rank > 0 && disk_rank < k)) && d.remote_count == 0) {
             int minr[kMaxWindowEntries];
             for (int q = 0; q < nd; ++q) minr[q] = 99;
             for (int64_t i = 0; i < n; ++i) {
@@ -2942,8 +3062,11 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
             for (int q = 0; q < nd; ++q) {
                 const int32_t e = ids[distinct[q]];
-                if (e < 0 || e >= d.n_expert || minr[q] < tail_rank) continue;
+                if (e < 0 || e >= d.n_expert) continue;
                 if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;   // resident
+                const bool tail = tail_rank > 0 && minr[q] >= tail_rank;
+                const bool disk = disk_rank > 0 && minr[q] >= disk_rank && d.src->transient(d.layers, e);
+                if (!tail && !disk) continue;
                 skip_d[q] = true;
                 --nmiss;
                 ++d.tail_experts;
@@ -3014,9 +3137,13 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     ++miss_rank;
                 }
             }
+            // a tail entry of a missed expert (above); STRATA_DISK_SKIP_FROM's of one read from the file, per entry too
+            const bool on_disk = kd != 0 && disk_rank > 0 && d.src->transient(d.layers, e);
             for (int64_t i = i0; i < n; ++i)
-                if (first_of[i] == i0) kind[i] = kd != 0 && tail_rank > 0 && d.remote_count == 0 && i % k >= tail_rank
-                                                     ? -2 : kd;   // a tail entry of a missed expert (above)
+                if (first_of[i] == i0)
+                    kind[i] = kd != 0 && d.remote_count == 0 &&
+                                      ((tail_rank > 0 && i % k >= tail_rank) || (on_disk && i % k >= disk_rank))
+                                  ? -2 : kd;
             if (kd != 0) continue;                 // the VRAM groups first; the PCIe groups below
             P.ptr[groups] = ptr;
             P.start[groups] = entries;
@@ -3127,6 +3254,18 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
             ++d.cache_refused;
             int16_t& jo = d.job_of[(size_t) e];
+            // #45: a job takes MAXT tokens, and an id routed twice within a token (the same expert in two of its k
+            // slots) can give one expert more: a ninth wrote past act/out/nact into fmt and the pool's per-job arrays,
+            // and the CPU pool faulted.  The expert gets another job then (jobs_multi has n_tok * k of them).
+            if (jo >= 0 && d.jobs_multi[(size_t) jo].nt >= MAXT) {
+                static std::atomic<bool> said{false};
+                if (!said.exchange(true))
+                    std::fprintf(stderr, "strata: expert %lld of layer %lld is routed more than %d times in a window "
+                                         "of %lld tokens (an id repeated within a token); it is computed in two "
+                                         "jobs (#45, said once)\n",
+                                 (long long) e, (long long) d.layers, MAXT, (long long) n_tok);
+                jo = -1;
+            }
             if (jo < 0) {
                 const uint8_t* zp[3] = {nullptr, nullptr, nullptr};
                 const bool zc = d.cold_mode == 4 && native && d.src->zc_roles(d.layers, e, zp);
@@ -3748,12 +3887,52 @@ bool ArenaExpertSource::open(const std::string& pack_dir, int64_t n_layers, int6
             return false;
         }
         if (hm.available < need) {
-            std::snprintf(buf, sizeof buf,
-                          "the expert arena needs %.2f GiB of RAM but %.2f GiB is available (%.2f GiB short): the load "
-                          "may swap or be stopped by the OS. Close other programs (or wait for an engine that is "
-                          "still exiting), or run with less RAM: --mmap-experts with --resident-budget-gib N",
-                          (double) need / gib, (double) hm.available / gib, (double) (need - hm.available) / gib);
-            ram_warning_ = buf;
+            // upstream 07d5ecfac (#4051): the shortfall is often an engine that was still exiting, a few seconds from
+            // giving its RAM back: wait for it, not for ever, and say so.  STRATA_ARENA_RAM_WAIT_S changes the seconds
+            // (0 loads at once).  The load then goes on either way - it only warns.
+            double wait_s = 20.0;
+            if (const char* w = std::getenv("STRATA_ARENA_RAM_WAIT_S"); w != nullptr && w[0] != '\0') {
+                char* end = nullptr;
+                const double v = std::strtod(w, &end);
+                if (end != w && *end == '\0' && v >= 0.0 && v <= 3600.0) wait_s = v;
+            }
+            double waited = 0.0;
+            uint64_t avail = hm.available;
+            if (wait_s > 0.0) {
+                const bool came = detail::wait_for_ram(
+                    need, wait_s, 0.25, 5.0,
+                    [](uint64_t& a) {
+                        detail::HostMemory h;
+                        if (!detail::host_available_memory(h)) return false;
+                        a = h.available;
+                        return true;
+                    },
+                    [](double s) { std::this_thread::sleep_for(std::chrono::duration<double>(s)); },
+                    [&](double w, uint64_t a) {
+                        std::fprintf(stderr, "strata generate: the expert arena needs %.2f GiB of RAM and %.2f GiB is "
+                                             "available; waiting up to %.0f s for it (another engine still exiting?) - "
+                                             "%.0f s so far (STRATA_ARENA_RAM_WAIT_S changes this)\n",
+                                     (double) need / gib, (double) a / gib, wait_s, w);
+                    },
+                    waited, avail);
+                if (came)
+                    std::fprintf(stderr, "strata generate: %.2f GiB of RAM is available now (after %.1f s): loading the "
+                                         "expert arena\n", (double) avail / gib, waited);
+                hm.available = avail;
+            }
+            if (hm.available < need) {
+                std::snprintf(buf, sizeof buf,
+                              "the expert arena needs %.2f GiB of RAM but %.2f GiB is available (%.2f GiB short%s): the "
+                              "load may swap or be stopped by the OS%s. Close other programs, or run with less RAM: "
+                              "--mmap-experts with --resident-budget-gib N",
+                              (double) need / gib, (double) hm.available / gib, (double) (need - hm.available) / gib,
+                              waited > 0.0 ? ", after waiting" : "",
+                              hm.available < need / 2 ? " - with this little room the whole machine can stall in "
+                                                        "memory reclaim until it is restarted; on Linux a systemd "
+                                                        "MemoryHigh= below the RAM keeps one program from taking all "
+                                                        "of it" : "");
+                ram_warning_ = buf;
+            }
         }
     }
 
