@@ -32,13 +32,69 @@ void init_once() {
     static std::once_flag f;
     std::call_once(f, [] { ggml_cpu_init(); });
 }
-size_t row_size(int type, int64_t k) { return ggml_row_size((ggml_type) type, k); }
+size_t row_size(int type, int64_t k) {
+    if (type == 42) return (size_t) (k / 64) * 18;   // GSQ-RCO's Q2_0: not a ggml type (block below)
+    return ggml_row_size((ggml_type) type, k);
+}
+float f16_at(const uint8_t* p) {
+    ggml_fp16_t u;
+    std::memcpy(&u, p, sizeof u);
+    return ggml_fp16_to_fp32(u);
+}
+// A Q8_K (type 15) row's dot against a Q8_0 activation ({fp16 d; int8 codes} per 32 values): {fp32 d; int8
+// qs[256]; u16 bsums[16]}, the sums unused - the activation keeps no min to correct.  An exact integer sum per 32
+// values times the two scales, the device lane's decoding (ds4_iq_decode.hpp's kQ8_K) value for value.
+float q8k_row_dot(const uint8_t* w, const uint8_t* a, int n) {
+    float sum = 0.0f;
+    const int nb = n / 256;
+    for (int kb = 0; kb < nb; ++kb) {
+        const uint8_t* b = w + (size_t) kb * 292;
+        float d;
+        std::memcpy(&d, b, 4);
+        for (int sb = 0; sb < 8; ++sb) {
+            const uint8_t* ab = a + (size_t) (8 * kb + sb) * 34;
+            const int8_t* xq = (const int8_t*) (ab + 2);
+            const int8_t* qs = (const int8_t*) (b + 4 + 32 * sb);
+            int acc = 0;
+            for (int i = 0; i < 32; ++i) acc += (int) qs[i] * (int) xq[i];
+            sum += f16_at(ab) * (d * (float) acc);
+        }
+    }
+    return sum;
+}
+// A Q2_0 (type 42, GSQ-RCO's routed experts) row's dot against a Q8_0 activation ({fp16 d; int8 codes} per 32
+// values): value = d (code - 1), the 64-value block's u16 word j holding values 8j..8j+3 in its low byte and
+// 8j+4..8j+7 in its high one, the lowest 2 bits first (src/kernels' Fmt<42>).  An exact integer sum per 32 values
+// times the two fp16 scales - the device lane's decoding (ds4_iq_decode.hpp's kQ2_0) value for value.
+float q20_row_dot(const uint8_t* w, const uint8_t* a, int n) {
+    float sum = 0.0f;
+    const int nb = n / 64;
+    for (int kb = 0; kb < nb; ++kb) {
+        const uint8_t* b = w + (size_t) kb * 18;
+        const float d = f16_at(b);
+        for (int sb = 0; sb < 2; ++sb) {   // the block's two 32-value sub-blocks, u16 words 4 sb .. 4 sb + 3
+            const uint8_t* ab = a + (size_t) (2 * kb + sb) * 34;
+            const int8_t* xq = (const int8_t*) (ab + 2);
+            int acc = 0;
+            for (int j = 0; j < 4; ++j) {
+                const uint32_t q = (uint32_t) b[2 + 2 * (4 * sb + j)] | (uint32_t) b[3 + 2 * (4 * sb + j)] << 8;
+                for (int m = 0; m < 4; ++m)
+                    acc += ((int) ((q >> (2 * m)) & 3u) - 1) * (int) xq[8 * j + m] +
+                           ((int) ((q >> (8 + 2 * m)) & 3u) - 1) * (int) xq[8 * j + 4 + m];
+            }
+            sum += f16_at(ab) * (d * (float) acc);
+        }
+    }
+    return sum;
+}
 }  // namespace
 
 bool gg_cpu_type(int type) {
-    // every type ggml-cpu has a row dot for (ds4_gguf.cu's known types); the i-quants with a device kernel are usually
+    // every type ggml-cpu has a row dot for (ds4_gguf.cu's known types), plus Q2_0 (42, GSQ-RCO: the dot above) and
+    // the plain Q8_0 / Q8_K rows; the i-quants with a device kernel are usually
     // placed in VRAM, but a pack may hand any of them to this lane
     switch (type) {
+        case 8: case 15: case 42:
         case 10: case 11: case 12: case 13: case 14: case 16: case 17: case 18: case 19: case 20: case 21: case 22:
         case 23: case 29: return true;
         default: return false;
@@ -55,7 +111,11 @@ bool gg_cpu_fmt(int tg, int td, int n_embd, int n_ff, IqCpu& f, std::string& err
     }
     const ggml_type_traits_cpu* a = ggml_get_type_traits_cpu((ggml_type) tg);
     const ggml_type_traits_cpu* b = ggml_get_type_traits_cpu((ggml_type) td);
-    if (a == nullptr || b == nullptr || a->vec_dot == nullptr || b->vec_dot == nullptr) {
+    // Q2_0 (42) and Q8_K (15: an intermediate type - no CPU row dot in ggml-cpu) take the lane's own dots above,
+    // over a Q8_0 activation (type 8's from_float)
+    const auto own = [](int t) { return t == 42 || t == 15; };
+    if ((!own(tg) && (a == nullptr || a->vec_dot == nullptr)) ||
+        (!own(td) && (b == nullptr || b->vec_dot == nullptr))) {
         err = "ggml-cpu has no row dot for these types";
         return false;
     }
@@ -63,8 +123,8 @@ bool gg_cpu_fmt(int tg, int td, int n_embd, int n_ff, IqCpu& f, std::string& err
     f.td = td;
     f.n_embd = n_embd;
     f.n_ff = n_ff;
-    f.gu_act = (int) a->vec_dot_type;
-    f.d_act = (int) b->vec_dot_type;
+    f.gu_act = own(tg) ? 8 : (int) a->vec_dot_type;
+    f.d_act = own(td) ? 8 : (int) b->vec_dot_type;
     f.gu_row = row_size(tg, n_embd);
     f.d_row = row_size(td, n_ff);
     f.act_bytes = row_size(f.gu_act, n_embd);
@@ -231,6 +291,13 @@ static void dots(int type, const uint8_t* w, size_t rb, int n, const void* const
             strata::kernels::cpu::iq256_rows(type, w, rb, n, act, nt, out, r0, r1);
             return;
         }
+    }
+    if (type == 42 || type == 15) {   // the lane's own dots, a Q8_0 activation row per token
+        for (int r = r0; r < r1; ++r)
+            for (int t = 0; t < nt; ++t)
+                out[t][r] = type == 42 ? q20_row_dot(w + (size_t) r * rb, (const uint8_t*) act[t], n)
+                                       : q8k_row_dot(w + (size_t) r * rb, (const uint8_t*) act[t], n);
+        return;
     }
     const ggml_type_traits_cpu* tc = ggml_get_type_traits_cpu((ggml_type) type);
     if (dbg()) std::fprintf(stderr, "gg dots type %d n %d rows %d..%d nt %d\n", type, n, r0, r1, nt);

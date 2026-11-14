@@ -111,10 +111,13 @@ static Mat make_mat(std::mt19937_64& rng, int type, int rows, int k) {
     const size_t nblk = (size_t) rows * (k / bv);
     m.bytes.resize(nblk * (size_t) bb);
     for (auto& b : m.bytes) b = (uint8_t) rng();
-    for (size_t b = 0; b < nblk; ++b) {   // a sane F16 scale: at offset 0 (every type here but IQ1_M has d there)
+    for (size_t b = 0; b < nblk; ++b) {   // a sane scale: F16 at offset 0 (every type here but IQ1_M and Q8_K)
         const uint16_t d = f2h(0.02f + 0.0002f * (float) (rng() % 600));
         uint8_t* p = &m.bytes[b * (size_t) bb];
-        if (type == 29) {   // block_iq1_m has no d field: its F16 scale is the top nibbles of its four u16 scales
+        if (type == 15) {   // block_q8_K's d is F32 at offset 0
+            const float df = 0.02f + 0.0002f * (float) (rng() % 600);
+            std::memcpy(p, &df, 4);
+        } else if (type == 29) {   // block_iq1_m has no d field: its F16 scale is the top nibbles of its four u16 scales
             p[49] = (uint8_t) ((p[49] & 0x0f) | ((d & 0x000f) << 4));
             p[51] = (uint8_t) ((p[51] & 0x0f) | (d & 0x00f0));
             p[53] = (uint8_t) ((p[53] & 0x0f) | ((d & 0x0f00) >> 4));
@@ -124,9 +127,36 @@ static Mat make_mat(std::mt19937_64& rng, int type, int rows, int k) {
         }
     }
     m.w.resize((size_t) rows * k);
+    const size_t rb = (size_t) (k / bv) * (size_t) bb;
+    if (type == 15) {   // Q8_K: an intermediate type, no to_float in ggml - {fp32 d; int8 qs[256]; u16 bsums[16]}
+        for (int r = 0; r < rows; ++r)
+            for (int b = 0; b < k / 256; ++b) {
+                const uint8_t* p = &m.bytes[(size_t) r * rb + (size_t) b * 292];
+                float d;
+                std::memcpy(&d, p, 4);
+                const int8_t* qs = (const int8_t*) (p + 4);
+                for (int i = 0; i < 256; ++i) m.w[(size_t) r * k + 256 * b + i] = d * (float) qs[i];
+            }
+        return m;
+    }
+    if (type == 42) {   // Q2_0 (GSQ-RCO): no ggml decode - value = d (code - 1), u16 word j's low byte the
+        for (int r = 0; r < rows; ++r)   // values 8j..8j+3, its high byte 8j+4..8j+7
+            for (int b = 0; b < k / 64; ++b) {
+                const uint8_t* p = &m.bytes[(size_t) r * rb + (size_t) b * 18];
+                const float d = h2f((uint16_t) ((uint32_t) p[0] | (uint32_t) p[1] << 8));
+                for (int j = 0; j < 8; ++j) {
+                    const uint32_t q = (uint32_t) p[2 + 2 * j] | (uint32_t) p[3 + 2 * j] << 8;
+                    for (int m4 = 0; m4 < 4; ++m4) {
+                        m.w[(size_t) r * k + 64 * b + 8 * j + m4] = d * (float) ((int) ((q >> (2 * m4)) & 3u) - 1);
+                        m.w[(size_t) r * k + 64 * b + 8 * j + 4 + m4] =
+                            d * (float) ((int) ((q >> (8 + 2 * m4)) & 3u) - 1);
+                    }
+                }
+            }
+        return m;
+    }
     const ggml_type_traits* tr = ggml_get_type_traits((ggml_type) type);
     if (tr == nullptr || tr->to_float == nullptr) { std::printf("ggml has no to_float for type %d\n", type); std::exit(2); }
-    const size_t rb = (size_t) (k / bv) * (size_t) bb;
     for (int r = 0; r < rows; ++r) tr->to_float(&m.bytes[(size_t) r * rb], &m.w[(size_t) r * k], k);
     return m;
 }
@@ -1209,8 +1239,11 @@ int main(int argc, char** argv) try {
                         w2 = std::max(w2, std::fabs(y[(size_t) lr * E + r] - ref) / (sa + 1e-30));
                     }
                 }
-            // (the prompt sets' tiles take F16 operands for the i-quants: the tile's own rounding, not the token path's)
-            report("set down", type, w2, 3e-3);
+            // (the prompt sets' tiles take F16 operands for the i-quants: the tile's own rounding, not the token path's.
+            //  Q2_0's codes are not symmetric about 0 (value = code - 1, so a block's |w| runs to 2 d): against the
+            //  unquantized reference this fixture's worst row measured 6.75e-3, of which |y - q8ref| / sa was 3.9e-8 -
+            //  the activation's per-32 int8 rounding, as with IQ1_S above, not a decode error)
+            report("set down", type, w2, type == 42 ? 1e-2 : 3e-3);
 
             // ---- optional matrix-engine tiles forced on, against the scalar tiles forced on the same inputs: each within the
             // tolerances above of the CPU reference, the two within the same tolerance of each other, and the forced-on run must really

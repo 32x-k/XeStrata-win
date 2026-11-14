@@ -13,6 +13,10 @@ namespace strata::ds4::gguf::iq {
 constexpr int kQ5_K = 13, kQ6_K = 14;   // (the dense matrices' K-quants, GEMV only)
 constexpr int kQ2_K = 10, kQ3_K = 11, kQ4_K = 12, kIQ2_XXS = 16, kIQ2_XS = 17, kIQ3_XXS = 18, kIQ1_S = 19,
               kIQ4_NL = 20, kIQ3_S = 21, kIQ2_S = 22, kIQ4_XS = 23, kIQ1_M = 29;
+// Q8_0 (8) and Q8_K (15, a 256-value super-block of int8 codes under an F32 scale and 16 u16 block sums) and Q2_0
+// (42, the GSQ-RCO routed experts' own type, absent from upstream ggml: 64 values a block {fp16 d; 16 bytes of
+// 2-bit codes}, value = code - 1 - tools/gguf_reader.py's type 42, src/kernels' Fmt<42>)
+constexpr int kQ8_0 = 8, kQ8_K = 15, kQ2_0 = 42;
 
 /// The trellis types (Strata's, ds4_tq.cu): ggml's TQK6 / TQK7 (145 / 146, the table codebook) and the experimental
 /// TQK5X / TQK4X (224 / 225, computed codebook) and TQK5T / TQK4T (226 / 227, table): a block of 128 values is
@@ -31,6 +35,7 @@ inline bool supported(int t) {
         case kIQ2_XXS: case kIQ2_XS: case kIQ2_S: case kIQ3_XXS: case kIQ3_S: case kIQ4_XS:
         case kIQ1_S: case kIQ1_M: case kIQ4_NL:
         case kQ4_K: case kQ5_K: case kQ6_K: case kQ2_K: case kQ3_K:
+        case kQ8_0: case kQ8_K: case kQ2_0:
             return true;
         default:
             return is_tq(t);
@@ -40,7 +45,8 @@ inline bool supported(int t) {
 inline bool known(int t) { return block_bytes(t) > 0; }
 
 inline int block_values(int t) {
-    if (t == kIQ4_NL) return 32;   // (ggml's QK4_NL: the only type here whose block is not 256 values)
+    if (t == kIQ4_NL || t == kQ8_0) return 32;
+    if (t == kQ2_0) return 64;
     return is_tq(t) ? 128 : block_bytes(t) > 0 ? 256 : 0;
 }
 
@@ -61,6 +67,9 @@ inline int block_bytes(int t) {
         case kIQ1_S: return 50;
         case kIQ1_M: return 56;
         case kIQ4_NL: return 18;
+        case kQ8_0: return 34;    // {fp16 d; int8 qs[32]}
+        case kQ8_K: return 292;   // {fp32 d; int8 qs[256]; u16 bsums[16]}
+        case kQ2_0: return 18;    // {fp16 d; u8 qs[16]}: 64 two-bit codes
         default: return 0;
     }
 }
@@ -87,6 +96,9 @@ inline const char* name(int t) {
         case kIQ1_S: return "IQ1_S";
         case kIQ1_M: return "IQ1_M";
         case kIQ4_NL: return "IQ4_NL";
+        case kQ8_0: return "Q8_0";
+        case kQ8_K: return "Q8_K";
+        case kQ2_0: return "Q2_0";
         default: return "?";
     }
 }

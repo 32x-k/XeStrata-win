@@ -90,7 +90,7 @@ inline float lanes_sum(sycl::sub_group sg, float value) {
 // One subgroup owns one output row; a lane retains its quantization sub-block within each block.
 template <int T, int NE, int SG>
 void gate_up_kernel(const Args& a, int groups, size_t warps, sycl::queue& q) {
-    constexpr int LPR = SG, BPS = kQK<T> == 32 ? 1 : 8, STEP = LPR / BPS;
+    constexpr int LPR = SG, BPS = kQK<T> / 32, STEP = LPR / BPS;   // the 32-value sub-blocks a block
     static_assert(LPR % BPS == 0);
     const size_t threads = warps * SG, tiles = size_t(a.n_ff) / warps;
     const size_t rb = row_bytes_t<T>(a.n_embd);
@@ -108,7 +108,7 @@ void gate_up_kernel(const Args& a, int groups, size_t warps, sycl::queue& q) {
                 for (size_t j = tid; j < size_t(Ty<T>::TAB); j += threads) tab[j] = table<T>()[j];
             const auto* grid = tab.template get_multi_ptr<sycl::access::decorated::no>().get();
             const int lane = int(tid % SG), row = int(tile * warps + tid / SG);
-            const int ib = BPS == 8 ? lane & 7 : 0, first_block = BPS == 8 ? lane >> 3 : lane;
+            const int ib = lane % BPS, first_block = lane / BPS;
             const int subblocks = a.n_embd / 32, blocks = subblocks / BPS;
             const uint8_t* g = blob + a.tr[0] + size_t(row) * rb;
             const uint8_t* u = blob + a.tr[1] + size_t(row) * rb;
@@ -152,7 +152,7 @@ void gate_up_kernel(const Args& a, int groups, size_t warps, sycl::queue& q) {
 // Upstream 870aedd9 ds4_iq.cu down_kernel<T,NE,2>: two independent half-subgroup rows.
 template <int T, int NE, int SG>
 void down_kernel(const Args& a, int groups, size_t warps, sycl::queue& q) {
-    constexpr int RW = 2, LPR = SG / RW, BPS = kQK<T> == 32 ? 1 : 8, STEP = LPR / BPS;
+    constexpr int RW = 2, LPR = SG / RW, BPS = kQK<T> / 32, STEP = LPR / BPS;
     static_assert(LPR % BPS == 0);
     const size_t threads = warps * SG, tiles = size_t(a.n_embd) / (warps * RW);
     const size_t rb = row_bytes_t<T>(a.n_ff);
@@ -171,7 +171,7 @@ void down_kernel(const Args& a, int groups, size_t warps, sycl::queue& q) {
             const auto* grid = tab.template get_multi_ptr<sycl::access::decorated::no>().get();
             const int lane_sg = int(tid % SG), lane = lane_sg % LPR;
             const int row = int((tile * warps + tid / SG) * RW) + lane_sg / LPR;
-            const int ib = BPS == 8 ? lane & 7 : 0, first_block = BPS == 8 ? lane >> 3 : lane;
+            const int ib = lane % BPS, first_block = lane / BPS;
             const int subblocks = a.n_ff / 32, blocks = subblocks / BPS;
             const uint8_t* d = blob + a.tr[2] + size_t(row) * rb;
             const auto sg = it.get_sub_group();

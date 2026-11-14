@@ -10,6 +10,7 @@
 #include "ds4_iq_types.hpp"
 #include "ds4_sycl.hpp"
 #include "../kernels/xe/cuda_intrinsics.hpp"
+#include "../kernels/xe/iq_bits.hpp"
 #define GGML_COMMON_DECL_SYCL
 #define GGML_COMMON_IMPL_SYCL
 #include "ggml-common.h"
@@ -42,7 +43,13 @@ template <> struct Ty<kQ6_K> { static constexpr int B = 210, TAB = 0, MIN = 0; }
 // sets take it too
 constexpr int kMXFP4 = 39;
 template <> struct Ty<kMXFP4> { static constexpr int B = 17, TAB = 0, MIN = 0; };
-template <int T> constexpr int kQK = T == kMXFP4 || T == kIQ4_NL ? 32 : 256;   // values a block
+// the plain-quant types: Q8_0's 32-value {fp16 d; int8 codes}, Q8_K's super-block {fp32 d; int8 qs[256]; u16
+// bsums[16]} (the sums unused: the activation keeps no min to correct) and GSQ-RCO's Q2_0 (64 values a block
+// {fp16 d; u16 qs[8]}, each u16 eight 2-bit codes, value = code - 1)
+template <> struct Ty<kQ8_0> { static constexpr int B = 34, TAB = 0, MIN = 0; };
+template <> struct Ty<kQ8_K> { static constexpr int B = 292, TAB = 0, MIN = 0; };
+template <> struct Ty<kQ2_0> { static constexpr int B = 18, TAB = 0, MIN = 0; };
+template <int T> constexpr int kQK = T == kQ2_0 ? 64 : T == kMXFP4 || T == kIQ4_NL || T == kQ8_0 ? 32 : 256;   // values a block
 static_assert(sizeof(block_iq2_xxs) == 66 && sizeof(block_iq2_xs) == 74 && sizeof(block_iq2_s) == 82 &&
                   sizeof(block_iq3_xxs) == 98 &&
                   sizeof(block_iq3_s) == 110 && sizeof(block_iq4_xs) == 136 && sizeof(block_q4_K) == 144 &&
@@ -317,6 +324,29 @@ inline void decode_b(const uint8_t* __restrict__ b, int ib, const uint32_t* tab,
         s.d = h2f(b + 80);
         s.m0 = dmin * (float) (c0 >> 4);
         s.m1 = dmin * (float) (c1 >> 4);
+    } else if constexpr (T == kQ8_0) {   // d fp16, then the 32 int8 codes themselves
+#pragma unroll
+        for (int t = 0; t < 8; ++t) s.q[t] = (int) ld4(b + 2 + 4 * t);
+        s.s0 = s.s1 = 1;
+        s.d = h2f(b);
+        s.m0 = s.m1 = 0.0f;
+    } else if constexpr (T == kQ8_K) {   // d fp32, qs[256]: sub-block ib's codes at 4 + 32 ib (bsums unused)
+        const uint8_t* qs = b + 4 + 32 * ib;
+#pragma unroll
+        for (int t = 0; t < 8; ++t) s.q[t] = (int) ld4(qs + 4 * t);
+        s.s0 = s.s1 = 1;
+        s.d = sycl::bit_cast<float>(ld4(b));
+        s.m0 = s.m1 = 0.0f;
+    } else if constexpr (T == kQ2_0) {   // d fp16, qs u16[8]: word j's low byte the values 8j..8j+3, high 8j+4..8j+7
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const uint32_t q = ld2(b + 2 + 2 * (4 * ib + t)) & 0xffffu;
+            s.q[2 * t] = (int) strata::kernels::iq_bits::q2_0_bytes(q & 0xFFu);
+            s.q[2 * t + 1] = (int) strata::kernels::iq_bits::q2_0_bytes(q >> 8);
+        }
+        s.s0 = s.s1 = 1;
+        s.d = h2f(b);
+        s.m0 = s.m1 = 0.0f;
     } else {   // Q3_K
         const int n = ib >> 2, j = ib & 3;
         const uint8_t* qs = b + 32 + 32 * n;
@@ -333,7 +363,8 @@ inline void decode_b(const uint8_t* __restrict__ b, int ib, const uint32_t* tab,
 }
 template <int T>
 inline void decode(const uint8_t* __restrict__ row, int kb, const uint32_t* tab, Sub& s) {
-    decode_b<T>(row + (size_t) (kQK<T> == 32 ? kb : kb >> 3) * Ty<T>::B, kb & 7, tab, s);
+    constexpr int BPS = kQK<T> / 32;   // the 32-value sub-blocks a block
+    decode_b<T>(row + (size_t) (kb / BPS) * Ty<T>::B, kb % BPS, tab, s);
 }
 
 template <int T> inline const uint32_t* table() {
@@ -372,6 +403,7 @@ template <typename F> bool dispatch(int type, F fn) {
         DS4_TYPE(kIQ2_XXS); DS4_TYPE(kIQ2_XS); DS4_TYPE(kIQ2_S); DS4_TYPE(kIQ3_XXS); DS4_TYPE(kIQ3_S);
         DS4_TYPE(kIQ4_XS); DS4_TYPE(kIQ1_S); DS4_TYPE(kIQ1_M); DS4_TYPE(kIQ4_NL);
         DS4_TYPE(kQ2_K); DS4_TYPE(kQ3_K); DS4_TYPE(kQ4_K); DS4_TYPE(kQ5_K); DS4_TYPE(kQ6_K);
+        DS4_TYPE(kQ8_0); DS4_TYPE(kQ8_K); DS4_TYPE(kQ2_0);
         DS4_TYPE(kMXFP4);
         default: return false;
     }
@@ -384,6 +416,7 @@ inline float value(int type, const uint8_t* row, int index) {
         DS4_VALUE(kIQ2_XXS); DS4_VALUE(kIQ2_XS); DS4_VALUE(kIQ2_S); DS4_VALUE(kIQ3_XXS); DS4_VALUE(kIQ3_S);
         DS4_VALUE(kIQ4_XS); DS4_VALUE(kIQ1_S); DS4_VALUE(kIQ1_M); DS4_VALUE(kIQ4_NL);
         DS4_VALUE(kQ2_K); DS4_VALUE(kQ3_K); DS4_VALUE(kQ4_K); DS4_VALUE(kQ5_K); DS4_VALUE(kQ6_K); DS4_VALUE(kMXFP4);
+        DS4_VALUE(kQ8_0); DS4_VALUE(kQ8_K); DS4_VALUE(kQ2_0);
         default: return 0.0f;
     }
 #undef DS4_VALUE
