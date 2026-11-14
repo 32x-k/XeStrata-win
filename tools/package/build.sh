@@ -31,7 +31,7 @@ set -eu
 usage() {
   echo "usage: $0 ubuntu26.04 free|cuda13.1|cuda12.4 [COMMIT]" >&2
   echo "       $0 fedora44 free|cuda13.4 [COMMIT]" >&2
-  echo "       $0 windows cuda12.4 [COMMIT]" >&2
+  echo "       $0 windows free|cuda12.4 [COMMIT]" >&2
   exit 2
 }
 
@@ -42,7 +42,7 @@ commit=${3:-HEAD}
 case "$distro/$variant" in
   ubuntu26.04/free | ubuntu26.04/cuda13.1 | ubuntu26.04/cuda12.4) ;;
   fedora44/free | fedora44/cuda13.4) ;;
-  windows/cuda12.4) ;;
+  windows/free | windows/cuda12.4) ;;
   *) usage ;;
 esac
 # the images as pulled on 2026-10-06: a newer one is taken by changing these lines
