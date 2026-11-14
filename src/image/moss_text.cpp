@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <exception>
+#include <filesystem>
 #include <fstream>
 
 namespace strata::image {
@@ -95,7 +96,9 @@ int64_t MossText::hidden() const { return model_ != nullptr ? model_->spec().n_e
 
 bool MossText::read_states(const std::string& path, std::vector<float>& rows, int64_t& n, int64_t& width,
                            std::string& err) {
-    std::ifstream f(path, std::ios::binary);
+    // the u8 path: on Windows an ifstream of a plain string opens it in the system codepage, which no request's
+    // UTF-8 name survives (paths reach the engine as UTF-8, as strata_image.cpp's write_file does)
+    std::ifstream f(std::filesystem::path(std::u8string(path.begin(), path.end())), std::ios::binary);
     if (!f) {
         err = "cannot open " + path;
         return false;
