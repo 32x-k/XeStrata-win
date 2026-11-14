@@ -23,6 +23,12 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#else
+#include <cpuid.h>
+#endif
 
 namespace strata::kernels::cpu {
 namespace {
@@ -245,6 +251,201 @@ void dot_rows_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* 
     }
 }
 
+// ---- the DeepSeek CPU lane's exact rows (iq512x_rows; upstream Strata's 49e35e8bb, 1747c8e53, 6368dc68a): the same 64-value
+// decode, but summed as ggml's AVX2 dots sum, so a token's row is ggml-cpu's vec_dot bit for bit at any number of tokens: the integer
+// sums of a block fold to ggml's eight lanes (low half = the even 32-value chunk, high half = the odd one), the block scale is
+// f16(d) * y.d, eight float lanes accumulate across blocks, and K * ggml's hsum comes last.  vpdpwssd is the madd and the add in one.
+//
+// The sign masks of IQ2_XXS / IQ2_XS / IQ3_XXS come from a 7-bit index whose 8th bit is the parity of the other seven (ksigns_iq2xs[i] =
+// i | parity(i) << 7): popcount does all eight groups of 64 values in one vector.  AVX512_VPOPCNTDQ is not in this file's flags
+// (the compiler could then use it anywhere): these functions alone carry it, and iq512x_supported() asks the CPU for it.
+#if defined(__GNUC__) || defined(__clang__)
+#define IQ_X __attribute__((target("avx512vpopcntdq,avx512vl,avx512bw,avx512f")))
+#else
+#define IQ_X
+#endif
+
+IQ_X inline __mmask64 sign_mask_from_idx(__m256i si) {
+    const __m256i par = _mm256_slli_epi32(_mm256_and_si256(_mm256_popcnt_epi32(si), _mm256_set1_epi32(1)), 7);
+    return _cvtu64_mask64((uint64_t) _mm_cvtsi128_si64(_mm256_cvtepi32_epi8(_mm256_or_si256(si, par))));
+}
+inline __m256i sign_idx_xxs(uint32_t lo4, uint32_t hi4) {   // four 7-bit fields of each of two words -> eight dwords
+    const __m256i w = _mm256_inserti128_si256(_mm256_castsi128_si256(_mm_set1_epi32((int) lo4)), _mm_set1_epi32((int) hi4), 1);
+    return _mm256_and_si256(_mm256_srlv_epi32(w, _mm256_setr_epi32(0, 7, 14, 21, 0, 7, 14, 21)), _mm256_set1_epi32(127));
+}
+
+// (the grids by scalar lookups, as Fmt's: the same words as a gather, the same bits)
+template <int TY> struct FmtX : Fmt<TY> {
+    static inline void decode_x(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) { Fmt<TY>::decode(b, j, g, m, sc); }
+};
+template <> struct FmtX<16> : Fmt<16> {
+    IQ_X static inline void decode_x(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
+        const uint8_t* q = b + 2 + 16 * j;
+        const uint32_t a0 = u32(q), a1 = u32(q + 4), b0 = u32(q + 8), b1 = u32(q + 12);
+        g = _mm512_set_epi64((long long) iq2xxs_grid[b0 >> 24], (long long) iq2xxs_grid[(b0 >> 16) & 255],
+                             (long long) iq2xxs_grid[(b0 >> 8) & 255], (long long) iq2xxs_grid[b0 & 255],
+                             (long long) iq2xxs_grid[a0 >> 24], (long long) iq2xxs_grid[(a0 >> 16) & 255],
+                             (long long) iq2xxs_grid[(a0 >> 8) & 255], (long long) iq2xxs_grid[a0 & 255]);
+        m = sign_mask_from_idx(sign_idx_xxs(a1, b1));
+        const int sa = 2 * (int) (a1 >> 28) + 1, sb = 2 * (int) (b1 >> 28) + 1;
+        sc = scales4(sa, sa, sb, sb);
+    }
+};
+template <> struct FmtX<17> : Fmt<17> {
+    IQ_X static inline void decode_x(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
+        const uint8_t* q = b + 2 + 16 * j;
+        uint16_t v[8];
+        std::memcpy(v, q, 16);
+        g = _mm512_set_epi64((long long) iq2xs_grid[v[7] & 511], (long long) iq2xs_grid[v[6] & 511],
+                             (long long) iq2xs_grid[v[5] & 511], (long long) iq2xs_grid[v[4] & 511],
+                             (long long) iq2xs_grid[v[3] & 511], (long long) iq2xs_grid[v[2] & 511],
+                             (long long) iq2xs_grid[v[1] & 511], (long long) iq2xs_grid[v[0] & 511]);
+        m = sign_mask_from_idx(_mm256_srli_epi32(_mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*) q)), 9));
+        const uint8_t s0 = b[66 + 2 * j], s1 = b[66 + 2 * j + 1];
+        sc = scales4(2 * (s0 & 15) + 1, 2 * (s0 >> 4) + 1, 2 * (s1 & 15) + 1, 2 * (s1 >> 4) + 1);
+    }
+};
+template <> struct FmtX<18> : Fmt<18> {
+    IQ_X static inline void decode_x(const uint8_t* b, int j, __m512i& g, __mmask64& m, __m512i& sc) {
+        const uint8_t* q = b + 2 + 16 * j;
+        g = _mm512_set_epi32((int) iq3xxs_grid[q[15]], (int) iq3xxs_grid[q[14]], (int) iq3xxs_grid[q[13]], (int) iq3xxs_grid[q[12]],
+                             (int) iq3xxs_grid[q[11]], (int) iq3xxs_grid[q[10]], (int) iq3xxs_grid[q[9]], (int) iq3xxs_grid[q[8]],
+                             (int) iq3xxs_grid[q[7]], (int) iq3xxs_grid[q[6]], (int) iq3xxs_grid[q[5]], (int) iq3xxs_grid[q[4]],
+                             (int) iq3xxs_grid[q[3]], (int) iq3xxs_grid[q[2]], (int) iq3xxs_grid[q[1]], (int) iq3xxs_grid[q[0]]);
+        const uint32_t a = u32(b + 2 + 64 + 8 * j), c = u32(b + 2 + 64 + 8 * j + 4);
+        m = sign_mask_from_idx(sign_idx_xxs(a, c));
+        const int sa = 2 * (int) (a >> 28) + 1, sb = 2 * (int) (c >> 28) + 1;
+        sc = scales4(sa, sa, sb, sb);
+    }
+};
+
+inline __m256i fold256(__m512i a) { return _mm256_add_epi32(_mm512_castsi512_si256(a), _mm512_extracti64x4_epi64(a, 1)); }
+
+inline float hsum8_ggml(__m256 x) {
+    __m128 s = _mm_add_ps(_mm256_extractf128_ps(x, 1), _mm256_castps256_ps128(x));
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_movehdup_ps(s));
+    return _mm_cvtss_f32(s);
+}
+
+template <int TY, int NT>
+IQ_X inline void row_dot_x(const uint8_t* row, int nblocks, const block_q8_K* const* y, float* res) {
+    __m256 accf[NT];
+    for (int t = 0; t < NT; ++t) accf[t] = _mm256_setzero_ps();
+    const __m512i zero = _mm512_setzero_si512();
+    for (int i = 0; i < nblocks; ++i) {
+        const uint8_t* blk = row + (size_t) i * FmtX<TY>::bytes;
+        if (prefetch_ahead > 0) {
+            const uint8_t* ahead = blk + (size_t) prefetch_ahead;
+            _mm_prefetch((const char*) ahead, _MM_HINT_T0);
+            _mm_prefetch((const char*) ahead + 64, _MM_HINT_T0);
+        }
+        __m512i acci[NT];
+        for (int t = 0; t < NT; ++t) acci[t] = _mm512_setzero_si512();
+        for (int j = 0; j < 4; ++j) {
+            __m512i g, sc;
+            __mmask64 m;
+            FmtX<TY>::decode_x(blk, j, g, m, sc);
+            for (int t = 0; t < NT; ++t) {
+                const __m512i yv = _mm512_loadu_si512((const void*) (y[t][i].qs + 64 * j));
+                const __m512i ys = _mm512_mask_sub_epi8(yv, m, zero, yv);
+                acci[t] = _mm512_dpwssd_epi32(acci[t], _mm512_maddubs_epi16(g, ys), sc);
+            }
+        }
+        const float dx = h2f(u16(blk));
+        for (int t = 0; t < NT; ++t)
+            accf[t] = _mm256_fmadd_ps(_mm256_set1_ps(dx * y[t][i].d), _mm256_cvtepi32_ps(fold256(acci[t])), accf[t]);
+    }
+    for (int t = 0; t < NT; ++t) res[t] = FmtX<TY>::K * hsum8_ggml(accf[t]);
+}
+
+template <int TY, int NT>
+IQ_X void dot_rows_x(const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out, int r0, int r1) {
+    const block_q8_K* y[NT];
+    for (int t = 0; t < NT; ++t) y[t] = (const block_q8_K*) act[t];
+    float res[NT];
+    for (int r = r0; r < r1; ++r) {
+        row_dot_x<TY, NT>(w + (size_t) r * row_bytes, n / QK_K, y, res);
+        for (int t = 0; t < NT; ++t) out[t][r] = res[t];
+    }
+}
+
+// many tokens an expert (the prompt): signed int8 weights decoded once per block, activations as u8 (q8 + 128, once a call),
+// sum(w * q) = sum(w * (q + 128)) - 128 * sum(w) with the second sum once a weight block; tokens in tiles of 16 and rows in
+// groups of 8 so the tile's slice of a block and the group's accumulators stay in L1 (the AVX2 form's layout)
+template <int TY>
+IQ_X void dot_rows_wide(const uint8_t* w, size_t row_bytes, int n, const void* const* act, int T, float* const* out, int r0, int r1) {
+    constexpr int kTile = 16, kRows = 8;
+    const int nb = n / QK_K;
+    static thread_local std::vector<uint8_t> ubuf;
+    static thread_local std::vector<float> accb;
+    ubuf.resize((size_t) (T < kTile ? T : kTile) * n);
+    accb.resize((size_t) kRows * kTile * 8);
+    const __m512i zero = _mm512_setzero_si512(), one8 = _mm512_set1_epi8(1), flip = _mm512_set1_epi8((char) 0x80);
+    for (int t0 = 0; t0 < T; t0 += kTile) {
+        const int tt = T - t0 < kTile ? T - t0 : kTile;
+        const block_q8_K* y[kTile];
+        for (int t = 0; t < tt; ++t) {
+            y[t] = (const block_q8_K*) act[t0 + t];
+            uint8_t* u = ubuf.data() + (size_t) t * n;
+            for (int i = 0; i < nb; ++i)
+                for (int j = 0; j < 4; ++j)
+                    _mm512_storeu_si512((void*) (u + (size_t) i * 256 + 64 * j),
+                                        _mm512_xor_si512(_mm512_loadu_si512((const void*) (y[t][i].qs + 64 * j)), flip));
+        }
+        for (int rg = r0; rg < r1; rg += kRows) {
+            const int rr = r1 - rg < kRows ? r1 - rg : kRows;
+            for (int k = 0; k < rr * tt; ++k) _mm256_storeu_ps(&accb[(size_t) k * 8], _mm256_setzero_ps());
+            for (int i = 0; i < nb; ++i)
+                for (int q = 0; q < rr; ++q) {
+                    const uint8_t* blk = w + (size_t) (rg + q) * row_bytes + (size_t) i * FmtX<TY>::bytes;
+                    if (prefetch_ahead > 0) {
+                        _mm_prefetch((const char*) blk + prefetch_ahead, _MM_HINT_T0);
+                        _mm_prefetch((const char*) blk + prefetch_ahead + 64, _MM_HINT_T0);
+                    }
+                    __m512i w8[4], sc[4];
+                    __m512i corr = zero;
+                    for (int j = 0; j < 4; ++j) {
+                        __m512i g, s;
+                        __mmask64 m;
+                        FmtX<TY>::decode_x(blk, j, g, m, s);
+                        w8[j] = _mm512_mask_sub_epi8(g, m, zero, g);
+                        sc[j] = s;
+                        corr = _mm512_dpwssd_epi32(corr, _mm512_maddubs_epi16(one8, w8[j]), s);
+                    }
+                    const __m256i corr128 = _mm256_slli_epi32(fold256(corr), 7);
+                    const float dx = h2f(u16(blk));
+                    float* accq = &accb[(size_t) q * tt * 8];
+                    for (int t = 0; t < tt; ++t) {
+                        const uint8_t* u = ubuf.data() + (size_t) t * n + (size_t) i * 256;
+                        __m512i a = zero;
+                        for (int j = 0; j < 4; ++j)
+                            a = _mm512_dpwssd_epi32(a, _mm512_maddubs_epi16(_mm512_loadu_si512((const void*) (u + 64 * j)), w8[j]), sc[j]);
+                        const __m256i s = _mm256_sub_epi32(fold256(a), corr128);
+                        float* ap = accq + (size_t) t * 8;
+                        _mm256_storeu_ps(ap, _mm256_fmadd_ps(_mm256_set1_ps(dx * y[t][i].d), _mm256_cvtepi32_ps(s), _mm256_loadu_ps(ap)));
+                    }
+                }
+            for (int q = 0; q < rr; ++q)
+                for (int t = 0; t < tt; ++t)
+                    out[t0 + t][rg + q] = FmtX<TY>::K * hsum8_ggml(_mm256_loadu_ps(&accb[((size_t) q * tt + t) * 8]));
+        }
+    }
+}
+
+template <int TY>
+IQ_X void dot_rows_x_nt(int nt, const uint8_t* w, size_t row_bytes, int n, const void* const* act, float* const* out, int r0, int r1) {
+    switch (nt) {
+        case 1: dot_rows_x<TY, 1>(w, row_bytes, n, act, out, r0, r1); break;
+        case 2: dot_rows_x<TY, 2>(w, row_bytes, n, act, out, r0, r1); break;
+        case 3: dot_rows_x<TY, 3>(w, row_bytes, n, act, out, r0, r1); break;
+        case 4: dot_rows_x<TY, 4>(w, row_bytes, n, act, out, r0, r1); break;
+        case 5: dot_rows_x<TY, 5>(w, row_bytes, n, act, out, r0, r1); break;
+        case 6: dot_rows_x<TY, 6>(w, row_bytes, n, act, out, r0, r1); break;
+        default: dot_rows_wide<TY>(w, row_bytes, n, act, nt, out, r0, r1); break;
+    }
+}
+
 }  // namespace
 
 void iq512_gu_rows(int type, const uint8_t* blob, size_t gu_row, size_t up_off, int n, const void* const* act, int nt,
@@ -267,6 +468,38 @@ void iq512_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void*
         case 18: dot_rows_nt<18>(nt, w, row_bytes, n, act, out, r0, r1); break;
         case 21: dot_rows_nt<21>(nt, w, row_bytes, n, act, out, r0, r1); break;
         case 22: dot_rows_nt<22>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        default: break;
+    }
+}
+
+
+static bool has_vpopcnt() {   // AVX512_VPOPCNTDQ (CPUID 7.0 ECX bit 14)
+    static const bool ok = [] {
+#if defined(_MSC_VER)
+        int r[4];
+        __cpuidex(r, 7, 0);
+        return ((r[2] >> 14) & 1) != 0;
+#else
+        unsigned a, b, c, d;
+        if (!__get_cpuid_count(7, 0, &a, &b, &c, &d)) return false;
+        return ((c >> 14) & 1u) != 0;
+#endif
+    }();
+    return ok;
+}
+
+bool iq512x_supported(int type) noexcept {
+    return has_vpopcnt() && (type == 16 || type == 17 || type == 18 || type == 21 || type == 22);
+}
+
+IQ_X void iq512x_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
+                      int r0, int r1) {
+    switch (type) {
+        case 16: dot_rows_x_nt<16>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 17: dot_rows_x_nt<17>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 18: dot_rows_x_nt<18>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 21: dot_rows_x_nt<21>(nt, w, row_bytes, n, act, out, r0, r1); break;
+        case 22: dot_rows_x_nt<22>(nt, w, row_bytes, n, act, out, r0, r1); break;
         default: break;
     }
 }

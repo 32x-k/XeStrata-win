@@ -21,6 +21,8 @@
 #include "strata/kernels/cpu/iq_avx2.hpp"
 #include "strata/kernels/cpu/iq_avx512.hpp"
 
+#include <algorithm>
+#include <chrono>
 #include <mutex>
 #include <vector>
 
@@ -89,6 +91,26 @@ void gg_cpu_quant(int act, const float* x, int k, void* dst) {
 // DS4_GG_IQ256=0 disables these rows; other settings still require CPU instruction support.
 static std::atomic<int> g_iq256{-1};   // -1: environment, 0: disabled, positive: enabled
 void gg_cpu_set_iq256(int mode) { g_iq256.store(mode, std::memory_order_relaxed); }
+// `rows` rows of n random values of a type (the scales small and finite), and the xorshift state the caller goes on with
+static std::vector<uint8_t> test_rows(int type, int n, int rows, uint64_t& st) {
+    auto next = [&st] { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return st; };
+    const size_t rb = ggml_row_size((ggml_type) type, n), bb = ggml_type_size((ggml_type) type);
+    std::vector<uint8_t> w(rb * (size_t) rows);
+    for (auto& b : w) b = (uint8_t) next();
+    for (size_t o = 0; o < w.size(); o += bb) {
+        const ggml_fp16_t d = ggml_fp32_to_fp16(0.002f + 0.001f * (float) (next() % 16));
+        if (type == 29) {   // IQ1_M keeps its f16 in the top nibbles of the four scale words
+            uint16_t sc[4];
+            std::memcpy(sc, &w[o + 48], 8);
+            for (int j = 0; j < 4; ++j) sc[j] = (uint16_t) ((sc[j] & 0x0fff) | ((d >> (4 * j)) & 0xf) << 12);
+            std::memcpy(&w[o + 48], sc, 8);
+        } else {
+            std::memcpy(&w[o], &d, sizeof d);
+        }
+    }
+    return w;
+}
+// impl 1: the AVX-512 rows (iq512x_rows), 0: the AVX2 rows
 static bool own_ok(int type, int impl) {
     static std::once_flag once[2][32];
     static bool ok[2][32];
@@ -99,22 +121,10 @@ static bool own_ok(int type, int impl) {
         const ggml_type_traits_cpu* q8 = tc ? ggml_get_type_traits_cpu(tc->vec_dot_type) : nullptr;
         if (tc == nullptr || tc->vec_dot == nullptr || q8 == nullptr || q8->from_float == nullptr) return;
         const int n = 1024, rows = 7;
-        const size_t rb = ggml_row_size((ggml_type) type, n), bb = ggml_type_size((ggml_type) type), ab = ggml_row_size(tc->vec_dot_type, n);
+        const size_t rb = ggml_row_size((ggml_type) type, n), ab = ggml_row_size(tc->vec_dot_type, n);
         uint64_t st = 0x9E3779B97F4A7C15ull + (uint64_t) type;
         auto next = [&st] { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return st; };
-        std::vector<uint8_t> w(rb * rows);
-        for (auto& b : w) b = (uint8_t) next();
-        for (size_t o = 0; o < w.size(); o += bb) {
-            const ggml_fp16_t d = ggml_fp32_to_fp16(0.002f + 0.001f * (float) (next() % 16));
-            if (type == 29) {   // IQ1_M keeps its f16 in the top nibbles of the four scale words
-                uint16_t sc[4];
-                std::memcpy(sc, &w[o + 48], 8);
-                for (int j = 0; j < 4; ++j) sc[j] = (uint16_t) ((sc[j] & 0x0fff) | ((d >> (4 * j)) & 0xf) << 12);
-                std::memcpy(&w[o + 48], sc, 8);
-            } else {
-                std::memcpy(&w[o], &d, sizeof d);
-            }
-        }
+        const std::vector<uint8_t> w = test_rows(type, n, rows, st);
         for (int nt : {1, 2, 3, 4, 5, 6, 8, 16, 33}) {
             std::vector<std::vector<uint8_t>> a((size_t) nt, std::vector<uint8_t>(ab));
             std::vector<const void*> ap((size_t) nt);
@@ -128,11 +138,13 @@ static bool own_ok(int type, int impl) {
                 p1[(size_t) t] = o1[(size_t) t].data();
                 for (int r = 0; r < rows; ++r) tc->vec_dot(n, &o0[(size_t) t][(size_t) r], 0, w.data() + (size_t) r * rb, 0, ap[(size_t) t], 0, 1);
             }
-            if (impl == 1) strata::kernels::cpu::iq512_rows(type, w.data(), rb, n, ap.data(), nt, p1.data(), 0, rows);
+            if (impl == 1) strata::kernels::cpu::iq512x_rows(type, w.data(), rb, n, ap.data(), nt, p1.data(), 0, rows);
             else strata::kernels::cpu::iq256_rows(type, w.data(), rb, n, ap.data(), nt, p1.data(), 0, rows);
             for (int t = 0; t < nt; ++t)
                 if (std::memcmp(o0[(size_t) t].data(), o1[(size_t) t].data(), rows * sizeof(float)) != 0) {
-                    if (dbg() || std::getenv("DS4_GG_VERBOSE")) std::fprintf(stderr, "ds4: CPU lane type %d: AVX2 rows differ from ggml-cpu's dot at %d tokens, not used\n", type, nt);
+                    if (dbg() || std::getenv("DS4_GG_VERBOSE"))
+                        std::fprintf(stderr, "ds4: CPU lane type %d: %s rows differ from ggml-cpu's dot at %d tokens, not used\n",
+                                     type, impl == 1 ? "AVX-512" : "AVX2", nt);
                     return;
                 }
         }
@@ -140,19 +152,62 @@ static bool own_ok(int type, int impl) {
     });
     return ok[impl][k];
 }
-// Select only instruction sets reported by the CPU. The comparison below keeps ggml-cpu's arithmetic
-// when this build's vector kernel accumulates its products in a different order.
-// The environment is read once: dots() asks for every 64 rows, and Windows' getenv takes the CRT's environment lock, which
-// the lane's threads then wait on together.
-static bool want_512(int type) {
-    static const bool on = [] {
+// One token: whether the AVX-512 rows beat ggml-cpu's dot on this CPU, timed once per type on the first call - the same
+// cache-resident rows by both, interleaved rounds, the best round of each counting, and the rows taken only 3% faster or more.
+// (Upstream Strata chose them by the CPU's maker and family, from its measurements on Zen 4 and Zen 5: one token IQ2_XXS 35 ->
+// 44 GB/s, IQ2_XS 37 -> 48, IQ3_XXS 43 -> 45 on Zen 5.)
+static bool faster_512(int type) {
+    static std::once_flag once[32];
+    static bool fast[32];
+    const int k = type & 31;
+    std::call_once(once[k], [&] {
+        fast[k] = false;
+        const ggml_type_traits_cpu* tc = ggml_get_type_traits_cpu((ggml_type) type);
+        const ggml_type_traits_cpu* q8 = tc ? ggml_get_type_traits_cpu(tc->vec_dot_type) : nullptr;
+        if (tc == nullptr || tc->vec_dot == nullptr || q8 == nullptr || q8->from_float == nullptr) return;
+        const int n = 4096, rows = 128, passes = 8, rounds = 7;   // (about 140 KB of IQ2_XXS rows: the core's own caches)
+        const size_t rb = ggml_row_size((ggml_type) type, n);
+        uint64_t st = 0xD1B54A32D192ED03ull + (uint64_t) type;
+        const std::vector<uint8_t> w = test_rows(type, n, rows, st);
+        std::vector<float> x((size_t) n);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = 0.02f * std::sin(0.37f * (float) i);
+        std::vector<uint8_t> a(ggml_row_size(tc->vec_dot_type, n));
+        q8->from_float(x.data(), a.data(), n);
+        const void* ap[1] = {a.data()};
+        std::vector<float> o((size_t) rows);
+        float* op[1] = {o.data()};
+        double t_ggml = 1e30, t_rows = 1e30;
+        for (int round = 0; round < rounds; ++round) {
+            auto t0 = std::chrono::steady_clock::now();
+            for (int p = 0; p < passes; ++p)
+                for (int r = 0; r < rows; ++r) tc->vec_dot(n, &o[(size_t) r], 0, w.data() + (size_t) r * rb, 0, a.data(), 0, 1);
+            t_ggml = std::min(t_ggml, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            t0 = std::chrono::steady_clock::now();
+            for (int p = 0; p < passes; ++p) strata::kernels::cpu::iq512x_rows(type, w.data(), rb, n, ap, 1, op, 0, rows);
+            t_rows = std::min(t_rows, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        }
+        fast[k] = t_rows * 1.03 <= t_ggml;
+        if (dbg() || std::getenv("DS4_GG_VERBOSE"))
+            std::fprintf(stderr, "ds4: CPU lane type %d, one token: ggml-cpu's dot %.1f us, the AVX-512 rows %.1f us: %s\n", type,
+                         t_ggml * 1e6, t_rows * 1e6, fast[k] ? "the rows" : "ggml-cpu's dot");
+    });
+    return fast[k];
+}
+// The AVX-512 rows where the CPU has them (AVX-512 F/BW/VL/DQ/VNNI/VBMI and VPOPCNTDQ): from two tokens wherever they pass
+// own_ok() (upstream measured x2.4-4.8 at 2-16 tokens on Zen 4 and Zen 5), at one token where faster_512() finds them faster.
+// DS4_GG_IQ512: 1 takes them at every token count, 0 never.  The environment is read once: dots() asks for every 64 rows, and
+// Windows' getenv takes the CRT's environment lock, which the lane's threads then wait on together.
+static bool want_512(int type, int nt) {
+    static const int mode = [] {
         const char* v = std::getenv("DS4_GG_IQ512");
-        return (v == nullptr || std::strtol(v, nullptr, 10) != 0) && strata::kernels::cpu::cpu_avx512_ok();
+        if (!strata::kernels::cpu::cpu_avx512_ok()) return 0;
+        return v == nullptr ? 2 : std::strtol(v, nullptr, 10) != 0 ? 1 : 0;
     }();
-    return on && strata::kernels::cpu::iq512_supported(type);
+    if (mode == 0 || !strata::kernels::cpu::iq512x_supported(type)) return false;
+    return mode == 1 || nt >= 2 || faster_512(type);
 }
 // 0: ggml-cpu's dot, 1: the AVX2 rows, 2: the AVX-512 rows
-static int use_iq256(int type) {
+static int use_iq256(int type, int nt) {
     if (!strata::kernels::cpu::cpu_avx2_ok()) return 0;
     static const int from_env = [] {
         const char* v = std::getenv("DS4_GG_IQ256");
@@ -160,16 +215,16 @@ static int use_iq256(int type) {
     }();
     const int mode = g_iq256.load(std::memory_order_relaxed);
     if ((mode < 0 ? from_env : mode) == 0) return 0;
-    if (want_512(type) && own_ok(type, 1)) return 2;
+    if (want_512(type, nt) && own_ok(type, 1)) return 2;
     if (!strata::kernels::cpu::iq256_supported(type)) return 0;
     return own_ok(type, 0) ? 1 : 0;
 }
 
 static void dots(int type, const uint8_t* w, size_t rb, int n, const void* const* act, int nt, float* const* out, int r0, int r1) {
     if (nt > 0) {
-        const int impl = use_iq256(type);
+        const int impl = use_iq256(type, nt);
         if (impl == 2) {
-            strata::kernels::cpu::iq512_rows(type, w, rb, n, act, nt, out, r0, r1);
+            strata::kernels::cpu::iq512x_rows(type, w, rb, n, act, nt, out, r0, r1);
             return;
         }
         if (impl == 1) {
