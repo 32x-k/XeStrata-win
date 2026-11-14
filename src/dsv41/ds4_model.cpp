@@ -10502,6 +10502,8 @@ struct Model::Impl {
         }
         dump_sub(d, "qr_raw", l.il, p0, T, d.qr, (size_t) T * g.q_lora * 4);
         dump_sub(d, "kvr_raw", l.il, p0, T, d.kvr, (size_t) T * HD * 4);
+        // The finishes the first GEMV batch feeds - q's norm, the new window rows' norm + rope
+        // into ext, and the ratio-1 compressor input's norm - independent, so one launch.
         Finish fq;
         fq.w = l.q_norm;
         fq.eps = g.eps;
@@ -10511,22 +10513,6 @@ struct Model::Impl {
             fq.q8d = d.qd8;
             qq8.x = d.qr; qq8.q = d.qq8; qq8.d = d.qd8; qq8.k = g.q_lora; qq8.rows = T;
         }
-        finish(d.qr, T, g.q_lora, g.q_lora, fq, s);
-        dump_sub(d, "qr", l.il, p0, T, d.qr, (size_t) T * g.q_lora * 4);
-        if (NHL > 0) {
-            if (!mv(d, {job(l.wq_b, d.qr, d.q, T, g.q_lora, HQ)}, err, qq8.q ? &qq8 : nullptr)) return false;
-            Finish fr;
-            fr.rd = g.rd;
-            fr.pos = (int) p0;
-            fr.vpp = NHL;
-            fr.freqs = freqs;
-            finish(d.q, T * NHL, HD, HD, fr, s);
-        }
-        if (NHL > 0) dump_sub(d, "q", l.il, p0, T, d.q, (size_t) T * HQ * 4);
-        // the window rows: the ring's (positions p0 - win ..) then this window's, each query its own 128.  A DSpark
-        // block's ring holds the trunk's main KV (positions <= p0 - 1, seeded); its block of drafts attends to all of
-        // that ring and to the whole block, and leaves the ring as it was
-        ring_to_ext(l.win, d.ext, l.mtp ? (int64_t) g.win : p0, g.win, HD, s);   // (a block's ring: its rows as they lie)
         Finish fk;
         fk.w = l.kv_norm;
         fk.eps = g.eps;
@@ -10536,7 +10522,56 @@ struct Model::Impl {
         fk.quant = 1;
         fk.dst = d.ext + (size_t) g.win * HD;
         fk.dst_stride = HD;
-        finish(d.kvr, T, HD, HD, fk, s);
+        {
+            FinishJob fj[3];
+            int nf = 0;
+            fj[nf++] = FinishJob{d.qr, T, g.q_lora, g.q_lora, fq};
+            fj[nf++] = FinishJob{d.kvr, T, HD, HD, fk};
+            if (l.ratio == 1 && l.kv_src) {   // the R == 1 branch's own norm on ckr below
+                Finish fc;
+                fc.w = l.c_norm;
+                fc.eps = g.eps;
+                fj[nf++] = FinishJob{d.ckr, T, HD, HD, fc};
+            }
+            finish_n(fj, nf, s);
+        }
+        dump_sub(d, "qr", l.il, p0, T, d.qr, (size_t) T * g.q_lora * 4);
+        // The indexer's own q projection reads the same normalized qr: its GEMV goes next to
+        // wq_b's, its finish beside fr's (lim's clen_max is (p0 + T) / R, the newest query's).
+        const bool ix_iq = l.ix_src && l.ratio > 0 && (p0 + T) / l.ratio > 0;
+        if (NHL > 0) {
+            if (!mv(d, {job(l.wq_b, d.qr, d.q, T, g.q_lora, HQ)}, err, qq8.q ? &qq8 : nullptr)) return false;
+        }
+        if (ix_iq) {
+            if (!mv(d, {job(l.i_wq_b, d.qr, d.iq, T, g.q_lora, (size_t) g.ix_heads * g.ix_hd)}, err)) return false;
+        }
+        {
+            FinishJob fj[2];
+            int nf = 0;
+            if (NHL > 0) {
+                Finish fr;
+                fr.rd = g.rd;
+                fr.pos = (int) p0;
+                fr.vpp = NHL;
+                fr.freqs = freqs;
+                fj[nf++] = FinishJob{d.q, T * NHL, HD, HD, fr};
+            }
+            if (ix_iq) {
+                Finish fi;
+                fi.rd = g.rd;
+                fi.pos = (int) p0;
+                fi.vpp = g.ix_heads;
+                fi.freqs = freqs;
+                fi.quant = 3;
+                fj[nf++] = FinishJob{d.iq, T * g.ix_heads, g.ix_hd, g.ix_hd, fi};
+            }
+            if (nf) finish_n(fj, nf, s);
+        }
+        if (NHL > 0) dump_sub(d, "q", l.il, p0, T, d.q, (size_t) T * HQ * 4);
+        // the window rows: the ring's (positions p0 - win ..) then this window's, each query its own 128.  A DSpark
+        // block's ring holds the trunk's main KV (positions <= p0 - 1, seeded); its block of drafts attends to all of
+        // that ring and to the whole block, and leaves the ring as it was
+        ring_to_ext(l.win, d.ext, l.mtp ? (int64_t) g.win : p0, g.win, HD, s);   // (a block's ring: its rows as they lie)
         if (!l.mtp) ext_to_ring(d.ext, l.win, p0, g.win, T, HD, s, spec_win ? l.ring_bak : nullptr);
         dump_sub(d, "kv_win", l.il, p0, T, d.ext + (size_t) g.win * HD, (size_t) T * HD * 4);
         dump_sub(d, "ext", l.il, p0, T, d.ext, ((size_t) g.win + T) * HD * 2);   // (BF16 rows: the ring's, then this window's)
@@ -10563,20 +10598,14 @@ struct Model::Impl {
             const int64_t g_end = (p0 + T) / R;          // groups completed by p0 + T - 1
             const int ng = (int) std::max<int64_t>(0, g_end - g_first);
             if (l.kv_src) {
-                if (R == 1) {
-                    Finish fc;
-                    fc.w = l.c_norm;
-                    fc.eps = g.eps;
-                    finish(d.ckr, T, HD, HD, fc, s);
-                    {
-                        CopyRegions cr;
-                        cr.dst[0] = d.latent;
-                        cr.src[0] = d.ckr;
-                        cr.bytes[0] = (size_t) T * HD * 4;
-                        cr.n = 1;
-                        if (!(trim & 4) || !copy_regions(cr, s))
-                            CK(rt::copy_async(d.latent, d.ckr, (size_t) T * HD * 4, s));
-                    }
+                if (R == 1) {   // (ckr's norm went into the launch beside fq and fk, above)
+                    CopyRegions cr;
+                    cr.dst[0] = d.latent;
+                    cr.src[0] = d.ckr;
+                    cr.bytes[0] = (size_t) T * HD * 4;
+                    cr.n = 1;
+                    if (!(trim & 4) || !copy_regions(cr, s))
+                        CK(rt::copy_async(d.latent, d.ckr, (size_t) T * HD * 4, s));
                 } else {
                     if (spec_win && l.c_snap != nullptr) {   // to replay the accepted rows if drafts are rejected
                         const size_t ns = (size_t) R * HD * 4, nr = (size_t) T * HD * 4;
@@ -10619,20 +10648,26 @@ struct Model::Impl {
                     fi.quant = 3;
                     fi.pdst = ks.ik[(size_t) l.dev] + (size_t) g_first * ik_rb();
                     fi.pdst_stride = (long long) ik_rb();
-                    finish(d.ikr, ng, g.ix_hd, g.ix_hd, fi, s);
+                    FinishJob pj[2];
+                    int np = 0;
+                    pj[np++] = FinishJob{d.ikr, ng, g.ix_hd, g.ix_hd, fi};
+                    if (l.kv_src) {   // the new compressed rows' pack rides the same launch
+                        Finish fc;
+                        fc.rd = g.rd;
+                        fc.pos = (int) (g_first * R);
+                        fc.pos_step = R;
+                        fc.freqs = freqs;
+                        fc.quant = 2;
+                        fc.pdst = sr.ckv[(size_t) l.dev] + (size_t) g_first * ckv_rb();
+                        fc.pdst_stride = (long long) ckv_rb();
+                        pj[np++] = FinishJob{d.latent, ng, HD, HD, fc};
+                    }
+                    finish_n(pj, np, s);
                     if (!wp.par && !replicate(ks.ik, ks.h_ik, ks.ev_ik, fi.pdst, (size_t) g_first * ik_rb(),
                                               (size_t) ng * ik_rb(), l.dev, err))
                         return false;
                 }
-                if (clen_max > 0) {
-                    if (!mv(d, {job(l.i_wq_b, d.qr, d.iq, T, g.q_lora, (size_t) g.ix_heads * g.ix_hd)}, err)) return false;
-                    Finish fi;
-                    fi.rd = g.rd;
-                    fi.pos = (int) p0;
-                    fi.vpp = g.ix_heads;
-                    fi.freqs = freqs;
-                    fi.quant = 3;
-                    finish(d.iq, T * g.ix_heads, g.ix_hd, g.ix_hd, fi, s);
+                if (clen_max > 0) {   // (d.iq already normed and roped beside fr, above)
                     // (iw rows are 64 apart)
                     gemv_f16_rows(l.i_wproj, d.x, (size_t) D, g.ix_heads, D, T,
                                   1.0f / std::sqrt((float) g.ix_hd) / std::sqrt((float) g.ix_heads), d.iw, 64, s);
@@ -10681,7 +10716,7 @@ struct Model::Impl {
                 fc.quant = 2;
                 fc.pdst = sr.ckv[(size_t) l.dev] + (size_t) g_first * ckv_rb();
                 fc.pdst_stride = (long long) ckv_rb();
-                finish(d.latent, ng, HD, HD, fc, s);
+                if (!(l.ix_src && l.owns_k)) finish(d.latent, ng, HD, HD, fc, s);   // (else it rode the pair)
                 if (!wp.par && !replicate(sr.ckv, sr.h_ckv, sr.ev_ckv, fc.pdst, (size_t) g_first * ckv_rb(),
                                           (size_t) ng * ckv_rb(), l.dev, err))
                     return false;

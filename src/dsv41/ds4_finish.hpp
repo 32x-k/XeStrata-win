@@ -160,96 +160,126 @@ inline float quant_value(float value, float scale, int quant) {
     return e2m1_round(sycl::fmin(sycl::fmax(value / scale, -6.f), 6.f));
 }
 
-// Upstream ds4_kernels.cu finish_kernel<kPack>, with its 256-item strided
-// register rows, two-level XOR norm, adjacent RoPE and 16/32-value quantization.
+// Upstream ds4_kernels.cu finish_kernel<kPack>'s one-vector body - the 256-item strided
+// register rows, two-level XOR norm, adjacent RoPE and 16/32-value quantization.  The single
+// and the job-list launches below share it.
+template <int SG, bool Pack>
+void finish_rows(sycl::nd_item<1> item, size_t vector, float* x, int len, long long stride,
+                 const Finish& f, sycl::local_accessor<float, 1> red,
+                 sycl::local_accessor<uint32_t, 1> exchange) {
+    const int tid = int(item.get_local_linear_id());
+    float* row = x + static_cast<long long>(vector) * stride;
+    float r[kValues], ss = 0.f;
+    const int count = (len + kThreads - 1) / kThreads;
+    for (int j = 0; j < count; ++j) {
+        const int e = tid + j * kThreads;
+        r[j] = e < len ? row[e] : 0.f;
+        ss += r[j] * r[j];
+    }
+    if (f.w) {
+        const float total = block_sum<SG>(item, ss, red, exchange);
+        const float inv = sycl::rsqrt(total / float(len) + f.eps);
+        for (int j = 0; j < count; ++j) {
+            const int e = tid + j * kThreads;
+            if (e < len) r[j] = r[j] * inv * f.w[e];
+        }
+    }
+    if (f.rd > 0) {
+        const int r0 = len - f.rd;
+        const int pos = f.pos + int(vector / size_t(f.vpp)) * f.pos_step;
+        for (int j = 0; j < count; ++j) {
+            const int e = tid + j * kThreads;
+            const float other = sycl::permute_group_by_xor(item.get_sub_group(), r[j], 1);
+            if (e >= r0 && e < len) {
+                const float angle = float(pos) * f.freqs[(e - r0) >> 1];
+                const float c = sycl::cos(angle), sn = f.inverse ? -sycl::sin(angle) : sycl::sin(angle);
+                if (((e - r0) & 1) == 0) r[j] = r[j] * c - other * sn;
+                else r[j] = other * sn + r[j] * c;
+            }
+        }
+    }
+    uint8_t* packed = Pack ? f.pdst + static_cast<long long>(vector) * f.pdst_stride : nullptr;
+    if (f.quant != 0 || Pack) {
+        const int group = f.quant == 2 ? 16 : 32;
+        for (int j = 0; j < count; ++j) {
+            const int e = tid + j * kThreads;
+            const float a = group_max<SG>(item, e < len ? sycl::fabs(r[j]) : 0.f, group, exchange);
+            float rounded = 0.f, scale = 1.f;
+            if (e < len) {
+                scale = quant_scale(a, f.quant);
+                rounded = quant_value(r[j], scale, f.quant);
+                r[j] = rounded * scale;
+            }
+            if constexpr (Pack) {
+                if (f.quant == 1) {
+                    if (e < len) packed[e] = e4m3_code(rounded);
+                } else {
+                    const uint32_t code = e2m1_code(rounded);
+                    const uint32_t other = sycl::permute_group_by_xor(item.get_sub_group(), code, 1);
+                    if (e < len && !(e & 1)) packed[e >> 1] = uint8_t(code | (other << 4));
+                }
+                if (e < len && e % group == 0)
+                    packed[(f.quant == 1 ? len : len / 2) + e / group] = f.quant == 2 ?
+                        e4m3_code(scale) : uint8_t(sycl::bit_cast<uint32_t>(scale) >> 23);
+            }
+        }
+    }
+    // (DS4_DECODE_TRIM 2) the stored values rounded to int8 too, the gguf q8 quantizer's ops (amax / 127,
+    // rint, a zero block a 0 code) - for a Q8_0 job's input without a later quantize launch
+    if (f.q8) {
+        int8_t* q8 = f.q8 + static_cast<long long>(vector) * len;
+        float* q8d = f.q8d + static_cast<long long>(vector) * (len / 32);
+        for (int j = 0; j < count; ++j) {
+            const int e = tid + j * kThreads;
+            const float a = group_max<SG>(item, e < len ? sycl::fabs(r[j]) : 0.f, 32, exchange);
+            if (e < len) {
+                const float dx = a / 127.f;
+                q8[e] = int8_t(a > 0.f ? sycl::rint(r[j] / dx) : 0.f);
+                if (e % 32 == 0) q8d[e / 32] = dx;
+            }
+        }
+    }
+    uint16_t* dst = f.dst ? f.dst + static_cast<long long>(vector) * f.dst_stride : nullptr;
+    for (int j = 0; j < count; ++j) {
+        const int e = tid + j * kThreads;
+        if (e >= len) continue;
+        if (dst) dst[e] = bf16_rn(r[j]);
+        else if (!Pack) row[e] = r[j];
+    }
+}
 template <int SG, bool Pack>
 void finish_kernel(float* x, int vectors, int len, long long stride, Finish f, sycl::queue& q) {
     sycl_detail::submit(q, [&](sycl::handler& handler) {
         sycl::local_accessor<float, 1> red(sycl::range<1>(kThreads / 32 + 1), handler);
         sycl::local_accessor<uint32_t, 1> exchange(sycl::range<1>(SG == 16 ? kThreads : 1), handler);
         auto body = [=](sycl::nd_item<1> item) {
-            const int tid = int(item.get_local_linear_id());
-            const size_t vector = item.get_group_linear_id();
-            float* row = x + static_cast<long long>(vector) * stride;
-            float r[kValues], ss = 0.f;
-            const int count = (len + kThreads - 1) / kThreads;
-            for (int j = 0; j < count; ++j) {
-                const int e = tid + j * kThreads;
-                r[j] = e < len ? row[e] : 0.f;
-                ss += r[j] * r[j];
-            }
-            if (f.w) {
-                const float total = block_sum<SG>(item, ss, red, exchange);
-                const float inv = sycl::rsqrt(total / float(len) + f.eps);
-                for (int j = 0; j < count; ++j) {
-                    const int e = tid + j * kThreads;
-                    if (e < len) r[j] = r[j] * inv * f.w[e];
-                }
-            }
-            if (f.rd > 0) {
-                const int r0 = len - f.rd;
-                const int pos = f.pos + int(vector / size_t(f.vpp)) * f.pos_step;
-                for (int j = 0; j < count; ++j) {
-                    const int e = tid + j * kThreads;
-                    const float other = sycl::permute_group_by_xor(item.get_sub_group(), r[j], 1);
-                    if (e >= r0 && e < len) {
-                        const float angle = float(pos) * f.freqs[(e - r0) >> 1];
-                        const float c = sycl::cos(angle), sn = f.inverse ? -sycl::sin(angle) : sycl::sin(angle);
-                        if (((e - r0) & 1) == 0) r[j] = r[j] * c - other * sn;
-                        else r[j] = other * sn + r[j] * c;
-                    }
-                }
-            }
-            uint8_t* packed = Pack ? f.pdst + static_cast<long long>(vector) * f.pdst_stride : nullptr;
-            if (f.quant != 0 || Pack) {
-                const int group = f.quant == 2 ? 16 : 32;
-                for (int j = 0; j < count; ++j) {
-                    const int e = tid + j * kThreads;
-                    const float a = group_max<SG>(item, e < len ? sycl::fabs(r[j]) : 0.f, group, exchange);
-                    float rounded = 0.f, scale = 1.f;
-                    if (e < len) {
-                        scale = quant_scale(a, f.quant);
-                        rounded = quant_value(r[j], scale, f.quant);
-                        r[j] = rounded * scale;
-                    }
-                    if constexpr (Pack) {
-                        if (f.quant == 1) {
-                            if (e < len) packed[e] = e4m3_code(rounded);
-                        } else {
-                            const uint32_t code = e2m1_code(rounded);
-                            const uint32_t other = sycl::permute_group_by_xor(item.get_sub_group(), code, 1);
-                            if (e < len && !(e & 1)) packed[e >> 1] = uint8_t(code | (other << 4));
-                        }
-                        if (e < len && e % group == 0)
-                            packed[(f.quant == 1 ? len : len / 2) + e / group] = f.quant == 2 ?
-                                e4m3_code(scale) : uint8_t(sycl::bit_cast<uint32_t>(scale) >> 23);
-                    }
-                }
-            }
-            // (DS4_DECODE_TRIM 2) the stored values rounded to int8 too, the gguf q8 quantizer's ops (amax / 127,
-            // rint, a zero block a 0 code) - for a Q8_0 job's input without a later quantize launch
-            if (f.q8) {
-                int8_t* q8 = f.q8 + static_cast<long long>(vector) * len;
-                float* q8d = f.q8d + static_cast<long long>(vector) * (len / 32);
-                for (int j = 0; j < count; ++j) {
-                    const int e = tid + j * kThreads;
-                    const float a = group_max<SG>(item, e < len ? sycl::fabs(r[j]) : 0.f, 32, exchange);
-                    if (e < len) {
-                        const float dx = a / 127.f;
-                        q8[e] = int8_t(a > 0.f ? sycl::rint(r[j] / dx) : 0.f);
-                        if (e % 32 == 0) q8d[e / 32] = dx;
-                    }
-                }
-            }
-            uint16_t* dst = f.dst ? f.dst + static_cast<long long>(vector) * f.dst_stride : nullptr;
-            for (int j = 0; j < count; ++j) {
-                const int e = tid + j * kThreads;
-                if (e >= len) continue;
-                if (dst) dst[e] = bf16_rn(r[j]);
-                else if (!Pack) row[e] = r[j];
-            }
+            finish_rows<SG, Pack>(item, item.get_group_linear_id(), x, len, stride, f, red, exchange);
         };
         handler.parallel_for(sycl::nd_range<1>(size_t(vectors) * kThreads, kThreads), BoundBody<SG, decltype(body)>{body});
+    });
+}
+// A job list for one launch: up to kFinishJobs of finish's argument sets, their grids
+// concatenated, each workgroup its own (job, vector).  The jobs are independent by contract.
+struct FinishN {
+    FinishJob j[kFinishJobs];
+    int base[kFinishJobs + 1];
+    int n = 0;
+};
+template <int SG, bool Pack>
+void finish_n_kernel(const FinishN& b, sycl::queue& q) {
+    sycl_detail::submit(q, [&](sycl::handler& handler) {
+        sycl::local_accessor<float, 1> red(sycl::range<1>(kThreads / 32 + 1), handler);
+        sycl::local_accessor<uint32_t, 1> exchange(sycl::range<1>(SG == 16 ? kThreads : 1), handler);
+        auto body = [=](sycl::nd_item<1> item) {
+            const size_t g = item.get_group_linear_id();
+            int j = 0;
+            while (j + 1 < b.n && g >= size_t(b.base[j + 1])) ++j;
+            const FinishJob& job = b.j[j];
+            finish_rows<SG, Pack>(item, g - size_t(b.base[j]), job.x, job.len, job.stride, job.f,
+                                  red, exchange);
+        };
+        handler.parallel_for(sycl::nd_range<1>(size_t(b.base[b.n]) * kThreads, kThreads),
+                             BoundBody<SG, decltype(body)>{body});
     });
 }
 inline bool finish(float* x, int vectors, int len, long long stride, const Finish& f, sycl::queue& q) {
@@ -263,6 +293,33 @@ inline bool finish(float* x, int vectors, int len, long long stride, const Finis
     } else {
         if (f.pdst) finish_kernel<16, true>(x, vectors, len, stride, f, q);
         else finish_kernel<16, false>(x, vectors, len, stride, f, q);
+    }
+    return true;
+}
+inline bool finish_n(const FinishJob* jobs, int n, sycl::queue& q) {
+    sycl_detail::require_in_order(q);
+    if (n <= 1 || n > kFinishJobs) return false;   // one job: the plain launch
+    FinishN b;
+    b.n = n;
+    int total = 0;
+    const bool pack = jobs[0].f.pdst != nullptr;   // a launch packs or it does not
+    for (int i = 0; i < n; ++i) {
+        const FinishJob& j = jobs[i];
+        if (j.len <= 0 || j.len > kValues * kThreads || j.vectors <= 0) return false;
+        if ((j.f.pdst != nullptr) != pack) return false;
+        b.j[i] = j;
+        b.base[i] = total;
+        total += j.vectors;
+    }
+    b.base[n] = total;
+    const int sg = subgroup(caps(q), true);
+    if (!sg) return false;
+    if (sg == 32) {
+        if (pack) finish_n_kernel<32, true>(b, q);
+        else finish_n_kernel<32, false>(b, q);
+    } else {
+        if (pack) finish_n_kernel<16, true>(b, q);
+        else finish_n_kernel<16, false>(b, q);
     }
     return true;
 }

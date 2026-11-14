@@ -68,6 +68,17 @@ struct Finish {
     float* q8d = nullptr;
 };
 void finish(float* x, int n_vec, int len, long long stride, const Finish& f, sycl::queue& s);
+/// Up to kFinishJobs of them in one launch where the device path takes it (a workgroup its own
+/// (job, vector)); more jobs, or a shape the path does not take, run the calls one by one.
+/// finish's checks and rounding apply to each; the jobs must be independent of one another.
+constexpr int kFinishJobs = 4;
+struct FinishJob {
+    float* x = nullptr;
+    int vectors = 0, len = 0;
+    long long stride = 0;
+    Finish f;
+};
+void finish_n(const FinishJob* jobs, int n, sycl::queue& s);
 
 /// Hyper-Connections, row t of each [T][..] array: mixes[t][m] = (h_flat . fn[m]) * rsqrt(mean(h_flat^2) + eps), then
 /// pre / post / comb as hc_split_sinkhorn (comb[t][j * hc + k], j the source stream, k the destination).  Strides: mixes

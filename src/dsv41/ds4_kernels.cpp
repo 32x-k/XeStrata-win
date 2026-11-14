@@ -1501,14 +1501,18 @@ void embed(const uint16_t* rows, int T, float* h, int dim, int hc, sycl::queue& 
     });
 }
 
-void finish(float* x, int n_vec, int len, long long stride, const Finish& f, sycl::queue& s) {
-    if (n_vec <= 0) return;
+static void finish_args_check(int len, const Finish& f) {
     if (len <= 0 || f.rd < 0 || f.rd > len || (f.rd & 1) || (f.rd && ((len - f.rd) & 1)) || f.vpp <= 0)
         throw std::invalid_argument("ds4 finish: invalid vector or rotary dimensions");
     if (f.pdst && (f.quant < 1 || f.quant > 3 || len % 32))
         throw std::invalid_argument("ds4 finish: packed rows require whole quantization blocks");
     if (f.q8 && (f.q8d == nullptr || len % 32 || f.dst || f.pdst))
         throw std::invalid_argument("ds4 finish: int8 rows require whole unstrided blocks and no other output");
+}
+
+void finish(float* x, int n_vec, int len, long long stride, const Finish& f, sycl::queue& s) {
+    if (n_vec <= 0) return;
+    finish_args_check(len, f);
     if (finish_detail::finish(x, n_vec, len, stride, f, s)) return;
     parallel(s, size_t(n_vec), [=](size_t v) {
         float* row = x + static_cast<long long>(v) * stride;
@@ -1557,6 +1561,14 @@ void finish(float* x, int n_vec, int len, long long stride, const Finish& f, syc
                 f.quant == 2 ? e4m3_code(scale) : uint8_t(sycl::bit_cast<uint32_t>(scale) >> 23);
         }
     });
+}
+
+void finish_n(const FinishJob* jobs, int n, sycl::queue& s) {
+    for (int i = 0; i < n; ++i)
+        if (jobs[i].vectors > 0) finish_args_check(jobs[i].len, jobs[i].f);
+    if (finish_detail::finish_n(jobs, n, s)) return;
+    for (int i = 0; i < n; ++i)
+        finish(jobs[i].x, jobs[i].vectors, jobs[i].len, jobs[i].stride, jobs[i].f, s);
 }
 
 void hc_mix(const float* h, const float* fn, int hcdim, int n_mix, int T, float eps, float* mixes, sycl::queue& s) {
