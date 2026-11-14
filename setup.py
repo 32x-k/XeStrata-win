@@ -6369,6 +6369,14 @@ def install_dsv41(a, family: str, gpu: dict, chosen: list, port: int, ram: float
             cfg[name] = getattr(a, name)
     if a.browser is not None:
         cfg["open_browser"] = a.browser
+    if getattr(a, "images", None) is None and not a.yes and not JSON_OUT:   # asked only interactively
+        a.images = ask_images(CONF / f"xestrata-{tag.lower()}.json")
+    if getattr(a, "images", None):   # image generation is the image engine's, whatever the text model's arch
+        eng_img = packaged_engine_dir() if PACKAGED else ROOT / "engine"
+        got = setup_images(a, gpu, Path(a.models_dir), eng_img, md["ram_gb"])
+        cfg["images"], cfg["image_models"] = got if got is not None else (None, None)
+        if not cfg["image_models"]:
+            cfg["image_models"] = None
     CONF.mkdir(parents=True, exist_ok=True)
     STATE.mkdir(parents=True, exist_ok=True)
     cfg_path = CONF / f"xestrata-{tag.lower()}.json"
