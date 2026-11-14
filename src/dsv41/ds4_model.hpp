@@ -182,6 +182,9 @@ public:
     /// the pieces the state a prompt continues is made of.  0 and err: nothing was set aside (it holds pictures, there
     /// is no conversation, or the conversation is already set aside - unchanged since).
     uint64_t slot_save(std::vector<uint8_t>& out, std::string& err);
+    /// The bytes slot_save's `out` takes for the conversation as it is now: serve's SAVE announces its capture's
+    /// allowance (SWAIT) from it before the state comes off the device.
+    uint64_t slot_bytes() const;
     /// `data` (a slot's bytes) back into the model: the state at the slot's position n_pos, as slot_save took it -
     /// what a prompt that continues the slot's tokens reads on from (the caller checked the tokens are a prefix).
     bool slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err);

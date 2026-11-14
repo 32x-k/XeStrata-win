@@ -10802,6 +10802,7 @@ bool Model::slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::str
     const bool ok = p_->slot_load(data, bytes, n_pos, err);
     return p_->mailbox->ready(err) && ok;
 } catch (const std::exception& e) { p_->mailbox->stop(e.what()); err = e.what(); return false; }
+uint64_t Model::slot_bytes() const { return p_->slot_bytes(); }
 std::string Model::slot_identity() const { return p_->slot_identity(); }
 void Model::settle_idle(const std::atomic<bool>& cancel) { p_->cache_settle_idle(cancel); }
 void Model::save_profile() const { p_->save_profile(); }

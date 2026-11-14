@@ -364,7 +364,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
     std::printf("READY %lld stop\n", (long long) m.max_context());
     std::fflush(stdout);
-    std::fprintf(stderr, "strata-dsv41 serve: GEN <max_new> [keys] <ids>; GENI <max_new> [keys] <pictures> <ids>; STOP, QUIT\n");
+    std::fprintf(stderr, "strata-dsv41 serve: GEN <max_new> [keys] <ids>; GENI <max_new> [keys] <pictures> <ids>; SAVE / RESTORE <path>; STOP, QUIT\n");
     auto in = std::make_shared<Lines>();
     in->start();
     std::string line;
@@ -712,9 +712,135 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         settle_stop();    // (a line arrived, or the input closed)
         if (!have_line) break;
         if (line == "QUIT") break;
+        // Disk sessions (serve/images.py's "unload" policy, through StrataEngine::session_file: the engine stops for
+        // the image job and this file brings the conversation back after it): the same bytes a conversation slot
+        // holds, to or from the path the command names.  Answers: SAVED / RESTORED <tokens> <bytes> <ms>; SERR
+        // <invalid|io> 0 <reason> for a refusal or failure that leaves the engine in step - a load that fails after
+        // writing state is reset (slot_load's guard), never served from the mix.  On the way: SESSION <done> <total>
+        // after each block of the file moved (at most 16 MiB, the protocol's own size), and SWAIT <phase> <seconds>
+        // before a step that blocks in one call (the capture, the transfer back) - the allowance the main engine's
+        // session_phase_limit_s gives: a minute plus a second per 4 MiB, an hour at most.
+        if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
+            const bool save = line[0] == 'S';
+            const std::string path = line.substr(save ? 5 : 8);
+            const double t0 = now_ms();
+            const auto refuse = [&](const char* kind, const std::string& why) {
+                std::string one = why;   // one protocol line
+                for (char& c : one) if (c == '\n' || c == '\r') c = ' ';
+                std::fprintf(stderr, "ds4 session: %s %s failed (%s)\n", save ? "save" : "restore", path.c_str(), one.c_str());
+                std::printf("SERR %s 0 %s\n", kind, one.c_str());
+                std::fflush(stdout);
+            };
+            const auto blocking = [&](const char* phase, uint64_t bytes) {
+                std::printf("SWAIT %s %llu\n", phase,
+                            (unsigned long long) std::min<uint64_t>(3600, 60 + (bytes >> 22)));
+                std::fflush(stdout);
+            };
+            const uint64_t BLOCK = 16u << 20;
+            const auto moving = [&](uint64_t done, uint64_t total) {
+                std::printf("SESSION %llu %llu\n", (unsigned long long) done, (unsigned long long) total);
+                std::fflush(stdout);
+            };
+            const auto read_all = [&](const fs::path& from, std::vector<uint8_t>& out) {
+                std::ifstream f(from, std::ios::binary);
+                if (!f) return false;
+                f.seekg(0, std::ios::end);
+                const std::streamoff nb = f.tellg();
+                f.seekg(0, std::ios::beg);
+                if (nb <= 0) return false;
+                out.resize((size_t) nb);
+                uint64_t done = 0;
+                while (done < (uint64_t) nb) {
+                    const size_t n = (size_t) std::min<uint64_t>(BLOCK, (uint64_t) nb - done);
+                    if (!f.read((char*) out.data() + done, (std::streamsize) n)) { out.clear(); return false; }
+                    done += n;
+                    moving(done, (uint64_t) nb);
+                }
+                return true;
+            };
+            const fs::path fpath = fs::path(std::u8string(path.begin(), path.end()));
+            if (path.empty()) {
+                refuse("invalid", "missing path");
+            } else if (save) {
+                const std::vector<int32_t>& t = m.tokens();
+                if (t.empty()) { refuse("invalid", "no complete session to save"); continue; }
+                std::vector<uint8_t> buf;
+                std::string e;
+                blocking("capture", m.slot_bytes());
+                uint64_t bytes = m.slot_save(buf, e);
+                std::shared_ptr<std::vector<uint8_t>> held_slot;
+                if (bytes == 0 && e == "it is already set aside") {
+                    // the state's own slot already holds these bytes: the RAM one, else its file
+                    for (size_t i = slots.size(); i-- > 0 && !held_slot;)
+                        if (slots[i].tokens == t) {
+                            held_slot = slots[i].data;
+                            if (!held_slot) {
+                                auto f = std::make_shared<std::vector<uint8_t>>();
+                                if (read_all(fs::path(std::u8string(slots[i].path.begin(), slots[i].path.end())), *f))
+                                    held_slot = f;
+                            }
+                        }
+                    if (held_slot) { buf = *held_slot; bytes = buf.size(); }
+                }
+                if (bytes == 0) {
+                    refuse("io", e.empty() ? "the state did not serialize" : e);
+                } else {
+                    const std::string tmp = path + ".tmp";
+                    bool wrote = true;
+                    {
+                        std::ofstream f(fs::path(std::u8string(tmp.begin(), tmp.end())),
+                                        std::ios::binary | std::ios::trunc);
+                        uint64_t done = 0;
+                        while (wrote && done < buf.size()) {
+                            const size_t n = (size_t) std::min<uint64_t>(BLOCK, buf.size() - done);
+                            f.write((const char*) buf.data() + done, (std::streamsize) n);
+                            wrote = f.good();
+                            done += n;
+                            moving(done, buf.size());
+                        }
+                        f.flush();
+                        wrote = wrote && f.good();
+                    }
+                    if (!wrote) {
+                        std::error_code ec;
+                        std::filesystem::remove(fs::path(std::u8string(tmp.begin(), tmp.end())), ec);
+                        refuse("io", "writing the session file failed (disk full?)");
+                        continue;
+                    }
+                    blocking("rename", 0);
+                    std::error_code ec;
+                    fs::rename(fs::path(std::u8string(tmp.begin(), tmp.end())), fpath, ec);
+                    if (ec) refuse("io", "renaming the session file failed");
+                    else std::printf("SAVED %zu %llu %.1f\n", t.size(), (unsigned long long) bytes, now_ms() - t0);
+                }
+            } else {
+                std::vector<uint8_t> buf;
+                if (!read_all(fpath, buf)) { refuse("io", "cannot read the session file"); continue; }
+                // the slot form's header: magic, the identity's length and bytes, then the position (slot_load
+                // checks the magic and the identity itself; the position is its argument)
+                uint64_t il = 0, n = 0;
+                if (buf.size() >= 24) std::memcpy(&il, buf.data() + 8, 8);
+                if (il == 0 || il > (1u << 20) || buf.size() < 24 + (size_t) il) {
+                    refuse("invalid", "not a saved conversation");
+                    continue;
+                }
+                std::memcpy(&n, buf.data() + 16 + (size_t) il, 8);
+                std::string e;
+                blocking("transfer", buf.size());
+                if (!m.slot_load(buf.data(), buf.size(), (int64_t) n, e)) {
+                    refuse("io", e.empty() ? "the saved conversation did not load" : e);
+                    continue;
+                }
+                held.clear();   // (a slot is text only: the state that came back holds no pictures)
+                std::printf("RESTORED %llu %llu %.1f\n", (unsigned long long) n, (unsigned long long) buf.size(),
+                            now_ms() - t0);
+            }
+            std::fflush(stdout);
+            continue;
+        }
         const bool geni = line.rfind("GENI ", 0) == 0;
         if (!geni && line.rfind("GEN ", 0) != 0) {
-            std::printf("ERR unsupported command '%s' (GEN, GENI, STOP and QUIT)\n", line.substr(0, line.find(' ')).c_str());
+            std::printf("ERR unsupported command '%s' (GEN, GENI, SAVE, RESTORE, STOP and QUIT)\n", line.substr(0, line.find(' ')).c_str());
             std::fflush(stdout);
             continue;
         }

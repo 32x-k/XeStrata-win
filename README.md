@@ -13,6 +13,7 @@ English | [日本語](README.ja.md)
 
 This branch ports upstream Strata's DeepSeek-V4.1-Flash engine (`strata-dsv41`, upstream commit `870aedd9`) to SYCL.
 On a Radeon AI PRO R9700 (Windows, free mode) it loads the UD-IQ1_S GGUF of DeepSeek-V4.1-Flash and answers questions about text and about a picture. Asked the same question, it generated the same tokens as upstream's HIP build. Speculative decoding with the draft model (DSpark) works as well.
+It also serves as the text model for the server's image generation (`POST /v1/images/generations`, and `generate_image` from a chat). Under `--image-gpu-policy` `unload` (which `auto` may pick) the conversation is saved to disk before the engine leaves the GPU for the image job and brought back at the next start. `shrink` (`--vram-elastic`) is not supported by this engine.
 Its speed is still being tuned. It has run on one R9700 only.
 
 ### Upstreams and thanks
