@@ -543,23 +543,27 @@ set(CMAKE_TRY_COMPILE_CONFIGURATION Release)
     return tc
 
 
-def build_windows(tag: str, xwin: Path, keep_build: bool, jobs: int | None) -> None:
-    host = ROOT / ".tools" / "intel-llvm-contrib" / "install"
+def build_windows(tag: str, xwin: Path, keep_build: bool, jobs: int | None, free: bool = False) -> None:
+    # the tools of the toolchain of the same mode (free: .tools/intel-llvm, contrib: .tools/intel-llvm-contrib):
+    # the same tag, and the CUDA target where the adapter needs it
+    mode = "free" if free else "contrib"
+    host = ROOT / ".tools" / ("intel-llvm" if free else "intel-llvm-contrib") / "install"
     rec = json.loads((host / "XESTRATA.json").read_text()) if (host / "XESTRATA.json").exists() else {}
-    if rec.get("tag") != tag or "cuda" not in rec.get("backends", []):
-        fail(f"--windows runs the tools of the contrib toolchain of {tag} on this machine, which is not built",
-             f"build it first: tools/intel_llvm_build.py --contrib --tag {tag}")
+    if rec.get("tag") != tag or (not free and "cuda" not in rec.get("backends", [])):
+        fail(f"--windows runs the tools of the {mode} toolchain of {tag} on this machine, which is not built",
+             f"build it first: tools/intel_llvm_build.py {'' if free else '--contrib '}--tag {tag}")
     lacking = [t for t in (*HOST_TOOLS, *HOST_TOOLS_EXTRA) if not (host / "bin" / t).exists()]
     if lacking:
-        fail(f"the contrib toolchain lacks {', '.join(lacking)} (built before --windows needed them)",
-             f"build it again: tools/intel_llvm_build.py --contrib --rebuild --tag {tag}")
+        fail(f"the {mode} toolchain lacks {', '.join(lacking)} (built before --windows needed them)",
+             f"build it again: tools/intel_llvm_build.py {'' if free else '--contrib '}--rebuild --tag {tag}")
     if not (xwin / "crt" / "include").is_dir():
         fail(f"no MSVC CRT and Windows SDK in {xwin}", "xwin's splat: docs/DEVTOOLS.md#windows-cross-build, or --xwin")
     prepare_source(tag)
-    cuda = fetch_win_cuda(OUT / "cuda")
+    # the CUDA adapter's headers and import libraries are not free software: the free mode has no CUDA adapter
+    cuda = None if free else fetch_win_cuda(OUT / "cuda")
     hip = win_hip(OUT / "hip") if "hip" in rec.get("backends", []) else None
     if hip is None:
-        say(f"note: no ROCm HIP for {WIN_HIP_DLL} here, or a contrib toolchain without the HIP target: the Windows "
+        say(f"note: no ROCm HIP for {WIN_HIP_DLL} here, or a {mode} toolchain without the HIP target: the Windows "
             "runtime without AMD GPUs")
     hb = host / "bin"
     # the device libraries: the host compiler for Windows, with the CRT's and the SDK's headers after its own
@@ -570,7 +574,7 @@ def build_windows(tag: str, xwin: Path, keep_build: bool, jobs: int | None) -> N
     options = [
         f"-DCMAKE_TOOLCHAIN_FILE={win_toolchain(xwin, hb)}", "-DCMAKE_BUILD_TYPE=Release",
         f"-DCMAKE_INSTALL_PREFIX={INSTALL}", "-DLLVM_ENABLE_ASSERTIONS=OFF",
-        f"-DLLVM_TARGETS_TO_BUILD=X86;SPIRV;NVPTX{';AMDGPU' if hip else ''}",
+        f"-DLLVM_TARGETS_TO_BUILD=X86;SPIRV{';NVPTX' if cuda else ''}{';AMDGPU' if hip else ''}",
         "-DLLVM_HOST_TRIPLE=x86_64-pc-windows-msvc",
         # BLAKE3's MASM files: LLVM's ml (llvm-ml) does not assemble them; the C versions are taken
         "-DLLVM_DISABLE_ASSEMBLY_FILES=ON",
@@ -584,13 +588,14 @@ def build_windows(tag: str, xwin: Path, keep_build: bool, jobs: int | None) -> N
         "-DLLVM_BUILD_TOOLS=ON", "-DSYCL_ENABLE_WERROR=OFF", "-DSYCL_INCLUDE_TESTS=OFF", "-DLLVM_ENABLE_DOXYGEN=OFF",
         "-DLLVM_ENABLE_SPHINX=OFF", "-DBUILD_SHARED_LIBS=OFF", "-DSYCL_ENABLE_XPTI_TRACING=ON",
         "-DLLVM_ENABLE_LLD=OFF", "-DLLVM_SPIRV_ENABLE_LIBSPIRV_DIS=OFF", "-DXPTI_ENABLE_WERROR=OFF",
-        f"-DSYCL_ENABLE_BACKENDS=level_zero;level_zero_v2;cuda;opencl{';hip' if hip else ''}",
+        f"-DSYCL_ENABLE_BACKENDS=level_zero;level_zero_v2;opencl{';cuda' if cuda else ''}{';hip' if hip else ''}",
         # no sycl-jit (the runtime compiler, kernel_compiler's), which the engine does not use: it would build most of
         # LLVM's code generation and clang for Windows
         "-DSYCL_ENABLE_EXTENSION_JIT=OFF",
         "-DSYCL_ENABLE_MAJOR_RELEASE_PREVIEW_LIB=OFF",
-        "-DSYCL_UR_FORCE_FETCH_LEVEL_ZERO=ON", f"-DCUDAToolkit_ROOT={cuda}", "-DLLVM_ENABLE_DIA_SDK=OFF",
+        "-DSYCL_UR_FORCE_FETCH_LEVEL_ZERO=ON", "-DLLVM_ENABLE_DIA_SDK=OFF",
         "-DLLVM_ENABLE_ZSTD=OFF",
+        *((f"-DCUDAToolkit_ROOT={cuda}",) if cuda else ()),
         # the device libraries' tools, this machine's (patch build-libdevice-custom-tools); each also by its own
         # variable, else LLVM's get_host_tool_path sets its *_target in the cache to a build of it for this machine
         f"-DLIBCLC_CUSTOM_LLVM_TOOLS_BINARY_DIR={hb}", f"-DSYCL_LIBDEVICE_CXX_FLAGS={devflags}",
@@ -607,12 +612,14 @@ def build_windows(tag: str, xwin: Path, keep_build: bool, jobs: int | None) -> N
     started = time.time()
     if not (BUILD / "build.ninja").exists():
         run(["cmake", "-G", "Ninja", "-S", s / "llvm", "-B", BUILD, *options], env=env)
-    targets = [*WIN_TARGETS, *(["ur_adapter_hip"] if hip else [])]
+    targets = [t for t in WIN_TARGETS if cuda or t != "ur_adapter_cuda"]
+    targets += ["ur_adapter_hip"] if hip else []
     run(["cmake", "--build", BUILD, "--target", *targets, "--", "-j", str(jobs or os.cpu_count() or 4)], env=env)
     shutil.rmtree(INSTALL, ignore_errors=True)
     for component in WIN_COMPONENTS:
         run(["cmake", "--install", BUILD, "--component", component])
-    for rel in (*WIN_FILES, *(["bin/ur_adapter_hip.dll"] if hip else [])):
+    for rel in (*[f for f in WIN_FILES if cuda or f != "bin/ur_adapter_cuda.dll"],
+                *(["bin/ur_adapter_hip.dll"] if hip else [])):
         (INSTALL / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(BUILD / rel, INSTALL / rel)
     shutil.copytree(s / "xpti" / "include" / "xpti", INSTALL / "include" / "xpti", dirs_exist_ok=True)
@@ -630,7 +637,8 @@ def build_windows(tag: str, xwin: Path, keep_build: bool, jobs: int | None) -> N
                 shutil.copy2(f, lic / f"{dep.name[:-4]}-{f.name}")
     commit = subprocess.run(["git", "-C", str(SRC), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     RECORD.write_text(json.dumps({"tag": tag, "commit": commit, "fixes": [patch_id(p) for p in PATCHES],
-                                  "target": "x86_64-pc-windows-msvc", "cuda": WIN_CUDA,
+                                  "target": "x86_64-pc-windows-msvc", "license": mode,
+                                  "cuda": WIN_CUDA if cuda else None,
                                   "hip": WIN_HIP_DLL if hip else None,
                                   "built": time.strftime("%Y-%m-%d %H:%M"),
                                   "minutes": round((time.time() - started) / 60)}, indent=1))
@@ -650,6 +658,9 @@ def main() -> None:
     ap.add_argument("--windows", action="store_true",
                     help="the SYCL runtime for Windows (headers, import libraries and DLLs, for a Windows engine built "
                          "here), cross-built with the --contrib toolchain's tools, into .tools/intel-llvm-win")
+    ap.add_argument("--free", action="store_true",
+                    help="with --windows: the free toolchain's tools instead, and no CUDA adapter (the Windows "
+                         "runtime of free software only)")
     ap.add_argument("--xwin", type=Path, default=ROOT / ".tools" / "xwin" / "sdk",
                     help="with --windows: xwin's splat of the MSVC CRT and the Windows SDK (default .tools/xwin/sdk)")
     ap.add_argument("--tag", default=TAG, help=f"the intel/llvm release to build (default {TAG})")
@@ -659,12 +670,16 @@ def main() -> None:
     ap.add_argument("--jobs", type=int, metavar="N",
                     help="compile N files at once (default: the threads; the links as many as the free RAM allows)")
     a = ap.parse_args()
+    if a.free and not a.windows:
+        ap.error("--free goes with --windows (the plain build is the free toolchain already)")
     if a.windows:
         set_out(WIN_OUT)
         have = json.loads(RECORD.read_text()) if RECORD.exists() else {}
-        if a.rebuild or have.get("tag") != a.tag or have.get("fixes") != [patch_id(p) for p in PATCHES]:
-            say(f"building intel/llvm {a.tag}'s SYCL runtime for Windows in {OUT} ...")
-            build_windows(a.tag, a.xwin.resolve(), a.keep_build, a.jobs)
+        mode = "free" if a.free else "contrib"
+        if a.rebuild or have.get("tag") != a.tag or have.get("fixes") != [patch_id(p) for p in PATCHES] \
+                or have.get("license", "contrib" if have.get("cuda") else None) != mode:
+            say(f"building intel/llvm {a.tag}'s SYCL runtime for Windows in {OUT} ({mode}) ...")
+            build_windows(a.tag, a.xwin.resolve(), a.keep_build, a.jobs, a.free)
         else:
             say(f"intel/llvm {a.tag}'s SYCL runtime for Windows is already built in {INSTALL}")
         say(str(INSTALL))
