@@ -84,9 +84,10 @@ SelectionShape selection_shape(const sycl::queue& q, int vocab, bool history) {
 struct SelectionMemory {
     sycl::queue& q;
     Selected* data = nullptr;
+    char* host = nullptr;   // the batch's staging: host USM a device copy can reach without a producer drain
     ~SelectionMemory() {
         // This guard is declared after the host vectors: even a failed transfer must finish using them first.
-        try { q.wait(); if (data) sycl::free(data, q); }
+        try { q.wait(); if (data) sycl::free(data, q); if (host) sycl::free(host, q); }
         catch (...) { std::terminate(); }
     }
     SelectionMemory(const SelectionMemory&) = delete;
@@ -247,35 +248,50 @@ void host_sample(const float* dlogits, int n_tokens, int n_vocab, const int* dhi
     const int KMAX = kMax;
     int k = (p.top_k > 0 && p.top_k < KMAX) ? p.top_k : KMAX;
     if (k > n_vocab) k = n_vocab;
-    std::vector<float> hlogits(device_select ? 0 : (size_t) n_tokens * n_vocab);
-    std::vector<float> hbias(!device_select && p.logit_bias ? (size_t) n_vocab : 0);
-    std::vector<int> hhistory(!device_select && use_history ? (size_t) n_tokens * history_len : 0);
-    std::vector<int> hout((size_t) n_tokens), hdraft;
-    std::vector<SpecList> hq(dql ? (size_t) n_tokens : 0);
-    std::vector<Selected> selected(device_select ? (size_t) n_tokens : 0);
-    if constexpr (MODE == 2) hdraft.resize((size_t) n_tokens);
+    const size_t n_sel = device_select ? (size_t) n_tokens : 0;
+    const size_t n_log = device_select ? 0 : (size_t) n_tokens * n_vocab;
+    const size_t n_bias = !device_select && p.logit_bias ? (size_t) n_vocab : 0;
+    const size_t n_hist = !device_select && use_history ? (size_t) n_tokens * history_len : 0;
+    const size_t n_ql = dql ? (size_t) n_tokens : 0;
+    const size_t n_draft = MODE == 2 ? (size_t) n_tokens : 0;
     SelectionMemory memory(stream);
+    // (one host-USM arena for every span a device copy touches: staging through ordinary host memory would send
+    // the readback through a barrier that drains the stream first on Windows HIP - one more round-trip a token)
+    const size_t need = n_sel * sizeof(Selected) + n_log * sizeof(float) + n_hist * sizeof(int) +
+                        n_bias * sizeof(float) + n_ql * sizeof(SpecList) + n_draft * sizeof(int) +
+                        (size_t) n_tokens * sizeof(int);
+    if (need) {
+        memory.host = sycl::malloc_host<char>(need, stream);
+        if (!memory.host) throw std::bad_alloc();
+    }
+    char* at = memory.host;
+    auto carve = [&at](size_t bytes) { char* p = at; at += (bytes + 15) & ~size_t(15); return p; };
+    Selected* selected = reinterpret_cast<Selected*>(carve(n_sel * sizeof(Selected)));
+    float* hlogits = reinterpret_cast<float*>(carve(n_log * sizeof(float)));
+    int* hhistory = reinterpret_cast<int*>(carve(n_hist * sizeof(int)));
+    float* hbias = reinterpret_cast<float*>(carve(n_bias * sizeof(float)));
+    SpecList* ql = reinterpret_cast<SpecList*>(carve(n_ql * sizeof(SpecList)));
+    int* hdraft = reinterpret_cast<int*>(carve(n_draft * sizeof(int)));
+    int* out = reinterpret_cast<int*>(carve((size_t) n_tokens * sizeof(int)));
     if (device_select) {
-        memory.data = sycl::malloc_device<Selected>(selected.size(), stream);
+        memory.data = sycl::malloc_device<Selected>(n_sel, stream);
         if (!memory.data) throw std::bad_alloc();
         select_candidates(dlogits, n_tokens, n_vocab, use_history ? dhistory : nullptr, history_len, p, k,
                           memory.data, nullptr, shape, stream);
     }
     const core::ReadbackSpan copies[] = {
-        {selected.data(), memory.data, selected.size() * sizeof(Selected)},
-        {hlogits.data(), dlogits, hlogits.size() * sizeof(float)},
-        {hhistory.data(), dhistory, hhistory.size() * sizeof(int)},
-        {hbias.data(), p.logit_bias, hbias.size() * sizeof(float)},
-        {hq.data(), dql, MODE == 2 ? hq.size() * sizeof(SpecList) : 0},
-        {hdraft.data(), ddraft, hdraft.size() * sizeof(int)},
+        {selected, memory.data, n_sel * sizeof(Selected)},
+        {hlogits, dlogits, n_log * sizeof(float)},
+        {hhistory, dhistory, n_hist * sizeof(int)},
+        {hbias, p.logit_bias, n_bias * sizeof(float)},
+        {ql, dql, MODE == 2 ? n_ql * sizeof(SpecList) : 0},
+        {hdraft, ddraft, n_draft * sizeof(int)},
     };
     core::readback(stream, copies);
-    const float* logits = hlogits.data();
-    const int* history = use_history ? hhistory.data() : nullptr;
-    int* out = hout.data();
-    SpecList* ql = hq.data();
-    const int* draft = hdraft.data();
-    const float* bias = p.logit_bias ? hbias.data() : nullptr;
+    const float* logits = hlogits;
+    const int* history = use_history ? hhistory : nullptr;
+    const int* draft = hdraft;
+    const float* bias = p.logit_bias ? hbias : nullptr;
     const float inv_t = p.temperature > 0.0f ? 1.0f / p.temperature : 0.0f;
     std::vector<float> sc(device_select ? 0 : (size_t) n_vocab);
     std::vector<int> idx(device_select ? 0 : (size_t) n_vocab);
@@ -401,8 +417,9 @@ void host_sample(const float* dlogits, int n_tokens, int n_vocab, const int* dhi
             out[t] = pick;
         }
     }
-    core::copy_async(stream, dout, hout.data(), hout.size() * sizeof(int)).wait_and_throw();
-    if constexpr (MODE == 1) core::copy_async(stream, dql, hq.data(), hq.size() * sizeof(SpecList)).wait_and_throw();
+    // (the writes' completion is the caller's stream sync / SelectionMemory's wait, as in the greedy path)
+    core::copy_async(stream, dout, out, (size_t) n_tokens * sizeof(int));
+    if constexpr (MODE == 1) core::copy_async(stream, dql, ql, n_ql * sizeof(SpecList));
 }
 
 void spec_check(const SamplerParams& p, int n_vocab) {
