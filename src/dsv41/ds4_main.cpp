@@ -1701,7 +1701,22 @@ int main(int argc, char** argv) try {
     long long d_off = 0, d_acc = 0, rounds = 0;
     bool cool = false;
     if (n > 0) {
-        int tok = m.sample(temp, 1.0f, temp > 0 ? 64 : 1, 0.0f, cli_seed, counter++);
+        // DS4_FORCE_IDS: feed this comma-separated token list instead of the sampled ones (the sampler still
+        // runs, its picks unused) - a fixed-trajectory comparison, e.g. against another engine's output ids
+        std::vector<int> forced;
+        if (const char* fp = std::getenv("DS4_FORCE_IDS")) {
+            if (std::FILE* f = std::fopen(fp, "rb")) {
+                int v = 0; bool any = false;
+                for (int c = std::fgetc(f); c != EOF; c = std::fgetc(f))
+                    if (c >= '0' && c <= '9') { v = v * 10 + (c - '0'); any = true; }
+                    else if (any) { forced.push_back(v); v = 0; any = false; }
+                if (any) forced.push_back(v);
+                std::fclose(f);
+            }
+        }
+        size_t fidx = 0;
+        auto feed_tok = [&](int t) { return fidx < forced.size() ? forced[fidx++] : t; };
+        int tok = feed_tok(m.sample(temp, 1.0f, temp > 0 ? 64 : 1, 0.0f, cli_seed, counter++));
         std::vector<int> got;
         for (;;) {
             out.push_back(tok);
@@ -1735,7 +1750,7 @@ int main(int argc, char** argv) try {
                 cool = try_spec && off == 0;
                 std::reverse(got.begin(), got.end());
             }
-            tok = got.back();
+            tok = feed_tok(got.back());
             got.pop_back();
         }
         std::printf("\n");
