@@ -42,6 +42,7 @@ Tensors outside the experts are read as BF16, F32, F16, MXFP8 or Q8_0, and dense
 | conversation save and restore (serve's session_file protocol) | yes |
 | questions about a picture | yes |
 | speculative decoding (DSpark) | yes |
+| LoRA (the image models') | yes |
 
 ### Upstreams and thanks
 
@@ -49,7 +50,7 @@ This branch is built on the work of the projects below. Our thanks go to their a
 
 - [Strata](https://github.com/Niko1221/Strata) (Niko1221 and the Strata contributors, MIT): the DeepSeek-V4.1-Flash engine `strata-dsv41` (upstream commit `870aedd9`) and its picture reader (`ds4_vision`). This branch ports them to SYCL.
 - [Project Maya](https://github.com/mw00/project-maya) (Peasant Smith, mw00, and the Project Maya contributors, including needmorevram, MIT): the origin of Strata's DeepSeek engine (maya-ds4, v1.1.17, commit `8d9a9b5d`) and the approaches of its later releases. The copyright and license notice is in `third_party/main/project-maya/NOTICE.md`.
-- [XeStrata](https://github.com/MistVVK/XeStrata) (MistVVK and the XeStrata contributors, LGPL-3.0-or-later): this branch's base (xe0.2.2-1) and the way its Windows package is made.
+- [XeStrata](https://github.com/MistVVK/XeStrata) (MistVVK and the XeStrata contributors, LGPL-3.0-or-later): this branch's base (xe0.2.8-1) and the way its Windows package is made.
 - [exllamav3](https://github.com/turboderp-org/exllamav3) (turboderp, MIT): EXL3's file layout and codebooks, and the origin of the CPU expert kernels.
 - [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (the ggml authors, MIT): GGUF's quantized formats and the origin of the kernels that read them.
 - Model: DeepSeek's DeepSeek-V4.1-Flash, and its GGUF (UD-IQ1_S) by [Unsloth](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF).

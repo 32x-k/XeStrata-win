@@ -42,6 +42,7 @@ Radeon AI PRO R9700（Windows、free モード）で、DeepSeek-V4.1-Flash の U
 | 会話の保存と復帰（serve の session_file プロトコル） | 対応 |
 | 画像を読む質問 | 対応 |
 | 推測デコード（DSpark） | 対応 |
+| LoRA（画像を作るモデルのもの） | 対応 |
 
 ### 参考にした上流と謝辞
 
@@ -49,7 +50,7 @@ Radeon AI PRO R9700（Windows、free モード）で、DeepSeek-V4.1-Flash の U
 
 - [Strata](https://github.com/Niko1221/Strata)（Niko1221 と Strata の貢献者、MIT）: DeepSeek-V4.1-Flash のエンジン `strata-dsv41`（上流のコミット `870aedd9`）と、画像を読む部分（`ds4_vision`）。このブランチはこれを SYCL に移しました。
 - [Project Maya](https://github.com/mw00/project-maya)（mw00 の Peasant Smith と、needmorevram をはじめとする Project Maya の貢献者、MIT）: Strata の DeepSeek のエンジンの元（maya-ds4、v1.1.17 のコミット `8d9a9b5d`）と、その後の版の考え方。著作権とライセンスの表記は `third_party/main/project-maya/NOTICE.md` にあります。
-- [XeStrata](https://github.com/MistVVK/XeStrata)（MistVVK と XeStrata の貢献者、LGPL-3.0-or-later）: このブランチの元（xe0.2.2-1）と、Windows の配布物の作り方。
+- [XeStrata](https://github.com/MistVVK/XeStrata)（MistVVK と XeStrata の貢献者、LGPL-3.0-or-later）: このブランチの元（xe0.2.8-1）と、Windows の配布物の作り方。
 - [exllamav3](https://github.com/turboderp-org/exllamav3)（turboderp、MIT）: EXL3 のファイルの形とコードブック、CPU のエキスパートのカーネルの元。
 - [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp)（ggml の作者、MIT）: GGUF の量子化の形と、それを読むカーネルの元。
 - モデル: DeepSeek の DeepSeek-V4.1-Flash と、[Unsloth](https://huggingface.co/unsloth/DeepSeek-V4.1-Flash-1017-GGUF) による GGUF（UD-IQ1_S）。
