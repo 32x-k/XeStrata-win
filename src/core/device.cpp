@@ -360,6 +360,14 @@ Runtime* Runtime::owner_of_stream(const void* stream) {
     return nullptr;
 }
 
+// STRATA_KERNEL_PROFILE (a diagnostic): the queues keep each command's GPU start and end (enable_profiling), for
+// readers of the kernels' own times such as dsv41's DS4_KPROF.  Every command then costs the runtime its timing.
+static sycl::property_list queue_properties() {
+    if (std::getenv("STRATA_KERNEL_PROFILE") != nullptr)
+        return sycl::property_list{sycl::property::queue::in_order{}, sycl::property::queue::enable_profiling{}};
+    return sycl::property_list{sycl::property::queue::in_order{}};
+}
+
 sycl::async_handler Runtime::handler() {
     return [this](sycl::exception_list errors) {
         std::lock_guard<std::mutex> lock(error_mutex_);
@@ -368,8 +376,8 @@ sycl::async_handler Runtime::handler() {
 }
 
 Runtime::Runtime(int ordinal, const sycl::device& device) : ordinal_(ordinal), device_(device), context_(device_),
-    compute_(context_, device_, handler(), sycl::property::queue::in_order{}),
-    transfer_(context_, device_, handler(), sycl::property::queue::in_order{}), watchdog_([this] { watch(); }) {
+    compute_(context_, device_, handler(), queue_properties()),
+    transfer_(context_, device_, handler(), queue_properties()), watchdog_([this] { watch(); }) {
     marks_by_barrier_ = measure_marks();
 }
 
@@ -414,14 +422,20 @@ bool Runtime::measure_marks() {
 sycl::queue* Runtime::create_stream(bool high_priority) {
     std::lock_guard<std::mutex> lock(streams_mutex_);
 #if defined(SYCL_EXT_ONEAPI_QUEUE_PRIORITY)
-    if (high_priority)
+    if (high_priority) {
+        if (std::getenv("STRATA_KERNEL_PROFILE") != nullptr)
+            return &streams_.emplace_back(context_, device_, handler(),
+                                          sycl::property_list{sycl::property::queue::in_order{},
+                                                              sycl::ext::oneapi::property::queue::priority_high{},
+                                                              sycl::property::queue::enable_profiling{}});
         return &streams_.emplace_back(context_, device_, handler(),
                                       sycl::property_list{sycl::property::queue::in_order{},
                                                           sycl::ext::oneapi::property::queue::priority_high{}});
+    }
 #else
     (void) high_priority;
 #endif
-    return &streams_.emplace_back(context_, device_, handler(), sycl::property::queue::in_order{});
+    return &streams_.emplace_back(context_, device_, handler(), queue_properties());
 }
 
 // The prompt path's expert copies on the GPU's copy engine (upstream 01fe68dd, in its sycl/ port): Level Zero's v2
