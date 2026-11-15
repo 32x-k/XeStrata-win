@@ -7,10 +7,11 @@
 #include "strata/core/runtime.hpp"
 #include "strata/core/readback.hpp"
 #include "strata/prefill/gemm.hpp"
+#include <cstdlib>
 #include <limits>
 #include <memory>
 
-constexpr bool ds4_dbg(const char*) { return false; }
+inline bool ds4_dbg(const char* k) { return std::getenv(k) != nullptr; }
 
 namespace strata::ds4::rt {
 
