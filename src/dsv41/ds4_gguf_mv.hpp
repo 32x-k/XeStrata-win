@@ -24,20 +24,58 @@ struct BoundBody {
     [[sycl::reqd_work_group_size(8 * SG), sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]]
     void operator()(sycl::nd_item<1> item) const { body(item); }
 };
+// The 2- and 3-dimensional forms carry the same launch bounds on the thread
+// dimension: the grid's other dimensions are work-groups (tile, row, job) so
+// the kernels read them from get_group() instead of dividing a flat id.
+template <int SG, class Body>
+struct BoundBody2 {
+    Body body;
+    [[sycl::reqd_work_group_size(8 * SG, 1), sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]]
+    void operator()(sycl::nd_item<2> item) const { body(item); }
+};
+template <int SG, class Body>
+struct BoundBody3 {
+    Body body;
+    [[sycl::reqd_work_group_size(8 * SG, 1, 1), sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]]
+    void operator()(sycl::nd_item<3> item) const { body(item); }
+};
 template <int SG, class Body>
 struct DynamicBody {
     Body body;
     [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]]
     void operator()(sycl::nd_item<1> item) const { body(item); }
 };
-template <int SG, class Submitter, class Body>
-void submit_body(Submitter& submitter, sycl::nd_range<1> range, size_t warps, Body body) {
+template <int SG, class Body>
+struct DynamicBody2 {
+    Body body;
+    [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]]
+    void operator()(sycl::nd_item<2> item) const { body(item); }
+};
+template <int SG, class Body>
+struct DynamicBody3 {
+    Body body;
+    [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]]
+    void operator()(sycl::nd_item<3> item) const { body(item); }
+};
+template <int SG, class Submitter, int D, class Body>
+void submit_body(Submitter& submitter, sycl::nd_range<D> range, size_t warps, Body body) {
+    static_assert(D >= 1 && D <= 3);
+    const auto bound_body = [&] {
+        if constexpr (D == 1) return BoundBody<SG, Body>{body};
+        else if constexpr (D == 2) return BoundBody2<SG, Body>{body};
+        else return BoundBody3<SG, Body>{body};
+    }();
+    const auto dynamic_body = [&] {
+        if constexpr (D == 1) return DynamicBody<SG, Body>{body};
+        else if constexpr (D == 2) return DynamicBody2<SG, Body>{body};
+        else return DynamicBody3<SG, Body>{body};
+    }();
     if constexpr (std::is_same_v<Submitter, sycl::queue>) {   // (no event: sycl_detail::launch)
-        if (warps == 8) sycl_detail::launch(submitter, range, BoundBody<SG, Body>{body});
-        else sycl_detail::launch(submitter, range, DynamicBody<SG, Body>{body});
+        if (warps == 8) sycl_detail::launch(submitter, range, bound_body);
+        else sycl_detail::launch(submitter, range, dynamic_body);
     } else {
-        if (warps == 8) submitter.parallel_for(range, BoundBody<SG, Body>{body});
-        else submitter.parallel_for(range, DynamicBody<SG, Body>{body});
+        if (warps == 8) submitter.parallel_for(range, bound_body);
+        else submitter.parallel_for(range, dynamic_body);
     }
 }
 
@@ -85,12 +123,13 @@ inline T load(const void* p) {
 template <int SG>
 void quantize(const QuantItems& items, int max_k, int max_rows, size_t warps, sycl::queue& q) {
     const size_t tiles = (size_t(max_k) / 32 + warps - 1) / warps, threads = warps * SG;
-    submit_body<SG>(q, sycl::nd_range<1>(tiles * max_rows * items.n * threads, threads), warps,
-                   [=](sycl::nd_item<1> it) {
+    submit_body<SG>(q, sycl::nd_range<3>({tiles * threads, size_t(max_rows), size_t(items.n)},
+                                        {threads, 1, 1}), warps,
+                   [=](sycl::nd_item<3> it) {
         // NOLINTNEXTLINE(clang-analyzer-core.UndefinedBinaryOperatorResult): the analyzer's host call has no nd_item
-        const size_t group = it.get_group_linear_id(), tile = group % tiles;
-        const int row = int(group / tiles % size_t(max_rows)), item = int(group / (tiles * max_rows));
-        const size_t block = tile * warps + it.get_local_linear_id() / SG;
+        const size_t tile = it.get_group(0);
+        const int row = int(it.get_group(1)), item = int(it.get_group(2));
+        const size_t block = tile * warps + it.get_local_id(0) / SG;
         const int k = items.k[item];
         if (row >= items.rows[item] || block >= size_t(k) / 32) return;
         const auto sg = it.get_sub_group();
@@ -117,11 +156,11 @@ void quantize(const QuantItems& items, int max_k, int max_rows, size_t warps, sy
 template <int NC, bool VEC, int SG>
 void bf16_kernel(const Jobs& jobs, int count, int max_n, size_t warps, sycl::queue& q) {
     const size_t tiles = (size_t(max_n) + warps - 1) / warps, threads = warps * SG;
-    submit_body<SG>(q, sycl::nd_range<1>(tiles * count * threads, threads), warps,
-                   [=](sycl::nd_item<1> it) {
-        const Job& b = jobs.j[it.get_group_linear_id() / tiles];
-        const size_t row = it.get_group_linear_id() % tiles * warps + it.get_local_linear_id() / SG;
-        const int lane = int(it.get_local_linear_id() % SG);
+    submit_body<SG>(q, sycl::nd_range<2>({tiles * threads, size_t(count)}, {threads, 1}), warps,
+                   [=](sycl::nd_item<2> it) {
+        const Job& b = jobs.j[it.get_group(1)];
+        const size_t row = it.get_group(0) * warps + it.get_local_id(0) / SG;
+        const int lane = int(it.get_local_id(0) % SG);
         if (row >= size_t(b.n)) return;
         const auto* w = static_cast<const uint16_t*>(b.w) + row * b.ld;
         float acc[NC] = {};
@@ -220,12 +259,12 @@ struct Fetch {
 template <int NC, bool ST, int SG>
 void q8_kernel(const Jobs& jobs, int count, int max_n, size_t warps, sycl::queue& q) {
     const size_t tiles = (size_t(max_n) + warps - 1) / warps, threads = warps * SG;
-    const sycl::nd_range<1> range(tiles * count * threads, threads);
-    const auto body = [=](sycl::nd_item<1> it, uint32_t* stage) {
-        const Job& b = jobs.j[it.get_group_linear_id() / tiles];
-        const size_t warp = it.get_local_linear_id() / SG;
-        const size_t row = it.get_group_linear_id() % tiles * warps + warp;
-        const int lane = int(it.get_local_linear_id() % SG);
+    const sycl::nd_range<2> range({tiles * threads, size_t(count)}, {threads, 1});
+    const auto body = [=](sycl::nd_item<2> it, uint32_t* stage) {
+        const Job& b = jobs.j[it.get_group(1)];
+        const size_t warp = it.get_local_id(0) / SG;
+        const size_t row = it.get_group(0) * warps + warp;
+        const int lane = int(it.get_local_id(0) % SG);
         if (row >= size_t(b.n)) return;
         const auto* w = static_cast<const uint8_t*>(b.w) + row * b.ld;
         const int blocks = b.k / 32;
@@ -262,11 +301,11 @@ void q8_kernel(const Jobs& jobs, int count, int max_n, size_t warps, sycl::queue
         }
     };
     if constexpr (!ST) {
-        submit_body<SG>(q, range, warps, [=](sycl::nd_item<1> it) { body(it, nullptr); });
+        submit_body<SG>(q, range, warps, [=](sycl::nd_item<2> it) { body(it, nullptr); });
     } else {
 #if defined(SYCL_EXT_ONEAPI_LOCAL_MEMORY)
         if (warps == 8) {
-            submit_body<SG>(q, range, warps, [=](sycl::nd_item<1> it) {
+            submit_body<SG>(q, range, warps, [=](sycl::nd_item<2> it) {
                 auto stage = sycl::ext::oneapi::group_local_memory_for_overwrite<uint32_t[8 * SG * kQ8Bytes / 4]>(it.get_group());
                 body(it, *stage.get());
             });
@@ -275,7 +314,7 @@ void q8_kernel(const Jobs& jobs, int count, int max_n, size_t warps, sycl::queue
 #endif
         sycl_detail::submit(q, [&](sycl::handler& h) {
             sycl::local_accessor<uint32_t, 1> storage(warps * SG * kQ8Bytes / 4, h);
-            submit_body<SG>(h, range, warps, [=](sycl::nd_item<1> it) {
+            submit_body<SG>(h, range, warps, [=](sycl::nd_item<2> it) {
                 body(it, storage.template get_multi_ptr<sycl::access::decorated::no>().get());
             });
         });
@@ -288,11 +327,11 @@ void q8_kernel(const Jobs& jobs, int count, int max_n, size_t warps, sycl::queue
 template <int T, int NC, int SG>
 void iq_kernel(const Jobs& jobs, int count, int max_n, size_t warps, sycl::queue& q) {
     const size_t tiles = (size_t(max_n) + warps - 1) / warps, threads = warps * SG;
-    submit_body<SG>(q, sycl::nd_range<1>(tiles * count * threads, threads), warps,
-                   [=](sycl::nd_item<1> it) {
-        const Job& b = jobs.j[it.get_group_linear_id() / tiles];
-        const size_t row = it.get_group_linear_id() % tiles * warps + it.get_local_linear_id() / SG;
-        const int lane = int(it.get_local_linear_id() % SG);
+    submit_body<SG>(q, sycl::nd_range<2>({tiles * threads, size_t(count)}, {threads, 1}), warps,
+                   [=](sycl::nd_item<2> it) {
+        const Job& b = jobs.j[it.get_group(1)];
+        const size_t row = it.get_group(0) * warps + it.get_local_id(0) / SG;
+        const int lane = int(it.get_local_id(0) % SG);
         if (row >= size_t(b.n)) return;
         const auto* w = static_cast<const uint8_t*>(b.w) + row * b.ld;
         const int blocks = b.k / 32;
