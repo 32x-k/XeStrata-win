@@ -473,9 +473,7 @@ bool sparse_attn_register(const float* q, const uint16_t* win, const void* ckv, 
     }
     const long long p0 = a.p0;
     const int t0 = a.t0, window = a.win, compression = a.R, cap = a.kcap;
-    sycl_detail::submit(s, [&](sycl::handler& h) {
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(size_t(T) * head_tiles * local), sycl::range<1>(local)),
-                       [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
+    sycl_detail::launch(s, sycl::nd_range<1>(sycl::range<1>(size_t(T) * head_tiles * local), sycl::range<1>(local)), [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
             const auto group = item.get_group();
             const auto sg = item.get_sub_group();
             const size_t lane = item.get_local_linear_id(), sl = sg.get_local_linear_id();
@@ -565,7 +563,6 @@ bool sparse_attn_register(const float* q, const uint16_t* win, const void* ckv, 
                 for (int k = 0; k < V; ++k) out[base + sl + size_t(k) * SG] = accum[k] / denominator;
             }
         });
-    });
     return true;
 }
 // Reproduce the existing lane31 inclusive-prefix tree. Each 16-lane row
@@ -935,12 +932,17 @@ template <bool Contig, int SG>
 void sparse_rows(const float* q, const uint16_t* win, const uint16_t* rows_base, const int* sel, int sel_stride,
                  const AttnRows& a, const float* sink, int heads, int T, float scale, float* out, sycl::queue& s) {
     constexpr int WG = 256, Tile = 64, D = 512, Per = D / SG;
-    sycl_detail::submit(s, [&](sycl::handler& h) {
-        sycl::local_accessor<float, 1> qs(sycl::range<1>(D), h), sc(sycl::range<1>(Tile), h), st(sycl::range<1>(3), h);
-        // A tile's rows as element offsets: a window row from win, a selected row from rows_base (negated, less one).
-        sycl::local_accessor<long long, 1> rows(sycl::range<1>(Tile), h);
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(size_t(T) * heads * WG), sycl::range<1>(WG)),
-                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
+    {
+        auto kern = [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
+            auto qs_s = sycl::ext::oneapi::group_local_memory_for_overwrite<float[D]>(it.get_group());
+            float* qs = (*qs_s.get());
+            auto sc_s = sycl::ext::oneapi::group_local_memory_for_overwrite<float[Tile]>(it.get_group());
+            float* sc = (*sc_s.get());
+            auto st_s = sycl::ext::oneapi::group_local_memory_for_overwrite<float[3]>(it.get_group());
+            float* st = (*st_s.get());
+            // A tile's rows as element offsets: a window row from win, a selected row from rows_base (negated, less one).
+            auto rows_s = sycl::ext::oneapi::group_local_memory_for_overwrite<long long[Tile]>(it.get_group());
+            long long* rows = (*rows_s.get());
             const int g = int(it.get_group_linear_id()), t = g / heads, hh = g % heads;
             const int tid = int(it.get_local_linear_id());
             const auto c = attn_counts(a, t);
@@ -1017,8 +1019,9 @@ void sparse_rows(const float* q, const uint16_t* win, const uint16_t* rows_base,
             float* ov = out + (size_t(t) * heads + hh) * D;
             ov[size_t(tid) * 2] = o0 / den;
             ov[size_t(tid) * 2 + 1] = o1 / den;
-        });
-    });
+        };
+        sycl_detail::launch(s, sycl::nd_range<1>(sycl::range<1>(size_t(T) * heads * WG), sycl::range<1>(WG)), kern);
+    }
 }
 // The subgroup width for upstream's warp-a-row GEMVs (eight rows a group), or 0.
 int gemv_warp_width(const sycl::queue& s) {
@@ -1387,10 +1390,12 @@ bool topk_group(const float* vals, long long stride, int T, const Rows& r, const
     if (topk_ballot_group<32>(vals, stride, T, r, cand, cand_stride, blk, out, out_stride, wg, caps, s)) return true;
     if (topk_ballot_group<16>(vals, stride, T, r, cand, cand_stride, blk, out, out_stride, wg, caps, s)) return true;
 #endif
-    sycl_detail::submit(s, [&](sycl::handler& h) {
-        sycl::local_accessor<unsigned, 1> hist(sycl::range<1>(256), h);
-        sycl::local_accessor<uint32_t, 1> state(sycl::range<1>(3), h);   // prefix, mask, remaining
-        h.parallel_for(sycl::nd_range<1>(size_t(T) * wg, wg), [=](sycl::nd_item<1> item) {
+    {
+        auto kern = [=](sycl::nd_item<1> item)  {
+            auto hist_s = sycl::ext::oneapi::group_local_memory_for_overwrite<unsigned[256]>(item.get_group());
+            unsigned* hist = (*hist_s.get());
+            auto state_s = sycl::ext::oneapi::group_local_memory_for_overwrite<uint32_t[3]>(item.get_group());
+            uint32_t* state = (*state_s.get());
             const auto group = item.get_group();
             const int t = int(item.get_group_linear_id()), tid = int(item.get_local_linear_id()), step = int(wg);
             int n, k;
@@ -1449,8 +1454,9 @@ bool topk_group(const float* vals, long long stride, int T, const Rows& r, const
                 cnt_gt += sycl::reduce_over_group(group, gt, sycl::plus<int>());
                 cnt_eq += sycl::reduce_over_group(group, eq, sycl::plus<int>());
             }
-        });
-    });
+        };
+        sycl_detail::launch(s, sycl::nd_range<1>(size_t(T) * wg, wg), kern);
+    }
     return true;
 }
 }
@@ -2088,7 +2094,7 @@ void engram_gate(float* h,const float* kv,const float* w,int hc,int dim,int T,fl
     }
     const size_t local=std::min(reported,size_t(dim));
     sycl_detail::require_in_order(s);
-    sycl_detail::submit(s,[&](sycl::handler& handler){handler.parallel_for(sycl::nd_range<1>(size_t(T)*size_t(hc)*local,local),[=](sycl::nd_item<1> it){
+    sycl_detail::launch(s, sycl::nd_range<1>(size_t(T)*size_t(hc)*local,local), [=](sycl::nd_item<1> it)  {
         const size_t z=it.get_group_linear_id(),t=z/size_t(hc),k=z%size_t(hc),lane=it.get_local_linear_id();
         float* row=h+z*size_t(dim);const float* key=kv+(t*size_t(hc+1)+k)*size_t(dim);const float* value=kv+(t*size_t(hc+1)+size_t(hc))*size_t(dim);
         float sh=0.f,sk=0.f,sd=0.f;
@@ -2097,7 +2103,7 @@ void engram_gate(float* h,const float* kv,const float* w,int hc,int dim,int T,fl
         const float dot=sd*sycl::rsqrt(sh/float(dim)+eps)*sycl::rsqrt(sk/float(dim)+eps)*sycl::rsqrt(float(dim));
         const float sq=sycl::copysign(sycl::sqrt(sycl::fmax(sycl::fabs(dot),1e-6f)),dot);const float gate=1.f/(1.f+sycl::exp(-sq));
         for(size_t e=lane;e<size_t(dim);e+=local)row[e]+=gate*value[e];
-    });});
+    });
 }
 void gather_rows(const float* x, const Gather& g, int n, int cols, float* out, sycl::queue& s) {
     parallel(s, size_t(n) * cols, [=](size_t z) { out[z] = x[size_t(g.src[z / cols]) * cols + z % cols]; });
@@ -2383,8 +2389,7 @@ void moe_sort(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds
     size_t wg = 1;
     while (wg <= limit / 2) wg *= 2;
     // Each group owns one slot. Integer scans preserve ascending token/pick order.
-    sycl_detail::submit(s, [&](sycl::handler& h) {
-        h.parallel_for(sycl::nd_range<1>(size_t(n_vs) * wg, wg), [=](sycl::nd_item<1> item) {
+    sycl_detail::launch(s, sycl::nd_range<1>(size_t(n_vs) * wg, wg), [=](sycl::nd_item<1> item)  {
             const size_t slot = item.get_group_linear_id(), lane = item.get_local_linear_id();
             int count = 0;
             for (size_t q = lane; q < total; q += wg)
@@ -2392,24 +2397,20 @@ void moe_sort(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds
             const int sum = sycl::reduce_over_group(item.get_group(), count, sycl::plus<int>());
             if (lane == 0) bounds[slot + 1] = sum;
         });
-    });
     size_t scan_wg = 1;
     while (scan_wg < size_t(n_vs) + 1 && scan_wg <= caps.max_group / 2) scan_wg *= 2;
     if (scan_wg >= size_t(n_vs) + 1) {
-        sycl_detail::submit(s, [&](sycl::handler& h) {
-            h.parallel_for(sycl::nd_range<1>(scan_wg, scan_wg), [=](sycl::nd_item<1> item) {
+        sycl_detail::launch(s, sycl::nd_range<1>(scan_wg, scan_wg), [=](sycl::nd_item<1> item)  {
                 const size_t lane = item.get_local_linear_id();
                 const int count = lane && lane <= size_t(n_vs) ? bounds[lane] : 0;
                 sycl::group_barrier(item.get_group());
                 const int prefix = sycl::inclusive_scan_over_group(item.get_group(), count, sycl::plus<int>());
                 if (lane <= size_t(n_vs)) bounds[lane] = prefix;
             });
-        });
     } else {
         sycl_detail::single(s, [=] { bounds[0] = 0; for (int i = 0; i < n_vs; ++i) bounds[i + 1] += bounds[i]; });
     }
-    sycl_detail::submit(s, [&](sycl::handler& h) {
-        h.parallel_for(sycl::nd_range<1>(size_t(n_vs) * wg, wg), [=](sycl::nd_item<1> item) {
+    sycl_detail::launch(s, sycl::nd_range<1>(size_t(n_vs) * wg, wg), [=](sycl::nd_item<1> item)  {
             const size_t slot = item.get_group_linear_id(), lane = item.get_local_linear_id();
             int base = bounds[slot];
             for (size_t start = 0; start < total; start += wg) {
@@ -2424,7 +2425,6 @@ void moe_sort(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds
                 base += count;
             }
         });
-    });
 }
 void moe_combine(float* acc, const float* y, const int* pos, const float* w, int T, int k, int r0, int r1, int dim, sycl::queue& s) {
     parallel(s, size_t(T) * dim, [=](size_t z) {

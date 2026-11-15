@@ -20,10 +20,12 @@ template <int SG>
 void compress_kernel(const float* kv, const float* score, float* kv_state, float* score_state,
                      int ratio, int p0, int T, int d, const float* w, float eps, float* latent, sycl::queue& q) {
     constexpr int threads = finish_detail::kThreads;
-    sycl_detail::submit(q, [&](sycl::handler& handler) {
-        sycl::local_accessor<float, 1> red(sycl::range<1>(threads / 32 + 1), handler);
-        sycl::local_accessor<uint32_t, 1> exchange(sycl::range<1>(SG == 16 ? threads : 1), handler);
+    {
         auto body = [=](sycl::nd_item<1> item) {
+            auto red_s = sycl::ext::oneapi::group_local_memory_for_overwrite<float[threads / 32 + 1]>(item.get_group());
+            auto ex_s = sycl::ext::oneapi::group_local_memory_for_overwrite<uint32_t[SG == 16 ? threads : 1]>(item.get_group());
+            float* red = (*red_s.get());
+            uint32_t* exchange = (*ex_s.get());
             const int tid = int(item.get_local_linear_id());
             const int count = (d + threads - 1) / threads;
             int g = 0;
@@ -66,9 +68,9 @@ void compress_kernel(const float* kv, const float* score, float* kv_state, float
                 item.barrier(sycl::access::fence_space::global_and_local);
             }
         };
-        handler.parallel_for(sycl::nd_range<1>(threads, threads),
-                             finish_detail::BoundBody<SG, decltype(body)>{body});
-    });
+        sycl_detail::launch(q, sycl::nd_range<1>(threads, threads),
+                            finish_detail::BoundBody<SG, decltype(body)>{body});
+    }
 }
 
 inline bool compress(const float* kv, const float* score, float* kv_state, float* score_state,

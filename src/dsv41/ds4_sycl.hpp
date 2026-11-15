@@ -3,6 +3,7 @@
 #pragma once
 
 #include <sycl/sycl.hpp>
+#include <sycl/ext/oneapi/group_local_memory.hpp>
 #if defined(SYCL_EXT_ONEAPI_ENQUEUE_FUNCTIONS)
 #include <sycl/ext/oneapi/experimental/enqueue_functions.hpp>
 #endif

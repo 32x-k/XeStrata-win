@@ -94,11 +94,14 @@ void gate_up_kernel(const Args& a, int groups, size_t warps, sycl::queue& q) {
     static_assert(LPR % BPS == 0);
     const size_t threads = warps * SG, tiles = size_t(a.n_ff) / warps;
     const size_t rb = row_bytes_t<T>(a.n_embd);
-    sycl_detail::submit(q, [&](sycl::handler& h) {
-        sycl::local_accessor<uint32_t, 1> tab(sycl::range<1>(Ty<T>::TAB > 0 ? Ty<T>::TAB : 1), h);
-        sycl::local_accessor<int, 1> entries(sycl::range<1>(NE), h), inputs(sycl::range<1>(NE), h);
-        h.parallel_for(sycl::nd_range<1>(size_t(groups) * tiles * threads, threads),
-                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
+    {
+        auto body = [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
+            auto tab_s = sycl::ext::oneapi::group_local_memory_for_overwrite<uint32_t[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1]>(it.get_group());
+            auto en_s = sycl::ext::oneapi::group_local_memory_for_overwrite<int[NE]>(it.get_group());
+            auto in_s = sycl::ext::oneapi::group_local_memory_for_overwrite<int[NE]>(it.get_group());
+            uint32_t* tab = (*tab_s.get());
+            int* entries = (*en_s.get());
+            int* inputs = (*in_s.get());
             const size_t tid = it.get_local_linear_id(), tile = it.get_group_linear_id() % tiles;
             const int grp = int(it.get_group_linear_id() / tiles);
             const uint8_t* blob;
@@ -106,7 +109,7 @@ void gate_up_kernel(const Args& a, int groups, size_t warps, sycl::queue& q) {
             if (!group(a, grp, blob, first, end)) return;
             if constexpr (Ty<T>::TAB > 0)
                 for (size_t j = tid; j < size_t(Ty<T>::TAB); j += threads) tab[j] = table<T>()[j];
-            const auto* grid = tab.template get_multi_ptr<sycl::access::decorated::no>().get();
+            const auto* grid = tab;
             const int lane = int(tid % SG), row = int(tile * warps + tid / SG);
             const int ib = lane % BPS, first_block = lane / BPS;
             const int subblocks = a.n_embd / 32, blocks = subblocks / BPS;
@@ -145,8 +148,9 @@ void gate_up_kernel(const Args& a, int groups, size_t warps, sycl::queue& q) {
                     if (lane == 0) a.h[size_t(entries[i]) * a.n_ff + size_t(row)] = swiglu(gv, uv, a.limit);
                 }
             }
-        });
-    });
+        };
+        sycl_detail::launch(q, sycl::nd_range<1>(size_t(groups) * tiles * threads, threads), body);
+    }
 }
 
 // Upstream 870aedd9 ds4_iq.cu down_kernel<T,NE,2>: two independent half-subgroup rows.
@@ -156,11 +160,12 @@ void down_kernel(const Args& a, int groups, size_t warps, sycl::queue& q) {
     static_assert(LPR % BPS == 0);
     const size_t threads = warps * SG, tiles = size_t(a.n_embd) / (warps * RW);
     const size_t rb = row_bytes_t<T>(a.n_ff);
-    sycl_detail::submit(q, [&](sycl::handler& h) {
-        sycl::local_accessor<uint32_t, 1> tab(sycl::range<1>(Ty<T>::TAB > 0 ? Ty<T>::TAB : 1), h);
-        sycl::local_accessor<int, 1> entries(sycl::range<1>(NE), h);
-        h.parallel_for(sycl::nd_range<1>(size_t(groups) * tiles * threads, threads),
-                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
+    {
+        auto body = [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
+            auto tab_s = sycl::ext::oneapi::group_local_memory_for_overwrite<uint32_t[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1]>(it.get_group());
+            auto en_s = sycl::ext::oneapi::group_local_memory_for_overwrite<int[NE]>(it.get_group());
+            uint32_t* tab = (*tab_s.get());
+            int* entries = (*en_s.get());
             const size_t tid = it.get_local_linear_id(), tile = it.get_group_linear_id() % tiles;
             const int grp = int(it.get_group_linear_id() / tiles);
             const uint8_t* blob;
@@ -168,7 +173,7 @@ void down_kernel(const Args& a, int groups, size_t warps, sycl::queue& q) {
             if (!group(a, grp, blob, first, end)) return;
             if constexpr (Ty<T>::TAB > 0)
                 for (size_t j = tid; j < size_t(Ty<T>::TAB); j += threads) tab[j] = table<T>()[j];
-            const auto* grid = tab.template get_multi_ptr<sycl::access::decorated::no>().get();
+            const auto* grid = tab;
             const int lane_sg = int(tid % SG), lane = lane_sg % LPR;
             const int row = int((tile * warps + tid / SG) * RW) + lane_sg / LPR;
             const int ib = lane % BPS, first_block = lane / BPS;
@@ -202,8 +207,9 @@ void down_kernel(const Args& a, int groups, size_t warps, sycl::queue& q) {
                     if (lane == 0) a.part[size_t(entries[i]) * a.n_embd + size_t(row)] = value;
                 }
             }
-        });
-    });
+        };
+        sycl_detail::launch(q, sycl::nd_range<1>(size_t(groups) * tiles * threads, threads), body);
+    }
 }
 
 template <int T, bool GU, int SG>

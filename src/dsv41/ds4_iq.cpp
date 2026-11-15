@@ -456,10 +456,10 @@ bool light_lane_run(const SetArgs& a, size_t rb, sycl::queue& s, LightQ8 q) {
     if (!columns) return false;
     const size_t nc = (size_t(n) + columns - 1) / columns, threads = columns * SG;
     sycl_detail::require_in_order(s);
-    sycl_detail::submit(s, [&](sycl::handler& h) {
-        sycl::local_accessor<uint32_t, 1> tab(sycl::range<1>(Ty<T>::TAB > 0 ? Ty<T>::TAB : 1), h);
-        h.parallel_for(sycl::nd_range<1>(size_t(a.n_exp) * nc * threads, threads),
-                       [a, q, rb, k, n, columns, nc, tab](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
+    sycl_detail::launch(s, sycl::nd_range<1>(size_t(a.n_exp) * nc * threads, threads),
+                       [a, q, rb, k, n, columns, nc](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
+            auto tab_s = sycl::ext::oneapi::group_local_memory_for_overwrite<uint32_t[Ty<T>::TAB > 0 ? Ty<T>::TAB : 1]>(it.get_group());
+            uint32_t* tab = (*tab_s.get());
             const size_t id = it.get_local_linear_id(), group = it.get_group_linear_id(), e = group / nc;
             const int count = a.bounds[e + 1] - a.bounds[e], first = a.bounds[e] - a.row0;
             if (count <= 0 || count > kLightRows) return;
@@ -469,7 +469,7 @@ bool light_lane_run(const SetArgs& a, size_t rb, sycl::queue& s, LightQ8 q) {
             const auto sg = it.get_sub_group();
             const size_t col = (group % nc) * columns + sg.get_group_linear_id();
             if (col >= size_t(n)) return;
-            const auto* grids = tab.template get_multi_ptr<sycl::access::decorated::no>().get();
+            const auto* grids = tab;
             const uint8_t* blob = a.wbase + e * a.stride;
             float sums[R]{}, ups[GU ? R : 1]{};
             for (int kb = int(sg.get_local_linear_id()); kb < k / 32; kb += SG) {
@@ -497,7 +497,6 @@ bool light_lane_run(const SetArgs& a, size_t rb, sycl::queue& s, LightQ8 q) {
                 else a.y[out] = sum;
             }
         });
-    });
     return true;
 }
 

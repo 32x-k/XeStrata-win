@@ -76,7 +76,7 @@ inline float warp_sum(sycl::sub_group group, float value) {
 // memory, then subgroup 0. SG32 preserves the original order exactly. SG16
 // folds the extra subgroup sums in each lane before its final XOR reduction.
 template <int SG, int WG>
-inline float block_sum(sycl::nd_item<1> item, float value, sycl::local_accessor<float, 1> red) {
+inline float block_sum(sycl::nd_item<1> item, float value, float* red) {
     const size_t tid = item.get_local_linear_id(), lane = tid % SG, warp = tid / SG;
     value = warp_sum<SG>(item.get_sub_group(), value);
     if (lane == 0) red[warp] = value;
@@ -183,7 +183,7 @@ inline sycl::float4 load4(const float* pointer) {
 // the publication barriers. Each half has its own local-memory slots.
 template <int SG, int WG>
 inline sycl::float2 block_sum_pair(sycl::nd_item<1> item, float first, float second,
-                                    sycl::local_accessor<float, 1> red) {
+                                    float* red) {
     constexpr size_t stride = WG / SG + 1;
     const size_t tid = item.get_local_linear_id(), lane = tid % SG, warp = tid / SG;
     first = warp_sum<SG>(item.get_sub_group(), first);
@@ -208,11 +208,14 @@ template <int SG, bool Fused>
 void mix_kernel(const float* h, const float* fn, int hcdim, int n_mix, int tokens, float eps,
                 float* mixes, unsigned* counters, const Split& split, sycl::queue& q) {
     constexpr int WG = 256;
-    sycl_detail::submit(q, [&](sycl::handler& handler) {
-        sycl::local_accessor<float, 1> red(sycl::range<1>(2 * (WG / SG + 1)), handler);
-        sycl::local_accessor<float, 1> smx(sycl::range<1>(Fused ? 32 : 1), handler);
-        sycl::local_accessor<unsigned, 1> last(sycl::range<1>(1), handler);
+    {
         auto body = [=](sycl::nd_item<1> item) {
+            auto red_s = sycl::ext::oneapi::group_local_memory_for_overwrite<float[2 * (WG / SG + 1)]>(item.get_group());
+            auto smx_s = sycl::ext::oneapi::group_local_memory_for_overwrite<float[Fused ? 32 : 1]>(item.get_group());
+            auto last_s = sycl::ext::oneapi::group_local_memory_for_overwrite<unsigned[1]>(item.get_group());
+            float* red = (*red_s.get());
+            float* smx = (*smx_s.get());
+            unsigned* last = (*last_s.get());
             const size_t tid = item.get_local_linear_id(), index = item.get_group_linear_id();
             const size_t token = index / size_t(n_mix), mix = index % size_t(n_mix);
             const float* x = h + token * hcdim;
@@ -245,8 +248,7 @@ void mix_kernel(const float* h, const float* fn, int hcdim, int n_mix, int token
                     for (size_t i = tid; i < 32; i += SG)
                         smx[i] = i < size_t(n_mix) ? mixes[token * 32 + i] : 0.f;
                     sycl::group_barrier(item.get_sub_group());
-                    split_body<SG>(item.get_sub_group(),
-                        smx.template get_multi_ptr<sycl::access::decorated::no>().get(), token, split);
+                    split_body<SG>(item.get_sub_group(), smx, token, split);
                 }
                 if (tid == 0) {
                     sycl::atomic_ref<unsigned, sycl::memory_order::relaxed, sycl::memory_scope::device,
@@ -255,8 +257,9 @@ void mix_kernel(const float* h, const float* fn, int hcdim, int n_mix, int token
                 }
             }
         };
-        handler.parallel_for(sycl::nd_range<1>(size_t(tokens) * n_mix * WG, WG), BoundBody<SG, WG, decltype(body)>{body});
-    });
+        sycl_detail::launch(q, sycl::nd_range<1>(size_t(tokens) * n_mix * WG, WG),
+                            BoundBody<SG, WG, decltype(body)>{body});
+    }
 }
 inline bool mix(const float* h, const float* fn, int hcdim, int n_mix, int tokens, float eps,
                 float* mixes, sycl::queue& q, unsigned* counters = nullptr, const Split* split = nullptr) {
@@ -314,7 +317,7 @@ inline bool split(const float* mixes, int tokens, const Split& args, sycl::queue
 template <int SG, int WG, class Item>
 inline void pre_norm_body(Item item, const float* h, const float* mix, const float* w, int dim, int hc,
                           size_t token, float eps, float* x, int8_t* q, float* qd,
-                          sycl::local_accessor<float, 1> red) {
+                          float* red) {
     const size_t tid = item.get_local_linear_id();
     const float* row = h + token * size_t(hc) * dim;
     const float* pre = mix + token * 8;
@@ -347,13 +350,12 @@ template <int SG>
 void pre_norm_kernel(const float* h, const float* mix, const float* w, int dim, int hc, int tokens,
                      float eps, float* x, sycl::queue& q) {
     constexpr int WG = 1024;
-    sycl_detail::submit(q, [&](sycl::handler& handler) {
-        sycl::local_accessor<float, 1> red(sycl::range<1>(WG / SG + 1), handler);
-        auto body = [=](sycl::nd_item<1> item) {
-            pre_norm_body<SG, WG>(item, h, mix, w, dim, hc, item.get_group_linear_id(), eps, x, nullptr, nullptr, red);
-        };
-        handler.parallel_for(sycl::nd_range<1>(size_t(tokens) * WG, WG), BoundBody<SG, WG, decltype(body)>{body});
-    });
+    auto body = [=](sycl::nd_item<1> item) {
+        auto red_s = sycl::ext::oneapi::group_local_memory_for_overwrite<float[WG / SG + 1]>(item.get_group());
+        pre_norm_body<SG, WG>(item, h, mix, w, dim, hc, item.get_group_linear_id(), eps, x,
+                              nullptr, nullptr, (*red_s.get()));
+    };
+    sycl_detail::launch(q, sycl::nd_range<1>(size_t(tokens) * WG, WG), BoundBody<SG, WG, decltype(body)>{body});
 }
 inline bool pre_norm(const float* h, const float* mix, const float* w, int dim, int hc, int tokens,
                      float eps, float* x, sycl::queue& q) {
@@ -388,9 +390,10 @@ struct SplitPreNorm {
 template <int SG>
 void split_pre_norm_kernel(const SplitPreNorm& a, int tokens, sycl::queue& q) {
     constexpr int WG = 1024;
-    sycl_detail::submit(q, [&](sycl::handler& handler) {
-        sycl::local_accessor<float, 1> red(sycl::range<1>(WG / SG + 1), handler);
+    {
         auto body = [=](sycl::nd_item<1> item) {
+            auto red_s = sycl::ext::oneapi::group_local_memory_for_overwrite<float[WG / SG + 1]>(item.get_group());
+            float* red = (*red_s.get());
             const size_t group = item.get_group_linear_id(), token = group >> 1;
             if ((group & 1u) == 0) {
                 pre_norm_body<SG, WG>(item, a.h, a.mix, a.w, a.dim, a.hc, token, a.eps, a.x, a.q, a.qd, red);
@@ -401,8 +404,9 @@ void split_pre_norm_kernel(const SplitPreNorm& a, int tokens, sycl::queue& q) {
             const Split s{a.scale, a.base, a.hc, a.iters, a.hc_eps, a.pre, a.post, a.comb};
             split_body<SG>(item.get_sub_group(), a.mixes + token * 32, token, s);
         };
-        handler.parallel_for(sycl::nd_range<1>(size_t(tokens) * 2 * WG, WG), BoundBody<SG, WG, decltype(body)>{body});
-    });
+        sycl_detail::launch(q, sycl::nd_range<1>(size_t(tokens) * 2 * WG, WG),
+                            BoundBody<SG, WG, decltype(body)>{body});
+    }
 }
 // 0: nothing launched (the caller takes the separate launches); 1: launched, x left unrounded (no
 // 32-lane subgroup for the int8 blocks - q / qd are not touched); 2: launched and x rounded.

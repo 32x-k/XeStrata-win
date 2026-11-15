@@ -72,7 +72,7 @@ struct BoundBody {
 // Every item in the WG calls this helper: the offset-16 exchange uses LDS,
 // with a second barrier before any caller can reuse the same scratch.
 template <int SG, class T>
-inline T xor32(sycl::nd_item<1> item, T value, int offset, sycl::local_accessor<uint32_t, 1> exchange) {
+inline T xor32(sycl::nd_item<1> item, T value, int offset, uint32_t* exchange) {
     if constexpr (SG == 16) {
         if (offset == 16) {
             const size_t tid = item.get_local_linear_id();
@@ -86,7 +86,7 @@ inline T xor32(sycl::nd_item<1> item, T value, int offset, sycl::local_accessor<
     return sycl::permute_group_by_xor(item.get_sub_group(), value, offset);
 }
 template <int SG>
-inline float warp_sum(sycl::nd_item<1> item, float value, sycl::local_accessor<uint32_t, 1> exchange) {
+inline float warp_sum(sycl::nd_item<1> item, float value, uint32_t* exchange) {
     static_for<5>([&](auto index) {
         constexpr int offset = 16 >> decltype(index)::value;
         value += xor32<SG>(item, value, offset, exchange);
@@ -94,8 +94,8 @@ inline float warp_sum(sycl::nd_item<1> item, float value, sycl::local_accessor<u
     return value;
 }
 template <int SG>
-inline float block_sum(sycl::nd_item<1> item, float value, sycl::local_accessor<float, 1> red,
-                        sycl::local_accessor<uint32_t, 1> exchange) {
+inline float block_sum(sycl::nd_item<1> item, float value, float* red,
+                        uint32_t* exchange) {
     const size_t tid = item.get_local_linear_id(), lane = tid & 31u, warp = tid >> 5;
     value = warp_sum<SG>(item, value, exchange);
     if (lane == 0) red[warp] = value;
@@ -120,7 +120,7 @@ inline float block_sum(sycl::nd_item<1> item, float value, sycl::local_accessor<
 }
 template <int SG>
 inline float group_max(sycl::nd_item<1> item, float value, int group,
-                        sycl::local_accessor<uint32_t, 1> exchange) {
+                        uint32_t* exchange) {
     for (int offset = group / 2; offset > 0; offset >>= 1)
         value = sycl::fmax(value, xor32<SG>(item, value, offset, exchange));
     return value;
@@ -165,8 +165,8 @@ inline float quant_value(float value, float scale, int quant) {
 // and the job-list launches below share it.
 template <int SG, bool Pack>
 void finish_rows(sycl::nd_item<1> item, size_t vector, float* x, int len, long long stride,
-                 const Finish& f, sycl::local_accessor<float, 1> red,
-                 sycl::local_accessor<uint32_t, 1> exchange) {
+                 const Finish& f, float* red,
+                 uint32_t* exchange) {
     const int tid = int(item.get_local_linear_id());
     float* row = x + static_cast<long long>(vector) * stride;
     float r[kValues], ss = 0.f;
@@ -249,14 +249,14 @@ void finish_rows(sycl::nd_item<1> item, size_t vector, float* x, int len, long l
 }
 template <int SG, bool Pack>
 void finish_kernel(float* x, int vectors, int len, long long stride, Finish f, sycl::queue& q) {
-    sycl_detail::submit(q, [&](sycl::handler& handler) {
-        sycl::local_accessor<float, 1> red(sycl::range<1>(kThreads / 32 + 1), handler);
-        sycl::local_accessor<uint32_t, 1> exchange(sycl::range<1>(SG == 16 ? kThreads : 1), handler);
-        auto body = [=](sycl::nd_item<1> item) {
-            finish_rows<SG, Pack>(item, item.get_group_linear_id(), x, len, stride, f, red, exchange);
-        };
-        handler.parallel_for(sycl::nd_range<1>(size_t(vectors) * kThreads, kThreads), BoundBody<SG, decltype(body)>{body});
-    });
+    auto body = [=](sycl::nd_item<1> item) {
+        auto red_s = sycl::ext::oneapi::group_local_memory_for_overwrite<float[kThreads / 32 + 1]>(item.get_group());
+        auto ex_s = sycl::ext::oneapi::group_local_memory_for_overwrite<uint32_t[SG == 16 ? kThreads : 1]>(item.get_group());
+        finish_rows<SG, Pack>(item, item.get_group_linear_id(), x, len, stride, f,
+                              (*red_s.get()), (*ex_s.get()));
+    };
+    sycl_detail::launch(q, sycl::nd_range<1>(size_t(vectors) * kThreads, kThreads),
+                        BoundBody<SG, decltype(body)>{body});
 }
 // A job list for one launch: up to kFinishJobs of finish's argument sets, their grids
 // concatenated, each workgroup its own (job, vector).  The jobs are independent by contract.
@@ -267,20 +267,18 @@ struct FinishN {
 };
 template <int SG, bool Pack>
 void finish_n_kernel(const FinishN& b, sycl::queue& q) {
-    sycl_detail::submit(q, [&](sycl::handler& handler) {
-        sycl::local_accessor<float, 1> red(sycl::range<1>(kThreads / 32 + 1), handler);
-        sycl::local_accessor<uint32_t, 1> exchange(sycl::range<1>(SG == 16 ? kThreads : 1), handler);
-        auto body = [=](sycl::nd_item<1> item) {
-            const size_t g = item.get_group_linear_id();
-            int j = 0;
-            while (j + 1 < b.n && g >= size_t(b.base[j + 1])) ++j;
-            const FinishJob& job = b.j[j];
-            finish_rows<SG, Pack>(item, g - size_t(b.base[j]), job.x, job.len, job.stride, job.f,
-                                  red, exchange);
-        };
-        handler.parallel_for(sycl::nd_range<1>(size_t(b.base[b.n]) * kThreads, kThreads),
-                             BoundBody<SG, decltype(body)>{body});
-    });
+    auto body = [=](sycl::nd_item<1> item) {
+        auto red_s = sycl::ext::oneapi::group_local_memory_for_overwrite<float[kThreads / 32 + 1]>(item.get_group());
+        auto ex_s = sycl::ext::oneapi::group_local_memory_for_overwrite<uint32_t[SG == 16 ? kThreads : 1]>(item.get_group());
+        const size_t g = item.get_group_linear_id();
+        int j = 0;
+        while (j + 1 < b.n && g >= size_t(b.base[j + 1])) ++j;
+        const FinishJob& job = b.j[j];
+        finish_rows<SG, Pack>(item, g - size_t(b.base[j]), job.x, job.len, job.stride, job.f,
+                              (*red_s.get()), (*ex_s.get()));
+    };
+    sycl_detail::launch(q, sycl::nd_range<1>(size_t(b.base[b.n]) * kThreads, kThreads),
+                        BoundBody<SG, decltype(body)>{body});
 }
 inline bool finish(float* x, int vectors, int len, long long stride, const Finish& f, sycl::queue& q) {
     sycl_detail::require_in_order(q);
@@ -331,9 +329,10 @@ template <int SG>
 void ext_to_ring_kernel(const uint16_t* ext, uint8_t* ring, int64_t p0, int n, int tokens, int dim,
                         sycl::queue& q, uint8_t* backup) {
     const size_t row_bytes = kv_row_bytes(kKvFp8, dim);
-    sycl_detail::submit(q, [&](sycl::handler& handler) {
-        sycl::local_accessor<uint32_t, 1> exchange(sycl::range<1>(SG == 16 ? kThreads : 1), handler);
-        auto body = [=](sycl::nd_item<1> item) {
+    auto body = [=](sycl::nd_item<1> item) {
+        auto ex_s = sycl::ext::oneapi::group_local_memory_for_overwrite<uint32_t[SG == 16 ? kThreads : 1]>(item.get_group());
+        uint32_t* exchange = (*ex_s.get());
+        {
             const size_t token = item.get_group_linear_id(), tid = item.get_local_linear_id();
             if (tokens - int(token) > n) return; // Uniform WG skip; a later token overwrites this slot.
             uint8_t* row = ring + size_t((p0 + static_cast<int64_t>(token)) % n) * row_bytes;
@@ -355,9 +354,10 @@ void ext_to_ring_kernel(const uint16_t* ext, uint8_t* ring, int64_t p0, int n, i
                 row[e] = e4m3_code(value, k);
                 if ((e & 31u) == 0) row[size_t(dim) + e / 32] = uint8_t(k + 127);
             }
-        };
-        handler.parallel_for(sycl::nd_range<1>(size_t(tokens) * kThreads, kThreads), BoundBody<SG, decltype(body)>{body});
-    });
+        }
+    };
+    sycl_detail::launch(q, sycl::nd_range<1>(size_t(tokens) * kThreads, kThreads),
+                        BoundBody<SG, decltype(body)>{body});
 }
 inline bool ext_to_ring(const uint16_t* ext, uint8_t* ring, int64_t p0, int n, int tokens, int dim,
                         sycl::queue& q, uint8_t* backup) {
