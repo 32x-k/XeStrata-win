@@ -46,6 +46,14 @@ inline void single(sycl::queue& q, const K& k) { q.single_task(k); }
 
 // The runtime chooses the work-group shape; these portable kernels need neither
 // a particular sub-group size nor a matrix extension.
+// BoundBody's counterpart for bodies without a subgroup requirement, of any work-group size: the kernel's entry
+// inlines the body instead of copying the functor's captures to private memory (R9700, HIP backend).
+template <int WG, class Body>
+struct BoundBodyX {
+    Body body;
+    [[sycl::reqd_work_group_size(WG)]] [[gnu::always_inline]]
+    void operator()(sycl::nd_item<1> item) const { body(item); }
+};
 template <class F>
 inline void parallel(sycl::queue& q, size_t n, F f) {
     require_in_order(q);

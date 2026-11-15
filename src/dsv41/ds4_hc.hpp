@@ -61,7 +61,9 @@ inline int subgroup(const Caps& c, size_t group, bool fused = false, size_t extr
 template <int SG, int WG, class Body>
 struct BoundBody {
     Body body;
-    [[sycl::reqd_work_group_size(WG), sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]]
+    // Inlined into the kernel as upstream's __global__ body is: left a call, the kernel copies its captures to
+    // private memory and reads them from there (R9700, HIP backend - same case as finish_detail's BoundBody).
+    [[sycl::reqd_work_group_size(WG), sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] [[gnu::always_inline]]
     void operator()(sycl::nd_item<1> item) const { body(item); }
 };
 template <int SG>

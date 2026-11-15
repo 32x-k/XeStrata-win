@@ -211,8 +211,14 @@ bool route_groups(sycl::queue& s, int T, int n, F f) {
     while (local <= limit / 2) local *= 2;
     sycl_detail::submit(s, [&](sycl::handler& h) {
         sycl::local_accessor<float, 1> scores(size_t(n), h), biased(size_t(n), h);
-        h.parallel_for(sycl::nd_range<1>(sycl::range<1>(size_t(T) * local), sycl::range<1>(local)),
-                       [=](sycl::nd_item<1> item) { f(item, scores, biased); });
+        auto body = [=](sycl::nd_item<1> item) { f(item, scores, biased); };
+        // The common decode width bound: the kernel's entry inlines f instead of copying its captures to private
+        // memory (R9700, HIP backend).
+        if (local == 256)
+            h.parallel_for(sycl::nd_range<1>(sycl::range<1>(size_t(T) * local), sycl::range<1>(local)),
+                           sycl_detail::BoundBodyX<256, decltype(body)>{body});
+        else
+            h.parallel_for(sycl::nd_range<1>(sycl::range<1>(size_t(T) * local), sycl::range<1>(local)), body);
     });
     return true;
 }
@@ -335,14 +341,21 @@ void unpack_selected(const void* ckv, const int* sel, int sel_stride, const Attn
                      uint16_t* decoded, size_t decoded_stride, sycl::queue& s) {
     if (unpack_selected_parts(ckv, sel, sel_stride, a, T, d, decoded, decoded_stride, s)) return;
     const size_t dim = size_t(d), row_bytes = kv_row_bytes(kKvFp4, d);
-    parallel(s, size_t(T) * sel_stride * dim, [=](size_t i) {
+    const size_t n = size_t(T) * sel_stride * dim;
+    if (!n) return;
+    sycl_detail::require_in_order(s);
+    auto body = [=](sycl::nd_item<1> it) {
+        const size_t i = it.get_global_linear_id();
+        if (i >= n) return;
         const size_t row = i / dim, t = row / sel_stride, j = row % sel_stride, e = i % dim;
         const int selected = attn_counts(a, int(t)).selected;
         if (selected <= 0 || j >= size_t(selected)) return;
         const auto* source = static_cast<const uint8_t*>(ckv) + size_t(sel[t * sel_stride + j]) * row_bytes;
         // E2M1 times E4M3 has at most eight significant bits, exact in BF16.
         decoded[(t * decoded_stride + j) * dim + e] = bf16_rn(kv_value(source, kKvFp4, d, int(e)));
-    });
+    };
+    sycl_detail::launch(s, sycl::nd_range<1>((n + 255) / 256 * 256, 256),
+                        sycl_detail::BoundBodyX<256, decltype(body)>{body});
 }
 bool sparse_attn_tiled_original(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
                        const AttnRows& a, const float* sink, int heads, int d, int T, float scale,
@@ -1020,7 +1033,10 @@ void sparse_rows(const float* q, const uint16_t* win, const uint16_t* rows_base,
             ov[size_t(tid) * 2] = o0 / den;
             ov[size_t(tid) * 2 + 1] = o1 / den;
         };
-        sycl_detail::launch(s, sycl::nd_range<1>(sycl::range<1>(size_t(T) * heads * WG), sycl::range<1>(WG)), kern);
+        // BoundBody: the kernel's entry inlines the body, as upstream's __global__ does, instead of copying its
+        // captures to private memory (R9700, HIP backend - this kernel had 624 bytes of them).
+        sycl_detail::launch(s, sycl::nd_range<1>(sycl::range<1>(size_t(T) * heads * WG), sycl::range<1>(WG)),
+                            hc_detail::BoundBody<SG, WG, decltype(kern)>{kern});
     }
 }
 // The subgroup width for upstream's warp-a-row GEMVs (eight rows a group), or 0.
@@ -1950,16 +1966,24 @@ void cand_blocks(const float* score, long long stride, int T, const Rows& r, int
         rb.n[t] = (r.n[t] + blk - 1) / blk;
         max_blocks = std::max(max_blocks, rb.n[t]);
     }
-    parallel(s, size_t(T) * max_blocks, [=](size_t z) {
-        const int t = int(z / max_blocks), b = int(z % max_blocks);
-        int n, k; rows_at(r, t, n, k);
-        if (b >= (n + blk - 1) / blk) return;
-        float m = -std::numeric_limits<float>::infinity();
-        for (int j = b * blk; j < sycl::min(n, (b + 1) * blk); ++j)
-            m = sycl::fmax(m, score[static_cast<long long>(t) * stride + j]);
-        if (b == (n - 1) / blk) m = std::numeric_limits<float>::infinity();
-        bm[static_cast<long long>(t) * bm_stride + b] = m;
-    });
+    const size_t cb_n = size_t(T) * max_blocks;
+    if (cb_n) {
+        sycl_detail::require_in_order(s);
+        auto body = [=](sycl::nd_item<1> it) {
+            const size_t z = it.get_global_linear_id();
+            if (z >= cb_n) return;
+            const int t = int(z / max_blocks), b = int(z % max_blocks);
+            int n, k; rows_at(r, t, n, k);
+            if (b >= (n + blk - 1) / blk) return;
+            float m = -std::numeric_limits<float>::infinity();
+            for (int j = b * blk; j < sycl::min(n, (b + 1) * blk); ++j)
+                m = sycl::fmax(m, score[static_cast<long long>(t) * stride + j]);
+            if (b == (n - 1) / blk) m = std::numeric_limits<float>::infinity();
+            bm[static_cast<long long>(t) * bm_stride + b] = m;
+        };
+        sycl_detail::launch(s, sycl::nd_range<1>((cb_n + 255) / 256 * 256, 256),
+                            sycl_detail::BoundBodyX<256, decltype(body)>{body});
+    }
     topk(bm, bm_stride, T, rb, nullptr, 0, 1, out, out_stride, s);
 }
 void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
@@ -2109,14 +2133,22 @@ void gather_rows(const float* x, const Gather& g, int n, int cols, float* out, s
     parallel(s, size_t(n) * cols, [=](size_t z) { out[z] = x[size_t(g.src[z / cols]) * cols + z % cols]; });
 }
 void combine(const float* ed, const float* cpu, const float* sh, const Combine& c, int T, int dim, float* out, sycl::queue& s) {
-    parallel(s, size_t(T) * dim, [=](size_t z) {
+    // BoundBodyX: Combine's kilobyte of tables read out of the kernarg instead of a private copy (R9700).
+    const size_t n = size_t(T) * dim;
+    if (!n) return;
+    sycl_detail::require_in_order(s);
+    auto body = [=](sycl::nd_item<1> it) {
+        const size_t z = it.get_global_linear_id();
+        if (z >= n) return;
         const size_t t = z / dim, e = z % dim;
         float v = 0.f;
         for (int j = 0; j < c.n[t]; ++j) v += c.w[t][j] * ed[size_t(c.row[t][j]) * dim + e];
         if (cpu && c.cpu[t]) v += cpu[z];
         if (sh) v += sh[z];
         out[z] = v;
-    });
+    };
+    sycl_detail::launch(s, sycl::nd_range<1>((n + 255) / 256 * 256, 256),
+                        sycl_detail::BoundBodyX<256, decltype(body)>{body});
 }
 
 void publish_req(Req* req, int T, unsigned seq, int na0, int na1, sycl::queue& s, Resp* resp, int* cpu_any,
