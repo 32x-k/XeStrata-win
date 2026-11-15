@@ -238,8 +238,10 @@ void host_sample(const float* dlogits, int n_tokens, int n_vocab, const int* dhi
     const auto shape = selection_shape(stream, n_vocab, use_history);
     const bool device_select = shape.local != 0;
     if (device_select && (p.greedy || p.temperature <= 0.f)) {
+        // (no wait: the caller's readback of dout on this in-order stream orders after the kernel, and its sync
+        // reports any error - a wait here would cost one host round-trip a token)
         select_candidates(dlogits, n_tokens, n_vocab, use_history ? dhistory : nullptr, history_len, p, 1,
-                          nullptr, dout, shape, stream).wait_and_throw();
+                          nullptr, dout, shape, stream);
         return;
     }
     const int KMAX = kMax;

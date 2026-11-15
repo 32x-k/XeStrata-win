@@ -2866,7 +2866,7 @@ struct Model::Impl {
                       dalloc(d, d.sh_out, W * D, err) && dalloc(d, d.cpu_part, W * D, err) &&
                       dalloc(d, d.freqs_win, 64, err) && dalloc(d, d.freqs_comp, 64, err) &&
                       dalloc(d, d.topk, W * topk_stride(), err) && dalloc(d, d.cand, W * cand_stride(), err) &&
-                      dalloc(d, d.tok, 16, err) && dalloc(d, d.emb_rows, W * D, err) &&
+                      hmap(d.tok, 16, err) && dalloc(d, d.emb_rows, W * D, err) &&
                       dalloc(d, d.ext, ((size_t) g.win + W) * g.hd, err) && dalloc(d, d.xe, P * D, err) &&
                       dalloc(d, d.xg, P * g.ff, err) && dalloc(d, d.xu, P * g.ff, err) && dalloc(d, d.xhh, P * g.ff, err) &&
                       dalloc(d, d.ed, P * D, err) && dalloc(d, d.plan_ptr, P, err) && dalloc(d, d.cpu_any, 1, err);
@@ -8306,9 +8306,10 @@ struct Model::Impl {
         sp.counter = counter;
         sp.logit_bias = bias;
         strata::dsv41k::sample_tokens(d.logits + (size_t) row * g.vocab, 1, g.vocab, nullptr, 0, sp, d.tok, d.st);
+        // (d.tok is host-mapped: the sampler writes the answer, the sync is the only wait - a readback from
+        // unregistered host memory would first drain the stream behind a barrier, one more round-trip a token)
         int t = -1;
-        rt::readback_async(&t, d.tok, 4, d.st);
-        rt::stream_sync(d.st);
+        if (rt::stream_sync(d.st) == rt::Result::success) t = d.tok[0];
         return t;
     }
 
@@ -11112,9 +11113,10 @@ struct Model::Impl {
         sp.logit_bias = cur_bias;
         strata::dsv41k::sample_tokens(d.logits + (size_t) std::max(0, n_logits - 1) * g.vocab, 1, g.vocab, nullptr, 0,
                                        sp, d.tok, d.st);
+        // (d.tok is host-mapped: the sampler writes the answer, the sync is the only wait - a readback from
+        // unregistered host memory would first drain the stream behind a barrier, one more round-trip a token)
         int t = -1;
-        rt::readback_async(&t, d.tok, 4, d.st);
-        rt::stream_sync(d.st);
+        if (rt::stream_sync(d.st) == rt::Result::success) t = d.tok[0];
         return t;
     }
 
