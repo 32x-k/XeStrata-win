@@ -82,25 +82,25 @@ void submit_body(Submitter& submitter, sycl::nd_range<D> range, size_t warps, Bo
 // Upstream 870aedd9 ds4_gguf.cu BfJob/BfJobs and QuantItems. Job metadata is copied
 // into each kernel; the caller's temporary jobs array is never device storage.
 struct Job {
-    const void* w = nullptr;
-    size_t ld = 0;
-    const float* x = nullptr;
-    size_t xcs = 0;
-    float* y = nullptr;
-    size_t ycs = 0;
-    const float* bias = nullptr;
-    float alpha = 0.f;
-    int k = 0, n = 0, ncol = 0;
-    const int8_t* xq = nullptr;
-    const float* xd = nullptr;
+    const void* w;
+    size_t ld;
+    const float* x;
+    size_t xcs;
+    float* y;
+    size_t ycs;
+    const float* bias;
+    float alpha;
+    int k, n, ncol;
+    const int8_t* xq;
+    const float* xd;
 };
 struct Jobs { Job j[x3::kMaxMvJobs]; };
 struct QuantItems {
-    const float* x[x3::kMaxMvJobs] = {};
-    size_t ldx[x3::kMaxMvJobs] = {};
-    int k[x3::kMaxMvJobs] = {}, rows[x3::kMaxMvJobs] = {};
-    int8_t* q[x3::kMaxMvJobs] = {};
-    float* d[x3::kMaxMvJobs] = {};
+    const float* x[x3::kMaxMvJobs];
+    size_t ldx[x3::kMaxMvJobs];
+    int k[x3::kMaxMvJobs], rows[x3::kMaxMvJobs];
+    int8_t* q[x3::kMaxMvJobs];
+    float* d[x3::kMaxMvJobs];
     int n = 0;
 };
 

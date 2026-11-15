@@ -344,7 +344,7 @@ unsigned mv_batch(const x3::MvJob* jobs, int n, sycl::queue& s, const PreQ8* pre
         });
     }
     if (counts[3]) {
-        iq::MvJob jobs_iq[x3::kMaxMvJobs] = {};
+        iq::MvJob jobs_iq[x3::kMaxMvJobs];
         for (int i = 0; i < counts[3]; ++i) {
             const auto& b = batch[3].j[i]; auto& j = jobs_iq[i];
             j.w = static_cast<const uint8_t*>(b.w); j.ld = b.ld; j.type = iq_types[i];

@@ -105,15 +105,15 @@ bool light_down(const SetArgs& a, sycl::queue& s);
 /// GEMV jobs on such matrices (an expert's views on the host-routed path): y[c][r] = alpha (row r . x_c) + bias[r] for
 /// ncol activations, x as int8 rows (xq + c k, scales xd + c k / 32).
 struct MvJob {
-    const uint8_t* w = nullptr;
-    size_t ld = 0;   // bytes a row
-    int type = 0, k = 0, n = 0, ncol = 1;
-    const int8_t* xq = nullptr;
-    const float* xd = nullptr;
-    float* y = nullptr;
-    size_t ycs = 0;
-    const float* bias = nullptr;
-    float alpha = 1.0f;
+    const uint8_t* w;
+    size_t ld;   // bytes a row
+    int type, k, n, ncol;
+    const int8_t* xq;
+    const float* xd;
+    float* y;
+    size_t ycs;
+    const float* bias;
+    float alpha;
 };
 bool mv(const MvJob* jobs, int n, sycl::queue& s);
 
