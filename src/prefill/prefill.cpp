@@ -846,6 +846,11 @@ bool Prefill::set_helper(core::RemoteExperts* helper, int64_t max_rows, std::str
     // a layer's rows at most: an 8192-row share is ~84 MB each of rows and results, and few layers of a chunk below
     // the streamed walk's 2048 tokens give the helper more
     hs->cap = 8192;
+    // STRATA_PREFILL_HELPER_CAP=n: a layer's helper rows at most (default 8192).  A UMA helper that reads the host RAM in
+    // place (--expert-host-device1) can take far more of a chunk's streamed experts than the 8192 a discrete helper's
+    // buffers were sized for.
+    if (const char* v = std::getenv("STRATA_PREFILL_HELPER_CAP"); v != nullptr && std::strtoll(v, nullptr, 10) > 0)
+        hs->cap = std::strtoll(v, nullptr, 10);
     const int64_t cap = hs->cap;
     int64_t gu_w = 0, ff = 0;
     for (const auto& f : lay.fmt) { gu_w = std::max<int64_t>(gu_w, 2 * f.n_ff); ff = std::max<int64_t>(ff, f.n_ff); }
@@ -2262,7 +2267,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // k lands in ring slot k % ring); a copy is issued once the entry `ring` before it is consumed (its slot's
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
         const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
-        const bool stream_all = m.ring > STAGE && T >= STREAM_ALL_MIN && m.src != nullptr;
+        // STRATA_PREFILL_STREAM_ALL_MIN=n: the chunk size from which every non-resident expert is streamed in id order
+        // (default STREAM_ALL_MIN); that walk gives the helper GPU no share, so a UMA helper is kept in by raising it
+        static const int64_t stream_all_min = [] {
+            const char* v = std::getenv("STRATA_PREFILL_STREAM_ALL_MIN");
+            return v != nullptr && std::strtoll(v, nullptr, 10) > 0 ? (int64_t) std::strtoll(v, nullptr, 10) : STREAM_ALL_MIN;
+        }();
+        const bool stream_all = m.ring > STAGE && T >= stream_all_min && m.src != nullptr;
         struct StreamEntry { int32_t l, e; const uint8_t* blob; int job; };
         std::vector<StreamEntry> seq;
         std::vector<size_t> seq_start;
