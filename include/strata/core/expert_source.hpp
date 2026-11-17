@@ -575,6 +575,10 @@ public:
     /// reserve_exchanges); released by close().
     bool register_on(int device, std::string& err) override;
     bool registered_on(int device) const override;
+    /// Whether [p, p + bytes) lies inside a host block register_on() registered on engine device `device` - the
+    /// complement's parts and the exchange buffers as they were then.  A blob address a helper GPU's kernels may
+    /// dereference (--expert-host-device1 follows a resident expert the exchanges move within them).
+    bool registered_range(int device, const uint8_t* p, uint64_t bytes) const;
     FileExpertSource() = default;
     ~FileExpertSource() override;
     FileExpertSource(const FileExpertSource&) = delete;
@@ -981,7 +985,7 @@ private:
     struct Exchange { size_t in, out; int64_t q; uint64_t bytes; };
     std::vector<Exchange> staged_;
     uint8_t* xstage_ = nullptr;               ///< exchange buffers, `xstage_cap_ x xstage_blob_`
-    std::vector<std::pair<int, std::vector<void*>>> stage_reg_;   ///< register_on: a device, its registrations
+    std::vector<std::pair<int, std::vector<std::pair<void*, size_t>>>> stage_reg_;   ///< register_on: a device, its (address, bytes) blocks
     bool xstage_pinned_ = false;
     int xstage_dev_ = 0;                      ///< the engine device whose host USM holds pinned exchange buffers
     int64_t xstage_cap_ = 0;

@@ -978,15 +978,15 @@ bool FileExpertSource::register_on(int device, std::string& err) {
     // the exchange buffers: another maker's host USM is not registered here, and their copies stay pageable
     if (xstage_ != nullptr && xstage_cap_ > 0 && !(xstage_pinned_ && !strata::gpu::same_backend(xstage_dev_, device)))
         blocks.emplace_back(xstage_, (size_t) xstage_cap_ * (size_t) xstage_blob_);
-    std::vector<void*> regs;
+    std::vector<std::pair<void*, size_t>> regs;
     for (const auto& [p, n] : blocks) {
         if (!strata::gpu::host_register_on(device, p, n)) {
-            for (void* r : regs) strata::gpu::host_unregister_on(device, r);
+            for (const auto& r : regs) strata::gpu::host_unregister_on(device, r.first);
             err = std::string("registering the RAM copy on GPU ") + std::to_string(device) + ": " +
                   strata::gpu::last_error();
             return false;
         }
-        regs.push_back(p);
+        regs.emplace_back(p, n);
     }
     stage_reg_.emplace_back(device, std::move(regs));
     return true;
@@ -1047,13 +1047,24 @@ bool FileExpertSource::registered_on(int device) const {
     return false;
 }
 
+bool FileExpertSource::registered_range(int device, const uint8_t* p, uint64_t bytes) const {
+    if (p == nullptr || bytes == 0) return false;
+    for (const auto& o : stage_reg_)
+        if (o.first == device)
+            for (const auto& [base, n] : o.second)
+                if (bytes <= n && p >= (const uint8_t*) base &&
+                    (uint64_t) (p - (const uint8_t*) base) <= n - bytes)
+                    return true;
+    return false;
+}
+
 void FileExpertSource::close() {
     io_stop();
     if (complement_arena_ || xstage_) strata::gpu::device_sync();
     for (auto& o : stage_reg_) {   // before the memory goes, and after that GPU's copies from it
         const OnDevice on(o.first);
         (void) strata::gpu::device_sync();
-        for (void* p : o.second) strata::gpu::host_unregister_on(o.first, p);
+        for (const auto& r : o.second) strata::gpu::host_unregister_on(o.first, r.first);
     }
     stage_reg_.clear();
     inputs_.clear();

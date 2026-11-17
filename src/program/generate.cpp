@@ -5840,6 +5840,10 @@ int main(int argc, char** argv) {
     if (o.remote_expert_opt && (o.expert_cache_remote[0] > 0 || o.expert_host_device1))
         remote_opt = std::make_unique<strata::core::RemoteExpertOpt>();
     bool host_active = false;   // --expert-host-device1: remote_experts[0] reads the arena in place
+    // --expert-host-device1 with --mmap-experts: the helper's host tier is the resident RAM copy, which
+    // pin_cache_complement only makes below (and the exchange buffers with it): the open waits for it
+    // there, and remote_opt->init with it (the peers must be final).
+    const bool host_deferred = o.expert_host_device1 && srcp == &src;
     const bool multi_remote = o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
     if (o.expert_cache_remote[0] > 0) {
         if (o.expert_cache <= 0 || profile.empty() || o.no_pool) {
@@ -5923,7 +5927,7 @@ int main(int argc, char** argv) {
         }
     }
     // --expert-host-device1: no VRAM tier on the helper GPU - its kernels read the experts it serves
-    // straight out of the host arena in place (the UMA case: a second copy of the same RAM would be
+    // straight out of the host copy in place (the UMA case: a second copy of the same RAM would be
     // all a "cache" there could be).  A failure only disables the helper; the engine runs as without it.
     if (o.expert_host_device1) {
         if (o.expert_cache <= 0 || o.no_pool) {
@@ -5931,10 +5935,7 @@ int main(int argc, char** argv) {
                                  "the expert pool\n");
             return 2;
         }
-        if (srcp != &arena_src) {
-            std::fprintf(stderr, "strata generate: --expert-host-device1 needs the resident expert arena, "
-                                 "not --mmap-experts: it is off\n");
-        } else {
+        if (srcp == &arena_src) {
             std::vector<uint8_t> claimed((size_t) g.n_layers * (size_t) g.n_expert, 0);
             for (auto& st : stages)   // a layer split: what a stage's cache holds is no helper's
                 for (const auto& pr : st->profile)
@@ -5949,10 +5950,18 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
                 if (remote_opt) remote_opt->detach(remote_experts[0]);
             }
+        } else if (host_deferred) {
+            // FileExpertSource: the copy the helper reads is pin_cache_complement()'s, made below - the
+            // open, remote_opt->init and drive.d.remote's entry wait for it there
+            std::fprintf(stderr, "strata generate: --expert-host-device1: GPU%d opens after the resident "
+                                 "RAM copy is pinned below\n", remote_dev[0]);
+        } else {
+            std::fprintf(stderr, "strata generate: --expert-host-device1 needs the resident expert arena, "
+                                 "not --mmap-experts: it is off\n");
         }
     }
 
-    if (remote_opt && !remote_opt->init(err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
+    if (remote_opt && !host_deferred && !remote_opt->init(err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
     Drive drive;
     for (int r = 0; r < 3; ++r)
         if (o.expert_cache_remote[(size_t) r] > 0 || (r == 0 && host_active))
@@ -7177,6 +7186,43 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: resident CPU experts: %.2f GiB, %lld experts\n",
                          (double) src.resident_bytes() / 1073741824.0, (long long) src.resident_count());
             mem_mark("the resident experts");
+        }
+    }
+    // --expert-host-device1 with --mmap-experts (deferred from the helper GPUs' setup): the helper's host
+    // tier is the resident RAM copy pin_cache_complement() just made - and the exchange buffers
+    // reserve_exchanges() gave the adaptive tier, registered on the helper inside open_host() so its
+    // kernels may also read an expert a round moved there.  No copy, or none it can reach: the helper
+    // stays off and never reaches drive.d.remote; the engine runs as without it.
+    if (host_deferred) {
+        if (src.complement_ready() && src.complement_pinned()) {
+            std::vector<uint8_t> claimed((size_t) g.n_layers * (size_t) g.n_expert, 0);
+            for (auto& st : stages)   // a layer split: what a stage's cache holds is no helper's
+                for (const auto& pr : st->profile)
+                    if (st->cache.slot_of(pr.first, pr.second) >= 0)
+                        claimed[(size_t) pr.first * (size_t) g.n_expert + (size_t) pr.second] = 1;
+            if (remote_opt) remote_opt->attach(remote_experts[0]);
+            if (remote_experts[0].open_host(remote_dev[0], g.n_layers, g.n_expert, xcache, *srcp, claimed, err)) {
+                host_active = true;
+                if (drive.d.remote_count < (int) (sizeof drive.d.remote / sizeof drive.d.remote[0])) {
+                    for (int r = drive.d.remote_count; r > 0; --r) drive.d.remote[r] = drive.d.remote[r - 1];
+                    drive.d.remote[0] = &remote_experts[0];   // the device-1 helper first, as without the deferral
+                    ++drive.d.remote_count;
+                }
+                std::fprintf(stderr, "strata generate: GPU%d reads the resident RAM copy in place: "
+                                     "%lld experts\n", remote_dev[0], (long long) remote_experts[0].host_held());
+            } else {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                if (remote_opt) remote_opt->detach(remote_experts[0]);
+            }
+        } else {
+            std::fprintf(stderr, "strata generate: --expert-host-device1 needs the resident expert arena or a "
+                                 "page-locked resident RAM copy (--resident-experts, --resident-budget-gib): "
+                                 "it is off\n");
+        }
+        // the peers are final now - the optimized reduce allocates per open one (a failed open detached above)
+        if (remote_opt && !remote_opt->init(err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
         }
     }
     // The experts the GPU does not hold read from the model files (--mmap-experts, no RAM copy): the window rule is

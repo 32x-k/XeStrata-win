@@ -33,9 +33,9 @@ public:
               const ExpertCache& primary, ExpertSource& source,
               std::vector<uint8_t>& claimed, std::string& err);
     /// --expert-host-device1: the helper holds no VRAM cache at all.  Its kernels read the host
-    /// arena's blobs in place - an iGPU's UMA, or a GPU whose kernels read host memory registered
+    /// copy's blobs in place - an iGPU's UMA, or a GPU whose kernels read host memory registered
     /// on it (gpu::kernels_read_registered; Level Zero's registrations are copy-only, refused inside).
-    /// "Held" is then: in the arena (a stable, registered address) and in no GPU's expert cache.
+    /// "Held" is then: in the host copy (a registered address) and in no GPU's expert cache.
     /// open() and this are exclusive; `claimed` (a layer split's stage caches) is only read.
     bool open_host(int device, int64_t layers, int64_t experts, const ExpertCache& primary,
                    ExpertSource& source, const std::vector<uint8_t>& claimed, std::string& err);
@@ -128,13 +128,15 @@ private:
     std::vector<int32_t> start_, dst_, tok_, original_row_;
     std::vector<unsigned long long> ptr_;
 
-    // host mode (--expert-host-device1): no cache_; the kernels read the arena's registered host
-    // addresses in place.  host_blob_ is the address open_host() saw; begin() claims a row only
-    // while the source still answers the same address for it (a source whose pinned blobs move
-    // would fall back to the CPU).
+    // host mode (--expert-host-device1): no cache_; the kernels read the host copy's registered
+    // addresses in place.  host_blob_ is the address last served; begin() claims a row while the
+    // source still answers it, or - FileExpertSource, whose resident experts move with the adaptive
+    // tier's exchanges and rotation - one inside a block registered on this GPU (registered_range,
+    // host_file_).  Any other answer leaves the row to the CPU.
     bool probe_arena_read(int64_t layers, std::string& err);
     bool host_mode_ = false;
     ExpertSource* host_src_ = nullptr;
+    FileExpertSource* host_file_ = nullptr;   ///< host_src_ when it is one: its registered blobs move
     std::vector<uint8_t> host_held_;
     std::vector<const uint8_t*> host_blob_;
     int64_t host_count_ = 0;

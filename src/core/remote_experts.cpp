@@ -101,6 +101,7 @@ void RemoteExperts::close() {
     layers_present_.clear();
     host_mode_ = false;
     host_src_ = nullptr;
+    host_file_ = nullptr;
     host_held_.clear();
     host_blob_.clear();
     host_count_ = 0;
@@ -229,8 +230,8 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
 
 // --expert-host-device1: NO VRAM cache, no fill.  The source's pinned blobs stay where they are and
 // this GPU's kernels read them in place - the tier for a UMA GPU (an iGPU beside a dGPU's limited
-// VRAM) whose "cache" would only be a second copy of the same RAM.  Held = pinned in the source with
-// the stable address it answered at open, and in no GPU's expert cache (the primary's and a layer
+// VRAM) whose "cache" would only be a second copy of the same RAM.  Held = pinned in the source at a
+// host address registered on this GPU, and in no GPU's expert cache (the primary's and a layer
 // split's stage caches', `claimed`).
 bool RemoteExperts::open_host(int device, int64_t layers, int64_t experts,
                               const ExpertCache& primary, ExpertSource& source,
@@ -261,9 +262,12 @@ bool RemoteExperts::open_host(int device, int64_t layers, int64_t experts,
             close();
             return false;
         }
-        // The held table: a stable arena address for every expert no GPU's cache has.  blob()'s
-        // answer is the address the kernels are given; a source that cannot keep it stable is
-        // found out at claim time (begin), where the row goes back to the CPU.
+        // The held table: a registered host address for every expert no GPU's cache has.  blob()'s
+        // answer is the address the kernels are given; a source whose answer moves is found out at
+        // claim time (begin), where the row goes back to the CPU - unless the file source moved it
+        // between blocks registered on this GPU (the RAM copy's exchanges), which begin() follows.
+        auto* file_src = dynamic_cast<FileExpertSource*>(&source);
+        const auto& lay = strata::kernels::cpu::expert_layout();
         host_held_.assign((size_t) layers * (size_t) experts, 0);
         host_blob_.assign((size_t) layers * (size_t) experts, nullptr);
         layers_present_.assign((size_t) layers, 0);
@@ -273,13 +277,21 @@ bool RemoteExperts::open_host(int device, int64_t layers, int64_t experts,
                 const size_t i = (size_t) l * (size_t) experts + (size_t) e;
                 if (claimed[i] || primary.slot_of(l, e) >= 0 || !source.pinned(l, e)) continue;
                 const uint8_t* p = source.blob(l, e);
-                if (p == nullptr) continue;
+                // a RAM copy can hold parts this GPU cannot read (another maker's host USM in a
+                // layer split): only what register_on() put on this device counts as held
+                if (p == nullptr ||
+                    (file_src != nullptr &&
+                     !file_src->registered_range(device, p, (uint64_t) lay.blob_bytes(l))))
+                    continue;
                 host_held_[i] = 1;
                 host_blob_[i] = p;
                 layers_present_[(size_t) l] = 1;
                 ++host_count_;
             }
         }
+        // a file source's held set grows as the tier's exchanges, evictions and resident replacements
+        // make experts resident on any layer: keep every layer's begin() running so it can adopt them
+        if (file_src != nullptr) std::fill(layers_present_.begin(), layers_present_.end(), (uint8_t) 1);
         if (host_count_ == 0) {
             err = "GPU" + std::to_string(device) + " experts: the host arena holds no expert the GPU "
                   "caches do not already have; --expert-host-device1 is off";
@@ -322,6 +334,7 @@ bool RemoteExperts::open_host(int device, int64_t layers, int64_t experts,
         d_tok_ = meta->tok;
         d_count_ = &meta->count;
         host_src_ = &source;
+        host_file_ = file_src;
         host_mode_ = true;
     } catch (const std::exception& e) {
         err = "GPU" + std::to_string(device) + " experts: " + e.what();
@@ -440,12 +453,24 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
             (primary_res && primary_res[(size_t) layer * (size_t) n_expert_ + (size_t) e] >= 0)) continue;
         const uint8_t* blob = nullptr;
         if (host_mode_) {
-            // the registered arena address open_host() saw, still the source's answer for this
-            // expert - a pinned blob that moved goes back to the CPU
+            // the host address last served for this expert, still the source's answer for it.
+            // A FileExpertSource's resident experts move with the adaptive tier's exchanges and
+            // rotation - a pinned blob whose new address lies in a block registered on this GPU is
+            // served from there (an expert newly resident is adopted the same way); any other
+            // answer leaves the row to the CPU.
             const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) e;
-            if (index >= host_held_.size() || !host_held_[index] || !host_src_->pinned(layer, e)) continue;
+            if (index >= host_held_.size() || (!host_held_[index] && host_file_ == nullptr) ||
+                !host_src_->pinned(layer, e)) continue;
             const uint8_t* p = host_src_->blob(layer, e);
-            if (p == nullptr || p != host_blob_[index]) continue;
+            if (p == nullptr ||
+                (p != host_blob_[index] &&
+                 (host_file_ == nullptr ||
+                  !host_file_->registered_range(device_, p,
+                                                (uint64_t) strata::kernels::cpu::expert_layout()
+                                                               .blob_bytes(layer)))))
+                continue;
+            host_held_[index] = 1;
+            host_blob_[index] = p;
             blob = p;
         } else {
             const int32_t slot = cache_.slot_of(layer, e);
