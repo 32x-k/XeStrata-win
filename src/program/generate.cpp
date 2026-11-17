@@ -2349,6 +2349,22 @@ void route_stop_signals() {
 #endif
 }
 
+// The prompt path's stream-every-expert walk (from STREAM_ALL_MIN tokens a chunk) hands the CPU pool no share: on a
+// slow host link it waits on PCIe while the pool idles.  Measured 2026-11-18 (UD-Q4_K_XL, R9700 on a 7.2 GB/s OCuLink
+// x4 link, the CPU pool taking ~0.9 of the missed experts): 4K prompt 482 -> 1127 tok/s, 32K 1334 -> 1788 with the walk
+// off.  Below 12 GB/s, with the pool attached and STRATA_PREFILL_STREAM_ALL_MIN unset, the walk is turned off.
+static void auto_stream_all_off(double link_gbps, const char* who) {
+    if (std::getenv("STRATA_PREFILL_STREAM_ALL_MIN") != nullptr) return;
+    if (!(link_gbps > 0.0 && link_gbps < 12.0)) return;
+#if defined(_WIN32)
+    _putenv_s("STRATA_PREFILL_STREAM_ALL_MIN", "1000000000");
+#else
+    setenv("STRATA_PREFILL_STREAM_ALL_MIN", "1000000000", 0);
+#endif
+    std::fprintf(stderr, "strata %s: the host link carries %.1f GB/s: a prompt's missed experts go to the CPU pool, not "
+                         "a stream of all of them (STRATA_PREFILL_STREAM_ALL_MIN=2048 restores the stream)\n", who, link_gbps);
+}
+
 int main(int argc, char** argv) {
     // **UNBUFFERED, BECAUSE THE INTERESTING OUTPUT IS THE OUTPUT BEFORE A CRASH.**  `stdout` redirected to a
     // pipe or a file is block-buffered, so a program that dies loses every line it had already printed - which
@@ -7274,6 +7290,14 @@ int main(int argc, char** argv) {
                                  "cache (STRATA_PREFILL_HELPER_SOURCE)\n");
         }
         strata::prefill::Prefill sp;
+        // the pool is idle while a prompt is read unless batch slots decode between its parts; decided before the
+        // buffers are planned, since a slow link turns the stream-every-expert walk (and its ring) off
+        const bool pool_share =
+            !multi_gpu && o.batch <= 0 && !o.no_pool && cpu_share_default_ok(g, xcache, srcp == &src ? &src : nullptr);
+        if (pool_share && strata::prefill::cpu_share_setting() != 0.0) {
+            if (link_gbps <= 0.0) link_gbps = probe_pcie_h2d_gbps();
+            auto_stream_all_off(link_gbps, "serve");
+        }
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
         int32_t lend_first = -1;          // the first slot the prompt path may borrow (its largest chunk)
@@ -7358,9 +7382,7 @@ int main(int argc, char** argv) {
             }
         }
         if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
-        // the pool is idle while a prompt is read unless batch slots decode between its parts
-        if (!multi_gpu && o.batch <= 0 && !o.no_pool && cpu_share_default_ok(g, xcache, srcp == &src ? &src : nullptr))
-            sp.set_cpu_pool(&pool);
+        if (pool_share) sp.set_cpu_pool(&pool);
         mem_mark("before the prompt path init");
         if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes)) {
             std::fprintf(stderr, "strata serve: %s\n", err.c_str());

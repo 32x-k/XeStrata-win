@@ -148,12 +148,12 @@ private:
 constexpr int64_t STREAM_ALL_MIN = 2048;
 // STRATA_PREFILL_STREAM_ALL_MIN=n: the chunk size from which every non-resident expert is streamed in id order (default
 // STREAM_ALL_MIN); that walk gives the helper GPU and the CPU no share.  Every layout choice keyed on the walk reads it.
+// Read at each call, not once: the serve path sets it from the link probe after the VRAM estimates have read the
+// default (an estimate made with the stream's ring is the larger one, so the order only costs a few cache slots).
 inline int64_t stream_all_min() {
-    static const int64_t v = [] {
-        const char* e = std::getenv("STRATA_PREFILL_STREAM_ALL_MIN");
-        return e != nullptr && std::strtoll(e, nullptr, 10) > 0 ? (int64_t) std::strtoll(e, nullptr, 10) : STREAM_ALL_MIN;
-    }();
-    return v;
+    const char* e = std::getenv("STRATA_PREFILL_STREAM_ALL_MIN");
+    const long long v = e != nullptr ? std::strtoll(e, nullptr, 10) : 0;
+    return v > 0 ? (int64_t) v : STREAM_ALL_MIN;
 }
 // STRATA_PREFILL_CPU_SHARE (set_cpu_pool, upstream 978d3558, opt-in there): a chunk below STREAM_ALL_MIN hands the
 // decode CPU pool - idle while a prompt is read - the non-resident experts few of its tokens route to, instead of
