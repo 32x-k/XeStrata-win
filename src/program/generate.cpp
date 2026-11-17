@@ -33,6 +33,7 @@
 #include "strata/core/expert_source.hpp"
 #include "strata/core/pinned.hpp"
 #include "strata/core/remote_experts.hpp"
+#include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
@@ -324,6 +325,7 @@ struct Options {
     int expert_cache = 0;
     std::array<int, 3> expert_cache_remote{}; ///< CUDA1..3 slots; CUDA0 keeps dense/state/MTP
     std::string expert_cache_remote_placement = "stripe"; ///< stripe experts or assign complete layers to CUDA1..3
+    bool remote_expert_opt = false;            ///< optional optimization of the existing remote-expert decode path
     bool expert_cache_cpu_order = false;
     /// **R4.2g.  ROUND 328 MEASURED THAT THE GLOBAL ADMISSION POLICY CANNOT WORK, AND THIS IS THE FIX.**
     /// The default policy hands out slots in arrival order from one counter shared by all 48 layers, so the
@@ -735,6 +737,7 @@ void usage() {
                  "  --expert-cache-device3 N  pre-fill N more experts on CUDA3\n"
                  "  --expert-cache-remote-placement stripe|layer  distribute expert ranks or whole\n"
                  "                       layers across CUDA1..3 (default: stripe)\n"
+                 "  --remote-expert-opt   enable remote-expert decode optimizations (serve mode)\n"
                  "  --batch-mtp / --no-batch-mtp  --batch with --mtp: each slot also verifies one MTP proposal a\n"
                  "                       window (default on where it applies; STRATA_BATCH_MTP=1/0 too); ~50 MiB a\n"
                  "                       slot; on a layer split the slot drafters sit on the last GPU (not with\n"
@@ -2542,6 +2545,7 @@ int main(int argc, char** argv) {
         else if (a == "--expert-cache-device3") o.expert_cache_remote[2] = (int) std::strtol(next("--expert-cache-device3"), nullptr, 10);
         else if (a == "--expert-cache-remote-placement")
             o.expert_cache_remote_placement = next("--expert-cache-remote-placement");
+        else if (a == "--remote-expert-opt") o.remote_expert_opt = true;
         else if (a == "--vram-reserve-mib") {
             o.vram_reserve_mib = (int) std::strtol(next("--vram-reserve-mib"), nullptr, 10);
             o.vram_reserve_given = true;
@@ -2922,7 +2926,7 @@ int main(int argc, char** argv) {
                             ? "--pipeline-windows 1 needs exactly two stages"
                         : o.mtp.empty() || o.spec < 2 ? "it needs the MTP drafter (--mtp, --spec)"
                         : o.batch != 0 ? "not with --batch slots"
-                        : helpers ? "not with the helper caches (--expert-cache-device1..3)"
+                        : helpers ? "not with the helper caches (--expert-cache-device1..3, --remote-expert-opt)"
                         : nullptr;
         if (off != nullptr) {
             std::fprintf(stderr, "strata generate: --pipeline-windows %d is off: %s\n", o.pipeline_windows, off);
@@ -3129,6 +3133,10 @@ int main(int argc, char** argv) {
     }
     if (o.expert_cache_remote_placement != "stripe" && o.expert_cache_remote_placement != "layer") {
         std::fprintf(stderr, "strata generate: --expert-cache-remote-placement must be stripe or layer\n");
+        return 2;
+    }
+    if (o.remote_expert_opt && !o.serve) {
+        std::fprintf(stderr, "strata generate: --remote-expert-opt requires --serve\n");
         return 2;
     }
 
@@ -5808,6 +5816,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: layer split: CUDA0 runs layers 0-%lld\n", (long long) (split_at[0] - 1));
 
     std::array<strata::core::RemoteExperts, 3> remote_experts;
+    std::unique_ptr<strata::core::RemoteExpertOpt> remote_opt;
+    if (o.remote_expert_opt && o.expert_cache_remote[0] > 0)
+        remote_opt = std::make_unique<strata::core::RemoteExpertOpt>();
     const bool multi_remote = o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
     if (o.expert_cache_remote[0] > 0) {
         if (o.expert_cache <= 0 || profile.empty() || o.no_pool) {
@@ -5879,6 +5890,7 @@ int main(int argc, char** argv) {
                 if (st->cache.slot_of(pr.first, pr.second) >= 0)
                     claimed[(size_t) pr.first * (size_t) g.n_expert + (size_t) pr.second] = 1;
         for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0) {
+            if (remote_opt) remote_opt->attach(remote_experts[(size_t) r]);
             if (!remote_experts[(size_t) r].open(remote_dev[r], o.expert_cache_remote[(size_t) r],
                      g.n_layers, g.n_expert, by_device[(size_t) r], xcache, *srcp, claimed, err)) {
                 std::fprintf(stderr, "strata generate: %s\n", err.c_str());
@@ -5890,6 +5902,7 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (remote_opt && !remote_opt->init(err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
     Drive drive;
     for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
         drive.d.remote[drive.d.remote_count++] = &remote_experts[(size_t) r];
@@ -6999,6 +7012,7 @@ int main(int argc, char** argv) {
                         : multi_gpu && srcp == &arena_src ? "not with a layer split in the arena mode"
                         : o.pipeline_windows >= 2 && srcp == &arena_src ? "not with --pipeline-windows 2 in the arena mode"
                         : o.batch > 0 && o.batch_groups > 1 ? "not with --batch-groups (the pipelined slot groups)"
+                        : remote_opt ? "not with --remote-expert-opt"
                         : o.pipeline_windows >= 2 && !pl_async ? "not with --pipeline-windows 2 (STRATA_PIPELINE_ADAPT_ASYNC=0)"
                         : o.pipeline_windows >= 2 && split_devs.size() > 1
                             ? "not with --pipeline-windows 2 on three or more stages"
@@ -7376,6 +7390,7 @@ int main(int argc, char** argv) {
                     // the hand-off's size) and bounds its captured batch layouts like it (upstream 48f2c47d)
                     if (batch_mtp) gs.ver.set_batch_graph_limit(64);
                     if (adapt_device_table_lags()) gs.ver.set_always_publish(true);
+                    gs.ver.set_remote_expert_opt(remote_opt.get());
                     ok_s = gs.ver.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr,
                                        batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err);
                     split_drive.cache_base[st] = gs.cache.device_slot(0);
@@ -7483,6 +7498,7 @@ int main(int argc, char** argv) {
         }
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp: slot rotation makes many layouts (LRU)
         if (adapt_device_table_lags()) ver.set_always_publish(true);
+        ver.set_remote_expert_opt(remote_opt.get());
         if (!ver.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr,
                       batch_mtp ? strata::kernels::kVerifyMaxT : std::max(o.spec, o.batch), err) ||
             (use_mtp &&
@@ -8427,10 +8443,11 @@ int main(int argc, char** argv) {
         int64_t adapt_swaps_n = 0, adapt_sync_n = 0;   // STRATA_DECODE_TIMING: swaps issued, of them synchronous
         auto adapt = [&]() -> bool {
             if (!pending.empty()) return true;   // the previous swaps are still in flight
+            if (remote_opt && !remote_opt->adapt(drive.d.usage, host_res, pending, o.adapt_swaps, *srcp)) return false;
             using Swap = strata::core::TierSwap;
             std::vector<Swap> swaps = strata::core::choose_swaps(
                 drive.d.usage.data(), host_res.data(), g.n_layers, g.n_expert, o.adapt_min_gain, [](int64_t) { return 0; },
-                [&](int64_t l, int32_t e) { return helper_holds(drive.d, l, e); });
+                [&](int64_t l, int32_t e) { return (remote_opt && remote_opt->owns(l, e)) || helper_holds(drive.d, l, e); });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
             bool main_live = false;
             auto swap_home = [&](int32_t layer) {   // the cache that owns the layer, on its card's stream

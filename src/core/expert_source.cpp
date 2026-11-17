@@ -3208,13 +3208,19 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     }();
     const bool gpu_zeroes_hits = d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap && dec_batch && !device_plan;
     const bool any_cpu = std::any_of(kind, kind + n, [](int32_t v) { return v == -1; });   // -2: skipped, no work
+    // --remote-expert-opt: a token whose rows the helper GPUs all serve needs no activation quantized either
+    const bool remote_opt = std::any_of(d.remote, d.remote + d.remote_count,
+                                        [](RemoteExperts* r) { return r->optimized_decode(); });
     const auto c1 = std::chrono::steady_clock::now();
     if (!any_cpu) {
     } else if (native) {
         for (int64_t t = 0; t < n_tok; ++t)
-            native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * W, d.nact_multi[(size_t) t].bytes);
+            if (!remote_opt || std::any_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v == -1; }))
+                native_quant_act(lay.fmt[(size_t) d.layers], x_f + (size_t) t * W, d.nact_multi[(size_t) t].bytes);
     } else {
-        for (int64_t t = 0; t < n_tok; ++t) act_quant_q8_1(x_f + (size_t) t * W, (int) W, d.act_multi[(size_t) t]);
+        for (int64_t t = 0; t < n_tok; ++t)
+            if (!remote_opt || std::any_of(kind + t * k, kind + (t + 1) * k, [](int32_t v) { return v == -1; }))
+                act_quant_q8_1(x_f + (size_t) t * W, (int) W, d.act_multi[(size_t) t]);
     }
     const auto c2 = std::chrono::steady_clock::now();
     if (any_cpu) {   // the experts the CPU computes, fetched together (the GGUF in place reads them on several threads)

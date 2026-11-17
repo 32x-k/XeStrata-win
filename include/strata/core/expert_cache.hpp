@@ -179,6 +179,15 @@ public:
     /// The slot range layer `l` may admit into under per-layer admission.  Exposed so a test can check it.
     void layer_slot_range(int64_t layer, int64_t& lo, int64_t& hi) const;
 
+    /// --remote-expert-opt: the slot `out_expert` held now belongs to `in_expert` of the same layer - the
+    /// new blob was written into it already; only the table moves.  No admission count changes.
+    void replace(int64_t layer, int64_t out_expert, int64_t in_expert) {
+        const int32_t s = slot_of(layer, out_expert);
+        if (s < 0 || in_expert < 0 || in_expert >= n_expert_) return;
+        residency_[(size_t) (layer * n_expert_ + out_expert)] = kNotResident;
+        residency_[(size_t) (layer * n_expert_ + in_expert)] = s;
+    }
+
     /// The device address of one slot.
     uint8_t* device_slot(int32_t slot);
     const uint8_t* device_slot(int32_t slot) const;

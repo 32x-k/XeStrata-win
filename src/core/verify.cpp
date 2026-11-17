@@ -6,6 +6,7 @@
 
 #include "strata/core/native_head.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/remote_expert_opt.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
@@ -497,6 +498,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     diag_verify_fn().store(&diag_active_verifier);
     device_ = current_device();   // a layer split's stage on another GPU: init runs on it (OnDevice)
     rr_stats_ = route_resident_cfg().stats_on(device_);   // STRATA_ROUTE_RESIDENT: this GPU's counters, outside graph capture
+    if (remote_opt_ != nullptr && !remote_opt_->attach_device(device_, err)) return false;
     wt_ = &wt;
     g_ = &g;
     ss_ = &ss;
@@ -767,7 +769,9 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
     {
         const char* v = std::getenv("STRATA_VERIFY_RESIDENT_GRAPH");
-        res_graph_ = !always_publish_ && hits.h_res != nullptr && hits.d_res != nullptr &&
+        // (not with remote_opt_: the resident graph rings no doorbell, so the pool never calls begin() and
+        //  the recorded combine would add a stale helper sum - the helper's reduced rows need the host round)
+        res_graph_ = !always_publish_ && remote_opt_ == nullptr && hits.h_res != nullptr && hits.d_res != nullptr &&
                      (v == nullptr || std::strtol(v, nullptr, 10) != 0);
     }
     if (device_plan_ || res_graph_) {
@@ -1550,7 +1554,10 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             } else {
                 if (!segmented_) wait_flag_ge(m_flag_, ring, cs);   // the CPU's share is in the mapped rows
                 stamp(l, 23, grp);
-                if (dec_batch)   // only the CPU rows cross PCIe (p_dst[0, counts[1]) = the GPU's own rows)
+                if (remote_opt_)    // #578: the helper's rows come back reduced; skip them as well
+                    remote_opt_->copy_rows(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, tb, n, p_dst,
+                                           p_counts + 1, cs);
+                else if (dec_batch)   // only the CPU rows cross PCIe (p_dst[0, counts[1]) = the GPU's own rows)
                     copy_rows_from_mapped(parts_ + (size_t) tb * K * N, m_ymiss_ + (size_t) tb * K * N, (int64_t) n * K, N,
                                           p_dst, p_counts + 1, cs);
                 else
@@ -1558,7 +1565,7 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             }
         }
         const bool multi_combine = dec_batch && n > 1 && native_moe_combine_enabled();
-        const bool fold_hits = multi_combine && native_moe_fuse_hits();   // the hit rows added inside the combine
+        const bool fold_hits = multi_combine && !remote_opt_ && native_moe_fuse_hits();   // the hit rows added inside
         if (!fold_hits) moe_hit_add(parts_ + (size_t) tb * K * N, hit_out, p_dst, p_counts + 1, cap, N, cs);
         if (multi_combine) {   // one launch for the window's rows
             try {
@@ -1576,6 +1583,8 @@ bool Verifier::record_window(int T, strata::gpu::Stream cs, std::string& err) {
             mb.weights = w_ + t * K; mb.shared = shared_ + t * N;
             if (!moe_combine_parts(g, l, K, mb, parts_ + (size_t) t * K * N, bo_ + t * N, cs, err)) return false;
         }
+        if (remote_opt_) remote_opt_->combine(bo_ + tb * N, y_dummy_ + tb * N, tb, n,
+                                              device_plan_ ? skip_ + grp : nullptr, ring, cs);
         stamp(l, 24, grp);
         if (l == g.n_layers - 1) {
             if (dec_batch) gr_write_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, gs, Rt(tb), n, cs);
@@ -2058,9 +2067,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         set_plan_slot(grp);
         const int tb = gtb[grp], n = gte[grp] - gtb[grp];
         progress_at("verify window: the CPU experts of layer", l);
+        if (remote_opt_) remote_opt_->begin(h_w_ + (size_t) tb * ss.k, tb, n);
         if (pool != nullptr)
             pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss.k, n, ss.k,
                  h_ymiss_ + (size_t) tb * ss.k * g.n_embd, l);
+        if (remote_opt_) remote_opt_->end();
         VDBG("layer %lld served\n", (long long) l);
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -2574,7 +2585,11 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         cur_layer_ = want - 1;
         set_plan_slot(0);
         progress_at("verify batch: the CPU experts of layer", l);
+        // The recorded graph consumes the helper mask and weighted sum just as the solo graph does.  Reset both and
+        // supply this layer's routing weights.
+        if (remote_opt_) remote_opt_->begin(h_w_, 0, S);
         if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, l);
+        if (remote_opt_) remote_opt_->end();
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
@@ -2944,7 +2959,9 @@ int Verifier::batch_poll(PoolMultiFn pool, void* user, std::string& err) {
         const Clock::time_point b = Clock::now();
         cur_layer_ = want - 1;
         set_plan_slot(0);
+        if (remote_opt_) remote_opt_->begin(h_w_, 0, S);
         if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, lb_ + b_k_);
+        if (remote_opt_) remote_opt_->end();
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
@@ -3185,6 +3202,7 @@ bool Verifier::capture_all(std::string& err) {
     if (g_ == nullptr) { err = "verify: capture_all before init"; return false; }
     if (segmented_) { err = "verify: pipelined windows need a GPU whose running kernels see the host's writes"; return false; }
     if (!always_publish_) { err = "verify: pipelined windows need set_always_publish before init"; return false; }
+    if (remote_opt_ != nullptr) { err = "verify: pipelined windows do not serve --remote-expert-opt"; return false; }
     if (rt_dump_ || rt_replay_) { err = "STRATA_ROUTE_DUMP / STRATA_ROUTE_REPLAY: not with pipelined windows"; return false; }
     for (int T = 1; T <= max_t_; ++T)
         if (!capture(T, err)) return false;

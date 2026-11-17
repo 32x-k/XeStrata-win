@@ -43,6 +43,7 @@
 namespace strata::core {
 
 class NativeHead;
+class RemoteExpertOpt;
 
 /// The CPU pool for a window: x_f (n_tok, n_embd), ids (n_tok, k) -> out (n_tok * k, n_embd), hit rows zeroed.
 using PoolMultiFn = void (*)(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
@@ -255,6 +256,9 @@ public:
     /// Turns the device-planned layers and the all-resident window graph off: with windows in flight the adaptive
     /// tier marks an expert evicted on the host before the device's residency table follows.  Before `init`.
     void set_always_publish(bool on) { always_publish_ = on; }
+    /// --remote-expert-opt: the helper GPUs' reduced rows and the mask of the CPU rows they replace.
+    /// Before init/capture.  Not with pipelined windows (capture_all refuses it).
+    void set_remote_expert_opt(RemoteExpertOpt* opt) { remote_opt_ = opt; }
     strata::gpu::Stream stream() const { return cs_; }
     int device() const { return device_; }
     /// Capture every window size and the commit graph now (a capture syncs the stream: never with a window in flight).
@@ -491,6 +495,7 @@ private:
     // pipelined windows (pl_launch ...)
     strata::gpu::Stream ext_stream_ = nullptr;   ///< set_stream: the stage's shared stream (not destroyed here)
     bool always_publish_ = false;
+    RemoteExpertOpt* remote_opt_ = nullptr;      ///< set_remote_expert_opt
     bool pl_stage(int T, const int32_t* tokens, int64_t pos0, const int32_t ple_prev[2], std::string& err);
     strata::gpu::Event *ev_done_ = nullptr, *ev_commit_ = nullptr;
     unsigned long long* prof_pin_ = nullptr;   ///< host copy of the stamps (pipelined windows)

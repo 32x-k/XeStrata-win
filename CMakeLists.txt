@@ -427,7 +427,8 @@ if(STRATA_ENABLE_XE)
   # ---- strata_engine (P2.S5): the composed layer, the session loop, the expert sources and caches, the
   # verify window and the MTP drafter.  Host code over strata_core's GPU operations (strata/core/gpu.hpp).
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp
-                                   src/core/remote_experts.cpp src/core/expert_cache.cpp src/core/native_head.cpp
+                                   src/core/remote_experts.cpp src/core/remote_expert_opt.cpp
+                                   src/core/expert_cache.cpp src/core/native_head.cpp
                                    src/core/native_dense.cpp src/core/verify.cpp src/core/moe_window.cpp
                                    src/core/plain_model.cpp src/core/plain_glm5.cpp src/core/pcie_split.cpp
                                    src/core/mtp.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp

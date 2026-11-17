@@ -14,6 +14,7 @@
 #include <vector>
 
 namespace strata::core {
+class RemoteExpertOpt;
 
 /// A static, profile-filled expert tier on another GPU. GPU 0 keeps all
 /// dense weights and state; results return through the existing pinned CPU rows.
@@ -41,6 +42,7 @@ public:
     bool owns(int64_t index) const { return owned_[(size_t) index] != 0; }
     /// This helper's cache holds (layer, expert): begin() will take its rows unless the plan gave them away.
     bool holds(int64_t layer, int32_t expert) const { return cache_.slot_of(layer, expert) >= 0; }
+    bool optimized_decode() const { return remote_opt_ != nullptr; }
     /// The engine device this helper runs on (-1: not open).
     int device() const { return device_; }
     /// (layer, expert)'s blob in this helper's VRAM, or null where it does not hold it.
@@ -68,6 +70,8 @@ public:
     double ms_wait() const { return ms_wait_; }
 
 private:
+    friend class RemoteExpertOpt;
+    RemoteExpertOpt* remote_opt_ = nullptr;
     int device_ = -1;
     int64_t n_expert_ = 0;
     int32_t groups_ = 0;

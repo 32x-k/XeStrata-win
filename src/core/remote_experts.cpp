@@ -6,11 +6,12 @@
 // A second GPU holds a static tier of the experts GPU 0's cache does not, and computes the decode's CPU-candidate rows
 // that fall on them; the CPU pool computes the rest.  Each layer's activations go to it through its own host USM and
 // its compact result rows come back the same way: no peer path is needed (a B70 and a 4070 have none).  After the
-// CUDA implementation (upstream src/core/remote_experts.cpp, v0.1.44.1), without its cache reads for the prompt path
-// and its reduction on the helper.
+// CUDA implementation (upstream src/core/remote_experts.cpp, v0.1.44.1), without its cache reads for the prompt path.
+// --remote-expert-opt's weighted reduction on the helper is in remote_expert_opt.cpp.
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/gpu.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/remote_expert_opt.hpp"
 #include "strata/core/runtime.hpp"
 
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -168,19 +169,20 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
             (size_t) strata::kernels::moe_hit_grouped_scratch_bytes(CAP, H, FF),
             strata::kernels::native_expert_scratch_bytes(CAP, FF));
         const size_t rows = (size_t) CAP * H * sizeof(float);
+        const size_t meta_bytes = sizeof(RemoteMeta) + (remote_opt_ ? remote_opt_->metadata_bytes() : 0);
         stream_ = gpu::stream_create();
         read_stream_ = gpu::stream_create_copy();
         const char* step = stream_ == nullptr                                   ? "stream"
                          : read_stream_ == nullptr                              ? "cache read stream"
                          : !gpu::alloc_host(&h_x_, rows)                        ? "input staging"
                          : !gpu::alloc_host(&h_out_, rows)                      ? "result staging"
-                         : !gpu::alloc_host(&h_meta_, sizeof(RemoteMeta))       ? "metadata staging"
+                         : !gpu::alloc_host(&h_meta_, meta_bytes)               ? "metadata staging"
                          : !gpu::alloc_device(&d_x_, rows)                      ? "input"
                          : !gpu::alloc_device(&d_out_, rows)                    ? "result"
                          : !gpu::alloc_device(&d_q8_, (size_t) CAP * (H / 32) * 36) ? "activation"
                          : !gpu::alloc_device(&d_scales_, (size_t) CAP * (H / 32) * sizeof(float)) ? "activation scales"
                          : !gpu::alloc_device(&d_scratch_, scratch)             ? "scratch"
-                         : !gpu::alloc_device(&d_meta_, sizeof(RemoteMeta))     ? "group metadata"
+                         : !gpu::alloc_device(&d_meta_, meta_bytes)             ? "group metadata"
                                                                                 : nullptr;
         if (step != nullptr) { err = failed(device, step); close(); return false; }
         // Zero copy: the helper's kernels read their input from, and write their compact rows into, its own host USM
@@ -270,18 +272,24 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
     std::memcpy(meta->dst, dst_.data(), dst_.size() * sizeof(dst_[0]));
     std::memcpy(meta->tok, tok_.data(), tok_.size() * sizeof(tok_[0]));
     meta->count = (int32_t) group_id_.size();
+    const bool reduce = remote_opt_ && remote_opt_->active();
+    if (reduce && k != 10) {   // the reduced rows' metadata is laid out for top-10 routing
+        err = "GPU" + std::to_string(device_) + " experts: --remote-expert-opt needs top-10 routing";
+        return false;
+    }
+    if (reduce) remote_opt_->prepare(*this, meta + 1);
     groups_ = (int32_t) group_id_.size();
-    const uint64_t compact_bytes = (uint64_t) dst_.size() * H * sizeof(float);
+    const uint64_t compact_bytes = (uint64_t) (reduce ? n_tok : dst_.size()) * H * sizeof(float);
     try {
         const OnDevice on(device_);
         void* s = stream_;
         if ((!zero_copy_ && !gpu::copy_async(d_x_, h_x_, (size_t) n_tok * H * sizeof(float), s)) ||
-            !gpu::copy_async(d_meta_, h_meta_, sizeof(RemoteMeta), s)) {
+            !gpu::copy_async(d_meta_, h_meta_, sizeof(RemoteMeta) + (reduce ? remote_opt_->metadata_bytes() : 0), s)) {
             err = failed(device_, "copy input");
             return false;
         }
         const float* xin = zero_copy_ ? h_x_ : d_x_;
-        float* out = zero_copy_ ? h_out_ : d_out_;
+        float* out = zero_copy_ && !reduce ? h_out_ : d_out_;
         const auto& lay = strata::kernels::cpu::expert_layout();
         if (lay.native) {
             const auto& fmt = lay.fmt[(size_t) layer];
@@ -303,7 +311,9 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
             strata::kernels::moe_grouped_s2(d_ptr_, d_start_, d_count_, d_dst_, d_tok_, groups_,
                                             (int64_t) dst_.size(), d_q8_, d_scales_, d_scratch_, out, s);
         }
-        if (!zero_copy_ && !gpu::copy_async(h_out_, d_out_, (size_t) compact_bytes, s)) {
+        if (reduce) {
+            if (!remote_opt_->reduce(*this, (RemoteMeta*) d_meta_ + 1, err)) return false;
+        } else if (!zero_copy_ && !gpu::copy_async(h_out_, d_out_, (size_t) compact_bytes, s)) {
             err = failed(device_, "copy results");
             return false;
         }
@@ -328,6 +338,7 @@ bool RemoteExperts::finish(float* out, std::string& err) {
         return false;
     }
     ms_wait_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+    if (remote_opt_ && remote_opt_->active()) { remote_opt_->accumulate(*this); return true; }
     for (size_t i = 0; i < original_row_.size(); ++i)
         std::memcpy(out + (size_t) original_row_[i] * H, h_out_ + i * H, (size_t) H * sizeof(float));
     return true;
