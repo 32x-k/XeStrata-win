@@ -325,6 +325,9 @@ struct Options {
     int expert_cache = 0;
     std::array<int, 3> expert_cache_remote{}; ///< CUDA1..3 slots; CUDA0 keeps dense/state/MTP
     std::string expert_cache_remote_placement = "stripe"; ///< stripe experts or assign complete layers to CUDA1..3
+    /// --expert-host-device1: CUDA1 keeps no VRAM cache at all - its kernels compute the misses
+    /// straight out of the host expert arena (a UMA GPU).  Not with --expert-cache-device1.
+    bool expert_host_device1 = false;
     bool remote_expert_opt = false;            ///< optional optimization of the existing remote-expert decode path
     bool expert_cache_cpu_order = false;
     /// **R4.2g.  ROUND 328 MEASURED THAT THE GLOBAL ADMISSION POLICY CANNOT WORK, AND THIS IS THE FIX.**
@@ -735,6 +738,11 @@ void usage() {
                  "  --expert-cache-device1 N  pre-fill N experts on CUDA1 (experimental)\n"
                  "  --expert-cache-device2 N  pre-fill N more experts on CUDA2\n"
                  "  --expert-cache-device3 N  pre-fill N more experts on CUDA3\n"
+                 "  --expert-host-device1  CUDA1 holds no expert copy at all: its kernels compute the\n"
+                 "                       missed experts straight from the host arena in place (a UMA\n"
+                 "                       GPU, or one whose kernels read registered host memory; checked\n"
+                 "                       at the start, off when it cannot).  Not with\n"
+                 "                       --expert-cache-device1\n"
                  "  --expert-cache-remote-placement stripe|layer  distribute expert ranks or whole\n"
                  "                       layers across CUDA1..3 (default: stripe)\n"
                  "  --remote-expert-opt   enable remote-expert decode optimizations (serve mode)\n"
@@ -2543,6 +2551,7 @@ int main(int argc, char** argv) {
         else if (a == "--expert-cache-device1") o.expert_cache_remote[0] = (int) std::strtol(next("--expert-cache-device1"), nullptr, 10);
         else if (a == "--expert-cache-device2") o.expert_cache_remote[1] = (int) std::strtol(next("--expert-cache-device2"), nullptr, 10);
         else if (a == "--expert-cache-device3") o.expert_cache_remote[2] = (int) std::strtol(next("--expert-cache-device3"), nullptr, 10);
+        else if (a == "--expert-host-device1") o.expert_host_device1 = true;
         else if (a == "--expert-cache-remote-placement")
             o.expert_cache_remote_placement = next("--expert-cache-remote-placement");
         else if (a == "--remote-expert-opt") o.remote_expert_opt = true;
@@ -2875,12 +2884,13 @@ int main(int argc, char** argv) {
         const int n_vis = strata::core::Runtime::count();
         int next_free = 1;
         for (int r = 0; r < 3; ++r) {
-            if (o.expert_cache_remote[(size_t) r] <= 0) continue;
+            if (o.expert_cache_remote[(size_t) r] <= 0 && !(r == 0 && o.expert_host_device1)) continue;
             while (next_free < n_vis &&
                    std::find(split_devs.begin(), split_devs.end(), next_free) != split_devs.end()) ++next_free;
             if (next_free >= n_vis) {
-                std::fprintf(stderr, "strata generate: --expert-cache-remote with a layer split needs a GPU that runs no "
-                                     "stage (%d visible, %zu used by the split)\n", n_vis, split_devs.size() + 1);
+                std::fprintf(stderr, "strata generate: --expert-cache-remote/--expert-host-device1 with a layer split "
+                                     "needs a GPU that runs no stage (%d visible, %zu used by the split)\n",
+                             n_vis, split_devs.size() + 1);
                 return 2;
             }
             remote_dev[r] = next_free++;
@@ -2909,7 +2919,8 @@ int main(int argc, char** argv) {
                 return false;
             }
         };
-        const bool helpers = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
+        const bool helpers = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0 ||
+                             o.expert_host_device1;
         const bool on = o.serve && multi_gpu && split_devs.size() == 1 && !(ae != nullptr && std::atoi(ae) == 0) &&
                         !o.mtp.empty() && o.spec >= 2 && o.batch == 0 && !helpers && xe2(0) && xe2(split_devs[0]);
         o.pipeline_windows = on ? 2 : 0;
@@ -2918,7 +2929,8 @@ int main(int argc, char** argv) {
                                  "GPUs (--pipeline-windows 0 or STRATA_PIPELINE_AUTO=0 turns it off)\n");
     }
     if (o.pipeline_windows > 0) {
-        const bool helpers = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
+        const bool helpers = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0 ||
+                             o.expert_host_device1;
         const char* off = !o.serve ? "it needs --serve"
                         : split_same ? "it needs each stage of the layer split on its own GPU"
                         : !multi_gpu ? "it needs a layer split on two or more GPUs"
@@ -3135,6 +3147,11 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --expert-cache-remote-placement must be stripe or layer\n");
         return 2;
     }
+    if (o.expert_host_device1 && o.expert_cache_remote[0] > 0) {
+        std::fprintf(stderr, "strata generate: --expert-host-device1 and --expert-cache-device1 cannot be "
+                             "used together (CUDA1 either caches experts or reads the host arena in place)\n");
+        return 2;
+    }
     if (o.remote_expert_opt && !o.serve) {
         std::fprintf(stderr, "strata generate: --remote-expert-opt requires --serve\n");
         return 2;
@@ -3195,7 +3212,7 @@ int main(int argc, char** argv) {
         }
     }
     const bool native_pack = strata::kernels::cpu::expert_layout().native;
-    if (o.expert_cache_remote[0] > 0) {
+    if (o.expert_cache_remote[0] > 0 || o.expert_host_device1) {
         // Keep CUDA1's proven startup order: initialise its context before
         // allocating GPU0 weights or mapping the large host expert arena.
         double free_gib = 0;
@@ -3222,7 +3239,8 @@ int main(int argc, char** argv) {
     std::vector<int> preloaded;
     if (multi_gpu) preloaded = split_devs;
     for (int r = 0; r < 3; ++r)   // and on the helper GPUs
-        if (o.expert_cache_remote[(size_t) r] > 0) preloaded.push_back(remote_dev[r]);
+        if (o.expert_cache_remote[(size_t) r] > 0 || (r == 0 && o.expert_host_device1))
+            preloaded.push_back(remote_dev[r]);
     for (const int d : preloaded) strata::core::Runtime::at(d).preload_kernels();
     // stopped when main returns, whichever way (stop_preload)
     struct PreloadStop {
@@ -3252,9 +3270,10 @@ int main(int argc, char** argv) {
             const strata::core::OnDevice on(d);
             strata::prefill::Gemm::prepare();
         }
-    // a helper GPU (--expert-cache-device1): both links, for its share of the prompt's experts (attach_prompt_helper),
-    // before the model takes the room the probe copies through; --layer-split auto reads them itself
-    if (o.expert_cache_remote[0] > 0 && native_pack)
+    // a helper GPU (--expert-cache-device1, --expert-host-device1): both links, for its share of the prompt's
+    // experts (attach_prompt_helper), before the model takes the room the probe copies through;
+    // --layer-split auto reads them itself
+    if ((o.expert_cache_remote[0] > 0 || o.expert_host_device1) && native_pack)
         for (const int d : {0, remote_dev[0]}) {
             if (link_readings().count(d)) continue;
             const strata::core::OnDevice on(d);
@@ -4303,7 +4322,7 @@ int main(int argc, char** argv) {
     // session and the cache are sized
     {
         const char* ev = std::getenv("STRATA_KV_GROW");
-        bool remote = false;
+        bool remote = o.expert_host_device1;
         for (const int r : o.expert_cache_remote) remote = remote || r > 0;
         const int want = ev != nullptr && ev[0] != '\0' ? (ev[0] != '0' ? 1 : 0) : o.kv_grow;
         // Default (-1): the device's own virtual-memory page size decides.  The B70 (Level Zero) reports 64 KiB and the
@@ -4778,8 +4797,8 @@ int main(int argc, char** argv) {
                                      "serial MTP windows); --batch-groups 1 or STRATA_BATCH_MTP_SERIAL=1 keeps --batch-mtp "
                                      "with serial windows"
                                    : "it does not combine with --batch-groups (pipelined slot groups) yet")
-                        : !stages.empty() && o.expert_cache_remote[0] > 0
-                            ? "it is not run with helper expert caches on a layer split"
+                        : !stages.empty() && (o.expert_cache_remote[0] > 0 || o.expert_host_device1)
+                            ? "it is not run with helper expert tiers on a layer split"
                         : !o.serve ? "it needs --serve" : nullptr;
         if (why != nullptr) {
             if (want_batch_mtp > 0) std::fprintf(stderr, "strata generate: WARNING: --batch-mtp is off: %s\n", why);
@@ -5259,7 +5278,8 @@ int main(int argc, char** argv) {
         const char* why = !o.serve ? "it works between requests of --serve"
                         : multi_gpu ? "a layer split has a cache per GPU"
                         : std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
-                                      [](int n) { return n > 0; }) ? "the helper caches on other GPUs"
+                                      [](int n) { return n > 0; }) || o.expert_host_device1
+                            ? "the helper tiers on other GPUs"
                         : o.resident_cpu_experts || o.resident_gib != 0 ? "the resident low-RAM mode"
                         : o.vram_segment_mib < 64 ? "--vram-segment-mib is below 64"
                         : !strata::gpu::vmem_supported() ? "this GPU's runtime has no virtual memory" : nullptr;
@@ -5817,8 +5837,9 @@ int main(int argc, char** argv) {
 
     std::array<strata::core::RemoteExperts, 3> remote_experts;
     std::unique_ptr<strata::core::RemoteExpertOpt> remote_opt;
-    if (o.remote_expert_opt && o.expert_cache_remote[0] > 0)
+    if (o.remote_expert_opt && (o.expert_cache_remote[0] > 0 || o.expert_host_device1))
         remote_opt = std::make_unique<strata::core::RemoteExpertOpt>();
+    bool host_active = false;   // --expert-host-device1: remote_experts[0] reads the arena in place
     const bool multi_remote = o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
     if (o.expert_cache_remote[0] > 0) {
         if (o.expert_cache <= 0 || profile.empty() || o.no_pool) {
@@ -5901,11 +5922,41 @@ int main(int argc, char** argv) {
                          (long long) remote_experts[(size_t) r].resident(), remote_experts[(size_t) r].gib());
         }
     }
+    // --expert-host-device1: no VRAM tier on the helper GPU - its kernels read the experts it serves
+    // straight out of the host arena in place (the UMA case: a second copy of the same RAM would be
+    // all a "cache" there could be).  A failure only disables the helper; the engine runs as without it.
+    if (o.expert_host_device1) {
+        if (o.expert_cache <= 0 || o.no_pool) {
+            std::fprintf(stderr, "strata generate: --expert-host-device1 needs a CUDA0 expert cache and "
+                                 "the expert pool\n");
+            return 2;
+        }
+        if (srcp != &arena_src) {
+            std::fprintf(stderr, "strata generate: --expert-host-device1 needs the resident expert arena, "
+                                 "not --mmap-experts: it is off\n");
+        } else {
+            std::vector<uint8_t> claimed((size_t) g.n_layers * (size_t) g.n_expert, 0);
+            for (auto& st : stages)   // a layer split: what a stage's cache holds is no helper's
+                for (const auto& pr : st->profile)
+                    if (st->cache.slot_of(pr.first, pr.second) >= 0)
+                        claimed[(size_t) pr.first * (size_t) g.n_expert + (size_t) pr.second] = 1;
+            if (remote_opt) remote_opt->attach(remote_experts[0]);
+            if (remote_experts[0].open_host(remote_dev[0], g.n_layers, g.n_expert, xcache, *srcp, claimed, err)) {
+                host_active = true;
+                std::fprintf(stderr, "strata generate: GPU%d reads the host arena in place: %lld experts\n",
+                             remote_dev[0], (long long) remote_experts[0].host_held());
+            } else {
+                std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+                if (remote_opt) remote_opt->detach(remote_experts[0]);
+            }
+        }
+    }
 
     if (remote_opt && !remote_opt->init(err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
     Drive drive;
-    for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
-        drive.d.remote[drive.d.remote_count++] = &remote_experts[(size_t) r];
+    for (int r = 0; r < 3; ++r)
+        if (o.expert_cache_remote[(size_t) r] > 0 || (r == 0 && host_active))
+            drive.d.remote[drive.d.remote_count++] = &remote_experts[(size_t) r];
     drive.d.hit_cpu_order = o.expert_cache_cpu_order;
     drive.d.split_rows = !o.no_split_rows;
     drive.d.pool = &pool;
@@ -7163,7 +7214,9 @@ int main(int argc, char** argv) {
         // Default off: the prompt path's source is srcp, exactly as before.
         std::vector<strata::core::RemoteExperts*> prefill_helpers;
         prefill_helpers.reserve((size_t) drive.d.remote_count);
-        for (int r = 0; r < drive.d.remote_count; ++r) prefill_helpers.push_back(drive.d.remote[r]);
+        for (int r = 0; r < drive.d.remote_count; ++r)
+            if (!drive.d.remote[r]->host_mode())   // VRAM caches only: there is no helper copy to read
+                prefill_helpers.push_back(drive.d.remote[r]);
         std::unique_ptr<strata::core::RemotePrefillSource> prefill_helper_src;
         strata::core::ExpertSource* prefill_src = srcp;
         uint64_t helper_blobs_before = 0, helper_bytes_before = 0;
@@ -10749,7 +10802,8 @@ int main(int argc, char** argv) {
             std::array<int64_t, 3> remote_before{};
             std::array<int64_t, 3> launches_before{};
             std::array<uint64_t, 3> compact_before{}, full_before{};
-            for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
+            for (int r = 0; r < 3; ++r)
+                if (o.expert_cache_remote[(size_t) r] > 0 || (r == 0 && host_active))
             {
                 remote_before[(size_t) r] = remote_experts[(size_t) r].computed();
                 launches_before[(size_t) r] = remote_experts[(size_t) r].launched_layers();
@@ -13052,7 +13106,8 @@ int main(int argc, char** argv) {
                                      "of %lld windows\n", (long long) t2_rej[0], (long long) t2_hit[0], (long long) t2_rej[1],
                              (long long) t2_hit[1], (long long) t2_rej[2], (long long) t2_hit[2], (long long) t2_rej[3],
                              (long long) t2_hit[3], (long long) dec_windows);
-            for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
+            for (int r = 0; r < 3; ++r)
+                if (o.expert_cache_remote[(size_t) r] > 0 || (r == 0 && host_active))
                 std::fprintf(stderr, "strata serve: CUDA%d: %lld expert entries, %lld active layer launches, %.1f MiB returned "
                                      "(%.1f MiB with full rows) in this request; host %.0f ms staging+launching, %.0f ms "
                                      "waiting for it (since start)\n", r + 1,
@@ -14186,7 +14241,8 @@ int main(int argc, char** argv) {
                         "  pool phases", wp / per, dr / per, rp / per);
         }
         std::printf("%-24s %lld blobs read\n", "  expert blobs", (long long) srcp->reads());
-        for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
+        for (int r = 0; r < 3; ++r)
+            if (o.expert_cache_remote[(size_t) r] > 0 || (r == 0 && host_active))
             std::printf("  CUDA%d experts           %lld routed entries computed\n",
                         r + 1, (long long) remote_experts[(size_t) r].computed());
         // ---- **R4's DISPATCH MEASUREMENT: h, ON THE ENGINE'S OWN ROUTING.**  No offline trace, no corpus

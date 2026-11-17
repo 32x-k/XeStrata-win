@@ -32,6 +32,17 @@ public:
               const std::vector<std::pair<int32_t, int32_t>>& ranked,
               const ExpertCache& primary, ExpertSource& source,
               std::vector<uint8_t>& claimed, std::string& err);
+    /// --expert-host-device1: the helper holds no VRAM cache at all.  Its kernels read the host
+    /// arena's blobs in place - an iGPU's UMA, or a GPU whose kernels read host memory registered
+    /// on it (gpu::kernels_read_registered; Level Zero's registrations are copy-only, refused inside).
+    /// "Held" is then: in the arena (a stable, registered address) and in no GPU's expert cache.
+    /// open() and this are exclusive; `claimed` (a layer split's stage caches) is only read.
+    bool open_host(int device, int64_t layers, int64_t experts, const ExpertCache& primary,
+                   ExpertSource& source, const std::vector<uint8_t>& claimed, std::string& err);
+    /// open_host(): this helper computes straight from the host arena, it has no VRAM cache.
+    bool host_mode() const { return host_mode_; }
+    /// Experts open_host() marked held (not GPU-resident, a stable arena address).
+    int64_t host_held() const { return host_count_; }
     void close();
 
     /// `kind` is the primary verifier's classification (-1 = CPU candidate),
@@ -40,13 +51,25 @@ public:
                int64_t k, const int32_t* kind, const int32_t* primary_res,
                std::string& err);
     bool owns(int64_t index) const { return owned_[(size_t) index] != 0; }
-    /// This helper's cache holds (layer, expert): begin() will take its rows unless the plan gave them away.
-    bool holds(int64_t layer, int32_t expert) const { return cache_.slot_of(layer, expert) >= 0; }
+    /// This helper serves (layer, expert): in its VRAM cache, or - host mode - in the arena with a
+    /// stable registered address.  begin() takes its rows unless the plan gave them away.
+    bool holds(int64_t layer, int32_t expert) const {
+        if (host_mode_) {
+            const int64_t i = layer * n_expert_ + expert;
+            return i >= 0 && i < (int64_t) host_held_.size() && host_held_[(size_t) i] != 0;
+        }
+        return cache_.slot_of(layer, expert) >= 0;
+    }
     bool optimized_decode() const { return remote_opt_ != nullptr; }
     /// The engine device this helper runs on (-1: not open).
     int device() const { return device_; }
-    /// (layer, expert)'s blob in this helper's VRAM, or null where it does not hold it.
+    /// (layer, expert)'s blob where this helper's kernels read it: its VRAM slot, or - host mode -
+    /// its registered host address in the arena.  Null where it does not hold it.
     const uint8_t* blob_on_device(int64_t layer, int32_t expert) const {
+        if (host_mode_) {
+            const int64_t i = layer * n_expert_ + expert;
+            return i >= 0 && i < (int64_t) host_blob_.size() ? host_blob_[(size_t) i] : nullptr;
+        }
         const int32_t slot = cache_.slot_of(layer, expert);
         return slot >= 0 ? cache_.device_slot(slot) : nullptr;
     }
@@ -104,6 +127,17 @@ private:
     std::vector<int32_t> group_of_, group_id_;
     std::vector<int32_t> start_, dst_, tok_, original_row_;
     std::vector<unsigned long long> ptr_;
+
+    // host mode (--expert-host-device1): no cache_; the kernels read the arena's registered host
+    // addresses in place.  host_blob_ is the address open_host() saw; begin() claims a row only
+    // while the source still answers the same address for it (a source whose pinned blobs move
+    // would fall back to the CPU).
+    bool probe_arena_read(int64_t layers, std::string& err);
+    bool host_mode_ = false;
+    ExpertSource* host_src_ = nullptr;
+    std::vector<uint8_t> host_held_;
+    std::vector<const uint8_t*> host_blob_;
+    int64_t host_count_ = 0;
 };
 
 /// STRATA_PREFILL_HELPER_SOURCE (opt-in): the prompt path's view of the expert tiers, where a blob a helper

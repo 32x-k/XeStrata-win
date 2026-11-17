@@ -80,6 +80,12 @@ void RemoteExpertOpt::attach(RemoteExperts& remote) {
     peers_.push_back({&remote});
 }
 
+void RemoteExpertOpt::detach(RemoteExperts& remote) {
+    remote.remote_opt_ = nullptr;
+    peers_.erase(std::remove_if(peers_.begin(), peers_.end(),
+                                [&](const Peer& p) { return p.remote == &remote; }), peers_.end());
+}
+
 bool RemoteExpertOpt::attach_device(int device, std::string& err) {
     for (const Sink& s : sinks_)
         if (s.device == device) return true;
@@ -212,7 +218,7 @@ void RemoteExpertOpt::combine(float* dst, float* scratch, int token_begin, int t
 
 bool RemoteExpertOpt::owns(int64_t layer, int32_t expert) const {
     for (const auto& p : peers_)
-        if (p.remote->cache_.slot_of(layer, expert) >= 0) return true;
+        if (p.remote->holds(layer, expert)) return true;   // its cache's, or the arena's in host mode
     return false;
 }
 
@@ -234,6 +240,7 @@ bool RemoteExpertOpt::adapt(const std::vector<float>& usage, const std::vector<i
     std::string err;
     for (auto& p : peers_) {
         auto& r = *p.remote;
+        if (r.host_mode_) continue;   // the arena is not this tier's to swap: it holds everything already
         std::vector<Swap> swaps;
         std::vector<std::pair<float, int32_t>> candidates, victims;
         for (int32_t l = 0; l < (int32_t) r.layers_present_.size(); ++l) {

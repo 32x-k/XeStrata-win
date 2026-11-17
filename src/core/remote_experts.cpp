@@ -18,6 +18,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
+#include "strata/kernels/verify_kernels.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -25,6 +26,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <map>
+#include <vector>
 
 namespace strata::core {
 namespace {
@@ -96,6 +99,11 @@ void RemoteExperts::close() {
     zero_copy_ = false;
     original_row_.clear();
     layers_present_.clear();
+    host_mode_ = false;
+    host_src_ = nullptr;
+    host_held_.clear();
+    host_blob_.clear();
+    host_count_ = 0;
 }
 
 bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
@@ -219,6 +227,197 @@ bool RemoteExperts::open(int device, int slots, int64_t layers, int64_t experts,
     return true;
 }
 
+// --expert-host-device1: NO VRAM cache, no fill.  The source's pinned blobs stay where they are and
+// this GPU's kernels read them in place - the tier for a UMA GPU (an iGPU beside a dGPU's limited
+// VRAM) whose "cache" would only be a second copy of the same RAM.  Held = pinned in the source with
+// the stable address it answered at open, and in no GPU's expert cache (the primary's and a layer
+// split's stage caches', `claimed`).
+bool RemoteExperts::open_host(int device, int64_t layers, int64_t experts,
+                              const ExpertCache& primary, ExpertSource& source,
+                              const std::vector<uint8_t>& claimed, std::string& err) {
+    close();
+    if (device < 1 || device >= Runtime::count() || layers <= 0 || experts <= 0 ||
+        claimed.size() != (size_t) layers * (size_t) experts) {
+        err = "GPU" + std::to_string(device) + " experts: --expert-host-device1 needs the device and "
+              "the model's geometry";
+        return false;
+    }
+    try {
+        const OnDevice on(device);
+        device_ = device;
+        n_expert_ = experts;
+        // The kernels will dereference host addresses a registration made visible to this device:
+        // a CUDA or HIP GPU reads registered host memory at the same address, a Level Zero GPU's
+        // registration is for its copies only (gpu.hpp).
+        if (!gpu::kernels_read_registered()) {
+            err = "GPU" + std::to_string(device) + " experts: this GPU's kernels cannot read host "
+                  "memory registered on it; --expert-host-device1 is off";
+            close();
+            return false;
+        }
+        if (!source.register_on(device, err)) {
+            err = "GPU" + std::to_string(device) + " experts: " + err +
+                  "; --expert-host-device1 is off";
+            close();
+            return false;
+        }
+        // The held table: a stable arena address for every expert no GPU's cache has.  blob()'s
+        // answer is the address the kernels are given; a source that cannot keep it stable is
+        // found out at claim time (begin), where the row goes back to the CPU.
+        host_held_.assign((size_t) layers * (size_t) experts, 0);
+        host_blob_.assign((size_t) layers * (size_t) experts, nullptr);
+        layers_present_.assign((size_t) layers, 0);
+        host_count_ = 0;
+        for (int64_t l = 0; l < layers; ++l) {
+            for (int32_t e = 0; e < experts; ++e) {
+                const size_t i = (size_t) l * (size_t) experts + (size_t) e;
+                if (claimed[i] || primary.slot_of(l, e) >= 0 || !source.pinned(l, e)) continue;
+                const uint8_t* p = source.blob(l, e);
+                if (p == nullptr) continue;
+                host_held_[i] = 1;
+                host_blob_[i] = p;
+                layers_present_[(size_t) l] = 1;
+                ++host_count_;
+            }
+        }
+        if (host_count_ == 0) {
+            err = "GPU" + std::to_string(device) + " experts: the host arena holds no expert the GPU "
+                  "caches do not already have; --expert-host-device1 is off";
+            close();
+            return false;
+        }
+        // A copy through the registration is not proof the kernels can address the arena (the
+        // registration was made for copies): fetch_blobs reads the sampled addresses with the same
+        // 16-byte loads the PCIe share uses, and the bytes are compared with the host's own.
+        if (!probe_arena_read(layers, err)) {
+            err = "GPU" + std::to_string(device) + " experts: it cannot read the host arena in "
+                  "place (" + err + "); --expert-host-device1 is off";
+            close();
+            return false;
+        }
+        const size_t scratch = std::max<size_t>(
+            (size_t) strata::kernels::moe_hit_grouped_scratch_bytes(CAP, H, FF),
+            strata::kernels::native_expert_scratch_bytes(CAP, FF));
+        const size_t rows = (size_t) CAP * H * sizeof(float);
+        const size_t meta_bytes = sizeof(RemoteMeta) + (remote_opt_ ? remote_opt_->metadata_bytes() : 0);
+        stream_ = gpu::stream_create();
+        const char* step = stream_ == nullptr                                   ? "stream"
+                         : !gpu::alloc_host(&h_x_, rows)                        ? "input staging"
+                         : !gpu::alloc_host(&h_out_, rows)                      ? "result staging"
+                         : !gpu::alloc_host(&h_meta_, meta_bytes)               ? "metadata staging"
+                         : !gpu::alloc_device(&d_x_, rows)                      ? "input"
+                         : !gpu::alloc_device(&d_out_, rows)                    ? "result"
+                         : !gpu::alloc_device(&d_q8_, (size_t) CAP * (H / 32) * 36) ? "activation"
+                         : !gpu::alloc_device(&d_scales_, (size_t) CAP * (H / 32) * sizeof(float)) ? "activation scales"
+                         : !gpu::alloc_device(&d_scratch_, scratch)             ? "scratch"
+                         : !gpu::alloc_device(&d_meta_, meta_bytes)             ? "group metadata"
+                                                                                : nullptr;
+        if (step != nullptr) { err = failed(device, step); close(); return false; }
+        const char* zc = std::getenv("STRATA_REMOTE_ZEROCOPY");
+        zero_copy_ = !(zc && zc[0] == '0') && gpu::kernels_read_host(h_x_) && gpu::kernels_read_host(h_out_);
+        auto* meta = (RemoteMeta*) d_meta_;
+        d_ptr_ = meta->ptr;
+        d_start_ = meta->start;
+        d_dst_ = meta->dst;
+        d_tok_ = meta->tok;
+        d_count_ = &meta->count;
+        host_src_ = &source;
+        host_mode_ = true;
+    } catch (const std::exception& e) {
+        err = "GPU" + std::to_string(device) + " experts: " + e.what();
+        close();
+        return false;
+    }
+    owned_.assign(CAP, 0);
+    group_of_.resize(CAP);
+    group_id_.reserve(CAP);
+    ptr_.reserve(CAP);
+    start_.reserve(CAP + 1);
+    dst_.reserve(CAP);
+    tok_.reserve(CAP);
+    original_row_.reserve(CAP);
+    computed_ = 0;
+    launched_layers_ = 0;
+    returned_bytes_ = full_row_bytes_ = 0;
+    return true;
+}
+
+// The open_host startup check: this GPU's KERNELS - not its copy engine - read a few held blobs in
+// place.  Both ends of the first and the last held blob of every layer are sampled (each layer is a
+// registration piece, or a piece's bounds lie inside it): fetch_blobs' 16-byte loads move the bytes
+// into device memory, the host reads them back and compares.  A GPU that cannot address the arena,
+// or that reads it wrong (the UHD 770's registration copied wrong bytes), fails here - before any
+// decode window depends on it.
+bool RemoteExperts::probe_arena_read(int64_t layers, std::string& err) {
+    constexpr int64_t kProbe = 64 << 10;
+    std::map<int64_t, std::vector<const uint8_t*>> groups;   // probe bytes -> the arena addresses
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    for (int64_t l = 0; l < layers; ++l) {
+        const int64_t bb = (int64_t) lay.blob_bytes(l);
+        const int64_t pn = std::min<int64_t>(bb, kProbe) & ~(int64_t) 15;   // fetch_blobs' 16 B vectors
+        if (pn < 16) continue;
+        const uint8_t* first = nullptr;
+        const uint8_t* last = nullptr;
+        for (int64_t e = 0; e < n_expert_; ++e) {
+            const uint8_t* p = host_blob_[(size_t) l * (size_t) n_expert_ + (size_t) e];
+            if (p == nullptr) continue;
+            if (first == nullptr) first = p;
+            last = p;
+        }
+        if (first == nullptr) continue;
+        std::vector<const uint8_t*>& v = groups[pn];
+        v.push_back(first);
+        if (bb > pn) v.push_back(first + bb - pn);
+        if (last != first) {
+            v.push_back(last);
+            if (bb > pn) v.push_back(last + bb - pn);
+        }
+    }
+    for (const auto& [pn, ptrs] : groups) {
+        const int64_t nr = (int64_t) ptrs.size();
+        const size_t bytes = (size_t) nr * (size_t) pn;
+        unsigned long long* d_src = nullptr;
+        int32_t* d_n = nullptr;
+        uint8_t* d_dst = nullptr;
+        bool ok = gpu::alloc_device(&d_src, (size_t) nr * sizeof(unsigned long long)) &&
+                  gpu::alloc_device(&d_n, sizeof(int32_t)) &&
+                  gpu::alloc_device(&d_dst, bytes);
+        if (!ok) {
+            err = std::string("the probe's buffers: ") + gpu::last_error();
+        } else {
+            std::vector<unsigned long long> tab;
+            tab.reserve(ptrs.size());
+            for (const uint8_t* p : ptrs) tab.push_back((unsigned long long) p);
+            const int32_t n32 = (int32_t) nr;
+            ok = gpu::copy(d_src, tab.data(), tab.size() * sizeof(tab[0])) &&
+                 gpu::copy(d_n, &n32, sizeof n32);
+            if (!ok) {
+                err = std::string("the probe's tables: ") + gpu::last_error();
+            } else {
+                strata::kernels::fetch_blobs(d_src, d_n, d_dst, pn, (int) nr, nullptr);   // synchronous
+                std::vector<uint8_t> back(bytes);
+                ok = gpu::copy(back.data(), d_dst, bytes);
+                if (!ok) {
+                    err = std::string("the probe's readback: ") + gpu::last_error();
+                } else {
+                    for (int64_t i = 0; ok && i < nr; ++i)
+                        if (std::memcmp(back.data() + (size_t) i * (size_t) pn, ptrs[(size_t) i],
+                                        (size_t) pn) != 0) {
+                            err = "the kernel's read of arena region " + std::to_string(i) +
+                                  " does not match the host's bytes";
+                            ok = false;
+                        }
+                }
+            }
+        }
+        gpu::free(d_src);
+        gpu::free(d_n);
+        gpu::free(d_dst);
+        if (!ok) return false;
+    }
+    return true;
+}
+
 bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok,
                           int64_t k, const int32_t* kind, const int32_t* primary_res,
                           std::string& err) {
@@ -239,8 +438,20 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
         const int32_t e = ids[i];
         if ((kind && kind[i] != -1) || e < 0 || e >= n_expert_ ||
             (primary_res && primary_res[(size_t) layer * (size_t) n_expert_ + (size_t) e] >= 0)) continue;
-        const int32_t slot = cache_.slot_of(layer, e);
-        if (slot < 0) continue;
+        const uint8_t* blob = nullptr;
+        if (host_mode_) {
+            // the registered arena address open_host() saw, still the source's answer for this
+            // expert - a pinned blob that moved goes back to the CPU
+            const size_t index = (size_t) layer * (size_t) n_expert_ + (size_t) e;
+            if (index >= host_held_.size() || !host_held_[index] || !host_src_->pinned(layer, e)) continue;
+            const uint8_t* p = host_src_->blob(layer, e);
+            if (p == nullptr || p != host_blob_[index]) continue;
+            blob = p;
+        } else {
+            const int32_t slot = cache_.slot_of(layer, e);
+            if (slot < 0) continue;
+            blob = cache_.device_slot(slot);
+        }
         owned_[(size_t) i] = 1;
         int32_t group = -1;
         for (size_t g = 0; g < group_id_.size(); ++g)
@@ -248,7 +459,7 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
         if (group < 0) {
             group = (int32_t) group_id_.size();
             group_id_.push_back(e);
-            ptr_.push_back((unsigned long long) cache_.device_slot(slot));
+            ptr_.push_back((unsigned long long) blob);
         }
         group_of_[(size_t) i] = group;
         ++computed_;

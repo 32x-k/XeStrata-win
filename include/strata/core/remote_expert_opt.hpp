@@ -29,7 +29,10 @@ public:
     RemoteExpertOpt(const RemoteExpertOpt&) = delete;
     RemoteExpertOpt& operator=(const RemoteExpertOpt&) = delete;
 
-    void attach(RemoteExperts& remote); // before RemoteExperts::open
+    void attach(RemoteExperts& remote); // before RemoteExperts::open / open_host
+    /// Undoes attach when the helper's open failed and it stays closed (a refused host-arena
+    /// helper): its peer is removed so init() allocates nothing for it.
+    void detach(RemoteExperts& remote);
     bool init(std::string& err);        // after all helper caches are open
     /// A verifier's device (Verifier::init): its kernels read their own host-USM copy of the sums.
     /// Idempotent; the copy for device 0 is made by init().
