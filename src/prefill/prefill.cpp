@@ -2919,7 +2919,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     // would stream and at most max_rows tokens route to (their rows last, after the CPU's)
                     std::vector<char> on_help;
                     int64_t rows_help = 0, n_help = 0;
-                    if (helper_ && !stream_all && lay_c.native) {
+                    // STRATA_PREFILL_HELPER_MAX_T=n: the helper takes a share only of chunks below n tokens (default: every
+                    // chunk).  Measured on the R9700 + 8060S (UD-Q4_K_XL, 2026-11-18): the 8060S's share sped up the
+                    // agent turns' small chunks but held big ones back 4-7%, where the R9700 waits for it
+                    static const int64_t helper_max_t = [] {
+                        const char* v = std::getenv("STRATA_PREFILL_HELPER_MAX_T");
+                        return v != nullptr && std::strtoll(v, nullptr, 10) > 0 ? (int64_t) std::strtoll(v, nullptr, 10)
+                                                                                : INT64_MAX;
+                    }();
+                    if (helper_ && !stream_all && lay_c.native && T < helper_max_t) {
                         HelperShare& hs = *helper_;
                         for (int32_t e = 0; e < m.g->n_expert; ++e) {
                             const int32_t c = m.cnt[(size_t) e];
