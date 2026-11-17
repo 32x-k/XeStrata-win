@@ -146,6 +146,15 @@ private:
 };
 
 constexpr int64_t STREAM_ALL_MIN = 2048;
+// STRATA_PREFILL_STREAM_ALL_MIN=n: the chunk size from which every non-resident expert is streamed in id order (default
+// STREAM_ALL_MIN); that walk gives the helper GPU and the CPU no share.  Every layout choice keyed on the walk reads it.
+inline int64_t stream_all_min() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("STRATA_PREFILL_STREAM_ALL_MIN");
+        return e != nullptr && std::strtoll(e, nullptr, 10) > 0 ? (int64_t) std::strtoll(e, nullptr, 10) : STREAM_ALL_MIN;
+    }();
+    return v;
+}
 // STRATA_PREFILL_CPU_SHARE (set_cpu_pool, upstream 978d3558, opt-in there): a chunk below STREAM_ALL_MIN hands the
 // decode CPU pool - idle while a prompt is read - the non-resident experts few of its tokens route to, instead of
 // streaming them.  `auto` (the default here): the share measured (each layer's CPU time per expert and the GPU's per
@@ -193,7 +202,7 @@ inline int ring_slots(size_t T) {
         r = (int) std::min<uint64_t>((uint64_t) r, mem / 8 / blob);
     }
     const int big = std::clamp<int>(r, 16, RING_MAX);
-    return (int64_t) T >= STREAM_ALL_MIN ? big : STAGE;
+    return (int64_t) T >= stream_all_min() ? big : STAGE;
 }
 // The BF16-weight projections (hyper-connection, SSM alpha/beta, indexer, router, shared gate, PLE key/value) take
 // BF16 activations here and FP32 ones in decode.  STRATA_PREFILL_BF16X2 adds each activation's BF16 remainder as a
@@ -1240,7 +1249,7 @@ uint64_t expert_group_bytes(size_t T) {
         dq.take<uint16_t>((size_t) (g_expert_group * GU_ELEMS), ok);
         dq.take<uint16_t>((size_t) (g_expert_group * D_ELEMS), ok);
     }
-    if (mp.any && (int64_t) T >= STREAM_ALL_MIN) {
+    if (mp.any && (int64_t) T >= stream_all_min()) {
         q8.take<uint8_t>(MMQ_GROUP * mp.gu_max, ok);
         q8.take<uint8_t>(MMQ_GROUP * mp.d_max, ok);
     }
@@ -1340,7 +1349,7 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         // only once its copy is done: with fewer buffers than slots the copies and the launching thread wait on the
         // ring (the case above, 4 threads: 16 buffers 4.1 s, 96 3.8 s).  Where most streamed blobs come from pinned
         // RAM the device ring is deeper and the host copies few: the ring stays as it is.
-        if (std::getenv("STRATA_STAGER_RING") == nullptr && (int64_t) T >= STREAM_ALL_MIN && g_pinned_share < 0.9)
+        if (std::getenv("STRATA_STAGER_RING") == nullptr && (int64_t) T >= stream_all_min() && g_pinned_share < 0.9)
             m.stager->kRing = std::max(m.stager->kRing, std::min(ring_slots(T), 256));
         if (!m.stager->init((size_t) MAXBLOB(), threads)) ok = false;
     }
@@ -1510,7 +1519,7 @@ bool Prefill::carve(size_t T, void* alloc) {
             m.dq_gu = dq.take<uint16_t>((size_t) (g_expert_group * GU_ELEMS), ok);
             m.dq_d = dq.take<uint16_t>((size_t) (g_expert_group * D_ELEMS), ok);
         }
-        if (ok && mmq_plan().any && (int64_t) T >= STREAM_ALL_MIN) {
+        if (ok && mmq_plan().any && (int64_t) T >= stream_all_min()) {
             m.grp_gu = q8.take<uint8_t>(MMQ_GROUP * mmq_plan().gu_max, ok);
             m.grp_d = q8.take<uint8_t>(MMQ_GROUP * mmq_plan().d_max, ok);
         }
@@ -1522,7 +1531,7 @@ bool Prefill::carve(size_t T, void* alloc) {
         // the bounds: n + 1 absolute, then MMQ_GROUP + 1 relative a group; a group may hold one expert (the rows cap)
         m.bounds_dev = o.take<int32_t>((size_t) (m.g->n_expert + 1 + m.g->n_expert * (MMQ_GROUP + 1)), ok);
         m.tab_dev = o.take<int32_t>((size_t) (4 * m.g->n_expert), ok);
-        if ((int64_t) T < STREAM_ALL_MIN) m.mring = o.take<uint8_t>(MMQ_RING * MMQ_SLOT(), ok);
+        if ((int64_t) T < stream_all_min()) m.mring = o.take<uint8_t>(MMQ_RING * MMQ_SLOT(), ok);
         m.mgrp_live[0] = m.mgrp_live[1] = false;
         // (written at every run's start, not here: when serving, these are live expert-cache slots until a request
         // lends them - a write now would corrupt a resident expert)
@@ -1780,7 +1789,7 @@ uint64_t Prefill::bytes_needed(const core::ModelGeometry& g, const core::Session
         o.take<int32_t>(T * K, ok);
         o.take<int32_t>((size_t) (2 * (g.n_expert + g.n_expert / MMQ_GROUP + 2)), ok);
         o.take<int32_t>((size_t) (4 * g.n_expert), ok);
-        if ((int64_t) T < STREAM_ALL_MIN) o.take<uint8_t>(MMQ_RING * MMQ_SLOT(), ok);
+        if ((int64_t) T < stream_all_min()) o.take<uint8_t>(MMQ_RING * MMQ_SLOT(), ok);
     }
     for (int i = 0; i < ring_slots(T); ++i) o.take<uint8_t>((size_t) MAXBLOB(), ok);
     f(T * N);
@@ -2267,13 +2276,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // k lands in ring slot k % ring); a copy is issued once the entry `ring` before it is consumed (its slot's
         // `used` event recorded), so the copy stream never waits on an event that is not queued yet
         const strata::kernels::cpu::ExpertLayout& lay0 = strata::kernels::cpu::expert_layout();
-        // STRATA_PREFILL_STREAM_ALL_MIN=n: the chunk size from which every non-resident expert is streamed in id order
-        // (default STREAM_ALL_MIN); that walk gives the helper GPU no share, so a UMA helper is kept in by raising it
-        static const int64_t stream_all_min = [] {
-            const char* v = std::getenv("STRATA_PREFILL_STREAM_ALL_MIN");
-            return v != nullptr && std::strtoll(v, nullptr, 10) > 0 ? (int64_t) std::strtoll(v, nullptr, 10) : STREAM_ALL_MIN;
-        }();
-        const bool stream_all = m.ring > STAGE && T >= stream_all_min && m.src != nullptr;
+        const bool stream_all = m.ring > STAGE && T >= stream_all_min() && m.src != nullptr;
         struct StreamEntry { int32_t l, e; const uint8_t* blob; int job; };
         std::vector<StreamEntry> seq;
         std::vector<size_t> seq_start;
