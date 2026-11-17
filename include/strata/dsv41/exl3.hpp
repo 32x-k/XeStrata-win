@@ -102,6 +102,9 @@ struct MoeArgs {
     const float* plan_w = nullptr;
     const float* cpu_part = nullptr;
     const int* cpu_flag = nullptr;
+    // non-null: cpu_part / cpu_flag read through these live on the device instead (a decode graph's staged pointers)
+    const float* const* cpu_part_p = nullptr;
+    const int* const* cpu_flag_p = nullptr;
     ExpertLayout lay;
     int k = 8, n_embd = 4096, n_ff = 2048;
     float limit = 0.0f;   // 0: no clamp

@@ -188,7 +188,9 @@ void moe_down(const MoeArgs& a, const float* h, const float* sh_out, float* out,
         }
         for (int c = 0; c < 128; ++c) {
             float v = sum[c];
-            if (a.cpu_flag && *a.cpu_flag) v += a.cpu_part[c0 + c];
+            const int* cf = a.cpu_flag_p ? *a.cpu_flag_p : a.cpu_flag;
+            const float* cp = a.cpu_part_p ? *a.cpu_part_p : a.cpu_part;
+            if (cf && *cf) v += cp[c0 + c];
             if (sh_out) v += sh_out[c0 + c];
             out[c0 + c] = v;
         }

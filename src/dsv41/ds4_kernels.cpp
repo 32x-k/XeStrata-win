@@ -99,14 +99,19 @@ float kv_value(const void* data, int fmt, int d, int e) {
     return q * scale;
 }
 void rows_at(const Rows& r, int t, int& n, int& k) {
-    if (!r.gen) { n = r.n[t]; k = r.k[t]; return; }
-    const int nn = int((r.p0 + t + 1) / r.R), cb = sycl::min(r.ccap, (nn + r.blk - 1) / r.blk);
+    if (!r.gen && !r.np && !r.kp) { n = r.n[t]; k = r.k[t]; return; }
+    const long long p0 = r.p0_p ? *r.p0_p : r.p0;
+    const int nn = int((p0 + t + 1) / r.R), cb = sycl::min(r.ccap, (nn + r.blk - 1) / r.blk);
+    int gn = r.n[t], gk = r.k[t];
     switch (r.gen) {
-    case 1: n = nn; k = sycl::min(r.kcap, nn); break;
-    case 2: n = nn; k = cb; break;
-    case 3: n = cb * r.blk; k = sycl::min(r.kcap, nn); break;
-    default: n = (nn + r.blk - 1) / r.blk; k = r.kcap; break;
+    case 1: gn = nn; gk = sycl::min(r.kcap, nn); break;
+    case 2: gn = nn; gk = cb; break;
+    case 3: gn = cb * r.blk; gk = sycl::min(r.kcap, nn); break;
+    case 4: gn = (nn + r.blk - 1) / r.blk; gk = r.kcap; break;
+    default: break;
     }
+    n = r.np ? r.np[t] : gn;
+    k = r.kp ? r.kp[t] : gk;
 }
 struct GemvCaps {
     size_t max_group = 0;
@@ -294,10 +299,11 @@ void route_group_packed(sycl::nd_item<1> item, sycl::local_accessor<float, 1> sc
 struct AttnCounts { int first, window, selected; };
 AttnCounts attn_counts(const AttnRows& a, int t) {
     if (!a.gen) return {a.win0[t], a.nwin[t], a.nsel[t]};
-    const long long ta = a.t0 + t, pa = a.p0 + ta;
-    const long long first = sycl::max(static_cast<long long>(a.win) - a.p0, ta + 1);
+    const long long p0 = a.p0_p ? *a.p0_p : a.p0;
+    const long long ta = a.t0 + t, pa = p0 + ta;
+    const long long first = sycl::max(static_cast<long long>(a.win) - p0, ta + 1);
     return {int(first), int(a.win + ta - first + 1),
-            a.R > 0 ? int(sycl::min(static_cast<long long>(a.kcap), (pa + 1) / a.R)) : 0};
+            a.sel_p ? a.sel_p[t] : (a.R > 0 ? int(sycl::min(static_cast<long long>(a.kcap), (pa + 1) / a.R)) : 0)};
 }
 struct AttnCaps { size_t max_group, local_bytes, subgroup, units; };
 struct AttnTile { size_t local = 0, heads = 0, rows = 0; };
@@ -484,7 +490,8 @@ bool sparse_attn_register(const float* q, const uint16_t* win, const void* ckv, 
         decoded_stride = size_t(scratch->cap);
         unpack_selected(ckv, sel, sel_stride, a, T, D, decoded, decoded_stride, s);
     }
-    const long long p0 = a.p0;
+    const long long p0_host = a.p0;
+    const long long* p0p = a.p0_p;
     const int t0 = a.t0, window = a.win, compression = a.R, cap = a.kcap;
     sycl_detail::launch(s, sycl::nd_range<1>(sycl::range<1>(size_t(T) * head_tiles * local), sycl::range<1>(local)), [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(STRATA_SUB_GROUP(SG))]] {
             const auto group = item.get_group();
@@ -492,6 +499,7 @@ bool sparse_attn_register(const float* q, const uint16_t* win, const void* ckv, 
             const size_t lane = item.get_local_linear_id(), sl = sg.get_local_linear_id();
             const size_t block = item.get_group_linear_id(), t = block / head_tiles;
             const size_t head = (block % head_tiles) * G + sg.get_group_linear_id();
+            const long long p0 = p0p ? *p0p : p0_host;
             const long long ta = t0 + static_cast<long long>(t), pa = p0 + ta;
             const long long first = sycl::max(static_cast<long long>(window) - p0, ta + 1);
             const int nwin = int(window + ta - first + 1);
@@ -653,7 +661,8 @@ bool sparse_attn_heads(const float* q, const uint16_t* win, const void* ckv, con
         decoded_stride = size_t(scratch->cap);
         unpack_selected(ckv, sel, sel_stride, a, T, D, decoded, decoded_stride, s);
     }
-    const long long p0 = a.p0;
+    const long long p0_host = a.p0;
+    const long long* p0p = a.p0_p;
     const int t0 = a.t0, window = a.win, compression = a.R, cap = a.kcap;
     sycl_detail::submit(s, [&](sycl::handler& h) {
         h.parallel_for<SparseHeadsKernel<H, G, R, SG>>(sycl::nd_range<1>(sycl::range<1>(size_t(T) * head_tiles * local), sycl::range<1>(local)),
@@ -663,6 +672,7 @@ bool sparse_attn_heads(const float* q, const uint16_t* win, const void* ckv, con
             const size_t lane = item.get_local_linear_id(), sl = sg.get_local_linear_id();
             const size_t block = item.get_group_linear_id(), t = block / head_tiles;
             const size_t head = ((block % head_tiles) * G + sg.get_group_linear_id()) * H;
+            const long long p0 = p0p ? *p0p : p0_host;
             const long long ta = t0 + static_cast<long long>(t), pa = p0 + ta;
             const long long first = sycl::max(static_cast<long long>(window) - p0, ta + 1);
             const int nwin = int(window + ta - first + 1);
@@ -953,13 +963,14 @@ void sparse_rows(const float* q, const uint16_t* win, const uint16_t* rows_base,
             float* sc = (*sc_s.get());
             auto st_s = sycl::ext::oneapi::group_local_memory_for_overwrite<float[3]>(it.get_group());
             float* st = (*st_s.get());
-            // A tile's rows as element offsets: a window row from win, a selected row from rows_base (negated, less one).
-            auto rows_s = sycl::ext::oneapi::group_local_memory_for_overwrite<long long[Tile]>(it.get_group());
-            long long* rows = (*rows_s.get());
+            // A tile's rows as pointers, as upstream's shared table: a window row from win, a selected row from
+            // rows_base.  (Offsets made every reader re-do the sign check and the base select.)
+            auto rows_s = sycl::ext::oneapi::group_local_memory_for_overwrite<const uint16_t* [Tile]>(it.get_group());
+            const uint16_t** rows = (*rows_s.get());
             const int g = int(it.get_group_linear_id()), t = g / heads, hh = g % heads;
             const int tid = int(it.get_local_linear_id());
             const auto c = attn_counts(a, t);
-            auto row = [&](int j) { const long long o = rows[j]; return o >= 0 ? win + o : rows_base + (-1 - o); };
+            auto row = [&](int j) { return rows[j]; };
             const int* sl = sel + size_t(t) * sel_stride;
             for (int i = tid; i < D; i += WG) qs[i] = q[(size_t(t) * heads + hh) * D + i];
             if (tid == 0) { st[0] = -1e30f; st[2] = 0.f; }
@@ -967,14 +978,17 @@ void sparse_rows(const float* q, const uint16_t* win, const uint16_t* rows_base,
             const auto sg = it.get_sub_group();
             const int lane = int(sg.get_local_linear_id()), wp = tid / SG, nw = WG / SG;
             float o0 = 0.f, o1 = 0.f;
+            float qr[Per];
+#pragma unroll
+            for (int x = 0; x < Per; ++x) qr[x] = qs[lane * Per + x];
             const int total = c.window + c.selected;
             for (int t0 = 0; t0 < total; t0 += Tile) {
                 const int nt = sycl::min(Tile, total - t0);
                 if (tid < nt) {
                     const int j = t0 + tid;
-                    rows[tid] = j < c.window ? (static_cast<long long>(c.first) + j) * D :
-                        -1 - static_cast<long long>(Contig ? size_t(t) * sel_stride + size_t(j - c.window) :
-                                                    size_t(sl[j - c.window])) * D;
+                    rows[tid] = j < c.window ? win + (static_cast<size_t>(c.first) + j) * D :
+                        rows_base + (Contig ? size_t(t) * sel_stride + size_t(j - c.window) :
+                                              size_t(sl[j - c.window])) * D;
                 }
                 it.barrier(sycl::access::fence_space::local_space);
                 for (int jj = wp; jj < nt; jj += nw) {
@@ -985,11 +999,11 @@ void sparse_rows(const float* q, const uint16_t* win, const uint16_t* rows_base,
                         for(int block=0;block<Per/8;++block) {
                             const auto v=sparse_bf16_pack(rr+ptrdiff_t(block)*8);
 #pragma unroll
-                            for(int k=0;k<8;++k)dot+=qs[lane*Per+block*8+k]*bf16_value(v[k]);
+                            for(int k=0;k<8;++k)dot+=qr[block*8+k]*bf16_value(v[k]);
                         }
                     } else {
 #pragma unroll
-                        for (int x = 0; x < Per; ++x) dot += qs[lane * Per + x] * bf16_value(rr[x]);
+                        for (int x = 0; x < Per; ++x) dot += qr[x] * bf16_value(rr[x]);
                     }
                     dot = subgroup_sum<SG>(sg, dot);
                     if (lane == 0) sc[jj] = dot * scale;
@@ -1021,10 +1035,28 @@ void sparse_rows(const float* q, const uint16_t* win, const uint16_t* rows_base,
                 o0 *= cs;
                 o1 *= cs;
                 const int col = tid * 2;
-                for (int j = 0; j < nt; ++j) {
-                    const uint16_t* rr = row(j);
-                    o0 += sc[j] * bf16_value(rr[col]);
-                    o1 += sc[j] * bf16_value(rr[col + 1]);
+                int j = 0;
+                for (; j + 4 <= nt; j += 4) {
+                    // Batch the four rows' loads so their latencies overlap; the accumulation order is unchanged.
+                    uint32_t pr0, pr1, pr2, pr3;
+                    __builtin_memcpy(&pr0, row(j) + col, sizeof(pr0));
+                    __builtin_memcpy(&pr1, row(j + 1) + col, sizeof(pr1));
+                    __builtin_memcpy(&pr2, row(j + 2) + col, sizeof(pr2));
+                    __builtin_memcpy(&pr3, row(j + 3) + col, sizeof(pr3));
+                    o0 += sc[j] * bf16_value(uint16_t(pr0 & 0xffffu));
+                    o1 += sc[j] * bf16_value(uint16_t(pr0 >> 16));
+                    o0 += sc[j + 1] * bf16_value(uint16_t(pr1 & 0xffffu));
+                    o1 += sc[j + 1] * bf16_value(uint16_t(pr1 >> 16));
+                    o0 += sc[j + 2] * bf16_value(uint16_t(pr2 & 0xffffu));
+                    o1 += sc[j + 2] * bf16_value(uint16_t(pr2 >> 16));
+                    o0 += sc[j + 3] * bf16_value(uint16_t(pr3 & 0xffffu));
+                    o1 += sc[j + 3] * bf16_value(uint16_t(pr3 >> 16));
+                }
+                for (; j < nt; ++j) {
+                    uint32_t pr;
+                    __builtin_memcpy(&pr, row(j) + col, sizeof(pr));
+                    o0 += sc[j] * bf16_value(uint16_t(pr & 0xffffu));
+                    o1 += sc[j] * bf16_value(uint16_t(pr >> 16));
                 }
                 it.barrier(sycl::access::fence_space::local_space);
             }
@@ -1173,8 +1205,10 @@ bool unpack_selected_parts(const void* ckv, const int* sel, int sel_stride, cons
         // attn_counts' selected rows, a.nsel read at constant indices: indexing the kernel's copy of the rows
         // by t would put it in private memory.
         int selected = 0;
-        if (a.gen) {
-            if (a.R > 0) selected = int(sycl::min(static_cast<long long>(a.kcap), (a.p0 + a.t0 + t + 1) / a.R));
+        if (a.sel_p) selected = a.sel_p[t];
+        else if (a.gen) {
+            const long long ap0 = a.p0_p ? *a.p0_p : a.p0;
+            if (a.R > 0) selected = int(sycl::min(static_cast<long long>(a.kcap), (ap0 + a.t0 + t + 1) / a.R));
         } else {
 #pragma unroll
             for (int i = 0; i < kWin; ++i)
@@ -1242,9 +1276,14 @@ bool index_score_group(const float* q, const float* w, const uint8_t* kc, int he
             for (int c = 0; c < HD; c += 8) {
                 float kv[8];
                 if constexpr (KF == kKvFp4p) {
+                    const uint32_t cw = *reinterpret_cast<const uint32_t*>(kr + c / 2);
                     const float ks = sycl::bit_cast<float>(uint32_t(kr[HD / 2 + c / 32]) << 23);
 #pragma unroll
-                    for (int x = 0; x < 8; ++x) kv[x] = e2m1_value(uint8_t(kr[(c + x) / 2] >> (4 * (x & 1)))) * ks;
+                    for (int x = 0; x < 8; ++x) {
+                        const uint32_t b = cw >> (4 * x);
+                        const auto h = sycl::bit_cast<sycl::half>(uint16_t(((b & 8u) << 12) | ((b & 7u) << 9)));
+                        kv[x] = float(h) * 16384.0f * ks;
+                    }
                 } else {
                     const auto* b = reinterpret_cast<const uint16_t*>(kr) + c;
 #pragma unroll
@@ -1253,11 +1292,9 @@ bool index_score_group(const float* q, const float* w, const uint8_t* kc, int he
 #pragma unroll
                 for (int hh = 0; hh < 32; ++hh) {
                     if (hh >= heads) break;
-                    float query[8];
+                    const float* qh = &qs[hh * HD + c];
 #pragma unroll
-                    for (int x = 0; x < 8; ++x) query[x] = qs[hh * HD + c + x];
-#pragma unroll
-                    for (int x = 0; x < 8; ++x) acc[hh] += query[x] * kv[x];
+                    for (int x = 0; x < 8; ++x) acc[hh] += qh[x] * kv[x];
                 }
             }
             float sum = 0.f;
@@ -1542,7 +1579,8 @@ void finish(float* x, int n_vec, int len, long long stride, const Finish& f, syc
         if (f.w) for (int e = 0; e < len; ++e) ss += row[e] * row[e];
         const float inv = f.w ? sycl::rsqrt(ss / float(len) + f.eps) : 1.f;
         const int g = f.quant == 2 ? 16 : 32;
-        const int r0 = len - f.rd, pos = f.pos + int(v / f.vpp) * f.pos_step;
+        const int fpos = f.pos_p ? *f.pos_p : f.pos;
+        const int r0 = len - f.rd, pos = fpos + int(v / f.vpp) * f.pos_step;
         uint8_t* packed = f.pdst ? f.pdst + static_cast<long long>(v) * f.pdst_stride : nullptr;
         uint16_t* dst = f.dst ? f.dst + static_cast<long long>(v) * f.dst_stride : nullptr;
         // These 32 values are a quantization block, independent of the device's subgroup width.
@@ -1652,7 +1690,7 @@ void hc_mix_split(const float* h, const float* fn, int hcdim, int n_mix, int T, 
     const hc_detail::Split args{scale, base, hc, iters, hc_eps, pre, post, comb};
     if (hc_detail::mix(h, fn, hcdim, n_mix, T, eps, mixes, s, cnt, &args)) return;
     hc_mix_split(h, fn, hcdim, n_mix, T, eps, mixes, scale, base, hc, iters, hc_eps, pre, post, comb, s);
-    if (cnt) s.memset(cnt, 0, size_t(T) * sizeof(unsigned));
+    if (cnt && !sycl_detail::suppressed_submit(s)) s.memset(cnt, 0, size_t(T) * sizeof(unsigned));
 }
 void hc_pre_norm(const float* h, const float* mix, const float* w, int dim, int hc, int T, float eps, float* x, sycl::queue& s) {
     if (hc_detail::pre_norm(h, mix, w, dim, hc, T, eps, x, s)) return;
@@ -1784,7 +1822,7 @@ int* router_bad_flag(sycl::queue& s) {
     static core::PerDevice<int*> flags;
     return flags.get(s.get_device(), [&] {
         int* flag = sycl::malloc_device<int>(1, s);
-        if (flag != nullptr) s.memset(flag, 0, sizeof(int));   // in order, ahead of the kernels that set it
+        if (flag != nullptr && !sycl_detail::suppressed_submit(s)) s.memset(flag, 0, sizeof(int));   // in order, ahead of the kernels that set it
         return flag;
     });
 }
@@ -1861,12 +1899,12 @@ bool copy_regions(const CopyRegions& r, sycl::queue& s) {
 }
 
 void compress_win(const float* kv, const float* score, float* kv_state, float* score_state, int ratio, int p0, int T,
-                  int d, const float* w, float eps, float* latent, sycl::queue& s) {
-    if (compress_detail::compress(kv, score, kv_state, score_state, ratio, p0, T, d, w, eps, latent, s)) return;
+                  int d, const float* w, float eps, float* latent, sycl::queue& s, const int* p0_p) {
+    if (compress_detail::compress(kv, score, kv_state, score_state, ratio, p0, T, d, w, eps, latent, s, p0_p)) return;
     int g = 0;
     for (int t = 0; t < T; ++t) {
-        const int slot = (p0 + t) % ratio;
         parallel(s, size_t(d), [=](size_t e) {
+            const int slot = int(((p0_p ? *p0_p : p0) + t) % ratio);
             kv_state[size_t(slot) * d + e] = kv[size_t(t) * d + e];
             score_state[size_t(slot) * d + e] = score[size_t(t) * d + e];
         });
@@ -1961,7 +1999,11 @@ void cand_blocks(const float* score, long long stride, int T, const Rows& r, int
                  int* out, int out_stride, sycl::queue& s) {
     Rows rb = r;
     int max_blocks = 0;
-    if (r.gen) { rb.gen = 4; rb.blk = blk; max_blocks = (int((r.p0 + T) / r.R) + blk - 1) / blk; }
+    if (r.gen) {
+        rb.gen = 4; rb.blk = blk;
+        max_blocks = (int(((r.p0_p ? *r.p0_p : r.p0) + T) / r.R) + blk - 1) / blk;
+        if (r.p0_p) max_blocks = (max_blocks + 63) & ~63;   // a decode graph's stable grid (rows_at bounds inside)
+    }
     else for (int t = 0; t < T; ++t) {
         rb.n[t] = (r.n[t] + blk - 1) / blk;
         max_blocks = std::max(max_blocks, rb.n[t]);
@@ -2044,20 +2086,24 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
         for (size_t e = lane; e < size_t(d); e += local) result[e] /= den;
     });
 }
-void ring_to_ext(const uint8_t* ring, uint16_t* ext, int64_t p0, int n, int d, sycl::queue& s) {
+void ring_to_ext(const uint8_t* ring, uint16_t* ext, int64_t p0, int n, int d, sycl::queue& s,
+                 const int64_t* p0_p) {
     parallel(s, size_t(n) * d, [=](size_t z) {
+        const int64_t p0_live = p0_p ? *p0_p : p0;
         const int r = int(z / d), e = int(z % d);
-        const int64_t p = p0 - n + r;
+        const int64_t p = p0_live - n + r;
         ext[z] = p < 0 ? 0 : bf16_rn(kv_value(ring + size_t(p % n) * kv_row_bytes(kKvFp8, d), kKvFp8, d, e));
     });
 }
-void ext_to_ring(const uint16_t* ext, uint8_t* ring, int64_t p0, int n, int T, int d, sycl::queue& s, uint8_t* backup) {
+void ext_to_ring(const uint16_t* ext, uint8_t* ring, int64_t p0, int n, int T, int d, sycl::queue& s, uint8_t* backup,
+                 const int64_t* p0_p) {
     if (d % 32) throw std::invalid_argument("ds4 ring: incomplete FP8 block");
-    if (finish_detail::ext_to_ring(ext, ring, p0, n, T, d, s, backup)) return;
+    if (finish_detail::ext_to_ring(ext, ring, p0, n, T, d, s, backup, p0_p)) return;
     const size_t rb = kv_row_bytes(kKvFp8, d);
     parallel(s, size_t(T), [=](size_t t) {
+        const int64_t p0_live = p0_p ? *p0_p : p0;
         if (T - int(t) > n) return;
-        uint8_t* row = ring + size_t((p0 + t) % n) * rb;
+        uint8_t* row = ring + size_t((p0_live + t) % n) * rb;
         if (backup) for (size_t j = 0; j < rb; ++j) backup[t * rb + j] = row[j];
         for (int start = 0; start < d; start += 32) {
             uint32_t a = 0;
@@ -2153,6 +2199,8 @@ void combine(const float* ed, const float* cpu, const float* sh, const Combine& 
 
 void publish_req(Req* req, int T, unsigned seq, int na0, int na1, sycl::queue& s, Resp* resp, int* cpu_any,
                  const unsigned* host_done);
+void publish_req_dyn(Req* reqs, int T, const unsigned* seq_p, int na0, int na1, sycl::queue& s, Resp* resps,
+                     int* cpu_any, const unsigned* host_done);
 
 // STRATA_DS4_RESIDENT_SKIP_W / _TOPK (upstream 86bb00b, CHANGES THE ANSWERS - Turbo; 0 = off): which of a token's k
 // routed experts the decode keeps, wherever they live (VRAM too).  Rank = the weight order (the weights, ties by
@@ -2197,13 +2245,15 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, sycl::queue& s,
                    const float* bias_vl, unsigned vl, int na0, int na1, Resp* resp, int* cpu_any,
-                   const unsigned* host_done) {
+                   const unsigned* host_done, const unsigned* seq_p) {
     if (T > kWin || dim > kMaxDim || k < 0 || k > kPicks || k > n)
         throw std::invalid_argument("ds4 route_publish: invalid request dimensions");
     if (req == nullptr || host_done == nullptr) resp = nullptr;
     if (resp == nullptr) cpu_any = nullptr;    // (self-answer only where the publish can answer)
+    // seq_p (a decode graph's staged word): seq and the request/answer slots are taken on the device, req and resp
+    // then the rings' bases - the slot is (*seq_p) % kRing.
     const ResidentSkip rs = resident_skip();
-    const auto publish = [=](size_t t) {
+    const auto publish = [=](size_t t, Req* slot_req) {
         const int* ids = idx + t * kPicks;
         float* weights = w + t * kPicks;
         float wsum = 0.0f;
@@ -2219,7 +2269,7 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
             weights[i] = wv;
             plan_ptr[t * kPicks + i] = kept ? vram[ids[i]] : 0;
             cpu |= kept && vram[ids[i]] == 0;
-            if (req) { req->ids[t][i] = kept ? ids[i] : -1; req->w[t][i] = wv; }
+            if (slot_req) { slot_req->ids[t][i] = kept ? ids[i] : -1; slot_req->w[t][i] = wv; }
         }
         // (6227775's self-answer) a pick on the CPU lane noted for the publish below
         if (cpu && cpu_any != nullptr)
@@ -2229,22 +2279,25 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
     };
     int* bad = router_bad_flag(s);
     const bool launched = route_groups(s, T, n, [=](sycl::nd_item<1> item, auto scores, auto biased) {
+        Req* slot_req = req && seq_p ? req + (*seq_p) % kRing : req;
         const size_t t = item.get_group_linear_id(), lane = item.get_local_linear_id();
         const float* b = bias_vl && ((vl >> t) & 1u) ? bias_vl : bias;
         route_group(item, scores, biased, logits + t * 1024, b, n, k, scale, idx + t * kPicks, w + t * kPicks, bad);
-        bool cpu = lane == 0 ? publish(t) : false;
+        bool cpu = lane == 0 ? publish(t, slot_req) : false;
         cpu = sycl::group_broadcast(item.get_group(), cpu, 0);
-        if (req && cpu)
+        if (slot_req && cpu)
             for (size_t e = lane; e < size_t(std::max(dim, 0)); e += item.get_local_range(0))
-                req->x[t][e] = x[t * dim + e];
+                slot_req->x[t][e] = x[t * dim + e];
     });
     if (!launched) parallel(s, size_t(T), [=](size_t t) {
+        Req* slot_req = req && seq_p ? req + (*seq_p) % kRing : req;
         const float* b = bias_vl && ((vl >> t) & 1u) ? bias_vl : bias;
         route_row(logits + t * 1024, b, n, k, scale, idx + t * kPicks, w + t * kPicks, bad);
-        const bool cpu = publish(t);
-        if (req && cpu) for (int e = 0; e < dim; ++e) req->x[t][e] = x[t * dim + e];
+        const bool cpu = publish(t, slot_req);
+        if (slot_req && cpu) for (int e = 0; e < dim; ++e) slot_req->x[t][e] = x[t * dim + e];
     });
-    publish_req(req, T, seq, na0, na1, s, resp, cpu_any, host_done);
+    if (seq_p) publish_req_dyn(req, T, seq_p, na0, na1, s, resp, cpu_any, host_done);
+    else publish_req(req, T, seq, na0, na1, s, resp, cpu_any, host_done);
 }
 // route_publish's publish, shared with route_pair: the request's counts and sequence behind the routing
 // kernel, on the device where the report allows it, a host task otherwise.
@@ -2279,10 +2332,50 @@ void publish_req(Req* req, int T, unsigned seq, int na0, int na1, sycl::queue& s
         });
         return;
     }
+    if (sycl_detail::suppressed_submit(s)) return;
     s.submit([=](sycl::handler& h) {
         // Completion of the preceding kernel makes its mailbox writes visible to
         // this host task. The release store publishes the entire request at once.
         h.host_task([=] {
+            req->na[0] = na0; req->na[1] = na1; req->T = T;
+            std::atomic_ref<unsigned>(req->seq).store(seq, std::memory_order_release);
+        });
+    });
+}
+// publish_req with the sequence read live on the device: seq = *seq_p, req = reqs + seq % kRing, resp the same
+// (the decode graph's staged sequence word - the rings' bases in, the slot picked on the device).
+void publish_req_dyn(Req* reqs, int T, const unsigned* seq_p, int na0, int na1, sycl::queue& s, Resp* resps,
+                     int* cpu_any, const unsigned* host_done) {
+    if (reqs == nullptr || seq_p == nullptr) return;
+    if (system_publish(s)) {
+        sycl_detail::single(s, [=] {
+            const unsigned seq = *seq_p;
+            Req* req = reqs + seq % kRing;
+            Resp* resp = resps ? resps + seq % kRing : nullptr;
+            req->na[0] = na0; req->na[1] = na1; req->T = T;
+            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+            sycl::atomic_ref<unsigned, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                             sycl::access::address_space::generic_space>(req->seq).store(seq);
+            if (resp == nullptr || cpu_any == nullptr) return;
+            const int any = sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                           sycl::access::address_space::generic_space>(*cpu_any).load();
+            sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                             sycl::access::address_space::generic_space>(*cpu_any).store(0);
+            if (any || host_done == nullptr ||
+                int(seq - *(volatile const unsigned*) host_done) >= int(kRing / 2))
+                return;
+            for (int t = 0; t < T; ++t) resp->cpu[t] = 0;
+            sycl::atomic_fence(sycl::memory_order::release, sycl::memory_scope::system);
+            sycl::atomic_ref<unsigned, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                             sycl::access::address_space::generic_space>(resp->seq).store(seq);
+        });
+        return;
+    }
+    if (sycl_detail::suppressed_submit(s)) return;
+    s.submit([=](sycl::handler& h) {
+        h.host_task([=] {
+            const unsigned seq = *seq_p;
+            Req* req = reqs + seq % kRing;
             req->na[0] = na0; req->na[1] = na1; req->T = T;
             std::atomic_ref<unsigned>(req->seq).store(seq, std::memory_order_release);
         });
@@ -2313,7 +2406,7 @@ bool route_pair(const RoutePair& a, sycl::queue& s) {
     while (local <= limit / 2) local *= 2;
     sycl_detail::require_in_order(s);
     const ResidentSkip rs = resident_skip();
-    const auto publish = [=](size_t t, const int* ids, float* weights) {
+    const auto publish = [=](size_t t, const int* ids, float* weights, Req* req) {
         float wsum = 0.0f;
         if (rs.w > 0.0f || rs.k > 0)
             for (int i = 0; i < a.k; ++i) wsum += weights[i];
@@ -2327,8 +2420,8 @@ bool route_pair(const RoutePair& a, sycl::queue& s) {
             weights[i] = wv;
             a.plan_ptr[t * kPicks + i] = kept ? a.vram[ids[i]] : 0;
             cpu |= kept && a.vram[ids[i]] == 0;
-            a.req->ids[t][i] = kept ? ids[i] : -1;
-            a.req->w[t][i] = wv;
+            req->ids[t][i] = kept ? ids[i] : -1;
+            req->w[t][i] = wv;
         }
         return cpu;
     };
@@ -2337,23 +2430,25 @@ bool route_pair(const RoutePair& a, sycl::queue& s) {
         sycl::local_accessor<float, 1> scores(size_t(n_max), h), biased(size_t(n_max), h);
         h.parallel_for(sycl::nd_range<1>(sycl::range<1>(size_t(a.T) * 2 * local), sycl::range<1>(local)),
                        [=](sycl::nd_item<1> item) {
+            Req* req = a.seq_p ? a.req + (*a.seq_p) % kRing : a.req;
             const size_t g = item.get_group_linear_id(), t = g >> 1, lane = item.get_local_linear_id();
             if ((g & 1u) == 0) {
                 const float* b = a.bias_vl && ((a.vl >> t) & 1u) ? a.bias_vl : a.bias;
                 route_group(item, scores, biased, a.logits + t * 1024, b, a.n, a.k, a.route_scale,
                             a.idx + t * kPicks, a.w + t * kPicks, bad);
-                bool cpu = lane == 0 ? publish(t, a.idx + t * kPicks, a.w + t * kPicks) : false;
+                bool cpu = lane == 0 ? publish(t, a.idx + t * kPicks, a.w + t * kPicks, req) : false;
                 cpu = sycl::group_broadcast(item.get_group(), cpu, 0);
                 if (cpu)
                     for (size_t e = lane; e < size_t(a.dim); e += local)
-                        a.req->x[t][e] = a.x[t * size_t(a.dim) + e];
+                        req->x[t][e] = a.x[t * size_t(a.dim) + e];
             } else {
                 route_group(item, scores, biased, a.a_logits + t * 1024, a.a_bias, a.a_n, a.m, 1.f,
-                            a.req->ahead[t] + a.off, nullptr, nullptr);
+                            req->ahead[t] + a.off, nullptr, nullptr);
             }
         });
     });
-    publish_req(a.req, a.T, a.seq, a.na0, a.na1, s, nullptr, nullptr, nullptr);
+    if (a.seq_p) publish_req_dyn(a.req, a.T, a.seq_p, a.na0, a.na1, s, nullptr, nullptr, nullptr);
+    else publish_req(a.req, a.T, a.seq, a.na0, a.na1, s, nullptr, nullptr, nullptr);
     return true;
 }
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, sycl::queue& s) {
@@ -2363,6 +2458,19 @@ void route_ahead(const float* logits, const float* bias, int n, int m, int T, Re
         route_group(item, scores, biased, logits + t * 1024, bias, n, m, 1.f, req->ahead[t] + off, nullptr, nullptr);
     });
     if (!launched) parallel(s, size_t(T), [=](size_t t) {
+        route_row(logits + t * 1024, bias, n, m, 1.f, req->ahead[t] + off, nullptr, nullptr);
+    });
+}
+void route_ahead_dyn(const float* logits, const float* bias, int n, int m, int T, Req* reqs, const unsigned* seq_p,
+                     int off, sycl::queue& s) {
+    if (T > kWin || off < 0 || off + m > kAhead) throw std::invalid_argument("ds4 route_ahead: invalid request dimensions");
+    const bool launched = route_groups(s, T, n, [=](sycl::nd_item<1> item, auto scores, auto biased) {
+        Req* req = reqs + (*seq_p) % kRing;
+        const size_t t = item.get_group_linear_id();
+        route_group(item, scores, biased, logits + t * 1024, bias, n, m, 1.f, req->ahead[t] + off, nullptr, nullptr);
+    });
+    if (!launched) parallel(s, size_t(T), [=](size_t t) {
+        Req* req = reqs + (*seq_p) % kRing;
         route_row(logits + t * 1024, bias, n, m, 1.f, req->ahead[t] + off, nullptr, nullptr);
     });
 }
@@ -2410,7 +2518,29 @@ void wait_seq(const unsigned* seq_ptr, unsigned seq, sycl::queue& s) {
     }
     // Elsewhere the wait stays on the host: it needs neither atomics on host allocations nor a system-scope
     // fence from the device.
+    if (sycl_detail::suppressed_submit(s)) return;
     s.submit([=](sycl::handler& h) { h.host_task([=] { wait_mailbox(seq_ptr, seq, false, control.get()); }); });
+}
+void wait_seq_dyn(Resp* resps, const unsigned* seq_p, sycl::queue& s) {
+    sycl_detail::require_in_order(s);
+    unsigned* release = nullptr;
+    const auto control = mailbox_for(s, &release);
+    if (device_wait(s) && (release || !control)) {
+        using Flag = sycl::atomic_ref<unsigned, sycl::memory_order::relaxed, sycl::memory_scope::device,
+                                      sycl::access::address_space::generic_space>;
+        sycl_detail::single(s, [=] {
+            const unsigned seq = *seq_p;
+            unsigned* const flag = &resps[seq % kRing].seq;
+            if (release) while (Flag(*flag).load() != seq && Flag(*release).load() == 0u) {}
+            else while (Flag(*flag).load() != seq) {}
+            sycl::atomic_fence(sycl::memory_order::acquire, sycl::memory_scope::system);
+        });
+        return;
+    }
+    if (sycl_detail::suppressed_submit(s)) return;
+    s.submit([=](sycl::handler& h) {
+        h.host_task([=] { const unsigned seq = *seq_p; wait_mailbox(&resps[seq % kRing].seq, seq, false, control.get()); });
+    });
 }
 void moe_sort(const int* idx, int T, int k, const int* vs, int n_vs, int* bounds, int* row_tok, int* pos, sycl::queue& s) {
     sycl_detail::require_in_order(s);
@@ -2620,7 +2750,7 @@ void xfer_put(const Xfer& x, unsigned* flag, unsigned seq, unsigned* cnt, sycl::
     core::ReadbackSpan copies[4]{};
     for (int i = 0; i < x.n; ++i) copies[i] = {x.dst[i], x.src[i], x.bytes[i]};
     core::readback_async(s, std::span<const core::ReadbackSpan>(copies, size_t(x.n)));
-    if (cnt) s.memset(cnt, 0, sizeof(unsigned));
+    if (cnt && !sycl_detail::suppressed_submit(s)) s.memset(cnt, 0, sizeof(unsigned));
     if (flag) set_flag(flag, seq, s);
 }
 void win_submit(sycl::queue& s) {

@@ -186,7 +186,7 @@ void finish_rows(sycl::nd_item<1> item, size_t vector, float* x, int len, long l
     }
     if (f.rd > 0) {
         const int r0 = len - f.rd;
-        const int pos = f.pos + int(vector / size_t(f.vpp)) * f.pos_step;
+        const int pos = (f.pos_p ? *f.pos_p : f.pos) + int(vector / size_t(f.vpp)) * f.pos_step;
         for (int j = 0; j < count; ++j) {
             const int e = tid + j * kThreads;
             const float other = sycl::permute_group_by_xor(item.get_sub_group(), r[j], 1);
@@ -198,7 +198,7 @@ void finish_rows(sycl::nd_item<1> item, size_t vector, float* x, int len, long l
             }
         }
     }
-    uint8_t* packed = Pack ? f.pdst + static_cast<long long>(vector) * f.pdst_stride : nullptr;
+    uint8_t* packed = Pack ? (f.pdst_p ? *f.pdst_p : f.pdst) + static_cast<long long>(vector) * f.pdst_stride : nullptr;
     if (f.quant != 0 || Pack) {
         const int group = f.quant == 2 ? 16 : 32;
         for (int j = 0; j < count; ++j) {
@@ -327,15 +327,16 @@ inline bool finish_n(const FinishJob* jobs, int n, sycl::queue& q) {
 // row contract separate from finish_kernel.
 template <int SG>
 void ext_to_ring_kernel(const uint16_t* ext, uint8_t* ring, int64_t p0, int n, int tokens, int dim,
-                        sycl::queue& q, uint8_t* backup) {
+                        sycl::queue& q, uint8_t* backup, const int64_t* p0p = nullptr) {
     const size_t row_bytes = kv_row_bytes(kKvFp8, dim);
     auto body = [=](sycl::nd_item<1> item) {
+        const int64_t p0_live = p0p ? *p0p : p0;
         auto ex_s = sycl::ext::oneapi::group_local_memory_for_overwrite<uint32_t[SG == 16 ? kThreads : 1]>(item.get_group());
         uint32_t* exchange = (*ex_s.get());
         {
             const size_t token = item.get_group_linear_id(), tid = item.get_local_linear_id();
             if (tokens - int(token) > n) return; // Uniform WG skip; a later token overwrites this slot.
-            uint8_t* row = ring + size_t((p0 + static_cast<int64_t>(token)) % n) * row_bytes;
+            uint8_t* row = ring + size_t((p0_live + static_cast<int64_t>(token)) % n) * row_bytes;
             if (backup) {
                 for (size_t i = tid; i < row_bytes; i += kThreads) backup[token * row_bytes + i] = row[i];
                 item.barrier(sycl::access::fence_space::global_and_local);
@@ -360,14 +361,14 @@ void ext_to_ring_kernel(const uint16_t* ext, uint8_t* ring, int64_t p0, int n, i
                         BoundBody<SG, decltype(body)>{body});
 }
 inline bool ext_to_ring(const uint16_t* ext, uint8_t* ring, int64_t p0, int n, int tokens, int dim,
-                        sycl::queue& q, uint8_t* backup) {
+                        sycl::queue& q, uint8_t* backup, const int64_t* p0p = nullptr) {
     sycl_detail::require_in_order(q);
     if (tokens == 0) return true;
     if (tokens < 0 || dim <= 0 || n <= 0) return false;
     const int sg = subgroup(caps(q), false);
     if (!sg) return false;
-    if (sg == 32) ext_to_ring_kernel<32>(ext, ring, p0, n, tokens, dim, q, backup);
-    else ext_to_ring_kernel<16>(ext, ring, p0, n, tokens, dim, q, backup);
+    if (sg == 32) ext_to_ring_kernel<32>(ext, ring, p0, n, tokens, dim, q, backup, p0p);
+    else ext_to_ring_kernel<16>(ext, ring, p0, n, tokens, dim, q, backup, p0p);
     return true;
 }
 

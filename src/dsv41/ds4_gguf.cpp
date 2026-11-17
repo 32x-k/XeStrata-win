@@ -414,7 +414,9 @@ void token_combine(const x3::MoeArgs& a, const float* part, const float* shared,
             const float value = a.plan_ptr[e] ? part[size_t(e) * a.n_embd + row] : 0.f;
             sum = sycl::fma(a.plan_w[e], value, sum);
         }
-        if (a.cpu_part && a.cpu_flag && *a.cpu_flag) sum += a.cpu_part[row];
+        const int* cf = a.cpu_flag_p ? *a.cpu_flag_p : a.cpu_flag;
+        const float* cp = a.cpu_part_p ? *a.cpu_part_p : a.cpu_part;
+        if (cp && cf && *cf) sum += cp[row];
         out[row] = sum + (shared ? shared[row] : 0.f);
     });
 }
@@ -712,7 +714,9 @@ void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* 
             const auto* blob = reinterpret_cast<const uint8_t*>(a.plan_ptr[e]);
             if (blob) result += a.plan_w[e] * quant_dot(td, blob + a.lay.trellis[2] + c * rd, h + size_t(e) * a.n_ff, a.n_ff);
         }
-        if (a.cpu_part && a.cpu_flag && *a.cpu_flag) result += a.cpu_part[c];
+        const int* cf = a.cpu_flag_p ? *a.cpu_flag_p : a.cpu_flag;
+        const float* cp = a.cpu_part_p ? *a.cpu_part_p : a.cpu_part;
+        if (cp && cf && *cf) result += cp[c];
         if (sh_out) result += sh_out[c];
         out[c] = result;
     });

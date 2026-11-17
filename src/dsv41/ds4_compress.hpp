@@ -18,10 +18,12 @@ namespace strata::ds4::compress_detail {
 // not a measured device optimum; the same reported capabilities as finish gate it.
 template <int SG>
 void compress_kernel(const float* kv, const float* score, float* kv_state, float* score_state,
-                     int ratio, int p0, int T, int d, const float* w, float eps, float* latent, sycl::queue& q) {
+                     int ratio, int p0, int T, int d, const float* w, float eps, float* latent, sycl::queue& q,
+                     const int* p0p = nullptr) {
     constexpr int threads = finish_detail::kThreads;
     {
         auto body = [=](sycl::nd_item<1> item) {
+            const int p0_live = p0p ? *p0p : p0;
             auto red_s = sycl::ext::oneapi::group_local_memory_for_overwrite<float[threads / 32 + 1]>(item.get_group());
             auto ex_s = sycl::ext::oneapi::group_local_memory_for_overwrite<uint32_t[SG == 16 ? threads : 1]>(item.get_group());
             float* red = (*red_s.get());
@@ -30,13 +32,13 @@ void compress_kernel(const float* kv, const float* score, float* kv_state, float
             const int count = (d + threads - 1) / threads;
             int g = 0;
             for (int t = 0; t < T; ++t) {
-                const int slot = (p0 + t) % ratio;
+                const int slot = int((p0_live + t) % ratio);
                 for (int e = tid; e < d; e += threads) {
                     kv_state[size_t(slot) * d + e] = kv[size_t(t) * d + e];
                     score_state[size_t(slot) * d + e] = score[size_t(t) * d + e];
                 }
                 item.barrier(sycl::access::fence_space::global_and_local);
-                if ((p0 + t + 1) % ratio) continue;
+                if ((p0_live + t + 1) % ratio) continue;
 
                 float r[finish_detail::kValues], ss = 0.f;
                 for (int j = 0; j < count; ++j) {
@@ -74,14 +76,15 @@ void compress_kernel(const float* kv, const float* score, float* kv_state, float
 }
 
 inline bool compress(const float* kv, const float* score, float* kv_state, float* score_state,
-                     int ratio, int p0, int T, int d, const float* w, float eps, float* latent, sycl::queue& q) {
+                     int ratio, int p0, int T, int d, const float* w, float eps, float* latent, sycl::queue& q,
+                     const int* p0p = nullptr) {
     if (T <= 0) return true;
     if (ratio <= 0 || d <= 0 || d > finish_detail::kValues * finish_detail::kThreads) return false;
     const int sg = finish_detail::subgroup(finish_detail::caps(q), true);
     if (!sg) return false;
     sycl_detail::require_in_order(q);
-    if (sg == 32) compress_kernel<32>(kv, score, kv_state, score_state, ratio, p0, T, d, w, eps, latent, q);
-    else compress_kernel<16>(kv, score, kv_state, score_state, ratio, p0, T, d, w, eps, latent, q);
+    if (sg == 32) compress_kernel<32>(kv, score, kv_state, score_state, ratio, p0, T, d, w, eps, latent, q, p0p);
+    else compress_kernel<16>(kv, score, kv_state, score_state, ratio, p0, T, d, w, eps, latent, q, p0p);
     return true;
 }
 

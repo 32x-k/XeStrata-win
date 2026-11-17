@@ -7,16 +7,97 @@
 #if defined(SYCL_EXT_ONEAPI_ENQUEUE_FUNCTIONS)
 #include <sycl/ext/oneapi/experimental/enqueue_functions.hpp>
 #endif
+#include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
+#include <map>
+#include <mutex>
 #include <stdexcept>
+#include <string>
+#include <typeinfo>
 #include <utility>
+#include <vector>
 
 namespace strata::ds4::sycl_detail {
 
 inline void require_in_order(const sycl::queue& q) {
     if (!q.has_property<sycl::property::queue::in_order>())
         throw std::invalid_argument("ds4 kernels require an in-order SYCL queue");
+}
+
+// DS4_KPROF (a diagnostic, with STRATA_KERNEL_PROFILE for the queues' timing): each kernel of a decoded token is
+// enqueued with an event while `on` is set, named by its function object's type, and `collect` adds its GPU time
+// (command_end - command_start) to that name's after the token's sync; `report` prints them by time, a token's.
+struct KernelProfile {
+    struct Sum { double ms = 0; long long n = 0; };
+    std::atomic<bool> on{false};
+    std::mutex mu;
+    std::vector<std::pair<sycl::event, const char*>> events;
+    std::map<std::string, Sum> sums;
+    long long tokens = 0;
+    void add(sycl::event e, const char* name) {
+        std::lock_guard<std::mutex> lk(mu);
+        events.emplace_back(std::move(e), name);
+    }
+    void collect() {
+        std::lock_guard<std::mutex> lk(mu);
+        if (events.empty()) return;
+        for (auto& [e, name] : events) {
+            try {
+                e.wait();
+                const auto t0 = e.get_profiling_info<sycl::info::event_profiling::command_start>();
+                const auto t1 = e.get_profiling_info<sycl::info::event_profiling::command_end>();
+                Sum& s = sums[name];
+                s.ms += t1 > t0 ? double(t1 - t0) * 1e-6 : 0.0;
+                ++s.n;
+            } catch (const std::exception&) {
+                ++sums[std::string("(no timing) ") + name].n;
+            }
+        }
+        events.clear();
+        ++tokens;
+    }
+    void report(std::FILE* f) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (tokens == 0) return;
+        std::vector<std::pair<std::string, Sum>> v(sums.begin(), sums.end());
+        std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+        double ms = 0;
+        long long n = 0;
+        for (const auto& x : v) ms += x.second.ms, n += x.second.n;
+        const double t = double(tokens);
+        std::fprintf(f, "kernels per token (DS4_KPROF, %lld tokens): %.3f ms in %.1f kernels\n", tokens, ms / t, double(n) / t);
+        for (const auto& [name, s] : v)
+            std::fprintf(f, "  %8.3f ms %7.1f x %8.2f us  %s\n", s.ms / t, double(s.n) / t,
+                         s.n ? 1e3 * s.ms / double(s.n) : 0.0, name.c_str());
+    }
+};
+inline KernelProfile& kernel_profile() {
+    static KernelProfile p;
+    return p;
+}
+inline bool kernel_profile_on() { return kernel_profile().on.load(std::memory_order_relaxed); }
+
+// (DS4_GRAPH) while a decode token's host pass runs against a recorded graph, the submissions it would make are
+// the graph's own: they are dropped here (the pass only builds the run's staged words), then one graph_launch
+// replays the recorded stream.  Set by ds4_model's decode loop only.
+inline std::atomic<bool>& submit_suppressed() {
+    static std::atomic<bool> v{false};
+    return v;
+}
+inline std::atomic<long long>& submit_suppress_count() {
+    static std::atomic<long long> v{0};
+    return v;
+}
+inline bool submit_suppress_on() { return submit_suppressed().load(std::memory_order_relaxed); }
+// A stream write the suppressed pass skips: counted so the pass's submission shape can be checked against the
+// recorded graph's node count.  The queue argument is ignored.
+inline bool suppressed_submit(sycl::queue&) {
+    if (!submit_suppress_on()) return false;
+    submit_suppress_count().fetch_add(1, std::memory_order_relaxed);
+    return true;
 }
 
 // Kernels are enqueued without an event (sycl_ext_oneapi_enqueue_functions) where the compiler has the extension:
@@ -26,22 +107,38 @@ inline void require_in_order(const sycl::queue& q) {
 #if defined(SYCL_EXT_ONEAPI_ENQUEUE_FUNCTIONS)
 namespace sx = sycl::ext::oneapi::experimental;
 template <class CGF>
-inline void submit(sycl::queue& q, CGF&& cgf) { sx::submit(q, std::forward<CGF>(cgf)); }
+inline void submit(sycl::queue& q, CGF&& cgf) {
+    if (suppressed_submit(q)) return;
+    if (kernel_profile_on()) return kernel_profile().add(q.submit(std::forward<CGF>(cgf)), typeid(CGF).name());
+    sx::submit(q, std::forward<CGF>(cgf));
+}
 template <int D, class K>
-inline void launch(sycl::queue& q, sycl::nd_range<D> range, const K& k) { sx::nd_launch(q, range, k); }
+inline void launch(sycl::queue& q, sycl::nd_range<D> range, const K& k) {
+    if (suppressed_submit(q)) return;
+    if (kernel_profile_on()) return kernel_profile().add(q.parallel_for(range, k), typeid(K).name());
+    sx::nd_launch(q, range, k);
+}
 template <int D, class K>
-inline void launch(sycl::queue& q, sycl::range<D> range, const K& k) { sx::parallel_for(q, range, k); }
+inline void launch(sycl::queue& q, sycl::range<D> range, const K& k) {
+    if (suppressed_submit(q)) return;
+    if (kernel_profile_on()) return kernel_profile().add(q.parallel_for(range, k), typeid(K).name());
+    sx::parallel_for(q, range, k);
+}
 template <class K>
-inline void single(sycl::queue& q, const K& k) { sx::single_task(q, k); }
+inline void single(sycl::queue& q, const K& k) {
+    if (suppressed_submit(q)) return;
+    if (kernel_profile_on()) return kernel_profile().add(q.single_task(k), typeid(K).name());
+    sx::single_task(q, k);
+}
 #else
 template <class CGF>
-inline void submit(sycl::queue& q, CGF&& cgf) { q.submit(std::forward<CGF>(cgf)); }
+inline void submit(sycl::queue& q, CGF&& cgf) { if (!suppressed_submit(q)) q.submit(std::forward<CGF>(cgf)); }
 template <int D, class K>
-inline void launch(sycl::queue& q, sycl::nd_range<D> range, const K& k) { q.parallel_for(range, k); }
+inline void launch(sycl::queue& q, sycl::nd_range<D> range, const K& k) { if (!suppressed_submit(q)) q.parallel_for(range, k); }
 template <int D, class K>
-inline void launch(sycl::queue& q, sycl::range<D> range, const K& k) { q.parallel_for(range, k); }
+inline void launch(sycl::queue& q, sycl::range<D> range, const K& k) { if (!suppressed_submit(q)) q.parallel_for(range, k); }
 template <class K>
-inline void single(sycl::queue& q, const K& k) { q.single_task(k); }
+inline void single(sycl::queue& q, const K& k) { if (!suppressed_submit(q)) q.single_task(k); }
 #endif
 
 // The runtime chooses the work-group shape; these portable kernels need neither

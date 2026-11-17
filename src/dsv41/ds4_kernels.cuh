@@ -55,12 +55,14 @@ struct Finish {
     const float* w = nullptr;
     float eps = 1e-20f;
     int rd = 0, pos = 0, inverse = 0, vpp = 1, pos_step = 1;
+    const int* pos_p = nullptr;   // non-null: pos read through it on the device (a decode graph's staged word)
     const float* freqs = nullptr;   // rd / 2 values
     int quant = 0;
     uint16_t* dst = nullptr;
     long long dst_stride = 0;
     uint8_t* pdst = nullptr;
     long long pdst_stride = 0;
+    uint8_t* const* pdst_p = nullptr;   // non-null: pdst read through it on the device (a decode graph's staged pointer)
     // (DS4_DECODE_TRIM 2) non-null: the values written to x also rounded to int8 as gguf mv rounds a Q8_0 job's input
     // (q8_quant_block's ops on the stored value) - q8 [n_vec][len], q8d [n_vec][len / 32], dense rows whatever x's stride; len % 32 == 0,
     // no dst / pdst (finish refuses otherwise, nothing launched)
@@ -187,7 +189,7 @@ bool copy_regions(const CopyRegions& r, sycl::queue& s);
 /// completes a group writes the group's pooled latent (softmax over the slots, per value, then rmsnorm(w)) to the next
 /// row of latent.
 void compress_win(const float* kv, const float* score, float* kv_state, float* score_state, int ratio, int p0, int T,
-                  int d, const float* w, float eps, float* latent, sycl::queue& s);
+                  int d, const float* w, float eps, float* latent, sycl::queue& s, const int* p0_p = nullptr);
 
 /// Per-query sizes, by value - or (gen > 0, a chunk of any length) made on the device from the query's position: query
 /// t at position p0 + t has nn = (p0 + t + 1) / R compressed positions and cb = min(ccap, ceil(nn / blk)) candidate
@@ -200,6 +202,9 @@ struct Rows {
     int k[kWin];
     int gen = 0, R = 1, kcap = 0, ccap = 0, blk = 1;
     long long p0 = 0;
+    const long long* p0_p = nullptr;   // non-null: p0 read through it on the device (a decode graph's staged word)
+    const int* np = nullptr;           // non-null: n[t] read through it (a decode graph's staged row counts)
+    const int* kp = nullptr;           // non-null: k[t] read through it
 };
 
 /// The indexer's scores, row t: out[t][i] = sum_h relu(q[t][h] . k[p]) w[t][h] for i < n (the widest query's), p = i, or
@@ -235,6 +240,8 @@ struct AttnRows {
     // then the chunk's), selecting min(kcap, (its position + 1) / R) compressed rows when R > 0
     int gen = 0, t0 = 0, win = 0, R = 0, kcap = 0;
     long long p0 = 0;
+    const long long* p0_p = nullptr;   // non-null: p0 read through it on the device (a decode graph's staged word)
+    const int* sel_p = nullptr;        // non-null: nsel[t] read through it (the planner's carried top-k count)
 };
 void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
                  const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, sycl::queue& s,
@@ -243,9 +250,10 @@ void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int
 /// ring[(p0 + t) % n] = ext[n + t] for t < T.  The ring's rows kKvFp8 (each group of 32 at the smallest power-of-two
 /// scale its BF16 values fit under: exact for values on the FP8 grid, the window's), the window buffer's BF16 (p0 = n:
 /// the ring's rows as they lie).
-void ring_to_ext(const uint8_t* ring, uint16_t* ext, int64_t p0, int n, int d, sycl::queue& s);
+void ring_to_ext(const uint8_t* ring, uint16_t* ext, int64_t p0, int n, int d, sycl::queue& s,
+                 const int64_t* p0_p = nullptr);
 void ext_to_ring(const uint16_t* ext, uint8_t* ring, int64_t p0, int n, int T, int d, sycl::queue& s,
-                 uint8_t* backup = nullptr);
+                 uint8_t* backup = nullptr, const int64_t* p0_p = nullptr);
 /// A speculative window's rollback: ring[(p0 + t) % n] = backup[t] for keep <= t < T (the rows ext_to_ring replaced).
 void ring_restore(uint8_t* ring, const uint8_t* backup, int64_t p0, int n, int keep, int T, int d, sycl::queue& s);
 /// The same for up to kMaxRingBatch layers' rings at once (one launch).
@@ -316,10 +324,14 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
                    const unsigned long long* vram, const float* x, int dim, int* idx, float* w,
                    unsigned long long* plan_ptr, Req* req, unsigned seq, sycl::queue& s, const float* bias_vl = nullptr,
                    unsigned vl = 0, int na0 = 0, int na1 = 0, Resp* resp = nullptr, int* cpu_any = nullptr,
-                   const unsigned* host_done = nullptr);
+                   const unsigned* host_done = nullptr, const unsigned* seq_p = nullptr);
 /// Lookahead: the m picks a later layer will likely make (its gate's logits on this layer's FFN input, the routing's
 /// score + bias, the m best of n) into req->ahead[t][off ..) for the T tokens - before route_publish, which publishes them.
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, sycl::queue& s);
+/// route_ahead whose request slot is taken on the device: req = reqs + (*seq_p) % kRing read live (a decode graph's
+/// staged sequence word).
+void route_ahead_dyn(const float* logits, const float* bias, int n, int m, int T, Req* reqs, const unsigned* seq_p,
+                     int off, sycl::queue& s);
 /// (DS4_ROUTE_FUSE) a token's route_publish and route_ahead in one launch of two groups a token, each its
 /// own kernel's body (disjoint request fields), then the publish as route_publish submits it.  False,
 /// nothing launched: no request, a dimension out of range or the groups' local memory not enough - the
@@ -342,6 +354,7 @@ struct RoutePair {
     const float *a_logits = nullptr, *a_bias = nullptr;   // route_ahead's
     int a_n = 0, m = 0, off = 0;
     int T = 1;
+    const unsigned* seq_p = nullptr;   // non-null: seq read live and req / resp are the rings' bases (slot *seq_p % kRing)
 };
 bool route_pair(const RoutePair& a, sycl::queue& s);
 /// The RAM store's picks for the device (a decode token's k plan pointers): those the VRAM table left at 0 whose expert zc_tab has (the
@@ -350,6 +363,9 @@ void zc_stage(unsigned long long* plan, const int* idx, const unsigned long long
               sycl::queue& s);
 /// Waits (one thread, on the device) until *seq_ptr == seq.
 void wait_seq(const unsigned* seq_ptr, unsigned seq, sycl::queue& s);
+/// wait_seq with the reply slot and sequence read live on the device: flag = &resps[(*seq_p) % kRing].seq, the wait
+/// for *seq_p (a decode graph's staged sequence word).
+void wait_seq_dyn(Resp* resps, const unsigned* seq_p, sycl::queue& s);
 /// True once if the router (route / route_publish) had no pick to make on this device since the last call - every score it was
 /// given NaN (a non-finite gate input) - and clears it; it took a stand-in expert so nothing read out of bounds, but the layer's
 /// output is garbage.  Waits for the stream: call it where the host has the stream's results anyway, not per kernel.

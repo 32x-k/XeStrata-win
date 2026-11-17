@@ -35,6 +35,7 @@
 #include "ds4_cpu_exl3.hpp"
 #include "ds4_pool.hpp"
 #include "ds4_store.hpp"
+#include "ds4_sycl.hpp"
 #include "strata/dsv41/exl3_cpu.hpp"
 #include "strata/dsv41/exl3.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -1150,6 +1151,38 @@ struct Model::Impl {
     // a window of one through moe_gate_up / moe_down (DS4_MOE_TOKEN=0: win_experts, whose down rows run
     // before the wait for the CPU lane - the same bits, no faster)
     bool moe_token_path = std::getenv("DS4_MOE_TOKEN") == nullptr || std::atoi(std::getenv("DS4_MOE_TOKEN")) != 0;
+    // (DS4_GRAPH) a decode token's whole stream as one command graph, replayed instead of ~1500 submissions a
+    // token.  The launches' changing arguments - the position, the request sequences, the mailbox slots - are read
+    // by the kernels through gdyn's staged words; everything else is identical every token.  The pass that writes
+    // gdyn runs the same code with the stream's submissions suppressed, then graph_launch replays the recording.
+    struct GraphDyn {
+        long long p0 = 0;
+        int pos = 0;
+        unsigned seq[128] = {};
+        const float* cpu_part[128] = {};
+        const int* cpu_flag[128] = {};
+        int topk_v[128] = {};   // a layer's nsel: the planner's carried top-k count (lim.n > 0 gate folded in)
+        int cand_v[128] = {};   // a layer's wp.cand
+        int candx[128] = {};    // a layer's wp.cand * cand_blk
+        int gpos[128] = {};     // a layer's group-boundary finishes' pos (g_first * R)
+        uint8_t* pdst_a[128] = {};   // ... and the index keys' packed destination
+        uint8_t* pdst_b[128] = {};   // ... and the compressed KV's
+    };
+    GraphDyn* gdyn_buf = nullptr;               // the staging words' allocation (host USM)
+    float* dlsum = nullptr;                         // DS4_LSUM: per-layer residual sumsq slots (device)
+    GraphDyn* gdyn = nullptr;                   // non-null only while a decode-graph pass runs
+    strata::gpu::Graph* dec_graph = nullptr;
+    strata::gpu::Graph* dec_graph2 = nullptr;   // the shape before last (the fingerprints alternate: ng's boundary work)
+    uint32_t g_fp2 = 0;
+    long long g_nodes2 = 0;
+    uint32_t g_fp = 0, g_fp_now = 0;            // the recorded graph's branch fingerprint, this token's
+    long long g_nodes = 0;                      // the recorded graph's node count
+    bool g_broken = false;                      // a pass's shape differed: the graph path is off for good
+    bool g_unstable = false;                    // this token bakes a per-token pointer into its kernels (the group-boundary finishes' g_first) - it always runs normally
+    uint32_t* gfp_ = nullptr;                   // non-null while a pass collects its branch fingerprint
+    uint32_t g_pending = 0;                     // a mismatch's fingerprint (re-recorded when it repeats in a row)
+    int g_pending_n = 0;
+    void gfp(long long v) { if (gfp_) *gfp_ = *gfp_ * 33u + (unsigned) v; }
     int async_max_t = std::getenv("DS4_ASYNC_T") ? std::atoi(std::getenv("DS4_ASYNC_T")) : 8;   // windows up to this
     // lookahead: while layer L runs, the device guesses the next layer's picks (its gate on L's FFN input, the same
     // choice) and publishes them with L's routing; the CPU lane asks for the guessed experts it will read from the files
@@ -1389,6 +1422,36 @@ struct Model::Impl {
     // ... and a run of chunks' (prof_chunk): a layer's start, after its attention, after the routing and the shared
     // expert, after its experts (the streamed ones' waits for their reads in it); printed after the run
     bool prof_chunk = false;
+    // DS4_STAMPS: a decode round's device-clock stamps (diagnostic). One work item writes AMD's steady counter
+    // to a host-USM ring at the marked points; the round's stream_sync makes them visible and forward() then
+    // aggregates them. A token's layout: [round start], 13 a layer (entry, wq_a batch done, projections
+    // done, pre-sparse, sparse done, output projections done, attn end, MoE front end, pre-gate_up, pre-wait,
+    // post-wait, post-down, end), [head start], [head end].
+    unsigned long long* stamps = nullptr;
+    static constexpr long kStampCap = 1 << 20;
+    long stamp_n = 0;
+    long stamp_base = -1;
+    const bool stamp_dbg = ds4_dbg("DS4_STAMPS");
+    // DIAG DS4_DUPK=<id> [DS4_DUPN=<n>, 4]: the decode's attention kernel <id> launched n more times a layer (its cost
+    // in the model: the wall time's growth / (n * layers))
+    const int dupk = std::getenv("DS4_DUPK") ? std::atoi(std::getenv("DS4_DUPK")) : 0;
+    const int dupn = std::getenv("DS4_DUPN") ? std::atoi(std::getenv("DS4_DUPN")) : 4;
+    template <class F>
+    void dupx(int id, int T, F&& f) {
+        if (dupk == id && T == 1) for (int i = 0; i < dupn; ++i) f();
+    }
+    void stamp(rt::Queue s) {
+        if (!stamp_dbg || stamps == nullptr || stamp_n >= kStampCap) return;
+        unsigned long long* p = stamps;
+        const long i = stamp_n++;
+        sycl_detail::single(static_cast<sycl::queue&>(s), [p, i] {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(__AMDGCN__)
+            p[i] = (unsigned long long) __builtin_readsteadycounter();
+#else
+            p[i] = 0;
+#endif
+        });
+    }
     // DS4_PROF stages of the chunked prompt (finer ones than the decode's 0..5): 0 between layers, 1 attention rest (wq_b, wo,
     // hc_post), 2 router-side tail (shared expert), 3 experts (+ waits), 4 Engram, 5 attn mHC (mix, split, norm), 6 attention
     // projections (wq_a, wkv, compressor), 7 compressor + indexer, 8 q_b + rope, 9 sparse attention, 10 ffn mHC + router + sort
@@ -1541,6 +1604,14 @@ struct Model::Impl {
             rt::set_device(d.id);
             if (rt::device_sync() != rt::Result::success)
                 std::fprintf(stderr, "ds4: queue drain during shutdown: %s\n", rt::error_string(rt::Result::error));
+        }
+        if (dec_graph) { strata::gpu::graph_destroy(dec_graph); dec_graph = nullptr; }
+        if (dec_graph2) { strata::gpu::graph_destroy(dec_graph2); dec_graph2 = nullptr; }
+        if (gdyn_buf != nullptr && !devs.empty()) {
+            try { sycl::free(gdyn_buf, static_cast<sycl::queue&>(devs[0].st)); }
+            catch (const std::exception&) {}
+            gdyn_buf = nullptr;
+            gdyn = nullptr;
         }
         warm_scratch.clear();   // all users of queues have joined before their release
         pools.clear();
@@ -7119,6 +7190,35 @@ struct Model::Impl {
                     std::fprintf(stderr, "ds4 prof CPU lane (IQ rows) per call: n %.0f, entries/call %.2f, prep %.3f ms, gate+up %.3f ms, h-quant %.3f ms, down %.3f ms\n", acc[4], acc[5] / acc[4], acc[0] / acc[4], acc[1] / acc[4], acc[2] / acc[4], acc[3] / acc[4]);
             }
         }
+        {   // DIAG DS4_LANE_T: the lane's gate+up and down by weight type: ms, GB read, GB/s (summed; printed every 2000 calls)
+            static const bool on = std::getenv("DS4_LANE_T") != nullptr;
+            if (on) {
+                static std::mutex mu;
+                static std::map<int, std::array<double, 5>> acc;   // type -> gate+up ms, gate+up bytes, down ms, down bytes, entries
+                static long long calls = 0;
+                const double te = now_ms();
+                std::lock_guard<std::mutex> lk(mu);
+                double gb = 0, db = 0;
+                for (const Ent& en : ents) {
+                    (void) en;
+                    gb += (double) (mx_part_bytes(l, 0) + mx_part_bytes(l, 1));
+                    db += (double) mx_part_bytes(l, 2);
+                }
+                auto& g0 = acc[fm.tg];
+                g0[0] += tr1 - tq1; g0[1] += gb; g0[4] += ne;
+                auto& d0 = acc[1000 + fm.td];
+                d0[2] += te - tq2; d0[3] += db; d0[4] += ne;
+                if (++calls % 2000 == 0)
+                    for (const auto& [t, a] : acc) {
+                        if (t < 1000)
+                            std::fprintf(stderr, "lane gate+up type %d: %.0f entries, %.3f ms an entry, %.1f GB/s\n", t, a[4],
+                                         a[0] / a[4], a[1] / 1e6 / a[0]);
+                        else
+                            std::fprintf(stderr, "lane down    type %d: %.0f entries, %.3f ms an entry, %.1f GB/s\n", t - 1000, a[4],
+                                         a[2] / a[4], a[3] / 1e6 / a[2]);
+                    }
+            }
+        }
     }
 
     // the window's CPU-lane experts made ready (and pinned) in the store for the length of the call
@@ -8587,8 +8687,10 @@ struct Model::Impl {
                 }
             }
             const int clen_max = (int) ((p0 + T) / R);
+            gfp(l.ix_src);
             if (l.ix_src) {
                 Src& ks = srcs[(size_t) l.ik_src];
+                gfp(l.owns_k && ng > 0); gfp(clen_max > 0);
                 if (l.owns_k && ng > 0) {
                     native_f16::rows(latent, HD, nullptr, ng, HD, c.lat16, s, d.native_f16_output);
                     if (!gemm(d, c, l.i_wk, c.lat16, HD, ng, c.ikr, g.ix_hd, 0.0f, err)) return false;
@@ -10103,6 +10205,7 @@ struct Model::Impl {
         // for a whole one, each pass reading the whole share; a GGUF's: 8, so that every window the engine can build (rows
         // <= kWin = 8) walks the head once instead of twice - measured on the drafter's fixed T=5: 4.55 -> 2.83 ms, its
         // round 14.49 -> 13.46; the verify window's head 3.48 -> 2.68 ms, the same logits.  DS4_HEAD_PER overrides.)
+        gfp(nm);
         const int per = d.head.fmt != 0 ? (std::getenv("DS4_HEAD_PER") ? std::atoi(std::getenv("DS4_HEAD_PER")) :
                                                                                    strata::ds4::head_per_default(defaults_026(), rows)
                                                                                    )
@@ -10145,6 +10248,7 @@ struct Model::Impl {
         Dev& d = devs[(size_t) di];
         rt::set_device(d.id);
         const int D = g.dim, H = g.hc;
+        gfp(n_logits);
         if (n_logits <= 0) return true;
         const int t0 = T - n_logits;
         hc_pre_norm(d.h + (size_t) t0 * H * D, d.pre + (size_t) t0 * 8, d.norm_w, D, H, n_logits, g.eps, d.x, d.st);
@@ -10179,6 +10283,9 @@ struct Model::Impl {
                 err = "token " + std::to_string(tk[t]) + " out of range";
                 return false;
             }
+        static const bool ostat = ds4_dbg("DS4_OSTAT");
+        static double o_pre = 0, o_tick = 0; static int o_n = 0;
+        const double o0 = ostat ? now_ms() : 0;
         const int64_t p0 = pos;
         slot_held = false;   // (the state grows now: what slot_save took is no longer the conversation)
         for (int t = 0; t < T; ++t) {
@@ -10200,11 +10307,35 @@ struct Model::Impl {
             std::memcpy(h_emb + (size_t) t * D, emb_row(p0 + t, tk[t]), (size_t) D * 2);
         plan_window(p0, T, wplan);
         prof_window = prof_on && T == 1;
+        static const bool kprof_on = std::getenv("DS4_KPROF") != nullptr;
+        sycl_detail::kernel_profile().on.store(kprof_on && T == 1);
         n_logits = std::min(logits_rows, T);
+        if (ostat) o_pre += now_ms() - o0;
+        if (stamp_dbg && stamps == nullptr && !hmap(stamps, kStampCap, err)) return false;
+        stamp_base = (stamp_dbg && T == 1) ? stamp_n : -1;
         const double tl = now_ms();
         if (par) {
             if (!forward_par(p0, T, err)) return false;
         } else if (!forward_serial(p0, T, err)) return false;
+        if (ds4_dbg("DS4_HSUM")) {   // DIAG: this window's residual checksum (a decode-graph diff probe)
+            Dev& dh = devs[(size_t) head_dev];
+            std::vector<float> v((size_t) T * g.hc * g.dim);
+            rt::set_device(dh.id);
+            if (rt::readback(v.data(), dh.h, v.size() * 4, dh.st) == rt::Result::success) {
+                double s2 = 0; for (float x : v) s2 += (double) x * x;
+                std::fprintf(stderr, "HSUM p0=%lld n=%zu sumsq=%.9g\n", (long long) p0, v.size(), s2);
+            }
+        }
+        if (dlsum != nullptr) {   // DIAG: the per-layer sums this token left
+            Dev& dl = devs[(size_t) head_dev];
+            float lv[384] = {};
+            rt::set_device(dl.id);
+            if (rt::readback(lv, dlsum, sizeof(lv), dl.st) == rt::Result::success) {
+                std::fprintf(stderr, "LSUM p0=%lld", (long long) p0);
+                for (int li = 0; li < g.nl && li < 128; ++li) std::fprintf(stderr, " %.7g", (double) lv[li]); std::fprintf(stderr, " | emb=%.7g | mid=", (double) lv[300]); for (int li = 0; li < g.nl && li < 40; ++li) std::fprintf(stderr, " %.7g", (double) lv[40 + li]); std::fprintf(stderr, " | ao="); for (int li = 0; li < g.nl && li < 40; ++li) std::fprintf(stderr, " %.7g", (double) lv[80 + li]); std::fprintf(stderr, " | o="); for (int li = 0; li < g.nl && li < 40; ++li) std::fprintf(stderr, " %.7g", (double) lv[128 + li]); std::fprintf(stderr, " | q="); for (int li = 0; li < g.nl && li < 40; ++li) std::fprintf(stderr, " %.7g", (double) lv[168 + li]); std::fprintf(stderr, " | x="); for (int li = 0; li < g.nl && li < 40; ++li) std::fprintf(stderr, " %.7g", (double) lv[216 + li]); std::fprintf(stderr, " | ext=%.7g fr=%.7g p0l=%.7g | cnt=%.7g %.7g %.7g %.7g %.7g %.7g", (double) lv[301], (double) lv[309], (double) lv[310], (double) lv[302], (double) lv[303], (double) lv[304], (double) lv[305], (double) lv[306], (double) lv[307]);
+                std::fprintf(stderr, "\n");
+            }
+        }
         st.layer_ms += now_ms() - tl;
         for (auto& b : eg_win)
             if (b->live) eg_finish(*b);
@@ -10215,10 +10346,54 @@ struct Model::Impl {
         const double th = now_ms();
         CK(rt::stream_sync(d.st));
         st.head_ms += now_ms() - th;
+        if (stamp_dbg && T == 1 && stamp_base >= 0 && stamp_n >= stamp_base + 2 + 13 * g.nl) {
+            static long n_tok = 0;
+            static double a_mhc = 0, a_wqa = 0, a_prj = 0, a_sel = 0, a_sp = 0, a_swo = 0, a_hcp = 0, a_mf = 0, a_sh = 0, a_gu = 0, a_wait = 0, a_dn = 0, a_tail = 0, a_gap = 0, a_head = 0, a_round = 0;
+            const long b = stamp_base;
+            double mhc = 0, wqa = 0, prj = 0, sel = 0, sp = 0, swo = 0, hcp = 0, mf = 0, sh = 0, gu = 0, w = 0, dn = 0, tail = 0, gap = 0;
+            for (int il = 0; il < g.nl; ++il) {
+                const long e = b + 1 + il * 13;
+                mhc += (double) (stamps[e + 1] - stamps[e]);
+                wqa += (double) (stamps[e + 2] - stamps[e + 1]);
+                prj += (double) (stamps[e + 3] - stamps[e + 2]);
+                sel += (double) (stamps[e + 4] - stamps[e + 3]);
+                sp += (double) (stamps[e + 5] - stamps[e + 4]);
+                swo += (double) (stamps[e + 6] - stamps[e + 5]);
+                hcp += (double) (stamps[e + 7] - stamps[e + 6]);
+                mf += (double) (stamps[e + 8] - stamps[e + 7]);
+                sh += (double) (stamps[e + 9] - stamps[e + 8]);
+                gu += (double) (stamps[e + 10] - stamps[e + 9]);
+                w += (double) (stamps[e + 11] - stamps[e + 10]);
+                dn += (double) (stamps[e + 12] - stamps[e + 11]);
+                tail += 0;
+                if (il + 1 < g.nl) gap += (double) (stamps[e + 13] - stamps[e + 12]);
+            }
+            const long he = b + 1 + 13 * g.nl;
+            a_mhc += mhc; a_wqa += wqa; a_prj += prj; a_sel += sel; a_sp += sp; a_swo += swo; a_hcp += hcp; a_mf += mf; a_sh += sh; a_gu += gu; a_wait += w;
+            a_dn += dn; a_gap += gap;
+            a_head += (double) (stamps[he + 1] - stamps[he]);
+            a_round += (double) (stamps[he + 1] - stamps[b]);
+            if (++n_tok % 64 == 0) {
+                std::fprintf(stderr,
+                             "STAMPS %ld tok | ticks/tok (~100MHz): round %.0f | mhc %.0f, wqa %.0f, proj %.0f, sel %.0f, sparse %.0f, wo %.0f, hcp %.0f, mfr %.0f, sh %.0f, gu %.0f, wait %.0f, dn %.0f, gaps %.0f | head %.0f\n",
+                             n_tok, a_round / n_tok, a_mhc / n_tok, a_wqa / n_tok, a_prj / n_tok, a_sel / n_tok, a_sp / n_tok, a_swo / n_tok,
+                             a_hcp / n_tok, a_mf / n_tok, a_sh / n_tok, a_gu / n_tok, a_wait / n_tok, a_dn / n_tok, a_gap / n_tok, a_head / n_tok);
+                a_mhc = a_wqa = a_prj = a_sel = a_sp = a_swo = a_hcp = a_mf = a_sh = a_gu = a_wait = a_dn = a_gap = a_head = a_round = 0; n_tok = 0;
+            }
+        }
         prof_collect();
+        if (sycl_detail::kernel_profile_on()) {
+            sycl_detail::kernel_profile().on.store(false);
+            sycl_detail::kernel_profile().collect();
+        }
         pos += T;
         st.tokens += T;
+        const double o1 = ostat ? now_ms() : 0;
         cache_tick(T);
+        if (ostat && ((o_tick += now_ms() - o1, ++o_n) & 15) == 0) {
+            std::fprintf(stderr, "OSTAT n=%d pre=%.3f tick=%.3f ms/tok\n", o_n, o_pre / o_n, o_tick / o_n);
+            o_pre = o_tick = 0; o_n = 0;
+        }
         if (seed_rows != 0 && !seed_drafter(p0, seed_rows < 0 ? T : seed_rows, 0, err)) return false;
         return true;
     }
@@ -10246,19 +10421,34 @@ struct Model::Impl {
     }
     bool forward_serial(int64_t p0, int T, std::string& err) {
         const int D = g.dim, H = g.hc;
+        auto pass = [&]() -> bool {
         int cur = L[0].dev;
         if (ds4_dbg("DS4_SYNC_WIN")) rt::device_sync();
         {
             Dev& d = devs[(size_t) cur];
             rt::set_device(d.id);
-            CK(emb_upload(d.emb_rows, h_emb, (size_t) T * D * 2, d.st));
+            if (!sycl_detail::suppressed_submit(static_cast<sycl::queue&>(d.st)))
+                CK(emb_upload(d.emb_rows, h_emb, (size_t) T * D * 2, d.st));
             embed(d.emb_rows, T, d.h, D, H, d.st);
             if (ds4_dbg("DS4_DBG_EMB")) {}
             init_pre(d.pre, T, d.st);
+            if (ds4_dbg("DS4_LSUM") && T == 1) {   // DIAG: the embedding sumsq this token starts with
+                if (dlsum == nullptr) dlsum = sycl::malloc_device<float>(384, static_cast<sycl::queue&>(d.st));
+                if (dlsum != nullptr) {
+                    float* out = dlsum + 300;
+                    const uint16_t* er = d.emb_rows;
+                    sycl_detail::single(d.st, [=] {
+                        double a = 0;
+                        for (int i = 0; i < D; ++i) a += (double) er[i] * er[i];
+                        *out = (float) a;
+                    });
+                }
+            }
             if (ds4_dbg("DS4_DBG_EMB")) dbg_h("after init_pre", d, T);
         }
         std::vector<float> dump;
         if (dump_h != nullptr) dump.resize((size_t) T * g.nl * H * D);
+        if (T == 1) stamp(devs[(size_t) cur].st);
         for (int il = 0; il < g.nl; ++il) {
             Layer& l = L[(size_t) il];
             if (l.dev != cur) {
@@ -10300,7 +10490,101 @@ struct Model::Impl {
             err = "the head is not on the last layer's GPU";
             return false;
         }
-        return head_rows_dev(head_dev, T, err);
+        if (T == 1) stamp(devs[(size_t) head_dev].st);
+        {
+            const bool ok = head_rows_dev(head_dev, T, err);
+            if (T == 1) stamp(devs[(size_t) head_dev].st);
+            return ok;
+        }
+        };
+        // (DS4_GRAPH) a decode token's stream replayed as one command graph: the pass runs once with submissions
+        // suppressed (it still writes the staged words the kernels read live and collects its branch fingerprint);
+        // a matching recording replays, a new steady shape records, anything else runs normally.
+        const bool graph_on = ds4_dbg("DS4_GRAPH") && !g_broken && T == 1 && devs.size() == 1 && head_nm() == 1 &&
+                              wplan.async && moe_token_path && !spec_win && g.n_mtp == 0 && !wplan.par &&
+                              dump_h == nullptr && dupk == 0 && !prof_window && !prof_chunk && !stamp_dbg &&
+                              !sync_decode;
+        if (!graph_on) return pass();
+        Dev& gd = devs[0];
+        sycl::queue& gq = static_cast<sycl::queue&>(gd.st);
+        if (gdyn_buf == nullptr) {
+            if (!gq.get_device().has(sycl::aspect::usm_host_allocations)) { g_broken = true; return pass(); }
+            try { gdyn_buf = sycl::malloc_host<GraphDyn>(1, gq); }
+            catch (const std::exception&) { gdyn_buf = nullptr; }
+            if (gdyn_buf == nullptr) { g_broken = true; return pass(); }
+            std::memset(gdyn_buf, 0, sizeof(GraphDyn));   // unwritten slots stage as 0/nullptr
+        }
+        g_fp_now = 2166136261u;
+        g_unstable = false;
+        gfp_ = &g_fp_now;
+        gdyn = gdyn_buf;
+        gdyn->p0 = p0;
+        gdyn->pos = (int) p0;
+        sycl_detail::submit_suppress_count().store(0);
+        sycl_detail::submit_suppressed().store(true);
+        bool g_ok = false;
+        try { g_ok = pass(); }
+        catch (const std::exception&) {
+            sycl_detail::submit_suppressed().store(false);
+            gfp_ = nullptr;
+            gdyn = nullptr;
+            g_broken = true;
+            return pass();
+        }
+        sycl_detail::submit_suppressed().store(false);
+        gfp_ = nullptr;
+        if (!g_ok) { gdyn = nullptr; return false; }
+        const long long nodes = sycl_detail::submit_suppress_count().load();
+        if (g_unstable) {   // the boundary finishes' pointers bake per-token values: never recorded, never replayed
+            if (ds4_dbg("DS4_GRAPH_LOG")) std::fprintf(stderr, "graph: unstable p0=%lld fp=%08x\n", (long long) p0, g_fp_now);
+            gdyn = nullptr;
+            return pass();
+        }
+        if ((dec_graph != nullptr && nodes == g_nodes && g_fp_now == g_fp) ||
+            (dec_graph2 != nullptr && nodes == g_nodes2 && g_fp_now == g_fp2)) {
+            gdyn = nullptr;
+            if (ds4_dbg("DS4_GRAPH_LOG")) std::fprintf(stderr, "graph: replay p0=%lld fp=%08x nodes=%lld\n", (long long) p0, g_fp_now, nodes);
+            strata::gpu::Graph* gg = (nodes == g_nodes && g_fp_now == g_fp) ? dec_graph : dec_graph2;
+            if (!strata::gpu::graph_launch(gg, gd.st.handle)) { g_broken = true; return pass(); }
+            return true;
+        }
+        const bool record = (dec_graph == nullptr && dec_graph2 == nullptr) ||
+                            (g_pending == g_fp_now && ++g_pending_n >= 2);
+        if (!record) {
+            if (ds4_dbg("DS4_GRAPH_LOG")) std::fprintf(stderr, "graph: normal p0=%lld fp=%08x (rec %08x) nodes=%lld\n", (long long) p0, g_fp_now, g_fp, nodes);
+            g_pending = g_fp_now;
+            g_pending_n = 1;
+            gdyn = nullptr;
+            return pass();
+        }
+        g_pending_n = 0;
+        if (dec_graph2) { strata::gpu::graph_destroy(dec_graph2); }
+        dec_graph2 = dec_graph; g_fp2 = g_fp; g_nodes2 = g_nodes; dec_graph = nullptr;
+        if (!strata::gpu::begin_capture(gd.st.handle)) {
+            gdyn = nullptr;
+            g_broken = true;
+            return pass();
+        }
+        try { g_ok = pass(); }
+        catch (const std::exception&) {
+            strata::gpu::abandon_capture(gd.st.handle);
+            gdyn = nullptr;
+            g_broken = true;
+            return pass();
+        }
+        if (!strata::gpu::end_capture(gd.st.handle, &dec_graph)) {
+            strata::gpu::abandon_capture(gd.st.handle);
+            gdyn = nullptr;
+            g_broken = true;
+            return pass();
+        }
+        gdyn = nullptr;
+        if (!g_ok) return false;
+        g_fp = g_fp_now;
+        g_nodes = nodes;
+        if (ds4_dbg("DS4_GRAPH_LOG")) std::fprintf(stderr, "graph: recorded p0=%lld fp=%08x nodes=%lld\n", (long long) p0, g_fp_now, nodes);
+        if (!strata::gpu::graph_launch(dec_graph, gd.st.handle)) { g_broken = true; return pass(); }
+        return true;
     }
 
     // threads: each device's thread enqueues its layers (a group's members each their share) at once, the
@@ -10439,8 +10723,17 @@ struct Model::Impl {
         if (ds4_dbg("DS4_DBG_SLOTS") && l.il < 2 && l.lay.fmt == gg::kFmtMXFP4) {}
         if (ds4_dbg("DS4_TRACE_DISP")) std::fprintf(stderr, "TRACE layer %d p0=%lld T=%d\n", l.il, (long long) p0, T);
         if (ds4_dbg("DS4_DBG_H") && mi == 0 && (l.il < 2 || ds4_dbg("DS4_DBG_ALL"))) {}
+        {   // DIAG DS4_HOST_SLEEP_US: the host spins this long at each decoded layer's start (does the GPU wait for the host?)
+            static const double us = std::getenv("DS4_HOST_SLEEP_US") ? std::atof(std::getenv("DS4_HOST_SLEEP_US")) : 0.0;
+            if (us > 0 && T == 1) {
+                const double until = now_ms() + us / 1000.0;
+                while (now_ms() < until) {}
+            }
+        }
+        if (T == 1) stamp(s);
         prof_mark(d, 0);
         // Engram
+        gfp(l.eg >= 0);
         if (l.eg >= 0) {
             const int cols = (pk.eg_ngram - 1) * pk.eg_heads, ehd = pk.eg_hd;
             const size_t per = (size_t) cols * (ehd + ehd / 32);
@@ -10448,9 +10741,9 @@ struct Model::Impl {
             uint8_t* src = h_eg + (size_t) l.eg * eg_cap * per;
             // [token][rows | scales] -> [all rows][all scales], two strided copies for the whole window.
             const size_t row_bytes = (size_t) cols * ehd, scale_bytes = (size_t) cols * (ehd / 32);
-            CK(rt::copy2d_async(d.eg_rows, row_bytes, src, per, row_bytes, (size_t) T, s));
+            if (!sycl_detail::suppressed_submit(s)) CK(rt::copy2d_async(d.eg_rows, row_bytes, src, per, row_bytes, (size_t) T, s));
             uint8_t* sc = d.eg_rows + (size_t) T * cols * ehd;
-            CK(rt::copy2d_async(sc, scale_bytes, src + row_bytes, per, scale_bytes, (size_t) T, s));
+            if (!sycl_detail::suppressed_submit(s)) CK(rt::copy2d_async(sc, scale_bytes, src + row_bytes, per, scale_bytes, (size_t) T, s));
             engram_dequant(d.eg_rows, sc, T * cols, ehd, d.eg_x, s, (int) eg_fmt[(size_t) l.eg]);
             dump_sub(d, "eg_rows", l.il, p0, T, d.eg_rows, (size_t) T * cols * ehd);
             dump_sub(d, "eg_x", l.il, p0, T, d.eg_x, (size_t) T * cols * ehd * 4);
@@ -10468,13 +10761,18 @@ struct Model::Impl {
         dump_sub(d, "ring_in", l.il, p0, T, l.win, (size_t) g.win * kv_row_bytes(kKvFp8, HD));
         // attention
         const bool fuse = hc_fuse && !l.mtp && (T == 1 || (hc_fuse_win && T <= kWin));
+        gfp(fuse);
         gg::PreQ8 xq8;
         if (fuse) {
             // DS4_HC_FUSE: the split and pre-norm in one launch, x's int8 rounding there; a shape the
             // fused launch does not take (it returns 0) keeps the separate launches.
             hc_mix(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, s);
+            dupx(1, T, [&] { hc_mix(d.h, l.hca_fn, H * D, (2 + H) * H, T, g.eps, d.mix, s); });
             const int fused = hc_split_pre_norm(hc_args(l, false, d.mix, d.h, d.pre, d.x, d.xq8, d.xd8,
                                                         d.a_pre, d.a_post, d.a_comb), s, T);
+            gfp(fused);
+            dupx(2, T, [&] { (void) hc_split_pre_norm(hc_args(l, false, d.mix, d.h, d.pre, d.x, d.xq8, d.xd8,
+                                                              d.a_pre, d.a_post, d.a_comb), s, T); });
             if (fused) {
                 if (fused == 2) { xq8.x = d.x; xq8.q = d.xq8; xq8.d = d.xd8; xq8.k = D; xq8.rows = T; }
             } else {
@@ -10492,6 +10790,15 @@ struct Model::Impl {
         dump_sub(d, "a_comb", l.il, p0, T, d.a_comb, (size_t) T * 64 * 4);
         dump_sub(d, "pre_in", l.il, p0, T, d.pre, (size_t) T * 8 * 4);
         dump_sub(d, "attn_x", l.il, p0, T, d.x, (size_t) T * D * 4);
+        if (ds4_dbg("DS4_LSUM") && T == 1 && dlsum != nullptr) {   // DIAG: normed input sumsq
+            float* ox = dlsum + 216 + l.il;
+            const float* xp = d.x;
+            sycl_detail::single(s, [=] {
+                double a = 0;
+                for (int i = 0; i < D; ++i) a += (double) xp[i] * xp[i];
+                *ox = (float) a;
+            });
+        }
         {
             x3::MvJob j[4];
             int nj = 0;
@@ -10500,7 +10807,9 @@ struct Model::Impl {
             if (l.kv_src) j[nj++] = job(l.c_wkv, d.x, d.ckr, T, D, HD);
             if (l.kv_src && l.ratio > 1) j[nj++] = job(l.c_wgate, d.x, d.cgr, T, D, HD);
             if (!mv_n(d, j, nj, err, xq8.q ? &xq8 : nullptr)) return false;
+            dupx(3, T, [&] { (void) mv_n(d, j, nj, err, xq8.q ? &xq8 : nullptr); });
         }
+        if (T == 1) stamp(s);
         dump_sub(d, "qr_raw", l.il, p0, T, d.qr, (size_t) T * g.q_lora * 4);
         dump_sub(d, "kvr_raw", l.il, p0, T, d.kvr, (size_t) T * HD * 4);
         // The finishes the first GEMV batch feeds - q's norm, the new window rows' norm + rope
@@ -10509,6 +10818,7 @@ struct Model::Impl {
         fq.w = l.q_norm;
         fq.eps = g.eps;
         gg::PreQ8 qq8;
+        gfp(trim);
         if (trim & 2) {
             fq.q8 = d.qq8;
             fq.q8d = d.qd8;
@@ -10519,6 +10829,7 @@ struct Model::Impl {
         fk.eps = g.eps;
         fk.rd = g.rd;
         fk.pos = (int) p0;
+        fk.pos_p = gdyn ? &gdyn->pos : nullptr;
         fk.freqs = freqs;
         fk.quant = 1;
         fk.dst = d.ext + (size_t) g.win * HD;
@@ -10535,13 +10846,16 @@ struct Model::Impl {
                 fj[nf++] = FinishJob{d.ckr, T, HD, HD, fc};
             }
             finish_n(fj, nf, s);
+            dupx(4, T, [&] { finish_n(fj, nf, s); });
         }
         dump_sub(d, "qr", l.il, p0, T, d.qr, (size_t) T * g.q_lora * 4);
         // The indexer's own q projection reads the same normalized qr: its GEMV goes next to
         // wq_b's, its finish beside fr's (lim's clen_max is (p0 + T) / R, the newest query's).
         const bool ix_iq = l.ix_src && l.ratio > 0 && (p0 + T) / l.ratio > 0;
+        gfp(ix_iq);
         if (NHL > 0) {
             if (!mv(d, {job(l.wq_b, d.qr, d.q, T, g.q_lora, HQ)}, err, qq8.q ? &qq8 : nullptr)) return false;
+            dupx(5, T, [&] { (void) mv(d, {job(l.wq_b, d.qr, d.q, T, g.q_lora, HQ)}, err, qq8.q ? &qq8 : nullptr); });
         }
         if (ix_iq) {
             if (!mv(d, {job(l.i_wq_b, d.qr, d.iq, T, g.q_lora, (size_t) g.ix_heads * g.ix_hd)}, err)) return false;
@@ -10553,6 +10867,7 @@ struct Model::Impl {
                 Finish fr;
                 fr.rd = g.rd;
                 fr.pos = (int) p0;
+                fr.pos_p = gdyn ? &gdyn->pos : nullptr;
                 fr.vpp = NHL;
                 fr.freqs = freqs;
                 fj[nf++] = FinishJob{d.q, T * NHL, HD, HD, fr};
@@ -10561,22 +10876,62 @@ struct Model::Impl {
                 Finish fi;
                 fi.rd = g.rd;
                 fi.pos = (int) p0;
+                fi.pos_p = gdyn ? &gdyn->pos : nullptr;
                 fi.vpp = g.ix_heads;
                 fi.freqs = freqs;
                 fi.quant = 3;
                 fj[nf++] = FinishJob{d.iq, T * g.ix_heads, g.ix_hd, g.ix_hd, fi};
             }
             if (nf) finish_n(fj, nf, s);
+            if (nf) dupx(6, T, [&] { finish_n(fj, nf, s); });
         }
         if (NHL > 0) dump_sub(d, "q", l.il, p0, T, d.q, (size_t) T * HQ * 4);
+        if (ds4_dbg("DS4_LSUM") && T == 1 && dlsum != nullptr) {   // DIAG: q sumsq and topk checksum
+            float* oq = dlsum + 168 + l.il;
+            const float* qp = d.q;
+            const int nq = NHL * HD;
+            sycl_detail::single(s, [=] {
+                double a = 0;
+                for (int i = 0; i < nq; ++i) a += (double) qp[i] * qp[i];
+                *oq = (float) a;
+            });
+            float* ot = dlsum + 260 + l.il;
+            const int* tp = d.topk;
+            sycl_detail::single(s, [=] {
+                double a = 0;
+                for (int i = 0; i < 32; ++i) a = a * 33 + tp[i];
+                *ot = (float) a;
+            });
+        }
         // the window rows: the ring's (positions p0 - win ..) then this window's, each query its own 128.  A DSpark
         // block's ring holds the trunk's main KV (positions <= p0 - 1, seeded); its block of drafts attends to all of
         // that ring and to the whole block, and leaves the ring as it was
-        ring_to_ext(l.win, d.ext, l.mtp ? (int64_t) g.win : p0, g.win, HD, s);   // (a block's ring: its rows as they lie)
-        if (!l.mtp) ext_to_ring(d.ext, l.win, p0, g.win, T, HD, s, spec_win ? l.ring_bak : nullptr);
+        ring_to_ext(l.win, d.ext, l.mtp ? (int64_t) g.win : p0, g.win, HD, s, gdyn ? &gdyn->p0 : nullptr);   // (a block's ring: its rows as they lie)
+        dupx(7, T, [&] { ring_to_ext(l.win, d.ext, l.mtp ? (int64_t) g.win : p0, g.win, HD, s, gdyn ? &gdyn->p0 : nullptr); });
+        if (!l.mtp) ext_to_ring(d.ext, l.win, p0, g.win, T, HD, s, spec_win ? l.ring_bak : nullptr, gdyn ? &gdyn->p0 : nullptr);
+        if (!l.mtp) dupx(8, T, [&] { ext_to_ring(d.ext, l.win, p0, g.win, T, HD, s, spec_win ? l.ring_bak : nullptr, gdyn ? &gdyn->p0 : nullptr); });
+        if (T == 1) stamp(s);
         dump_sub(d, "kv_win", l.il, p0, T, d.ext + (size_t) g.win * HD, (size_t) T * HD * 4);
+        if (ds4_dbg("DS4_LSUM") && T == 1 && l.il == 0 && dlsum != nullptr) {   // DIAG: ext window checksum, split by source
+            float* oe = dlsum + 301;
+            const uint16_t* xp = d.ext;
+            const int nd = HD, nw = g.win;
+            const int64_t p0l = gdyn ? p0 : 0;
+            sycl_detail::single(s, [=] {
+                double ring = 0, fresh = 0;
+                for (int r = 0; r < nw; ++r)          // ring-derived rows (positions p0 - nw + r)
+                    for (int i = r * nd; i < r * nd + nd; i += 13) ring += (double) sycl_detail::bf16_value(xp[i]) * 0.001;
+                for (int i = nw * nd; i < (nw + 1) * nd; ++i) fresh += (double) sycl_detail::bf16_value(xp[i]) * 0.001;
+                oe[0] = (float) ring; oe[8] = (float) fresh; oe[9] = (float) p0l;
+            });
+        }
         dump_sub(d, "ext", l.il, p0, T, d.ext, ((size_t) g.win + T) * HD * 2);   // (BF16 rows: the ring's, then this window's)
         AttnRows ar;
+        if (gdyn) {   // the graph's kernels derive the window rows on the device; nsel comes staged (topk_v below)
+            ar.gen = 1; ar.p0 = p0; ar.p0_p = &gdyn->p0;
+            ar.t0 = 0; ar.win = g.win; ar.R = l.ratio; ar.kcap = g.ix_topk;
+            ar.sel_p = &gdyn->topk_v[l.il];
+        }
         for (int t = 0; t < T; ++t) {
             if (l.mtp) {
                 ar.win0[t] = 0;
@@ -10591,6 +10946,7 @@ struct Model::Impl {
         }
         const void* ckv = nullptr;
         int ckv_fmt = kKvFp4;
+        gfp(l.ratio); gfp(l.kv_src);
         if (l.ratio > 0) {
             Src& sr = srcs[(size_t) l.src];
             const int R = l.ratio;
@@ -10598,7 +10954,9 @@ struct Model::Impl {
             const int64_t g_first = p0 / R;              // the first group whose last position is >= p0
             const int64_t g_end = (p0 + T) / R;          // groups completed by p0 + T - 1
             const int ng = (int) std::max<int64_t>(0, g_end - g_first);
+            gfp(ng);
             if (l.kv_src) {
+                gfp(R); gfp(spec_win && l.c_snap != nullptr);
                 if (R == 1) {   // (ckr's norm went into the launch beside fq and fk, above)
                     CopyRegions cr;
                     cr.dst[0] = d.latent;
@@ -10606,7 +10964,7 @@ struct Model::Impl {
                     cr.bytes[0] = (size_t) T * HD * 4;
                     cr.n = 1;
                     if (!(trim & 4) || !copy_regions(cr, s))
-                        CK(rt::copy_async(d.latent, d.ckr, (size_t) T * HD * 4, s));
+                        if (!sycl_detail::suppressed_submit(s)) CK(rt::copy_async(d.latent, d.ckr, (size_t) T * HD * 4, s));
                 } else {
                     if (spec_win && l.c_snap != nullptr) {   // to replay the accepted rows if drafts are rejected
                         const size_t ns = (size_t) R * HD * 4, nr = (size_t) T * HD * 4;
@@ -10617,13 +10975,14 @@ struct Model::Impl {
                         cr.dst[3] = l.c_rows + (size_t) kWin * HD; cr.src[3] = d.cgr; cr.bytes[3] = nr;
                         cr.n = 4;
                         if (!(trim & 4) || !copy_regions(cr, s)) {
-                            CK(rt::copy_async(l.c_snap, l.c_kv, ns, s));
-                            CK(rt::copy_async(l.c_snap + (size_t) R * HD, l.c_score, ns, s));
-                            CK(rt::copy_async(l.c_rows, d.ckr, nr, s));
-                            CK(rt::copy_async(l.c_rows + (size_t) kWin * HD, d.cgr, nr, s));
+                            if (!sycl_detail::suppressed_submit(s)) CK(rt::copy_async(l.c_snap, l.c_kv, ns, s));
+                            if (!sycl_detail::suppressed_submit(s)) CK(rt::copy_async(l.c_snap + (size_t) R * HD, l.c_score, ns, s));
+                            if (!sycl_detail::suppressed_submit(s)) CK(rt::copy_async(l.c_rows, d.ckr, nr, s));
+                            if (!sycl_detail::suppressed_submit(s)) CK(rt::copy_async(l.c_rows + (size_t) kWin * HD, d.cgr, nr, s));
                         }
                     }
-                    compress_win(d.ckr, d.cgr, l.c_kv, l.c_score, R, (int) p0, T, HD, l.c_norm, g.eps, d.latent, s);
+                    compress_win(d.ckr, d.cgr, l.c_kv, l.c_score, R, (int) p0, T, HD, l.c_norm, g.eps, d.latent, s,
+                                 gdyn ? &gdyn->pos : nullptr);
                     dump_sub(d, "ckr", l.il, p0, T, d.ckr, (size_t) T * HD * 4);
                     dump_sub(d, "cgr", l.il, p0, T, d.cgr, (size_t) T * HD * 4);
                 }
@@ -10635,8 +10994,14 @@ struct Model::Impl {
                 lim.k[t] = std::min(g.ix_topk, lim.n[t]);
                 clen_max = std::max(clen_max, lim.n[t]);
             }
+            if (gdyn) {   // the graph's kernels derive the same rows on the device through p0_p
+                lim.gen = 1; lim.p0 = p0; lim.p0_p = &gdyn->p0; lim.R = R;
+                lim.kcap = g.ix_topk; lim.ccap = g.cand_topk; lim.blk = std::max(1, g.cand_blk);
+            }
+            gfp(l.ix_src);
             if (l.ix_src) {
                 Src& ks = srcs[(size_t) l.ik_src];
+                gfp(l.owns_k && ng > 0); gfp(clen_max > 0);
                 if (l.owns_k && ng > 0) {
                     if (!mv(d, {job(l.i_wk, d.latent, d.ikr, ng, HD, g.ix_hd)}, err)) return false;
                     Finish fi;
@@ -10649,6 +11014,8 @@ struct Model::Impl {
                     fi.quant = 3;
                     fi.pdst = ks.ik[(size_t) l.dev] + (size_t) g_first * ik_rb();
                     fi.pdst_stride = (long long) ik_rb();
+                    if (gdyn) { fi.pos_p = &gdyn->gpos[l.il]; fi.pdst_p = &gdyn->pdst_a[l.il];
+                              gdyn->gpos[l.il] = fi.pos; gdyn->pdst_a[l.il] = fi.pdst; }
                     FinishJob pj[2];
                     int np = 0;
                     pj[np++] = FinishJob{d.ikr, ng, g.ix_hd, g.ix_hd, fi};
@@ -10661,6 +11028,8 @@ struct Model::Impl {
                         fc.quant = 2;
                         fc.pdst = sr.ckv[(size_t) l.dev] + (size_t) g_first * ckv_rb();
                         fc.pdst_stride = (long long) ckv_rb();
+                        if (gdyn) { fc.pos_p = &gdyn->gpos[l.il]; fc.pdst_p = &gdyn->pdst_b[l.il];
+                                  gdyn->gpos[l.il] = fc.pos; gdyn->pdst_b[l.il] = fc.pdst; }
                         pj[np++] = FinishJob{d.latent, ng, HD, HD, fc};
                     }
                     finish_n(pj, np, s);
@@ -10676,6 +11045,7 @@ struct Model::Impl {
                     bool restrict_ = false;
                     for (int t = 0; t < T; ++t)
                         restrict_ = restrict_ || (lim.n[t] + g.cand_blk - 1) / g.cand_blk > g.cand_topk;
+                    gfp(l.uses_cand && restrict_); gfp(l.cand_src);
                     if (l.uses_cand && restrict_) {
                         Rows cl;   // the candidate positions of each query: its blocks x blk
                         int nmax = 0;
@@ -10684,6 +11054,13 @@ struct Model::Impl {
                             cl.k[t] = wp.cand[l.il][t];
                             nmax = std::max(nmax, wp.cand[l.il][t] * g.cand_blk);
                         }
+                        if (gdyn) {
+                            cl = lim;
+                            cl.kp = &gdyn->cand_v[l.il];
+                            gdyn->cand_v[l.il] = wp.cand[l.il][0];
+                            nmax = (nmax + 255) & ~255;   // a stable grid inside a 256-row bucket (lim bounds inside)
+                        }
+                        gfp(nmax);
                         index_score(d.iq, d.iw, ks.ik[(size_t) l.dev], g.ix_heads, g.ix_hd, T, nmax, d.cand,
                                     (int) cand_stride(), g.cand_blk, cl, d.scores, ss, s);
                         Rows tr;
@@ -10691,9 +11068,17 @@ struct Model::Impl {
                             tr.n[t] = wp.cand[l.il][t] * g.cand_blk;
                             tr.k[t] = lim.k[t];
                         }
+                        if (gdyn) {
+                            tr = lim;
+                            tr.np = &gdyn->candx[l.il];
+                            gdyn->candx[l.il] = wp.cand[l.il][0] * g.cand_blk;
+                        }
                         topk(d.scores, ss, T, tr, d.cand, (int) cand_stride(), g.cand_blk, d.topk, (int) topk_stride(), s);
                     } else {
-                        index_score(d.iq, d.iw, ks.ik[(size_t) l.dev], g.ix_heads, g.ix_hd, T, clen_max, nullptr, 0, 1,
+                        int nb = clen_max;
+                        if (gdyn) nb = (nb + 255) & ~255;   // a stable grid inside a 256-row bucket (lim bounds inside)
+                        gfp(nb);
+                        index_score(d.iq, d.iw, ks.ik[(size_t) l.dev], g.ix_heads, g.ix_hd, T, nb, nullptr, 0, 1,
                                     lim, d.scores, ss, s);
                         if (l.cand_src) {
                             Rows cr;
@@ -10701,6 +11086,7 @@ struct Model::Impl {
                                 cr.n[t] = lim.n[t];
                                 cr.k[t] = g.cand_topk;
                             }
+                            if (gdyn) { cr = lim; cr.kcap = g.cand_topk; }
                             cand_blocks(d.scores, ss, T, cr, g.cand_blk, d.bm, (long long) bm_stride(), d.cand,
                                         (int) cand_stride(), s);
                         }
@@ -10717,6 +11103,8 @@ struct Model::Impl {
                 fc.quant = 2;
                 fc.pdst = sr.ckv[(size_t) l.dev] + (size_t) g_first * ckv_rb();
                 fc.pdst_stride = (long long) ckv_rb();
+                if (gdyn) { fc.pos_p = &gdyn->gpos[l.il]; fc.pdst_p = &gdyn->pdst_b[l.il];
+                          gdyn->gpos[l.il] = fc.pos; gdyn->pdst_b[l.il] = fc.pdst; }
                 if (!(l.ix_src && l.owns_k)) finish(d.latent, ng, HD, HD, fc, s);   // (else it rode the pair)
                 if (!wp.par && !replicate(sr.ckv, sr.h_ckv, sr.ev_ckv, fc.pdst, (size_t) g_first * ckv_rb(),
                                           (size_t) ng * ckv_rb(), l.dev, err))
@@ -10741,38 +11129,95 @@ struct Model::Impl {
             for (int t = 0; t < T; ++t) ar.nsel[t] = lim.n[t] > 0 ? wp.topk[l.il][t] : 0;
             ckv = sr.ckv[(size_t) l.dev];
         }
+        gfp(l.mtp); gfp(NHL);
+        if (gdyn) gdyn->topk_v[l.il] = ar.nsel[0];   // sel_p is read for every layer: stage dense layers' 0 too
         if (l.mtp) {   // the block's rows (BF16), after the ring's in ext, as every query's selection
             ckv = d.ext + (size_t) g.win * HD;
             ckv_fmt = kKvBf16;
             iota_rows(d.topk, T, T, (int) topk_stride(), s);
         }
         if (NHL > 0) {
+            if (T == 1) stamp(s);
+            if (ds4_dbg("DS4_LSUM") && T == 1 && l.il == 0 && dlsum != nullptr) {   // DIAG: the counts the attention kernel derives
+                float* oc = dlsum + 302;
+                const AttnRows ac = ar;
+                sycl_detail::single(s, [=] {
+                    const long long p0l = ac.p0_p ? *ac.p0_p : ac.p0;
+                    const long long ta = ac.t0, pa = p0l + ta;
+                    const long long first = sycl::max(static_cast<long long>(ac.win) - p0l, ta + 1);
+                    oc[0] = (float) p0l;
+                    oc[1] = (float) first;
+                    oc[2] = (float) (ac.win + ta - first + 1);
+                    oc[3] = (float) (ac.sel_p ? ac.sel_p[0] : -7.f);
+                    oc[4] = (float) ac.win0[0];
+                    oc[5] = (float) ac.nwin[0];
+                });
+            }
             sparse_attn(d.q, d.ext, ckv, d.topk, (int) topk_stride(), ar, l.sink, NHL, HD, T,
                         1.0f / std::sqrt((float) HD), d.o, s, ckv_fmt, 0, &d.attn_scr);
+            dupx(9, T, [&] { sparse_attn(d.q, d.ext, ckv, d.topk, (int) topk_stride(), ar, l.sink, NHL, HD, T,
+                                         1.0f / std::sqrt((float) HD), d.o, s, ckv_fmt, 0, &d.attn_scr); });
+            stamp(s);
             dump_sub(d, "o", l.il, p0, T, d.o, (size_t) T * HQ * 4);
+            if (ds4_dbg("DS4_LSUM") && T == 1 && dlsum != nullptr) {   // DIAG: sparse_attn raw output sumsq
+                float* out = dlsum + 128 + l.il;
+                const float* op = d.o;
+                const int nq = NHL * HD;
+                sycl_detail::single(s, [=] {
+                    double a = 0;
+                    for (int i = 0; i < nq; ++i) a += (double) op[i] * op[i];
+                    *out = (float) a;
+                });
+            }
             Finish fo;
             fo.rd = g.rd;
             fo.pos = (int) p0;
+            fo.pos_p = gdyn ? &gdyn->pos : nullptr;
             fo.vpp = NHL;
             fo.freqs = freqs;
             fo.inverse = 1;
             fo.quant = 1;
             finish(d.o, T * NHL, HD, HD, fo, s);
+            dupx(10, T, [&] { finish(d.o, T * NHL, HD, HD, fo, s); });
             dump_sub(d, "o_fin", l.il, p0, T, d.o, (size_t) T * HQ * 4);
             x3::MvJob j[16];
             const int per = HQ / OG;
             for (int gi = 0; gi < OG; ++gi)
                 j[gi] = job(l.wo_a[gi], d.o + (size_t) gi * per, d.oa + (size_t) gi * g.o_lora, T, HQ, (size_t) OG * g.o_lora);
             if (!mv_n(d, j, OG, err)) return false;
+            dupx(11, T, [&] { (void) mv_n(d, j, OG, err); });
             if (!mv(d, {job(l.wo_b, d.oa, d.ao, T, (size_t) OG * g.o_lora, D)}, err)) return false;
-        } else CK(rt::memset_async(d.ao, 0, (size_t) T * D * sizeof(*d.ao), s));   // (no heads: nothing to add)
+            dupx(12, T, [&] { (void) mv(d, {job(l.wo_b, d.oa, d.ao, T, (size_t) OG * g.o_lora, D)}, err); });
+        } else if (!sycl_detail::suppressed_submit(s)) CK(rt::memset_async(d.ao, 0, (size_t) T * D * sizeof(*d.ao), s));   // (no heads: nothing to add)
+        if (T == 1) stamp(s);
         dump_sub(d, "ao", l.il, p0, T, d.ao, (size_t) T * D * 4);
+        if (ds4_dbg("DS4_LSUM") && T == 1 && dlsum != nullptr) {   // DIAG: raw attention output sumsq
+            float* out = dlsum + 80 + l.il;
+            const float* ap = d.ao;
+            sycl_detail::single(s, [=] {
+                double a = 0;
+                for (int i = 0; i < D; ++i) a += (double) ap[i] * ap[i];
+                *out = (float) a;
+            });
+        }
         if (nm > 1) allreduce(d.ao, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
         hc_post(d.ao, d.h, d.a_post, d.a_comb, D, H, T, d.h2, s);
+        dupx(13, T, [&] { hc_post(d.ao, d.h, d.a_post, d.a_comb, D, H, T, d.h2, s); });
         std::swap(d.h, d.h2);
+        if (ds4_dbg("DS4_LSUM") && T == 1 && dlsum != nullptr) {   // DIAG: post-attention residual sumsq
+            float* out = dlsum + 40 + l.il;
+            const float* hp = d.h;
+            const int nd = H * D;
+            sycl_detail::single(s, [=] {
+                double a = 0;
+                for (int i = 0; i < nd; ++i) a += (double) hp[i] * hp[i];
+                *out = (float) a;
+            });
+        }
         if (dump_l != nullptr && mi == 0) dump_layer(d, d.h, 1000 + l.il, p0, T);   // (DS4_DUMP_L: after the attention)
         dump_sub(d, "h_attn", l.il, p0, T, d.h, (size_t) T * H * D * 4);
         prof_mark(d, 1);
+        if (T == 1) stamp(s);
         // the MoE
         gg::PreQ8 fq8;
         if (fuse) {
@@ -10793,10 +11238,13 @@ struct Model::Impl {
                          d.pre, d.f_post, d.f_comb, s);
             hc_pre_norm(d.h, d.a_pre, l.ffn_norm, D, H, T, g.eps, d.x, s);
         }
+        { static const int dup = std::getenv("DS4_DUP") ? std::atoi(std::getenv("DS4_DUP")) : 0;
+          for (int i = 0; i < dup; ++i) hc_pre_norm(d.h, d.a_pre, l.ffn_norm, D, H, T, g.eps, d.x, s); }   // DIAG
         dump_sub(d, "f_pre", l.il, p0, T, d.pre, (size_t) T * 8 * 4);
         dump_sub(d, "f_post", l.il, p0, T, d.f_post, (size_t) T * 8 * 4);
         dump_sub(d, "f_comb", l.il, p0, T, d.f_comb, (size_t) T * 64 * 4);
         dump_sub(d, "ffn_x", l.il, p0, T, d.x, (size_t) T * D * 4);
+        gfp(wp.async); gfp(wp.vl);
         if (wp.async) {
             // the routing goes to the service thread through the mailbox (a group's lead publishes it, the members
             // make the same plan) while the device runs the shared expert and the VRAM experts (from the plan the
@@ -10804,6 +11252,12 @@ struct Model::Impl {
             const unsigned sq = wp.seq[l.il];
             const int slot = (int) (sq % kRing);
             const bool lead = mi == 0 && sq != 0, wait = lead && wp.wait[l.il];   // (plan_request)
+            gfp(sq != 0); gfp(wait);
+            if (gdyn) {   // the request's live sequence and the reply slot's pointers, read on the device at replay
+                gdyn->seq[l.il] = sq;
+                gdyn->cpu_part[l.il] = wait ? resps[slot].part[0] : nullptr;
+                gdyn->cpu_flag[l.il] = wait ? &resps[slot].cpu[0] : nullptr;
+            }
             // DS4_ROUTE_FUSE: this layer's and the next layer's gate GEMVs in one launch, the routing and the
             // lookahead in another (one lookahead layer); a shape the pair launches do not take keeps the
             // separate launches.
@@ -10815,19 +11269,22 @@ struct Model::Impl {
                 nx1->gate_bias != nullptr && l.n_exp >= 1 && l.n_exp <= 1024 &&
                 nx1->n_exp >= 1 && nx1->n_exp <= 1024 && l.k_exp >= 1 && l.k_exp <= kPicks && m1 >= 1 &&
                 D >= 4 && D % 4 == 0 && D <= kMaxDim) {
+                gfp(nx1 != nullptr);
                 gl_pair = gemv_f32_pair(l.gate(), l.n_exp, d.glog, nx1->gate(), nx1->n_exp, d.glog_a, d.x, D, s, T, 1024);
                 if (gl_pair) {
                     RoutePair rp;
                     rp.logits = d.glog; rp.bias = l.gate_bias; rp.n = l.n_exp; rp.k = l.k_exp;
                     rp.route_scale = g.route_scale; rp.vram = l.vram_tab; rp.x = d.x; rp.dim = D;
-                    rp.idx = d.ridx; rp.w = d.rw; rp.plan_ptr = d.plan_ptr; rp.req = reqs + slot;
+                    rp.idx = d.ridx; rp.w = d.rw; rp.plan_ptr = d.plan_ptr; rp.req = gdyn ? reqs : reqs + slot;
                     rp.bias_vl = l.gate_bias_vl; rp.vl = l.mtp ? 0u : wp.vl; rp.seq = sq;
+                    rp.seq_p = gdyn ? &gdyn->seq[l.il] : nullptr;
                     rp.na0 = m1; rp.na1 = 0;
                     rp.a_logits = d.glog_a; rp.a_bias = nx1->gate_bias; rp.a_n = nx1->n_exp; rp.m = m1; rp.off = 0;
                     rp.T = T;
                     fused_route = route_pair(rp, s);
                 }
             }
+            gfp(gl_pair); gfp(fused_route);
             if (!fused_route) {
                 if (!gl_pair) gemv_f32(l.gate(), d.x, l.n_exp, D, T, d.glog, 1024, s);
                 int na[2] = {0, 0};   // lookahead: the next layers' guesses (their gate on this FFN input), published below
@@ -10838,13 +11295,18 @@ struct Model::Impl {
                     float* gl = d.glog_a + (size_t) (a - 1) * kWin * 1024;
                     // (normed with the next layer's FFN weights instead: the same hit rate)
                     if (!(gl_pair && nx == nx1)) gemv_f32(nx->gate(), d.x, nx->n_exp, D, T, gl, 1024, s);
-                    route_ahead(gl, nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s);
+                    if (gdyn) route_ahead_dyn(gl, nx->gate_bias, nx->n_exp, m, T, reqs, &gdyn->seq[l.il], (a - 1) * kAhead1, s);
+                    else route_ahead(gl, nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s);
                     na[a - 1] = m;
                 }
                 route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
-                              d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl,
-                              na[0], na[1], lead && self_answer ? resps + slot : nullptr, d.cpu_any, lane_done);
+                              d.plan_ptr, lead ? (gdyn ? reqs : reqs + slot) : nullptr, sq, s, l.gate_bias_vl,
+                              l.mtp ? 0u : wp.vl,
+                              na[0], na[1], lead && self_answer ? (gdyn ? resps : resps + slot) : nullptr, d.cpu_any,
+                              lane_done, gdyn ? &gdyn->seq[l.il] : nullptr);
+                gfp(na[0]); gfp(na[1]);
             }
+            if (T == 1) stamp(s);
             {
                 x3::MvJob js[2] = {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)};
                 if (!mv_n(d, js, 2, err, fq8.q ? &fq8 : nullptr)) return false;
@@ -10855,21 +11317,26 @@ struct Model::Impl {
             } else {
                 swiglu(d.sg, d.su, T * FF, g.lim, d.sh, s);
             }
+            gfp(sq8.q != nullptr);
             if (!mv(d, {job(l.s2, d.sh, d.sh_out, T, FF, D)}, err, sq8.q ? &sq8 : nullptr)) return false;
             prof_mark(d, 2);
             const x3::ExpertLayout& lay = nm > 1 ? l.hlay : l.lay;
+            gfp(T == 1 && moe_token_path);
             if (T == 1 && moe_token_path) {
                 x3::MoeArgs ma;
                 ma.plan_ptr = d.plan_ptr;
                 ma.plan_w = d.rw;
                 ma.cpu_part = wait ? resps[slot].part[0] : nullptr;
                 ma.cpu_flag = wait ? &resps[slot].cpu[0] : nullptr;
+                ma.cpu_part_p = gdyn ? &gdyn->cpu_part[l.il] : nullptr;
+                ma.cpu_flag_p = gdyn ? &gdyn->cpu_flag[l.il] : nullptr;
                 ma.lay = lay;
                 ma.k = l.k_exp;
                 ma.n_embd = D;
                 ma.n_ff = FF;
                 ma.limit = g.lim;
                 const bool mx = lay.fmt == gg::kFmtMXFP4;
+                gfp(mx); gfp(zc_stage_buf != nullptr && l.zc_tab != nullptr);
                 if (zc_stage_buf != nullptr && l.zc_tab != nullptr)   // (the store's experts copied to VRAM at the PCIe rate first)
                     zc_stage(d.plan_ptr, d.ridx, l.zc_tab, l.k_exp, zc_stage_buf, zc_stride, l.blob, s);
                 // DS4_TLOG2: the expert stage's three host spans (gate/up issue, the CPU-lane wait, down issue)
@@ -10885,16 +11352,51 @@ struct Model::Impl {
                     });
                 }
                 const double m0 = tlog2 ? now_ms() : 0.0;
+                stamp(s);
                 if (mx) gg::moe_gate_up(ma, d.x, d.xg, s);
                 else x3::moe_gate_up(ma, d.x, d.xg, s);
+                {   // DIAG: DS4_FLUSH=MiB reads a buffer that size first (the cache emptied), then DS4_DUP_GU more gate/ups
+                    static const int dup = std::getenv("DS4_DUP_GU") ? std::atoi(std::getenv("DS4_DUP_GU")) : 0;
+                    static const size_t fl = std::getenv("DS4_FLUSH") ? size_t(std::atoi(std::getenv("DS4_FLUSH"))) << 20 : 0;
+                    static sycl::uint4* fbuf = nullptr;
+                    static unsigned* fout = nullptr;
+                    if (fl && !fbuf) {
+                        rt::alloc_device(&fbuf, fl);
+                        rt::alloc_device(&fout, sizeof(unsigned));
+                        if (!fbuf || !fout) { std::fprintf(stderr, "DS4_FLUSH: no room\n"); std::abort(); }
+                    }
+                    if (fl) {
+                        sycl::uint4* fb = fbuf;
+                        unsigned* fo = fout;
+                        const size_t n16 = fl / 16, items = size_t(1) << 16;
+                        sycl_detail::parallel(s, items, [=](size_t i) {
+                            unsigned acc = 0;
+                            for (size_t j = i; j < n16; j += items) { const sycl::uint4 v = fb[j]; acc ^= v.x() ^ v.y() ^ v.z() ^ v.w(); }
+                            if (acc == 0x9e3779b9u) *fo = acc;
+                        });
+                    }
+                    for (int i = 0; i < dup; ++i) { if (mx) gg::moe_gate_up(ma, d.x, d.xg, s); else x3::moe_gate_up(ma, d.x, d.xg, s); }
+                }
                 const double m1 = tlog2 ? now_ms() : 0.0;
                 prof_mark(d, 3);
-                if (wait) wait_seq(&resps[slot].seq, sq, s);
+                stamp(s);
+                if (wait) {
+                    if (gdyn) wait_seq_dyn(resps, &gdyn->seq[l.il], s);
+                    else wait_seq(&resps[slot].seq, sq, s);
+                }
+                stamp(s);
                 const double m2 = tlog2 ? now_ms() : 0.0;
                 prof_mark(d, 4);
                 if (mx) gg::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
                 else x3::moe_down(ma, d.xg, d.sh_out, d.moe_out, s);
+                stamp(s);
                 if (tlog2) { t_moe_gu += m1 - m0; t_moe_wait += m2 - m1; t_moe_dn += now_ms() - m2; ++t_moe_n; }
+                if (tlog2 && t_moe_n % 400 == 0) {
+                        std::fprintf(stderr, "tlog2: %ld stages | host ms a stage: gate_up %.2f  cpu_wait %.2f  down %.2f\n",
+                                     t_moe_n, t_moe_n ? t_moe_gu / (double) t_moe_n : 0.0,
+                                     t_moe_n ? t_moe_wait / (double) t_moe_n : 0.0,
+                                     t_moe_n ? t_moe_dn / (double) t_moe_n : 0.0);
+                }
             } else {   // each distinct expert read once for the window's tokens
                 gf::MoeWin mw;
                 mw.plan_ptr = d.plan_ptr;
@@ -10936,10 +11438,25 @@ struct Model::Impl {
                 }
             }
             if (mi == 0) st.experts += (int64_t) T * l.k_exp;
+            gfp(nm);
             if (nm > 1) allreduce(d.moe_out, T * D, ag, mi, ++d.ar_seq, d.xcnt, s);
             hc_post(d.moe_out, d.h, d.f_post, d.f_comb, D, H, T, d.h2, s);
             std::swap(d.h, d.h2);
+            if (ds4_dbg("DS4_LSUM")) {   // DIAG: this layer's residual sumsq into a slot, replay recomputes it
+                if (dlsum == nullptr) dlsum = sycl::malloc_device<float>(384, static_cast<sycl::queue&>(s));
+                if (dlsum != nullptr) {
+                    float* out = dlsum + l.il;
+                    const float* hp = d.h;
+                    const int nd = H * D;
+                    sycl_detail::single(s, [=] {
+                        double a = 0;
+                        for (int i = 0; i < nd; ++i) a += (double) hp[i] * hp[i];
+                        *out = (float) a;
+                    });
+                }
+            }
             prof_mark(d, 5);
+            if (T == 1) stamp(s);
             return true;
         }
         if (nm > 1) {
@@ -11094,6 +11611,7 @@ struct Model::Impl {
             ph[0] += ph2 - ph0; ph[1] += ph3 - ph2; ph[2] += ph4 - ph3; if (ph_prev > 0 && ph0 - ph_prev < 5.0) ph[3] += ph0 - ph_prev; ph_prev = ph4; ++ph_n;
             static bool reg = false;
             if (!reg) { reg = true; std::atexit([] { std::fprintf(stderr, "phases per layer call (%ld): route enqueue + shared expert + wait %.3f ms, routing analysis + GPU experts enqueue %.3f ms, CPU lane + combine + hc_post %.3f ms, attention enqueue %.3f ms%s", ph_n, ph[0] / ph_n, ph[1] / ph_n, ph[2] / ph_n, ph[3] / ph_n, "\n"); }); }
+            if (ph_n % 400 == 0) std::fprintf(stderr, "phases per layer call (%ld): route enqueue + shared expert + wait %.3f ms, routing analysis + GPU experts enqueue %.3f ms, CPU lane + combine + hc_post %.3f ms, attention enqueue %.3f ms%s", ph_n, ph[0] / ph_n, ph[1] / ph_n, ph[2] / ph_n, ph[3] / ph_n, "\n");
         }
         // (h_part / h_x are written again only after the next layer's route has synchronized, which follows these)
         return true;

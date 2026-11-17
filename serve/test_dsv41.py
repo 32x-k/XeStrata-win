@@ -807,14 +807,17 @@ class SyclConfig(unittest.TestCase):
         for cap in ("supports_tools", "supports_tool_calls", "supports_parallel_tool_calls"):
             self.assertTrue(template.caps[cap], cap)
 
-    def test_one_gpu_and_no_vision(self):
-        cfg = {"arch": "deepseek41", "args": ["--pack", "example", "--vision", "on"], "gpu": 2}
+    def test_one_gpu_and_vision(self):
+        cfg = {"arch": "deepseek41", "args": ["--pack", "example", "--vision", "off"], "gpu": 2}
         args = server.engine_args(cfg)
         self.assertEqual(args[args.index("--vision") + 1], "off")
         self.assertEqual(args[args.index("--tp") + 1], "1")
         self.assertEqual(args[args.index("--threads") + 1], "off")
         self.assertEqual(args[args.index("--gpus") + 1], "2")
-        self.assertEqual(cfg["args"][-1], "on")
+        self.assertEqual(cfg["args"][-1], "off")
+        for given in (["--pack", "example"], ["--pack", "example", "--vision"]):
+            args = server.engine_args({"arch": "deepseek41", "args": given})
+            self.assertEqual(args[args.index("--vision") + 1], "on", given)
 
     def test_multiple_gpu_requests_are_refused(self):
         base = {"arch": "deepseek41", "args": ["--pack", "example"]}
@@ -851,15 +854,15 @@ class SyclImages(ApiBase):
                 with self.subTest(route=route):
                     status, result = self.post(route, body)
                     self.assertEqual(status, 400, result)
-                    self.assertIn("does not support images", result["error"]["message"])
+                    self.assertIn("without pictures for DeepSeek", result["error"]["message"])
             load.assert_not_called()
             download.assert_not_called()
 
     def test_tool_images_are_not_silently_dropped(self):
         self.start("hello")
         messages = [{"role": "tool", "content": [{"type": "image", "source": "missing-image.png"}]}]
-        with self.assertRaisesRegex(ValueError, "does not support images"):
-            self.svc.prepare(messages, None, {})
+        read, _, _, _ = self.svc.prompt_ids(messages, None, {}, store=False)
+        self.assertEqual(read[0]["content"], [{"type": "text", "text": "[image omitted: this server has no image encoder]"}])
 
 
 if __name__ == "__main__":

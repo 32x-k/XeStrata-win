@@ -28,6 +28,7 @@
 #include "ds4_os.hpp"
 #include "ds4_packinfo.hpp"
 #include "ds4_slotmeta.hpp"
+#include "ds4_sycl.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -240,7 +241,14 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
     const double rt2 = rt_now();
     const unsigned long long rs2 = rt_seq();
     if (!m.step(tok, true, err)) return false;
+    static const bool ostat = std::getenv("DS4_OSTAT") != nullptr;
+    static double o_smp = 0; static int o_n = 0;
+    const double rt3 = rt_now();
     out.push_back(m.sample(temperature, top_p, top_k, min_p, seed, counter++));
+    if (ostat && ((o_smp += rt_now() - rt3, ++o_n) & 15) == 0) {
+        std::fprintf(stderr, "OSTAT smp=%.3f ms/tok\n", o_smp / o_n);
+        o_smp = 0; o_n = 0;
+    }
     g_rt.step += rt_now() - rt2;
     g_rt.step_d += rt_seq() - rs2;
     ++g_rt.steps;
@@ -1843,6 +1851,7 @@ int main(int argc, char** argv) try {
                      (s.prof_ms[2] - s0.prof_ms[2]) / pt, (s.prof_ms[3] - s0.prof_ms[3]) / pt,
                      (s.prof_ms[4] - s0.prof_ms[4]) / pt, (s.prof_ms[5] - s0.prof_ms[5]) / pt);
     }
+    strata::ds4::sycl_detail::kernel_profile().report(stderr);   // DS4_KPROF
     if (df != nullptr) std::fclose(df);
     m.save_profile();
     return 0;

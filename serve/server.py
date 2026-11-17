@@ -72,6 +72,7 @@ from serve.frontend import (THINK_END, ChatTemplate, Event, GlmOutputParser, Har
                             literal_tags, thinking_signature, mark_think_literals,
                             openai_to_messages, require_messages, tool_choice_of, unmark_think_literals)
 from serve.mcp import McpCancelled, McpHub, hub_from_config  # noqa: E402
+from serve.ds_pictures import DsPictures  # noqa: E402
 from serve import runconfig  # noqa: E402
 from serve.webfiles import subtree_file as web_subtree_file  # noqa: E402
 from serve import logit_bias as bias_api  # noqa: E402
@@ -3054,19 +3055,23 @@ def deepseek_engine_args(cfg: dict) -> list[str]:
     args = list(cfg["args"])
     if any(flag in args for flag in ("--layer-split", "--split-device", "--peer-device")):
         raise ValueError("DeepSeek-V4.1 currently supports one SYCL GPU")
-    for flag, value in (("--tp", "1"), ("--threads", "off"), ("--vision", "off")):
+    for flag, value in (("--tp", "1"), ("--threads", "off")):
         positions = [i for i, arg in enumerate(args) if arg == flag]
         for i in reversed(positions):
             if i + 1 == len(args) or args[i + 1].startswith("--"):
-                if flag != "--vision":
-                    raise ValueError(f"{flag} needs {value} for the DeepSeek-V4.1 SYCL engine")
-                args.insert(i + 1, value)
-            elif args[i + 1] != value:
-                if flag != "--vision":
-                    raise ValueError(f"{flag} must be {value} for the DeepSeek-V4.1 SYCL engine")
-                args[i + 1] = value
+                raise ValueError(f"{flag} needs {value} for the DeepSeek-V4.1 SYCL engine")
+            if args[i + 1] != value:
+                raise ValueError(f"{flag} must be {value} for the DeepSeek-V4.1 SYCL engine")
         if not positions:
             args += [flag, value]
+    # pictures, read by the engine's own vision tower (serve/ds_pictures.py): on unless the config's args say
+    # --vision off, as upstream's server has them
+    positions = [i for i, arg in enumerate(args) if arg == "--vision"]
+    for i in reversed(positions):
+        if i + 1 == len(args) or args[i + 1].startswith("--"):
+            args.insert(i + 1, "on")
+    if not positions:
+        args += ["--vision", "on"]
     positions = [i for i, arg in enumerate(args) if arg == "--gpus"]
     for i in positions:
         if i + 1 == len(args) or not args[i + 1].isdecimal():
@@ -4505,8 +4510,6 @@ class Service:
         that is down (an idle unload's) is brought back by load(), as a request's own load does before prepare()."""
         # `cancel` (#1999): set when the client hangs up; the downloads, the wait for the turn and the encodes stop
         # between pictures and raise ClientGone
-        if self.family == "deepseek41" and images_of(messages):
-            raise ValueError("this build does not support images for DeepSeek-V4.1")
         messages = self.expand_files(messages, cancel)
         # Cached tool images are references in browser history, never arbitrary file paths or huge base64 strings.
         for message in messages:
@@ -4541,6 +4544,10 @@ class Service:
             if self.vision is None:
                 if self.vision_error:
                     raise ValueError("images are unavailable: " + self.vision_error)
+                if self.family == "deepseek41":
+                    raise ValueError("this server was started without pictures for DeepSeek-V4.1 (--vision off in the "
+                                     "config's args, or a pack made without the picture reader), so it cannot read "
+                                     "images")
                 raise ValueError("this server was started without the vision encoder (run setup again and choose "
                                  "'vision'), so it cannot read images")
             pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
@@ -4556,6 +4563,18 @@ class Service:
             low = [item.get("detail") == "low" for m in messages if isinstance(m.get("content"), list)
                    for item in m["content"] if item.get("type") == "image"]
             images = [low_detail(fetch(src)) if is_low else fetch(src) for src, is_low in zip(images, low)]
+            if isinstance(self.vision, DsPictures):
+                # DeepSeek-V4.1: the engine has its own vision tower.  The pictures go to it as raw RGB in the file of
+                # a GENI line (serve/ds_pictures.py); each template placeholder becomes the run of image tokens its
+                # picture takes.  prepare() hands the file to run(), which deletes it; a count of the prompt alone
+                # (store=False) deletes it here.
+                ids, ds_file = self.vision.build(ids, [Vision.load(src) if isinstance(src, str) else src
+                                                       for src in images])
+                if store:
+                    self.embeddings.path = ds_file
+                else:
+                    Path(ds_file).unlink(missing_ok=True)
+                return messages, ids, encoded_ids, encoded
             # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
             # run on the GPU at the same time - an encode during a running request left that request stuck at
             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
@@ -4638,12 +4657,13 @@ class Service:
             # (an encoder restart, the cache's eviction) with other bits still matches its checkpoints
             self.embeddings.keys = [Path(p).stem[:16] for p, _ in encoded]
             write_temporary(combined, [p for p, _ in encoded])
-        if self.family == "deepseek41" and req is not None and req.get("strata_prefix") is None and not images:
+        pictures = bool(images) or self.embeddings.path is not None   # DeepSeek's pictures are a file, not `encoded`
+        if self.family == "deepseek41" and req is not None and req.get("strata_prefix") is None and not pictures:
             lead = self.deepseek_shared_start(messages)
             if lead:
                 req["strata_prefix"] = {"messages": lead}
         if req is not None and req.get("strata_prefix") is not None:
-            req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, bool(images))
+            req["strata_prefix"] = self.resolve_prefix(req["strata_prefix"], messages, tools, kwargs, ids, pictures)
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
     @staticmethod
@@ -7577,8 +7597,9 @@ def make_handler(svc: Service):
             and http(s) images are the page's own to send; files come from Strata's own page, a trusted origin or a
             client that is no browser.  ValueError (a 400)."""
             sources = images_of(messages)
-            if svc.family == "deepseek41" and sources:
-                raise ValueError("this build does not support images for DeepSeek-V4.1")
+            if svc.family == "deepseek41" and sources and svc.vision is None:   # refused before the engine loads
+                raise ValueError("this server was started without pictures for DeepSeek-V4.1 (--vision off in the "
+                                 "config's args, or a pack made without the picture reader), so it cannot read images")
             self._no_local_sources(sources)
 
         def _no_local_sources(self, sources):
@@ -9143,6 +9164,15 @@ def main() -> int:
                   fit_max_tokens=a.fit_max_tokens or (not a.no_fit_max_tokens
                                                       and cfg.get("fit_max_tokens") is not False))
     svc.set_family(cfg.get("arch"))
+    if cfg.get("arch") == "deepseek41" and vision is None and a.engine == "strata":
+        # DeepSeek-V4.1 reads pictures with the engine's own tower (--vision on, the default): no separate reader
+        # process.  `--vision off` in the config's args, or a pack without a tower, leaves svc.vision None: pictures
+        # are refused with a 400 that says so.
+        dsp = DsPictures.from_config(cfg, tmp_dir=Path(cfg["log"]).parent / "ds-pictures" if cfg.get("log") else None)
+        if dsp is not None:
+            svc.vision = dsp
+            print("[strata] pictures: on (DeepSeek-V4.1 reads them with the engine's own vision tower; --vision off "
+                  "turns them off)", flush=True)
     svc.vision_error = vision_error
     svc.vision_fallback = vision_fallback
     if (tpath / "vocab.json").exists():

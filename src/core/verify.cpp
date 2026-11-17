@@ -388,6 +388,7 @@ struct Verifier::AsyncLaunch {
         cv.notify_one();
     }
     bool failed() const { return state.load(std::memory_order_acquire) == 2; }
+    bool launching() const { return state.load(std::memory_order_acquire) == 1; }
     bool wait(std::string& err) {
         int v;
         while ((v = state.load(std::memory_order_acquire)) == 1) state.wait(1, std::memory_order_acquire);
@@ -2035,7 +2036,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             if (now - last_flush > std::chrono::microseconds(2000)) {
                 last_flush = now;
                 if (al != nullptr && al->failed()) { (void) al->wait(err); return false; }
-                const strata::gpu::Status st = strata::gpu::stream_status(cs_);
+                // The queue is asked only once the launch call has returned: until then it holds the queue's lock that
+                // the query takes, and a large window (with the K/V streamed, from 64K on an R9700 under Windows) makes
+                // hipGraphLaunch wait for the GPU to drain, which waits for this thread's answer to the layer it rang.
+                const strata::gpu::Status st = al != nullptr && al->launching() ? strata::gpu::Status::Pending
+                                                                                : strata::gpu::stream_status(cs_);
                 if (st == strata::gpu::Status::Failed) {
                     err = "verify: layer " + std::to_string(l) + ": " + strata::gpu::last_error();
                     return false;
