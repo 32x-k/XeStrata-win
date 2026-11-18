@@ -8570,6 +8570,7 @@ int main(int argc, char** argv) {
                 drive.d.usage.data(), host_res.data(), g.n_layers, g.n_expert, o.adapt_min_gain, [](int64_t) { return 0; },
                 [&](int64_t l, int32_t e) { return (remote_opt && remote_opt->owns(l, e)) || helper_holds(drive.d, l, e); });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
+            if (remote_opt) remote_opt->spend_host_admission((int) swaps.size());
             bool main_live = false;
             auto swap_home = [&](int32_t layer) {   // the cache that owns the layer, on its card's stream
                 const int stn = multi_gpu ? stage_of(layer) : 0;
@@ -12608,6 +12609,19 @@ int main(int argc, char** argv) {
             if (!pcie_move_decided && drive.d.pcie_split == pcie_split_ptr)
                 pcie_move_decided = pcie_move_if_pays(drive.d, ver.fetch_branch(), sp.stats(), host_res, o.spec);
             seed_usage_from_prompt(drive.d.usage, sp.stats(), routed_seen, g.n_expert, 4 * (int64_t) o.adapt_every, o.adapt_decay);
+            // a long prompt lets the primary's tier take the experts it routed to, though a host-mode helper reads them
+            // too (RemoteExpertOpt::open_host_admission): STRATA_HOST_ADMIT_MIN tokens read (default 1024) open
+            // STRATA_HOST_ADMIT_SWAPS swaps (default 96, one adapt round; 0 keeps the tier out of the helper's experts).
+            // Measured 2026-11-18 (UD-Q4_K_XL, R9700 + 8060S, strata_bench --long, against 0): 96 took the agent's turn
+            // first token 3.50 -> 2.85 and 3.53 -> 2.81 s, its decode 62.7 -> 66.0 and 61.5 -> 63.7 tok/s; 384 read
+            // prompts 6-8% faster but the agent decoded 51 tok/s (the tier swapped through the turn's decode)
+            if (remote_opt) {
+                static const int64_t admit_min = [] { const char* v = std::getenv("STRATA_HOST_ADMIT_MIN");
+                    return v != nullptr ? (int64_t) std::strtoll(v, nullptr, 10) : (int64_t) 1024; }();
+                static const int admit_swaps = [] { const char* v = std::getenv("STRATA_HOST_ADMIT_SWAPS");
+                    return v != nullptr ? (int) std::strtol(v, nullptr, 10) : 96; }();
+                if (admit_swaps > 0 && n - resume >= admit_min) remote_opt->open_host_admission(admit_swaps);
+            }
             // the window rule, as the chain drafts: another draft after n when the rule would keep it (--spec-window)
             const strata::core::MtpDrafter::More draft_more = [&](int n, const float* pr) {
                 return req_minp_rule ? pr[n - 1] >= (float) req_spec_min_p : policy.mtp_extend(pr, n, S_mtp);

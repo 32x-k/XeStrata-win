@@ -17,6 +17,8 @@
 #include <utility>
 #include <vector>
 
+#include <atomic>
+
 namespace strata::core {
 class RemoteExperts;
 class ExpertSource;
@@ -38,6 +40,15 @@ public:
     /// Idempotent; the copy for device 0 is made by init().
     bool attach_device(int device, std::string& err);
     bool owns(int64_t layer, int32_t expert) const;
+    /// A helper in host mode holds nearly every RAM-resident expert, so owns() keeps the primary's adaptive tier
+    /// from following a prompt.  After a long prompt the serve loop opens `swaps` admissions of such experts (owns()
+    /// leaves host-mode helpers out while any remain); each adapt round spends what it swapped.  Left open, the tier
+    /// churned through decode: 57 -> 43 tok/s (2026-11-18, R9700 + 8060S, 7.2 GB/s link).
+    void open_host_admission(int swaps) { host_admit_.store(swaps, std::memory_order_relaxed); }
+    void spend_host_admission(int swaps) {
+        int v = host_admit_.load(std::memory_order_relaxed);
+        while (v > 0 && !host_admit_.compare_exchange_weak(v, v > swaps ? v - swaps : 0, std::memory_order_relaxed)) {}
+    }
     bool adapt(const std::vector<float>& usage, const std::vector<int32_t>& primary,
                const std::vector<std::pair<int32_t, int32_t>>& pending, int max_swaps,
                ExpertSource& source);
@@ -68,5 +79,6 @@ private:
     std::vector<Sink> sinks_;
     const float* weights_ = nullptr;
     int token_begin_ = 0, tokens_ = 0;
+    std::atomic<int> host_admit_{0};
 };
 } // namespace strata::core

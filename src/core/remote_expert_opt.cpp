@@ -217,8 +217,10 @@ void RemoteExpertOpt::combine(float* dst, float* scratch, int token_begin, int t
 }
 
 bool RemoteExpertOpt::owns(int64_t layer, int32_t expert) const {
+    const bool admit_host = host_admit_.load(std::memory_order_relaxed) > 0;   // after a long prompt (open_host_admission)
     for (const auto& p : peers_)
-        if (p.remote->holds(layer, expert)) return true;   // its cache's, or the arena's in host mode
+        if (!(admit_host && p.remote->host_mode()) && p.remote->holds(layer, expert))
+            return true;   // its cache's, or the arena's in host mode
     return false;
 }
 
