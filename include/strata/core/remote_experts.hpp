@@ -7,6 +7,7 @@
 #include "strata/core/expert_source.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -91,6 +92,8 @@ public:
     /// host time spent in begin() (staging + launches) and in finish() (waiting for this GPU), cumulative
     double ms_begin() const { return ms_begin_; }
     double ms_wait() const { return ms_wait_; }
+    /// STRATA_HELPER_PROF: the per-stage times since start, one line on stderr
+    void prof_print(int index) const;
 
 private:
     friend class RemoteExpertOpt;
@@ -103,6 +106,9 @@ private:
     uint64_t returned_bytes_ = 0;
     uint64_t full_row_bytes_ = 0;
     double ms_begin_ = 0, ms_wait_ = 0;
+    double prof_ms_[7] = {};   ///< staging, copy in, quantize, experts, reduce/out, begin->finish gap, finish wait
+    uint64_t prof_launch_ = 0, prof_groups_ = 0, prof_rows_ = 0, prof_bytes_ = 0;
+    std::chrono::steady_clock::time_point begin_end_{};
     ExpertCache cache_;
     void* stream_ = nullptr;
     void* read_stream_ = nullptr;   ///< STRATA_PREFILL_HELPER_SOURCE: cache -> host copies

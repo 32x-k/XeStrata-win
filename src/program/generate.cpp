@@ -13208,6 +13208,8 @@ int main(int argc, char** argv) {
                              (double) (remote_experts[(size_t) r].returned_bytes() - compact_before[(size_t) r]) / 1048576.0,
                              (double) (remote_experts[(size_t) r].full_row_bytes() - full_before[(size_t) r]) / 1048576.0,
                              remote_experts[(size_t) r].ms_begin(), remote_experts[(size_t) r].ms_wait());
+            for (int r = 0; r < 3; ++r)
+                if (o.expert_cache_remote[(size_t) r] > 0 || (r == 0 && host_active)) remote_experts[(size_t) r].prof_print(r + 1);
             if (prefill_helper_src) {
                 const uint64_t blobs = prefill_helper_src->helper_blobs(), bytes = prefill_helper_src->helper_bytes();
                 std::fprintf(stderr, "strata serve: prefill helper source: %lld blobs / %.1f MiB taken from a helper's "

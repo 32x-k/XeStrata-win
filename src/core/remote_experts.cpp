@@ -431,6 +431,25 @@ bool RemoteExperts::probe_arena_read(int64_t layers, std::string& err) {
     return true;
 }
 
+// STRATA_HELPER_PROF=1 (measuring only, slower): each stage of a helper layer is synchronised and timed, so the
+// request line shows where the helper's time goes; without it only the gap between begin() and finish() is kept.
+static bool helper_prof() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_HELPER_PROF"); return v != nullptr && v[0] == '1'; }();
+    return on;
+}
+
+void RemoteExperts::prof_print(int index) const {
+    if (!helper_prof()) return;
+    const double n = (double) std::max<uint64_t>(1, prof_launch_);
+    std::fprintf(stderr, "strata serve: CUDA%d prof (since start, per layer launch in us): %llu launches, %.1f groups, %.1f rows, "
+                         "%.1f MB read; host staging %.1f, copy in %.1f, quantize %.1f, experts %.1f (%.1f GB/s), "
+                         "reduce/out %.1f; begin->finish gap %.1f, finish wait %.1f\n", index,
+                 (unsigned long long) prof_launch_, (double) prof_groups_ / n, (double) prof_rows_ / n,
+                 (double) prof_bytes_ / n / 1e6, prof_ms_[0] * 1e3 / n, prof_ms_[1] * 1e3 / n, prof_ms_[2] * 1e3 / n,
+                 prof_ms_[3] * 1e3 / n, prof_ms_[3] > 0 ? (double) prof_bytes_ / (prof_ms_[3] * 1e6) : 0.0,
+                 prof_ms_[4] * 1e3 / n, prof_ms_[5] * 1e3 / n, prof_ms_[6] * 1e3 / n);
+}
+
 bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok,
                           int64_t k, const int32_t* kind, const int32_t* primary_res,
                           std::string& err) {
@@ -516,14 +535,25 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
     if (reduce) remote_opt_->prepare(*this, meta + 1);
     groups_ = (int32_t) group_id_.size();
     const uint64_t compact_bytes = (uint64_t) (reduce ? n_tok : dst_.size()) * H * sizeof(float);
+    const bool prof = helper_prof();
+    auto pt = std::chrono::steady_clock::now();
+    if (prof) prof_ms_[0] += std::chrono::duration<double, std::milli>(pt - timer.t0).count();
     try {
         const OnDevice on(device_);
         void* s = stream_;
+        auto mark = [&](int stage) {
+            if (!prof) return;
+            gpu::stream_sync(s);
+            const auto now = std::chrono::steady_clock::now();
+            prof_ms_[stage] += std::chrono::duration<double, std::milli>(now - pt).count();
+            pt = now;
+        };
         if ((!zero_copy_ && !gpu::copy_async(d_x_, h_x_, (size_t) n_tok * H * sizeof(float), s)) ||
             !gpu::copy_async(d_meta_, h_meta_, sizeof(RemoteMeta) + (reduce ? remote_opt_->metadata_bytes() : 0), s)) {
             err = failed(device_, "copy input");
             return false;
         }
+        mark(1);
         const float* xin = zero_copy_ ? h_x_ : d_x_;
         float* out = zero_copy_ && !reduce ? h_out_ : d_out_;
         const auto& lay = strata::kernels::cpu::expert_layout();
@@ -535,6 +565,7 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
                 xin = d_x_;
             }
             strata::kernels::quantize_q8_1_rows(xin, n_tok, H, d_q8_, s);
+            mark(2);
             auto L = strata::kernels::native_expert_layout(fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff, fmt.up_type);
             if (fmt.had_d) {   // APR: and the down weights the rotated h
                 L.had_block = fmt.had_block;
@@ -542,10 +573,13 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
             }
             strata::kernels::native_expert_grouped(L, d_ptr_, d_start_, d_count_, d_dst_, d_tok_, groups_,
                                                    (int64_t) dst_.size(), d_q8_, d_scratch_, out, s);
+            mark(3);
         } else {
             strata::kernels::quantize_q8_0_scaled(xin, d_q8_, d_scales_, n_tok * H, s);
+            mark(2);
             strata::kernels::moe_grouped_s2(d_ptr_, d_start_, d_count_, d_dst_, d_tok_, groups_,
                                             (int64_t) dst_.size(), d_q8_, d_scales_, d_scratch_, out, s);
+            mark(3);
         }
         if (reduce) {
             if (!remote_opt_->reduce(*this, (RemoteMeta*) d_meta_ + 1, err)) return false;
@@ -557,6 +591,17 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
         err = "GPU" + std::to_string(device_) + " experts: " + e.what();
         return false;
     }
+    if (prof) {
+        const OnDevice on(device_);
+        gpu::stream_sync(stream_);
+        prof_ms_[4] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pt).count();
+    }
+    ++prof_launch_;
+    prof_groups_ += (uint64_t) groups_;
+    prof_rows_ += (uint64_t) dst_.size();
+    if (strata::kernels::cpu::expert_layout().native)
+        prof_bytes_ += (uint64_t) groups_ * (uint64_t) strata::kernels::cpu::expert_layout().blob_bytes(layer);
+    begin_end_ = std::chrono::steady_clock::now();
     ++launched_layers_;
     returned_bytes_ += compact_bytes;
     full_row_bytes_ += (uint64_t) n * H * sizeof(float);
@@ -566,6 +611,7 @@ bool RemoteExperts::begin(int64_t layer, const float* x, const int32_t* ids, int
 bool RemoteExperts::finish(float* out, std::string& err) {
     if (group_id_.empty()) return true;
     const auto w0 = std::chrono::steady_clock::now();
+    prof_ms_[5] += std::chrono::duration<double, std::milli>(w0 - begin_end_).count();
     try {
         const OnDevice on(device_);
         if (!gpu::stream_sync(stream_)) { err = failed(device_, "finish"); return false; }
@@ -574,6 +620,7 @@ bool RemoteExperts::finish(float* out, std::string& err) {
         return false;
     }
     ms_wait_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+    prof_ms_[6] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
     if (remote_opt_ && remote_opt_->active()) { remote_opt_->accumulate(*this); return true; }
     for (size_t i = 0; i < original_row_.size(); ++i)
         std::memcpy(out + (size_t) original_row_[i] * H, h_out_ + i * H, (size_t) H * sizeof(float));
