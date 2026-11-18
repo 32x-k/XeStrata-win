@@ -2353,16 +2353,26 @@ void route_stop_signals() {
 // slow host link it waits on PCIe while the pool idles.  Measured 2026-11-18 (UD-Q4_K_XL, R9700 on a 7.2 GB/s OCuLink
 // x4 link, the CPU pool taking ~0.9 of the missed experts): 4K prompt 482 -> 1127 tok/s, 32K 1334 -> 1788 with the walk
 // off.  Below 12 GB/s, with the pool attached and STRATA_PREFILL_STREAM_ALL_MIN unset, the walk is turned off.
+// A slow host link (an eGPU's OCuLink, a PCIe x4 slot): a prompt chunk of fewer than STREAM_ALL_AUTO_MIN tokens leaves
+// its missed experts to the CPU pool instead of streaming every one of them over the link; a larger chunk streams them,
+// one copy then serving its many tokens.  Measured on R9700 (OCuLink 7.2 GB/s) + 8060S, UD-Q4_K_XL, code prompts
+// (XeStrata's sources), prefill tok/s with the stream / without it: 4K 386 / 769, 8K 675 / 917, 16K 1136 / 1158,
+// 32K 1745 / 1437, 64K 1788 / 1486, 124K 1771 / 1447 (chunks of 32,768).
+constexpr int64_t STREAM_ALL_AUTO_MIN = 24576;
+
 static void auto_stream_all_off(double link_gbps, const char* who) {
     if (std::getenv("STRATA_PREFILL_STREAM_ALL_MIN") != nullptr) return;
     if (!(link_gbps > 0.0 && link_gbps < 12.0)) return;
+    const std::string v = std::to_string(STREAM_ALL_AUTO_MIN);
 #if defined(_WIN32)
-    _putenv_s("STRATA_PREFILL_STREAM_ALL_MIN", "1000000000");
+    _putenv_s("STRATA_PREFILL_STREAM_ALL_MIN", v.c_str());
 #else
-    setenv("STRATA_PREFILL_STREAM_ALL_MIN", "1000000000", 0);
+    setenv("STRATA_PREFILL_STREAM_ALL_MIN", v.c_str(), 0);
 #endif
-    std::fprintf(stderr, "strata %s: the host link carries %.1f GB/s: a prompt's missed experts go to the CPU pool, not "
-                         "a stream of all of them (STRATA_PREFILL_STREAM_ALL_MIN=2048 restores the stream)\n", who, link_gbps);
+    std::fprintf(stderr, "strata %s: the host link carries %.1f GB/s: a prompt chunk of fewer than %lld tokens leaves "
+                         "its missed experts to the CPU pool, a larger one streams them all "
+                         "(STRATA_PREFILL_STREAM_ALL_MIN=N sets the line)\n", who, link_gbps,
+                 (long long) STREAM_ALL_AUTO_MIN);
 }
 
 int main(int argc, char** argv) {
