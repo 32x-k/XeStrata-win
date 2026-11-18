@@ -32,6 +32,7 @@
 #include "parity_device.hpp"
 
 #include <array>
+#include <cstring>
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -375,8 +376,20 @@ static int check_blob(const char* label, int l, const std::vector<uint8_t>& blob
         // bytes it reads a microsecond
         if (std::getenv("STRATA_GROUPED_BENCH") != nullptr && f.gu_type != 30) {
             constexpr int kCopies = 64, kG = 8, kSets = kCopies / kG, kIters = 200;
-            auto* many = static_cast<uint8_t*>(par::alloc_bytes(blob.size() * kCopies));
-            for (int c = 0; c < kCopies; ++c) par::copy_bytes_in(many + blob.size() * c, blob.data(), blob.size());
+            // STRATA_GROUPED_BENCH_HOST=1: the copies in host RAM registered for the device as the engine's RAM copy is
+            // (a helper GPU reading it in place, --expert-host-device1); else in device memory
+            const bool host_copies = std::getenv("STRATA_GROUPED_BENCH_HOST") != nullptr &&
+                                     std::getenv("STRATA_GROUPED_BENCH_HOST")[0] == '1';
+            uint8_t* many = nullptr;
+            if (host_copies) {
+                const size_t total = (blob.size() * kCopies + (2u << 20) - 1) & ~(size_t) ((2u << 20) - 1);
+                many = static_cast<uint8_t*>(std::aligned_alloc(2u << 20, total));
+                for (int c = 0; c < kCopies; ++c) std::memcpy(many + blob.size() * c, blob.data(), blob.size());
+                sycl::ext::oneapi::experimental::prepare_for_device_copy(many, total, strata::core::Runtime::get().context());
+            } else {
+                many = static_cast<uint8_t*>(par::alloc_bytes(blob.size() * kCopies));
+                for (int c = 0; c < kCopies; ++c) par::copy_bytes_in(many + blob.size() * c, blob.data(), blob.size());
+            }
             std::vector<unsigned long long> ptrs((size_t) kSets * kG);
             for (int i = 0; i < kSets * kG; ++i) ptrs[(size_t) i] = (unsigned long long) (many + blob.size() * i);
             auto* dptrs = static_cast<unsigned long long*>(par::alloc_bytes(ptrs.size() * 8));
