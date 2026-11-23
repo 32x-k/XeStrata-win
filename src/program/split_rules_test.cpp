@@ -82,6 +82,18 @@ int main() {
         CHECK(!floors_exceed_minimum(share_floors({0, 0}, L)));
         CHECK(!below_floors({}, 48, {}));
     }
+    {
+        for (double hit : {0.0, 0.5, 1.0}) {
+            const double gpu = 100.0 * hit / 10.0, cpu = 100.0 * (1.0 - hit) / 5.0;
+            CHECK(layer_experts_ms(100, hit, 10, 5, 1, false) == std::max(gpu, cpu));
+            CHECK(layer_experts_ms(100, hit, 10, 5, 1, true) == gpu + cpu);
+            CHECK(layer_experts_ms(100, hit, 10, 5, 1, true, false) == std::max(gpu, cpu));
+        }
+        const auto mixed = link_miss_scale({16, 100}, std::vector<bool>{false, true});
+        CHECK(mixed[0] == 1 && mixed[1] == 1);
+        const auto discrete = link_miss_scale({16, 2}, std::vector<bool>{false, false});
+        CHECK(discrete[0] == 1 && discrete[1] == 8);
+    }
     if (failed == 0) std::printf("split_rules_test: ok\n");
     return failed ? 1 : 0;
 }

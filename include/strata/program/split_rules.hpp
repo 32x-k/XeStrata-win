@@ -151,6 +151,22 @@ inline std::vector<double> link_miss_scale(const std::vector<double>& gbps, doub
     return s;
 }
 
+/// Price expert reads on separate buses or on shared UMA DRAM.
+inline double layer_experts_ms(double bytes, double hit, double gpu_bw, double cpu_bw, double link_scale,
+                               bool integrated, bool uma_shared = true) {
+    const double gpu = bytes * hit / gpu_bw;
+    const double cpu = bytes * (1.0 - hit) / cpu_bw * link_scale;
+    return integrated && uma_shared ? gpu + cpu : std::max(gpu, cpu);
+}
+
+inline std::vector<double> link_miss_scale(const std::vector<double>& gbps, const std::vector<bool>& integrated,
+                                           double min_ratio = kLinkScaleMin) {
+    std::vector<double> discrete = gbps;
+    for (size_t i = 0; i < discrete.size() && i < integrated.size(); ++i)
+        if (integrated[i]) discrete[i] = 0.0;
+    return link_miss_scale(discrete, min_ratio);
+}
+
 /// The smallest spare room over the stages of `cuts`: room[i] - session(lb, le) - need(lb, le), where `need_prefix[l]`
 /// is the bytes of every expert of layers [0, l) (n_layers + 1 entries).
 template <class Session>

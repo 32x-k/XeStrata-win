@@ -841,9 +841,10 @@ DeviceInfo device_info(int ordinal) {
         } catch (const sycl::exception&) { /* Optional telemetry; never substitute zero for unknown. */ }
     }
     uint64_t free = out.free_bytes_known ? out.free_bytes : out.total_bytes;
-    if (out.free_bytes_known && !integrated(d)) apply_os_budget(pci_of(d), free);
+    if (integrated(d)) apply_uma_limit(free);
+    else if (out.free_bytes_known) apply_os_budget(pci_of(d), free);
     apply_vram_limit(free, out.total_bytes);
-    if (out.free_bytes_known) out.free_bytes = free;
+    out.free_bytes = free;
     out.compute_units = d.get_info<sycl::info::device::max_compute_units>();
     out.pci = pci_of(d);
     if (d.get_backend() == sycl::backend::ext_oneapi_hip) {   // HIP's version is the gfx name; others' a version

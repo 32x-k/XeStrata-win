@@ -3474,6 +3474,11 @@ int main(int argc, char** argv) {
             return 1;
         }
         auto dev_of_stage = [&](int i) { return i == 0 ? 0 : split_devs[(size_t) i - 1]; };
+        std::vector<bool> dev_integrated((size_t) ns);
+        for (int i = 0; i < ns; ++i)
+            dev_integrated[(size_t) i] = strata::core::device_info(dev_of_stage(i)).integrated;
+        const char* uma_shared_env = std::getenv("STRATA_SPLIT_UMA_SHARED");
+        const bool uma_shared = !uma_shared_env || std::strcmp(uma_shared_env, "0") != 0;
         // the measurements below are per GPU (i: CUDA0, then --split-device's order); `ord` says which GPU runs each
         // stage of the placement being priced (the order search below)
         std::vector<int> ord((size_t) ns);
@@ -3556,7 +3561,13 @@ int main(int argc, char** argv) {
         for (int i = 0; i < ns; ++i) {
             const strata::core::OnDevice on(dev_of_stage(i));
             size_t fb = 0, tb = 0;
-            strata::gpu::mem_info(&fb, &tb);
+            if (!strata::gpu::mem_info(&fb, &tb)) {
+                std::fprintf(stderr, "strata generate: layer split auto: CUDA%d memory query failed: %s; "
+                                     "Level Zero may require ZES_ENABLE_SYSMAN=1\n",
+                             dev_of_stage(i), strata::gpu::last_error());
+                const auto info = strata::core::device_info(dev_of_stage(i));
+                if (info.integrated) fb = (size_t) info.free_bytes;
+            }
             free0[(size_t) i] = (int64_t) fb;
             prompt[(size_t) i] = o.prefill_chunk > 0 && own_prompt
                                      ? (int64_t) strata::prefill::Prefill::bytes_needed(ga, s_ctx, o.prefill_chunk) : 0;
@@ -3642,8 +3653,8 @@ int main(int argc, char** argv) {
                 const double f = p != nullptr ? std::strtod(p, nullptr) : 0.0;
                 if (f > 0.0) bw[(size_t) i] *= f;
             }
-            std::fprintf(stderr, "strata generate: layer split auto: CUDA%d reads %.0f GB/s, %.2f GiB free\n",
-                         dev_of_stage(i), bw[(size_t) i] / 1e6, (double) free0[(size_t) i] / 1073741824.0);
+            std::fprintf(stderr, "strata generate: layer split auto: CUDA%d%s reads %.0f GB/s, %.2f GiB free\n",
+                         dev_of_stage(i), dev_integrated[(size_t) i] ? " [UMA]" : "", bw[(size_t) i] / 1e6, (double) free0[(size_t) i] / 1073741824.0);
         }
         std::fprintf(stderr, "strata generate: layer split auto: the CPU experts read RAM at %.0f GB/s\n", cpu_bw / 1e6);
         // each stage's link (upstream 0391e478): the prompt path streams a stage's missed experts over its own link,
@@ -3668,7 +3679,7 @@ int main(int argc, char** argv) {
             const char* v = std::getenv("STRATA_SPLIT_UNIFORM");
             return v && v[0] == '1';
         }();
-        std::vector<double> link_scale = strata::program::split_rules::link_miss_scale(link_gbps);
+        std::vector<double> link_scale = strata::program::split_rules::link_miss_scale(link_gbps, dev_integrated);
         for (int i = 0; i < ns; ++i) {
             const double lbw = link_gbps[(size_t) i];
             if (split_uniform) link_scale[(size_t) i] = 1.0;
@@ -3734,7 +3745,8 @@ int main(int argc, char** argv) {
                 const double hit = layer_mass[(size_t) l] > 0 ? layer_held[(size_t) l] / layer_mass[(size_t) l] : 1.0;
                 const double experts = (double) Ka * rows * (double) lay.blob_bytes(l);
                 ms += dense_layer / bw[(size_t) d] +
-                      std::max(experts * hit / bw[(size_t) d], experts * (1.0 - hit) / cpu_bw * link_scale[(size_t) d]);
+                      strata::program::split_rules::layer_experts_ms(experts, hit, bw[(size_t) d], cpu_bw,
+                          link_scale[(size_t) d], dev_integrated[(size_t) d], uma_shared);
                 all += layer_mass[(size_t) l];
                 kept += layer_held[(size_t) l];
             }
