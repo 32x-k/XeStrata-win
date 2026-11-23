@@ -7,6 +7,8 @@
 #define STRATA_DEVICE_ARCH_TAG_TU core_device
 #include "strata/kernels/device_arch_tag.hpp"
 #include "strata/platform/memory.hpp"
+#include "strata/core/uma_memory.hpp"
+#include "strata/core/conversation_memory.hpp"
 
 
 #if defined(__has_include)
@@ -35,6 +37,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <climits>
 #include <cstdio>
@@ -719,31 +722,42 @@ void apply_os_budget(const std::string& pci, uint64_t& free) {
         free = std::min(free, budget > usage ? budget - usage : 0);
 }
 
-void apply_uma_limit(uint64_t& free) {
-    static const uint64_t headroom = [] {
-        const char* v = std::getenv("STRATA_UMA_HEADROOM_GIB");
-        const long long g = v != nullptr ? std::strtoll(v, nullptr, 10) : 6;
-        return (uint64_t) std::max(0LL, g) << 30;
-    }();
+void apply_uma_limit(uint64_t& free, uint64_t total, bool known) {
+    const uint64_t headroom = parse_uma_gib_env(std::getenv("STRATA_UMA_HEADROOM_GIB"), 6) << 30;
+    UmaMemoryInput input;
+    input.runtime_free_known = known;
+    input.runtime_free = free;
+    input.runtime_total = total;
+    input.headroom = headroom;
 #if defined(_WIN32)
     MEMORYSTATUSEX ms{};
     ms.dwLength = sizeof ms;
-    if (GlobalMemoryStatusEx(&ms)) {
-        const uint64_t avail = (uint64_t) ms.ullAvailPhys;
-        free = std::min(free, avail > headroom ? avail - headroom : 0);
+    if (!GlobalMemoryStatusEx(&ms)) return;
+    input.os_available = ms.ullAvailPhys;
+    input.has_commit_limit = true;
+    input.commit_available = ms.ullAvailPageFile;
+    input.commit_margin = uma_commit_margin_bytes(ms.ullTotalPhys, std::getenv("STRATA_UMA_COMMIT_RESERVE_GIB"));
+#else
+    const auto sample = sample_host_memory();
+    if (!sample) return;
+    input.os_available = sample->available;
+#endif
+    const auto result = compute_uma_free(input);
+    free = result.effective_free;
+#if defined(_WIN32)
+    if (result.commit_capped) {
+        static std::once_flag warning;
+        std::call_once(warning, [&] {
+            std::fprintf(stderr, "Xe runtime: Windows commit limits UMA memory (%.2f GiB remaining); consider increasing the Windows page file.\n", double(input.commit_available) / (1ull << 30));
+        });
     }
 #else
-    std::ifstream meminfo("/proc/meminfo");
-    std::string key;
-    uint64_t kb = 0;
-    while (meminfo >> key >> kb) {
-        if (key == "MemAvailable:") {
-            const uint64_t avail = kb << 10;
-            free = std::min(free, avail > headroom ? avail - headroom : 0);
-            return;
-        }
-        meminfo.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-    }
+    static std::once_flag summary;
+    std::call_once(summary, [&] {
+        std::fprintf(stderr, "Xe runtime: UMA runtime_free=%llu os_avail=%llu headroom=%llu effective_free=%llu bytes\n",
+                     (unsigned long long) input.runtime_free, (unsigned long long) input.os_available,
+                     (unsigned long long) headroom, (unsigned long long) free);
+    });
 #endif
 }
 
@@ -841,7 +855,7 @@ DeviceInfo device_info(int ordinal) {
         } catch (const sycl::exception&) { /* Optional telemetry; never substitute zero for unknown. */ }
     }
     uint64_t free = out.free_bytes_known ? out.free_bytes : out.total_bytes;
-    if (integrated(d)) apply_uma_limit(free);
+    if (integrated(d)) apply_uma_limit(free, out.total_bytes, out.free_bytes_known);
     else if (out.free_bytes_known) apply_os_budget(pci_of(d), free);
     apply_vram_limit(free, out.total_bytes);
     out.free_bytes = free;
