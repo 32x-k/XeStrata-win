@@ -3311,9 +3311,9 @@ int main(int argc, char** argv) {
         const strata::core::DeviceInfo gi = strata::core::device_info(0);
         // the experts' products beside the dense ones: a user read "DP4a" alone and took it that RDNA3's WMMA ran
         // nowhere, while the experts' int8 products took it
-        std::fprintf(stderr, "strata generate: GPU %s, %u compute units, %.1f GiB, prompt matrix products on %s; the "
+        std::fprintf(stderr, "strata generate: GPU %s (%s), %u compute units, %.1f GiB, prompt matrix products on %s; the "
                              "experts' in %s\n",
-                     gi.name.c_str(), gi.compute_units, (double) gi.total_bytes / (1024.0 * 1024 * 1024),
+                     gi.name.c_str(), gi.integrated ? "integrated" : "discrete", gi.compute_units, (double) gi.total_bytes / (1024.0 * 1024 * 1024),
                      strata::prefill::Gemm::path(), strata::prefill::experts_path().c_str());
         // a layer split: each later stage's GPU takes the paths its own report gives (B70 + RTX 4070: XMX and FP16 on
         // one, joint_matrix and int8 on the other)
@@ -3323,9 +3323,9 @@ int main(int argc, char** argv) {
             said.push_back(d);
             const strata::core::OnDevice on(d);
             const strata::core::DeviceInfo di = strata::core::device_info(d);
-            std::fprintf(stderr, "strata generate: GPU %d %s, %u compute units, %.1f GiB, prompt matrix products on %s; "
+            std::fprintf(stderr, "strata generate: GPU %d %s (%s), %u compute units, %.1f GiB, prompt matrix products on %s; "
                                  "the experts' in %s\n",
-                         d, di.name.c_str(), di.compute_units, (double) di.total_bytes / (1024.0 * 1024 * 1024),
+                         d, di.name.c_str(), di.integrated ? "integrated" : "discrete", di.compute_units, (double) di.total_bytes / (1024.0 * 1024 * 1024),
                          strata::prefill::Gemm::path(), strata::prefill::experts_path().c_str());
         }
     }

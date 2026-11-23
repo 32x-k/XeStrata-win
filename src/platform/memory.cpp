@@ -209,6 +209,31 @@ bool segment_budget(const std::string& pci, DXGI_MEMORY_SEGMENT_GROUP group, uin
 }
 }  // namespace
 
+bool gpu_is_integrated(const std::string& pci, bool& integrated) {
+    std::string why;
+    auto* adapter = adapter_at(pci, why);
+    if (!adapter) return false;
+    DXGI_ADAPTER_DESC1 desc{};
+    if (FAILED(adapter->GetDesc1(&desc))) return false;
+    HMODULE gdi = GetModuleHandleA("gdi32.dll");
+    using Open = NTSTATUS(APIENTRY*)(D3DKMT_OPENADAPTERFROMLUID*);
+    using Query = NTSTATUS(APIENTRY*)(const D3DKMT_QUERYADAPTERINFO*);
+    using Close = NTSTATUS(APIENTRY*)(const D3DKMT_CLOSEADAPTER*);
+    auto open = (Open) GetProcAddress(gdi, "D3DKMTOpenAdapterFromLuid");
+    auto query = (Query) GetProcAddress(gdi, "D3DKMTQueryAdapterInfo");
+    auto close = (Close) GetProcAddress(gdi, "D3DKMTCloseAdapter");
+    if (!open || !query || !close) return false;
+    D3DKMT_OPENADAPTERFROMLUID o{}; o.AdapterLuid = desc.AdapterLuid;
+    if (open(&o) < 0) return false;
+    D3DKMT_ADAPTERTYPE type{};
+    D3DKMT_QUERYADAPTERINFO q{}; q.hAdapter = o.hAdapter; q.Type = KMTQAITYPE_ADAPTERTYPE;
+    q.pPrivateDriverData = &type; q.PrivateDriverDataSize = sizeof type;
+    const bool ok = query(&q) >= 0;
+    D3DKMT_CLOSEADAPTER c{}; c.hAdapter = o.hAdapter; close(&c);
+    if (ok) integrated = type.Integrated != 0;
+    return ok;
+}
+
 bool gpu_local_memory_budget(const std::string& pci, uint64_t& budget, uint64_t& usage, std::string& why) {
     return segment_budget(pci, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, budget, usage, why);
 }
@@ -232,6 +257,7 @@ uint64_t cma_free_bytes() { return 0; }
 void make_free_ram(uint64_t) {}
 double settle_page_migration(double, double, double, double& peak) { peak = 0.0; return 0.0; }
 #else
+bool gpu_is_integrated(const std::string&, bool&) { return false; }
 LockResult lock_resident(void* p, uint64_t bytes) {
     LockResult r;
     if (p == nullptr || bytes == 0) { r.note = "nothing to lock"; return r; }

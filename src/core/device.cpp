@@ -47,6 +47,10 @@
 #include <memory>
 #include <mutex>
 #include <fstream>
+#include <map>
+#ifndef _WIN32
+#include <dirent.h>
+#endif
 #include <string>
 #include <vector>
 #if defined(_WIN32)
@@ -706,10 +710,67 @@ bool integrated_gpu(const sycl::device& d) {
     const sycl::backend b = d.get_backend();
     if (b == sycl::backend::ext_oneapi_level_zero) return d.has(sycl::aspect::ext_oneapi_is_integrated_gpu);
     if (b != sycl::backend::ext_oneapi_hip) return false;
+    static std::mutex mu;
+    static std::map<std::string, bool> cache;
+    const std::string pci = pci_of(d);
+    std::lock_guard<std::mutex> lock(mu);
+    const auto it = cache.find(pci);
+    if (pci != "?" && it != cache.end()) return it->second;
+#ifdef _WIN32
+    HMODULE hip = nullptr;
+    for (const char* name : {"amdhip64_7.dll", "amdhip64_6.dll", "amdhip64.dll"})
+        if ((hip = GetModuleHandleA(name))) break;
+    auto symbol = [hip](const char* name) -> void* { return hip ? (void*) GetProcAddress(hip, name) : nullptr; };
+#else
+    auto symbol = [](const char* name) -> void* { return dlsym(RTLD_DEFAULT, name); };
+#endif
+    using Count = int (*)(int*); using Bus = int (*)(char*, int, int); using Attribute = int (*)(int*, int, int);
+    const auto count = (Count) symbol("hipGetDeviceCount");
+    const auto bus = (Bus) symbol("hipDeviceGetPCIBusId");
+    const auto attr = (Attribute) symbol("hipDeviceGetAttribute");
+    bool value = false, known = false;
+    int n = 0;
+    if (pci != "?" && count && bus && attr && count(&n) == 0) {
+        for (int i = 0; i < n; ++i) {
+            char id[64]{}; int v = 0;
+            if (bus(id, sizeof id, i) == 0) {
+                std::string address(id);
+                for (auto& c : address) c = (char) std::tolower((unsigned char)c);
+                if (address == pci && attr(&v, 28, i) == 0) { value = v != 0; known = true; break; }
+            }
+        }
+    }
+#ifdef _WIN32
+    if (!known) known = strata::platform::gpu_is_integrated(pci, value);
+#else
+    if (!known && pci != "?") {
+        DIR* dir = opendir("/sys/class/kfd/kfd/topology/nodes");
+        if (dir) {
+            while (auto* entry = readdir(dir)) {
+                if (!std::isdigit((unsigned char)entry->d_name[0])) continue;
+                std::ifstream f(std::string("/sys/class/kfd/kfd/topology/nodes/") + entry->d_name + "/properties");
+                std::string key; uint64_t v, location = 0, domain = 0, cores = 0; bool has_location = false, has_cores = false;
+                while (f >> key >> v) {
+                    if (key == "location_id") { location = v; has_location = true; }
+                    else if (key == "domain") domain = v;
+                    else if (key == "cpu_cores_count") { cores = v; has_cores = true; }
+                }
+                char id[32]; std::snprintf(id, sizeof id, "%04llx:%02llx:%02llx.%llx", (unsigned long long)domain,
+                    (unsigned long long)(location >> 8), (unsigned long long)((location >> 3) & 31), (unsigned long long)(location & 7));
+                if (has_location && has_cores && pci == id) { value = cores > 0; known = true; break; }
+            }
+            closedir(dir);
+        }
+    }
+#endif
+    if (!known) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    return d.get_info<sycl::info::device::host_unified_memory>();
+        value = d.get_info<sycl::info::device::host_unified_memory>();
 #pragma clang diagnostic pop
+    }
+    if (pci != "?") cache[pci] = value;
+    return value;
 }
 
 // upstream 004b15cd (#409): an integrated GPU's memory is the system RAM, and what its runtime reports free need not

@@ -11,6 +11,9 @@
 
 namespace strata::platform {
 
+/// Returns whether adapter type could be queried, and sets integrated on success.
+bool gpu_is_integrated(const std::string& pci, bool& integrated);
+
 struct LockResult {
     bool ok = false;
     uint64_t locked_bytes = 0;   ///< may be less than requested; the rest stays pageable
