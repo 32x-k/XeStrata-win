@@ -68,6 +68,33 @@ int main(){try {
             Work a(0,m,n,host,false), b(1,m,n,host,false), c(1,m,n,host,true); double total[2];
             for(int d=0;d<2;d++){ strata::core::OnDevice on(d); Work& w=d?b:a; double q=measure([&]{w.quant();}); double g=measure([&]{w.gate();}); double s=measure([&]{w.swiglu();}); double down=measure([&]{w.down();}); total[d]=measure([&]{w.all();}); std::printf("%d %d %.3f %.3f %.3f %.3f %.2f%% %.3f\n",d,m,q,g,s,down,100*s/(g+s+down),total[d]); std::fflush(stdout); }
             double direct_ms; { strata::core::OnDevice other(1); direct_ms=measure([&]{c.all();}); }
+            if (n == 1280 && m >= 512) {
+                std::vector<double> times;
+                for (int i=0;i<9;i++) {
+                    { strata::core::OnDevice o(0); check(gpu::device_sync()); }
+                    { strata::core::OnDevice o(1); check(gpu::device_sync()); }
+                    auto start=Clock::now();
+                    { strata::core::OnDevice o(0); a.all(); }
+                    { strata::core::OnDevice o(1); c.all(); }
+                    { strata::core::OnDevice o(0); check(gpu::device_sync()); }
+                    { strata::core::OnDevice o(1); check(gpu::device_sync()); }
+                    if(i>=2) times.push_back(std::chrono::duration<double,std::milli>(Clock::now()-start).count());
+                }
+                std::sort(times.begin(),times.end());
+                std::printf("overlap M=%d serial_ms=%.3f concurrent_ms=%.3f overlap_pct=%.2f\n",m,total[0]+direct_ms,times[3],100*(total[0]+direct_ms-times[3])/(total[0]+direct_ms));
+                strata::core::OnDevice o(0);
+                size_t count=size_t(m)*K, bytes=count*4;
+                void* wire=nullptr; check(posix_memalign(&wire,4096,2*bytes)==0); check(gpu::host_register_on(0,wire,2*bytes));
+                auto* h=(uint16_t*)alloc(bytes); auto* x=a.x; auto& q=strata::core::Runtime::get().stream(nullptr);
+                auto pack=[&]{q.parallel_for(sycl::range<1>(count),[=](sycl::id<1> i){h[i]=sycl::bit_cast<uint16_t>(sycl::half(x[i]));});};
+                auto unpack=[&]{q.parallel_for(sycl::range<1>(count),[=](sycl::id<1> i){x[i]=(float)sycl::bit_cast<sycl::half>(h[i]);});};
+                std::vector<float> original(count); check(gpu::copy(original.data(),x,bytes));
+                double f32=measure([&]{ for(int j=0;j<2;j++){check(gpu::copy_async((char*)wire+j*bytes,x,bytes,nullptr));check(gpu::copy_async(x,(char*)wire+j*bytes,bytes,nullptr));} });
+                double f16=measure([&]{ for(int j=0;j<2;j++){pack();check(gpu::copy_async((char*)wire+j*bytes/2,h,bytes/2,nullptr));check(gpu::copy_async(h,(char*)wire+j*bytes/2,bytes/2,nullptr));unpack();} });
+                std::vector<float> rounded(count); check(gpu::copy(rounded.data(),x,bytes)); double error=0; for(size_t i=0;i<count;i++) error=std::max(error,double(std::abs(original[i]-rounded[i])));
+                std::printf("exchange M=%d fp32_ms=%.3f fp16_ms=%.3f speedup=%.3f max_abs=%.8g\n",m,f32,f16,f32/f16,error);
+                check(gpu::copy(a.x,original.data(),bytes)); gpu::free(h); gpu::host_unregister_on(0,wire); std::free(wire);
+            }
             strata::core::OnDevice on(0); auto ref=a.result(); double h2d=measure([&]{check(gpu::copy_async(a.weights,host,bytes,nullptr));}); double stream=measure([&]{check(gpu::copy_async(a.weights,host,bytes,nullptr)); a.all();}); auto streamed=a.result(); std::vector<float> direct; {strata::core::OnDevice other(1); direct=c.result();}
             double e1=0,e2=0; for(size_t i=0;i<ref.size();i++){if(!std::isfinite(ref[i])||!std::isfinite(streamed[i])||!std::isfinite(direct[i])) throw std::runtime_error("non-finite output"); e1=std::max(e1,double(std::abs(ref[i]-streamed[i]))); e2=std::max(e2,double(std::abs(ref[i]-direct[i])));}
             std::printf("cross %d %.3f %.3f %.3f %.2f %.3f %.8g %.8g\n",m,total[0],stream,h2d,bytes/(h2d*1e6),direct_ms,e1,e2); std::fflush(stdout); if(e1>1e-2||e2>1e-2) throw std::runtime_error("parity failed");

@@ -1642,6 +1642,9 @@ double probe_pcie_h2d_gbps(std::string* samples = nullptr) {
 void attach_prompt_helper(strata::prefill::Prefill& sp, strata::core::RemoteExperts& helper, const char* who) {
     const auto& lay = strata::kernels::cpu::expert_layout();
     if (!lay.native || lay.fmt.empty()) return;
+    const char* fp16_env = std::getenv("STRATA_PREFILL_HELPER_FP16");
+    const bool fp16_exchange = fp16_env ? std::strcmp(fp16_env, "0") != 0 :
+        (strata::core::device_info(helper.device()).integrated || helper.host_mode());
     int64_t rows = -1;
     double l0 = 0, lh = 0;
     if (const char* v = std::getenv("STRATA_PREFILL_HELPER_ROWS")) rows = std::strtoll(v, nullptr, 10);
@@ -1656,7 +1659,7 @@ void attach_prompt_helper(strata::prefill::Prefill& sp, strata::core::RemoteExpe
         for (size_t l = 0; l < lay.fmt.size(); ++l) blob += (double) lay.blob_bytes((int64_t) l);
         blob /= (double) lay.fmt.size();
         rows = strata::prefill::prompt_helper_max_rows(blob, strata::kernels::cpu::H, l0, lh,
-                                                       strata::core::device_info(helper.device()).integrated);
+                                                       strata::core::device_info(helper.device()).integrated, fp16_exchange);
     }
     if (rows <= 0) {
         if (l0 <= 0.0 || lh <= 0.0)
@@ -1677,8 +1680,8 @@ void attach_prompt_helper(strata::prefill::Prefill& sp, strata::core::RemoteExpe
                (v == nullptr || std::strcmp(v, "0") != 0);
     }();
     std::fprintf(stderr, "strata %s: the helper GPU computes the prompt's experts it holds that at most %lld of a chunk's "
-                         "tokens route to (links %.1f and %.1f GB/s)%s\n", who, (long long) rows, l0, lh,
-                 uma_direct ? " [UMA direct]" : "");
+                         "tokens route to (links %.1f and %.1f GB/s)%s%s\n", who, (long long) rows, l0, lh,
+                 uma_direct && !fp16_exchange ? " [UMA direct]" : "", fp16_exchange ? " [FP16 exchange]" : "");
 }
 
 // The time of one small host->device copy (64 KiB, the median of 16 after a warmup): the fixed part of a layer
