@@ -5304,7 +5304,20 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
-    strata::kernels::cpu::ExpertPool pool(pipe_n0 > 0 ? pipe_n0 : o.pool_workers, /*pin=*/true,
+    int pool_workers = pipe_n0 > 0 ? pipe_n0 : o.pool_workers;
+    if (o.expert_host_device1 && pool_workers == 0 && strata::kernels::cpu::pool_cores_setting().empty()) {
+        const int automatic = std::max(1, (int) std::min<size_t>(strata::kernels::cpu::physical_cores(true).size(),
+                                      (size_t) strata::kernels::cpu::default_worker_cap()));
+        const int tuned = strata::prefill::uma_host_helper_cpu_threads(
+            automatic, strata::core::device_info(remote_dev[0]).integrated, true, false,
+            std::getenv("STRATA_UMA_HELPER_CPU_THREADS"));
+        if (tuned != automatic) {
+            pool_workers = tuned;
+            std::fprintf(stderr, "strata generate: UMA host helper CPU pool workers: %d -> %d "
+                                 "(override with STRATA_UMA_HELPER_CPU_THREADS=0 or --pool-workers)\n", automatic, tuned);
+        }
+    }
+    strata::kernels::cpu::ExpertPool pool(pool_workers, /*pin=*/true,
                                           /*host_works=*/!o.no_host_worker, /*first_core=*/0, o.pool_tasks);
     std::fprintf(stderr, "strata generate: CPU pool tasks/phase: %d%s, participating threads: %d\n",
                  o.pool_tasks ? o.pool_tasks : 3 * (pool.workers() + (pool.host_works() ? 1 : 0)),

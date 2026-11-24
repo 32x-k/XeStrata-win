@@ -77,6 +77,7 @@ struct ExpertJobMulti {
 ///
 /// `skip_first` drops the first core, which P2.S3 reserves for the host loop.
 std::vector<int> physical_cores(bool skip_first);
+int default_worker_cap();
 
 /// `--pool-cores LIST` / STRATA_POOL_CORES / the config's "pool_cores" (experimental, off by default; upstream
 /// 7a5599581): pin the pool's workers to exactly these logical processors, in this order, instead of one per physical

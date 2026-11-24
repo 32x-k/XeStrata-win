@@ -350,7 +350,7 @@ void ExpertPool::diag(std::FILE* f) const {
 // Upstream's default for a hybrid CPU with more E-cores than P-cores (the P-cores and half the E-cores, bec4c838a) is
 // not taken: on an i7-14700 it cost XeStrata 3% of the decode and 13% of the prompt (13 workers against 19, B70,
 // GLM-5.3-Flash and llm-jp-4.1, 2026-10-20).
-static int default_worker_cap() {
+int default_worker_cap() {
     int cap = 32;
 #if defined(__linux__)
     auto first_line = [](const char* path) {
