@@ -18,6 +18,7 @@
 // (`phase-2-correct-engine.md:5-9`).  What it is FOR is the honest tok/s figure and the logit dump.
 
 #include "strata/core/runtime.hpp"
+#include "strata/prefill/helper_policy.hpp"
 #include "strata/core/device.hpp"
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_tier.hpp"
@@ -1654,7 +1655,8 @@ void attach_prompt_helper(strata::prefill::Prefill& sp, strata::core::RemoteExpe
         double blob = 0;
         for (size_t l = 0; l < lay.fmt.size(); ++l) blob += (double) lay.blob_bytes((int64_t) l);
         blob /= (double) lay.fmt.size();
-        rows = l0 > 0.0 && lh > 0.0 ? (int64_t) (blob / (2.0 * strata::kernels::cpu::H * 4) * lh / l0) : 0;
+        rows = strata::prefill::prompt_helper_max_rows(blob, strata::kernels::cpu::H, l0, lh,
+                                                       strata::core::device_info(helper.device()).integrated);
     }
     if (rows <= 0) {
         if (l0 <= 0.0 || lh <= 0.0)
@@ -1668,8 +1670,15 @@ void attach_prompt_helper(strata::prefill::Prefill& sp, strata::core::RemoteExpe
                      err.c_str());
         return;
     }
+    const bool uma_direct = [&] {
+        const strata::core::OnDevice on(helper.device());
+        const char* v = std::getenv("STRATA_PREFILL_HELPER_UMA_DIRECT");
+        return strata::core::device_info(helper.device()).integrated && strata::gpu::kernels_read_registered() &&
+               (v == nullptr || std::strcmp(v, "0") != 0);
+    }();
     std::fprintf(stderr, "strata %s: the helper GPU computes the prompt's experts it holds that at most %lld of a chunk's "
-                         "tokens route to (links %.1f and %.1f GB/s)\n", who, (long long) rows, l0, lh);
+                         "tokens route to (links %.1f and %.1f GB/s)%s\n", who, (long long) rows, l0, lh,
+                 uma_direct ? " [UMA direct]" : "");
 }
 
 // The time of one small host->device copy (64 KiB, the median of 16 after a warmup): the fixed part of a layer

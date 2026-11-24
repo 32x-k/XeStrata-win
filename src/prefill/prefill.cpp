@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later AND MIT
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/prefill/prefill.hpp"
+#include "strata/prefill/helper_policy.hpp"
 #include "strata/core/expert_tier.hpp"
 #include "strata/core/mtp.hpp"
 #include "strata/core/progress.hpp"
@@ -811,6 +812,7 @@ struct Prefill::HelperShare {
     int32_t* h_meta = nullptr;     // the helper's host USM, staging the two above
     const uint8_t** h_wtab = nullptr;
     std::vector<int32_t> toks, tok_of;
+    bool uma_direct = false;
     bool live = false;
     int64_t rows = 0;
     ~HelperShare() {
@@ -852,12 +854,7 @@ bool Prefill::set_helper(core::RemoteExperts* helper, int64_t max_rows, std::str
     hs->h = helper;
     hs->prim = core::current_device();
     hs->max_rows = max_rows;
-    // a layer's rows at most: an 8192-row share is ~84 MB each of rows and results, and few layers of a chunk below
-    // the streamed walk's 2048 tokens give the helper more
-    hs->cap = 8192;
-    // STRATA_PREFILL_HELPER_CAP=n: a layer's helper rows at most (default 8192).  A UMA helper that reads the host RAM in
-    // place (--expert-host-device1) can take far more of a chunk's streamed experts than the 8192 a discrete helper's
-    // buffers were sized for.
+    hs->cap = uma_helper_default_cap(core::device_info(helper->device()).integrated, helper->host_mode());
     if (const char* v = std::getenv("STRATA_PREFILL_HELPER_CAP"); v != nullptr && std::strtoll(v, nullptr, 10) > 0)
         hs->cap = std::strtoll(v, nullptr, 10);
     const int64_t cap = hs->cap;
@@ -874,10 +871,13 @@ bool Prefill::set_helper(core::RemoteExperts* helper, int64_t max_rows, std::str
                     err = "the helper GPU's int8 products do not take these experts' types";
                     return false;
                 }
+            const char* direct = std::getenv("STRATA_PREFILL_HELPER_UMA_DIRECT");
+            hs->uma_direct = core::device_info(hs->dev).integrated && strata::gpu::kernels_read_registered() &&
+                             (direct == nullptr || std::strcmp(direct, "0") != 0);
             hs->s = strata::gpu::stream_create();
             hs->ctx = std::make_unique<mmq::Context>();
             const bool ok = hs->s != nullptr &&
-                strata::gpu::alloc_device(&hs->x, rows_b) && strata::gpu::alloc_device(&hs->d, rows_b) &&
+                (hs->uma_direct || (strata::gpu::alloc_device(&hs->x, rows_b) && strata::gpu::alloc_device(&hs->d, rows_b))) &&
                 strata::gpu::alloc_device(&hs->gu, (size_t) cap * gu_w * sizeof(float)) &&
                 strata::gpu::alloc_device(&hs->hh, (size_t) cap * ff * sizeof(float)) &&
                 strata::gpu::alloc_device(&hs->xq, mmq::q8_bytes(cap, N) * 2) &&
@@ -3094,7 +3094,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const bool up_mixed = strata::kernels::cpu::native_mixed_gu(hf);
                             const int up_type = up_mixed ? hf.up_type : hf.gu_type;
                             const bool up_xq2 = strata::kernels::iq_mmq_type_dup(up_type) != strata::kernels::iq_mmq_type_dup(hf.gu_type);
-                            if (!strata::gpu::copy_async(hs.x, hs.x_ex, (size_t) U * N * sizeof(float), q) ||
+                            if ((!hs.uma_direct && !strata::gpu::copy_async(hs.x, hs.x_ex, (size_t) U * N * sizeof(float), q)) ||
                                 !strata::gpu::copy_async(d_src, src, (size_t) rows_help * sizeof(int32_t), q) ||
                                 !strata::gpu::copy_async(d_bounds, bounds, (size_t) (ne + 1) * sizeof(int32_t), q) ||
                                 (hs.live == false && !strata::gpu::copy_async(const_cast<int32_t*>(d_ident), hs.h_meta + 2 * hs.cap + 1,
@@ -3107,8 +3107,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             // the sums for either product that reads them (as plain_prompt.cpp)
                             const int xq_type =
                                 !up_xq2 && strata::kernels::iq_mmq_type_sums(up_type) ? up_type : hf.gu_type;
-                            mmq::quantize(hs.x, d_src, hs.xq, xq_type, N, N, rows_help, q);
-                            if (up_mixed && up_xq2) mmq::quantize(hs.x, d_src, hs.xq2, up_type, N, N, rows_help, q);
+                            mmq::quantize(hs.uma_direct ? hs.x_ex : hs.x, d_src, hs.xq, xq_type, N, N, rows_help, q);
+                            if (up_mixed && up_xq2) mmq::quantize(hs.uma_direct ? hs.x_ex : hs.x, d_src, hs.xq2, up_type, N, N, rows_help, q);
                             const int64_t ff = hf.n_ff;
                             mmq::Product gu;
                             gu.type = hf.gu_type; gu.w_rows = 2 * ff; gu.w_cols = N; gu.n = (int) ne; gu.xq = hs.xq;
@@ -3125,9 +3125,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             mmq::Product dn;
                             dn.type = hf.d_type; dn.w_rows = N; dn.w_cols = ff; dn.n = (int) ne; dn.xq = hs.hq;
                             dn.bounds = d_bounds; dn.ids = d_ident; dn.total_rows = rows_help; dn.max_rows = maxr;
-                            dn.rows = rows_help; dn.dst = hs.d; dn.ld_dst = N; dn.wtab = hs.wtab; dn.woff = hf.down_off;
+                            dn.rows = rows_help; dn.dst = hs.uma_direct ? hs.d_ex : hs.d; dn.ld_dst = N; dn.wtab = hs.wtab; dn.woff = hf.down_off;
                             hs.ctx->run(dn, q);
-                            if (!strata::gpu::copy_async(hs.d_ex, hs.d, (size_t) rows_help * N * sizeof(float), q)) {
+                            if (!hs.uma_direct && !strata::gpu::copy_async(hs.d_ex, hs.d, (size_t) rows_help * N * sizeof(float), q)) {
                                 err = std::string("prefill: the helper's results: ") + strata::gpu::last_error();
                                 return false;
                             }

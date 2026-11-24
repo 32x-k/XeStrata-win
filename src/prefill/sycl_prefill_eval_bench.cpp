@@ -26,18 +26,23 @@ template<class F> double measure(F f) {
     std::sort(v.begin(),v.end()); return v[3];
 }
 struct Work {
-    int d,m,n; size_t gu,blob; void *weights,*xq,*hq; float *x,*g,*out; int32_t *bounds,*ids; const uint8_t** tab; mmq::Context ctx;
-    Work(int dev,int rows,int ff,const void* host,bool direct):d(dev),m(rows),n(ff) {
+    int d,m,n; bool direct_io; size_t gu,blob; void *weights,*xq,*hq; float *x,*g,*out; int32_t *bounds,*ids; const uint8_t** tab; mmq::Context ctx;
+    Work(int dev,int rows,int ff,const void* host,bool direct):d(dev),m(rows),n(ff),direct_io(direct) {
         strata::core::OnDevice on(d); gu=mmq::matrix_bytes(T,2*n,K); blob=gu+mmq::matrix_bytes(T,K,n);
         weights=direct?nullptr:alloc(E*blob); if(weights) check(gpu::copy(weights,host,E*blob));
-        x=(float*)alloc(size_t(m)*K*4); g=(float*)alloc(size_t(m)*2*n*4); out=(float*)alloc(size_t(m)*K*4);
+        if (direct_io) {
+            check(posix_memalign((void**)&x,4096,size_t(m)*K*4)==0);
+            check(posix_memalign((void**)&out,4096,size_t(m)*K*4)==0);
+            check(gpu::host_register_on(d,x,size_t(m)*K*4)); check(gpu::host_register_on(d,out,size_t(m)*K*4));
+        } else { x=(float*)alloc(size_t(m)*K*4); out=(float*)alloc(size_t(m)*K*4); }
+        g=(float*)alloc(size_t(m)*2*n*4);
         xq=alloc(mmq::q8_bytes(m,K)); hq=alloc(mmq::q8_bytes(m,n)); bounds=(int32_t*)alloc((E+1)*4); ids=(int32_t*)alloc(m*4); tab=(const uint8_t**)alloc(E*sizeof(*tab));
         std::vector<float> hx(size_t(m)*K); for(size_t i=0;i<hx.size();i++) hx[i]=(int(i%251)-125)/250.f;
         std::vector<int32_t> hb(E+1); for(int e=0;e<=E;e++) hb[e]=e*(m/E);
         std::vector<const uint8_t*> ht(E); for(int e=0;e<E;e++) ht[e]=(const uint8_t*)(direct?host:weights)+e*blob;
         check(gpu::copy(x,hx.data(),hx.size()*4)); check(gpu::copy(bounds,hb.data(),hb.size()*4)); check(gpu::copy((void*)tab,ht.data(),ht.size()*sizeof(ht[0]))); mmq::iota(ids,m,nullptr); check(gpu::device_sync());
     }
-    ~Work() { strata::core::OnDevice on(d); for(const void* p:{weights,(void*)x,(void*)g,(void*)out,xq,hq,(void*)bounds,(void*)ids,(void*)tab}) gpu::free(p); }
+    ~Work() { strata::core::OnDevice on(d); if (direct_io) { gpu::host_unregister_on(d,x); gpu::host_unregister_on(d,out); std::free(x); std::free(out); } else { gpu::free(x); gpu::free(out); } for(const void* p:{weights,(void*)g,xq,hq,(void*)bounds,(void*)ids,(void*)tab}) gpu::free(p); }
     void quant(){mmq::quantize(x,nullptr,xq,T,K,K,m,nullptr);}
     void gate(){ mmq::Product p; p.type=T;p.w_rows=2*n;p.w_cols=K;p.n=E;p.xq=xq;p.bounds=bounds;p.ids=ids;p.total_rows=m;p.max_rows=m/E;p.rows=m;p.dst=g;p.ld_dst=2*n;p.wtab=tab;ctx.run(p,nullptr); }
     void swiglu(){mmq::swiglu_quantize(g,hq,T,m,n,false,nullptr);}
