@@ -746,6 +746,9 @@ if(STRATA_ENABLE_XE)
   # `strata generate` (P2.S6): the program that composes the components into tokens
   add_executable(strata src/program/generate.cpp src/program/plain_generate.cpp src/program/option_scope.cpp)
   strata_utf8_manifest(strata)
+  add_executable(sycl_prefill_eval_bench src/prefill/sycl_prefill_eval_bench.cpp)
+  target_link_libraries(sycl_prefill_eval_bench PRIVATE strata_prefill)
+
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec)
 
   # the image engine (Qwen-Image-2.1's DiT, src/image/): its kernels and the DiT; strata-image-probe, one block of the
