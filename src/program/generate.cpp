@@ -1681,7 +1681,7 @@ void attach_prompt_helper(strata::prefill::Prefill& sp, strata::core::RemoteExpe
     }();
     std::fprintf(stderr, "strata %s: the helper GPU computes the prompt's experts it holds that at most %lld of a chunk's "
                          "tokens route to (links %.1f and %.1f GB/s)%s%s\n", who, (long long) rows, l0, lh,
-                 uma_direct && !fp16_exchange ? " [UMA direct]" : "", fp16_exchange ? " [FP16 exchange]" : "");
+                 uma_direct ? " [UMA direct]" : "", fp16_exchange ? " [FP16 exchange]" : "");
 }
 
 // The time of one small host->device copy (64 KiB, the median of 16 after a warmup): the fixed part of a layer

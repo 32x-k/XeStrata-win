@@ -18,7 +18,7 @@ int main() {
     assert(uma_host_helper_cpu_threads(16, true, true, false, "-1") == 8);
     assert(uma_host_helper_cpu_threads(16, true, true, false, "3x") == 8);
     assert(uma_host_helper_cpu_threads(16, true, true, false, "999999999999999999999999") == 8);
-    assert(uma_helper_default_cap(true, true) == 32768);
+    assert(uma_helper_default_cap(true, true) == 8192);
     assert(uma_helper_default_cap(true, false) == 8192);
     assert(uma_helper_default_cap(false, true) == 8192);
     assert(prompt_helper_max_rows(8000, 100, 10, 5, false) == 5);

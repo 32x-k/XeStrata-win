@@ -834,7 +834,6 @@ struct Prefill::HelperShare {
                 strata::gpu::device_sync();
                 strata::gpu::free(tok_dev);
                 strata::gpu::free(xg);
-                strata::gpu::free(prim_half);
             }
             for (float* p : {x_ex, d_ex}) {
                 if (p == nullptr) continue;
@@ -858,7 +857,7 @@ bool Prefill::set_helper(core::RemoteExperts* helper, int64_t max_rows, std::str
     hs->prim = core::current_device();
     hs->max_rows = max_rows;
     hs->cap = uma_helper_default_cap(core::device_info(helper->device()).integrated, helper->host_mode());
-    if (const char* v = std::getenv("STRATA_PREFILL_HELPER_CAP"); v != nullptr && std::strtoll(v, nullptr, 10) > 0)
+    if (const char* v = std::getenv("STRATA_PREFILL_HELPER_CAP"); v != nullptr && std::strtoll(v, nullptr, 10) > 1)
         hs->cap = std::strtoll(v, nullptr, 10);
     const int64_t cap = hs->cap;
     int64_t gu_w = 0, ff = 0;
@@ -899,11 +898,11 @@ bool Prefill::set_helper(core::RemoteExperts* helper, int64_t max_rows, std::str
             for (int64_t i = 0; i < cap; ++i) hs->h_meta[2 * cap + 1 + i] = (int32_t) i;   // the identity
         }
         if (!strata::gpu::alloc_device(&hs->tok_dev, (size_t) cap * sizeof(int32_t)) ||
-            !strata::gpu::alloc_device(&hs->xg, rows_b) ||
-            (hs->fp16_exchange && !strata::gpu::alloc_device(&hs->prim_half, wire_b))) {
+            !strata::gpu::alloc_device(&hs->xg, rows_b)) {
             err = std::string("this GPU's buffers for the helper: ") + strata::gpu::last_error();
             return false;
         }
+        hs->prim_half = reinterpret_cast<uint16_t*>(hs->xg);
         for (float** p : {&hs->x_ex, &hs->d_ex}) {
             *p = static_cast<float*>(strata::platform::DirectFile::alloc_aligned(wire_b));
             if (*p == nullptr) { err = "no host memory for the helper's rows"; return false; }
@@ -3088,10 +3087,25 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             err = std::string("prefill: the helper's tokens: ") + strata::gpu::last_error();
                             return false;
                         }
-                        gather_rows(m.mixed, hs.tok_dev, hs.xg, U, N, m.cs);
-                        if (hs.fp16_exchange) strata::kernels::f32_to_f16_bulk(hs.xg, hs.prim_half, U * N, m.cs);
-                        if (!strata::gpu::copy_async(hs.x_ex, hs.fp16_exchange ? (const void*) hs.prim_half : (const void*) hs.xg, (size_t) U * N * (hs.fp16_exchange ? 2 : 4), m.cs) ||
-                            !strata::gpu::stream_sync(m.cs)) {
+                        bool copied = true;
+                        if (hs.fp16_exchange) {
+                            // Keep conversion input and output disjoint within the existing buffer.
+                            const int64_t chunk = std::max<int64_t>(1, hs.cap * 2 / 3);
+                            auto* packed = reinterpret_cast<uint16_t*>(hs.xg + (size_t) chunk * N);
+                            for (int64_t start = 0; start < U; start += chunk) {
+                                const int64_t count = std::min(chunk, U - start);
+                                gather_rows(m.mixed, hs.tok_dev + start, hs.xg, count, N, m.cs);
+                                strata::kernels::f32_to_f16_bulk(hs.xg, packed, count * N, m.cs);
+                                if (!strata::gpu::copy_async(reinterpret_cast<uint16_t*>(hs.x_ex) + (size_t) start * N,
+                                                             packed, (size_t) count * N * sizeof(uint16_t), m.cs)) {
+                                    copied = false; break;
+                                }
+                            }
+                        } else {
+                            gather_rows(m.mixed, hs.tok_dev, hs.xg, U, N, m.cs);
+                            copied = strata::gpu::copy_async(hs.x_ex, hs.xg, (size_t) U * N * sizeof(float), m.cs);
+                        }
+                        if (!copied || !strata::gpu::stream_sync(m.cs)) {
                             err = std::string("prefill: the helper's rows: ") + strata::gpu::last_error();
                             return false;
                         }

@@ -25,7 +25,8 @@ inline int uma_host_helper_cpu_threads(int default_threads, bool helper_integrat
     return std::min(default_threads, std::max(2, default_threads / 2));
 }
 inline int64_t uma_helper_default_cap(bool integrated, bool host_mode) {
-    return integrated && host_mode ? 32768 : 8192;
+    (void) integrated; (void) host_mode;
+    return 8192;
 }
 inline int64_t prompt_helper_max_rows(double blob, int64_t n_embd, double primary, double helper, bool integrated,
                                       bool fp16_exchange = false) {
