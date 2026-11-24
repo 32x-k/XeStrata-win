@@ -385,7 +385,7 @@ if(STRATA_ENABLE_XE)
   endif()
 
   add_library(strata_core STATIC src/core/device.cpp src/core/pinned.cpp src/core/gpu.cpp src/core/graph.cpp
-                                 src/core/readback.cpp
+                                 src/core/readback.cpp src/core/conversation_memory.cpp
                                  src/core/weights.cpp src/core/layout.cpp)
   target_include_directories(strata_core PUBLIC include)
   target_link_libraries(strata_core PUBLIC strata_sycl strata_warnings strata_plan strata_platform)
@@ -432,7 +432,7 @@ if(STRATA_ENABLE_XE)
                                    src/core/native_dense.cpp src/core/verify.cpp src/core/moe_window.cpp
                                    src/core/plain_model.cpp src/core/plain_glm5.cpp src/core/pcie_split.cpp
                                    src/core/mtp.cpp src/core/conversation_snapshot.cpp src/core/conversation_state.cpp
-                                   src/core/conversation_memory.cpp src/core/conversation_disk.cpp
+                                   src/core/conversation_disk.cpp
                                    src/core/conversation_file.cpp src/core/vmm.cpp src/core/draft_head.cpp
                                    src/core/grammar.cpp)
   target_include_directories(strata_engine PUBLIC include)

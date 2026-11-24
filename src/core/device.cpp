@@ -722,7 +722,8 @@ bool integrated_gpu(const sycl::device& d) {
         if ((hip = GetModuleHandleA(name))) break;
     auto symbol = [hip](const char* name) -> void* { return hip ? (void*) GetProcAddress(hip, name) : nullptr; };
 #else
-    auto symbol = [](const char* name) -> void* { return dlsym(RTLD_DEFAULT, name); };
+    static void* hip = dlopen("libamdhip64.so", RTLD_LAZY | RTLD_LOCAL);
+    auto symbol = [](const char* name) -> void* { return hip ? dlsym(hip, name) : nullptr; };
 #endif
     using Count = int (*)(int*); using Bus = int (*)(char*, int, int); using Attribute = int (*)(int*, int, int);
     const auto count = (Count) symbol("hipGetDeviceCount");
@@ -736,7 +737,7 @@ bool integrated_gpu(const sycl::device& d) {
             if (bus(id, sizeof id, i) == 0) {
                 std::string address(id);
                 for (auto& c : address) c = (char) std::tolower((unsigned char)c);
-                if (address == pci && attr(&v, 28, i) == 0) { value = v != 0; known = true; break; }
+                if (address == pci && attr(&v, 16, i) == 0) { value = v != 0; known = true; break; }
             }
         }
     }
